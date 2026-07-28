@@ -24,6 +24,14 @@ _Avoid_: Launch city, free-form location
 The conversational interface that interprets a Player's natural-language intent, helps select values, and persists only user-confirmed structured Match Filters.
 _Avoid_: Model, agent, chatbot
 
+**Telegram Language Hint**:
+The optional Telegram app UI language tag received with a Player's update and used only to localize the initial interaction.
+_Avoid_: System language, OS locale, confirmed language
+
+**Conversation Language**:
+The language explicitly selected or confirmed by a Player for communication with the Bot Assistant.
+_Avoid_: Telegram Language Hint, system language
+
 **Source Chat**:
 A Telegram chat explicitly included by the product owner as an approved source of new messages.
 _Avoid_: Scraped chat, monitored group
