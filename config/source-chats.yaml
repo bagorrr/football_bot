@@ -1,0 +1,13 @@
+source_chats:
+  - username: piterfut
+    url: https://t.me/piterfut
+    enabled: true
+  - username: lovefootballspb
+    url: https://t.me/lovefootballspb
+    enabled: true
+  - username: fballer_spb
+    url: https://t.me/fballer_spb
+    enabled: true
+  - username: spbfutbol
+    url: https://t.me/spbfutbol
+    enabled: true
