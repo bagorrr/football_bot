@@ -14,6 +14,7 @@ Telegram state and the job queue.
 - [Delivery roadmap](docs/product/roadmap.md)
 - [Language onboarding](docs/product/language-onboarding.md)
 - [Conversational onboarding](docs/product/onboarding-flow.md)
+- [Location resolution](docs/product/location-resolution.md)
 - [Search-direction taxonomy](docs/product/search-direction-taxonomy.md)
 - [Source Message classification pipeline](docs/product/classification-pipeline.md)
 - [Source Chat consent basis](docs/product/source-consent.md)

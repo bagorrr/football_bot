@@ -350,6 +350,7 @@ location or country of residence.
 | `referee_search` | `🌍 В какой стране ищем судью?` | `🌍 In which country should we look for a referee?` | `🌍 ¿En qué país buscamos un árbitro?` | `🌍 Dans quel pays devons-nous chercher un arbitre ?` |
 | `refereeing_service_offer` | `🌍 В какой стране вы готовы работать судьёй?` | `🌍 In which country are you available to work as a referee?` | `🌍 ¿En qué país está disponible para trabajar como árbitro?` | `🌍 Dans quel pays êtes-vous disponible pour travailler comme arbitre ?` |
 
-Country is followed by city. Sub-city selection and normalization, including
-colloquial place names, remain a separate Wayfinder decision. Direction-specific
-fields and filters follow the location stages and are also resolved separately.
+Country is followed by the city and Sub-city Area stages defined in
+[`location-resolution.md`](location-resolution.md). Direction-specific fields
+and filters follow the confirmed location stages and remain a separate
+Wayfinder decision.
