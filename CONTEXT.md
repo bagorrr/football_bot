@@ -20,6 +20,10 @@ _Avoid_: Search settings, recommendation preferences
 The country and city selected by a Player as the geographic boundary for matching Open Matches.
 _Avoid_: Launch city, free-form location
 
+**Bot Assistant**:
+The conversational interface that interprets a Player's natural-language intent, helps select values, and persists only user-confirmed structured Match Filters.
+_Avoid_: Model, agent, chatbot
+
 **Source Chat**:
 A Telegram chat explicitly included by the product owner as an approved source of new messages.
 _Avoid_: Scraped chat, monitored group

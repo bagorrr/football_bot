@@ -36,6 +36,7 @@ The Telegram bot is the initial user-facing frontend. A separate web application
 ├── docs/
 │   ├── agents/
 │   ├── adr/
+│   ├── research/
 │   └── product/
 ├── tests/
 │   ├── contract/
