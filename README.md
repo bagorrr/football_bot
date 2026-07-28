@@ -5,6 +5,7 @@ Greenfield Telegram product for turning permitted football-match posts into norm
 ## Project documents
 
 - [Delivery roadmap](docs/product/roadmap.md)
+- [Language onboarding](docs/product/language-onboarding.md)
 - [Proposed repository structure](docs/product/repository-structure.md)
 - [Agent workflow](AGENTS.md)
 
