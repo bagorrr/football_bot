@@ -11,3 +11,13 @@ Use the canonical triage labels: `needs-triage`, `needs-info`, `ready-for-agent`
 ### Domain docs
 
 This repository uses a single-context domain-doc layout: a root `CONTEXT.md` and repository-wide ADRs under `docs/adr/`. See `docs/agents/domain.md`.
+
+### Delivery lifecycle and thread handoffs
+
+Before starting and before finishing work that advances product grilling,
+Wayfinder, specification, ticketing, implementation, review, release, or
+production deployment, read `docs/agents/delivery-handoffs.md`.
+
+Do not cross a fresh-thread boundary defined there. When a task reaches or
+stops at a lifecycle gate, end the final response with the required
+`Next handoff` block and a paste-ready prompt for the correct next thread.
