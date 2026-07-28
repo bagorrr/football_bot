@@ -2,7 +2,7 @@
 
 Issues, specifications, Wayfinder maps, and implementation tickets for this repository live in GitHub Issues. Use the `gh` CLI for tracker operations.
 
-The local repository does not yet have a GitHub remote. Until one is configured, tracker operations that require repository discovery are unavailable.
+The GitHub repository is `bagorrr/football_bot`; the local `origin` remote points to it.
 
 ## Conventions
 
@@ -14,7 +14,7 @@ The local repository does not yet have a GitHub remote. Until one is configured,
 - Remove a label: `gh issue edit <number> --remove-label "..."`
 - Close an issue: `gh issue close <number> --comment "..."`
 
-Infer the repository from `git remote -v` once the GitHub remote is configured.
+Infer the repository from `git remote -v`; `gh` resolves `bagorrr/football_bot` automatically from the configured remote.
 
 ## Pull requests as a triage surface
 
