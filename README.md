@@ -4,6 +4,11 @@ Greenfield Telegram product for turning consent-covered football posts into
 normalized opportunities with model-assisted classification and recommending
 relevant results to users.
 
+The current PoC ingests every observable message from each enabled Source Chat
+and performs bounded model classification through Codex CLI authenticated with
+ChatGPT-managed Codex access. A durable application worker, not Codex, owns
+Telegram state and the job queue.
+
 ## Project documents
 
 - [Delivery roadmap](docs/product/roadmap.md)

@@ -1,3 +1,9 @@
+ingestion_policy:
+  scope: all_messages
+  include_edits: true
+  include_deletion_events: true
+  preclassification_keyword_filter: false
+
 source_chats:
   - username: piterfut
     url: https://t.me/piterfut

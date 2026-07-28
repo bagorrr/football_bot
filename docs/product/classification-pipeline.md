@@ -3,6 +3,8 @@
 Status: Confirmed architecture baseline. The canonical opportunity taxonomy is
 still resolved through GitHub Wayfinder issue
 [Define the canonical search-direction taxonomy](https://github.com/bagorrr/football_bot/issues/2).
+The current PoC execution adapter is recorded in
+[Use ChatGPT-authenticated Codex CLI for PoC classification](https://github.com/bagorrr/football_bot/issues/13).
 
 ## Decision
 
@@ -12,12 +14,33 @@ a rules-only parser is not an acceptable primary classifier.
 
 The model does not replace the production service. A conventional long-running
 service owns Telegram connectivity, durable storage, queueing, idempotency,
-retries, backpressure, credentials, and monitoring. A stateless classification
-worker makes bounded model calls through the OpenAI Responses API.
+retries, backpressure, credentials, and monitoring.
 
-In this architecture, “direct API call” means a direct call **to a model**. It
-does not mean that the application tries to understand natural language without
-a model.
+The project currently has no OpenAI Platform API key. For the PoC, the
+classification worker invokes a separate bounded `codex exec --ephemeral`
+subprocess for each job. Codex CLI is authenticated on the trusted server
+through the product owner's ChatGPT-managed Codex access. This still uses an
+OpenAI model; it changes the authentication and execution adapter, not the need
+for semantic model interpretation.
+
+The durable worker is continuous. Each Codex invocation is finite and
+supervised. A single persistent Codex conversation never owns Telegram delivery
+or queue state.
+
+## Source coverage
+
+Every account-visible message or post in every enabled Source Chat is admitted
+to ingestion and classification:
+
+- all administrators, ordinary users, anonymous administrators, and
+  channel-authored posts;
+- ordinary text, captions, replies, and supported attachment metadata;
+- edits as new revisions and deletion events as tombstones;
+- relevant, irrelevant, ambiguous, malformed, and non-football messages.
+
+There is no keyword or rules pre-filter before model classification. “Parse all
+messages” means ingest and classify every observable message; it does not mean
+publish every message or retain every raw body indefinitely.
 
 ## Processing flow
 
@@ -28,9 +51,11 @@ a model.
 3. A durable queue creates an idempotent classification job keyed by Source
    Chat, Telegram message ID, and current message revision.
 4. A context builder creates a minimal permitted context bundle.
-5. A classification worker sends that bundle to a model with no shell,
-   filesystem, network, or other agent tools and requests a strict structured
-   result.
+5. A classification worker starts a finite Codex CLI process in an isolated
+   minimal workspace and requests a strict structured result. The process uses
+   saved ChatGPT authentication, an ephemeral session, a read-only sandbox, no
+   MCP servers or plugins, no application secrets, bounded input/output, and a
+   hard timeout.
 6. Deterministic validators reject impossible or incomplete combinations and
    normalize accepted fields.
 7. The application either publishes a normalized football opportunity, routes
@@ -71,6 +96,23 @@ must distinguish at least:
 
 Schema validity is necessary but not sufficient. Business validation and
 provenance checks remain application responsibilities.
+
+## Codex execution contract
+
+- Install and authenticate Codex CLI on the trusted worker with ChatGPT sign-in;
+  use headless device authentication where available.
+- Store the refreshed Codex authentication only in the dedicated worker user's
+  protected credential store. Treat it as a secret and never place it in
+  `.env`, Git, logs, prompts, or tickets.
+- Run one isolated ephemeral classification turn per queued message revision.
+- Pass the Source Message as untrusted data inside a fixed classifier prompt;
+  never allow its text to become an operator instruction.
+- Require a versioned JSON Schema and validate the final output independently.
+- Keep concurrency low and configurable. When ChatGPT authentication, quota, or
+  usage limits prevent a run, leave the job in the durable queue and alert.
+- Record the Codex version, selected model, prompt/schema/glossary versions,
+  exit status, duration, and machine-readable run events without recording
+  credentials or unnecessary message bodies.
 
 ## Ambiguity policy
 
@@ -113,7 +155,7 @@ Before publishing classifications from real Source Chats:
 - version the corpus, prompt, schema, model, and glossary;
 - require a regression run before changing any of those versions.
 
-Codex CLI and the ChatGPT desktop app remain useful for developing the
-classifier, running evaluations, analyzing failures, and performing
-operator-approved backfills. They are not the continuously running production
-message consumer.
+This subscription-authenticated Codex adapter is the confirmed PoC path. If a
+Platform API credential or Enterprise Codex access token becomes available, it
+may replace the adapter after regression testing without changing ingestion,
+queueing, normalized output, or matching.

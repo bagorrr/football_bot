@@ -3,7 +3,8 @@
 ## Purpose
 
 Build a Telegram product that receives consent-covered football opportunity
-posts, turns them into normalized opportunities with model-assisted
+posts, ingests every observable message from each enabled Source Chat, turns
+relevant content into normalized opportunities with model-assisted
 classification, and recommends relevant results to users according to their
 confirmed preferences.
 
@@ -50,6 +51,8 @@ Do not duplicate detailed decisions or ticket status in this file.
 - Target users and their main job-to-be-done.
 - Chats and message sources that may be processed.
 - Telegram access, consent evidence, withdrawal, and new-member boundaries.
+- Complete-stream ingestion and the rule that relevance filtering happens only
+  after model classification.
 - Definition of a football match listing.
 - Required and optional listing attributes.
 - Duplicate and conflicting posts.
@@ -157,6 +160,9 @@ Each ticket is implemented in a fresh context using `tdd` one red-green slice at
 - Relevant static checks and tests pass.
 - Operational and failure behaviour are covered proportionally to risk.
 - Classifier changes pass the versioned representative-corpus regression gate.
+- ChatGPT-authenticated Codex worker tests cover expired authentication,
+  subscription-limit exhaustion, process timeout, malformed output, restart,
+  and durable queue recovery without message loss.
 
 ## Phase 6 — Review and release
 

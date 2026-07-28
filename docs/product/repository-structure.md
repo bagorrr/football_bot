@@ -59,7 +59,11 @@ deployment image, database, and queue; these logical roles do not require
 premature microservices.
 
 The ingestion role owns Telethon update state and raw event durability. The
-classification role makes bounded model calls and never owns Telegram delivery.
+classification role supervises bounded, ephemeral Codex CLI subprocesses
+authenticated through ChatGPT-managed Codex access and never owns Telegram
+delivery. Codex runs under a dedicated unprivileged service identity in an
+isolated minimal workspace; its authentication is operational secret state, not
+repository configuration.
 The recommendation role matches accepted normalized opportunities to confirmed
 user filters. See
 [`docs/product/classification-pipeline.md`](classification-pipeline.md) and

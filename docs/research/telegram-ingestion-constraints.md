@@ -26,6 +26,14 @@ scope, and withdrawal are in
 [`docs/product/source-consent.md`](../product/source-consent.md) and
 [`ADR 0002`](../adr/0002-record-source-chat-consent.md).
 
+The confirmed ingestion scope is the complete observable stream of each enabled
+Source Chat: every new message or post from every author, every observed edit,
+and every delivered deletion event. Relevance filtering happens only after
+model classification; there is no author or keyword pre-filter. Continuing
+consent for later participants is maintained through the Source Chat's
+admission/participation process. If universal coverage cannot be maintained, the
+whole Source Chat is paused rather than partially sampled.
+
 ## Bot API versus user-authorized MTProto
 
 | Capability | Bot API | User-authorized MTProto / Telethon |

@@ -65,12 +65,12 @@ The language explicitly selected or confirmed by a Player for communication with
 _Avoid_: Telegram Language Hint, system language
 
 **Source Chat**:
-A Telegram chat explicitly included by the product owner as an approved source of new messages.
-_Avoid_: Scraped chat, monitored group
+A Telegram chat approved as a complete source stream while its continuing consent process covers every participant.
+_Avoid_: Scraped chat, sampled chat, partially monitored group
 
 **Source Message**:
-A message published in a Source Chat and admitted to classification; it is not necessarily a relevant football opportunity.
-_Avoid_: Match Post, Offer, Listing before classification
+Every account-visible message or post published in a Source Chat, regardless of author or football relevance; edits are revisions of the same Source Message.
+_Avoid_: Selected Post, Match Post, Offer, Listing before classification
 
 **Source Author**:
 The Telegram account that published a Source Message, regardless of whether the account belongs to an administrator or an ordinary chat participant.
