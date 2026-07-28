@@ -4,6 +4,8 @@ Status: Confirmed architecture baseline. The canonical opportunity taxonomy is
 defined in
 [`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md) and
 [ADR 0003](../adr/0003-separate-user-intent-from-opportunity-type.md).
+Location extraction and normalization are defined in
+[`docs/product/location-resolution.md`](location-resolution.md).
 The current PoC execution adapter is recorded in
 [Use ChatGPT-authenticated Codex CLI for PoC classification](https://github.com/bagorrr/football_bot/issues/13).
 
@@ -168,6 +170,31 @@ Examples:
   venue and any competing opportunity type.
 
 These examples are evaluation cases, not hard-coded phrase rules.
+
+## Location normalization
+
+Keep Source Message geography separate from a Bot User's Search Area:
+
+- a `Location Mention` is the exact source evidence;
+- a `Location Candidate` is a proposed normalized interpretation;
+- an `Opportunity Location` is accepted normalized geography.
+
+The model proposes Location Candidates and cites their evidence. The application
+accepts one only when message or configured Source Chat context establishes the
+parent geography, the location resolver validates the entity and its
+containment, and no competing or contradictory interpretation remains. Model
+confidence alone is insufficient.
+
+Preserve the most specific supported type: address, landmark vicinity,
+colloquial named-place vicinity, or administrative area. Add parent geography
+only through validated containment and retain the resolver and glossary
+versions. Run a second location pass only with new permitted context; otherwise
+route evidence-backed conflicts to review and evidence-poor ambiguity to
+unresolved.
+
+The full acceptance rules, the `на коменде` case, and Bot User location
+confirmation behavior are canonical in
+[`docs/product/location-resolution.md`](location-resolution.md).
 
 ## Evaluation gate
 

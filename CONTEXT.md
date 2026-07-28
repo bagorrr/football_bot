@@ -149,8 +149,28 @@ Criteria explicitly selected by a Player to determine which Open Matches are inc
 _Avoid_: Search settings, recommendation preferences
 
 **Search Area**:
-The geographic boundary where a Bot User wants compatible Opportunities or is willing to provide a service.
+A Bot User's explicitly confirmed geographic boundary for one discovery flow. It contains one country, one city, and either the whole city or one or more Sub-city Areas within it.
 _Avoid_: Current location, country of residence, Launch city
+
+**Suggested Country**:
+An unconfirmed country shortcut based only on the Bot User's previously confirmed Search Area for the same User Intent.
+_Avoid_: Detected Country, inferred country, current country
+
+**Sub-city Area**:
+A typed geographic refinement within one confirmed city, such as an administrative district, neighborhood, named locality, or the vicinity of a station, landmark, or address.
+_Avoid_: District when the place is not an administrative district, Location Filter
+
+**Location Mention**:
+The exact Source Message text or source reference that expresses a place.
+_Avoid_: Location Candidate, Opportunity Location, normalized location
+
+**Location Candidate**:
+One proposed normalized interpretation of a Location Mention that has not yet passed the location acceptance checks.
+_Avoid_: Opportunity Location, Search Area, inferred fact
+
+**Opportunity Location**:
+Accepted normalized geography derived from a Source Message, preserving the most specific supported place and its verified parent hierarchy.
+_Avoid_: Search Area, Location Candidate, Source Chat geography
 
 **Bot Assistant**:
 The conversational interface that interprets a Bot User's natural-language input, helps select values, and persists only user-confirmed structured selections.

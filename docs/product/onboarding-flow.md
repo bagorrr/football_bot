@@ -1,8 +1,8 @@
 # Conversational Onboarding
 
-Status: Confirmed through terminal User Intent and country prompt selection.
-Later state invalidation and direction-specific filters remain Wayfinder
-decisions.
+Status: Confirmed through the complete location stage. Later
+direction-specific filters and the complete onboarding state machine remain
+Wayfinder decisions.
 
 ## Confirmed sequence
 
@@ -11,11 +11,13 @@ decisions.
 3. Resolve any direction-specific subtype.
 4. Select the country.
 5. Select the city.
-6. Continue through direction-specific filters.
+6. Select the whole city or one or more Sub-city Areas.
+7. Continue through direction-specific filters.
 
-The exact sub-city stage, including district selection and colloquial location
-normalization, remains open and may be inserted after city. The canonical
-taxonomy and all reviewed localized copy live in
+Suggested Country, city normalization, the Sub-city Area stage, and Source
+Message location normalization are canonical in
+[`docs/product/location-resolution.md`](location-resolution.md). The canonical
+direction taxonomy and reviewed direction/country copy live in
 [`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md).
 
 ## Top-level direction menu
@@ -118,5 +120,8 @@ Every subsequent menu and every prompt waiting for free text must include a bott
 ```
 
 The button returns the Bot User to the previous logical onboarding stage and
-allows the previous selection to be changed. Exact invalidation rules for
-answers that depend on a changed earlier selection remain a Wayfinder decision.
+allows the previous selection to be changed. Back alone preserves confirmed
+geography. Confirming a different country clears city and Sub-city Areas;
+confirming a different city clears Sub-city Areas; selecting the whole city
+clears individual areas. Complete invalidation rules for later
+direction-specific answers remain with the onboarding-state Wayfinder decision.
