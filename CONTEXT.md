@@ -16,6 +16,10 @@ _Avoid_: Team, tournament, transfer, permanent roster vacancy
 A Player's intent to find one or more Open Matches that satisfy their confirmed Match Filters.
 _Avoid_: Team Search, match listing
 
+**Player Search**:
+An organizer's intent to find individual Players for a specific Open Match.
+_Avoid_: Game Search, Transfer Player Search
+
 **Competition Search**:
 The onboarding branch for finding either a Tournament or an opponent team; the Player must choose one of those two intents before selecting geography.
 _Avoid_: Opponent Team Search
@@ -27,6 +31,18 @@ _Avoid_: Opponent Search
 **Opponent Search**:
 The intent of a team representative to find another team for a football game.
 _Avoid_: Tournament Search, Team Search
+
+**Transfer Search**:
+The onboarding branch for a long-term or seasonal move between teams; the user must choose whether to find a new team or find a Player for transfer.
+_Avoid_: Player Search, one-off replacement
+
+**New Team Search**:
+A Player's intent to find a new team through a long-term or seasonal transfer.
+_Avoid_: Game Search, Team Search
+
+**Transfer Player Search**:
+A team representative's intent to find a Player for a long-term or seasonal transfer.
+_Avoid_: Player Search
 
 **Match Filters**:
 Criteria explicitly selected by a Player to determine which Open Matches are included in their results.

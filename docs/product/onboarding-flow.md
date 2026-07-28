@@ -25,6 +25,21 @@ The two selections continue independently:
 - `Tournament Search` → `🌍 В какой стране ищем турнир?`
 - `Opponent Search` → `🌍 В какой стране ищем команду-соперника?`
 
+`Transfer Search` also has a subtype step before country:
+
+> 🔄 **Что вы хотите?**
+
+```text
+[ Найти новую команду ]
+[ Найти игрока для трансфера ]
+[          ⬅️ Назад          ]
+```
+
+The two selections continue independently:
+
+- `New Team Search` → `🌍 В какой стране ищем новую команду?`
+- `Transfer Player Search` → `🌍 В какой стране ищем игрока для трансфера?`
+
 ## Back navigation
 
 The initial language-selection screen is the only onboarding stage without a Back button.
