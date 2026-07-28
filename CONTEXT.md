@@ -12,6 +12,10 @@ _Avoid_: End user, football user
 A specific upcoming football game with places available to individual Players.
 _Avoid_: Team, tournament, transfer, permanent roster vacancy
 
+**Game Search**:
+A Player's intent to find one or more Open Matches that satisfy their confirmed Match Filters.
+_Avoid_: Team Search, match listing
+
 **Match Filters**:
 Criteria explicitly selected by a Player to determine which Open Matches are included in their results.
 _Avoid_: Search settings, recommendation preferences
