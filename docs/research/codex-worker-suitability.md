@@ -12,6 +12,10 @@ normal long-running application service. Let that service make bounded OpenAI
 [Responses API](https://developers.openai.com/api/reference/overview#start-here)
 requests for the model-dependent parsing/classification step.
 
+This is a model-based architecture, not a rules-only parser. “Direct Responses
+API requests” means that a language model performs the semantic interpretation.
+The conventional service owns reliable execution around that model call.
+
 `codex exec` is supported for unattended **bounded jobs** such as CI pipelines
 and scheduled work. The desktop app supports unattended scheduled tasks. Neither
 surface is documented as a headless, continuously available application runtime
@@ -118,16 +122,22 @@ The API still requires application-level reliability:
 2. A durable queue creates one idempotent classification job keyed by the
    Telegram chat/message identity. Retries must not create duplicate downstream
    opportunities.
-3. A stateless worker calls the Responses API with the Source Message as data,
+3. A deterministic context builder adds the smallest permitted reply, adjacent
+   message, chat-geography, glossary, timestamp, and timezone context needed to
+   interpret slang and relative language.
+4. A stateless worker calls the Responses API with the context bundle as data,
    no model tools, bounded output, and a strict JSON Schema covering relevance,
-   opportunity type, extracted fields, and an explicit uncertain/review result.
+   candidate opportunity type, extracted facts with evidence, ambiguity
+   reasons, and an explicit uncertain/review result.
    OpenAI's [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)
    enforce schema adherence and make refusals programmatically detectable.
-4. The service validates business rules, persists the prompt/schema version,
+5. The service validates business rules, persists the prompt/schema/glossary
+   version,
    pinned model, request IDs, raw structured result, and final status, then
-   publishes only accepted classifications. Exhausted retries go to a
-   dead-letter/manual-review path.
-5. Scale the application workers horizontally under an explicit concurrency
+   publishes only accepted classifications. Genuine semantic ambiguity may
+   receive one bounded second pass; unresolved cases remain unpublished or go
+   to review. Exhausted infrastructure retries go to a dead-letter path.
+6. Scale the application workers horizontally under an explicit concurrency
    budget. Use metrics for queue age, API latency/errors, token usage,
    classification outcomes, retries, and review rate.
 
@@ -135,3 +145,7 @@ For ordinary short Source Messages, use synchronous Responses calls. API
 [background mode](https://developers.openai.com/api/docs/guides/background)
 exists for genuinely long-running model tasks and supports polling/cancellation,
 but it does not replace the application's queue or message lifecycle.
+
+The confirmed product-level contract, including examples such as “ищем пару
+типов на команду” and “поиграю в вс на ваське”, is recorded in
+[`docs/product/classification-pipeline.md`](../product/classification-pipeline.md).

@@ -2,7 +2,10 @@
 
 ## Purpose
 
-Build a Telegram product that receives permitted football-match posts, turns them into normalized match listings, and recommends relevant listings to users according to their preferences.
+Build a Telegram product that receives consent-covered football opportunity
+posts, turns them into normalized opportunities with model-assisted
+classification, and recommends relevant results to users according to their
+confirmed preferences.
 
 This roadmap records the stable delivery flow and transition gates. Active status, decisions, specifications, and implementation tickets live in GitHub Issues.
 
@@ -11,6 +14,8 @@ This roadmap records the stable delivery flow and transition gates. Active statu
 - Domain language: `CONTEXT.md`
 - Architecture decisions: `docs/adr/`
 - Stable delivery flow: this roadmap
+- Model classification boundary: `docs/product/classification-pipeline.md`
+- Source consent basis: `docs/product/source-consent.md`
 - Open decision space: GitHub Wayfinder map, when needed
 - Product specification: GitHub spec issue
 - Implementation work: GitHub tracer-bullet issues
@@ -44,7 +49,7 @@ Do not duplicate detailed decisions or ticket status in this file.
 
 - Target users and their main job-to-be-done.
 - Chats and message sources that may be processed.
-- Telegram access and consent boundaries.
+- Telegram access, consent evidence, withdrawal, and new-member boundaries.
 - Definition of a football match listing.
 - Required and optional listing attributes.
 - Duplicate and conflicting posts.
@@ -114,6 +119,7 @@ A GitHub specification issue synthesizing the conversation, domain documentation
 - Acceptance criteria are testable.
 - Scope and non-goals are explicit.
 - Affected modules and integration seams are identified.
+- Ambiguous Source Message and unpublished/review behaviour are explicit.
 
 ## Phase 4 — Ticketing
 
@@ -150,6 +156,7 @@ Each ticket is implemented in a fresh context using `tdd` one red-green slice at
 - Acceptance criteria pass.
 - Relevant static checks and tests pass.
 - Operational and failure behaviour are covered proportionally to risk.
+- Classifier changes pass the versioned representative-corpus regression gate.
 
 ## Phase 6 — Review and release
 

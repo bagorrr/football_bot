@@ -8,7 +8,23 @@ Use a **dedicated user-authorized MTProto account through Telethon**, joined to 
 
 Treat ingestion as an idempotent, current-state projection rather than an audit log. Persist `(peer_id, message_id)`, upsert new and edited messages, apply deletion tombstones, retain Telethon's update state, run catch-up after reconnect, and reconcile a bounded history window. Telegram and Telethon do not support an absolute “every deletion and every historical revision” guarantee.
 
-There is also a blocking policy question before production: Telegram's current API Terms prohibit using or aggregating Telegram data for the development or deployment of AI/ML, and the linked Content Licensing terms extend this to scraping, indexing, harvesting, aggregation, validation, and deployment. The stated exception requires explicit, informed, affirmative, continued consent from **all relevant users**, limited to the specific content and context. Approval of a Source Chat by its owner or by the product owner does not appear to satisfy that exception. Do not send Source Messages to an AI/ML classifier or launch AI-backed ingestion without a documented compliance decision. See [Telegram API Terms §§1.4–1.5](https://core.telegram.org/api/terms) and [Terms of Service for Content Licensing](https://telegram.org/tos/content-licensing).
+Telegram's current API Terms prohibit using or aggregating Telegram data for the
+development or deployment of AI/ML, and the linked Content Licensing terms
+extend this to scraping, indexing, harvesting, aggregation, validation, and
+deployment. The stated exception requires explicit, informed, affirmative,
+continued consent from **all relevant users**, limited to the specific content
+and context. Approval of a Source Chat by its owner or by the product owner
+alone would not appear to satisfy that exception. See
+[Telegram API Terms §§1.4–1.5](https://core.telegram.org/api/terms) and
+[Terms of Service for Content Licensing](https://telegram.org/tos/content-licensing).
+
+Project status: the product owner has confirmed the required consent from every
+current user in the configured Source Chats for the planned processing.
+Therefore this finding is no longer a Wayfinder blocker for corpus or production
+architecture work. The recorded basis and conditions for future users, expanded
+scope, and withdrawal are in
+[`docs/product/source-consent.md`](../product/source-consent.md) and
+[`ADR 0002`](../adr/0002-record-source-chat-consent.md).
 
 ## Bot API versus user-authorized MTProto
 
@@ -68,9 +84,12 @@ Telegram requires an application-specific `api_id`, warns that unofficial client
 
 These terms can change, and Telegram says it may notify the developer account of changes. Re-check them before prototype approval and release. In particular, the current AI/ML prohibition is broader than model training and explicitly names deployment and aggregation.
 
-## Questions for a synthetic, non-production prototype
+## Prototype validation plan
 
-Use only a new dedicated account and synthetic test groups/channels; do not point the prototype at real Source Chats or stored production credentials.
+Use a new dedicated account and synthetic test groups/channels for the initial
+technical validation. A subsequent limited validation against a real Source Chat
+may proceed only through the documented consent gate and production credential
+controls; do not copy real message exports or credentials into the repository.
 
 1. Across a private basic group, private/public supergroup, and private/public channel, verify new/edit/delete event shape, anonymous/channel-authored posts, albums/media, service messages, and chat/message identifiers.
 2. Disconnect briefly and for a longer interval, then verify handler ordering, duplicate delivery, persisted update state, `catch_up()`, `differenceTooLong` handling, and bounded history reconciliation.
@@ -78,4 +97,7 @@ Use only a new dedicated account and synthetic test groups/channels; do not poin
 4. Verify hidden prehistory, join-request, removal/rejoin, migrated-group, and protected-content behavior using synthetic messages only.
 5. Measure request volume and observed flood waits for the expected Source Chat count and backfill window; verify that restarts, 2FA login, session revocation, and credential rotation fail closed.
 
-The prototype can validate library behavior and operational assumptions, but it cannot turn Telegram's best-effort deletion feed into an audit guarantee or resolve the AI/content-licensing compliance question.
+The prototype can validate library behavior and operational assumptions, but it
+cannot turn Telegram's best-effort deletion feed into an audit guarantee or
+establish and maintain consent. Consent evidence, admission, and withdrawal
+remain separate operational responsibilities.

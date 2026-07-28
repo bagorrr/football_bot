@@ -16,14 +16,17 @@ The Telegram bot is the initial user-facing frontend. A separate web application
 │   ├── backend/
 │   ├── telegram-bot/
 │   ├── ingestion-worker/
+│   ├── classification-worker/
 │   ├── recommendation-worker/
 │   └── web/
 ├── modules/
 │   ├── domain/
 │   ├── contracts/
 │   ├── telegram-adapter/
-│   ├── parsing/
+│   ├── classification/
+│   ├── normalization/
 │   ├── matching/
+│   ├── consent/
 │   ├── persistence/
 │   ├── observability/
 │   └── testkit/
@@ -50,7 +53,17 @@ The folders describe logical boundaries, not a commitment to a language, framewo
 
 ## Initial deployment posture
 
-Prefer a modular backend with a separate asynchronous worker unless product grilling or technical research provides evidence for more independently deployed services.
+Prefer a modular backend with separate asynchronous ingestion, classification,
+and recommendation process roles. They may initially share one codebase,
+deployment image, database, and queue; these logical roles do not require
+premature microservices.
+
+The ingestion role owns Telethon update state and raw event durability. The
+classification role makes bounded model calls and never owns Telegram delivery.
+The recommendation role matches accepted normalized opportunities to confirmed
+user filters. See
+[`docs/product/classification-pipeline.md`](classification-pipeline.md) and
+[`ADR 0001`](../adr/0001-use-a-durable-model-classification-service.md).
 
 ## Repository split triggers
 
