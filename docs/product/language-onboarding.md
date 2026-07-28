@@ -1,6 +1,7 @@
 # Language Onboarding
 
-Status: Accepted for language detection, selection mechanics, and Russian master copy. The capability list in the welcome message still requires alignment with the MVP scope.
+Status: Accepted for language detection, selection mechanics, Russian master
+copy, and handoff to the canonical search-direction menu.
 
 ## Language resolution
 
@@ -48,16 +49,14 @@ Russian master copy:
 
 > **Хотите поиграть в футбол или организуете футбольный матч? ⚽️**
 >
-> **Быстро найдем:**
+> **Быстро найдём:**
 >
-> - команду
-> - игроков
-> - тренеров
-> - судей
-> - турнир
-> - трансферы
-> - услуги тренера
-> - услуги судьи
+> - матч для вас;
+> - игроков на матч;
+> - турнир или команду-соперника;
+> - тренера или запрос на услуги тренера;
+> - судью или запрос на услуги судьи;
+> - новую команду или игрока для трансфера.
 >
 > Для поиска надо ответить на несколько простых вопросов.
 >
@@ -67,7 +66,7 @@ Maintain reviewed static equivalents for English, Spanish, French, and Russian.
 
 ## Free-text language selection
 
-When the Player presses the bottom language-selection button, send this message in the current display language.
+When the Bot User presses the bottom language-selection button, send this message in the current display language.
 
 Russian master copy:
 
@@ -77,7 +76,7 @@ Russian master copy:
 
 The Bot Assistant normalizes an unambiguous language name to an application locale and stores it as an explicit Conversation Language. Ask a clarification only when the input is ambiguous or cannot be mapped safely.
 
-## Continue to country
+## Continue to intent selection
 
 After selecting one of the four fixed buttons, this is the second bot-authored message. After using free-text language selection, it is the third bot-authored message.
 
@@ -85,9 +84,21 @@ Russian master copy:
 
 > ✅ Будем общаться на русском.
 >
-> 🌍 **В какой вы стране?**
+> ⚽️ **Что вы хотите сделать?**
 
-Render this message in the selected Conversation Language.
+```text
+[ Найти матч для себя ]
+[ Найти игроков на матч ]
+[ Турнир или соперник ]
+[ Тренеры ] [ Судьи ]
+[ ⬅️ Назад ] [ Трансферы ]
+```
+
+Render this message in the selected Conversation Language. The reviewed
+English, Spanish, French, and Russian direction menus and subsequent
+direction-specific country prompts are canonical in
+[`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md).
+Country is selected only after the Bot User confirms a terminal User Intent.
 
 ## Persistence
 

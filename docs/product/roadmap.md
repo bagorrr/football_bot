@@ -15,6 +15,8 @@ This roadmap records the stable delivery flow and transition gates. Active statu
 - Domain language: `CONTEXT.md`
 - Architecture decisions: `docs/adr/`
 - Stable delivery flow: this roadmap
+- Canonical search and opportunity taxonomy:
+  `docs/product/search-direction-taxonomy.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
 - Source consent basis: `docs/product/source-consent.md`
 - Open decision space: GitHub Wayfinder map, when needed

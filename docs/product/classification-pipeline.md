@@ -1,8 +1,9 @@
 # Source Message Classification Pipeline
 
 Status: Confirmed architecture baseline. The canonical opportunity taxonomy is
-still resolved through GitHub Wayfinder issue
-[Define the canonical search-direction taxonomy](https://github.com/bagorrr/football_bot/issues/2).
+defined in
+[`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md) and
+[ADR 0003](../adr/0003-separate-user-intent-from-opportunity-type.md).
 The current PoC execution adapter is recorded in
 [Use ChatGPT-authenticated Codex CLI for PoC classification](https://github.com/bagorrr/football_bot/issues/13).
 
@@ -82,11 +83,36 @@ Message.
 
 ## Structured classification result
 
-The exact enum values depend on the taxonomy decision, but the result contract
-must distinguish at least:
+A Source Message classification returns zero, one, or several Opportunity
+Candidates. Each candidate has exactly one of these canonical
+`opportunity_type` values:
+
+```text
+open_match
+player_match_availability
+tournament
+opponent_request
+roster_vacancy
+player_transfer_availability
+coach_availability
+coach_request
+referee_availability
+referee_request
+```
+
+Split independent actionable propositions into separate candidates with their
+own evidence. Do not duplicate one proposition merely because two
+interpretations compete; preserve the alternatives and route that candidate as
+unresolved.
+
+`user_intent` belongs to the Bot User's confirmed onboarding state and is not a
+Source Message classifier output. Compatibility between User Intents and
+Opportunity Types is defined only by the canonical taxonomy.
+
+The result contract must also distinguish at least:
 
 - football relevance;
-- candidate opportunity or participant intent;
+- zero or more typed Opportunity Candidates;
 - extracted facts, normalized values, and unresolved fields;
 - evidence spans or source references for material extracted facts;
 - ambiguity reasons and competing interpretations;
@@ -135,10 +161,11 @@ Examples:
   its date, location, match type, and even one-off versus roster intent may need
   surrounding context. The classifier extracts the supported facts and keeps
   the rest unresolved.
-- “поиграю в вс на ваське” likely expresses player availability on Sunday near
-  a colloquial Saint Petersburg location. The classifier may normalize the day
-  relative to the message timestamp and propose a location candidate, while
-  preserving uncertainty about the exact venue and opportunity type.
+- “поиграю в вс на ваське” is a
+  `player_match_availability` candidate on the supported reading. The
+  classifier may normalize the day relative to the message timestamp and
+  propose a location candidate, while preserving uncertainty about the exact
+  venue and any competing opportunity type.
 
 These examples are evaluation cases, not hard-coded phrase rules.
 
