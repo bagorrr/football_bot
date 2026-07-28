@@ -129,7 +129,7 @@ Tickets should deliver thin end-to-end behaviour. Avoid horizontal tickets such 
 
 Example vertical slice:
 
-> A user sets a city preference, an eligible listing is ingested, and the user receives a recommendation.
+> A user selects a country and city, an eligible listing is ingested, and the user receives a recommendation.
 
 ### Exit gate
 

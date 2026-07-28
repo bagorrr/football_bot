@@ -5,7 +5,7 @@ A Telegram-based marketplace that helps adult amateur football participants disc
 ## Language
 
 **Player**:
-An adult amateur footballer who is the primary MVP user and wants to find one or more relevant Open Matches in the launch city.
+An adult amateur footballer who is the primary MVP user and wants to find one or more relevant Open Matches in a selected Search Area.
 _Avoid_: End user, football user
 
 **Open Match**:
@@ -15,6 +15,10 @@ _Avoid_: Team, tournament, transfer, permanent roster vacancy
 **Match Filters**:
 Criteria explicitly selected by a Player to determine which Open Matches are included in their results.
 _Avoid_: Search settings, recommendation preferences
+
+**Search Area**:
+The country and city selected by a Player as the geographic boundary for matching Open Matches.
+_Avoid_: Launch city, free-form location
 
 **Source Chat**:
 A Telegram chat explicitly included by the product owner as an approved source of new messages.
