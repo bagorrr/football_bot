@@ -36,8 +36,8 @@ operational policy lives in
 
 - Corpus and architecture work may proceed for consent-covered content.
 - The remaining Source Author identity, minimization, retention, deletion, and
-  withdrawal details stay open in Wayfinder issue
-  [#6](https://github.com/bagorrr/football_bot/issues/6), but no longer block
-  those two tickets.
+  withdrawal details stay open in
+  [Define Source Author identity, retention, and withdrawal](https://github.com/bagorrr/football_bot/issues/6),
+  but no longer block those two tickets.
 - Release readiness requires evidence that the consent gate and withdrawal path
   are implemented and auditable.

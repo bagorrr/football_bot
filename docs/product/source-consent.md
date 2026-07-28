@@ -32,8 +32,8 @@ chat membership:
   processing purposes as unconsented until the required consent is recorded;
 - provide a withdrawal path and stop future model processing after withdrawal;
 - suppress affected active opportunities promptly and execute the deletion or
-  retention workflow decided in Wayfinder issue
-  [#6](https://github.com/bagorrr/football_bot/issues/6);
+  retention workflow decided in
+  [Define Source Author identity, retention, and withdrawal](https://github.com/bagorrr/football_bot/issues/6);
 - minimize raw-message and Source Author data, keep access auditable, and never
   place consent evidence, message exports, or personal identifiers in Git.
 

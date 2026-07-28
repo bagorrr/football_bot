@@ -2,7 +2,7 @@
 
 Status: Confirmed architecture baseline. The canonical opportunity taxonomy is
 still resolved through GitHub Wayfinder issue
-[#2](https://github.com/bagorrr/football_bot/issues/2).
+[Define the canonical search-direction taxonomy](https://github.com/bagorrr/football_bot/issues/2).
 
 ## Decision
 
