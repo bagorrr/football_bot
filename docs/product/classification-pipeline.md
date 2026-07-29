@@ -6,6 +6,9 @@ defined in
 [ADR 0003](../adr/0003-separate-user-intent-from-opportunity-type.md).
 Location extraction and normalization are defined in
 [`docs/product/location-resolution.md`](location-resolution.md).
+Evidence-backed Opportunity Attributes and direction-specific acceptance
+requirements are defined in
+[`docs/product/opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
 The current PoC execution adapter is recorded in
 [Use ChatGPT-authenticated Codex CLI for PoC classification](https://github.com/bagorrr/football_bot/issues/13).
 
@@ -124,6 +127,17 @@ The result contract must also distinguish at least:
 
 Schema validity is necessary but not sufficient. Business validation and
 provenance checks remain application responsibilities.
+
+An extracted value is an Opportunity Attribute only when it retains supporting
+Source Message evidence and passes application validation. Missing optional
+attributes remain unknown. Discovery Criteria belong to the Bot User's
+confirmed discovery state and are never classifier output.
+
+Apply the Opportunity Type acceptance matrix in
+[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md)
+before publishing a candidate. The same document defines the deliberately
+narrow children-only exclusion: exclude only a game explicitly described as a
+children's game, without inferring age or gender from indirect signals.
 
 ## Codex execution contract
 

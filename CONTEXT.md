@@ -33,7 +33,7 @@ A non-terminal onboarding choice that groups related User Intents and requires a
 _Avoid_: User Intent, Opportunity Type
 
 **Game Search**:
-A Player's Search Intent to find one or more Open Matches that satisfy their confirmed Match Filters.
+A Player's Search Intent to find one or more Open Matches that satisfy their confirmed Discovery Criteria.
 _Avoid_: Team Search, match listing
 
 **Player Search**:
@@ -102,6 +102,10 @@ _Avoid_: Source Message, accepted Opportunity
 An accepted and normalized Opportunity Candidate eligible for matching to compatible User Intents.
 _Avoid_: Opportunity Candidate, Source Message
 
+**Opportunity Attribute**:
+An evidence-backed normalized fact derived from a Source Message for an Opportunity Candidate or accepted Opportunity. Its absence means unknown, not false.
+_Avoid_: Discovery Criterion, unsupported inference, user preference
+
 **Open Match**:
 A specific upcoming football game with places available to individual Players.
 _Avoid_: Team, tournament, transfer, permanent roster vacancy
@@ -144,9 +148,49 @@ _Avoid_: Referee Availability, Referee Search
 
 ### Search and conversation
 
-**Match Filters**:
-Criteria explicitly selected by a Player to determine which Open Matches are included in their results.
-_Avoid_: Search settings, recommendation preferences
+**Discovery Criterion**:
+A constraint explicitly confirmed by a Bot User for one discovery flow. An unopened, empty, or cleared optional criterion imposes no constraint and never asserts an Opportunity Attribute.
+_Avoid_: Opportunity Attribute, inferred preference, classifier output
+
+**Event Time**:
+One local date or bounded inclusive date range for a particular game, tournament, or event-specific request, with an optional exact local time or day part.
+_Avoid_: Availability Window, Recurring Availability, message timestamp
+
+**Availability Window**:
+A bounded local date range in which one or more participants are available for one-off football games.
+_Avoid_: Event Time, Recurring Availability, Seasonal Timing
+
+**Recurring Availability**:
+A repeating combination of weekdays and local times, optionally beginning on one local date.
+_Avoid_: Event Time, Availability Window, Seasonal Timing
+
+**Seasonal Timing**:
+A long-term move's readiness now, local start date, or explicitly named season.
+_Avoid_: Event Time, Recurring Availability, transfer deadline
+
+**Team Format**:
+The number of football players per side, including the goalkeeper when the goalkeeper is part of that format.
+_Avoid_: total participant count, roster size, Venue Setting
+
+**Playing Level**:
+A self- or author-reported football playing level, not a verified credential, contract, or sporting title.
+_Avoid_: qualification, licence, Play Intensity
+
+**Venue Setting**:
+Whether football activity takes place indoors, outdoors, or outdoors under a roof.
+_Avoid_: Playing Surface, Opportunity Location, venue name
+
+**Playing Surface**:
+The evidence-backed material or surface category on which football activity takes place.
+_Avoid_: Venue Setting, Opportunity Location
+
+**Payment Status**:
+Whether participation or a service is explicitly free, explicitly paid, or unknown; any stated amount establishes paid status.
+_Avoid_: inferred currency, price preference
+
+**Response Route**:
+The automatically selected, evidence-supported path by which a Bot User can contact or reply to the source of an Opportunity.
+_Avoid_: result card, Source Author identity, invented contact
 
 **Search Area**:
 A Bot User's explicitly confirmed geographic boundary for one discovery flow. It contains one country, one city, and either the whole city or one or more Sub-city Areas within it.

@@ -232,7 +232,8 @@ For:
 > Ищу где послезавтра поиграть на коменде
 
 this decision interprets only the location phrase `на коменде`. Relative time
-is resolved by the later direction-specific fields and filters decision.
+is resolved under the temporal contract in
+[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
 
 The model may propose the vicinity of `Комендантский проспект` when the message
 or configured Source Chat establishes Saint Petersburg. If the location
@@ -268,20 +269,13 @@ Location Candidate is unresolved. Whether an Opportunity with only broad
 geography matches a particular Search Area belongs to matching semantics, not
 location normalization.
 
-## Deferred decisions
+## Related decisions
 
-This decision does not define:
+Date and time handling, venue characteristics, Team Format, Playing Level,
+Playing Surface, Payment Status, Response Route, Opportunity acceptance, and
+the direction-specific interaction sequence are canonical in
+[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
 
-- date or time handling, including `послезавтра`;
-- football field or venue characteristics;
-- team format such as `n×n`;
-- team or participant level;
-- playing surface;
-- paid/free status or price;
-- registration or contact method.
-
-Those fields and their interaction sequence remain with
-[Define direction-specific opportunity fields and search filters](https://github.com/bagorrr/football_bot/issues/14).
 Hard-versus-ranked geographic compatibility, distance, ordering, explanations,
 and result-card behavior remain with
 [Define matching and result-card semantics across directions](https://github.com/bagorrr/football_bot/issues/8).

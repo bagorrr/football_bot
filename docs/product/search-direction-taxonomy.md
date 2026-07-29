@@ -351,6 +351,7 @@ location or country of residence.
 | `refereeing_service_offer` | `🌍 В какой стране вы готовы работать судьёй?` | `🌍 In which country are you available to work as a referee?` | `🌍 ¿En qué país está disponible para trabajar como árbitro?` | `🌍 Dans quel pays êtes-vous disponible pour travailler comme arbitre ?` |
 
 Country is followed by the city and Sub-city Area stages defined in
-[`location-resolution.md`](location-resolution.md). Direction-specific fields
-and filters follow the confirmed location stages and remain a separate
-Wayfinder decision.
+[`location-resolution.md`](location-resolution.md). The confirmed normalized
+fields, required discovery cores, filter sequences, and localized filter copy
+live in
+[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
