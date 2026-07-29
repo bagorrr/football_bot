@@ -100,6 +100,17 @@ until the Bot User gives final confirmation.
 | SETTINGS-LANG-09 | Press `Русский` | Locale changed `fr → ru`; Settings re-rendered in Russian; Telegram hint remained `ru`; completed search remained present; no draft was created. | Passed |
 | VIEW-01 | Observe replacements across message `#112` through `#144` | Every observed current view was marked protected and had `active_view_matches_logical_revision=True`; replaced views became old and were marked `deleted best effort`. | Passed for normal replacement path |
 | VIEW-02 | Invalid free text on button-only screens | Invalid text changed no confirmed domain value, but a replacement current view and new logical revision were rendered. | Observed; no contract deviation assigned yet |
+| SETTINGS-SUPPORT-01 | Press `Поддержка` on Russian Settings | Before and after the action the logical stage remained `settings`; the current view stayed at message `#144`, revision `44`, protected and revision-matched. The prototype emitted `OPEN URL: https://telegram.me/myfootball_support_bot`; locale stayed `ru`, `completed_searches=1`, and `draft=None`. | Passed |
+| SETTINGS-MODE-01 | Press `Режим` on Russian Settings | The logical stage changed `settings → mode`; message `#144` was replaced by protected message `#145`, revision `45`, with `active_view_matches_logical_revision=True`. The screen showed selected `✅ Поиск`, `Лента`, and Back. Locale stayed `ru`, `completed_searches=1`, and `draft=None`. | Passed |
+| SETTINGS-FEED-01 | Press `Лента` in Mode | The prototype emitted `Feed will be available after the MVP.` The stage stayed `mode`; no message or logical revision was created (`#145`, revision `45` remained current), and locale, completed search, and empty draft state were unchanged. | Passed as placeholder behavior |
+| SETTINGS-FEED-02 | Localization assessment of `SETTINGS-FEED-01` | Although the no-state-change placeholder behavior passed, its callback notice was English while the explicit account locale and surrounding UI were Russian. | Localization defect |
+| SETTINGS-MODE-02 | Press already selected `✅ Поиск` in Mode | The stage stayed `mode`; no message or logical revision was created (`#145`, revision `45` remained current), and locale, completed search, and empty draft state were unchanged. The prototype emitted `Search is already the active MVP mode.` | Passed as no-op behavior |
+| SETTINGS-MODE-03 | Localization assessment of `SETTINGS-MODE-02` | The already-active notice was English while the explicit account locale and surrounding UI were Russian. | Same localization defect as `SETTINGS-FEED-02` |
+| SETTINGS-MODE-BACK-01 | Press Back from Mode | The logical stage changed `mode → settings`; message `#145` was replaced by protected message `#146`, revision `46`, with `active_view_matches_logical_revision=True`. Russian Settings rendered again; locale stayed `ru`, `completed_searches=1`, and `draft=None`. | Passed |
+| SETTINGS-PREMIUM-01 | Press `Премиум` in Russian Settings | The prototype emitted `Premium will be available later (MVP placeholder).` The stage stayed `settings`; no message or logical revision was created (`#146`, revision `46` remained current), and locale, completed search, and empty draft state were unchanged. | Passed as placeholder behavior |
+| SETTINGS-PREMIUM-02 | Localization assessment of `SETTINGS-PREMIUM-01` | The Premium placeholder notice was English while the explicit account locale and surrounding UI were Russian. | Same localization defect as `SETTINGS-FEED-02` |
+| SETTINGS-BACK-01 | Press Back from Settings | The logical stage changed `settings → main_menu`; message `#146` was replaced by protected message `#147`, revision `47`, with `active_view_matches_logical_revision=True`. Russian Main Menu rendered with New Search, Search Results, and Settings; locale stayed `ru`, `completed_searches=1`, and `draft=None`. | Passed |
+| MENU-02 | Invoke native `Menu` while already on Main Menu | Domain state stayed `main_menu` with locale `ru`, `completed_searches=1`, and `draft=None`. A fresh protected Main Menu message `#148`, revision `48`, replaced message `#147`; the active view matched the logical revision and the old view was deleted best effort. | Passed for functional idempotence; replacement observed |
 
 ## Deferred prototype fix queue
 
@@ -124,14 +135,18 @@ published product verdict.
    model failure, invalid/past values, Back, and confirmed-state preservation.
 8. Do not enter Details Hub until the date flow is fixed, retested, and
    explicitly approved by the Bot User.
+9. Localize callback notices and placeholders to the explicit account locale;
+   `SETTINGS-FEED-02`, `SETTINGS-MODE-03`, and `SETTINGS-PREMIUM-02` prove that
+   Russian Settings currently emit English Feed, already-active, and Premium
+   notices.
 
 ## Planned checks not yet executed
 
 These are listed explicitly so the current passed observations cannot be
 mistaken for complete validation:
 
-- Settings: Language selector, Support, Mode, Feed placeholder, Premium
-  placeholder, and every Back destination.
+- Remaining Settings checks: Mode, Feed placeholder, Premium placeholder, and
+  every Back destination. Language and Support observations are recorded above.
 - Repeated Menu behavior and Main Menu replacement.
 - New repeated search, pause at repeated-search Direction, `/start` resume,
   superseding a paused draft, and 30-day expiry.
