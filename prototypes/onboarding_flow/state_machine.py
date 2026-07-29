@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date, timedelta
+import re
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 FROZEN_TODAY = date(2026, 7, 29)
@@ -53,16 +55,7 @@ COPY: dict[str, dict[str, str]] = {
     ),
     "settings": L("Настройки", "Settings", "Ajustes", "Paramètres"),
     "menu": L("Меню", "Menu", "Menú", "Menu"),
-    "whole_city": L("Весь город", "Whole city", "Toda la ciudad", "Toute la ville"),
-    "choose_areas": L(
-        "Выбрать район или место",
-        "Choose an area or place",
-        "Elegir una zona o lugar",
-        "Choisir une zone ou un lieu",
-    ),
-    "choose_date": L("Выбрать дату", "Choose a date", "Elegir fecha", "Choisir une date"),
-    "today": L("Сегодня", "Today", "Hoy", "Aujourd’hui"),
-    "tomorrow": L("Завтра", "Tomorrow", "Mañana", "Demain"),
+    "confirm": L("Подтвердить", "Confirm", "Confirmar", "Confirmer"),
 }
 
 
@@ -675,6 +668,16 @@ COUNTRIES = {
     },
 }
 
+CITY_TIMEZONES = {
+    "MOW": "Europe/Moscow",
+    "SPE": "Europe/Moscow",
+    "MAD": "Europe/Madrid",
+    "BCN": "Europe/Madrid",
+    "PAR": "Europe/Paris",
+    "LYO": "Europe/Paris",
+    "BER": "Europe/Berlin",
+}
+
 
 def tr(state: dict[str, Any], key: str) -> str:
     return COPY[key][display_locale(state)]
@@ -743,8 +746,12 @@ def new_draft(state: dict[str, Any], origin: str) -> dict[str, Any]:
         "stage": "direction",
         "branch": None,
         "user_intent": None,
+        "pending_direction": None,
         "country": None,
+        "country_name": None,
         "city": None,
+        "city_name": None,
+        "city_timezone": None,
         "area_mode": None,
         "areas": [],
         "required_date": None,
@@ -851,6 +858,7 @@ def _apply_debug(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
                 "start": yesterday.isoformat(),
                 "end": yesterday.isoformat(),
                 "timezone": "selected-city",
+                "validated_today": FROZEN_TODAY.isoformat(),
             }
             draft["stage"] = "post_core"
             state["surface"] = "draft"
@@ -966,8 +974,57 @@ def _apply_product_event(
         _effect(state, "Back discarded free-text language input; language is unchanged.")
         return True, True
 
+    if kind == "direction_resolution":
+        resolution = _validated_interpretation(state, "direction", event.get("value"))
+        if resolution is None:
+            return False, True
+        draft = _draft(state)
+        draft["pending_direction"] = {
+            "intent": resolution["candidate_id"],
+            "source": resolution["source"],
+        }
+        draft["stage"] = "direction_confirm"
+        _effect(
+            state,
+            f"Direction model proposed {resolution['candidate_id']}; "
+            "terminal User Intent remains unconfirmed.",
+        )
+        return True, True
+
+    if kind == "confirm_direction":
+        draft = _draft(state)
+        pending = draft.get("pending_direction")
+        if not isinstance(pending, dict) or pending.get("intent") not in {
+            candidate["id"] for candidate in interpretation_candidates(state, "direction")
+        }:
+            _set_interpretation_failure(state, "direction", "missing_direction_proposal")
+            draft["stage"] = "direction"
+            draft["pending_direction"] = None
+            return False, True
+        intent = pending["intent"]
+        source = pending.get("source")
+        draft["pending_direction"] = None
+        changed, render = _apply_product_event(
+            state,
+            {"kind": "select_intent", "value": intent},
+        )
+        if source:
+            _effect(
+                state,
+                state["last_effect"] + _resolution_source_note(source),
+            )
+        return changed, render
+
+    if kind == "back_direction_confirm":
+        draft = _draft(state)
+        draft["pending_direction"] = None
+        draft["stage"] = "direction"
+        _effect(state, "Back rejected the model Direction proposal; confirmed intent unchanged.")
+        return True, True
+
     if kind == "open_branch":
         draft = _draft(state)
+        draft["pending_direction"] = None
         draft["branch"] = value
         draft["stage"] = "branch"
         _effect(state, f"Opened Intent Branch {value}; terminal User Intent is unchanged.")
@@ -975,6 +1032,7 @@ def _apply_product_event(
 
     if kind == "select_intent":
         draft = _draft(state)
+        draft["pending_direction"] = None
         old = draft["user_intent"]
         if old != value:
             if old is not None:
@@ -1022,6 +1080,7 @@ def _apply_product_event(
         return _commit_country(
             state,
             resolution["candidate_id"],
+            canonical_label=resolution["resolved"]["canonical_label"],
             resolution_source=resolution["source"],
         )
 
@@ -1051,6 +1110,8 @@ def _apply_product_event(
         return _commit_city(
             state,
             resolution["candidate_id"],
+            canonical_label=resolution["resolved"]["canonical_label"],
+            timezone=resolution["resolved"]["timezone"],
             resolution_source=resolution["source"],
         )
 
@@ -1060,41 +1121,24 @@ def _apply_product_event(
         _effect(state, "Back from City → Country; confirmed city and descendants remain.")
         return True, True
 
-    if kind == "whole_city":
-        draft = _draft(state)
-        draft["area_mode"] = "whole_city"
-        draft["areas"] = []
-        _advance_after_area(draft)
-        _effect(state, "Committed Whole city; prior individual areas cleared, other values preserved.")
-        return True, True
-
-    if kind == "open_area_editor":
-        draft = _draft(state)
-        draft["temp_edit"] = list(draft["areas"]) if draft["area_mode"] == "areas" else []
-        draft["stage"] = "areas_edit"
-        _effect(state, "Opened temporary Sub-city Areas selection; confirmed Search Area unchanged.")
-        return True, True
-
-    if kind == "toggle_area":
-        draft = _draft(state)
-        values = draft["temp_edit"]
-        if value in values:
-            values.remove(value)
-        else:
-            values.append(value)
-        _effect(state, f"Toggled temporary area {value}; not committed.")
-        return True, True
-
-    if kind == "done_areas":
-        draft = _draft(state)
-        if not draft["temp_edit"]:
-            _effect(state, "Empty Sub-city Area selection is not a complete Search Area.")
+    if kind == "area_resolution":
+        resolution = _validated_interpretation(state, "area", event.get("value"))
+        if resolution is None:
             return False, True
-        draft["area_mode"] = "areas"
-        draft["areas"] = list(draft["temp_edit"])
-        draft["temp_edit"] = None
+        draft = _draft(state)
+        resolved = resolution["resolved"]
+        if resolved["whole_city"]:
+            draft["area_mode"] = "whole_city"
+            draft["areas"] = []
+        else:
+            draft["area_mode"] = "areas"
+            draft["areas"] = [resolved["canonical_label"]]
         _advance_after_area(draft)
-        _effect(state, "Committed Sub-city Areas; dates, times, and criteria were preserved.")
+        _effect(
+            state,
+            "Committed model-resolved Search Area; dates, times, and criteria "
+            f"were preserved.{_resolution_source_note(resolution['source'])}",
+        )
         return True, True
 
     if kind == "back_areas":
@@ -1104,42 +1148,24 @@ def _apply_product_event(
         _effect(state, "Back from Sub-city Areas → City; uncommitted area edits discarded.")
         return True, True
 
-    if kind == "back_area_editor":
-        draft = _draft(state)
-        draft["stage"] = "areas"
-        draft["temp_edit"] = None
-        _effect(state, "Back discarded temporary area edits; confirmed Search Area preserved.")
-        return True, True
-
-    if kind in {"date_today", "date_tomorrow"}:
-        chosen = FROZEN_TODAY + timedelta(days=kind == "date_tomorrow")
-        return _commit_required_date(state, chosen, chosen)
-
-    if kind == "open_date_input":
-        draft = _draft(state)
-        draft["stage"] = "date_input"
-        draft["temp_edit"] = deepcopy(draft["required_date"])
-        _effect(state, "Opened temporary date picker; confirmed required date unchanged.")
-        return True, True
-
-    if kind == "date_text":
-        parsed = _parse_date_range(str(value))
-        if parsed is None:
-            _effect(state, f"Date input {value!r} is invalid; confirmed date unchanged.")
+    if kind == "date_resolution":
+        resolution = _validated_interpretation(state, "date", event.get("value"))
+        if resolution is None:
             return False, True
-        return _commit_required_date(state, parsed[0], parsed[1])
+        resolved = resolution["resolved"]
+        return _commit_required_date(
+            state,
+            date.fromisoformat(resolved["start"]),
+            date.fromisoformat(resolved["end"]),
+            timezone=resolved["timezone"],
+            current_date=resolved["current_date"],
+            resolution_source=resolution["source"],
+        )
 
     if kind == "back_required_date":
         draft = _draft(state)
         draft["stage"] = "areas"
         _effect(state, "Back from Required Date → Sub-city Areas; confirmed date preserved.")
-        return True, True
-
-    if kind == "back_date_input":
-        draft = _draft(state)
-        draft["stage"] = "required_date"
-        draft["temp_edit"] = None
-        _effect(state, "Back discarded date-picker edits; confirmed date preserved.")
         return True, True
 
     if kind == "open_details":
@@ -1516,7 +1542,12 @@ def _apply_product_event(
         return True, True
 
     if kind == "settings_premium":
-        state["callback_notice"] = "Premium will be available later (MVP placeholder)."
+        state["callback_notice"] = {
+            "ru": "Премиум появится позже (заглушка MVP).",
+            "en": "Premium will be available later (MVP placeholder).",
+            "es": "Premium estará disponible más adelante (marcador de MVP).",
+            "fr": "Premium sera disponible plus tard (emplacement MVP).",
+        }[display_locale(state)]
         _effect(state, "Premium placeholder changed no state and created no message.")
         return False, False
 
@@ -1526,12 +1557,22 @@ def _apply_product_event(
         return True, True
 
     if kind == "mode_search":
-        state["callback_notice"] = "Search is already the active MVP mode."
+        state["callback_notice"] = {
+            "ru": "Поиск уже выбран как активный режим MVP.",
+            "en": "Search is already the active MVP mode.",
+            "es": "La búsqueda ya es el modo activo del MVP.",
+            "fr": "La recherche est déjà le mode actif du MVP.",
+        }[display_locale(state)]
         _effect(state, "Checked Search mode remained unchanged.")
         return False, False
 
     if kind == "mode_feed":
-        state["callback_notice"] = "Feed will be available after the MVP."
+        state["callback_notice"] = {
+            "ru": "Лента появится после MVP.",
+            "en": "Feed will be available after the MVP.",
+            "es": "El feed estará disponible después del MVP.",
+            "fr": "Le fil sera disponible après le MVP.",
+        }[display_locale(state)]
         _effect(state, "Feed placeholder changed no state and created no message.")
         return False, False
 
@@ -1557,9 +1598,21 @@ def _commit_country(
     state: dict[str, Any],
     canonical: str,
     *,
+    canonical_label: str | None = None,
     resolution_source: str | None = None,
 ) -> tuple[bool, bool]:
-    if canonical not in COUNTRIES:
+    known_country = canonical in COUNTRIES
+    if known_country:
+        canonical_label = COUNTRIES[canonical]["names"][display_locale(state)]
+    if (
+        not known_country
+        and (
+            not re.fullmatch(r"[A-Z]{2}", canonical)
+            or not isinstance(canonical_label, str)
+            or not canonical_label.strip()
+            or len(canonical_label) > 100
+        )
+    ):
         _set_interpretation_failure(
             state,
             "country",
@@ -1581,7 +1634,10 @@ def _commit_country(
         else:
             effect = f"Confirmed country {canonical}.{resolution_note}"
         draft["country"] = canonical
+        draft["country_name"] = canonical_label
     else:
+        if canonical_label:
+            draft["country_name"] = canonical_label
         effect = (
             f"Re-confirmed canonical country {canonical}; descendants preserved."
             f"{resolution_note}"
@@ -1595,13 +1651,38 @@ def _commit_city(
     state: dict[str, Any],
     canonical: str,
     *,
+    canonical_label: str | None = None,
+    timezone: str | None = None,
     resolution_source: str | None = None,
 ) -> tuple[bool, bool]:
     draft = _draft(state)
     country_id = draft["country"]
+    known_city = (
+        country_id in COUNTRIES
+        and canonical in COUNTRIES[country_id]["cities"]
+    )
+    if known_city:
+        canonical_label = COUNTRIES[country_id]["cities"][canonical]["names"][
+            display_locale(state)
+        ]
+        timezone = CITY_TIMEZONES.get(canonical)
+    timezone_valid = isinstance(timezone, str)
+    if timezone_valid:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            timezone_valid = False
     if (
-        country_id not in COUNTRIES
-        or canonical not in COUNTRIES[country_id]["cities"]
+        not known_city
+        and (
+            not isinstance(canonical, str)
+            or not canonical.strip()
+            or len(canonical) > 80
+            or not isinstance(canonical_label, str)
+            or not canonical_label.strip()
+            or len(canonical_label) > 100
+            or not timezone_valid
+        )
     ):
         _set_interpretation_failure(
             state,
@@ -1623,7 +1704,13 @@ def _commit_city(
         else:
             effect = f"Confirmed city {canonical}.{resolution_note}"
         draft["city"] = canonical
+        draft["city_name"] = canonical_label
+        draft["city_timezone"] = timezone
     else:
+        if canonical_label:
+            draft["city_name"] = canonical_label
+        if timezone:
+            draft["city_timezone"] = timezone
         effect = (
             f"Re-confirmed canonical city {canonical}; descendants preserved."
             f"{resolution_note}"
@@ -1637,14 +1724,16 @@ def _validated_interpretation(
     state: dict[str, Any],
     field: str,
     payload: Any,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     allowed_ids = {
         candidate["id"] for candidate in interpretation_candidates(state, field)
     }
+    bounded = field in {"language", "direction"}
     contract_valid = isinstance(payload, dict)
     status = payload.get("status") if contract_valid else None
     source = payload.get("source") if contract_valid else None
     candidate_ids = payload.get("candidate_ids") if contract_valid else None
+    resolved = payload.get("resolved") if contract_valid else None
     model_id = payload.get("model_id") if contract_valid else None
     duration_ms = payload.get("duration_ms") if contract_valid else None
     failure_code = payload.get("failure_code") if contract_valid else None
@@ -1656,19 +1745,27 @@ def _validated_interpretation(
         and isinstance(candidate_ids, list)
         and all(isinstance(item, str) for item in candidate_ids)
         and len(candidate_ids) == len(set(candidate_ids))
-        and set(candidate_ids).issubset(allowed_ids)
+        and len(candidate_ids) <= max(len(allowed_ids), 4)
+        and (not bounded or set(candidate_ids).issubset(allowed_ids))
     )
     if contract_valid and status == "accepted":
-        contract_valid = len(candidate_ids) == 1
+        contract_valid = (
+            len(candidate_ids) == 1
+            and (
+                (bounded and resolved is None)
+                or (not bounded and _valid_resolved_interpretation(field, resolved))
+            )
+        )
     elif contract_valid and status == "ambiguous":
-        contract_valid = len(candidate_ids) >= 2
+        contract_valid = len(candidate_ids) >= 2 and resolved is None
     elif contract_valid:
-        contract_valid = len(candidate_ids) == 0
+        contract_valid = len(candidate_ids) == 0 and resolved is None
 
     if not contract_valid:
         status = "technical_failure"
         source = "laboratory"
         candidate_ids = []
+        resolved = None
         model_id = None
         duration_ms = None
         failure_code = "invalid_interpretation_contract"
@@ -1677,6 +1774,7 @@ def _validated_interpretation(
         "field": field,
         "status": status,
         "candidate_ids": list(candidate_ids),
+        "resolved": deepcopy(resolved),
         "source": source,
         "model_id": model_id if isinstance(model_id, str) else None,
         "duration_ms": duration_ms if isinstance(duration_ms, int) else None,
@@ -1684,7 +1782,14 @@ def _validated_interpretation(
     }
 
     if status == "accepted":
-        return {"candidate_id": candidate_ids[0], "source": source}
+        candidate_id = candidate_ids[0]
+        if field in {"country", "city", "area"}:
+            candidate_id = resolved["canonical_id"]
+        return {
+            "candidate_id": candidate_id,
+            "source": source,
+            "resolved": deepcopy(resolved),
+        }
 
     state["resolution_notice"] = {
         "field": field,
@@ -1709,6 +1814,55 @@ def _validated_interpretation(
             f"({failure_code or 'unknown'}); confirmed state unchanged.",
         )
     return None
+
+
+def _valid_resolved_interpretation(field: str, resolved: Any) -> bool:
+    if not isinstance(resolved, dict):
+        return False
+    if field == "date":
+        start_value = resolved.get("start")
+        end_value = resolved.get("end")
+        current_value = resolved.get("current_date")
+        timezone = resolved.get("timezone")
+        try:
+            start = date.fromisoformat(start_value)
+            end = date.fromisoformat(end_value)
+            current = date.fromisoformat(current_value)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(timezone, str):
+            return False
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return False
+        return start >= current and end >= start
+
+    canonical_id = resolved.get("canonical_id")
+    canonical_label = resolved.get("canonical_label")
+    if (
+        not isinstance(canonical_id, str)
+        or not canonical_id.strip()
+        or len(canonical_id) > 80
+        or not isinstance(canonical_label, str)
+        or not canonical_label.strip()
+        or len(canonical_label) > 100
+    ):
+        return False
+    if field == "country":
+        return bool(re.fullmatch(r"[A-Z]{2}", canonical_id))
+    if field == "city":
+        timezone = resolved.get("timezone")
+        if not isinstance(timezone, str):
+            return False
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return False
+        return True
+    if field == "area":
+        return isinstance(resolved.get("whole_city"), bool)
+    return False
 
 
 def _set_interpretation_failure(
@@ -1753,7 +1907,10 @@ def _draft(state: dict[str, Any]) -> dict[str, Any]:
 
 def _clear_for_intent_replacement(draft: dict[str, Any]) -> None:
     draft["country"] = None
+    draft["country_name"] = None
     draft["city"] = None
+    draft["city_name"] = None
+    draft["city_timezone"] = None
     draft["area_mode"] = None
     draft["areas"] = []
     draft["required_date"] = None
@@ -1766,6 +1923,8 @@ def _clear_for_parent_geography_replacement(
 ) -> None:
     if clear_city:
         draft["city"] = None
+        draft["city_name"] = None
+        draft["city_timezone"] = None
     draft["area_mode"] = None
     draft["areas"] = []
     draft["required_date"] = None
@@ -1793,20 +1952,45 @@ def _advance_after_area(draft: dict[str, Any]) -> None:
 
 
 def _commit_required_date(
-    state: dict[str, Any], start: date, end: date
+    state: dict[str, Any],
+    start: date,
+    end: date,
+    *,
+    timezone: str = "selected-city",
+    current_date: str | None = None,
+    resolution_source: str | None = None,
 ) -> tuple[bool, bool]:
     draft = _draft(state)
+    if current_date is not None:
+        try:
+            local_today = date.fromisoformat(current_date)
+        except ValueError:
+            _set_interpretation_failure(state, "date", "invalid_local_calendar")
+            return False, True
+        if start < local_today:
+            state["resolution_notice"] = {
+                "field": "date",
+                "status": "unresolved",
+                "candidate_ids": [],
+            }
+            _effect(
+                state,
+                "Date proposal was in the selected-city past; confirmed date unchanged.",
+            )
+            return False, True
     old = deepcopy(draft["required_date"])
     draft["required_date"] = {
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "timezone": "selected-city",
+        "timezone": timezone,
+        "validated_today": current_date or FROZEN_TODAY.isoformat(),
     }
     draft["stage"] = "post_core"
     draft["temp_edit"] = None
     _effect(
         state,
-        f"Required date {old or '∅'} → {draft['required_date']}; only the core date changed.",
+        f"Required date {old or '∅'} → {draft['required_date']}; only the core date "
+        f"changed.{_resolution_source_note(resolution_source)}",
     )
     return True, True
 
@@ -1865,7 +2049,12 @@ def _core_ready(draft: dict[str, Any]) -> bool:
     if draft["user_intent"] not in DATE_REQUIRED:
         return True
     required = draft["required_date"]
-    return bool(required and date.fromisoformat(required["end"]) >= FROZEN_TODAY)
+    if not required:
+        return False
+    threshold = date.fromisoformat(
+        required.get("validated_today", FROZEN_TODAY.isoformat())
+    )
+    return date.fromisoformat(required["end"]) >= threshold
 
 
 def _replace_view(state: dict[str, Any], *, reason: str) -> None:
@@ -2047,7 +2236,35 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
             else:
                 button["kind"] = "select_intent"
         buttons.append(_button(tr(state, "back"), "back_direction"))
-        return _screen(LANGUAGE_CONFIRMATION[locale], buttons)
+        text = LANGUAGE_CONFIRMATION[locale] + "\n\n" + {
+            "ru": "Можно нажать кнопку или написать своими словами, что вы хотите найти или предложить.",
+            "en": "Tap a button or describe in your own words what you want to find or offer.",
+            "es": "Pulse un botón o describa con sus propias palabras lo que quiere buscar u ofrecer.",
+            "fr": "Appuyez sur un bouton ou décrivez avec vos mots ce que vous souhaitez trouver ou proposer.",
+        }[locale]
+        return _screen(
+            _with_resolution_notice(state, "direction", text),
+            buttons,
+            expects_text="direction",
+        )
+
+    if stage == "direction_confirm":
+        pending = draft.get("pending_direction") or {}
+        intent = pending.get("intent")
+        label = _intent_label(intent, locale)
+        text = {
+            "ru": f"Я понял так: «{label}».\n\nПодтвердить это направление?",
+            "en": f"I understood: “{label}”.\n\nConfirm this direction?",
+            "es": f"He entendido: «{label}».\n\n¿Confirmar esta opción?",
+            "fr": f"J’ai compris : « {label} ».\n\nConfirmer cette direction ?",
+        }[locale]
+        return _screen(
+            text,
+            [
+                _button(tr(state, "confirm"), "confirm_direction"),
+                _button(tr(state, "back"), "back_direction_confirm"),
+            ],
+        )
 
     if stage == "branch":
         branch = BRANCHES[draft["branch"]]
@@ -2070,16 +2287,32 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
                 state,
                 "country",
                 text
-                + "\n\n[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
-                "other text is interpreted by GPT-5.6 Sol and resolver-validated. "
-                "`?ambiguous`, `?invalid`, and `?model-fail` exercise fallbacks.",
+                + "\n\n"
+                + {
+                    "ru": (
+                        "[МОДЕЛЬ ПРОТОТИПА] GPT-5.6 Sol может предложить любую страну; "
+                        "затем ответ проверяется локально."
+                    ),
+                    "en": (
+                        "[PROTOTYPE MODEL] GPT-5.6 Sol may propose any country; "
+                        "the answer is then validated locally."
+                    ),
+                    "es": (
+                        "[MODELO DEL PROTOTIPO] GPT-5.6 Sol puede proponer cualquier país; "
+                        "después se valida la respuesta localmente."
+                    ),
+                    "fr": (
+                        "[MODÈLE DU PROTOTYPE] GPT-5.6 Sol peut proposer n’importe quel pays ; "
+                        "la réponse est ensuite validée localement."
+                    ),
+                }[locale],
             ),
             [_button(tr(state, "back"), "back_country")],
             expects_text="country",
         )
 
     if stage == "city":
-        country = _country_name(draft["country"], locale)
+        country = _draft_country_name(draft, locale)
         text = {
             "ru": f"✅ Страна поиска: {country}.\n\n🏙 В каком городе ищем?",
             "en": f"✅ Search country: {country}.\n\n🏙 Which city should we search?",
@@ -2091,72 +2324,85 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
                 state,
                 "city",
                 text
-                + "\n\n[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
-                "other text is interpreted by GPT-5.6 Sol and resolver-validated. "
-                "`?ambiguous`, `?invalid`, and `?model-fail` exercise fallbacks.",
+                + "\n\n"
+                + {
+                    "ru": (
+                        "[МОДЕЛЬ ПРОТОТИПА] GPT-5.6 Sol может предложить любой город "
+                        "в выбранной стране; затем ответ проверяется локально."
+                    ),
+                    "en": (
+                        "[PROTOTYPE MODEL] GPT-5.6 Sol may propose any city in the "
+                        "selected country; the answer is then validated locally."
+                    ),
+                    "es": (
+                        "[MODELO DEL PROTOTIPO] GPT-5.6 Sol puede proponer cualquier "
+                        "ciudad del país elegido; después se valida localmente."
+                    ),
+                    "fr": (
+                        "[MODÈLE DU PROTOTYPE] GPT-5.6 Sol peut proposer n’importe quelle "
+                        "ville du pays choisi ; la réponse est ensuite validée localement."
+                    ),
+                }[locale],
             ),
             [_button(tr(state, "back"), "back_city")],
             expects_text="city",
         )
 
     if stage == "areas":
-        city = _city_name(draft["country"], draft["city"], locale)
+        city = _draft_city_name(draft, locale)
         text = {
-            "ru": f"📍 Где именно в {city} ищем?",
-            "en": f"📍 Where exactly in {city} should we search?",
-            "es": f"📍 ¿Dónde exactamente en {city} buscamos?",
-            "fr": f"📍 Où exactement à {city} cherchons-nous ?",
+            "ru": (
+                f"📍 Уточните зону поиска.\n\nВыбранный город: {city}.\n\n"
+                "Напишите район, метро, улицу, стадион или другое место. "
+                "Если подходит весь город, напишите «весь город»."
+            ),
+            "en": (
+                f"📍 Refine the search area.\n\nSelected city: {city}.\n\n"
+                "Type a district, metro station, street, stadium, or another place. "
+                "If anywhere in the city works, type “whole city”."
+            ),
+            "es": (
+                f"📍 Precise la zona de búsqueda.\n\nCiudad elegida: {city}.\n\n"
+                "Escriba un barrio, metro, calle, estadio u otro lugar. "
+                "Si sirve toda la ciudad, escriba «toda la ciudad»."
+            ),
+            "fr": (
+                f"📍 Précisez la zone de recherche.\n\nVille choisie : {city}.\n\n"
+                "Saisissez un quartier, métro, rue, stade ou autre lieu. "
+                "Si toute la ville convient, écrivez «toute la ville»."
+            ),
         }[locale]
         return _screen(
-            text,
-            [
-                _button(tr(state, "whole_city"), "whole_city"),
-                _button(tr(state, "choose_areas"), "open_area_editor"),
-                _button(tr(state, "back"), "back_areas"),
-            ],
-        )
-
-    if stage == "areas_edit":
-        candidates = _area_candidates(draft["city"], locale)
-        selected = set(draft["temp_edit"])
-        buttons = [
-            _button(("☑ " if key in selected else "☐ ") + label, "toggle_area", key)
-            for key, label in candidates
-        ]
-        buttons += [
-            _button(tr(state, "done"), "done_areas"),
-            _button(tr(state, "back"), "back_area_editor"),
-        ]
-        return _screen(
-            {
-                "ru": "📍 Выберите один или несколько районов/мест.",
-                "en": "📍 Choose one or more areas/places.",
-                "es": "📍 Elija una o varias zonas/lugares.",
-                "fr": "📍 Choisissez une ou plusieurs zones/lieux.",
-            }[locale],
-            buttons,
+            _with_resolution_notice(state, "area", text),
+            [_button(tr(state, "back"), "back_areas")],
+            expects_text="area",
         )
 
     if stage == "required_date":
         return _screen(
-            L("📅 Когда?", "📅 When?", "📅 ¿Cuándo?", "📅 Quand ?")[locale],
-            [
-                _button(tr(state, "today"), "date_today"),
-                _button(tr(state, "tomorrow"), "date_tomorrow"),
-                _button(tr(state, "choose_date"), "open_date_input"),
-                _button(tr(state, "back"), "back_required_date"),
-            ],
-        )
-
-    if stage == "date_input":
-        return _screen(
-            {
-                "ru": "Введите YYYY-MM-DD или YYYY-MM-DD..YYYY-MM-DD.",
-                "en": "Enter YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD.",
-                "es": "Introduzca YYYY-MM-DD o YYYY-MM-DD..YYYY-MM-DD.",
-                "fr": "Saisissez YYYY-MM-DD ou YYYY-MM-DD..YYYY-MM-DD.",
-            }[locale],
-            [_button(tr(state, "back"), "back_date_input")],
+            _with_resolution_notice(
+                state,
+                "date",
+                {
+                    "ru": (
+                        "📅 Когда?\n\nНапишите дату или период своими словами — "
+                        "например: «завтра», «в субботу» или «с 5 по 7 августа»."
+                    ),
+                    "en": (
+                        "📅 When?\n\nType a date or range in your own words — "
+                        "for example, “tomorrow”, “on Saturday”, or “August 5–7”."
+                    ),
+                    "es": (
+                        "📅 ¿Cuándo?\n\nEscriba una fecha o periodo con sus palabras — "
+                        "por ejemplo, «mañana», «el sábado» o «del 5 al 7 de agosto»."
+                    ),
+                    "fr": (
+                        "📅 Quand ?\n\nSaisissez une date ou une période avec vos mots — "
+                        "par exemple « demain », « samedi » ou « du 5 au 7 août »."
+                    ),
+                }[locale],
+            ),
+            [_button(tr(state, "back"), "back_required_date")],
             expects_text="date",
         )
 
@@ -2523,7 +2769,13 @@ def _with_resolution_notice(
                 "les données confirmées sont conservées."
             ),
         }[locale]
-    return text + "\n\n[PROTOTYPE FALLBACK] " + message
+    prefix = {
+        "ru": "[РЕЗЕРВНЫЙ ОТВЕТ ПРОТОТИПА] ",
+        "en": "[PROTOTYPE FALLBACK] ",
+        "es": "[RESPUESTA ALTERNATIVA DEL PROTOTIPO] ",
+        "fr": "[RÉPONSE DE REPLI DU PROTOTYPE] ",
+    }[locale]
+    return text + "\n\n" + prefix + message
 
 
 def _interpretation_candidate_label(
@@ -2535,11 +2787,15 @@ def _interpretation_candidate_label(
     if field == "language":
         return LANGUAGE_NATIVE_NAMES.get(candidate_id, candidate_id)
     if field == "country":
-        return _country_name(candidate_id, locale)
+        label = _country_name(candidate_id, locale)
+        return candidate_id if label == "∅" else label
     if field == "city":
         draft = state.get("draft")
         country_id = draft.get("country") if draft else None
-        return _city_name(country_id, candidate_id, locale)
+        label = _city_name(country_id, candidate_id, locale)
+        return candidate_id if label == "∅" else label
+    if field == "direction":
+        return _intent_label(candidate_id, locale)
     return candidate_id
 
 
@@ -2600,7 +2856,6 @@ def event_for_text(state: dict[str, Any], value: str, update_id: int) -> dict[st
         "language": "language_free_text",
         "country": "country_text",
         "city": "city_text",
-        "date": "date_text",
         "detail_number": "detail_number_text",
         "exact_time": "exact_time_text",
         "seasonal": "seasonal_nested_text",
@@ -2648,7 +2903,10 @@ def state_lines(state: dict[str, Any]) -> list[str]:
             f"draft={draft['id']} origin={draft['origin']} paused={draft['paused']} "
             f"status={draft['status']} stage={draft['stage']}",
             f"branch={draft['branch']!r} user_intent={draft['user_intent']!r}",
-            f"country={draft['country']!r} city={draft['city']!r} "
+            f"pending_direction={draft['pending_direction']!r}",
+            f"country={draft['country']!r} country_name={draft['country_name']!r} "
+            f"city={draft['city']!r} city_name={draft['city_name']!r} "
+            f"city_timezone={draft['city_timezone']!r} "
             f"area_mode={draft['area_mode']!r} areas={draft['areas']!r}",
             f"required_date={draft['required_date']!r}",
             f"criteria={draft['criteria']!r}",
@@ -2704,11 +2962,32 @@ def interpretation_candidates(
             }
             for locale in SUPPORTED_LOCALES
         ]
+    if field == "direction":
+        candidates = [
+            {
+                "id": item["id"],
+                "names": sorted(set(item["label"].values())),
+                "known_aliases": [],
+            }
+            for item in DIRECTIONS
+            if item["kind"] == "intent"
+        ]
+        for branch in BRANCHES.values():
+            candidates.extend(
+                {
+                    "id": intent,
+                    "names": sorted(set(label.values())),
+                    "known_aliases": [],
+                }
+                for intent, label in branch["intents"]
+            )
+        return candidates
     if field == "country":
         return [
             {
                 "id": country_id,
                 "names": sorted(set(country["names"].values())),
+                "display_name": country["names"][display_locale(state)],
                 "known_aliases": sorted(country["aliases"]),
             }
             for country_id, country in COUNTRIES.items()
@@ -2722,6 +3001,8 @@ def interpretation_candidates(
             {
                 "id": city_id,
                 "names": sorted(set(city["names"].values())),
+                "display_name": city["names"][display_locale(state)],
+                "timezone": CITY_TIMEZONES.get(city_id),
                 "known_aliases": sorted(city["aliases"]),
             }
             for city_id, city in COUNTRIES[country_id]["cities"].items()
@@ -2738,12 +3019,26 @@ def exact_interpretation_candidate(
 
     if field == "language":
         return _normalize_language(value)
+    if field == "direction":
+        normalized = value.strip().casefold()
+        for candidate in interpretation_candidates(state, "direction"):
+            if normalized in {name.casefold() for name in candidate["names"]}:
+                return candidate["id"]
+        return None
     if field == "country":
         return _normalize_country(value)
     if field == "city":
         draft = state.get("draft")
         country_id = draft.get("country") if draft else None
         return _normalize_city(country_id, value)
+    if field == "area":
+        if value.strip().casefold() in {
+            "весь город",
+            "whole city",
+            "toda la ciudad",
+            "toute la ville",
+        }:
+            return "whole_city"
     return None
 
 
@@ -2813,20 +3108,25 @@ def _city_name(country_id: str | None, city_id: str | None, locale: str) -> str:
     return "∅"
 
 
-def _area_candidates(city_id: str | None, locale: str) -> list[tuple[str, str]]:
-    if city_id == "SPE":
-        labels = [
-            ("komendantsky", L("Комендантский проспект", "Komendantsky Prospekt", "Komendantsky Prospekt", "Komendantsky Prospekt")),
-            ("pionerskaya", L("Пионерская", "Pionerskaya", "Pionerskaya", "Pionerskaya")),
-            ("central", L("Центральный район", "Central district", "Distrito central", "Quartier central")),
-        ]
-    else:
-        labels = [
-            ("center", L("Центр", "Centre", "Centro", "Centre")),
-            ("north", L("Север", "North", "Norte", "Nord")),
-            ("south", L("Юг", "South", "Sur", "Sud")),
-        ]
-    return [(key, label[locale]) for key, label in labels]
+def _draft_country_name(draft: dict[str, Any], locale: str) -> str:
+    known = _country_name(draft.get("country"), locale)
+    return draft.get("country_name") or known
+
+
+def _draft_city_name(draft: dict[str, Any], locale: str) -> str:
+    known = _city_name(draft.get("country"), draft.get("city"), locale)
+    return draft.get("city_name") or known
+
+
+def _intent_label(intent: str | None, locale: str) -> str:
+    for item in DIRECTIONS:
+        if item["kind"] == "intent" and item["id"] == intent:
+            return item["label"][locale]
+    for branch in BRANCHES.values():
+        for candidate, label in branch["intents"]:
+            if candidate == intent:
+                return label[locale]
+    return intent or "∅"
 
 
 def _effect(state: dict[str, Any], message: str) -> None:

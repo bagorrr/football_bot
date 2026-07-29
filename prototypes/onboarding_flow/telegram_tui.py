@@ -48,9 +48,8 @@ HELP = """LAB controls (not product commands):
   q                      quit
 
 On a text-input screen, type the requested value. Exact reviewed aliases resolve
-locally; other language/country/city text uses one bounded GPT-5.6 Sol call.
-Country examples: Russia, Spain, France, Germany. City examples depend on the
-country: Moscow, Saint Petersburg, Madrid, Barcelona, Paris, Lyon, Berlin.
+locally; other language/direction/geography/area/date text uses one isolated
+GPT-5.6 Sol call. Geography is not limited to the small deterministic examples.
 `?ambiguous`, `?invalid`, and `?model-fail` exercise fallback paths without
 changing confirmed state.
 """
@@ -94,7 +93,7 @@ def render(state: dict[str, Any], no_clear: bool) -> None:
     print(f"{BOLD}THROWAWAY PROTOTYPE — Telegram-like onboarding lab{RESET}")
     print(f"{DIM}No persistence · no matching · no result cards · no results menu{RESET}")
     print(
-        f"{DIM}Free-text fallback · {MODEL_ID} via isolated ephemeral Codex CLI{RESET}"
+        f"{DIM}AI-native onboarding · {MODEL_ID} via isolated ephemeral Codex CLI{RESET}"
     )
     print("╭" + "─" * 76 + "╮")
     if active is None:

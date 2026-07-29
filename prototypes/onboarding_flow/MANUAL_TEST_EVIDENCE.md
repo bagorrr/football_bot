@@ -211,3 +211,38 @@ For every material manual action, append:
 3. the relevant confirmed and temporary state;
 4. the visible user-facing result;
 5. whether the observation matches the currently confirmed contract.
+
+## 2026-07-30 consolidated prototype-fix boundary
+
+This section is an append-only status correction to the earlier deferred queue.
+The queue remains historically accurate as the plan at the time it was
+written. Items 1–6 and 9 now have local throwaway-prototype implementations in
+the working tree; they are **not yet Bot User approved**. Item 7 is now the
+active focused-retest stage. Item 8 remains in force: Details Hub is still
+deferred until the new date flow is manually retested and explicitly approved.
+
+The implementation keeps the ten confirmed terminal intent IDs bounded, while
+allowing the model to propose open country/city values with a canonical label
+and IANA city timezone. This is a prototype mechanism, not a selected
+production location dependency.
+
+| ID | Action or input | Observed result and state | Provisional status |
+| --- | --- | --- | --- |
+| FIX-CONTRACT-01 | First post-fix smoke attempt: send `Шэляба` for confirmed country `RU` | The model returned `chelyabinsk`, `Челябинск`, and `Asia/Yekaterinburg`, but the state-machine city contract rejected the structurally valid payload because its city validator fell through without returning success. Country remained `RU`, city remained unset, and the Russian technical fallback rendered. | Implementation defect found; confirmed state preserved |
+| FIX-CONTRACT-02 | Correct the city-contract return and replay the captured structured payload | The same payload advanced to Search Area with `city='chelyabinsk'`, `city_name='Челябинск'`, and `city_timezone='Asia/Yekaterinburg'`. | Local correction passed; live replay follows |
+| FIX-DIR-01 | Fresh one-command run: select `Русский`, then send `Найти матч` at Direction | `gpt-5.6-sol` proposed `game_search`; the draft moved to `direction_confirm` with `user_intent=None`. The screen displayed «Я понял так: “Найти матч для себя”» with Confirm and Back. | Smoke passed; explicit user retest pending |
+| FIX-DIR-02 | Press `Подтвердить` | Only after confirmation did `user_intent='game_search'` persist and Country open. | Smoke passed; explicit user retest pending |
+| FIX-GEO-01 | Send exact country `Россия`, then typo/colloquial city `Шэляба` | Country resolved locally to `RU`; the live model resolved the city outside the old fixture to `chelyabinsk`, `Челябинск`, and `Asia/Yekaterinburg`. The draft advanced directly to one free-text Search Area screen. | Smoke passed; production dependency remains undecided |
+| FIX-AREA-01 | Observe Search Area, then send `Центральный район` | The screen exposed only Back and asked for a district, metro, street, stadium, other place, or «весь город». The model committed `area_mode='areas'`, `areas=['Центральный район, Челябинск']`, and advanced to Required Date. | Smoke passed; explicit user retest pending |
+| FIX-DATE-01 | Observe Required Date, then send `завтра` | The screen exposed only Back and requested a natural-language date or range. With selected-city timezone `Asia/Yekaterinburg` and local current date `2026-07-30`, the model resolved `2026-07-31`; the machine committed it and advanced to `post_core`. | Smoke passed; explicit user retest pending |
+| FIX-DATE-PAST-01 | Back from `post_core`, then send `вчера` | The model returned unresolved; the draft stayed at Required Date, the previously confirmed `2026-07-31` remained unchanged, and the Russian fallback asked for different wording. | Smoke passed; explicit user retest pending |
+| FIX-BACK-01 | Press Back from Required Date | Returned in one step to the single Search Area text screen; confirmed area and date remained unchanged. | Smoke passed; explicit user retest pending |
+| FIX-BACK-02 | Press Back from Search Area | Returned in one step directly to City; no intermediate area-choice/checklist screen appeared. Confirmed descendants remained visible in state because Back is navigation-only. | Smoke passed; explicit user retest pending |
+| FIX-GEO-OPEN-01 | Isolated smoke of Country input `Италия`, which is absent from the deterministic `COUNTRIES` examples | The model proposed `IT` with canonical label `Италия`; the state machine accepted the structured value and advanced to City with no city selected. | Open-geography prototype mechanism passed; production dependency remains undecided |
+| FIX-DATE-RANGE-01 | Isolated Moscow-date smoke: send `с 5 по 7 августа` with local current date `2026-07-30` | The model proposed the inclusive range `2026-08-05..2026-08-07`, timezone `Europe/Moscow`; the local adapter accepted the future ordered range. | Smoke passed; explicit user retest pending |
+
+The Settings callback localization change is implemented locally for Russian,
+English, Spanish, and French Feed, active Search mode, and Premium notices, but
+its focused post-fix manual replay has not yet been executed. No evidence above
+is a prototype verdict or authorization to update product documentation,
+GitHub, Wayfinder fog, or native dependencies.

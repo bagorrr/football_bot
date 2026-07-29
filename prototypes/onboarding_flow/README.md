@@ -25,10 +25,18 @@ python3 prototypes/onboarding_flow/telegram_tui.py
 
 The prototype uses only the Python 3 standard library and keeps all state in
 memory. It requires a locally installed Codex CLI already signed in with
-ChatGPT. Exact reviewed language and place aliases resolve locally. Other
-language, country, and city text starts one isolated `codex exec --ephemeral`
-call using `gpt-5.6-sol`; the application then validates the returned ID against
-the prototype catalog before the pure state machine may use it.
+ChatGPT. Exact reviewed aliases resolve locally. Other language, Direction,
+country, city, area/place, and required-date text starts one isolated
+`codex exec --ephemeral` call using `gpt-5.6-sol`.
+
+Direction proposals are constrained to the ten confirmed terminal intents and
+must be explicitly confirmed before they become draft state. Country and city
+resolution is not limited to the small deterministic example catalog; the
+adapter returns structured canonical labels and a city timezone, which the
+state machine validates before use. Area/place and required-date screens accept
+free text and expose only Back. Dates are resolved against the selected city's
+local calendar, and past or ambiguous input preserves the previously confirmed
+date.
 
 The model subprocess runs in a temporary empty workspace with a read-only
 sandbox, no user config, project rules, apps, plugins, MCP servers, web search,
@@ -56,9 +64,10 @@ other Telegram account.
    resumption with the current Main Menu `New search` action.
 6. Use `!fail-render`, `!keep-old` + `!stale`, `!cleanup-current`, and
    `!delete-current` to inspect the Active Chat View safety rules.
-7. On a free-text language, country, or city screen, compare an exact alias with
-   an obvious typo such as `Рассея`; use `?ambiguous`, `?invalid`, and
-   `?model-fail` to verify that fallback paths preserve confirmed state.
+7. On a free-text language, Direction, country, city, area, or date screen,
+   compare exact input with an obvious typo such as `Рассея`; use `?ambiguous`,
+   `?invalid`, and `?model-fail` to verify that fallback paths preserve
+   confirmed state.
 
 Non-Russian text outside the reviewed canonical tables is prototype scaffolding,
 not proposed final copy.
