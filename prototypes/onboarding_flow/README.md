@@ -24,8 +24,24 @@ python3 prototypes/onboarding_flow/telegram_tui.py
 ```
 
 The prototype uses only the Python 3 standard library and keeps all state in
-memory. Type `help` inside it for laboratory controls. Those controls simulate
-Telegram failures; they are not proposed product commands.
+memory. It requires a locally installed Codex CLI already signed in with
+ChatGPT. Exact reviewed language and place aliases resolve locally. Other
+language, country, and city text starts one isolated `codex exec --ephemeral`
+call using `gpt-5.6-sol`; the application then validates the returned ID against
+the prototype catalog before the pure state machine may use it.
+
+The model subprocess runs in a temporary empty workspace with a read-only
+sandbox, no user config, project rules, apps, plugins, MCP servers, web search,
+shell/browser/computer tools, or Telegram/database/API credential environment
+variables. Its minimal environment retains only what the local CLI needs to
+reuse saved Codex authentication. It has a hard timeout and a strict JSON
+Schema. Ambiguous, unsupported, malformed, timed-out, and unavailable-model
+outcomes preserve confirmed state.
+
+Type `help` inside the TUI for laboratory controls. Those controls simulate
+Telegram and model failures; they are not proposed product commands. This is a
+terminal simulation only: it does not connect to `@my_football_game_bot` or any
+other Telegram account.
 
 ## Suggested HITL checkpoints
 
@@ -40,6 +56,9 @@ Telegram failures; they are not proposed product commands.
    resumption with the current Main Menu `New search` action.
 6. Use `!fail-render`, `!keep-old` + `!stale`, `!cleanup-current`, and
    `!delete-current` to inspect the Active Chat View safety rules.
+7. On a free-text language, country, or city screen, compare an exact alias with
+   an obvious typo such as `Рассея`; use `?ambiguous`, `?invalid`, and
+   `?model-fail` to verify that fallback paths preserve confirmed state.
 
 Non-Russian text outside the reviewed canonical tables is prototype scaffolding,
 not proposed final copy.

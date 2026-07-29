@@ -8,11 +8,18 @@ import sys
 import textwrap
 from typing import Any
 
+from model_interpreter import (
+    MODEL_FIELDS,
+    MODEL_ID,
+    check_model_runtime,
+    resolve_free_text,
+)
 from state_machine import (
     SUPPORTED_LOCALES,
     bootstrap_state,
     dispatch,
     event_for_button,
+    event_for_interpretation,
     event_for_text,
     state_lines,
 )
@@ -40,10 +47,12 @@ HELP = """LAB controls (not product commands):
   help                   show this help
   q                      quit
 
-On a text-input screen, type the requested value. Country examples: Russia,
-Spain, France, Germany. City examples depend on the country: Moscow,
-Saint Petersburg, Madrid, Barcelona, Paris, Lyon, Berlin. `?ambiguous` and
-`?invalid` exercise fallback without changing confirmed state.
+On a text-input screen, type the requested value. Exact reviewed aliases resolve
+locally; other language/country/city text uses one bounded GPT-5.6 Sol call.
+Country examples: Russia, Spain, France, Germany. City examples depend on the
+country: Moscow, Saint Petersburg, Madrid, Barcelona, Paris, Lyon, Berlin.
+`?ambiguous`, `?invalid`, and `?model-fail` exercise fallback paths without
+changing confirmed state.
 """
 
 
@@ -84,6 +93,9 @@ def render(state: dict[str, Any], no_clear: bool) -> None:
     active = state["active_view"]
     print(f"{BOLD}THROWAWAY PROTOTYPE — Telegram-like onboarding lab{RESET}")
     print(f"{DIM}No persistence · no matching · no result cards · no results menu{RESET}")
+    print(
+        f"{DIM}Free-text fallback · {MODEL_ID} via isolated ephemeral Codex CLI{RESET}"
+    )
     print("╭" + "─" * 76 + "╮")
     if active is None:
         box_text("No Active Chat View")
@@ -147,6 +159,11 @@ def find_stale_event(state: dict[str, Any], update_id: int) -> dict[str, Any] | 
 
 def main() -> int:
     args = parse_args()
+    model_ready, model_status = check_model_runtime()
+    if not model_ready:
+        print(f"MODEL PREFLIGHT FAILED: {model_status}", file=sys.stderr)
+        return 2
+    print(f"MODEL PREFLIGHT OK: {model_status}", flush=True)
     hint = args.hint if args.hint in SUPPORTED_LOCALES else args.hint
     state = bootstrap_state(hint)
     update_counter = [1]
@@ -242,7 +259,27 @@ def main() -> int:
                     state, active["buttons"][index], next_update_id(update_counter)
                 )
         elif raw:
-            event = event_for_text(state, raw, next_update_id(update_counter))
+            update_id = next_update_id(update_counter)
+            expected = (
+                active.get("expects_text")
+                if active and not active["deleted_by_user"]
+                else None
+            )
+            if expected in MODEL_FIELDS:
+                print(
+                    f"\n{DIM}INTERPRETER: checking exact aliases, then using the "
+                    f"bounded model fallback for {expected} if needed…{RESET}",
+                    flush=True,
+                )
+                resolution = resolve_free_text(state, expected, raw)
+                event = event_for_interpretation(
+                    state,
+                    expected,
+                    resolution,
+                    update_id,
+                )
+            else:
+                event = event_for_text(state, raw, update_id)
 
         if event is None:
             continue

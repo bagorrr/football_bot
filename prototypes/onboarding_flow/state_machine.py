@@ -14,6 +14,18 @@ from typing import Any
 
 FROZEN_TODAY = date(2026, 7, 29)
 SUPPORTED_LOCALES = ("en", "es", "fr", "ru")
+LANGUAGE_ALIASES = {
+    "en": {"english", "английский", "anglais", "inglés"},
+    "es": {"español", "spanish", "испанский", "espagnol"},
+    "fr": {"français", "french", "французский", "francés"},
+    "ru": {"русский", "russian", "ruso", "russe"},
+}
+LANGUAGE_NATIVE_NAMES = {
+    "en": "English",
+    "es": "Español",
+    "fr": "Français",
+    "ru": "Русский",
+}
 
 
 def L(ru: str, en: str, es: str, fr: str) -> dict[str, str]:
@@ -704,6 +716,8 @@ def initial_state(telegram_hint: str = "ru") -> dict[str, Any]:
         "last_effect": "Prototype initialized; /start has not been rendered yet.",
         "transition_log": [],
         "callback_notice": None,
+        "resolution_notice": None,
+        "last_interpretation": None,
         "debug": {
             "fail_next_render": False,
             "keep_next_old_view": False,
@@ -751,6 +765,7 @@ def dispatch(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
 
     next_state = deepcopy(state)
     next_state["callback_notice"] = None
+    next_state["resolution_notice"] = None
     kind = event["kind"]
 
     if kind.startswith("debug_"):
@@ -889,6 +904,7 @@ def _apply_product_event(
         if locale not in SUPPORTED_LOCALES:
             _effect(state, f"Unsupported language candidate {locale!r}; no language changed.")
             return False, True
+        resolution_note = _resolution_source_note(event.get("resolution_source"))
         previous = state["account"]["locale"]
         state["account"]["locale"] = locale
         state["account"]["locale_source"] = "explicit"
@@ -897,7 +913,7 @@ def _apply_product_event(
             _effect(
                 state,
                 f"Conversation Language changed {previous or '∅'} → {locale}; "
-                "draft and completed searches were preserved.",
+                f"draft and completed searches were preserved.{resolution_note}",
             )
         else:
             if state["draft"] is None:
@@ -907,7 +923,8 @@ def _apply_product_event(
             state["draft"]["stage"] = "direction"
             _effect(
                 state,
-                f"Conversation Language set to {locale}; first draft is at Direction.",
+                f"Conversation Language set to {locale}; first draft is at Direction."
+                f"{resolution_note}",
             )
         return True, True
 
@@ -926,6 +943,19 @@ def _apply_product_event(
             _effect(state, f"Language input {value!r} is ambiguous or unsupported; no change.")
             return False, True
         return _apply_product_event(state, {"kind": "set_language", "value": locale})
+
+    if kind == "language_resolution":
+        resolution = _validated_interpretation(state, "language", event.get("value"))
+        if resolution is None:
+            return False, True
+        return _apply_product_event(
+            state,
+            {
+                "kind": "set_language",
+                "value": resolution["candidate_id"],
+                "resolution_source": resolution["source"],
+            },
+        )
 
     if kind == "back_language_free":
         state["surface"] = (
@@ -983,22 +1013,17 @@ def _apply_product_event(
         if canonical is None:
             _effect(state, f"Country input {value!r} was invalid/ambiguous; no state changed.")
             return False, True
-        old = draft["country"]
-        if old != canonical:
-            if old is not None:
-                _clear_for_parent_geography_replacement(draft, clear_city=True)
-                effect = (
-                    f"Country {old} → {canonical}; city, areas, required/exact temporal "
-                    "values cleared; non-temporal criteria and day parts preserved."
-                )
-            else:
-                effect = f"Confirmed country {canonical}."
-            draft["country"] = canonical
-        else:
-            effect = f"Re-confirmed canonical country {canonical}; descendants preserved."
-        draft["stage"] = "city"
-        _effect(state, effect)
-        return True, True
+        return _commit_country(state, canonical)
+
+    if kind == "country_resolution":
+        resolution = _validated_interpretation(state, "country", event.get("value"))
+        if resolution is None:
+            return False, True
+        return _commit_country(
+            state,
+            resolution["candidate_id"],
+            resolution_source=resolution["source"],
+        )
 
     if kind == "back_country":
         draft = _draft(state)
@@ -1017,22 +1042,17 @@ def _apply_product_event(
         if canonical is None:
             _effect(state, f"City input {value!r} was invalid/ambiguous; no state changed.")
             return False, True
-        old = draft["city"]
-        if old != canonical:
-            if old is not None:
-                _clear_for_parent_geography_replacement(draft, clear_city=False)
-                effect = (
-                    f"City {old} → {canonical}; areas and required/exact temporal values "
-                    "cleared; non-temporal criteria and day parts preserved."
-                )
-            else:
-                effect = f"Confirmed city {canonical}."
-            draft["city"] = canonical
-        else:
-            effect = f"Re-confirmed canonical city {canonical}; descendants preserved."
-        draft["stage"] = "areas"
-        _effect(state, effect)
-        return True, True
+        return _commit_city(state, canonical)
+
+    if kind == "city_resolution":
+        resolution = _validated_interpretation(state, "city", event.get("value"))
+        if resolution is None:
+            return False, True
+        return _commit_city(
+            state,
+            resolution["candidate_id"],
+            resolution_source=resolution["source"],
+        )
 
     if kind == "back_city":
         draft = _draft(state)
@@ -1533,6 +1553,198 @@ def _apply_product_event(
     return False, True
 
 
+def _commit_country(
+    state: dict[str, Any],
+    canonical: str,
+    *,
+    resolution_source: str | None = None,
+) -> tuple[bool, bool]:
+    if canonical not in COUNTRIES:
+        _set_interpretation_failure(
+            state,
+            "country",
+            "resolver_rejected_candidate",
+        )
+        return False, True
+
+    draft = _draft(state)
+    old = draft["country"]
+    resolution_note = _resolution_source_note(resolution_source)
+    if old != canonical:
+        if old is not None:
+            _clear_for_parent_geography_replacement(draft, clear_city=True)
+            effect = (
+                f"Country {old} → {canonical}; city, areas, required/exact temporal "
+                "values cleared; non-temporal criteria and day parts preserved."
+                f"{resolution_note}"
+            )
+        else:
+            effect = f"Confirmed country {canonical}.{resolution_note}"
+        draft["country"] = canonical
+    else:
+        effect = (
+            f"Re-confirmed canonical country {canonical}; descendants preserved."
+            f"{resolution_note}"
+        )
+    draft["stage"] = "city"
+    _effect(state, effect)
+    return True, True
+
+
+def _commit_city(
+    state: dict[str, Any],
+    canonical: str,
+    *,
+    resolution_source: str | None = None,
+) -> tuple[bool, bool]:
+    draft = _draft(state)
+    country_id = draft["country"]
+    if (
+        country_id not in COUNTRIES
+        or canonical not in COUNTRIES[country_id]["cities"]
+    ):
+        _set_interpretation_failure(
+            state,
+            "city",
+            "resolver_rejected_candidate",
+        )
+        return False, True
+
+    old = draft["city"]
+    resolution_note = _resolution_source_note(resolution_source)
+    if old != canonical:
+        if old is not None:
+            _clear_for_parent_geography_replacement(draft, clear_city=False)
+            effect = (
+                f"City {old} → {canonical}; areas and required/exact temporal values "
+                "cleared; non-temporal criteria and day parts preserved."
+                f"{resolution_note}"
+            )
+        else:
+            effect = f"Confirmed city {canonical}.{resolution_note}"
+        draft["city"] = canonical
+    else:
+        effect = (
+            f"Re-confirmed canonical city {canonical}; descendants preserved."
+            f"{resolution_note}"
+        )
+    draft["stage"] = "areas"
+    _effect(state, effect)
+    return True, True
+
+
+def _validated_interpretation(
+    state: dict[str, Any],
+    field: str,
+    payload: Any,
+) -> dict[str, str] | None:
+    allowed_ids = {
+        candidate["id"] for candidate in interpretation_candidates(state, field)
+    }
+    contract_valid = isinstance(payload, dict)
+    status = payload.get("status") if contract_valid else None
+    source = payload.get("source") if contract_valid else None
+    candidate_ids = payload.get("candidate_ids") if contract_valid else None
+    model_id = payload.get("model_id") if contract_valid else None
+    duration_ms = payload.get("duration_ms") if contract_valid else None
+    failure_code = payload.get("failure_code") if contract_valid else None
+
+    contract_valid = (
+        contract_valid
+        and status in {"accepted", "ambiguous", "unresolved", "technical_failure"}
+        and source in {"deterministic_alias", "codex_model", "laboratory"}
+        and isinstance(candidate_ids, list)
+        and all(isinstance(item, str) for item in candidate_ids)
+        and len(candidate_ids) == len(set(candidate_ids))
+        and set(candidate_ids).issubset(allowed_ids)
+    )
+    if contract_valid and status == "accepted":
+        contract_valid = len(candidate_ids) == 1
+    elif contract_valid and status == "ambiguous":
+        contract_valid = len(candidate_ids) >= 2
+    elif contract_valid:
+        contract_valid = len(candidate_ids) == 0
+
+    if not contract_valid:
+        status = "technical_failure"
+        source = "laboratory"
+        candidate_ids = []
+        model_id = None
+        duration_ms = None
+        failure_code = "invalid_interpretation_contract"
+
+    state["last_interpretation"] = {
+        "field": field,
+        "status": status,
+        "candidate_ids": list(candidate_ids),
+        "source": source,
+        "model_id": model_id if isinstance(model_id, str) else None,
+        "duration_ms": duration_ms if isinstance(duration_ms, int) else None,
+        "failure_code": failure_code if isinstance(failure_code, str) else None,
+    }
+
+    if status == "accepted":
+        return {"candidate_id": candidate_ids[0], "source": source}
+
+    state["resolution_notice"] = {
+        "field": field,
+        "status": status,
+        "candidate_ids": list(candidate_ids),
+    }
+    if status == "ambiguous":
+        _effect(
+            state,
+            f"{field.title()} interpretation was ambiguous among "
+            f"{', '.join(candidate_ids)}; confirmed state unchanged.",
+        )
+    elif status == "unresolved":
+        _effect(
+            state,
+            f"{field.title()} interpretation was unresolved; confirmed state unchanged.",
+        )
+    else:
+        _effect(
+            state,
+            f"{field.title()} interpretation failed technically "
+            f"({failure_code or 'unknown'}); confirmed state unchanged.",
+        )
+    return None
+
+
+def _set_interpretation_failure(
+    state: dict[str, Any],
+    field: str,
+    failure_code: str,
+) -> None:
+    state["last_interpretation"] = {
+        "field": field,
+        "status": "technical_failure",
+        "candidate_ids": [],
+        "source": "laboratory",
+        "model_id": None,
+        "duration_ms": None,
+        "failure_code": failure_code,
+    }
+    state["resolution_notice"] = {
+        "field": field,
+        "status": "technical_failure",
+        "candidate_ids": [],
+    }
+    _effect(
+        state,
+        f"{field.title()} resolver rejected the proposed candidate; "
+        "confirmed state unchanged.",
+    )
+
+
+def _resolution_source_note(source: Any) -> str:
+    if source == "codex_model":
+        return " Resolution source: Codex model proposal validated by the local resolver."
+    if source == "deterministic_alias":
+        return " Resolution source: exact local alias."
+    return ""
+
+
 def _draft(state: dict[str, Any]) -> dict[str, Any]:
     if not state["draft"]:
         raise RuntimeError("Prototype event expected an active Discovery Draft")
@@ -1717,10 +1929,15 @@ def build_screen(state: dict[str, Any]) -> dict[str, Any]:
             ],
         )
     if surface in {"language_free", "settings_language_free"}:
+        text = (
+            LANGUAGE_FREE_PROMPT[locale]
+            + "\n\n[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
+            "other text is interpreted by GPT-5.6 Sol and then validated "
+            "against the supported locale list. `?ambiguous`, `?invalid`, and "
+            "`?model-fail` exercise fallbacks."
+        )
         return _screen(
-            LANGUAGE_FREE_PROMPT[locale] + "\n\n"
-            "[PROTOTYPE INPUT] Try English / Español / Français / Русский; "
-            "`?ambiguous` leaves state unchanged.",
+            _with_resolution_notice(state, "language", text),
             [_button(tr(state, "back"), "back_language_free")],
             expects_text="language",
         )
@@ -1849,7 +2066,14 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
             "fr": "Saisissez le nom du pays.",
         }[locale]
         return _screen(
-            text + "\n\n[LAB INPUT] `?ambiguous` or `?invalid` must change nothing.",
+            _with_resolution_notice(
+                state,
+                "country",
+                text
+                + "\n\n[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
+                "other text is interpreted by GPT-5.6 Sol and resolver-validated. "
+                "`?ambiguous`, `?invalid`, and `?model-fail` exercise fallbacks.",
+            ),
             [_button(tr(state, "back"), "back_country")],
             expects_text="country",
         )
@@ -1863,7 +2087,14 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
             "fr": f"✅ Pays de recherche : {country}.\n\n🏙 Dans quelle ville cherchons-nous ?",
         }[locale]
         return _screen(
-            text + "\n\n[LAB INPUT] `?ambiguous` or `?invalid` must change nothing.",
+            _with_resolution_notice(
+                state,
+                "city",
+                text
+                + "\n\n[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
+                "other text is interpreted by GPT-5.6 Sol and resolver-validated. "
+                "`?ambiguous`, `?invalid`, and `?model-fail` exercise fallbacks.",
+            ),
             [_button(tr(state, "back"), "back_city")],
             expects_text="city",
         )
@@ -2219,6 +2450,99 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
     return _screen("Unknown nested editor", [_button(tr(state, "back"), "back_nested")])
 
 
+def _with_resolution_notice(
+    state: dict[str, Any],
+    field: str,
+    text: str,
+) -> str:
+    notice = state.get("resolution_notice")
+    if not notice or notice.get("field") != field:
+        return text
+
+    locale = display_locale(state)
+    status = notice.get("status")
+    labels = [
+        _interpretation_candidate_label(state, field, candidate_id, locale)
+        for candidate_id in notice.get("candidate_ids", [])
+    ]
+    choices = ", ".join(labels)
+    if status == "ambiguous":
+        message = {
+            "ru": (
+                f"Нужно уточнение: подходят несколько вариантов — {choices}. "
+                "Напишите один вариант точнее. Подтверждённые данные не изменены."
+            ),
+            "en": (
+                f"Clarification needed: several options fit — {choices}. "
+                "Type one option more precisely. Confirmed data was not changed."
+            ),
+            "es": (
+                f"Se necesita una aclaración: encajan varias opciones — {choices}. "
+                "Escriba una opción con más precisión. Los datos confirmados no cambiaron."
+            ),
+            "fr": (
+                f"Une précision est nécessaire : plusieurs choix conviennent — {choices}. "
+                "Saisissez un choix plus précisément. Les données confirmées sont inchangées."
+            ),
+        }[locale]
+    elif status == "unresolved":
+        message = {
+            "ru": (
+                "Не удалось надёжно сопоставить ввод с поддерживаемым вариантом. "
+                "Сформулируйте иначе; подтверждённые данные не изменены."
+            ),
+            "en": (
+                "The input could not be mapped safely to a supported option. "
+                "Try different wording; confirmed data was not changed."
+            ),
+            "es": (
+                "No se pudo asociar la entrada de forma segura a una opción compatible. "
+                "Pruebe otra formulación; los datos confirmados no cambiaron."
+            ),
+            "fr": (
+                "La saisie ne correspond pas de manière fiable à un choix pris en charge. "
+                "Reformulez-la ; les données confirmées sont inchangées."
+            ),
+        }[locale]
+    else:
+        message = {
+            "ru": (
+                "Распознавание временно недоступно. Попробуйте ещё раз; "
+                "подтверждённые данные сохранены."
+            ),
+            "en": (
+                "Interpretation is temporarily unavailable. Try again; "
+                "confirmed data was preserved."
+            ),
+            "es": (
+                "La interpretación no está disponible temporalmente. Inténtelo de nuevo; "
+                "se conservaron los datos confirmados."
+            ),
+            "fr": (
+                "L’interprétation est temporairement indisponible. Réessayez ; "
+                "les données confirmées sont conservées."
+            ),
+        }[locale]
+    return text + "\n\n[PROTOTYPE FALLBACK] " + message
+
+
+def _interpretation_candidate_label(
+    state: dict[str, Any],
+    field: str,
+    candidate_id: str,
+    locale: str,
+) -> str:
+    if field == "language":
+        return LANGUAGE_NATIVE_NAMES.get(candidate_id, candidate_id)
+    if field == "country":
+        return _country_name(candidate_id, locale)
+    if field == "city":
+        draft = state.get("draft")
+        country_id = draft.get("country") if draft else None
+        return _city_name(country_id, candidate_id, locale)
+    return candidate_id
+
+
 def _screen(
     text: str,
     buttons: list[dict[str, Any]],
@@ -2250,6 +2574,22 @@ def event_for_button(
         "update_id": update_id,
         "source_revision": active["revision"] if active else None,
         "source": "inline_callback",
+    }
+
+
+def event_for_interpretation(
+    state: dict[str, Any],
+    field: str,
+    resolution: dict[str, Any],
+    update_id: int,
+) -> dict[str, Any]:
+    active = state["active_view"]
+    return {
+        "kind": f"{field}_resolution",
+        "value": resolution,
+        "update_id": update_id,
+        "source_revision": active["revision"] if active else None,
+        "source": "bounded_text_interpreter",
     }
 
 
@@ -2343,33 +2683,78 @@ def state_lines(state: dict[str, Any]) -> list[str]:
         )
     )
     lines.append(f"debug={state['debug']!r}")
+    lines.append(f"last_interpretation={state['last_interpretation']!r}")
+    lines.append(f"resolution_notice={state['resolution_notice']!r}")
     lines.append(f"LAST EFFECT: {state['last_effect']}")
     return lines
 
 
+def interpretation_candidates(
+    state: dict[str, Any],
+    field: str,
+) -> list[dict[str, Any]]:
+    """Return the only canonical IDs a text interpreter may propose."""
+
+    if field == "language":
+        return [
+            {
+                "id": locale,
+                "names": [LANGUAGE_NATIVE_NAMES[locale]],
+                "known_aliases": sorted(LANGUAGE_ALIASES[locale]),
+            }
+            for locale in SUPPORTED_LOCALES
+        ]
+    if field == "country":
+        return [
+            {
+                "id": country_id,
+                "names": sorted(set(country["names"].values())),
+                "known_aliases": sorted(country["aliases"]),
+            }
+            for country_id, country in COUNTRIES.items()
+        ]
+    if field == "city":
+        draft = state.get("draft")
+        country_id = draft.get("country") if draft else None
+        if country_id not in COUNTRIES:
+            return []
+        return [
+            {
+                "id": city_id,
+                "names": sorted(set(city["names"].values())),
+                "known_aliases": sorted(city["aliases"]),
+            }
+            for city_id, city in COUNTRIES[country_id]["cities"].items()
+        ]
+    return []
+
+
+def exact_interpretation_candidate(
+    state: dict[str, Any],
+    field: str,
+    value: str,
+) -> str | None:
+    """Resolve only reviewed aliases; misspellings deliberately return None."""
+
+    if field == "language":
+        return _normalize_language(value)
+    if field == "country":
+        return _normalize_country(value)
+    if field == "city":
+        draft = state.get("draft")
+        country_id = draft.get("country") if draft else None
+        return _normalize_city(country_id, value)
+    return None
+
+
 def _normalize_language(value: str) -> str | None:
     normalized = value.strip().casefold()
-    aliases = {
-        "english": "en",
-        "английский": "en",
-        "anglais": "en",
-        "inglés": "en",
-        "español": "es",
-        "spanish": "es",
-        "испанский": "es",
-        "espagnol": "es",
-        "français": "fr",
-        "french": "fr",
-        "французский": "fr",
-        "francés": "fr",
-        "русский": "ru",
-        "russian": "ru",
-        "ruso": "ru",
-        "russe": "ru",
-    }
     if normalized in {"?ambiguous", "?invalid", ""}:
         return None
-    return aliases.get(normalized)
+    for locale, aliases in LANGUAGE_ALIASES.items():
+        if normalized in aliases:
+            return locale
+    return None
 
 
 def _normalize_country(value: str) -> str | None:
