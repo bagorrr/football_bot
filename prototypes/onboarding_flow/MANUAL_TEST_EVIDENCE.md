@@ -246,3 +246,29 @@ English, Spanish, and French Feed, active Search mode, and Premium notices, but
 its focused post-fix manual replay has not yet been executed. No evidence above
 is a prototype verdict or authorization to update product documentation,
 GitHub, Wayfinder fog, or native dependencies.
+
+## Bot User-directed focused retest
+
+| ID | Action or input | Observed result and state | Provisional status |
+| --- | --- | --- | --- |
+| RETEST-DIR-01 | Select `Русский`, send `Найти матч`, then press `Подтвердить` | The model first proposed `game_search` while `user_intent` remained `None`. Only the explicit confirmation persisted `user_intent='game_search'`, cleared `pending_direction`, and advanced to Country. | Passed; awaiting continuation of focused retest |
+| RETEST-COUNTRY-01 | Send typo `Русиа` at Country | The model proposed `RU` with canonical label `Россия`; the state machine confirmed the country and advanced to City. `user_intent='game_search'` remained unchanged and all city/descendant fields remained empty. | Passed |
+| RETEST-CITY-01 | Send colloquial typo `Шэляба` for confirmed country `RU` | The model resolved a city absent from the old fixture as `chelyabinsk`, canonical label `Челябинск`, timezone `Asia/Yekaterinburg`. The state machine advanced to the single free-text Search Area screen with only Back; country and intent were preserved. | Passed |
+| RETEST-AREA-01 | Send `Центральный район` at the single free-text Search Area screen | The model resolved `chelyabinsk-tsentralny-district` with label `Центральный район, Челябинск`; the machine committed `area_mode='areas'`, advanced to Required Date, and preserved intent/country/city. The date screen accepted text and exposed only Back. | Passed |
+| RETEST-DATE-RANGE-01 | Send `с 5 по 7 августа` with selected city `Челябинск`, timezone `Asia/Yekaterinburg`, and local current date `2026-07-30` | The model resolved inclusive dates `2026-08-05..2026-08-07`; the machine committed the range and advanced to `post_core` with Back, Details, and Search. Geography and all other confirmed state remained unchanged. | Passed; past-date preservation check follows |
+| RETEST-DATE-BACK-01 | Press Back from `post_core` after confirming the range | Returned to Required Date in one step. The confirmed range `2026-08-05..2026-08-07`, selected-city timezone, area, city, country, and intent were all preserved. | Passed |
+| RETEST-DATE-PAST-01 | Send `вчера` with local current date `2026-07-30` and an existing confirmed range | The model returned unresolved; the stage remained Required Date and the confirmed `2026-08-05..2026-08-07` range plus all geography remained unchanged. The visible Russian notice was generic («не удалось надёжно сопоставить…») and did not state that the date was in the past. | State preservation passed; user-facing reason is a prototype copy deviation |
+
+### Past-date copy correction
+
+The Bot User explicitly approved correcting the prototype message after
+`RETEST-DATE-PAST-01`. The adapter now asks the model to extract a clear date
+even when it is in the past; the local calendar validator converts that
+proposal into `unresolved` with `failure_code='past_date'`. The Russian screen
+then says: «Эта дата уже прошла. Напишите сегодняшнюю или будущую дату либо
+период; подтверждённые данные не изменены.»
+
+An isolated post-change replay of `вчера` produced that exact reason and did
+not advance from Required Date. The active user-directed TUI process still had
+the old code loaded and must be restarted before the corrected copy can be
+replayed there; its in-memory draft cannot be persisted by design.

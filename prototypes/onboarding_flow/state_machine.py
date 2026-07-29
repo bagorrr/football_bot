@@ -1795,6 +1795,7 @@ def _validated_interpretation(
         "field": field,
         "status": status,
         "candidate_ids": list(candidate_ids),
+        "failure_code": failure_code if isinstance(failure_code, str) else None,
     }
     if status == "ambiguous":
         _effect(
@@ -2707,6 +2708,7 @@ def _with_resolution_notice(
 
     locale = display_locale(state)
     status = notice.get("status")
+    failure_code = notice.get("failure_code")
     labels = [
         _interpretation_candidate_label(state, field, candidate_id, locale)
         for candidate_id in notice.get("candidate_ids", [])
@@ -2729,6 +2731,25 @@ def _with_resolution_notice(
             "fr": (
                 f"Une précision est nécessaire : plusieurs choix conviennent — {choices}. "
                 "Saisissez un choix plus précisément. Les données confirmées sont inchangées."
+            ),
+        }[locale]
+    elif status == "unresolved" and field == "date" and failure_code == "past_date":
+        message = {
+            "ru": (
+                "Эта дата уже прошла. Напишите сегодняшнюю или будущую дату либо "
+                "период; подтверждённые данные не изменены."
+            ),
+            "en": (
+                "That date has already passed. Type today, a future date, or a "
+                "future range; confirmed data was not changed."
+            ),
+            "es": (
+                "Esa fecha ya ha pasado. Escriba hoy, una fecha futura o un "
+                "periodo futuro; los datos confirmados no cambiaron."
+            ),
+            "fr": (
+                "Cette date est déjà passée. Saisissez aujourd’hui, une date future "
+                "ou une période future ; les données confirmées sont inchangées."
             ),
         }[locale]
     elif status == "unresolved":

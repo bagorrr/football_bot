@@ -247,6 +247,17 @@ def resolve_free_text(
             started,
             failure_code="invalid_model_result",
         )
+    if field == "date" and status == "accepted":
+        start = date.fromisoformat(resolved["start"])
+        current = date.fromisoformat(resolved["current_date"])
+        if start < current:
+            return _result(
+                "unresolved",
+                [],
+                "codex_model",
+                started,
+                failure_code="past_date",
+            )
     return _result(
         status,
         proposed_ids,
@@ -293,9 +304,10 @@ def _prompt(
             "and whole_city=true only when the user means the entire city."
         ),
         "date": (
-            "Interpret a future local date or inclusive date range using "
-            "context.current_local_date. For accepted, return ISO date_start and "
-            "date_end; never accept a date before current_local_date."
+            "Interpret any clear local date or inclusive date range using "
+            "context.current_local_date, including a date in the past. For accepted, "
+            "return ISO date_start and date_end. The local resolver, not you, decides "
+            "whether the interpreted date is still valid."
         ),
     }[field]
     return (
@@ -481,7 +493,7 @@ def _valid_resolved_value(
             current = date.fromisoformat(str(resolved.get("current_date")))
         except ValueError:
             return False
-        return start >= current and end >= start
+        return end >= start
 
     canonical_id = resolved.get("canonical_id")
     canonical_label = resolved.get("canonical_label")
