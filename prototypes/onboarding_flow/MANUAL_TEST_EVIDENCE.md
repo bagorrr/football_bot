@@ -280,3 +280,10 @@ past-date message, recorded `failure_code='past_date'`, stayed at Required
 Date, and preserved the confirmed range and all geography. This closes the
 prototype copy deviation from `RETEST-DATE-PAST-01`; explicit Bot User approval
 of the overall date stage is still pending.
+
+The Bot User then explicitly confirmed the corrected date stage after observing
+the natural-language future range, navigation-only Back, past-date rejection,
+clear localized reason, and preservation of the previously confirmed range.
+This is an intermediate HITL approval only; it is not the final prototype
+verdict. The earlier gate on Details Hub is therefore lifted for the next
+manual-test phase.
