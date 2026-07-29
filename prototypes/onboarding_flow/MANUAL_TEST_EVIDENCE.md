@@ -272,3 +272,11 @@ An isolated post-change replay of `вчера` produced that exact reason and di
 not advance from Required Date. The active user-directed TUI process still had
 the old code loaded and must be restarted before the corrected copy can be
 replayed there; its in-memory draft cannot be persisted by design.
+
+After restart, the operator reconstructed the same confirmed
+`game_search → Россия → Челябинск → Центральный район → 2026-08-05..2026-08-07`
+route and sent `вчера`. The live TUI rendered the corrected Russian
+past-date message, recorded `failure_code='past_date'`, stayed at Required
+Date, and preserved the confirmed range and all geography. This closes the
+prototype copy deviation from `RETEST-DATE-PAST-01`; explicit Bot User approval
+of the overall date stage is still pending.
