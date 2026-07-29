@@ -1,8 +1,7 @@
 # Conversational Onboarding
 
-Status: Confirmed through the complete location stage. Later
-direction-specific filters and the complete onboarding state machine remain
-Wayfinder decisions.
+Status: Confirmed through the direction-specific discovery-filter stage. The
+complete onboarding state machine remains a Wayfinder decision.
 
 ## Confirmed sequence
 
@@ -19,6 +18,9 @@ Message location normalization are canonical in
 [`docs/product/location-resolution.md`](location-resolution.md). The canonical
 direction taxonomy and reviewed direction/country copy live in
 [`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md).
+Direction-specific required cores, filter order, localized copy, and shared
+filter navigation are canonical in
+[`docs/product/opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
 
 ## Top-level direction menu
 

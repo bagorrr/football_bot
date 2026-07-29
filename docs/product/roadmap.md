@@ -21,6 +21,8 @@ This roadmap records the stable delivery flow and transition gates. Active statu
   `docs/product/search-direction-taxonomy.md`
 - Location confirmation and normalization:
   `docs/product/location-resolution.md`
+- Opportunity fields and Discovery Criteria:
+  `docs/product/opportunity-fields-and-discovery-filters.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
 - Source consent basis: `docs/product/source-consent.md`
 - Open decision space: GitHub Wayfinder map, when needed
