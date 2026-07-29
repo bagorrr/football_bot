@@ -1,0 +1,2454 @@
+"""THROWAWAY PROTOTYPE — pure multilingual onboarding state machine.
+
+The reducer in this file answers one design question for Wayfinder ticket #9.
+It is intentionally independent from Telegram, persistence, matching, result
+cards, and production application structure.
+"""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import date, timedelta
+from typing import Any
+
+
+FROZEN_TODAY = date(2026, 7, 29)
+SUPPORTED_LOCALES = ("en", "es", "fr", "ru")
+
+
+def L(ru: str, en: str, es: str, fr: str) -> dict[str, str]:
+    return {"ru": ru, "en": en, "es": es, "fr": fr}
+
+
+COPY: dict[str, dict[str, str]] = {
+    "back": L("⬅️ Назад", "⬅️ Back", "⬅️ Atrás", "⬅️ Retour"),
+    "done": L("Готово", "Done", "Listo", "Valider"),
+    "any": L("Неважно", "Any", "Cualquiera", "Peu importe"),
+    "search": L("Поиск", "Search", "Buscar", "Rechercher"),
+    "retry": L("Повторить", "Retry", "Reintentar", "Réessayer"),
+    "details": L("Детали", "Details", "Detalles", "Détails"),
+    "not_set": L("не задано", "not set", "sin definir", "non défini"),
+    "language": L("Язык", "Language", "Idioma", "Langue"),
+    "support": L("Поддержка", "Support", "Soporte", "Assistance"),
+    "mode": L("Режим", "Mode", "Modo", "Mode"),
+    "premium": L("Премиум", "Premium", "Premium", "Premium"),
+    "new_search": L("Новый поиск", "New search", "Nueva búsqueda", "Nouvelle recherche"),
+    "search_results": L(
+        "Результаты поиска",
+        "Search results",
+        "Resultados de búsqueda",
+        "Résultats de recherche",
+    ),
+    "settings": L("Настройки", "Settings", "Ajustes", "Paramètres"),
+    "menu": L("Меню", "Menu", "Menú", "Menu"),
+    "whole_city": L("Весь город", "Whole city", "Toda la ciudad", "Toute la ville"),
+    "choose_areas": L(
+        "Выбрать район или место",
+        "Choose an area or place",
+        "Elegir una zona o lugar",
+        "Choisir une zone ou un lieu",
+    ),
+    "choose_date": L("Выбрать дату", "Choose a date", "Elegir fecha", "Choisir une date"),
+    "today": L("Сегодня", "Today", "Hoy", "Aujourd’hui"),
+    "tomorrow": L("Завтра", "Tomorrow", "Mañana", "Demain"),
+}
+
+
+WELCOME = {
+    "ru": (
+        "Хотите поиграть в футбол или организуете футбольный матч? ⚽️\n\n"
+        "Быстро найдём матч, игроков, турнир, соперника, тренера, судью "
+        "или трансферный вариант.\n\nНа каком языке продолжим?"
+    ),
+    "en": (
+        "Would you like to play football or organize a football match? ⚽️\n\n"
+        "We can quickly find a match, players, a tournament, an opponent, "
+        "a coach, a referee, or a transfer option.\n\nWhich language shall we use?"
+    ),
+    "es": (
+        "¿Quiere jugar al fútbol u organizar un partido? ⚽️\n\n"
+        "Podemos encontrar rápidamente un partido, jugadores, un torneo, "
+        "un rival, un entrenador, un árbitro o un fichaje.\n\n¿En qué idioma continuamos?"
+    ),
+    "fr": (
+        "Souhaitez-vous jouer au football ou organiser un match ? ⚽️\n\n"
+        "Nous pouvons trouver rapidement un match, des joueurs, un tournoi, "
+        "un adversaire, un entraîneur, un arbitre ou un transfert.\n\n"
+        "Dans quelle langue continuons-nous ?"
+    ),
+}
+
+LANGUAGE_FREE_PROMPT = {
+    "ru": "🌐 Напишите название языка, на котором вам удобно общаться.",
+    "en": "🌐 Type the name of the language you would like to use.",
+    "es": "🌐 Escriba el nombre del idioma que desea utilizar.",
+    "fr": "🌐 Saisissez le nom de la langue que vous souhaitez utiliser.",
+}
+
+LANGUAGE_BUTTON = {
+    "ru": "🌐 Выбор языка",
+    "en": "🌐 Choose language",
+    "es": "🌐 Elegir idioma",
+    "fr": "🌐 Choisir la langue",
+}
+
+LANGUAGE_CONFIRMATION = {
+    "ru": "✅ Будем общаться на русском.\n\n⚽️ Что вы хотите сделать?",
+    "en": "✅ We’ll continue in English.\n\n⚽️ What would you like to do?",
+    "es": "✅ Continuaremos en español.\n\n⚽️ ¿Qué desea hacer?",
+    "fr": "✅ Nous continuerons en français.\n\n⚽️ Que souhaitez-vous faire ?",
+}
+
+DIRECTIONS: list[dict[str, Any]] = [
+    {
+        "kind": "intent",
+        "id": "game_search",
+        "label": L(
+            "Найти матч для себя",
+            "Find a match for me",
+            "Buscar un partido para mí",
+            "Trouver un match pour moi",
+        ),
+    },
+    {
+        "kind": "intent",
+        "id": "player_search",
+        "label": L(
+            "Найти игроков на матч",
+            "Find players for a match",
+            "Buscar jugadores para un partido",
+            "Trouver des joueurs pour un match",
+        ),
+    },
+    {
+        "kind": "branch",
+        "id": "competition_search",
+        "label": L(
+            "Турнир или соперник",
+            "Tournament or opponent team",
+            "Torneo o equipo rival",
+            "Tournoi ou équipe adverse",
+        ),
+    },
+    {
+        "kind": "branch",
+        "id": "coaching_services",
+        "label": L("Тренеры", "Coaches", "Entrenadores", "Entraîneurs"),
+    },
+    {
+        "kind": "branch",
+        "id": "refereeing_services",
+        "label": L("Судьи", "Referees", "Árbitros", "Arbitres"),
+    },
+    {
+        "kind": "branch",
+        "id": "transfer_search",
+        "label": L("Трансферы", "Transfers", "Fichajes", "Transferts"),
+    },
+]
+
+BRANCHES: dict[str, dict[str, Any]] = {
+    "competition_search": {
+        "heading": L(
+            "🏆 Что именно вы ищете?",
+            "🏆 What exactly are you looking for?",
+            "🏆 ¿Qué está buscando exactamente?",
+            "🏆 Que recherchez-vous exactement ?",
+        ),
+        "intents": [
+            (
+                "tournament_search",
+                L("Турнир", "Tournament", "Torneo", "Tournoi"),
+            ),
+            (
+                "opponent_search",
+                L("Команду-соперника", "Opponent team", "Equipo rival", "Équipe adverse"),
+            ),
+        ],
+    },
+    "transfer_search": {
+        "heading": L(
+            "🔄 Что вы хотите?",
+            "🔄 What would you like to do?",
+            "🔄 ¿Qué desea hacer?",
+            "🔄 Que souhaitez-vous faire ?",
+        ),
+        "intents": [
+            (
+                "new_team_search",
+                L(
+                    "Найти новую команду",
+                    "Find a new team",
+                    "Buscar un nuevo equipo",
+                    "Trouver une nouvelle équipe",
+                ),
+            ),
+            (
+                "transfer_player_search",
+                L(
+                    "Найти игрока для трансфера",
+                    "Find a player for transfer",
+                    "Buscar un jugador para fichar",
+                    "Trouver un joueur à recruter",
+                ),
+            ),
+        ],
+    },
+    "coaching_services": {
+        "heading": L(
+            "🧑‍🏫 Что вы хотите сделать?",
+            "🧑‍🏫 What would you like to do?",
+            "🧑‍🏫 ¿Qué desea hacer?",
+            "🧑‍🏫 Que souhaitez-vous faire ?",
+        ),
+        "intents": [
+            (
+                "coach_search",
+                L(
+                    "Найти тренера",
+                    "Find a coach",
+                    "Buscar un entrenador",
+                    "Trouver un entraîneur",
+                ),
+            ),
+            (
+                "coaching_service_offer",
+                L(
+                    "Предложить услуги тренера",
+                    "Offer coaching services",
+                    "Ofrecer servicios de entrenador",
+                    "Proposer des services d’entraîneur",
+                ),
+            ),
+        ],
+    },
+    "refereeing_services": {
+        "heading": L(
+            "🟨 Что вы хотите сделать?",
+            "🟨 What would you like to do?",
+            "🟨 ¿Qué desea hacer?",
+            "🟨 Que souhaitez-vous faire ?",
+        ),
+        "intents": [
+            (
+                "referee_search",
+                L(
+                    "Найти судью",
+                    "Find a referee",
+                    "Buscar un árbitro",
+                    "Trouver un arbitre",
+                ),
+            ),
+            (
+                "refereeing_service_offer",
+                L(
+                    "Предложить услуги судьи",
+                    "Offer refereeing services",
+                    "Ofrecer servicios de arbitraje",
+                    "Proposer des services d’arbitrage",
+                ),
+            ),
+        ],
+    },
+}
+
+INTENT_TO_BRANCH = {
+    intent: branch
+    for branch, spec in BRANCHES.items()
+    for intent, _label in spec["intents"]
+}
+
+COUNTRY_PROMPTS = {
+    "game_search": L(
+        "🌍 В какой стране ищем матч для вас?",
+        "🌍 In which country should we look for a match for you?",
+        "🌍 ¿En qué país buscamos un partido para usted?",
+        "🌍 Dans quel pays devons-nous chercher un match pour vous ?",
+    ),
+    "player_search": L(
+        "🌍 В какой стране ищем игроков на матч?",
+        "🌍 In which country should we look for players for the match?",
+        "🌍 ¿En qué país buscamos jugadores para el partido?",
+        "🌍 Dans quel pays devons-nous chercher des joueurs pour le match ?",
+    ),
+    "tournament_search": L(
+        "🌍 В какой стране ищем турнир?",
+        "🌍 In which country should we look for a tournament?",
+        "🌍 ¿En qué país buscamos un torneo?",
+        "🌍 Dans quel pays devons-nous chercher un tournoi ?",
+    ),
+    "opponent_search": L(
+        "🌍 В какой стране ищем команду-соперника?",
+        "🌍 In which country should we look for an opponent team?",
+        "🌍 ¿En qué país buscamos un equipo rival?",
+        "🌍 Dans quel pays devons-nous chercher une équipe adverse ?",
+    ),
+    "new_team_search": L(
+        "🌍 В какой стране ищем новую команду?",
+        "🌍 In which country should we look for a new team?",
+        "🌍 ¿En qué país buscamos un nuevo equipo?",
+        "🌍 Dans quel pays devons-nous chercher une nouvelle équipe ?",
+    ),
+    "transfer_player_search": L(
+        "🌍 В какой стране ищем игрока для трансфера?",
+        "🌍 In which country should we look for a player for transfer?",
+        "🌍 ¿En qué país buscamos un jugador para fichar?",
+        "🌍 Dans quel pays devons-nous chercher un joueur à recruter ?",
+    ),
+    "coach_search": L(
+        "🌍 В какой стране ищем тренера?",
+        "🌍 In which country should we look for a coach?",
+        "🌍 ¿En qué país buscamos un entrenador?",
+        "🌍 Dans quel pays devons-nous chercher un entraîneur ?",
+    ),
+    "coaching_service_offer": L(
+        "🌍 В какой стране вы готовы работать тренером?",
+        "🌍 In which country are you available to work as a coach?",
+        "🌍 ¿En qué país está disponible para trabajar como entrenador?",
+        "🌍 Dans quel pays êtes-vous disponible pour travailler comme entraîneur ?",
+    ),
+    "referee_search": L(
+        "🌍 В какой стране ищем судью?",
+        "🌍 In which country should we look for a referee?",
+        "🌍 ¿En qué país buscamos un árbitro?",
+        "🌍 Dans quel pays devons-nous chercher un arbitre ?",
+    ),
+    "refereeing_service_offer": L(
+        "🌍 В какой стране вы готовы работать судьёй?",
+        "🌍 In which country are you available to work as a referee?",
+        "🌍 ¿En qué país está disponible para trabajar como árbitro?",
+        "🌍 Dans quel pays êtes-vous disponible pour travailler comme arbitre ?",
+    ),
+}
+
+DATE_REQUIRED = {
+    "game_search",
+    "player_search",
+    "tournament_search",
+    "opponent_search",
+    "referee_search",
+    "refereeing_service_offer",
+}
+
+DETAIL_ORDER: dict[str, list[str]] = {
+    "game_search": [
+        "time",
+        "team_format",
+        "positions",
+        "playing_levels",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "player_search": [
+        "time",
+        "number_players",
+        "team_format",
+        "positions",
+        "playing_levels",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "tournament_search": [
+        "team_format",
+        "playing_levels",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "opponent_search": [
+        "time",
+        "team_format",
+        "playing_levels",
+        "venue_provision",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "new_team_search": [
+        "positions",
+        "playing_levels",
+        "team_format",
+        "seasonal_timing",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "transfer_player_search": [
+        "positions",
+        "playing_levels",
+        "team_format",
+        "seasonal_timing",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "coach_search": [
+        "coaching_type",
+        "playing_levels",
+        "team_format",
+        "schedule",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "coaching_service_offer": [
+        "coaching_type",
+        "playing_levels",
+        "team_format",
+        "schedule",
+        "venue_setting",
+        "playing_surface",
+        "payment",
+    ],
+    "referee_search": ["time", "event_type", "team_format", "referee_role", "payment"],
+    "refereeing_service_offer": [
+        "time",
+        "event_type",
+        "team_format",
+        "referee_role",
+        "payment",
+    ],
+}
+
+DETAIL_NAMES = {
+    "time": L("Время", "Time", "Hora", "Heure"),
+    "number_players": L(
+        "Количество игроков",
+        "Number of players",
+        "Número de jugadores",
+        "Nombre de joueurs",
+    ),
+    "team_format": L("Формат команд", "Team format", "Formato de equipos", "Format des équipes"),
+    "positions": L("Позиции", "Positions", "Posiciones", "Postes"),
+    "playing_levels": L(
+        "Уровни игры", "Playing levels", "Niveles de juego", "Niveaux de jeu"
+    ),
+    "venue_setting": L(
+        "Тип площадки", "Venue type", "Tipo de recinto", "Type de terrain"
+    ),
+    "playing_surface": L(
+        "Покрытие", "Playing surface", "Superficie de juego", "Revêtement"
+    ),
+    "payment": L("Оплата", "Payment", "Pago", "Paiement"),
+    "venue_provision": L(
+        "Наличие площадки",
+        "Venue availability",
+        "Disponibilidad del campo",
+        "Disponibilité du terrain",
+    ),
+    "seasonal_timing": L(
+        "Срок готовности", "Availability timing", "Disponibilidad", "Disponibilité"
+    ),
+    "coaching_type": L(
+        "Тип тренировки",
+        "Coaching type",
+        "Tipo de entrenamiento",
+        "Type d’entraînement",
+    ),
+    "schedule": L("Расписание", "Schedule", "Horario", "Planning"),
+    "event_type": L("Тип события", "Event type", "Tipo de evento", "Type d’événement"),
+    "referee_role": L("Роль судьи", "Referee role", "Rol del árbitro", "Rôle de l’arbitre"),
+}
+
+VALUE_LABELS: dict[str, dict[str, str]] = {
+    "morning": L("Утро", "Morning", "Mañana", "Matin"),
+    "daytime": L("День", "Daytime", "Día", "Journée"),
+    "evening": L("Вечер", "Evening", "Tarde", "Soir"),
+    "night": L("Ночь", "Night", "Noche", "Nuit"),
+    "goalkeeper": L("Вратарь", "Goalkeeper", "Portero", "Gardien"),
+    "defender": L("Защитник", "Defender", "Defensa", "Défenseur"),
+    "midfielder": L("Полузащитник", "Midfielder", "Centrocampista", "Milieu"),
+    "forward": L("Нападающий", "Forward", "Delantero", "Attaquant"),
+    "novice": L("Новичок", "Beginner", "Principiante", "Débutant"),
+    "average": L("Средний", "Average", "Medio", "Moyen"),
+    "high": L("Высокий", "High", "Alto", "Élevé"),
+    "professional": L("Профи", "Professional", "Profesional", "Professionnel"),
+    "indoor": L("В помещении", "Indoor", "En interior", "En salle"),
+    "outdoor": L("На улице", "Outdoor", "Al aire libre", "En extérieur"),
+    "covered_outdoor": L(
+        "На улице под крышей",
+        "Covered outdoor",
+        "Exterior cubierto",
+        "En extérieur couvert",
+    ),
+    "natural_grass": L(
+        "Натуральная трава", "Natural grass", "Césped natural", "Gazon naturel"
+    ),
+    "artificial_turf": L(
+        "Искусственный газон",
+        "Artificial turf",
+        "Césped artificial",
+        "Gazon synthétique",
+    ),
+    "hard_surface": L(
+        "Твёрдое покрытие", "Hard surface", "Superficie dura", "Surface dure"
+    ),
+    "wood_parquet": L("Дерево / паркет", "Wood / parquet", "Madera / parqué", "Bois / parquet"),
+    "free": L("Бесплатно", "Free", "Gratis", "Gratuit"),
+    "paid": L("Платно", "Paid", "De pago", "Payant"),
+    "team_has_venue": L(
+        "Площадка у нас есть", "We have a venue", "Tenemos campo", "Nous avons un terrain"
+    ),
+    "needs_opponent_venue": L(
+        "Нужна площадка соперника",
+        "Need the opponent’s venue",
+        "Necesitamos el campo del rival",
+        "Besoin du terrain adverse",
+    ),
+    "arrange_jointly": L(
+        "Найдём площадку вместе",
+        "We’ll find a venue together",
+        "Buscaremos un campo juntos",
+        "Nous trouverons un terrain ensemble",
+    ),
+    "ready_now": L(
+        "Готов перейти сейчас",
+        "Ready to move now",
+        "Disponible para cambiar de equipo ahora",
+        "Disponible pour changer d’équipe maintenant",
+    ),
+    "individual_training": L(
+        "Индивидуальные тренировки",
+        "Individual training",
+        "Entrenamiento individual",
+        "Entraînement individuel",
+    ),
+    "team_training": L(
+        "Тренировки команды",
+        "Team training",
+        "Entrenamiento de equipo",
+        "Entraînement d’équipe",
+    ),
+    "goalkeeper_training": L(
+        "Подготовка вратарей",
+        "Goalkeeper training",
+        "Entrenamiento de porteros",
+        "Entraînement des gardiens",
+    ),
+    "fitness_training": L(
+        "Физическая подготовка",
+        "Fitness training",
+        "Preparación física",
+        "Préparation physique",
+    ),
+    "match": L("Матч", "Match", "Partido", "Match"),
+    "tournament": L("Турнир", "Tournament", "Torneo", "Tournoi"),
+    "head_referee": L("Главный", "Head referee", "Árbitro principal", "Arbitre principal"),
+    "assistant_referee": L(
+        "Ассистент", "Assistant referee", "Árbitro asistente", "Arbitre assistant"
+    ),
+    "var": {"ru": "VAR", "en": "VAR", "es": "VAR", "fr": "VAR"},
+    "mon": L("Пн", "Mon", "Lun", "Lun"),
+    "tue": L("Вт", "Tue", "Mar", "Mar"),
+    "wed": L("Ср", "Wed", "Mié", "Mer"),
+    "thu": L("Чт", "Thu", "Jue", "Jeu"),
+    "fri": L("Пт", "Fri", "Vie", "Ven"),
+    "sat": L("Сб", "Sat", "Sáb", "Sam"),
+    "sun": L("Вс", "Sun", "Dom", "Dim"),
+}
+
+DETAIL_SPECS: dict[str, dict[str, Any]] = {
+    "time": {"mode": "time"},
+    "number_players": {"mode": "number"},
+    "team_format": {
+        "mode": "multi",
+        "values": ["5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"],
+    },
+    "positions": {
+        "mode": "multi",
+        "values": ["goalkeeper", "defender", "midfielder", "forward"],
+    },
+    "playing_levels": {
+        "mode": "multi",
+        "values": ["novice", "average", "high", "professional"],
+    },
+    "venue_setting": {
+        "mode": "multi",
+        "values": ["indoor", "outdoor", "covered_outdoor"],
+    },
+    "playing_surface": {
+        "mode": "multi",
+        "values": ["natural_grass", "artificial_turf", "hard_surface", "wood_parquet"],
+    },
+    "payment": {"mode": "multi", "values": ["free", "paid"]},
+    "venue_provision": {
+        "mode": "single",
+        "values": ["team_has_venue", "needs_opponent_venue", "arrange_jointly"],
+    },
+    "seasonal_timing": {"mode": "seasonal"},
+    "coaching_type": {
+        "mode": "multi",
+        "values": [
+            "individual_training",
+            "team_training",
+            "goalkeeper_training",
+            "fitness_training",
+        ],
+    },
+    "schedule": {"mode": "schedule"},
+    "event_type": {"mode": "multi", "values": ["match", "tournament"]},
+    "referee_role": {
+        "mode": "multi",
+        "values": ["head_referee", "assistant_referee", "var"],
+    },
+}
+
+COUNTRIES = {
+    "RU": {
+        "aliases": {"russia", "россия", "russie", "rusia"},
+        "names": L("Россия", "Russia", "Rusia", "Russie"),
+        "cities": {
+            "MOW": {
+                "aliases": {"moscow", "москва", "moscou", "moscú"},
+                "names": L("Москва", "Moscow", "Moscú", "Moscou"),
+            },
+            "SPE": {
+                "aliases": {
+                    "saint petersburg",
+                    "st petersburg",
+                    "санкт-петербург",
+                    "петербург",
+                    "санкт петербург",
+                    "san petersburgo",
+                    "saint-pétersbourg",
+                },
+                "names": L(
+                    "Санкт-Петербург",
+                    "Saint Petersburg",
+                    "San Petersburgo",
+                    "Saint-Pétersbourg",
+                ),
+            },
+        },
+    },
+    "ES": {
+        "aliases": {"spain", "испания", "españa", "espagne"},
+        "names": L("Испания", "Spain", "España", "Espagne"),
+        "cities": {
+            "MAD": {
+                "aliases": {"madrid", "мадрид"},
+                "names": {"ru": "Мадрид", "en": "Madrid", "es": "Madrid", "fr": "Madrid"},
+            },
+            "BCN": {
+                "aliases": {"barcelona", "барселона", "barcelone"},
+                "names": L("Барселона", "Barcelona", "Barcelona", "Barcelone"),
+            },
+        },
+    },
+    "FR": {
+        "aliases": {"france", "франция", "francia"},
+        "names": L("Франция", "France", "Francia", "France"),
+        "cities": {
+            "PAR": {
+                "aliases": {"paris", "париж", "parís"},
+                "names": L("Париж", "Paris", "París", "Paris"),
+            },
+            "LYO": {
+                "aliases": {"lyon", "лион"},
+                "names": L("Лион", "Lyon", "Lyon", "Lyon"),
+            },
+        },
+    },
+    "DE": {
+        "aliases": {"germany", "германия", "alemania", "allemagne", "deutschland"},
+        "names": L("Германия", "Germany", "Alemania", "Allemagne"),
+        "cities": {
+            "BER": {
+                "aliases": {"berlin", "берлин", "berlín"},
+                "names": L("Берлин", "Berlin", "Berlín", "Berlin"),
+            }
+        },
+    },
+}
+
+
+def tr(state: dict[str, Any], key: str) -> str:
+    return COPY[key][display_locale(state)]
+
+
+def display_locale(state: dict[str, Any]) -> str:
+    saved = state["account"]["locale"]
+    if saved in SUPPORTED_LOCALES:
+        return saved
+    hint = state["account"]["telegram_hint"]
+    return hint if hint in SUPPORTED_LOCALES else "en"
+
+
+def value_label(value: str, locale: str) -> str:
+    if value in VALUE_LABELS:
+        return VALUE_LABELS[value][locale]
+    return value
+
+
+def initial_state(telegram_hint: str = "ru") -> dict[str, Any]:
+    return {
+        "account": {
+            "locale": None,
+            "locale_source": None,
+            "telegram_hint": telegram_hint,
+            "last_seen_language_code": telegram_hint,
+            "ever_started_flow": False,
+            "next_draft_id": 1,
+        },
+        "surface": "language",
+        "draft": None,
+        "completed_searches": [],
+        "superseded_drafts": 0,
+        "logical_revision": 0,
+        "next_message_id": 101,
+        "active_view": None,
+        "old_views": [],
+        "processed_update_ids": [],
+        "last_effect": "Prototype initialized; /start has not been rendered yet.",
+        "transition_log": [],
+        "callback_notice": None,
+        "debug": {
+            "fail_next_render": False,
+            "keep_next_old_view": False,
+        },
+    }
+
+
+def bootstrap_state(telegram_hint: str = "ru") -> dict[str, Any]:
+    return dispatch(
+        initial_state(telegram_hint),
+        {"kind": "start", "update_id": 1, "source": "telegram_command"},
+    )
+
+
+def new_draft(state: dict[str, Any], origin: str) -> dict[str, Any]:
+    draft_id = state["account"]["next_draft_id"]
+    state["account"]["next_draft_id"] += 1
+    state["account"]["ever_started_flow"] = True
+    return {
+        "id": f"draft-{draft_id}",
+        "origin": origin,
+        "paused": False,
+        "stage": "direction",
+        "branch": None,
+        "user_intent": None,
+        "country": None,
+        "city": None,
+        "area_mode": None,
+        "areas": [],
+        "required_date": None,
+        "criteria": {},
+        "detail_key": None,
+        "temp_edit": None,
+        "nested_kind": None,
+        "nested_snapshot": None,
+        "nested_parent": None,
+        "nested_parent_snapshot": None,
+        "last_search_error": None,
+        "status": "editing",
+    }
+
+
+def dispatch(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    """Return a new state after one event; the input state is never mutated."""
+
+    next_state = deepcopy(state)
+    next_state["callback_notice"] = None
+    kind = event["kind"]
+
+    if kind.startswith("debug_"):
+        return _apply_debug(next_state, event)
+
+    update_id = event.get("update_id")
+    if update_id is not None:
+        if update_id in next_state["processed_update_ids"]:
+            _effect(next_state, f"Duplicate Telegram update {update_id} ignored; no state changed.")
+            return next_state
+        next_state["processed_update_ids"].append(update_id)
+        next_state["processed_update_ids"] = next_state["processed_update_ids"][-40:]
+
+    draft = next_state["draft"]
+    if kind == "search" and draft and draft["status"] == "submitting":
+        _effect(next_state, "Duplicate Search action ignored while submission is in flight.")
+        return next_state
+
+    if kind not in {"start", "menu_text", "system_search_success", "system_search_failure"}:
+        source_revision = event.get("source_revision")
+        if source_revision is not None and source_revision != next_state["logical_revision"]:
+            _effect(
+                next_state,
+                f"Stale input from revision {source_revision} rejected; "
+                f"current revision is {next_state['logical_revision']}.",
+            )
+            _replace_view(next_state, reason="stale input reconstructs current screen")
+            return next_state
+
+    changed, replace = _apply_product_event(next_state, event)
+    if replace:
+        _replace_view(next_state, reason=kind)
+    elif changed:
+        _log(next_state, f"{kind}: state changed without replacing the Active Chat View")
+    return next_state
+
+
+def _apply_debug(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    kind = event["kind"]
+    if kind == "debug_fail_render":
+        state["debug"]["fail_next_render"] = True
+        _effect(state, "LAB: the next replacement render will fail.")
+    elif kind == "debug_keep_old":
+        state["debug"]["keep_next_old_view"] = True
+        _effect(
+            state,
+            "LAB: the next old view will survive with its old callback controls.",
+        )
+    elif kind == "debug_delete_current":
+        if state["active_view"]:
+            state["active_view"]["deleted_by_user"] = True
+            _effect(
+                state,
+                "LAB: the Bot User deleted the current message; durable state is unchanged.",
+            )
+        else:
+            _effect(state, "LAB: there is no current Active Chat View to delete.")
+    elif kind == "debug_cleanup_current":
+        if state["active_view"]:
+            _effect(
+                state,
+                "LAB: bot cleanup refused to delete the current Active Chat View.",
+            )
+        else:
+            _effect(state, "LAB: there is no current Active Chat View.")
+    elif kind == "debug_expire_draft":
+        if state["draft"]:
+            expired_id = state["draft"]["id"]
+            state["draft"] = None
+            state["surface"] = "main_menu" if state["completed_searches"] else "idle"
+            _effect(
+                state,
+                f"LAB: {expired_id} expired after 30 inactive days; locale and history remain.",
+            )
+            _replace_view(state, reason="silent draft expiry surfaced by next interaction")
+        else:
+            _effect(state, "LAB: there is no draft to expire.")
+    elif kind == "debug_past_date":
+        draft = state["draft"]
+        if draft and draft["user_intent"] in DATE_REQUIRED:
+            yesterday = FROZEN_TODAY - timedelta(days=1)
+            draft["required_date"] = {
+                "start": yesterday.isoformat(),
+                "end": yesterday.isoformat(),
+                "timezone": "selected-city",
+            }
+            draft["stage"] = "post_core"
+            state["surface"] = "draft"
+            _effect(
+                state,
+                "LAB: the committed required date is now in the past; Search is blocked.",
+            )
+            _replace_view(state, reason="expired required date")
+        else:
+            _effect(state, "LAB: this draft has no date-required direction.")
+    else:
+        _effect(state, f"Unknown laboratory event: {kind}")
+    return state
+
+
+def _apply_product_event(
+    state: dict[str, Any], event: dict[str, Any]
+) -> tuple[bool, bool]:
+    kind = event["kind"]
+    value = event.get("value")
+
+    if kind == "start":
+        if state["account"]["locale"] is None:
+            state["surface"] = "language"
+            _effect(state, "/start → Language Selection because no explicit language exists.")
+        elif state["draft"]:
+            state["draft"]["paused"] = False
+            state["surface"] = "draft"
+            _effect(
+                state,
+                f"/start resumed {state['draft']['id']} at {state['draft']['stage']}; "
+                "confirmed values were preserved.",
+            )
+        else:
+            state["draft"] = new_draft(state, "repeated")
+            state["surface"] = "draft"
+            _effect(state, "/start created a fresh repeated-search draft at Direction.")
+        return True, True
+
+    if kind == "menu_text":
+        draft = state["draft"]
+        if draft and not draft["paused"] and state["surface"] == "draft":
+            _effect(state, "Menu during active onboarding re-renders the current stage.")
+        else:
+            state["surface"] = "main_menu"
+            _effect(state, "Menu rendered a new Main Menu view.")
+        return True, True
+
+    if kind == "set_language":
+        locale = value
+        if locale not in SUPPORTED_LOCALES:
+            _effect(state, f"Unsupported language candidate {locale!r}; no language changed.")
+            return False, True
+        previous = state["account"]["locale"]
+        state["account"]["locale"] = locale
+        state["account"]["locale_source"] = "explicit"
+        if state["surface"] in {"settings_language", "settings_language_free"}:
+            state["surface"] = "settings"
+            _effect(
+                state,
+                f"Conversation Language changed {previous or '∅'} → {locale}; "
+                "draft and completed searches were preserved.",
+            )
+        else:
+            if state["draft"] is None:
+                state["draft"] = new_draft(state, "first")
+            state["surface"] = "draft"
+            state["draft"]["paused"] = False
+            state["draft"]["stage"] = "direction"
+            _effect(
+                state,
+                f"Conversation Language set to {locale}; first draft is at Direction.",
+            )
+        return True, True
+
+    if kind == "open_language_free":
+        state["surface"] = (
+            "settings_language_free"
+            if state["surface"] == "settings_language"
+            else "language_free"
+        )
+        _effect(state, "Opened free-text language input; saved language is unchanged.")
+        return True, True
+
+    if kind == "language_free_text":
+        locale = _normalize_language(str(value))
+        if locale is None:
+            _effect(state, f"Language input {value!r} is ambiguous or unsupported; no change.")
+            return False, True
+        return _apply_product_event(state, {"kind": "set_language", "value": locale})
+
+    if kind == "back_language_free":
+        state["surface"] = (
+            "settings_language"
+            if state["surface"] == "settings_language_free"
+            else "language"
+        )
+        _effect(state, "Back discarded free-text language input; language is unchanged.")
+        return True, True
+
+    if kind == "open_branch":
+        draft = _draft(state)
+        draft["branch"] = value
+        draft["stage"] = "branch"
+        _effect(state, f"Opened Intent Branch {value}; terminal User Intent is unchanged.")
+        return True, True
+
+    if kind == "select_intent":
+        draft = _draft(state)
+        old = draft["user_intent"]
+        if old != value:
+            if old is not None:
+                _clear_for_intent_replacement(draft)
+                effect = f"User Intent {old} → {value}; Search Area, dates, and all criteria cleared."
+            else:
+                effect = f"Confirmed terminal User Intent {value}."
+            draft["user_intent"] = value
+        else:
+            effect = f"Re-selected canonical User Intent {value}; semantic no-op."
+        draft["branch"] = INTENT_TO_BRANCH.get(value)
+        draft["stage"] = "country"
+        _effect(state, effect)
+        return True, True
+
+    if kind == "back_direction":
+        draft = _draft(state)
+        if draft["origin"] == "first":
+            state["surface"] = "language"
+            _effect(state, "Back from first-onboarding Direction → Language Selection.")
+        else:
+            draft["paused"] = True
+            state["surface"] = "main_menu"
+            _effect(state, "Back from repeated-search Direction → Main Menu; draft paused.")
+        return True, True
+
+    if kind == "back_branch":
+        draft = _draft(state)
+        draft["stage"] = "direction"
+        _effect(state, "Back from Intent Branch → Direction; confirmed intent is unchanged.")
+        return True, True
+
+    if kind == "country_text":
+        draft = _draft(state)
+        canonical = _normalize_country(str(value))
+        if canonical is None:
+            _effect(state, f"Country input {value!r} was invalid/ambiguous; no state changed.")
+            return False, True
+        old = draft["country"]
+        if old != canonical:
+            if old is not None:
+                _clear_for_parent_geography_replacement(draft, clear_city=True)
+                effect = (
+                    f"Country {old} → {canonical}; city, areas, required/exact temporal "
+                    "values cleared; non-temporal criteria and day parts preserved."
+                )
+            else:
+                effect = f"Confirmed country {canonical}."
+            draft["country"] = canonical
+        else:
+            effect = f"Re-confirmed canonical country {canonical}; descendants preserved."
+        draft["stage"] = "city"
+        _effect(state, effect)
+        return True, True
+
+    if kind == "back_country":
+        draft = _draft(state)
+        branch = INTENT_TO_BRANCH.get(draft["user_intent"])
+        draft["stage"] = "branch" if branch else "direction"
+        draft["branch"] = branch
+        _effect(
+            state,
+            f"Back from Country → {draft['stage']}; confirmed geography is unchanged.",
+        )
+        return True, True
+
+    if kind == "city_text":
+        draft = _draft(state)
+        canonical = _normalize_city(draft["country"], str(value))
+        if canonical is None:
+            _effect(state, f"City input {value!r} was invalid/ambiguous; no state changed.")
+            return False, True
+        old = draft["city"]
+        if old != canonical:
+            if old is not None:
+                _clear_for_parent_geography_replacement(draft, clear_city=False)
+                effect = (
+                    f"City {old} → {canonical}; areas and required/exact temporal values "
+                    "cleared; non-temporal criteria and day parts preserved."
+                )
+            else:
+                effect = f"Confirmed city {canonical}."
+            draft["city"] = canonical
+        else:
+            effect = f"Re-confirmed canonical city {canonical}; descendants preserved."
+        draft["stage"] = "areas"
+        _effect(state, effect)
+        return True, True
+
+    if kind == "back_city":
+        draft = _draft(state)
+        draft["stage"] = "country"
+        _effect(state, "Back from City → Country; confirmed city and descendants remain.")
+        return True, True
+
+    if kind == "whole_city":
+        draft = _draft(state)
+        draft["area_mode"] = "whole_city"
+        draft["areas"] = []
+        _advance_after_area(draft)
+        _effect(state, "Committed Whole city; prior individual areas cleared, other values preserved.")
+        return True, True
+
+    if kind == "open_area_editor":
+        draft = _draft(state)
+        draft["temp_edit"] = list(draft["areas"]) if draft["area_mode"] == "areas" else []
+        draft["stage"] = "areas_edit"
+        _effect(state, "Opened temporary Sub-city Areas selection; confirmed Search Area unchanged.")
+        return True, True
+
+    if kind == "toggle_area":
+        draft = _draft(state)
+        values = draft["temp_edit"]
+        if value in values:
+            values.remove(value)
+        else:
+            values.append(value)
+        _effect(state, f"Toggled temporary area {value}; not committed.")
+        return True, True
+
+    if kind == "done_areas":
+        draft = _draft(state)
+        if not draft["temp_edit"]:
+            _effect(state, "Empty Sub-city Area selection is not a complete Search Area.")
+            return False, True
+        draft["area_mode"] = "areas"
+        draft["areas"] = list(draft["temp_edit"])
+        draft["temp_edit"] = None
+        _advance_after_area(draft)
+        _effect(state, "Committed Sub-city Areas; dates, times, and criteria were preserved.")
+        return True, True
+
+    if kind == "back_areas":
+        draft = _draft(state)
+        draft["stage"] = "city"
+        draft["temp_edit"] = None
+        _effect(state, "Back from Sub-city Areas → City; uncommitted area edits discarded.")
+        return True, True
+
+    if kind == "back_area_editor":
+        draft = _draft(state)
+        draft["stage"] = "areas"
+        draft["temp_edit"] = None
+        _effect(state, "Back discarded temporary area edits; confirmed Search Area preserved.")
+        return True, True
+
+    if kind in {"date_today", "date_tomorrow"}:
+        chosen = FROZEN_TODAY + timedelta(days=kind == "date_tomorrow")
+        return _commit_required_date(state, chosen, chosen)
+
+    if kind == "open_date_input":
+        draft = _draft(state)
+        draft["stage"] = "date_input"
+        draft["temp_edit"] = deepcopy(draft["required_date"])
+        _effect(state, "Opened temporary date picker; confirmed required date unchanged.")
+        return True, True
+
+    if kind == "date_text":
+        parsed = _parse_date_range(str(value))
+        if parsed is None:
+            _effect(state, f"Date input {value!r} is invalid; confirmed date unchanged.")
+            return False, True
+        return _commit_required_date(state, parsed[0], parsed[1])
+
+    if kind == "back_required_date":
+        draft = _draft(state)
+        draft["stage"] = "areas"
+        _effect(state, "Back from Required Date → Sub-city Areas; confirmed date preserved.")
+        return True, True
+
+    if kind == "back_date_input":
+        draft = _draft(state)
+        draft["stage"] = "required_date"
+        draft["temp_edit"] = None
+        _effect(state, "Back discarded date-picker edits; confirmed date preserved.")
+        return True, True
+
+    if kind == "open_details":
+        draft = _draft(state)
+        draft["stage"] = "details_hub"
+        _effect(state, "Opened Details Hub; confirmed criteria unchanged.")
+        return True, True
+
+    if kind == "back_post_core":
+        draft = _draft(state)
+        draft["stage"] = (
+            "required_date" if draft["user_intent"] in DATE_REQUIRED else "areas"
+        )
+        _effect(state, f"Back from post-core → {draft['stage']}; values preserved.")
+        return True, True
+
+    if kind == "back_details_hub":
+        draft = _draft(state)
+        draft["stage"] = "post_core"
+        _effect(state, "Back from Details Hub → post-core; criteria preserved.")
+        return True, True
+
+    if kind == "open_detail":
+        draft = _draft(state)
+        draft["detail_key"] = value
+        draft["temp_edit"] = _initial_detail_edit(value, draft["criteria"].get(value))
+        draft["nested_kind"] = None
+        draft["nested_snapshot"] = None
+        draft["nested_parent"] = None
+        draft["nested_parent_snapshot"] = None
+        draft["stage"] = "detail"
+        _effect(state, f"Opened {value} submenu with temporary editing state.")
+        return True, True
+
+    if kind == "toggle_detail":
+        draft = _draft(state)
+        values = draft["temp_edit"]
+        if value in values:
+            values.remove(value)
+        else:
+            values.append(value)
+        _effect(state, f"Toggled temporary {draft['detail_key']} value {value}.")
+        return True, True
+
+    if kind == "done_detail":
+        draft = _draft(state)
+        key = draft["detail_key"]
+        _commit_detail(draft, key, draft["temp_edit"])
+        draft["stage"] = "details_hub"
+        draft["detail_key"] = None
+        draft["temp_edit"] = None
+        _effect(state, f"Committed only {key}; unrelated criteria and core values preserved.")
+        return True, True
+
+    if kind == "back_detail":
+        draft = _draft(state)
+        key = draft["detail_key"]
+        draft["stage"] = "details_hub"
+        draft["detail_key"] = None
+        draft["temp_edit"] = None
+        draft["nested_kind"] = None
+        draft["nested_snapshot"] = None
+        draft["nested_parent"] = None
+        draft["nested_parent_snapshot"] = None
+        _effect(state, f"Back discarded uncommitted {key} edits.")
+        return True, True
+
+    if kind == "select_single_detail":
+        draft = _draft(state)
+        key = draft["detail_key"]
+        draft["criteria"][key] = value
+        draft["stage"] = "details_hub"
+        draft["detail_key"] = None
+        draft["temp_edit"] = None
+        _effect(state, f"Committed {key}={value}; all unrelated values preserved.")
+        return True, True
+
+    if kind == "clear_single_detail":
+        draft = _draft(state)
+        key = draft["detail_key"]
+        draft["criteria"].pop(key, None)
+        draft["stage"] = "details_hub"
+        draft["detail_key"] = None
+        draft["temp_edit"] = None
+        _effect(state, f"Cleared only optional criterion {key}.")
+        return True, True
+
+    if kind == "detail_number_text":
+        draft = _draft(state)
+        try:
+            number = int(str(value))
+        except ValueError:
+            number = 0
+        if number <= 0 or str(number) != str(value).strip():
+            _effect(state, f"{value!r} is not one whole number greater than zero; no change.")
+            return False, True
+        draft["criteria"]["number_players"] = number
+        draft["stage"] = "details_hub"
+        draft["detail_key"] = None
+        draft["temp_edit"] = None
+        _effect(state, f"Committed Number of Players={number}; unrelated values preserved.")
+        return True, True
+
+    if kind == "open_exact_time":
+        draft = _draft(state)
+        draft["nested_snapshot"] = deepcopy(draft["temp_edit"])
+        draft["nested_kind"] = "exact_time"
+        draft["stage"] = "detail_nested"
+        _effect(state, "Opened exact-time input; confirmed Time remains unchanged.")
+        return True, True
+
+    if kind == "exact_time_text":
+        if not _valid_clock(str(value)):
+            _effect(state, f"Exact time {value!r} is invalid; confirmed Time unchanged.")
+            return False, True
+        draft = _draft(state)
+        draft["criteria"]["time"] = {"exact": str(value).strip()}
+        _finish_detail(draft)
+        _effect(state, f"Committed exact local time {value}; unrelated values preserved.")
+        return True, True
+
+    if kind == "select_time_part":
+        draft = _draft(state)
+        draft["criteria"]["time"] = {"day_part": value}
+        _finish_detail(draft)
+        _effect(state, f"Committed qualitative Time={value}; exact Time was replaced.")
+        return True, True
+
+    if kind == "seasonal_ready_now":
+        draft = _draft(state)
+        draft["temp_edit"] = {"kind": "ready_now"}
+        _effect(state, "Set temporary Seasonal Timing=ready_now; press Done to commit.")
+        return True, True
+
+    if kind in {"open_seasonal_date", "open_seasonal_text"}:
+        draft = _draft(state)
+        draft["nested_snapshot"] = deepcopy(draft["temp_edit"])
+        draft["nested_kind"] = (
+            "seasonal_date" if kind == "open_seasonal_date" else "seasonal_text"
+        )
+        draft["stage"] = "detail_nested"
+        _effect(state, "Opened nested Seasonal Timing input; confirmed value unchanged.")
+        return True, True
+
+    if kind == "seasonal_nested_text":
+        draft = _draft(state)
+        if draft["nested_kind"] == "seasonal_date":
+            parsed = _parse_date_range(str(value))
+            if parsed is None or parsed[0] != parsed[1]:
+                _effect(state, f"{value!r} is not one valid local date; no change.")
+                return False, True
+            draft["temp_edit"] = {"kind": "start_date", "value": parsed[0].isoformat()}
+        elif not str(value).strip():
+            _effect(state, "An empty season is invalid; no change.")
+            return False, True
+        else:
+            draft["temp_edit"] = {"kind": "stated_season", "value": str(value).strip()}
+        draft["stage"] = "detail"
+        draft["nested_kind"] = None
+        draft["nested_snapshot"] = None
+        _effect(state, "Nested Seasonal Timing candidate stored temporarily; press Done to commit.")
+        return True, True
+
+    if kind == "schedule_open_nested":
+        draft = _draft(state)
+        if (
+            value == "schedule_interval_input"
+            and draft["nested_kind"] == "schedule_time"
+        ):
+            draft["nested_parent"] = "schedule_time"
+            draft["nested_parent_snapshot"] = deepcopy(draft["temp_edit"])
+        else:
+            draft["nested_snapshot"] = deepcopy(draft["temp_edit"])
+            draft["nested_parent"] = None
+            draft["nested_parent_snapshot"] = None
+        draft["nested_kind"] = value
+        draft["stage"] = "detail_nested"
+        _effect(state, f"Opened nested Schedule editor {value}; confirmed Schedule unchanged.")
+        return True, True
+
+    if kind == "schedule_toggle":
+        draft = _draft(state)
+        group = "days" if draft["nested_kind"] == "schedule_days" else "day_parts"
+        values = draft["temp_edit"].setdefault(group, [])
+        if value in values:
+            values.remove(value)
+        else:
+            values.append(value)
+        if group == "day_parts" and values:
+            draft["temp_edit"]["exact_interval"] = None
+        _effect(state, f"Toggled temporary Schedule {group} value {value}.")
+        return True, True
+
+    if kind == "schedule_interval_text":
+        draft = _draft(state)
+        parts = [part.strip() for part in str(value).split("-")]
+        if len(parts) != 2 or not all(_valid_clock(part) for part in parts):
+            _effect(state, f"Interval {value!r} is invalid; no change.")
+            return False, True
+        draft["temp_edit"]["exact_interval"] = parts
+        draft["temp_edit"]["day_parts"] = []
+        draft["stage"] = "detail_nested"
+        draft["nested_kind"] = draft["nested_parent"] or "schedule_time"
+        draft["nested_parent"] = None
+        draft["nested_parent_snapshot"] = None
+        _effect(
+            state,
+            "Exact Schedule interval stored temporarily; day parts cleared. "
+            "Returned to the parent Time submenu.",
+        )
+        return True, True
+
+    if kind == "schedule_start_text":
+        draft = _draft(state)
+        parsed = _parse_date_range(str(value))
+        if parsed is None or parsed[0] != parsed[1]:
+            _effect(state, f"Schedule start {value!r} is invalid; no change.")
+            return False, True
+        draft["temp_edit"]["start_date"] = parsed[0].isoformat()
+        draft["stage"] = "detail"
+        draft["nested_kind"] = None
+        draft["nested_snapshot"] = None
+        draft["nested_parent"] = None
+        draft["nested_parent_snapshot"] = None
+        _effect(state, "Schedule start date stored temporarily; confirmed Schedule unchanged.")
+        return True, True
+
+    if kind == "schedule_clear_start":
+        draft = _draft(state)
+        draft["temp_edit"]["start_date"] = None
+        draft["stage"] = "detail"
+        draft["nested_kind"] = None
+        draft["nested_snapshot"] = None
+        draft["nested_parent"] = None
+        draft["nested_parent_snapshot"] = None
+        _effect(state, "Cleared temporary Schedule start date.")
+        return True, True
+
+    if kind == "done_nested":
+        draft = _draft(state)
+        draft["stage"] = "detail"
+        draft["nested_kind"] = None
+        draft["nested_snapshot"] = None
+        draft["nested_parent"] = None
+        draft["nested_parent_snapshot"] = None
+        _effect(state, "Done kept nested changes in submenu temporary state; not yet committed.")
+        return True, True
+
+    if kind == "back_nested":
+        draft = _draft(state)
+        if draft["nested_parent"]:
+            parent = draft["nested_parent"]
+            draft["temp_edit"] = deepcopy(draft["nested_parent_snapshot"])
+            draft["nested_kind"] = parent
+            draft["nested_parent"] = None
+            draft["nested_parent_snapshot"] = None
+            draft["stage"] = "detail_nested"
+            _effect(
+                state,
+                "Back discarded nested free-text edits and returned to its parent submenu.",
+            )
+        else:
+            draft["temp_edit"] = deepcopy(draft["nested_snapshot"])
+            draft["stage"] = "detail"
+            draft["nested_kind"] = None
+            draft["nested_snapshot"] = None
+            _effect(state, "Back discarded nested edits; confirmed criterion remains unchanged.")
+        return True, True
+
+    if kind == "search":
+        draft = _draft(state)
+        if draft["status"] == "submitting":
+            _effect(state, "Duplicate Search action ignored while submission is in flight.")
+            return False, False
+        if not _core_ready(draft):
+            _effect(state, "Search blocked because the required discovery core is incomplete/expired.")
+            return False, True
+        draft["status"] = "submitting"
+        draft["stage"] = "submitting"
+        draft["last_search_error"] = None
+        _effect(
+            state,
+            "First Search accepted atomically; inline actions disabled and typing indicator shown.",
+        )
+        return True, True
+
+    if kind == "system_search_success":
+        draft = state["draft"]
+        if not draft or draft["status"] != "submitting":
+            _effect(state, "LAB completion ignored because no Search is submitting.")
+            return False, False
+        snapshot = {
+            "id": f"search-{len(state['completed_searches']) + 1}",
+            "user_intent": draft["user_intent"],
+            "search_area": {
+                "country": draft["country"],
+                "city": draft["city"],
+                "area_mode": draft["area_mode"],
+                "areas": deepcopy(draft["areas"]),
+            },
+            "required_date": deepcopy(draft["required_date"]),
+            "criteria": deepcopy(draft["criteria"]),
+            "result_count": "boundary-only",
+        }
+        state["completed_searches"].append(snapshot)
+        state["draft"] = None
+        state["surface"] = "result_boundary"
+        _effect(
+            state,
+            "Search succeeded (zero results would also count): immutable snapshot stored, "
+            "draft closed, native Menu restored. Result content stays out of scope.",
+        )
+        return True, True
+
+    if kind == "system_search_failure":
+        draft = state["draft"]
+        if not draft or draft["status"] != "submitting":
+            _effect(state, "LAB failure ignored because no Search is submitting.")
+            return False, False
+        draft["status"] = "editing"
+        draft["stage"] = "post_core"
+        draft["last_search_error"] = "technical_failure"
+        state["surface"] = "draft"
+        _effect(
+            state,
+            "Technical Search failure: draft and every confirmed input preserved; Retry available.",
+        )
+        return True, True
+
+    if kind == "main_new_search":
+        if state["draft"] and state["draft"]["paused"]:
+            state["superseded_drafts"] += 1
+            superseded = state["draft"]["id"]
+        else:
+            superseded = None
+        state["draft"] = new_draft(state, "repeated")
+        state["surface"] = "draft"
+        _effect(
+            state,
+            (
+                f"Current New search atomically superseded paused {superseded}; "
+                "fresh draft contains no copied inputs."
+                if superseded
+                else "Current New search created a fresh repeated-search draft with no copied inputs."
+            ),
+        )
+        return True, True
+
+    if kind == "main_results":
+        state["callback_notice"] = (
+            "PROTOTYPE BOUNDARY: search-results menu is intentionally not defined here."
+        )
+        _effect(state, "Search results action stopped at the explicit out-of-scope boundary.")
+        return False, False
+
+    if kind == "main_settings":
+        state["surface"] = "settings"
+        _effect(state, "Opened Settings; paused draft, if any, remains durable.")
+        return True, True
+
+    if kind == "settings_language":
+        state["surface"] = "settings_language"
+        _effect(state, "Opened Settings language selector; saved language unchanged.")
+        return True, True
+
+    if kind == "settings_support":
+        state["callback_notice"] = "OPEN URL: https://telegram.me/myfootball_support_bot"
+        _effect(state, "Support URL opened; Settings remains the current view.")
+        return False, False
+
+    if kind == "settings_mode":
+        state["surface"] = "mode"
+        _effect(state, "Opened Mode submenu.")
+        return True, True
+
+    if kind == "settings_premium":
+        state["callback_notice"] = "Premium will be available later (MVP placeholder)."
+        _effect(state, "Premium placeholder changed no state and created no message.")
+        return False, False
+
+    if kind == "settings_back":
+        state["surface"] = "main_menu"
+        _effect(state, "Back from Settings rendered a new Main Menu.")
+        return True, True
+
+    if kind == "mode_search":
+        state["callback_notice"] = "Search is already the active MVP mode."
+        _effect(state, "Checked Search mode remained unchanged.")
+        return False, False
+
+    if kind == "mode_feed":
+        state["callback_notice"] = "Feed will be available after the MVP."
+        _effect(state, "Feed placeholder changed no state and created no message.")
+        return False, False
+
+    if kind == "mode_back":
+        state["surface"] = "settings"
+        _effect(state, "Back from Mode → Settings.")
+        return True, True
+
+    if kind == "settings_language_back":
+        state["surface"] = "settings"
+        _effect(state, "Back from language selector → Settings; language unchanged.")
+        return True, True
+
+    if kind == "text":
+        _effect(state, f"Text {value!r} is not valid for the current logical screen; no state changed.")
+        return False, True
+
+    _effect(state, f"Unhandled event {kind}; no state changed.")
+    return False, True
+
+
+def _draft(state: dict[str, Any]) -> dict[str, Any]:
+    if not state["draft"]:
+        raise RuntimeError("Prototype event expected an active Discovery Draft")
+    return state["draft"]
+
+
+def _clear_for_intent_replacement(draft: dict[str, Any]) -> None:
+    draft["country"] = None
+    draft["city"] = None
+    draft["area_mode"] = None
+    draft["areas"] = []
+    draft["required_date"] = None
+    draft["criteria"] = {}
+    draft["last_search_error"] = None
+
+
+def _clear_for_parent_geography_replacement(
+    draft: dict[str, Any], *, clear_city: bool
+) -> None:
+    if clear_city:
+        draft["city"] = None
+    draft["area_mode"] = None
+    draft["areas"] = []
+    draft["required_date"] = None
+
+    time_value = draft["criteria"].get("time")
+    if isinstance(time_value, dict) and "exact" in time_value:
+        draft["criteria"].pop("time", None)
+
+    schedule = draft["criteria"].get("schedule")
+    if isinstance(schedule, dict):
+        schedule["exact_interval"] = None
+        schedule["start_date"] = None
+        if not schedule.get("days") and not schedule.get("day_parts"):
+            draft["criteria"].pop("schedule", None)
+
+    seasonal = draft["criteria"].get("seasonal_timing")
+    if isinstance(seasonal, dict) and seasonal.get("kind") == "start_date":
+        draft["criteria"].pop("seasonal_timing", None)
+
+
+def _advance_after_area(draft: dict[str, Any]) -> None:
+    draft["stage"] = (
+        "required_date" if draft["user_intent"] in DATE_REQUIRED else "post_core"
+    )
+
+
+def _commit_required_date(
+    state: dict[str, Any], start: date, end: date
+) -> tuple[bool, bool]:
+    draft = _draft(state)
+    old = deepcopy(draft["required_date"])
+    draft["required_date"] = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "timezone": "selected-city",
+    }
+    draft["stage"] = "post_core"
+    draft["temp_edit"] = None
+    _effect(
+        state,
+        f"Required date {old or '∅'} → {draft['required_date']}; only the core date changed.",
+    )
+    return True, True
+
+
+def _initial_detail_edit(key: str, confirmed: Any) -> Any:
+    mode = DETAIL_SPECS[key]["mode"]
+    if confirmed is not None:
+        return deepcopy(confirmed)
+    if mode == "multi":
+        return []
+    if mode == "seasonal":
+        return {}
+    if mode == "schedule":
+        return {
+            "days": [],
+            "day_parts": [],
+            "exact_interval": None,
+            "start_date": None,
+        }
+    return None
+
+
+def _commit_detail(draft: dict[str, Any], key: str, value: Any) -> None:
+    empty = value in (None, [], {}, "")
+    if key == "schedule" and isinstance(value, dict):
+        empty = not any(
+            [
+                value.get("days"),
+                value.get("day_parts"),
+                value.get("exact_interval"),
+                value.get("start_date"),
+            ]
+        )
+    if empty:
+        draft["criteria"].pop(key, None)
+    else:
+        draft["criteria"][key] = deepcopy(value)
+
+
+def _finish_detail(draft: dict[str, Any]) -> None:
+    draft["stage"] = "details_hub"
+    draft["detail_key"] = None
+    draft["temp_edit"] = None
+    draft["nested_kind"] = None
+    draft["nested_snapshot"] = None
+    draft["nested_parent"] = None
+    draft["nested_parent_snapshot"] = None
+
+
+def _core_ready(draft: dict[str, Any]) -> bool:
+    area_ready = draft["area_mode"] == "whole_city" or (
+        draft["area_mode"] == "areas" and bool(draft["areas"])
+    )
+    if not all([draft["user_intent"], draft["country"], draft["city"], area_ready]):
+        return False
+    if draft["user_intent"] not in DATE_REQUIRED:
+        return True
+    required = draft["required_date"]
+    return bool(required and date.fromisoformat(required["end"]) >= FROZEN_TODAY)
+
+
+def _replace_view(state: dict[str, Any], *, reason: str) -> None:
+    state["logical_revision"] += 1
+    revision = state["logical_revision"]
+    if state["debug"]["fail_next_render"]:
+        state["debug"]["fail_next_render"] = False
+        _log(
+            state,
+            f"RENDER FAILURE at revision {revision}: logical state persisted, "
+            "previous Active Chat View protected.",
+        )
+        state["last_effect"] += (
+            " Replacement rendering failed; previous current view remains visible "
+            "while its controls are stale."
+        )
+        return
+
+    screen = build_screen(state)
+    old = state["active_view"]
+    if old is not None:
+        old["current"] = False
+        if old.get("deleted_by_user"):
+            old["cleanup"] = "already deleted by Bot User"
+            old["buttons"] = []
+        elif state["debug"]["keep_next_old_view"]:
+            old["cleanup"] = "survived; old callbacks still visible (LAB)"
+            state["debug"]["keep_next_old_view"] = False
+        else:
+            old["cleanup"] = "deleted best effort"
+            old["buttons"] = []
+        state["old_views"].append(old)
+        state["old_views"] = state["old_views"][-8:]
+
+    message_id = state["next_message_id"]
+    state["next_message_id"] += 1
+    state["active_view"] = {
+        "message_id": message_id,
+        "revision": revision,
+        "current": True,
+        "deleted_by_user": False,
+        "cleanup": "PROTECTED CURRENT VIEW",
+        "reason": reason,
+        **screen,
+    }
+    _log(state, f"Rendered message {message_id} for revision {revision} ({reason}).")
+
+
+def build_screen(state: dict[str, Any]) -> dict[str, Any]:
+    locale = display_locale(state)
+    surface = state["surface"]
+    if surface == "language":
+        return _screen(
+            WELCOME[locale],
+            [
+                _button("English", "set_language", "en"),
+                _button("Español", "set_language", "es"),
+                _button("Français", "set_language", "fr"),
+                _button("Русский", "set_language", "ru"),
+                _button(LANGUAGE_BUTTON[locale], "open_language_free"),
+            ],
+        )
+    if surface in {"language_free", "settings_language_free"}:
+        return _screen(
+            LANGUAGE_FREE_PROMPT[locale] + "\n\n"
+            "[PROTOTYPE INPUT] Try English / Español / Français / Русский; "
+            "`?ambiguous` leaves state unchanged.",
+            [_button(tr(state, "back"), "back_language_free")],
+            expects_text="language",
+        )
+    if surface == "main_menu":
+        return _screen(
+            {
+                "ru": "Главное меню",
+                "en": "Main Menu",
+                "es": "Menú principal",
+                "fr": "Menu principal",
+            }[locale],
+            [
+                _button(tr(state, "new_search"), "main_new_search"),
+                _button(tr(state, "search_results"), "main_results"),
+                _button(tr(state, "settings"), "main_settings"),
+            ],
+            reply_menu=bool(state["completed_searches"]),
+        )
+    if surface == "settings":
+        return _screen(
+            tr(state, "settings"),
+            [
+                _button(tr(state, "language"), "settings_language"),
+                _button(tr(state, "support"), "settings_support"),
+                _button(tr(state, "mode"), "settings_mode"),
+                _button(tr(state, "premium"), "settings_premium"),
+                _button(tr(state, "back"), "settings_back"),
+            ],
+            reply_menu=bool(state["completed_searches"]),
+        )
+    if surface == "settings_language":
+        return _screen(
+            tr(state, "language"),
+            [
+                _button("English", "set_language", "en"),
+                _button("Español", "set_language", "es"),
+                _button("Français", "set_language", "fr"),
+                _button("Русский", "set_language", "ru"),
+                _button(LANGUAGE_BUTTON[locale], "open_language_free"),
+                _button(tr(state, "back"), "settings_language_back"),
+            ],
+            reply_menu=bool(state["completed_searches"]),
+        )
+    if surface == "mode":
+        return _screen(
+            tr(state, "mode"),
+            [
+                _button("✅ " + tr(state, "search"), "mode_search"),
+                _button(
+                    L("Лента", "Feed", "Feed", "Fil")[locale],
+                    "mode_feed",
+                ),
+                _button(tr(state, "back"), "mode_back"),
+            ],
+            reply_menu=bool(state["completed_searches"]),
+        )
+    if surface == "result_boundary":
+        return _screen(
+            {
+                "ru": (
+                    "✅ Поиск завершён.\n\n"
+                    "⛔ ГРАНИЦА ПРОТОТИПА: matching, карточки результатов "
+                    "и меню результатов здесь не определяются."
+                ),
+                "en": (
+                    "✅ Search completed.\n\n"
+                    "⛔ PROTOTYPE BOUNDARY: matching, result cards, and the "
+                    "results menu are not defined here."
+                ),
+                "es": (
+                    "✅ Búsqueda completada.\n\n"
+                    "⛔ LÍMITE DEL PROTOTIPO: aquí no se definen matching, "
+                    "tarjetas ni el menú de resultados."
+                ),
+                "fr": (
+                    "✅ Recherche terminée.\n\n"
+                    "⛔ LIMITE DU PROTOTYPE : le matching, les fiches et le "
+                    "menu des résultats ne sont pas définis ici."
+                ),
+            }[locale],
+            [],
+            reply_menu=True,
+        )
+    if surface == "idle":
+        return _screen(
+            "The Discovery Draft expired silently. Send /start to create a new flow.",
+            [],
+            reply_menu=bool(state["completed_searches"]),
+        )
+    return _build_draft_screen(state)
+
+
+def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
+    draft = _draft(state)
+    locale = display_locale(state)
+    stage = draft["stage"]
+    reply_menu = False
+
+    if stage == "direction":
+        buttons = [
+            _button(item["label"][locale], f"select_{item['kind']}", item["id"])
+            for item in DIRECTIONS
+        ]
+        for button in buttons:
+            if button["kind"] == "select_branch":
+                button["kind"] = "open_branch"
+            else:
+                button["kind"] = "select_intent"
+        buttons.append(_button(tr(state, "back"), "back_direction"))
+        return _screen(LANGUAGE_CONFIRMATION[locale], buttons)
+
+    if stage == "branch":
+        branch = BRANCHES[draft["branch"]]
+        buttons = [
+            _button(label[locale], "select_intent", intent)
+            for intent, label in branch["intents"]
+        ]
+        buttons.append(_button(tr(state, "back"), "back_branch"))
+        return _screen(branch["heading"][locale], buttons)
+
+    if stage == "country":
+        text = COUNTRY_PROMPTS[draft["user_intent"]][locale] + "\n\n" + {
+            "ru": "Напишите название страны.",
+            "en": "Type the country name.",
+            "es": "Escriba el nombre del país.",
+            "fr": "Saisissez le nom du pays.",
+        }[locale]
+        return _screen(
+            text + "\n\n[LAB INPUT] `?ambiguous` or `?invalid` must change nothing.",
+            [_button(tr(state, "back"), "back_country")],
+            expects_text="country",
+        )
+
+    if stage == "city":
+        country = _country_name(draft["country"], locale)
+        text = {
+            "ru": f"✅ Страна поиска: {country}.\n\n🏙 В каком городе ищем?",
+            "en": f"✅ Search country: {country}.\n\n🏙 Which city should we search?",
+            "es": f"✅ País de búsqueda: {country}.\n\n🏙 ¿En qué ciudad buscamos?",
+            "fr": f"✅ Pays de recherche : {country}.\n\n🏙 Dans quelle ville cherchons-nous ?",
+        }[locale]
+        return _screen(
+            text + "\n\n[LAB INPUT] `?ambiguous` or `?invalid` must change nothing.",
+            [_button(tr(state, "back"), "back_city")],
+            expects_text="city",
+        )
+
+    if stage == "areas":
+        city = _city_name(draft["country"], draft["city"], locale)
+        text = {
+            "ru": f"📍 Где именно в {city} ищем?",
+            "en": f"📍 Where exactly in {city} should we search?",
+            "es": f"📍 ¿Dónde exactamente en {city} buscamos?",
+            "fr": f"📍 Où exactement à {city} cherchons-nous ?",
+        }[locale]
+        return _screen(
+            text,
+            [
+                _button(tr(state, "whole_city"), "whole_city"),
+                _button(tr(state, "choose_areas"), "open_area_editor"),
+                _button(tr(state, "back"), "back_areas"),
+            ],
+        )
+
+    if stage == "areas_edit":
+        candidates = _area_candidates(draft["city"], locale)
+        selected = set(draft["temp_edit"])
+        buttons = [
+            _button(("☑ " if key in selected else "☐ ") + label, "toggle_area", key)
+            for key, label in candidates
+        ]
+        buttons += [
+            _button(tr(state, "done"), "done_areas"),
+            _button(tr(state, "back"), "back_area_editor"),
+        ]
+        return _screen(
+            {
+                "ru": "📍 Выберите один или несколько районов/мест.",
+                "en": "📍 Choose one or more areas/places.",
+                "es": "📍 Elija una o varias zonas/lugares.",
+                "fr": "📍 Choisissez une ou plusieurs zones/lieux.",
+            }[locale],
+            buttons,
+        )
+
+    if stage == "required_date":
+        return _screen(
+            L("📅 Когда?", "📅 When?", "📅 ¿Cuándo?", "📅 Quand ?")[locale],
+            [
+                _button(tr(state, "today"), "date_today"),
+                _button(tr(state, "tomorrow"), "date_tomorrow"),
+                _button(tr(state, "choose_date"), "open_date_input"),
+                _button(tr(state, "back"), "back_required_date"),
+            ],
+        )
+
+    if stage == "date_input":
+        return _screen(
+            {
+                "ru": "Введите YYYY-MM-DD или YYYY-MM-DD..YYYY-MM-DD.",
+                "en": "Enter YYYY-MM-DD or YYYY-MM-DD..YYYY-MM-DD.",
+                "es": "Introduzca YYYY-MM-DD o YYYY-MM-DD..YYYY-MM-DD.",
+                "fr": "Saisissez YYYY-MM-DD ou YYYY-MM-DD..YYYY-MM-DD.",
+            }[locale],
+            [_button(tr(state, "back"), "back_date_input")],
+            expects_text="date",
+        )
+
+    if stage == "post_core":
+        error = ""
+        if draft["last_search_error"]:
+            error = {
+                "ru": "⚠️ Техническая ошибка. Все ответы сохранены.\n\n",
+                "en": "⚠️ Technical failure. Every answer was preserved.\n\n",
+                "es": "⚠️ Error técnico. Se conservaron todas las respuestas.\n\n",
+                "fr": "⚠️ Erreur technique. Toutes les réponses ont été conservées.\n\n",
+            }[locale]
+        text = error + L(
+            "Можно уточнить детали или сразу начать поиск.",
+            "You can add details or start searching now.",
+            "Puedes añadir detalles o empezar a buscar ahora.",
+            "Vous pouvez ajouter des détails ou lancer la recherche maintenant.",
+        )[locale]
+        buttons = [
+            _button(tr(state, "back"), "back_post_core"),
+            _button(tr(state, "details"), "open_details"),
+        ]
+        if _core_ready(draft):
+            buttons.append(
+                _button(
+                    tr(state, "retry") if draft["last_search_error"] else tr(state, "search"),
+                    "search",
+                )
+            )
+        else:
+            text += "\n\n⛔ Search is blocked until the required core is valid again."
+        return _screen(text, buttons)
+
+    if stage == "details_hub":
+        detail_keys = DETAIL_ORDER[draft["user_intent"]]
+        lines = [
+            L(
+                "Можно выбрать следующие настройки:",
+                "You can choose the following settings:",
+                "Puedes elegir las siguientes opciones:",
+                "Vous pouvez choisir les paramètres suivants :",
+            )[locale],
+            "",
+        ]
+        buttons = []
+        for key in detail_keys:
+            name = DETAIL_NAMES[key][locale]
+            summary = _criterion_summary(draft["criteria"].get(key), locale)
+            lines.append(f"- {name}: {summary}")
+            buttons.append(_button(f"{name}: {summary} ▸", "open_detail", key))
+        buttons += [
+            _button(tr(state, "back"), "back_details_hub"),
+            _button(tr(state, "search"), "search"),
+        ]
+        return _screen("\n".join(lines), buttons)
+
+    if stage == "detail":
+        return _build_detail_screen(state)
+
+    if stage == "detail_nested":
+        return _build_nested_screen(state)
+
+    if stage == "submitting":
+        return _screen(
+            {
+                "ru": "⌨️ Telegram typing…\n\nПоиск отправляется. Inline-действия отключены.",
+                "en": "⌨️ Telegram typing…\n\nSearch is submitting. Inline actions are disabled.",
+                "es": "⌨️ Telegram typing…\n\nLa búsqueda se está enviando. Acciones desactivadas.",
+                "fr": "⌨️ Telegram typing…\n\nLa recherche est envoyée. Actions désactivées.",
+            }[locale],
+            [],
+            typing=True,
+        )
+
+    return _screen(f"Unknown prototype stage: {stage}", [])
+
+
+def _build_detail_screen(state: dict[str, Any]) -> dict[str, Any]:
+    draft = _draft(state)
+    locale = display_locale(state)
+    key = draft["detail_key"]
+    spec = DETAIL_SPECS[key]
+    mode = spec["mode"]
+    title = DETAIL_NAMES[key][locale]
+
+    if mode == "multi":
+        selected = set(draft["temp_edit"])
+        buttons = [
+            _button(
+                ("☑ " if value in selected else "☐ ") + value_label(value, locale),
+                "toggle_detail",
+                value,
+            )
+            for value in spec["values"]
+        ]
+        buttons += [
+            _button(tr(state, "done"), "done_detail"),
+            _button(tr(state, "back"), "back_detail"),
+        ]
+        return _screen(title + "\n\nTemporary selection — Done commits, Back discards.", buttons)
+
+    if mode == "single":
+        buttons = [
+            _button(value_label(value, locale), "select_single_detail", value)
+            for value in spec["values"]
+        ]
+        buttons += [
+            _button(tr(state, "any"), "clear_single_detail"),
+            _button(tr(state, "back"), "back_detail"),
+        ]
+        return _screen(title + "\n\nOne answer commits immediately.", buttons)
+
+    if mode == "number":
+        return _screen(
+            title
+            + "\n\n"
+            + L(
+                "Отправьте одно целое число больше нуля.",
+                "Send one whole number greater than zero.",
+                "Envía un número entero mayor que cero.",
+                "Envoyez un nombre entier supérieur à zéro.",
+            )[locale],
+            [
+                _button(tr(state, "any"), "clear_single_detail"),
+                _button(tr(state, "back"), "back_detail"),
+            ],
+            expects_text="detail_number",
+        )
+
+    if mode == "time":
+        return _screen(
+            title,
+            [
+                _button(
+                    L(
+                        "Указать точное время",
+                        "Enter exact time",
+                        "Indicar hora exacta",
+                        "Indiquer l’heure exacte",
+                    )[locale],
+                    "open_exact_time",
+                ),
+                *[
+                    _button(value_label(part, locale), "select_time_part", part)
+                    for part in ["morning", "daytime", "evening", "night"]
+                ],
+                _button(tr(state, "any"), "clear_single_detail"),
+                _button(tr(state, "back"), "back_detail"),
+            ],
+        )
+
+    if mode == "seasonal":
+        return _screen(
+            title + "\n\nTemporary mutually exclusive value — Done commits.",
+            [
+                _button(value_label("ready_now", locale), "seasonal_ready_now"),
+                _button(
+                    L(
+                        "Указать дату начала",
+                        "Enter a start date",
+                        "Indicar fecha de inicio",
+                        "Indiquer la date de début",
+                    )[locale],
+                    "open_seasonal_date",
+                ),
+                _button(
+                    L(
+                        "Указать сезон",
+                        "Enter a season",
+                        "Indicar temporada",
+                        "Indiquer la saison",
+                    )[locale],
+                    "open_seasonal_text",
+                ),
+                _button(tr(state, "done"), "done_detail"),
+                _button(tr(state, "back"), "back_detail"),
+            ],
+        )
+
+    if mode == "schedule":
+        temp = draft["temp_edit"]
+        return _screen(
+            title
+            + "\n\n"
+            + f"days={temp.get('days', [])}\n"
+            + f"day_parts={temp.get('day_parts', [])}\n"
+            + f"exact_interval={temp.get('exact_interval')}\n"
+            + f"start_date={temp.get('start_date')}",
+            [
+                _button("Days of week ▸", "schedule_open_nested", "schedule_days"),
+                _button("Time ▸", "schedule_open_nested", "schedule_time"),
+                _button("Start date ▸", "schedule_open_nested", "schedule_start"),
+                _button(tr(state, "done"), "done_detail"),
+                _button(tr(state, "back"), "back_detail"),
+            ],
+        )
+
+    return _screen(title, [_button(tr(state, "back"), "back_detail")])
+
+
+def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
+    draft = _draft(state)
+    locale = display_locale(state)
+    nested = draft["nested_kind"]
+
+    if nested == "exact_time":
+        return _screen(
+            L(
+                "Введите точное местное время выбранного города (HH:MM).",
+                "Enter the exact local time in the selected city (HH:MM).",
+                "Introduzca la hora local exacta de la ciudad seleccionada (HH:MM).",
+                "Indiquez l’heure locale exacte dans la ville sélectionnée (HH:MM).",
+            )[locale],
+            [_button(tr(state, "back"), "back_nested")],
+            expects_text="exact_time",
+        )
+
+    if nested in {"seasonal_date", "seasonal_text"}:
+        prompt = (
+            "Enter one local date as YYYY-MM-DD."
+            if nested == "seasonal_date"
+            else "Enter a localized season name."
+        )
+        return _screen(
+            prompt,
+            [_button(tr(state, "back"), "back_nested")],
+            expects_text="seasonal",
+        )
+
+    if nested == "schedule_days":
+        selected = set(draft["temp_edit"].get("days", []))
+        buttons = [
+            _button(
+                ("☑ " if day in selected else "☐ ") + value_label(day, locale),
+                "schedule_toggle",
+                day,
+            )
+            for day in ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+        ]
+        buttons += [
+            _button(tr(state, "done"), "done_nested"),
+            _button(tr(state, "back"), "back_nested"),
+        ]
+        return _screen("Schedule — days (temporary)", buttons)
+
+    if nested == "schedule_time":
+        selected = set(draft["temp_edit"].get("day_parts", []))
+        buttons = [
+            _button(
+                ("☑ " if part in selected else "☐ ") + value_label(part, locale),
+                "schedule_toggle",
+                part,
+            )
+            for part in ["morning", "daytime", "evening", "night"]
+        ]
+        buttons.append(
+            _button(
+                "Enter exact interval"
+                + (
+                    f": {draft['temp_edit']['exact_interval']}"
+                    if draft["temp_edit"].get("exact_interval")
+                    else ""
+                ),
+                "schedule_open_nested",
+                "schedule_interval_input",
+            )
+        )
+        buttons += [
+            _button(tr(state, "done"), "done_nested"),
+            _button(tr(state, "back"), "back_nested"),
+        ]
+        return _screen("Schedule — time (temporary)", buttons)
+
+    if nested == "schedule_interval_input":
+        return _screen(
+            "Enter one exact local interval as HH:MM-HH:MM.",
+            [_button(tr(state, "back"), "back_nested")],
+            expects_text="schedule_interval",
+        )
+
+    if nested == "schedule_start":
+        return _screen(
+            "Enter one local start date as YYYY-MM-DD, or clear it.",
+            [
+                _button(tr(state, "any"), "schedule_clear_start"),
+                _button(tr(state, "back"), "back_nested"),
+            ],
+            expects_text="schedule_start",
+        )
+
+    return _screen("Unknown nested editor", [_button(tr(state, "back"), "back_nested")])
+
+
+def _screen(
+    text: str,
+    buttons: list[dict[str, Any]],
+    *,
+    reply_menu: bool = False,
+    typing: bool = False,
+    expects_text: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "text": text,
+        "buttons": buttons,
+        "reply_menu": reply_menu,
+        "typing": typing,
+        "expects_text": expects_text,
+    }
+
+
+def _button(label: str, kind: str, value: Any = None) -> dict[str, Any]:
+    return {"label": label, "kind": kind, "value": value}
+
+
+def event_for_button(
+    state: dict[str, Any], button: dict[str, Any], update_id: int
+) -> dict[str, Any]:
+    active = state["active_view"]
+    return {
+        "kind": button["kind"],
+        "value": button.get("value"),
+        "update_id": update_id,
+        "source_revision": active["revision"] if active else None,
+        "source": "inline_callback",
+    }
+
+
+def event_for_text(state: dict[str, Any], value: str, update_id: int) -> dict[str, Any]:
+    active = state["active_view"]
+    expected = active.get("expects_text") if active else None
+    kind_by_input = {
+        "language": "language_free_text",
+        "country": "country_text",
+        "city": "city_text",
+        "date": "date_text",
+        "detail_number": "detail_number_text",
+        "exact_time": "exact_time_text",
+        "seasonal": "seasonal_nested_text",
+        "schedule_interval": "schedule_interval_text",
+        "schedule_start": "schedule_start_text",
+    }
+    return {
+        "kind": kind_by_input.get(expected, "text"),
+        "value": value,
+        "update_id": update_id,
+        "source_revision": active["revision"] if active else None,
+        "source": "text_message",
+    }
+
+
+def _criterion_summary(value: Any, locale: str) -> str:
+    if value in (None, [], {}, ""):
+        return COPY["not_set"][locale]
+    if isinstance(value, list):
+        return ", ".join(value_label(item, locale) for item in value)
+    if isinstance(value, dict):
+        if "day_part" in value:
+            return value_label(value["day_part"], locale)
+        if "exact" in value:
+            return value["exact"]
+        if value.get("kind") == "ready_now":
+            return value_label("ready_now", locale)
+        return ", ".join(f"{key}={part}" for key, part in value.items() if part)
+    return str(value)
+
+
+def state_lines(state: dict[str, Any]) -> list[str]:
+    account = state["account"]
+    draft = state["draft"]
+    active = state["active_view"]
+    lines = [
+        f"account.locale={account['locale']!r} source={account['locale_source']!r} "
+        f"telegram_hint={account['telegram_hint']!r}",
+        f"surface={state['surface']!r} logical_revision={state['logical_revision']}",
+        f"completed_searches={len(state['completed_searches'])} "
+        f"superseded_drafts={state['superseded_drafts']}",
+    ]
+    if draft:
+        lines += [
+            f"draft={draft['id']} origin={draft['origin']} paused={draft['paused']} "
+            f"status={draft['status']} stage={draft['stage']}",
+            f"branch={draft['branch']!r} user_intent={draft['user_intent']!r}",
+            f"country={draft['country']!r} city={draft['city']!r} "
+            f"area_mode={draft['area_mode']!r} areas={draft['areas']!r}",
+            f"required_date={draft['required_date']!r}",
+            f"criteria={draft['criteria']!r}",
+            f"editing detail={draft['detail_key']!r} temp={draft['temp_edit']!r} "
+            f"nested={draft['nested_kind']!r} nested_parent={draft['nested_parent']!r}",
+            f"last_search_error={draft['last_search_error']!r}",
+        ]
+    else:
+        lines.append("draft=None")
+    if active:
+        lines += [
+            f"active_view=message#{active['message_id']} revision={active['revision']} "
+            f"deleted_by_user={active['deleted_by_user']} cleanup={active['cleanup']!r}",
+            f"active_view_matches_logical_revision="
+            f"{active['revision'] == state['logical_revision']}",
+        ]
+    else:
+        lines.append("active_view=None")
+    old = state["old_views"][-2:]
+    lines.append(
+        "old_views="
+        + repr(
+            [
+                {
+                    "message": item["message_id"],
+                    "revision": item["revision"],
+                    "cleanup": item["cleanup"],
+                    "callbacks": len(item["buttons"]),
+                }
+                for item in old
+            ]
+        )
+    )
+    lines.append(f"debug={state['debug']!r}")
+    lines.append(f"LAST EFFECT: {state['last_effect']}")
+    return lines
+
+
+def _normalize_language(value: str) -> str | None:
+    normalized = value.strip().casefold()
+    aliases = {
+        "english": "en",
+        "английский": "en",
+        "anglais": "en",
+        "inglés": "en",
+        "español": "es",
+        "spanish": "es",
+        "испанский": "es",
+        "espagnol": "es",
+        "français": "fr",
+        "french": "fr",
+        "французский": "fr",
+        "francés": "fr",
+        "русский": "ru",
+        "russian": "ru",
+        "ruso": "ru",
+        "russe": "ru",
+    }
+    if normalized in {"?ambiguous", "?invalid", ""}:
+        return None
+    return aliases.get(normalized)
+
+
+def _normalize_country(value: str) -> str | None:
+    normalized = value.strip().casefold()
+    if normalized in {"?ambiguous", "?invalid", "congo", "конго", ""}:
+        return None
+    for country_id, country in COUNTRIES.items():
+        if normalized in country["aliases"]:
+            return country_id
+    return None
+
+
+def _normalize_city(country_id: str | None, value: str) -> str | None:
+    normalized = value.strip().casefold()
+    if normalized in {"?ambiguous", "?invalid", "springfield", ""}:
+        return None
+    if country_id not in COUNTRIES:
+        return None
+    for city_id, city in COUNTRIES[country_id]["cities"].items():
+        if normalized in city["aliases"]:
+            return city_id
+    return None
+
+
+def _parse_date_range(value: str) -> tuple[date, date] | None:
+    parts = [part.strip() for part in value.split("..")]
+    if len(parts) not in {1, 2}:
+        return None
+    try:
+        start = date.fromisoformat(parts[0])
+        end = date.fromisoformat(parts[-1])
+    except ValueError:
+        return None
+    if end < start:
+        return None
+    return start, end
+
+
+def _valid_clock(value: str) -> bool:
+    parts = value.strip().split(":")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return False
+    hour, minute = map(int, parts)
+    return 0 <= hour <= 23 and 0 <= minute <= 59 and len(parts[1]) == 2
+
+
+def _country_name(country_id: str | None, locale: str) -> str:
+    if country_id in COUNTRIES:
+        return COUNTRIES[country_id]["names"][locale]
+    return "∅"
+
+
+def _city_name(country_id: str | None, city_id: str | None, locale: str) -> str:
+    if country_id in COUNTRIES and city_id in COUNTRIES[country_id]["cities"]:
+        return COUNTRIES[country_id]["cities"][city_id]["names"][locale]
+    return "∅"
+
+
+def _area_candidates(city_id: str | None, locale: str) -> list[tuple[str, str]]:
+    if city_id == "SPE":
+        labels = [
+            ("komendantsky", L("Комендантский проспект", "Komendantsky Prospekt", "Komendantsky Prospekt", "Komendantsky Prospekt")),
+            ("pionerskaya", L("Пионерская", "Pionerskaya", "Pionerskaya", "Pionerskaya")),
+            ("central", L("Центральный район", "Central district", "Distrito central", "Quartier central")),
+        ]
+    else:
+        labels = [
+            ("center", L("Центр", "Centre", "Centro", "Centre")),
+            ("north", L("Север", "North", "Norte", "Nord")),
+            ("south", L("Юг", "South", "Sur", "Sud")),
+        ]
+    return [(key, label[locale]) for key, label in labels]
+
+
+def _effect(state: dict[str, Any], message: str) -> None:
+    state["last_effect"] = message
+    _log(state, message)
+
+
+def _log(state: dict[str, Any], message: str) -> None:
+    state["transition_log"].append(message)
+    state["transition_log"] = state["transition_log"][-12:]
