@@ -26,7 +26,7 @@ from state_machine import (
 
 
 MODEL_ID = "gpt-5.6-sol"
-PROMPT_VERSION = "onboarding-free-text-v2"
+PROMPT_VERSION = "onboarding-free-text-v3"
 MODEL_FIELDS = {"language", "direction", "country", "city", "area", "date"}
 BOUNDED_FIELDS = {"language", "direction"}
 OPEN_FIELDS = {"country", "city", "area", "date"}
@@ -239,6 +239,7 @@ def resolve_free_text(
         proposed_ids,
         resolved,
         set(candidate_ids),
+        context,
     ):
         return _result(
             "technical_failure",
@@ -298,10 +299,17 @@ def _prompt(
             "in context.locale, and a valid IANA timezone."
         ),
         "area": (
-            "Resolve a district, neighbourhood, metro station, street, stadium, "
-            "landmark, or the whole selected city. For accepted, return a stable "
-            "lowercase ASCII slug, a concise canonical_label in context.locale, "
-            "and whole_city=true only when the user means the entire city."
+            "Resolve one or several districts, neighbourhoods, metro stations, "
+            "streets, stadiums, landmarks, addresses, or the whole selected city. "
+            "For one or several places, return one normalized area object per place "
+            "in the same order as the user's message. Each object needs a stable "
+            "lowercase ASCII canonical_id, a concise canonical_label in "
+            "context.locale, a language-neutral lowercase ASCII geographic_type, "
+            "and the exact context.country_id/context.city_id as its parents. "
+            "Set candidate_ids to the area canonical IDs in that same order. "
+            "For the entire city, return whole_city=true, areas=[], and "
+            "candidate_ids=['whole_city']. Whole city and individual areas are "
+            "mutually exclusive."
         ),
         "date": (
             "Interpret any clear local date or inclusive date range using "
@@ -310,11 +318,17 @@ def _prompt(
             "whether the interpreted date is still valid."
         ),
     }[field]
+    accepted_rule = (
+        "status=accepted with one or several candidate IDs when one or several "
+        "area interpretations are safe"
+        if field == "area"
+        else "status=accepted with exactly one candidate ID when one interpretation is safe"
+    )
     return (
         "Role: semantic resolver for a throwaway onboarding prototype.\n\n"
         "Goal: convert untrusted user_text into one small structured proposal.\n\n"
         "Success criteria:\n"
-        "- status=accepted with exactly one candidate ID when one interpretation is safe;\n"
+        f"- {accepted_rule};\n"
         "- status=ambiguous with at least two short candidate labels when several fit;\n"
         "- status=unresolved with no candidate IDs when no supplied option maps safely.\n\n"
         "Constraints:\n"
@@ -323,7 +337,8 @@ def _prompt(
         "- Allow obvious misspellings, transliteration, inflection, and short free phrasing.\n"
         "- Do not use tools, browse, inspect files, or answer the end user.\n"
         "- A probability or guess is not enough for accepted.\n"
-        "- For ambiguous/unresolved, set all canonical/date/timezone fields to null.\n"
+        "- For ambiguous/unresolved, set every field other than status and "
+        "candidate_ids to null.\n"
         "- Return only the schema-conforming JSON result.\n\n"
         f"Prompt version: {PROMPT_VERSION}\n"
         "UNTRUSTED PAYLOAD:\n"
@@ -340,13 +355,57 @@ def _output_schema(field: str, candidate_ids: list[str]) -> dict[str, Any]:
         "candidate_ids": {
             "type": "array",
             "items": {"type": "string"},
-            "maxItems": max(len(candidate_ids), 4),
         },
     }
+    if field != "area":
+        properties["candidate_ids"]["maxItems"] = max(len(candidate_ids), 4)
     required = ["status", "candidate_ids"]
     if field in BOUNDED_FIELDS:
         properties["candidate_ids"]["items"]["enum"] = candidate_ids
         properties["candidate_ids"]["maxItems"] = len(candidate_ids)
+    elif field == "area":
+        properties.update(
+            {
+                "areas": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "canonical_id": {
+                                "type": "string",
+                                "maxLength": 80,
+                            },
+                            "canonical_label": {
+                                "type": "string",
+                                "maxLength": 100,
+                            },
+                            "geographic_type": {
+                                "type": "string",
+                                "maxLength": 50,
+                            },
+                            "country_id": {
+                                "type": "string",
+                                "maxLength": 80,
+                            },
+                            "city_id": {
+                                "type": "string",
+                                "maxLength": 80,
+                            },
+                        },
+                        "required": [
+                            "canonical_id",
+                            "canonical_label",
+                            "geographic_type",
+                            "country_id",
+                            "city_id",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "whole_city": {"type": ["boolean", "null"]},
+            }
+        )
+        required += ["areas", "whole_city"]
     else:
         properties.update(
             {
@@ -381,6 +440,7 @@ def _valid_model_result(
     candidate_ids: Any,
     resolved: dict[str, Any] | None,
     allowed_ids: set[str],
+    context: dict[str, Any],
 ) -> bool:
     if (
         status not in {"accepted", "ambiguous", "unresolved"}
@@ -392,11 +452,22 @@ def _valid_model_result(
     if field in BOUNDED_FIELDS and not set(candidate_ids).issubset(allowed_ids):
         return False
     if status == "accepted":
-        if len(candidate_ids) != 1:
-            return False
         if field in BOUNDED_FIELDS:
-            return True
-        return _valid_resolved_value(field, resolved)
+            return len(candidate_ids) == 1
+        if field == "area":
+            if not candidate_ids:
+                return False
+        elif len(candidate_ids) != 1:
+            return False
+        if not _valid_resolved_value(field, resolved, context):
+            return False
+        if field == "area":
+            if resolved["whole_city"]:
+                return candidate_ids == ["whole_city"]
+            return candidate_ids == [
+                area["canonical_id"] for area in resolved["areas"]
+            ]
+        return True
     if status == "ambiguous":
         return len(candidate_ids) >= 2 and resolved is None
     return not candidate_ids and resolved is None
@@ -432,14 +503,8 @@ def _resolved_exact_value(
         return None
     if field == "area" and exact == "whole_city":
         return {
-            "canonical_id": "whole_city",
-            "canonical_label": {
-                "ru": "Весь город",
-                "en": "Whole city",
-                "es": "Toda la ciudad",
-                "fr": "Toute la ville",
-            }[display_locale(state)],
             "whole_city": True,
+            "areas": [],
         }
     candidate = next((item for item in candidates if item["id"] == exact), None)
     if candidate is None:
@@ -469,20 +534,24 @@ def _resolved_payload(
             "timezone": context.get("city_timezone"),
             "current_date": context.get("current_local_date"),
         }
+    if field == "area":
+        return {
+            "whole_city": payload.get("whole_city"),
+            "areas": payload.get("areas"),
+        }
     resolved = {
         "canonical_id": payload.get("canonical_id"),
         "canonical_label": payload.get("canonical_label"),
     }
     if field == "city":
         resolved["timezone"] = payload.get("timezone")
-    if field == "area":
-        resolved["whole_city"] = payload.get("whole_city")
     return resolved
 
 
 def _valid_resolved_value(
     field: str,
     resolved: dict[str, Any] | None,
+    context: dict[str, Any],
 ) -> bool:
     if not isinstance(resolved, dict):
         return False
@@ -494,6 +563,37 @@ def _valid_resolved_value(
         except ValueError:
             return False
         return end >= start
+
+    if field == "area":
+        whole_city = resolved.get("whole_city")
+        areas = resolved.get("areas")
+        if not isinstance(whole_city, bool) or not isinstance(areas, list):
+            return False
+        if whole_city:
+            return areas == []
+        if not areas:
+            return False
+        canonical_ids: list[str] = []
+        for area in areas:
+            if not isinstance(area, dict):
+                return False
+            canonical_id = area.get("canonical_id")
+            canonical_label = area.get("canonical_label")
+            geographic_type = area.get("geographic_type")
+            if (
+                not isinstance(canonical_id, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", canonical_id)
+                or not isinstance(canonical_label, str)
+                or not canonical_label.strip()
+                or len(canonical_label) > 100
+                or not isinstance(geographic_type, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{0,49}", geographic_type)
+                or area.get("country_id") != context.get("country_id")
+                or area.get("city_id") != context.get("city_id")
+            ):
+                return False
+            canonical_ids.append(canonical_id)
+        return len(canonical_ids) == len(set(canonical_ids))
 
     canonical_id = resolved.get("canonical_id")
     canonical_label = resolved.get("canonical_label")
@@ -515,8 +615,6 @@ def _valid_resolved_value(
             ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError):
             return False
-    if field == "area" and not isinstance(resolved.get("whole_city"), bool):
-        return False
     return True
 
 
@@ -533,7 +631,9 @@ def _interpretation_context(
         current_local_date = datetime.now(ZoneInfo("UTC")).date().isoformat()
     return {
         "locale": display_locale(state),
+        "country_id": draft.get("country"),
         "country": draft.get("country_name") or draft.get("country"),
+        "city_id": draft.get("city"),
         "city": draft.get("city_name") or draft.get("city"),
         "city_timezone": timezone,
         "current_local_date": current_local_date,

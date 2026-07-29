@@ -430,3 +430,38 @@ Settings, lifecycle, Active Chat View, fallback, locale, terminal-intent, and
 core-routing items. The remaining blockers are the explicit defect and
 contract-gap rows above; matching, result cards, and the results menu remain
 deliberately out of scope.
+
+## 2026-07-30 confirmed closure corrections
+
+Before changing the Area contract, the complete pre-change prototype and
+append-only evidence were committed as `7561aac` and pushed to
+`codex/prototype-issue-9-multilingual-onboarding`. This is the durable
+before-state for comparison; it includes the provisional audit above and does
+not contain the corrections below.
+
+The Bot User then confirmed this prototype behavior: one AI-native Area message
+may name one or several Sub-city Areas; the model returns an ordered normalized
+list; whole city is mutually exclusive with that list; an accepted answer
+completes Search Area immediately; and the only inline action on the prompt is
+Back. This is confirmation for the throwaway prototype, not yet a published
+product verdict.
+
+| Evidence ID | Correction/check | Observed result | Assessment |
+| --- | --- | --- | --- |
+| FIX-AREA-CONTRACT-01 | Replace the single-label Area payload with `whole_city` plus an ordered normalized `areas` list containing stable canonical ID, localized label, language-neutral geographic type, country parent, and city parent | The pure machine now persists the complete validated list. Whole city requires an empty list; a place selection requires a non-empty list; candidate IDs must match the list exactly and in order. | Corrected to the confirmed prototype behavior |
+| FIX-AREA-PROMPT-I18N-01 | Render Area in Russian, English, Spanish, and French | Each prompt now explicitly says that one message may contain one or several places, mentions whole city, waits for text, and exposes only Back. | Passed structural localization check |
+| FIX-AREA-CONTRACT-NEGATIVE-01 | Submit four malformed laboratory payloads: whole city mixed with places, empty non-city list, candidate/list cardinality mismatch, and wrong city parent | All four were rejected as invalid interpretation contracts; confirmed country, city, Area, date, and criteria remained unchanged. | Passed local-authority and failure-preservation check |
+| FIX-AREA-LIVE-MODEL-01 | Send live Russian text `Арбат и Хамовники` with Russia/Moscow already confirmed | `gpt-5.6-sol` returned two ordered normalized objects (`arbat`, `khamovniki`) in `6993 ms`; the local contract accepted both and advanced immediately to Required Date. | Passed the focused live multi-area seam; this is not a gazetteer-quality verdict |
+| FIX-AREA-WHOLE-CITY-01 | Send exact reviewed alias `весь город` | The deterministic resolver returned `candidate_ids=['whole_city']`, `whole_city=True`, and `areas=[]`; the machine committed city-level Search Area immediately. | Passed mutual-exclusion path |
+| FIX-PLAYING-LEVELS-01 | Restore the accepted eight-value Playing Level vocabulary and render it across every applicable locale/intent editor | The value order is Beginner, Below average, Average, Above average, High, Very high, Master, Professional with reviewed Russian, English, Spanish, and French labels. All `32` applicable editor screens exposed all eight canonical values. | Corrected and passed |
+| FIX-SCHEDULE-INTERVAL-01 | Submit `20:00-19:00`, `20:00-20:00`, malformed text, and `19:00-20:00` | Reversed, zero-length, and malformed intervals preserved temporary and confirmed state and showed a localized inline warning. The ascending interval was stored temporarily and returned to the parent Time submenu. | Corrected and passed |
+| FIX-LANGUAGE-FREE-I18N-01 | Render the free-text Language screen in all four locales | The laboratory model paragraph now uses Russian, English, Spanish, or French consistently with the active Conversation Language; each screen still exposes only Back. | Corrected and passed |
+| RETEST-CLOSURE-CORE-DETAIL-MATRIX-01 | Rerun the cross-locale core routing and every top-level detail entry after the corrections | All `40` locale/intent core routes passed; `260` localized detail editors rendered; the `32` Playing Level editors contained the exact eight-value list. | Passed regression matrix |
+| RETEST-CLOSURE-FALLBACK-MATRIX-01 | Rerun ambiguous, unresolved, and technical-failure outcomes for Language, Direction, Country, City, Area, and Date in all four locales | All `72` cases preserved complete account and Discovery Draft state and rendered the localized fallback marker. | Passed regression matrix |
+| RETEST-CLOSURE-ONE-COMMAND-01 | Run `python3 prototypes/onboarding_flow/telegram_tui.py --no-clear` from the repository root | Model preflight succeeded, the localized first Active Chat View rendered, full state was visible, and EOF exited cleanly. | Passed one-command startup |
+
+The old long-running TUI process was deliberately stopped because Python had
+loaded the pre-correction modules into memory. A fresh process is required for
+the next manual check. The optional Seasonal Timing and Schedule start-date
+editors and the first-message/free-language copy-fidelity gap remain unchanged
+pending separate one-question-at-a-time confirmation.

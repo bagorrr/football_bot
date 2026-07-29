@@ -467,8 +467,22 @@ VALUE_LABELS: dict[str, dict[str, str]] = {
     "midfielder": L("Полузащитник", "Midfielder", "Centrocampista", "Milieu"),
     "forward": L("Нападающий", "Forward", "Delantero", "Attaquant"),
     "novice": L("Новичок", "Beginner", "Principiante", "Débutant"),
+    "below_average": L(
+        "Ниже среднего",
+        "Below average",
+        "Por debajo de la media",
+        "Inférieur à la moyenne",
+    ),
     "average": L("Средний", "Average", "Medio", "Moyen"),
+    "above_average": L(
+        "Выше среднего",
+        "Above average",
+        "Por encima de la media",
+        "Supérieur à la moyenne",
+    ),
     "high": L("Высокий", "High", "Alto", "Élevé"),
+    "very_high": L("Очень высокий", "Very high", "Muy alto", "Très élevé"),
+    "master": L("Мастер", "Master", "Máster", "Maître"),
     "professional": L("Профи", "Professional", "Profesional", "Professionnel"),
     "indoor": L("В помещении", "Indoor", "En interior", "En salle"),
     "outdoor": L("На улице", "Outdoor", "Al aire libre", "En extérieur"),
@@ -567,7 +581,16 @@ DETAIL_SPECS: dict[str, dict[str, Any]] = {
     },
     "playing_levels": {
         "mode": "multi",
-        "values": ["novice", "average", "high", "professional"],
+        "values": [
+            "novice",
+            "below_average",
+            "average",
+            "above_average",
+            "high",
+            "very_high",
+            "master",
+            "professional",
+        ],
     },
     "venue_setting": {
         "mode": "multi",
@@ -1134,11 +1157,13 @@ def _apply_product_event(
             draft["areas"] = []
         else:
             draft["area_mode"] = "areas"
-            draft["areas"] = [resolved["canonical_label"]]
+            draft["areas"] = deepcopy(resolved["areas"])
         _advance_after_area(draft)
         _effect(
             state,
-            "Committed model-resolved Search Area; dates, times, and criteria "
+            "Committed model-resolved Search Area "
+            f"({len(draft['areas']) if draft['area_mode'] == 'areas' else 'whole city'}); "
+            "dates, times, and criteria "
             f"were preserved.{_resolution_source_note(resolution['source'])}",
         )
         return True, True
@@ -1365,7 +1390,12 @@ def _apply_product_event(
     if kind == "schedule_interval_text":
         draft = _draft(state)
         parts = [part.strip() for part in str(value).split("-")]
-        if len(parts) != 2 or not all(_valid_clock(part) for part in parts):
+        if (
+            len(parts) != 2
+            or not all(_valid_clock(part) for part in parts)
+            or _clock_minutes(parts[0]) >= _clock_minutes(parts[1])
+        ):
+            state["input_notice"] = "invalid_schedule_interval"
             _effect(state, f"Interval {value!r} is invalid; no change.")
             return False, True
         draft["temp_edit"]["exact_interval"] = parts
@@ -1748,17 +1778,35 @@ def _validated_interpretation(
         and isinstance(candidate_ids, list)
         and all(isinstance(item, str) for item in candidate_ids)
         and len(candidate_ids) == len(set(candidate_ids))
-        and len(candidate_ids) <= max(len(allowed_ids), 4)
+        and (
+            field == "area"
+            or len(candidate_ids) <= max(len(allowed_ids), 4)
+        )
         and (not bounded or set(candidate_ids).issubset(allowed_ids))
     )
     if contract_valid and status == "accepted":
-        contract_valid = (
-            len(candidate_ids) == 1
-            and (
-                (bounded and resolved is None)
-                or (not bounded and _valid_resolved_interpretation(field, resolved))
+        if field == "area":
+            contract_valid = (
+                bool(candidate_ids)
+                and _valid_resolved_interpretation(state, field, resolved)
+                and (
+                    candidate_ids == ["whole_city"]
+                    if resolved["whole_city"]
+                    else candidate_ids
+                    == [area["canonical_id"] for area in resolved["areas"]]
+                )
             )
-        )
+        else:
+            contract_valid = (
+                len(candidate_ids) == 1
+                and (
+                    (bounded and resolved is None)
+                    or (
+                        not bounded
+                        and _valid_resolved_interpretation(state, field, resolved)
+                    )
+                )
+            )
     elif contract_valid and status == "ambiguous":
         contract_valid = len(candidate_ids) >= 2 and resolved is None
     elif contract_valid:
@@ -1786,7 +1834,7 @@ def _validated_interpretation(
 
     if status == "accepted":
         candidate_id = candidate_ids[0]
-        if field in {"country", "city", "area"}:
+        if field in {"country", "city"}:
             candidate_id = resolved["canonical_id"]
         return {
             "candidate_id": candidate_id,
@@ -1820,7 +1868,11 @@ def _validated_interpretation(
     return None
 
 
-def _valid_resolved_interpretation(field: str, resolved: Any) -> bool:
+def _valid_resolved_interpretation(
+    state: dict[str, Any],
+    field: str,
+    resolved: Any,
+) -> bool:
     if not isinstance(resolved, dict):
         return False
     if field == "date":
@@ -1841,6 +1893,38 @@ def _valid_resolved_interpretation(field: str, resolved: Any) -> bool:
         except (ZoneInfoNotFoundError, ValueError):
             return False
         return start >= current and end >= start
+
+    if field == "area":
+        whole_city = resolved.get("whole_city")
+        areas = resolved.get("areas")
+        if not isinstance(whole_city, bool) or not isinstance(areas, list):
+            return False
+        if whole_city:
+            return areas == []
+        if not areas:
+            return False
+        draft = state.get("draft") or {}
+        canonical_ids: list[str] = []
+        for area in areas:
+            if not isinstance(area, dict):
+                return False
+            canonical_id = area.get("canonical_id")
+            canonical_label = area.get("canonical_label")
+            geographic_type = area.get("geographic_type")
+            if (
+                not isinstance(canonical_id, str)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,79}", canonical_id)
+                or not isinstance(canonical_label, str)
+                or not canonical_label.strip()
+                or len(canonical_label) > 100
+                or not isinstance(geographic_type, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{0,49}", geographic_type)
+                or area.get("country_id") != draft.get("country")
+                or area.get("city_id") != draft.get("city")
+            ):
+                return False
+            canonical_ids.append(canonical_id)
+        return len(canonical_ids) == len(set(canonical_ids))
 
     canonical_id = resolved.get("canonical_id")
     canonical_label = resolved.get("canonical_label")
@@ -1864,8 +1948,6 @@ def _valid_resolved_interpretation(field: str, resolved: Any) -> bool:
         except (ZoneInfoNotFoundError, ValueError):
             return False
         return True
-    if field == "area":
-        return isinstance(resolved.get("whole_city"), bool)
     return False
 
 
@@ -2124,10 +2206,33 @@ def build_screen(state: dict[str, Any]) -> dict[str, Any]:
     if surface in {"language_free", "settings_language_free"}:
         text = (
             LANGUAGE_FREE_PROMPT[locale]
-            + "\n\n[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
-            "other text is interpreted by GPT-5.6 Sol and then validated "
-            "against the supported locale list. `?ambiguous`, `?invalid`, and "
-            "`?model-fail` exercise fallbacks."
+            + "\n\n"
+            + {
+                "ru": (
+                    "[МОДЕЛЬ ПРОТОТИПА] Точные проверенные названия распознаются "
+                    "локально; другой текст интерпретирует GPT-5.6 Sol, после чего "
+                    "ответ проверяется по списку поддерживаемых языков. "
+                    "`?ambiguous`, `?invalid` и `?model-fail` проверяют сбои."
+                ),
+                "en": (
+                    "[PROTOTYPE MODEL] Exact reviewed aliases resolve locally; "
+                    "other text is interpreted by GPT-5.6 Sol and then validated "
+                    "against the supported locale list. `?ambiguous`, `?invalid`, "
+                    "and `?model-fail` exercise fallbacks."
+                ),
+                "es": (
+                    "[MODELO DEL PROTOTIPO] Los nombres exactos revisados se resuelven "
+                    "localmente; GPT-5.6 Sol interpreta el resto del texto y después "
+                    "la respuesta se valida con la lista de idiomas admitidos. "
+                    "`?ambiguous`, `?invalid` y `?model-fail` prueban los fallos."
+                ),
+                "fr": (
+                    "[MODÈLE DU PROTOTYPE] Les noms exacts vérifiés sont résolus "
+                    "localement ; GPT-5.6 Sol interprète les autres textes, puis la "
+                    "réponse est validée par rapport aux langues prises en charge. "
+                    "`?ambiguous`, `?invalid` et `?model-fail` testent les échecs."
+                ),
+            }[locale]
         )
         return _screen(
             _with_resolution_notice(state, "language", text),
@@ -2357,22 +2462,26 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
         text = {
             "ru": (
                 f"📍 Уточните зону поиска.\n\nВыбранный город: {city}.\n\n"
-                "Напишите район, метро, улицу, стадион или другое место. "
+                "Одним сообщением напишите один или несколько районов, станций "
+                "метро, улиц, стадионов или других мест. "
                 "Если подходит весь город, напишите «весь город»."
             ),
             "en": (
                 f"📍 Refine the search area.\n\nSelected city: {city}.\n\n"
-                "Type a district, metro station, street, stadium, or another place. "
+                "In one message, type one or several districts, metro stations, "
+                "streets, stadiums, or other places. "
                 "If anywhere in the city works, type “whole city”."
             ),
             "es": (
                 f"📍 Precise la zona de búsqueda.\n\nCiudad elegida: {city}.\n\n"
-                "Escriba un barrio, metro, calle, estadio u otro lugar. "
+                "En un solo mensaje, escriba uno o varios barrios, estaciones de "
+                "metro, calles, estadios u otros lugares. "
                 "Si sirve toda la ciudad, escriba «toda la ciudad»."
             ),
             "fr": (
                 f"📍 Précisez la zone de recherche.\n\nVille choisie : {city}.\n\n"
-                "Saisissez un quartier, métro, rue, stade ou autre lieu. "
+                "Dans un seul message, saisissez un ou plusieurs quartiers, stations "
+                "de métro, rues, stades ou autres lieux. "
                 "Si toute la ville convient, écrivez «toute la ville»."
             ),
         }[locale]
@@ -2784,13 +2893,21 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if nested == "schedule_interval_input":
+        text = L(
+            "Введите один точный местный интервал в формате HH:MM-HH:MM.",
+            "Enter one exact local interval as HH:MM-HH:MM.",
+            "Introduzca un intervalo local exacto en formato HH:MM-HH:MM.",
+            "Saisissez un intervalle local exact au format HH:MM-HH:MM.",
+        )[locale]
+        if state.get("input_notice") == "invalid_schedule_interval":
+            text += "\n\n" + L(
+                "⚠️ Введите корректный интервал, в котором время начала раньше времени окончания.",
+                "⚠️ Enter a valid interval whose start time is earlier than its end time.",
+                "⚠️ Introduzca un intervalo válido cuya hora de inicio sea anterior a la hora de fin.",
+                "⚠️ Saisissez un intervalle valide dont l’heure de début précède l’heure de fin.",
+            )[locale]
         return _screen(
-            L(
-                "Введите один точный местный интервал в формате HH:MM-HH:MM.",
-                "Enter one exact local interval as HH:MM-HH:MM.",
-                "Introduzca un intervalo local exacto en formato HH:MM-HH:MM.",
-                "Saisissez un intervalle local exact au format HH:MM-HH:MM.",
-            )[locale],
+            text,
             [_button(tr(state, "back"), "back_nested")],
             expects_text="schedule_interval",
         )
@@ -3240,6 +3357,11 @@ def _valid_clock(value: str) -> bool:
         return False
     hour, minute = map(int, parts)
     return 0 <= hour <= 23 and 0 <= minute <= 59 and len(parts[1]) == 2
+
+
+def _clock_minutes(value: str) -> int:
+    hour, minute = map(int, value.strip().split(":"))
+    return hour * 60 + minute
 
 
 def _country_name(country_id: str | None, locale: str) -> str:

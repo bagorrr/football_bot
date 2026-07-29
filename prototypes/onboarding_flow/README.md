@@ -34,9 +34,11 @@ must be explicitly confirmed before they become draft state. Country and city
 resolution is not limited to the small deterministic example catalog; the
 adapter returns structured canonical labels and a city timezone, which the
 state machine validates before use. Area/place and required-date screens accept
-free text and expose only Back. Dates are resolved against the selected city's
-local calendar, and past or ambiguous input preserves the previously confirmed
-date.
+free text and expose only Back. One area message may name one or several places;
+the accepted normalized list completes Search Area immediately, while
+whole-city input remains mutually exclusive. Dates are resolved against the
+selected city's local calendar, and past or ambiguous input preserves the
+previously confirmed date.
 
 The model subprocess runs in a temporary empty workspace with a read-only
 sandbox, no user config, project rules, apps, plugins, MCP servers, web search,
