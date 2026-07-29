@@ -720,6 +720,7 @@ def initial_state(telegram_hint: str = "ru") -> dict[str, Any]:
         "transition_log": [],
         "callback_notice": None,
         "resolution_notice": None,
+        "input_notice": None,
         "last_interpretation": None,
         "debug": {
             "fail_next_render": False,
@@ -773,6 +774,7 @@ def dispatch(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
     next_state = deepcopy(state)
     next_state["callback_notice"] = None
     next_state["resolution_notice"] = None
+    next_state["input_notice"] = None
     kind = event["kind"]
 
     if kind.startswith("debug_"):
@@ -1279,6 +1281,7 @@ def _apply_product_event(
 
     if kind == "exact_time_text":
         if not _valid_clock(str(value)):
+            state["input_notice"] = "invalid_exact_time"
             _effect(state, f"Exact time {value!r} is invalid; confirmed Time unchanged.")
             return False, True
         draft = _draft(state)
@@ -2610,13 +2613,21 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
     nested = draft["nested_kind"]
 
     if nested == "exact_time":
+        text = L(
+            "Введите точное местное время выбранного города (HH:MM).",
+            "Enter the exact local time in the selected city (HH:MM).",
+            "Introduzca la hora local exacta de la ciudad seleccionada (HH:MM).",
+            "Indiquez l’heure locale exacte dans la ville sélectionnée (HH:MM).",
+        )[locale]
+        if state.get("input_notice") == "invalid_exact_time":
+            text += "\n\n" + L(
+                "⚠️ Введите корректное время от 00:00 до 23:59.",
+                "⚠️ Enter a valid time from 00:00 to 23:59.",
+                "⚠️ Introduzca una hora válida de 00:00 a 23:59.",
+                "⚠️ Saisissez une heure valide de 00:00 à 23:59.",
+            )[locale]
         return _screen(
-            L(
-                "Введите точное местное время выбранного города (HH:MM).",
-                "Enter the exact local time in the selected city (HH:MM).",
-                "Introduzca la hora local exacta de la ciudad seleccionada (HH:MM).",
-                "Indiquez l’heure locale exacte dans la ville sélectionnée (HH:MM).",
-            )[locale],
+            text,
             [_button(tr(state, "back"), "back_nested")],
             expects_text="exact_time",
         )
@@ -2964,6 +2975,7 @@ def state_lines(state: dict[str, Any]) -> list[str]:
     lines.append(f"debug={state['debug']!r}")
     lines.append(f"last_interpretation={state['last_interpretation']!r}")
     lines.append(f"resolution_notice={state['resolution_notice']!r}")
+    lines.append(f"input_notice={state['input_notice']!r}")
     lines.append(f"LAST EFFECT: {state['last_effect']}")
     return lines
 

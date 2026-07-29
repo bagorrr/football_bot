@@ -287,3 +287,16 @@ clear localized reason, and preservation of the previously confirmed range.
 This is an intermediate HITL approval only; it is not the final prototype
 verdict. The earlier gate on Details Hub is therefore lifted for the next
 manual-test phase.
+
+| RETEST-DETAILS-HUB-01 | After date-stage approval, reopen `post_core` and press `Детали` | Details Hub opened for `game_search` with Time, Team Format, Positions, Game Levels, Surface Type, Surface, and Payment in that order, followed by Back and Search. Every criterion was unset; the confirmed intent, geography, and date range were preserved unchanged. | Passed initial hub entry; editor checks follow |
+| RETEST-DETAIL-TIME-ENTRY-01 | Press `Время` in Details Hub | Time editor opened with Exact Time, Morning, Afternoon, Evening, Night, Any, and Back. `criteria` remained empty and `detail_key='time'`; all core values remained unchanged. | Passed editor entry |
+| RETEST-DETAIL-TIME-EXACT-ENTRY-01 | Press `Указать точное время` | A localized `HH:MM` text prompt opened with only Back. `nested_kind='exact_time'`; confirmed `criteria` stayed empty and the selected-city core remained unchanged. | Passed nested entry; invalid/valid inputs follow |
+| RETEST-DETAIL-TIME-INVALID-01 | Send invalid exact time `25:99` | The machine stayed in exact-time input and correctly left confirmed `criteria` empty. However, the replacement screen repeated only the original prompt and showed no visible explanation that the value was invalid; the reason existed only in laboratory `LAST EFFECT`. | State preservation passed; user-facing validation defect |
+
+The Bot User explicitly approved correcting
+`RETEST-DETAIL-TIME-INVALID-01`. The throwaway state now carries a transient
+`input_notice='invalid_exact_time'` for that replacement frame, and the
+localized exact-time prompt renders «Введите корректное время от 00:00 до
+23:59». An isolated post-change replay confirmed the visible warning and
+`criteria={}`. A restarted live-TUI replay is still required because the
+running process had the prior module loaded.
