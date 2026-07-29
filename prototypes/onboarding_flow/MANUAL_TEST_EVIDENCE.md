@@ -90,7 +90,15 @@ until the Bot User gives final confirmation.
 | MENU-01 | Press native Menu after Search | A new Main Menu view rendered with `Новый поиск`, `Результаты поиска`, and `Настройки`; `completed_searches=1`, `draft=None`. | Passed |
 | SETTINGS-01 | Press `Настройки` | Settings rendered with `Язык`, `Поддержка`, `Режим`, `Премиум`, and Back; locale remained `ru`, `completed_searches=1`, `draft=None`. | Passed |
 | SETTINGS-LANG-01 | Press `Язык` | Settings language selector rendered `English`, `Español`, `Français`, `Русский`, `🌐 Выбор языка`, and Back; saved locale remained `ru`, `completed_searches=1`, `draft=None`. | Passed |
-| VIEW-01 | Observe replacements across message `#112` through `#136` | Every observed current view was marked protected and had `active_view_matches_logical_revision=True`; replaced views became old and were marked `deleted best effort`. | Passed for normal replacement path |
+| SETTINGS-LANG-02 | Press `🌐 Выбор языка` | Free-text language prompt opened with only Back. Saved locale remained `ru`; the screen advertised exact aliases plus `gpt-5.6-sol` fallback validated against the four supported locales. | Passed |
+| SETTINGS-LANG-03 | Send `хочу на инглише` | Exact-alias check fell through to `gpt-5.6-sol`; model proposed `en`; local locale resolver accepted it; locale changed `ru → en`; Settings re-rendered in English; Telegram hint remained `ru`; `completed_searches=1`, `draft=None`. | Passed |
+| SETTINGS-LANG-04 | Press `Language` after switching to English | The selector re-rendered in English with `🌐 Choose language` and Back; locale remained `en`; completed search remained present. | Passed |
+| SETTINGS-LANG-05 | Press `Español` | Locale changed `en → es`; Settings re-rendered as `Ajustes` with `Idioma`, `Soporte`, `Modo`, `Premium`, and `Atrás`; Telegram hint remained `ru`; completed search remained present. | Passed |
+| SETTINGS-LANG-06 | Press `Idioma` after switching to Spanish | The selector re-rendered in Spanish with `🌐 Elegir idioma` and `Atrás`; locale remained `es`; completed search remained present. | Passed |
+| SETTINGS-LANG-07 | Press `Français` | Locale changed `es → fr`; Settings re-rendered as `Paramètres` with `Langue`, `Assistance`, `Mode`, `Premium`, and `Retour`; Telegram hint remained `ru`; completed search remained present. | Passed |
+| SETTINGS-LANG-08 | Press `Langue` after switching to French | The selector re-rendered in French with `🌐 Choisir la langue` and `Retour`; locale remained `fr`; completed search remained present. | Passed |
+| SETTINGS-LANG-09 | Press `Русский` | Locale changed `fr → ru`; Settings re-rendered in Russian; Telegram hint remained `ru`; completed search remained present; no draft was created. | Passed |
+| VIEW-01 | Observe replacements across message `#112` through `#144` | Every observed current view was marked protected and had `active_view_matches_logical_revision=True`; replaced views became old and were marked `deleted best effort`. | Passed for normal replacement path |
 | VIEW-02 | Invalid free text on button-only screens | Invalid text changed no confirmed domain value, but a replacement current view and new logical revision were rendered. | Observed; no contract deviation assigned yet |
 
 ## Deferred prototype fix queue
