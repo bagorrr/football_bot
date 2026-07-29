@@ -1,7 +1,8 @@
 # Language Onboarding
 
 Status: Accepted for language detection, selection mechanics, Russian master
-copy, and handoff to the canonical search-direction menu.
+copy, handoff to the canonical search-direction menu, and later changes through
+Settings.
 
 ## Language resolution
 
@@ -108,4 +109,24 @@ Persist the language preference by Telegram user ID:
 - `locale_source`: `explicit` or `telegram_hint`;
 - `last_seen_language_code`.
 
-An explicit Conversation Language always wins over later Telegram Language Hint changes. Provide `/language` or an equivalent settings action so the choice remains reversible.
+An explicit Conversation Language always wins over later Telegram Language
+Hint changes.
+
+After the first explicit selection:
+
+- `/start` does not show Language Selection again;
+- Language Selection is available only through Main Menu → Settings → Language;
+- there is no `/language` command;
+- the Settings selector offers the same four fixed languages and free-text
+  language selection;
+- Back returns to Settings without changing the saved language;
+- confirmation returns to Settings in the new language.
+
+Conversation Language is presentation state. Changing it preserves the
+Discovery Draft, User Intent, Search Area, concrete dates, Discovery Details,
+completed searches, and results. The Bot Assistant re-renders the current
+screen in the new language but does not translate old messages or recompute a
+Today or Tomorrow value that was already committed as a concrete local date.
+
+The complete navigation and state-preservation contract is canonical in
+[`docs/product/onboarding-flow.md`](onboarding-flow.md).

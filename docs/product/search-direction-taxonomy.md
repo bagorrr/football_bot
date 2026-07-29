@@ -48,7 +48,7 @@ the classifier preserves competing interpretations and returns an unresolved
 candidate rather than defaulting.
 
 Type compatibility only creates a candidate match. Geography, time, and later
-direction-specific filters decide whether two records actually match.
+direction-specific details decide whether two records actually match.
 
 ## Intent branches
 
@@ -352,6 +352,6 @@ location or country of residence.
 
 Country is followed by the city and Sub-city Area stages defined in
 [`location-resolution.md`](location-resolution.md). The confirmed normalized
-fields, required discovery cores, filter sequences, and localized filter copy
+fields, required discovery cores, detail sequences, and localized detail copy
 live in
-[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
+[`opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md).

@@ -8,7 +8,7 @@ Location extraction and normalization are defined in
 [`docs/product/location-resolution.md`](location-resolution.md).
 Evidence-backed Opportunity Attributes and direction-specific acceptance
 requirements are defined in
-[`docs/product/opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
+[`docs/product/opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md).
 The current PoC execution adapter is recorded in
 [Use ChatGPT-authenticated Codex CLI for PoC classification](https://github.com/bagorrr/football_bot/issues/13).
 
@@ -44,7 +44,7 @@ to ingestion and classification:
 - edits as new revisions and deletion events as tombstones;
 - relevant, irrelevant, ambiguous, malformed, and non-football messages.
 
-There is no keyword or rules pre-filter before model classification. “Parse all
+There is no keyword or rules pre-screen before model classification. “Parse all
 messages” means ingest and classify every observable message; it does not mean
 publish every message or retain every raw body indefinitely.
 
@@ -134,7 +134,7 @@ attributes remain unknown. Discovery Criteria belong to the Bot User's
 confirmed discovery state and are never classifier output.
 
 Apply the Opportunity Type acceptance matrix in
-[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md)
+[`opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md)
 before publishing a candidate. The same document defines the deliberately
 narrow children-only exclusion: exclude only a game explicitly described as a
 children's game, without inferring age or gender from indirect signals.

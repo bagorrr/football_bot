@@ -16,7 +16,7 @@ Telegram state and the job queue.
 - [Conversational onboarding](docs/product/onboarding-flow.md)
 - [Location resolution](docs/product/location-resolution.md)
 - [Search-direction taxonomy](docs/product/search-direction-taxonomy.md)
-- [Opportunity fields and discovery filters](docs/product/opportunity-fields-and-discovery-filters.md)
+- [Opportunity fields and discovery details](docs/product/opportunity-fields-and-discovery-details.md)
 - [Source Message classification pipeline](docs/product/classification-pipeline.md)
 - [Source Chat consent basis](docs/product/source-consent.md)
 - [Proposed repository structure](docs/product/repository-structure.md)

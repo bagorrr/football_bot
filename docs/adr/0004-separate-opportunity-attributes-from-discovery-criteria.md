@@ -36,7 +36,7 @@ merging their provenance.
 
 The normalized vocabularies, Opportunity acceptance requirements, and
 direction-specific discovery flows live in
-[`docs/product/opportunity-fields-and-discovery-filters.md`](../product/opportunity-fields-and-discovery-filters.md).
+[`docs/product/opportunity-fields-and-discovery-details.md`](../product/opportunity-fields-and-discovery-details.md).
 
 ## Rejected alternatives
 

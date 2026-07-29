@@ -65,7 +65,7 @@ delivery. Codex runs under a dedicated unprivileged service identity in an
 isolated minimal workspace; its authentication is operational secret state, not
 repository configuration.
 The recommendation role matches accepted normalized opportunities to confirmed
-user filters. See
+user details. See
 [`docs/product/classification-pipeline.md`](classification-pipeline.md) and
 [`ADR 0001`](../adr/0001-use-a-durable-model-classification-service.md).
 

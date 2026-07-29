@@ -233,7 +233,7 @@ For:
 
 this decision interprets only the location phrase `на коменде`. Relative time
 is resolved under the temporal contract in
-[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
+[`opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md).
 
 The model may propose the vicinity of `Комендантский проспект` when the message
 or configured Source Chat establishes Saint Petersburg. If the location
@@ -274,7 +274,7 @@ location normalization.
 Date and time handling, venue characteristics, Team Format, Playing Level,
 Playing Surface, Payment Status, Response Route, Opportunity acceptance, and
 the direction-specific interaction sequence are canonical in
-[`opportunity-fields-and-discovery-filters.md`](opportunity-fields-and-discovery-filters.md).
+[`opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md).
 
 Hard-versus-ranked geographic compatibility, distance, ordering, explanations,
 and result-card behavior remain with

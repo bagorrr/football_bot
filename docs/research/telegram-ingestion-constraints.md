@@ -28,8 +28,8 @@ scope, and withdrawal are in
 
 The confirmed ingestion scope is the complete observable stream of each enabled
 Source Chat: every new message or post from every author, every observed edit,
-and every delivered deletion event. Relevance filtering happens only after
-model classification; there is no author or keyword pre-filter. Continuing
+and every delivered deletion event. Relevance screening happens only after
+model classification; there is no author or keyword pre-screen. Continuing
 consent for later participants is maintained through the Source Chat's
 admission/participation process. If universal coverage cannot be maintained, the
 whole Source Chat is paused rather than partially sampled.
@@ -37,7 +37,7 @@ whole Source Chat is paused rather than partially sampled.
 ## Bot API versus user-authorized MTProto
 
 | Capability | Bot API | User-authorized MTProto / Telethon |
-|---|---|---|
+| --- | --- | --- |
 | Identity | Bot token; the bot has its own limited account | The client acts with the authorized user's identity and access |
 | Ordinary group messages | Privacy Mode exposes only commands, inline messages, replies to the bot, and service messages; full input requires Privacy Mode disabled or bot admin status | Receives messages visible to the user account in chats it has joined |
 | Channel posts | Receives posts in channels where the bot is a member; Telegram's MTProto method errors also state that bots can only be admins in channels | Ordinary subscriber/member access is sufficient to read; admin rights are not required |
