@@ -300,3 +300,20 @@ localized exact-time prompt renders «Введите корректное вре
 23:59». An isolated post-change replay confirmed the visible warning and
 `criteria={}`. A restarted live-TUI replay is still required because the
 running process had the prior module loaded.
+
+A fresh live TUI replay reconstructed a valid Moscow game-search core, opened
+Details → Time → Exact Time, and sent `25:99`. The visible Russian warning
+rendered exactly as intended, the stage stayed `detail_nested`, and
+`criteria={}` remained unchanged. This closes the prototype defect from
+`RETEST-DETAIL-TIME-INVALID-01`; valid exact-time commit is still pending.
+
+| RETEST-DETAIL-TIME-VALID-01 | Send valid exact local time `19:30` | The machine committed `criteria.time={'exact':'19:30'}`, cleared nested/editing state, and returned to Details Hub. The hub displayed `Время: 19:30`; all core values and unrelated criteria were preserved. | Passed |
+| RETEST-DETAIL-MULTI-ENTRY-01 | Press `Формат команд` | The multi-select opened with temporary `temp_edit=[]`, choices `5x5` through `11x11`, Done, and Back; confirmed criteria still contained only exact Time. The explanatory line `Temporary selection — Done commits, Back discards.` was English in an otherwise Russian screen. | Editor state passed; localization defect |
+
+The Bot User explicitly approved correcting the Details localization defect.
+The temporary multi-select and immediate single-select explanations are now
+localized in all four conversation languages. The same focused inspection also
+found and localized the prototype-only Seasonal and Schedule explanations,
+summaries, nested headings, buttons, and free-text prompts so later Details
+checks do not repeat the same hard-coded-English defect. Product documentation
+and canonical copy remain unchanged.

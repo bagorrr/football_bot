@@ -2437,7 +2437,12 @@ def _build_draft_screen(state: dict[str, Any]) -> dict[str, Any]:
                 )
             )
         else:
-            text += "\n\n⛔ Search is blocked until the required core is valid again."
+            text += "\n\n" + L(
+                "⛔ Поиск недоступен, пока обязательные ответы снова не станут корректными.",
+                "⛔ Search is blocked until the required core is valid again.",
+                "⛔ La búsqueda está bloqueada hasta que los datos obligatorios vuelvan a ser válidos.",
+                "⛔ La recherche est bloquée jusqu’à ce que les réponses obligatoires redeviennent valides.",
+            )[locale]
         return _screen(text, buttons)
 
     if stage == "details_hub":
@@ -2506,7 +2511,17 @@ def _build_detail_screen(state: dict[str, Any]) -> dict[str, Any]:
             _button(tr(state, "done"), "done_detail"),
             _button(tr(state, "back"), "back_detail"),
         ]
-        return _screen(title + "\n\nTemporary selection — Done commits, Back discards.", buttons)
+        return _screen(
+            title
+            + "\n\n"
+            + L(
+                "Выбор временный — «Готово» сохраняет, «Назад» отменяет.",
+                "Selection is temporary — Done saves it, Back discards it.",
+                "La selección es temporal: Listo la guarda y Atrás la descarta.",
+                "La sélection est temporaire : Valider l’enregistre et Retour l’annule.",
+            )[locale],
+            buttons,
+        )
 
     if mode == "single":
         buttons = [
@@ -2517,7 +2532,17 @@ def _build_detail_screen(state: dict[str, Any]) -> dict[str, Any]:
             _button(tr(state, "any"), "clear_single_detail"),
             _button(tr(state, "back"), "back_detail"),
         ]
-        return _screen(title + "\n\nOne answer commits immediately.", buttons)
+        return _screen(
+            title
+            + "\n\n"
+            + L(
+                "Выбранный ответ сохранится сразу.",
+                "The selected answer is saved immediately.",
+                "La respuesta elegida se guarda de inmediato.",
+                "La réponse choisie est enregistrée immédiatement.",
+            )[locale],
+            buttons,
+        )
 
     if mode == "number":
         return _screen(
@@ -2560,7 +2585,14 @@ def _build_detail_screen(state: dict[str, Any]) -> dict[str, Any]:
 
     if mode == "seasonal":
         return _screen(
-            title + "\n\nTemporary mutually exclusive value — Done commits.",
+            title
+            + "\n\n"
+            + L(
+                "Выбор временный и взаимоисключающий — «Готово» сохраняет.",
+                "The choice is temporary and mutually exclusive — Done saves it.",
+                "La elección es temporal y excluyente: Listo la guarda.",
+                "Le choix est temporaire et exclusif : Valider l’enregistre.",
+            )[locale],
             [
                 _button(value_label("ready_now", locale), "seasonal_ready_now"),
                 _button(
@@ -2588,17 +2620,50 @@ def _build_detail_screen(state: dict[str, Any]) -> dict[str, Any]:
 
     if mode == "schedule":
         temp = draft["temp_edit"]
+        days = ", ".join(value_label(item, locale) for item in temp.get("days", []))
+        day_parts = ", ".join(
+            value_label(item, locale) for item in temp.get("day_parts", [])
+        )
+        interval = temp.get("exact_interval")
+        interval_text = "-".join(interval) if interval else tr(state, "not_set")
+        start_text = temp.get("start_date") or tr(state, "not_set")
         return _screen(
             title
             + "\n\n"
-            + f"days={temp.get('days', [])}\n"
-            + f"day_parts={temp.get('day_parts', [])}\n"
-            + f"exact_interval={temp.get('exact_interval')}\n"
-            + f"start_date={temp.get('start_date')}",
+            + L(
+                f"Дни: {days or tr(state, 'not_set')}\n"
+                f"Части дня: {day_parts or tr(state, 'not_set')}\n"
+                f"Точный интервал: {interval_text}\n"
+                f"Дата начала: {start_text}",
+                f"Days: {days or tr(state, 'not_set')}\n"
+                f"Day parts: {day_parts or tr(state, 'not_set')}\n"
+                f"Exact interval: {interval_text}\n"
+                f"Start date: {start_text}",
+                f"Días: {days or tr(state, 'not_set')}\n"
+                f"Partes del día: {day_parts or tr(state, 'not_set')}\n"
+                f"Intervalo exacto: {interval_text}\n"
+                f"Fecha de inicio: {start_text}",
+                f"Jours : {days or tr(state, 'not_set')}\n"
+                f"Moments de la journée : {day_parts or tr(state, 'not_set')}\n"
+                f"Intervalle exact : {interval_text}\n"
+                f"Date de début : {start_text}",
+            )[locale],
             [
-                _button("Days of week ▸", "schedule_open_nested", "schedule_days"),
-                _button("Time ▸", "schedule_open_nested", "schedule_time"),
-                _button("Start date ▸", "schedule_open_nested", "schedule_start"),
+                _button(
+                    L("Дни недели ▸", "Days of week ▸", "Días de la semana ▸", "Jours de la semaine ▸")[locale],
+                    "schedule_open_nested",
+                    "schedule_days",
+                ),
+                _button(
+                    L("Время ▸", "Time ▸", "Hora ▸", "Heure ▸")[locale],
+                    "schedule_open_nested",
+                    "schedule_time",
+                ),
+                _button(
+                    L("Дата начала ▸", "Start date ▸", "Fecha de inicio ▸", "Date de début ▸")[locale],
+                    "schedule_open_nested",
+                    "schedule_start",
+                ),
                 _button(tr(state, "done"), "done_detail"),
                 _button(tr(state, "back"), "back_detail"),
             ],
@@ -2633,11 +2698,20 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if nested in {"seasonal_date", "seasonal_text"}:
-        prompt = (
-            "Enter one local date as YYYY-MM-DD."
-            if nested == "seasonal_date"
-            else "Enter a localized season name."
-        )
+        prompt = {
+            "seasonal_date": L(
+                "Введите одну местную дату в формате YYYY-MM-DD.",
+                "Enter one local date as YYYY-MM-DD.",
+                "Introduzca una fecha local en formato YYYY-MM-DD.",
+                "Saisissez une date locale au format YYYY-MM-DD.",
+            ),
+            "seasonal_text": L(
+                "Введите название сезона.",
+                "Enter a season name.",
+                "Introduzca el nombre de la temporada.",
+                "Saisissez le nom de la saison.",
+            ),
+        }[nested][locale]
         return _screen(
             prompt,
             [_button(tr(state, "back"), "back_nested")],
@@ -2658,7 +2732,15 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
             _button(tr(state, "done"), "done_nested"),
             _button(tr(state, "back"), "back_nested"),
         ]
-        return _screen("Schedule — days (temporary)", buttons)
+        return _screen(
+            L(
+                "Расписание — дни недели (временно)",
+                "Schedule — days (temporary)",
+                "Horario — días (temporal)",
+                "Planning — jours (temporaire)",
+            )[locale],
+            buttons,
+        )
 
     if nested == "schedule_time":
         selected = set(draft["temp_edit"].get("day_parts", []))
@@ -2672,7 +2754,12 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
         ]
         buttons.append(
             _button(
-                "Enter exact interval"
+                L(
+                    "Указать точный интервал",
+                    "Enter exact interval",
+                    "Indicar intervalo exacto",
+                    "Indiquer l’intervalle exact",
+                )[locale]
                 + (
                     f": {draft['temp_edit']['exact_interval']}"
                     if draft["temp_edit"].get("exact_interval")
@@ -2686,18 +2773,36 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
             _button(tr(state, "done"), "done_nested"),
             _button(tr(state, "back"), "back_nested"),
         ]
-        return _screen("Schedule — time (temporary)", buttons)
+        return _screen(
+            L(
+                "Расписание — время (временно)",
+                "Schedule — time (temporary)",
+                "Horario — hora (temporal)",
+                "Planning — heure (temporaire)",
+            )[locale],
+            buttons,
+        )
 
     if nested == "schedule_interval_input":
         return _screen(
-            "Enter one exact local interval as HH:MM-HH:MM.",
+            L(
+                "Введите один точный местный интервал в формате HH:MM-HH:MM.",
+                "Enter one exact local interval as HH:MM-HH:MM.",
+                "Introduzca un intervalo local exacto en formato HH:MM-HH:MM.",
+                "Saisissez un intervalle local exact au format HH:MM-HH:MM.",
+            )[locale],
             [_button(tr(state, "back"), "back_nested")],
             expects_text="schedule_interval",
         )
 
     if nested == "schedule_start":
         return _screen(
-            "Enter one local start date as YYYY-MM-DD, or clear it.",
+            L(
+                "Введите местную дату начала в формате YYYY-MM-DD или очистите её.",
+                "Enter one local start date as YYYY-MM-DD, or clear it.",
+                "Introduzca una fecha local de inicio en formato YYYY-MM-DD o bórrela.",
+                "Saisissez une date locale de début au format YYYY-MM-DD ou effacez-la.",
+            )[locale],
             [
                 _button(tr(state, "any"), "schedule_clear_start"),
                 _button(tr(state, "back"), "back_nested"),
@@ -2705,7 +2810,15 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
             expects_text="schedule_start",
         )
 
-    return _screen("Unknown nested editor", [_button(tr(state, "back"), "back_nested")])
+    return _screen(
+        L(
+            "Неизвестный вложенный редактор",
+            "Unknown nested editor",
+            "Editor anidado desconocido",
+            "Éditeur imbriqué inconnu",
+        )[locale],
+        [_button(tr(state, "back"), "back_nested")],
+    )
 
 
 def _with_resolution_notice(
