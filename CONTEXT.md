@@ -148,9 +148,25 @@ _Avoid_: Referee Availability, Referee Search
 
 ### Search and conversation
 
+**Discovery Flow**:
+One Bot User journey from a fresh Direction Menu through confirmed discovery inputs and one Search submission.
+_Avoid_: Telegram chat history, saved search, result list
+
+**Discovery Draft**:
+The one durable, unfinished, and user-scoped state record for a Discovery Flow. It stores confirmed inputs, temporary editing state, and the current logical stage independently from Telegram messages.
+_Avoid_: Active Chat View, completed search, per-intent draft cache
+
 **Discovery Criterion**:
 A constraint explicitly confirmed by a Bot User for one discovery flow. An unopened, empty, or cleared optional criterion imposes no constraint and never asserts an Opportunity Attribute.
 _Avoid_: Opportunity Attribute, inferred preference, classifier output
+
+**Discovery Detail**:
+A user-facing input or setting through which a Bot User confirms or clears one Discovery Criterion.
+_Avoid_: Opportunity Attribute, unconfirmed suggestion, matching rule
+
+**Active Chat View**:
+The current Telegram presentation of one logical bot screen. It may contain one message or a bounded group of result-card messages and is never the source of truth for a Discovery Draft.
+_Avoid_: Discovery Draft, Telegram chat history, completed search
 
 **Event Time**:
 One local date or bounded inclusive date range for a particular game, tournament, or event-specific request, with an optional exact local time or day part.
@@ -202,7 +218,7 @@ _Avoid_: Detected Country, inferred country, current country
 
 **Sub-city Area**:
 A typed geographic refinement within one confirmed city, such as an administrative district, neighborhood, named locality, or the vicinity of a station, landmark, or address.
-_Avoid_: District when the place is not an administrative district, Location Filter
+_Avoid_: District when the place is not an administrative district, Location constraint
 
 **Location Mention**:
 The exact Source Message text or source reference that expresses a place.

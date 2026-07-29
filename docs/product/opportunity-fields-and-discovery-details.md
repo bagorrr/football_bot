@@ -1,10 +1,10 @@
-# Opportunity Fields and Discovery Filters
+# Opportunity Fields and Discovery Details
 
 Status: Confirmed product baseline. The durable data-boundary decision is
 recorded in
 [ADR 0004](../adr/0004-separate-opportunity-attributes-from-discovery-criteria.md).
 The originating Wayfinder decision is
-[Define direction-specific opportunity fields and search filters](https://github.com/bagorrr/football_bot/issues/14).
+[Define direction-specific opportunity fields and discovery details](https://github.com/bagorrr/football_bot/issues/14).
 
 ## Scope
 
@@ -13,7 +13,7 @@ This document defines:
 - evidence-backed normalized fields for each canonical Opportunity Type;
 - the minimum fields required to accept an Opportunity Candidate;
 - Discovery Criteria confirmed by a Bot User after Search Area;
-- the exact direction-specific filter order and Telegram navigation;
+- the exact direction-specific detail order and Telegram navigation;
 - language-neutral answer shapes and reviewed Russian, English, Spanish, and
   French interface copy.
 
@@ -36,10 +36,10 @@ vocabularies, but they have different provenance and lifecycles and must not be
 stored as one shared assertion.
 
 - Missing Opportunity Attribute means `unknown`, never `false`.
-- An unopened, empty, or cleared optional filter means no constraint.
+- An unopened, empty, or cleared optional detail means no constraint.
 - Selecting every displayed value remains an explicit complete set; it is not
   collapsed into an empty criterion.
-- A Bot User's filter never manufactures a fact on an Opportunity.
+- A Bot User's detail never manufactures a fact on an Opportunity.
 - A Source Message fact never becomes a Bot User preference.
 - Every material Opportunity Attribute retains evidence from the Source
   Message or its permitted context bundle.
@@ -208,7 +208,7 @@ wood_parquet
 ```
 
 An unrecognized surface may remain evidence-backed source information but is
-not exposed through an `Other` filter value.
+not exposed through an `Other` detail value.
 
 ### Payment
 
@@ -222,8 +222,9 @@ unknown
 
 Any explicitly stated amount in any currency establishes `paid`, even when the
 word “paid” is absent. Preserve an exact amount and currency only when the
-Source Message states them; never infer a currency. The Bot User filters only
-by `free` and `paid` and never enters a minimum, maximum, or exact amount.
+Source Message states them; never infer a currency. The Bot User may select
+only `free` or `paid` as a Discovery Detail and never enters a minimum,
+maximum, or exact amount.
 
 ### Venue Provision
 
@@ -267,7 +268,7 @@ A Schedule may contain:
 - one optional local start date.
 
 The day/time choices apply as one recurring schedule. Direction-specific
-calendar exceptions are not part of the MVP filter.
+calendar exceptions are not part of the MVP detail.
 
 ### Refereeing fields
 
@@ -320,7 +321,7 @@ A standing Referee Availability offer does not require a date. A Referee
 Request is tied to a planned match or tournament and therefore does require one
 date or a bounded date range.
 
-## Source exclusion and non-filters
+## Source exclusion and non-details
 
 Play Intensity is not an Opportunity Attribute or Discovery Criterion in the
 MVP.
@@ -331,25 +332,25 @@ or is for children. Do not infer a children's game from age-band notation,
 birth year, school context, youth wording, or other indirect signals.
 
 Information listed as optional in the acceptance matrix may be retained with
-evidence without becoming a filter. In particular:
+evidence without becoming a selectable detail. In particular:
 
 - tournament structure, team count, remaining places, deadlines, prizes, and
-  detailed rules are not Tournament Search filters;
+  detailed rules are not Tournament Search details;
 - team name, league, roster size, kit colour, results, duration, and comments
-  are not Opponent Search filters;
+  are not Opponent Search details;
 - training schedules, team history, credentials, trial conditions, detailed
-  statistics, and playing style are not transfer filters;
+  statistics, and playing style are not transfer details;
 - coach qualifications, certificates, experience, language, duration, group
   size, equipment, programme, achievements, requester identity, and remote
-  format are not coaching filters;
+  format are not coaching details;
 - Playing Level, Venue Setting, Playing Surface, referee count, qualifications,
-  and experience are not refereeing filters.
+  and experience are not refereeing details.
 
 ## Direction-specific discovery flows
 
 All flows begin after the Search Area has been confirmed.
 
-| User Intent | Compatible Opportunity Type | Required discovery core | Optional filters in display order |
+| User Intent | Compatible Opportunity Type | Required discovery core | Optional details in display order |
 | --- | --- | --- | --- |
 | Game Search | Open Match | one date or bounded date range | Time; Team Format; Positions; Playing Levels; Venue Setting; Playing Surface; Payment |
 | Player Search | Player Match Availability | one date or bounded date range | Time; Number of Players; Team Format; Positions; Playing Levels; Venue Setting; Playing Surface; Payment |
@@ -387,11 +388,11 @@ Search, Referee Search, and Refereeing Service Offer show:
 
 After a valid date answer:
 
-> Можно выбрать расширенные фильтры или сразу начать поиск.
+> Можно уточнить детали или сразу начать поиск.
 
 ```text
 [ Назад ]
-[ Фильтры ]
+[ Детали ]
 [ Поиск ]
 ```
 
@@ -403,16 +404,16 @@ Search Area:
 
 ```text
 [ Назад ]
-[ Фильтры ]
+[ Детали ]
 [ Поиск ]
 ```
 
 `Поиск` starts discovery immediately. There is no disabled or non-clickable
-“Дополнительные фильтры” placeholder in any flow.
+“Дополнительные детали” placeholder in any flow.
 
-### Filter hub
+### Details hub
 
-The filter hub is one editable Telegram message. Its text lists the available
+The details hub is one editable Telegram message. Its text lists the available
 settings using exactly the same localized names and order as its buttons. Each
 button also summarizes the current selection:
 
@@ -428,24 +429,24 @@ button also summarizes the current selection:
 [ Поиск ]
 ```
 
-Inside the filter hub, the redundant `Фильтры` action is omitted. `Назад`
+Inside the details hub, the redundant `Детали` action is omitted. `Назад`
 returns to the post-core action screen without clearing criteria.
 
-Each filter button edits the same message into its submenu. For a submenu with
+Each detail button edits the same message into its submenu. For a submenu with
 `Готово`:
 
 - toggles modify a submenu draft;
-- `Готово` commits that draft and returns to the filter hub;
+- `Готово` commits that draft and returns to the details hub;
 - `⬅️ Назад` discards changes made since the submenu opened;
 - committing an empty selection clears the criterion.
 
 For a mutually exclusive submenu without `Готово`, selecting a value commits
-immediately and returns to the filter hub. `Неважно` clears the criterion.
+immediately and returns to the details hub. `Неважно` clears the criterion.
 
 After `Поиск`, prevent duplicate submission and show Telegram's native typing
 indicator until the result menu replaces the current search state.
 
-## Russian master filter screens
+## Russian master detail screens
 
 ### Time menu
 
@@ -470,7 +471,7 @@ One answer only:
 [ ⬅️ Назад ]
 ```
 
-A valid number commits immediately and returns to the filter hub. Approximate
+A valid number commits immediately and returns to the details hub. Approximate
 values and ranges are not accepted.
 
 ### Team Format menu
@@ -641,7 +642,7 @@ Identifiers and stored values are never localized.
 | Russian | English | Spanish | French |
 | --- | --- | --- | --- |
 | Назад | Back | Atrás | Retour |
-| Фильтры | Filters | Filtros | Filtres |
+| Детали | Details | Detalles | Détails |
 | Поиск | Search | Buscar | Rechercher |
 | Готово | Done | Listo | Valider |
 | Неважно | Any | Cualquiera | Peu importe |
@@ -654,16 +655,16 @@ Post-core message:
 
 | Russian | English | Spanish | French |
 | --- | --- | --- | --- |
-| Можно выбрать расширенные фильтры или сразу начать поиск. | You can choose advanced filters or start searching now. | Puedes elegir filtros avanzados o empezar a buscar ahora. | Vous pouvez choisir des filtres avancés ou lancer la recherche maintenant. |
+| Можно уточнить детали или сразу начать поиск. | You can add details or start searching now. | Puedes añadir detalles o empezar a buscar ahora. | Vous pouvez ajouter des détails ou lancer la recherche maintenant. |
 
-Filter-hub introduction, followed by the direction-specific list of localized
-filter names:
+Details-hub introduction, followed by the direction-specific list of localized
+detail names:
 
 | Russian | English | Spanish | French |
 | --- | --- | --- | --- |
 | Можно выбрать следующие настройки: | You can choose the following settings: | Puedes elegir las siguientes opciones: | Vous pouvez choisir les paramètres suivants : |
 
-### Filter names
+### Detail names
 
 | Russian | English | Spanish | French |
 | --- | --- | --- | --- |

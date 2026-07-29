@@ -21,8 +21,8 @@ This roadmap records the stable delivery flow and transition gates. Active statu
   `docs/product/search-direction-taxonomy.md`
 - Location confirmation and normalization:
   `docs/product/location-resolution.md`
-- Opportunity fields and Discovery Criteria:
-  `docs/product/opportunity-fields-and-discovery-filters.md`
+- Opportunity fields and Discovery Details:
+  `docs/product/opportunity-fields-and-discovery-details.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
 - Source consent basis: `docs/product/source-consent.md`
 - Open decision space: GitHub Wayfinder map, when needed
@@ -59,7 +59,7 @@ Do not duplicate detailed decisions or ticket status in this file.
 - Target users and their main job-to-be-done.
 - Chats and message sources that may be processed.
 - Telegram access, consent evidence, withdrawal, and new-member boundaries.
-- Complete-stream ingestion and the rule that relevance filtering happens only
+- Complete-stream ingestion and the rule that relevance screening happens only
   after model classification.
 - Definition of a football match listing.
 - Required and optional listing attributes.

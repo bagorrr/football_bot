@@ -19,12 +19,12 @@ and production-architecture Wayfinder tickets.
 
 Each enabled Source Chat is treated as one complete source stream. The ingestion
 worker must process every observable message and post from every author, plus
-edits and deletion events. It must not pre-filter by author role, keywords,
+edits and deletion events. It must not pre-screen by author role, keywords,
 apparent football relevance, or expected opportunity type. Irrelevant messages
 are rejected only after classification.
 
 Consent eligibility therefore applies to the whole Source Chat, not as a
-selective per-message classifier filter.
+selective per-message classifier gate.
 
 This file records the product owner's factual attestation and the resulting
 project decision. It is not an independent legal opinion. Supporting evidence

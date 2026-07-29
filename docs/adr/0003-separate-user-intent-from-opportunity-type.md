@@ -61,6 +61,6 @@ live in
 - Source classification emits Opportunity Candidates and Opportunity Types, not
   User Intents.
 - Matching begins with the explicit compatibility matrix and then evaluates
-  geography and direction-specific filters.
+  geography and direction-specific details.
 - Classifier datasets and regression metrics must cover all canonical
   Opportunity Types, compound messages, and ambiguity between adjacent types.

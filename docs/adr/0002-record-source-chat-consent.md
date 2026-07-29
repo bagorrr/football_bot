@@ -20,7 +20,7 @@ decisions.
 Every enabled Source Chat is a complete ingestion stream: all account-visible
 messages and posts from all authors are processed, including irrelevant
 messages, edits, and deletion events. There is no per-author or keyword
-pre-filter before classification.
+pre-screen before classification.
 
 Production must maintain participant-level evidence but gate processing at the
 Source Chat level. The continuing consent process for an enabled Source Chat
@@ -47,7 +47,7 @@ in [`docs/product/source-consent.md`](../product/source-consent.md).
 
 - Corpus and architecture work may proceed for consent-covered content.
 - Every enabled configured Source Chat is ingested as a complete observable
-  stream; irrelevant content is filtered only after model classification.
+  stream; irrelevant content is screened out only after model classification.
 - The remaining Source Author identity, minimization, retention, deletion, and
   withdrawal details stay open in
   [Define Source Author identity, retention, and withdrawal](https://github.com/bagorrr/football_bot/issues/6),
