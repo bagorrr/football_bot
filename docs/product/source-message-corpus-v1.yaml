@@ -1,0 +1,728 @@
+corpus:
+  name: "Redacted Representative Source Message Corpus"
+  version: "1.0"
+  status: "confirmed"
+  language_distribution:
+    russian: 38
+  controlled_event_sequence_count: 1
+  annotation_status: "provisional_manual"
+  provenance_record: "docs/product/source-message-corpus-provenance.md"
+
+redaction_tokens:
+  "[PERSON]": "A person name or identifying personal reference was removed."
+  "[TEAM]": "A team or club name was removed."
+  "[LEAGUE]": "A league or competition brand was removed."
+  "[LOCATION]": "A place, venue, station, district, or address was removed."
+  "[DATE]": "An exact source date was shifted or generalized."
+  "[AGE]": "An exact age was removed."
+  "[AMOUNT]": "An exact amount was generalized where it could aid linkage."
+
+cases:
+  - case_id: "sm-001"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      На сегодня нужен кипер
+      19:30
+      [LOCATION]
+    coverage_tags: ["ordinary", "relative_date", "location_redacted"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["open_match"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Open place, relative date, exact time, and redacted location are explicit."
+
+  - case_id: "sm-002"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-06T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Всем привет!
+      Сегодня на вечер нужен кипер...
+      Если вдруууг тебе не чем заняться, а хотел бы поотбивать мячи вечерком — го лс, мужик!
+    coverage_tags: ["slang", "misspelling", "relative_date", "informal_contact_route"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["open_match"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Slang and spelling errors must not hide a one-off goalkeeper opening."
+
+  - case_id: "sm-003"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T13:00:00+03:00"
+      synthetic: true
+    text: "Нужен кипер и 2 полевых"
+    coverage_tags: ["short", "incomplete", "ambiguous_time_horizon"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["open_match", "roster_vacancy"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "One-off versus long-term recruitment is not established."
+
+  - case_id: "sm-004"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-11T13:00:00+03:00"
+      synthetic: true
+    text: "Поиграю сегодня вечером. Любой формат"
+    coverage_tags: ["ordinary", "relative_date", "availability"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_match_availability"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "One-off availability is explicit; location and exact availability bounds need context."
+
+  - case_id: "sm-005"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-10T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Впишусь поиграть
+      (1–2 человека)
+    coverage_tags: ["slang", "group_availability", "incomplete"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_match_availability"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "A jointly available group is plausible, but date and location are absent."
+
+  - case_id: "sm-006"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-11T09:00:00+03:00"
+      synthetic: true
+    replied_to_text: "Всем привет, есть где сегодня можно побегать поиграть?"
+    text: "Сыграю на любой позиции в поле"
+    coverage_tags: ["contextual_reply", "position", "relative_date"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_match_availability"]
+      expected_pipeline_disposition: "needs_second_pass"
+      review_focus: "The reply alone lacks time; the permitted parent supplies same-day availability context."
+
+  - case_id: "sm-007"
+    provenance: "consented_real_redacted"
+    source_alias: "source_3"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T13:00:00+03:00"
+      synthetic: true
+    text: "Ищем команду в чемпионат 5х5 на газоне. Осталось последнее место для команды."
+    coverage_tags: ["ordinary", "team_registration", "team_format", "surface"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["tournament"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Open participation is explicit; Event Time is missing from the redacted fixture."
+
+  - case_id: "sm-008"
+    provenance: "consented_real_redacted"
+    source_alias: "source_3"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Добрый день!
+      Идёт донабор команд на однодневный турнир [DATE] — одно место,
+      и на весеннее первенство по футболу 5х5 — три места.
+      Игры в крытых манежах.
+    coverage_tags: ["tournament", "multiple_competitions", "duplicate_observed"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["tournament"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Two independently actionable competition propositions may require separate candidates."
+
+  - case_id: "sm-009"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T13:00:00+03:00"
+      synthetic: true
+    text: |-
+      Завтра с 21:00 до 00:00 однодневный турнир [LEAGUE].
+      Осталось одно место для команды и пару мест для игроков!
+      Подробнее в лс!
+    coverage_tags: ["compound", "relative_date", "team_place", "individual_places"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["tournament", "open_match"]
+      expected_pipeline_disposition: "needs_second_pass"
+      review_focus: "The team registration and individual player openings are independent propositions."
+
+  - case_id: "sm-010"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-05T13:00:00+03:00"
+      synthetic: true
+    text: "Ищем соперника для товарищеского матча 8х8"
+    coverage_tags: ["ordinary", "team_format", "incomplete"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["opponent_request"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "Opponent intent is clear, but Event Time and location are absent."
+
+  - case_id: "sm-011"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-06T18:00:00+03:00"
+      synthetic: true
+    text: "ищем соперника для спарринг матча в пятницу, 19:00"
+    coverage_tags: ["lowercase", "relative_weekday", "exact_time"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["opponent_request"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Date normalization depends on the synthetic reference time; location remains absent."
+
+  - case_id: "sm-012"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T18:00:00+03:00"
+      synthetic: true
+    replied_to_text: "С кем товарка, дружище?"
+    text: "Ищем соперников"
+    coverage_tags: ["contextual_reply", "short", "plural"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["opponent_request"]
+      expected_pipeline_disposition: "needs_second_pass"
+      review_focus: "The parent establishes that the short reply concerns a friendly match."
+
+  - case_id: "sm-013"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T09:00:00+03:00"
+      synthetic: true
+    text: "Нужен постоянный вратарь в команду. Играем по выходным в формате 5х5"
+    coverage_tags: ["edited_marker", "long_term", "position", "recurring_schedule"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["roster_vacancy"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "The word 'постоянный' establishes the long-term boundary."
+
+  - case_id: "sm-014"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T18:00:00+03:00"
+      synthetic: true
+    text: |-
+      В команду в [LEAGUE] нужны игроки.
+      Цель на сезон — место в середине таблицы.
+      Кому интересно, пишите в лс.
+    coverage_tags: ["seasonal", "multiple_players", "contact_route"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["roster_vacancy"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "The season goal establishes a durable team relationship."
+
+  - case_id: "sm-015"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-07T13:00:00+03:00"
+      synthetic: true
+    text: "Приветствую, ищем вратаря в команду 8х8, подробности в лс"
+    coverage_tags: ["edited_marker", "ambiguous_time_horizon", "short"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["open_match", "roster_vacancy"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "Team wording alone does not settle one-off versus long-term recruitment."
+
+  - case_id: "sm-016"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-11T09:00:00+03:00"
+      synthetic: true
+    text: "Ищу команду для постоянных игр, вратарь"
+    coverage_tags: ["long_term", "position", "short"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_transfer_availability"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Permanent play intent supports the transfer boundary."
+
+  - case_id: "sm-017"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-06T01:00:00+03:00"
+      synthetic: true
+    text: "Вратарь. [AGE]. Ищу команду 8х8"
+    coverage_tags: ["short", "age_redacted", "ambiguous_time_horizon"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_transfer_availability", "player_match_availability"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "The desired relationship duration is not explicit."
+
+  - case_id: "sm-018"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T13:00:00+03:00"
+      synthetic: true
+    text: |-
+      Всем доброго времени суток, ищу команду для игры.
+      Рассматриваю форматы 8х8 и 11х11.
+      Позиция — вратарь, есть большой опыт игры на разных турнирах.
+      Готов рассмотреть любые предложения.
+    coverage_tags: ["self_description", "multiple_formats", "experience_generalized"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_transfer_availability"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "A team search is clear, while detailed claims remain self-reported."
+
+  - case_id: "sm-019"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      [DATE] командная тренировка с лицензированным тренером 🔥
+      [LOCATION]
+      Время: 19:00–21:00
+      Пробная тренировка бесплатно!
+      Дополнительные вопросы в ЛС.
+    coverage_tags: ["edited_marker", "in_person_training", "free_trial", "qualification_claim"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["coach_availability"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "This is an explicit in-person coaching offer, not a Coach Request."
+
+  - case_id: "sm-020"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-05T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Всем привет. Сегодня в 21:00 тренировка под руководством квалифицированного тренера.
+      Можно присоединиться на постоянную основу и пробиться в состав.
+      Стоимость [AMOUNT] — аренда, оплата тренера и вода.
+      Пишите в лс.
+    coverage_tags: ["in_person_training", "paid", "compound_service_and_roster_context"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["coach_availability", "roster_vacancy"]
+      expected_pipeline_disposition: "needs_second_pass"
+      review_focus: "A paid coaching session and possible durable team place may be independent propositions."
+
+  - case_id: "sm-021"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-05T18:00:00+03:00"
+      synthetic: true
+    text: |-
+      Если есть кто хочет научиться играть в футбол правильно
+      или просто физику и технику подтянуть — приходите на тренировку.
+      Тренировки по средам с 21:30 до 23:00.
+      Тренер: [PERSON].
+      Цена для участников группы — [AMOUNT] за тренировку.
+      Пишите в личку.
+    coverage_tags: ["in_person_training", "recurring_schedule", "paid", "ordinary"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["coach_availability"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "An explicit recurring coaching-service offer."
+
+  - case_id: "sm-022"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-07T09:00:00+03:00"
+      synthetic: true
+    text: "Доброе утро, в команду 11х11 требуется тренер"
+    coverage_tags: ["short", "team_format", "ordinary"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["coach_request"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "An explicit Coach Request with little supporting detail."
+
+  - case_id: "sm-023"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-11T13:00:00+03:00"
+      synthetic: true
+    text: |-
+      Добрый день. Ищу тренера вратарей.
+      Для индивидуальных занятий. Можно в группе.
+      Писать в ЛС.
+    coverage_tags: ["edited_marker", "goalkeeper_training", "individual_or_group"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["coach_request"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "The requester explicitly wants goalkeeper coaching."
+
+  - case_id: "sm-024"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T13:00:00+03:00"
+      synthetic: true
+    text: |-
+      Доброго дня.
+      Есть тут тренера?
+      Ищем тренера, наш уехал с концами.
+    coverage_tags: ["colloquial", "grammar_error", "incomplete"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["coach_request"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Colloquial wording still expresses a replacement Coach Request."
+
+  - case_id: "sm-025"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-05T13:00:00+03:00"
+      synthetic: true
+    text: "Могу судить матчи, кому надо — пишите!"
+    coverage_tags: ["rare_type", "standing_offer", "short"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["referee_availability"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "A standing referee offer may omit a date, but still needs an accepted location."
+
+  - case_id: "sm-026"
+    provenance: "consented_real_redacted"
+    source_alias: "source_3"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T09:00:00+03:00"
+      synthetic: true
+    text: "Нужен судья на воскресенье"
+    coverage_tags: ["short", "relative_weekday", "incomplete"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["referee_request"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "Date can be proposed, but match or tournament context and location are absent."
+
+  - case_id: "sm-027"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-05T13:00:00+03:00"
+      synthetic: true
+    text: "Добрый, нужен судья на сегодня, товарка 8:8, шатер с 21–22:30, [LOCATION], в лс."
+    coverage_tags: ["missing_space", "abbreviation", "relative_date", "exact_time", "location_redacted"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["referee_request"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "A colloquial but explicit referee request for a friendly match."
+
+  - case_id: "sm-028"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-10T18:00:00+03:00"
+      synthetic: true
+    text: "Всем привет, на завтра нужен судья, детский турнир! Пишите в ЛС, расскажу подробности."
+    coverage_tags: ["edited_marker", "explicit_children_only", "relative_date"]
+    provisional_annotation:
+      football_relevance: "relevant_but_excluded"
+      opportunity_types: []
+      expected_pipeline_disposition: "irrelevant"
+      review_focus: "The event is explicitly a children's tournament and triggers the narrow exclusion."
+
+  - case_id: "sm-029"
+    provenance: "consented_real_redacted"
+    source_alias: "source_4"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-08T13:00:00+03:00"
+      synthetic: true
+    text: "?"
+    coverage_tags: ["ordinary_irrelevant", "malformed", "single_character"]
+    provisional_annotation:
+      football_relevance: "unknown"
+      opportunity_types: []
+      expected_pipeline_disposition: "irrelevant"
+      review_focus: "No football or opportunity evidence."
+
+  - case_id: "sm-030"
+    provenance: "consented_real_redacted"
+    source_alias: "source_4"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-07T13:00:00+03:00"
+      synthetic: true
+    text: "ну что за женщина роковая"
+    coverage_tags: ["ordinary_irrelevant", "off_topic", "edited_marker"]
+    provisional_annotation:
+      football_relevance: "irrelevant"
+      opportunity_types: []
+      expected_pipeline_disposition: "irrelevant"
+      review_focus: "Ordinary off-topic chat must still enter classification and then be rejected."
+
+  - case_id: "sm-031"
+    provenance: "consented_real_redacted"
+    source_alias: "source_4"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-06T09:00:00+03:00"
+      synthetic: true
+    text: "Ну или другим языком еб...ся и бухал 🤔😂"
+    coverage_tags: ["ordinary_irrelevant", "off_topic", "profanity", "edited_marker"]
+    provisional_annotation:
+      football_relevance: "irrelevant"
+      opportunity_types: []
+      expected_pipeline_disposition: "irrelevant"
+      review_focus: "Profanity is retained as distributional language but contains no opportunity."
+
+  - case_id: "sm-032"
+    provenance: "consented_real_redacted"
+    source_alias: "source_4"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-07T13:00:00+03:00"
+      synthetic: true
+    replied_to_text: "Так в том-то и дело: полного видео нет, запись начинается с этого момента."
+    text: "Если судить по этому видео — фола нет"
+    coverage_tags: ["football_relevant_no_opportunity", "contextual_reply"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: []
+      expected_pipeline_disposition: "irrelevant"
+      review_focus: "Football discussion is not itself a market opportunity."
+
+  - case_id: "sm-033"
+    provenance: "consented_real_redacted"
+    source_alias: "source_4"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-06T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Ребята, сорри за оффтоп, но может кто подскажет,
+      где сейчас купить хороший футбольный мяч для тренировок
+      за адекватные деньги?
+    coverage_tags: ["football_relevant_no_opportunity", "off_topic", "equipment_purchase"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: []
+      expected_pipeline_disposition: "irrelevant"
+      review_focus: "A request to buy equipment is outside the canonical opportunity taxonomy."
+
+  - case_id: "sm-034"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    duplicate_group: "duplicate_01"
+    observed_duplicate_count_in_source: 8
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-10T13:00:00+03:00"
+      synthetic: true
+    text: "Сегодня есть где поиграть?"
+    coverage_tags: ["duplicate", "short", "relative_date", "ambiguous_search_or_availability"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_match_availability"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "The message implies availability but lacks explicit duration, location, and player details."
+
+  - case_id: "sm-035"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_unedited"
+    duplicate_group: "duplicate_01"
+    observed_duplicate_count_in_source: 8
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-10T13:00:00+03:00"
+      synthetic: true
+    text: "Сегодня есть где поиграть?"
+    coverage_tags: ["duplicate", "short", "relative_date", "ambiguous_search_or_availability"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_match_availability"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "A separate observed Source Message with identical normalized text."
+
+  - case_id: "sm-036"
+    provenance: "consented_real_redacted"
+    source_alias: "source_4"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-09T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Требуется замена.
+      Сегодня на матч с 19:30 до 21:00 нужен один полевой игрок.
+      Пишите в чат по заинтересованности.
+    coverage_tags: ["edited_marker", "replacement", "relative_date", "exact_time"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["open_match"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "The current edited revision is classifiable, but the prior revision is unavailable."
+
+  - case_id: "sm-037"
+    provenance: "consented_real_redacted"
+    source_alias: "source_1"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-06T13:00:00+03:00"
+      synthetic: true
+    text: "Есть где сегодня бесплатно поиграть?"
+    coverage_tags: ["edited_marker", "relative_date", "payment", "ambiguous_search_or_availability"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["player_match_availability"]
+      expected_pipeline_disposition: "unresolved"
+      review_focus: "The current revision implies availability and a free-play preference, not a source-side Payment fact."
+
+  - case_id: "sm-038"
+    provenance: "consented_real_redacted"
+    source_alias: "source_2"
+    event_kind: "message_upsert"
+    revision_state: "current_edited_prior_revision_unavailable"
+    synthetic_time_context:
+      reference_local_datetime: "2026-01-07T09:00:00+03:00"
+      synthetic: true
+    text: |-
+      Всем привет.
+      В дружный коллектив на усиление требуются игроки на постоянную перспективу.
+      Нужны игроки, которые знают, что делать с мячом.
+      Тренировки с тренером и участие в различных турнирах.
+      Если интересно — пишите в личку.
+    coverage_tags: ["edited_marker", "long_term", "multiple_positions", "training_context"]
+    provisional_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["roster_vacancy"]
+      expected_pipeline_disposition: "needs_review"
+      review_focus: "Permanent perspective establishes a Roster Vacancy; coaching is context, not a Coach Request."
+
+controlled_event_sequences:
+  - case_id: "controlled-event-001"
+    provenance: "controlled_consented_live_event"
+    representativeness: "contract_observation_not_distribution_sample"
+    source_alias: "controlled_source"
+    coverage_tags:
+      - "controlled"
+      - "observed_edit_pair"
+      - "observed_deletion_tombstone"
+      - "location_redacted"
+      - "time_change"
+    event_sequence:
+      - observed_sequence: 1
+        event_kind: "message_create"
+        revision_number: 1
+        text: "Играем в это воскресенье в [LOCATION]. Пишите в личку, кто готов"
+      - observed_sequence: 2
+        event_kind: "message_edit"
+        prior_revision:
+          revision_number: 1
+          text: "Играем в это воскресенье в [LOCATION]. Пишите в личку, кто готов"
+        current_revision:
+          revision_number: 2
+          text: "Играем в это воскресенье в [LOCATION] в 20:00. Пишите в личку, кто готов"
+      - observed_sequence: 3
+        event_kind: "message_delete"
+        tombstone:
+          opaque_message_reference: "controlled-event-001"
+          deleted_revision_number: 2
+          message_body: null
+    contract_annotation:
+      football_relevance: "relevant"
+      opportunity_types: ["open_match"]
+      classifier_input_on_create: "revision_1"
+      classifier_input_on_edit: "revision_2"
+      classifier_input_on_delete: null
+      lifecycle_owner: "application"
+      expected_pipeline_disposition: "needs_review"
+      note: "This live sequence proves event observability and revision replacement only. It is controlled evidence, not a natural Source Message distribution sample."
