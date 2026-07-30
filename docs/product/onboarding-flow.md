@@ -3,6 +3,9 @@
 Status: Confirmed. The canonical state machine, Back behavior, draft lifetime,
 menu navigation, and Telegram message lifecycle were resolved in
 [Define onboarding state and Back navigation semantics](https://github.com/bagorrr/football_bot/issues/7).
+The AI-native Search Area and date interaction refinements were confirmed
+during
+[Validate the multilingual onboarding flow](https://github.com/bagorrr/football_bot/issues/9).
 
 Direction-specific required cores, Discovery Details, localized copy, and
 shared Details navigation are canonical in
@@ -57,8 +60,10 @@ Language.
 3. Resolve any Intent Branch into a terminal User Intent.
 4. Confirm country.
 5. Confirm city.
-6. Confirm the whole city or one or more Sub-city Areas.
-7. Confirm the required date or bounded range for directions that require it.
+6. In one free-text answer, confirm the whole city or one or more Sub-city
+   Areas.
+7. In one free-text answer, confirm the required date or bounded range for
+   directions that require it.
 8. Show the post-core action screen.
 9. Optionally edit direction-specific Discovery Details.
 10. Submit Search.
@@ -132,12 +137,12 @@ screen is earlier in the flow.
 | Intent Branch menu | Direction Menu |
 | Country | the owning Intent Branch, or Direction Menu for a direct intent |
 | City | Country |
-| Sub-city Areas | City; discard uncommitted area edits |
-| Required Date | Sub-city Areas |
-| Post-core action screen | Required Date when required; otherwise Sub-city Areas |
+| Search Area text stage | City; discard only unconfirmed interpretation or clarification state |
+| Required Date | Search Area text stage |
+| Post-core action screen | Required Date when required; otherwise Search Area text stage |
 | Details Hub | Post-core action screen |
 | Detail submenu | Details Hub; discard uncommitted submenu edits |
-| Nested picker or free-text prompt | parent submenu; preserve confirmed value |
+| Nested editor or free-text prompt | parent submenu; preserve confirmed value |
 | Settings language selector | Settings; preserve language |
 | Mode submenu | Settings |
 | Settings | a newly rendered Main Menu |
@@ -186,22 +191,38 @@ Back removes only those candidates.
 - Country, User Intent, non-temporal Discovery Criteria, weekdays, and
   qualitative day parts remain.
 
-### Sub-city Areas
+### Search Area
 
-Sub-city editing uses a temporary selection:
+After City, the Bot Assistant waits for one free-text answer in the current
+Conversation Language. The answer may name one or several Sub-city Areas or
+state that the whole city is acceptable. The only inline action is Back.
 
-- toggles change only the temporary selection;
-- `Готово` commits it;
-- Back discards it and preserves the previously confirmed Search Area;
-- `Весь город` commits immediately and clears individual areas.
+The model may propose an ordered list, but it remains unconfirmed until the
+application validates every stable identifier, geographic type, and country
+and city parent. One accepted interpretation commits the complete Search Area
+immediately and advances the flow. An accepted whole-city answer clears
+individual areas. Ambiguous, unresolved, invalid, and technical outcomes
+preserve the previously confirmed Search Area and keep the Bot Assistant
+waiting for text. Back returns to City and also preserves the confirmed Search
+Area.
 
 Changing only Sub-city Areas preserves date, time, and every other Discovery
 Criterion.
 
 ### Required date
 
-The date picker uses temporary state. Back cancels its edits. `Сегодня` and
-`Завтра` commit concrete dates in the selected city's local calendar.
+The Bot Assistant waits for one free-text date or bounded inclusive date range
+in the current Conversation Language. The only inline action is Back. Relative
+phrases such as Today, Tomorrow, or a weekday resolve against the selected
+city's local calendar.
+
+The model may propose calendar boundaries, but the application validates the
+city timezone, calendar values, ordering, and that the start has not passed.
+One accepted interpretation commits concrete local dates immediately and
+advances to the post-core screen. Ambiguous, unresolved, invalid, past, and
+technical outcomes preserve the confirmed date and keep the Bot Assistant
+waiting for text. Back returns to the Search Area text stage and preserves the
+confirmed date.
 
 Confirming a different required date replaces only the core date or range.
 Time and other details remain. A committed relative choice never rolls forward

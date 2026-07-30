@@ -4,6 +4,8 @@ Status: Confirmed product baseline for Suggested Country, city, Sub-city Area,
 Source Message location normalization, and location-specific revision rules.
 The originating Wayfinder decision is
 [Define Suggested Country and location confirmation](https://github.com/bagorrr/football_bot/issues/3).
+The one-message AI-native Search Area interaction was confirmed during
+[Validate the multilingual onboarding flow](https://github.com/bagorrr/football_bot/issues/9).
 
 ## Domain boundary
 
@@ -99,22 +101,36 @@ cities are shown with enough parent geography to distinguish them.
 A discovery flow contains one city. Searching another city or country requires
 a separate flow.
 
-## Sub-city stage
+## Search Area text stage
 
-After confirming city, always show an explicit choice between the whole city
-and a more precise Search Area:
+After confirming city, always ask one AI-native free-text question:
 
-> 📍 **Где именно в Санкт-Петербурге ищем?**
+> 📍 Уточните зону поиска.
+>
+> Выбранный город: Санкт-Петербург.
+>
+> Одним сообщением напишите один или несколько районов, станций метро, улиц,
+> стадионов или других мест. Если подходит весь город, напишите «весь город».
 
 ```text
-[ Весь город ]
-[ Выбрать район или место ]
 [ ⬅️ Назад ]
 ```
 
-The refinement is optional. `Весь город` completes the location stage at city
-level. `Выбрать район или место` accepts free text and may offer previously
-confirmed Sub-city Areas only for the same User Intent, country, and city.
+The Bot User answers in the current Conversation Language. The message may
+name one Sub-city Area, several Sub-city Areas, or the whole city. There is no
+separate whole-city button, `Выбрать район или место`, `Добавить ещё`, or
+`Готово` action. Previously confirmed Sub-city Areas for the same User Intent,
+country, and city may alter the ordinary wording of this one prompt but never
+become confirmed without a new answer.
+
+The four statically supported prompt baselines are:
+
+| Locale | Prompt |
+| --- | --- |
+| Russian | `📍 Уточните зону поиска.`<br><br>`Выбранный город: <город>.`<br><br>`Одним сообщением напишите один или несколько районов, станций метро, улиц, стадионов или других мест. Если подходит весь город, напишите «весь город».` |
+| English | `📍 Refine the search area.`<br><br>`Selected city: <city>.`<br><br>`In one message, type one or several districts, metro stations, streets, stadiums, or other places. If anywhere in the city works, type “whole city”.` |
+| Spanish | `📍 Precise la zona de búsqueda.`<br><br>`Ciudad elegida: <ciudad>.`<br><br>`En un solo mensaje, escriba uno o varios barrios, estaciones de metro, calles, estadios u otros lugares. Si sirve toda la ciudad, escriba «toda la ciudad».` |
+| French | `📍 Précisez la zone de recherche.`<br><br>`Ville choisie : <ville>.`<br><br>`Dans un seul message, saisissez un ou plusieurs quartiers, stations de métro, rues, stades ou autres lieux. Si toute la ville convient, écrivez «toute la ville».` |
 
 A Sub-city Area preserves its geographic type. Supported types include:
 
@@ -128,28 +144,43 @@ Do not silently convert one type into another. A station vicinity may have an
 administrative district as a verified parent, but it does not become a request
 for the entire district.
 
-The Bot User may confirm several Sub-city Areas within the same city. The
-selected areas form a union. `Весь город` is mutually exclusive with individual
-areas. After each accepted place, offer `Добавить ещё` and `Готово`.
+The Bot Assistant may use model assistance to propose an ordered normalized
+list from the complete message, but the application validates every candidate
+before persistence. Each accepted Sub-city Area needs:
+
+- a stable language-neutral identifier;
+- a localized display label;
+- its language-neutral geographic type;
+- the confirmed country and city as verified parents.
+
+The Bot User may confirm several Sub-city Areas within the same city. Their
+order follows the accepted interpretation of the message, and they form a
+union. Whole city is mutually exclusive with individual areas. One validated
+interpretation commits the complete Search Area immediately and advances the
+flow without a second confirmation screen.
 
 If a place cannot be normalized after clarification, keep the confirmed country
-and city and wait for revised free text. Offer only the useful alternatives:
+and city, preserve any previously confirmed Search Area, and wait for revised
+free text on the same one-button screen:
 
 > Не смог однозначно определить «на удельке у старого поля».
 >
-> Напишите район или место иначе либо выберите весь Санкт-Петербург.
+> Напишите район или место иначе. Если подходит весь Санкт-Петербург, напишите
+> «весь город».
 
 ```text
-[ Весь город ]
 [ ⬅️ Назад ]
 ```
 
-Do not show a redundant `Написать иначе` button while the Bot Assistant is
-already waiting for text. The unknown phrase may be retained as a candidate
+Do not add candidate, confirmation, or `Написать иначе` buttons while the Bot
+Assistant is already waiting for text. A concise clarification may name
+competing supported candidates in the message, but the Bot User resolves it
+with another text answer. An unresolved phrase may be retained as a candidate
 for a future reviewed glossary version, but it is not part of Search Area.
 
-`Весь город` or `Готово` completes the geographic stage. Show an informational
-summary and continue without another confirmation:
+An accepted whole-city phrase or normalized Sub-city Area list completes the
+geographic stage. Show an informational summary and continue without another
+confirmation:
 
 > ✅ Область поиска: **Россия → Санкт-Петербург → Комендантский проспект,
 > Пионерская**
@@ -168,12 +199,14 @@ Persist language-neutral normalized geography:
 Localized strings are presentation, not identity. The exact gazetteer provider
 is not selected by this product decision, but it must satisfy this contract.
 
-Pressing Back alone does not delete confirmed geography. Dependent geography is
-cleared only after the Bot User confirms a different canonical parent:
+Pressing Back from the Search Area text stage returns to City and does not
+delete confirmed geography. An ambiguous, unresolved, invalid, or technical
+interpretation also changes nothing. Dependent geography is cleared only after
+the Bot User confirms a different canonical parent:
 
 - a new country clears city and all Sub-city Areas;
 - a new city clears all Sub-city Areas;
-- `Весь город` clears individual Sub-city Areas;
+- an accepted whole-city answer clears individual Sub-city Areas;
 - reselecting the same canonical country or city preserves descendants;
 - changing Conversation Language changes labels, not place identities.
 
