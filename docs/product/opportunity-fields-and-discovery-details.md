@@ -5,6 +5,9 @@ recorded in
 [ADR 0004](../adr/0004-separate-opportunity-attributes-from-discovery-criteria.md).
 The originating Wayfinder decision is
 [Define direction-specific opportunity fields and discovery details](https://github.com/bagorrr/football_bot/issues/14).
+The AI-native required-date, Seasonal Timing start-date, and Schedule
+start-date interactions were confirmed during
+[Validate the multilingual onboarding flow](https://github.com/bagorrr/football_bot/issues/9).
 
 ## Scope
 
@@ -376,15 +379,27 @@ both a team's availability to play and its search for another team.
 After Search Area, Game Search, Player Search, Tournament Search, Opponent
 Search, Referee Search, and Refereeing Service Offer show:
 
-> 📅 **Когда?**
+> 📅 Когда?
+>
+> Напишите дату или период своими словами — например: «завтра», «в субботу»
+> или «с 5 по 7 августа».
 
 ```text
-[ Сегодня ] [ Завтра ]
-[ Выбрать дату ]
 [ ⬅️ Назад ]
 ```
 
-`Выбрать дату` opens a date picker that accepts one date or a bounded range.
+The Bot User answers in the current Conversation Language. The Bot Assistant
+accepts one local date or one bounded inclusive local date range. Relative
+phrases are resolved against the confirmed city's local calendar and timezone.
+The application validates the interpreted calendar values, ordering, timezone,
+and that the start date has not passed.
+
+There are no Today, Tomorrow, or date-picker buttons. One validated
+interpretation commits the concrete date boundaries immediately and advances
+to the post-core screen. An ambiguous, unresolved, invalid, past, or technical
+interpretation changes no confirmed input and leaves the same text prompt
+active. Back preserves any confirmed required date and returns to the Search
+Area text stage.
 
 After a valid date answer:
 
@@ -559,9 +574,23 @@ The three substantive answers are mutually exclusive:
 [ ⬅️ Назад ]
 ```
 
-`Указать дату начала` opens the local single-date picker. `Указать сезон`
-accepts localized free text for validation. An empty draft committed with
-`Готово` clears the criterion.
+`Указать дату начала` opens this AI-native nested prompt:
+
+> Напишите, с какой даты возможен переход. Например: «с 15 августа».
+
+```text
+[ ⬅️ Назад ]
+```
+
+The Bot User answers in the current Conversation Language. The value must
+resolve to one current or future local date in the confirmed city's timezone,
+not a range. A validated value returns to the Seasonal Timing menu as temporary
+state. It becomes a confirmed Discovery Criterion only when the Bot User
+presses `Готово` in that parent menu. Back from the nested prompt restores the
+temporary parent snapshot and changes no confirmed criterion.
+
+`Указать сезон` accepts localized free text for validation. An empty draft
+committed with `Готово` clears the criterion.
 
 ### Coaching Type menu
 
@@ -607,14 +636,18 @@ Time:
 
 Start date:
 
+> Напишите дату начала расписания или «неважно». Например: «с 15 августа».
+
 ```text
-[ Сегодня ] [ Завтра ]
-[ Выбрать дату ]
-[ Неважно ]
 [ ⬅️ Назад ]
 ```
 
-The Schedule start date is one local date, not a range.
+The Schedule start date is one current or future local date, not a range. The
+Bot User answers in the current Conversation Language. A localized `Неважно`
+answer clears only the temporary Schedule start date. A validated date or
+clear answer returns to the Schedule menu as temporary state; only its parent
+`Готово` action commits the Schedule. Back from the nested prompt restores the
+temporary parent snapshot and changes no confirmed Schedule.
 
 ### Event Type menu
 
@@ -646,9 +679,6 @@ Identifiers and stored values are never localized.
 | Поиск | Search | Buscar | Rechercher |
 | Готово | Done | Listo | Valider |
 | Неважно | Any | Cualquiera | Peu importe |
-| Сегодня | Today | Hoy | Aujourd’hui |
-| Завтра | Tomorrow | Mañana | Demain |
-| Выбрать дату | Choose a date | Elegir fecha | Choisir une date |
 | не задано | not set | sin definir | non défini |
 
 Post-core message:
@@ -715,6 +745,28 @@ Exact-time guidance:
 | --- | --- | --- | --- |
 | Введите точное местное время выбранного города. | Enter the exact local time in the selected city. | Introduce la hora local exacta de la ciudad seleccionada. | Indiquez l’heure locale exacte dans la ville sélectionnée. |
 | Введите один точный местный интервал начала–окончания. | Enter one exact local start–end interval. | Introduce un intervalo local exacto de inicio a fin. | Indiquez un créneau local précis de début à fin. |
+
+### AI-native date prompts
+
+These prompts wait for text and expose only the localized Back action.
+
+Required date or bounded range:
+
+| Russian | English | Spanish | French |
+| --- | --- | --- | --- |
+| `📅 Когда?`<br><br>`Напишите дату или период своими словами — например: «завтра», «в субботу» или «с 5 по 7 августа».` | `📅 When?`<br><br>`Type a date or range in your own words — for example, “tomorrow”, “on Saturday”, or “August 5–7”.` | `📅 ¿Cuándo?`<br><br>`Escriba una fecha o periodo con sus palabras — por ejemplo, «mañana», «el sábado» o «del 5 al 7 de agosto».` | `📅 Quand ?`<br><br>`Saisissez une date ou une période avec vos mots — par exemple « demain », « samedi » ou « du 5 au 7 août ».` |
+
+Seasonal Timing start date:
+
+| Russian | English | Spanish | French |
+| --- | --- | --- | --- |
+| `Напишите, с какой даты возможен переход. Например: «с 15 августа».` | `Type the date from which the move can happen. For example: “from 15 August”.` | `Escriba la fecha a partir de la cual puede realizarse el cambio. Por ejemplo: «desde el 15 de agosto».` | `Saisissez la date à partir de laquelle le changement est possible. Par exemple : « à partir du 15 août ».` |
+
+Schedule start date:
+
+| Russian | English | Spanish | French |
+| --- | --- | --- | --- |
+| `Напишите дату начала расписания или «неважно». Например: «с 15 августа».` | `Type the Schedule start date or “any”. For example: “from 15 August”.` | `Escriba la fecha de inicio del horario o «cualquiera». Por ejemplo: «desde el 15 de agosto».` | `Saisissez la date de début du planning ou «peu importe». Par exemple : « à partir du 15 août ».` |
 
 Schedule status labels:
 
