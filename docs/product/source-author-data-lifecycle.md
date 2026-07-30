@@ -17,9 +17,9 @@ the permitted identity and Source Message records, access and retention, and
 the distinct operational paths for Telegram deletion, Consent Withdrawal, and
 a Source Data Deletion Request.
 
-It does not define Opportunity freshness, duplicate selection, or the complete
-moderation workflow. Those decisions belong to
-[Define Opportunity publication lifecycle, deduplication, and moderation](https://github.com/bagorrr/football_bot/issues/23).
+Opportunity freshness, exact repost selection, publication state,
+reactivation, and moderation are canonical in
+[`opportunity-publication-lifecycle.md`](opportunity-publication-lifecycle.md).
 
 ## Publication and author identity
 

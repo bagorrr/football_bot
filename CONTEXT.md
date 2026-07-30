@@ -99,8 +99,20 @@ One potentially independent request or offer interpreted from a Source Message t
 _Avoid_: Source Message, accepted Opportunity
 
 **Opportunity**:
-An accepted and normalized Opportunity Candidate eligible for matching to compatible User Intents.
-_Avoid_: Opportunity Candidate, Source Message
+An accepted and normalized Opportunity Candidate with a durable identity across publication changes. Its Opportunity Publication State, not its existence, determines whether it is eligible for matching.
+_Avoid_: Opportunity Candidate, Source Message, active listing
+
+**Active Opportunity**:
+An Opportunity whose Opportunity Publication State is `active` and which is therefore eligible for matching and new result delivery.
+_Avoid_: accepted candidate, historical result, visible Source Message
+
+**Opportunity Publication State**:
+The current eligibility state of an Opportunity: `active`, `held_for_review`, `suppressed`, or `expired`.
+_Avoid_: classification disposition, Opportunity Type, moderation reason
+
+**Exact Repost Cluster**:
+A set of distinct Source Messages from the same Source Publisher in one Source Chat that pass the exact-repost equality rule and are presented as one Opportunity result.
+_Avoid_: message revision, transport duplicate, near duplicate
 
 **Opportunity Attribute**:
 An evidence-backed normalized fact derived from a Source Message for an Opportunity Candidate or accepted Opportunity. Its absence means unknown, not false.
