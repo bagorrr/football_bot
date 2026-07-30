@@ -49,9 +49,14 @@ immediately and completes physical deletion within 30 days. A minimum
 identifier-and-boundary replay rule prevents later history reconciliation from
 restoring deleted data.
 
-An exact Telegram user ID may later link Source Author and Bot User records,
-but identity details, message history, consent, and interaction state never
-transfer between those roles.
+The Bot Assistant does not proactively invite Source Authors, and an
+independent Bot Assistant start never creates or persists a link between
+Source Author and Bot User records. When a person explicitly starts a Consent
+Withdrawal or Source Data Deletion Request through the Bot Assistant, the
+application may compare the current Telegram user ID with the retained Source
+Author mapping for that request only. It does not persist the comparison result
+as a cross-role link. Identity details, message history, consent,
+Opportunities, and interaction state never transfer between the roles.
 
 The detailed contract lives in
 [`docs/product/source-author-data-lifecycle.md`](../product/source-author-data-lifecycle.md).
@@ -70,6 +75,9 @@ The detailed contract lives in
   control over every erasure request.
 - **Automatically restore Opportunities after re-attestation:** can republish
   stale, edited, deleted, or no-longer-contactable content.
+- **Persist a Source Author-to-Bot User link:** is unnecessary for ordinary
+  Bot Assistant use and would create a cross-role association beyond the
+  request-scoped identity check.
 
 ## Consequences
 
@@ -79,6 +87,8 @@ The detailed contract lives in
 - A Source Chat pause is fail-closed and creates an explicit non-ingested gap.
 - Source Author account flags can route review but never determine Opportunity
   Type or become a public accusation.
+- Source data requests made through the Bot Assistant use a request-scoped
+  exact-ID check without creating a durable role association.
 - Opportunity freshness, duplicate handling, moderation, and post-pause
   reactivation require the follow-up decision in
   [Define Opportunity publication lifecycle, deduplication, and moderation](https://github.com/bagorrr/football_bot/issues/23).

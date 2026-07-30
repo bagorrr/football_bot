@@ -244,13 +244,25 @@ The replay barrier remains while the Source Chat is configured and for 90 days
 after its permanent removal. New messages after the boundary remain
 processable when consent remains current.
 
-## Later Bot User conversion
+## Independent Bot Assistant entry
 
-When a Source Author later starts the Bot Assistant, an exact Telegram user ID
-may link the Source Author and Bot User records to the same account. No name,
-username, photo, message history, Opportunity history, consent state,
-Discovery Draft, or settings transfer between the two roles.
+The application never sends a Source Author a personal invitation, mention, or
+Bot Assistant message because of Source Chat activity. A Source Author becomes
+a Bot User only by independently starting the Bot Assistant.
 
-Source Chat consent and Bot User interaction state remain separate. The
-application never links the roles by name, username, profile image, or inferred
-identity.
+The Bot Assistant follows the ordinary onboarding flow for that account. It
+does not add a Source Author-specific consent step, disclose that the account
+was recognized from a Source Chat, or show prior Source Messages, Opportunities,
+Source Chats, contact data, or activity statistics. Starting the Bot Assistant
+does not create, renew, withdraw, or otherwise change Source Chat consent.
+
+The application does not create or persist a Source Author-to-Bot User link.
+When a person explicitly starts a Consent Withdrawal or Source Data Deletion
+Request through the Bot Assistant, the application may compare the current
+Telegram user ID with the retained Source Author mapping for that request only.
+It must not retain the comparison result as a link between the roles.
+
+No name, username, photo, message history, Opportunity history, consent state,
+Discovery Draft, settings, or other role state transfers in either direction.
+The application never associates the roles by name, username, profile image,
+or inferred identity.

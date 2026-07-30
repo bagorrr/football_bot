@@ -49,6 +49,12 @@ Handle `/start` in this order:
    stage without clearing it.
 3. Otherwise, create a fresh Discovery Draft and show the Direction Menu.
 
+Prior Source Author activity does not change this entry sequence. The
+application neither invites Source Authors into the Bot Assistant nor shows a
+role-specific consent or disclosure step when one independently starts it. The
+cross-role data boundary is canonical in
+[`source-author-data-lifecycle.md`](source-author-data-lifecycle.md).
+
 After the first language choice, Language Selection is not part of a new
 search. Conversation Language changes only through Main Menu → Settings →
 Language.
