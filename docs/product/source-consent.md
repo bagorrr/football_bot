@@ -2,6 +2,11 @@
 
 Status: Product-owner attestation recorded on 2026-07-28.
 
+Source Author identity, retention, withdrawal, and deletion behavior is
+canonical in
+[`source-author-data-lifecycle.md`](source-author-data-lifecycle.md) and
+[ADR 0006](../adr/0006-bound-source-identity-and-data-lifecycles.md).
+
 ## Current decision
 
 The product owner confirms that every current user in the Source Chats listed in
@@ -49,8 +54,8 @@ Production ingestion must enforce the complete-chat consent boundary:
   pause the entire Source Chat before processing further messages rather than
   continuing with partial coverage;
 - suppress affected active opportunities promptly and execute the deletion or
-  retention workflow decided in
-  [Define Source Author identity, retention, and withdrawal](https://github.com/bagorrr/football_bot/issues/6);
+  retention workflow in
+  [`source-author-data-lifecycle.md`](source-author-data-lifecycle.md);
 - minimize raw-message and Source Author data, keep access auditable, and never
   place consent evidence, message exports, or personal identifiers in Git.
 
