@@ -884,9 +884,9 @@ The following remain deliberately unresolved here:
 - result ordering, explanations, contact presentation, and result cards;
 - saved-search and notification behavior.
 
-Opportunity freshness, deduplication, revision and withdrawal suppression,
-reactivation, moderation, and abuse handling belong to
-[Define Opportunity publication lifecycle, deduplication, and moderation](https://github.com/bagorrr/football_bot/issues/23).
+Opportunity freshness, exact repost handling, revision and withdrawal
+suppression, reactivation, moderation, and abuse handling are canonical in
+[`opportunity-publication-lifecycle.md`](opportunity-publication-lifecycle.md).
 
 The complete onboarding state machine, revisiting prior stages, and dependent
 answer invalidation belong to

@@ -14,6 +14,9 @@ The current PoC execution adapter is recorded in
 Source Publisher, Source Author, retention, withdrawal, and deletion boundaries
 are defined in
 [`docs/product/source-author-data-lifecycle.md`](source-author-data-lifecycle.md).
+Accepted Opportunity publication states, freshness, exact reposts, moderation,
+and reactivation are defined in
+[`docs/product/opportunity-publication-lifecycle.md`](opportunity-publication-lifecycle.md).
 
 ## Decision
 
@@ -67,9 +70,10 @@ publish every message or retain every raw body indefinitely.
    hard timeout.
 6. Deterministic validators reject impossible or incomplete combinations and
    normalize accepted fields.
-7. The application either publishes a normalized football opportunity, routes
-   the result for another bounded classification/review step, or marks the
-   message as irrelevant or unresolved.
+7. The application either accepts and activates a normalized football
+   Opportunity under the publication-lifecycle gates, routes the result for
+   another bounded classification/review step, or marks the message as
+   irrelevant or unresolved.
 
 ## Minimal context bundle
 
