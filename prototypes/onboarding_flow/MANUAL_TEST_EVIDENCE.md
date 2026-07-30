@@ -493,3 +493,18 @@ This is confirmed prototype behavior, not yet a published product verdict.
 The pre-change interactive process was stopped before these checks because it
 had loaded older modules into memory. The first-message/free-language reviewed
 copy-fidelity gap remains unchanged and is the next unresolved closure item.
+
+## 2026-07-30 repeat closure audit
+
+The Bot User requested a complete repeat audit after confirming synchronization
+of the canonical AI-native Search Area and date contracts. This section records
+only the prototype checks and correction; it is not the final product verdict.
+
+| Evidence ID | Audit/correction | Observed result | Assessment |
+| --- | --- | --- | --- |
+| AUDIT-REPEAT-STRUCTURAL-01 | Rerun Language, all fixed branches and terminal intents, core routes, Details, Back, semantic invalidation, lifecycle, Menu/Settings, Active Chat View, Search recovery, fallbacks, and the results boundary against commit `a323fc8` | The one-off in-memory audit completed `907` checks: `260` detail screens, `32` eight-value Playing Level screens, and `96` fallback cases with both state-preservation and localized-copy assertions. | Passed the complete structural ticket matrix before the model-adapter correction below |
+| AUDIT-REPEAT-DATE-EMPTY-ID-01 | Send live required-date text `с 5 по 7 августа` | The model returned valid endpoints `2026-08-05..2026-08-07` but an empty internal `candidate_ids` list. The adapter returned `technical_failure/invalid_model_result`; the state machine correctly preserved all confirmed state. | Found a model-adapter normalization defect; the visible failure path remained safe |
+| FIX-DATE-CANDIDATE-EMPTY-01 | Extend date candidate normalization to a valid empty internal ID list as well as one or several internal IDs | Synthetic valid required-date payloads with zero, one, and two internal IDs all normalized to the single canonical ID `2026-08-05/2026-08-07`; malformed types remain subject to the existing contract checks. | Corrected without changing product semantics or state transitions |
+| RETEST-REPEAT-LIVE-MODEL-01 | Repeat four live seams: Russian free Direction, Russian multi-area, Russian required range, and Spanish typo city `Madrd` | All `4/4` were accepted and locally validated. The required range normalized to `2026-08-05/2026-08-07`; the city resolved to Madrid with `Europe/Madrid`. | Passed focused live model seam after the correction |
+| FIX-REPEAT-DATE-FALLBACK-COPY-01 | Compare the past-date fallback for required Date, Seasonal Timing start date, and Schedule start date in all four locales | Each field now asks only for values it accepts: required Date permits a date or range; Seasonal Timing permits one date; Schedule permits one date or localized `Any`. The Search Area Back laboratory effect now also describes the confirmed one-message contract rather than obsolete temporary area edits. | Corrected misleading failure/laboratory copy without changing state |
+| RETEST-REPEAT-TARGETED-01 | Rerun the affected fallback, Search Area Back, syntax, and one-command paths | All `12` localized past-date cases preserved account and draft state and used field-valid guidance. Search Area Back preserved the confirmed Search Area, required date, and criteria. Python compilation and `python3 prototypes/onboarding_flow/telegram_tui.py --no-clear` passed with model preflight and a protected current view. | Passed targeted regression after the two narrow corrections |

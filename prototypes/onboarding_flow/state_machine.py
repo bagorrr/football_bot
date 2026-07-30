@@ -1172,7 +1172,11 @@ def _apply_product_event(
         draft = _draft(state)
         draft["stage"] = "city"
         draft["temp_edit"] = None
-        _effect(state, "Back from Sub-city Areas → City; uncommitted area edits discarded.")
+        _effect(
+            state,
+            "Back from Search Area text stage → City; confirmed Search Area preserved "
+            "and unconfirmed interpretation state discarded.",
+        )
         return True, True
 
     if kind == "date_resolution":
@@ -3037,24 +3041,65 @@ def _with_resolution_notice(
         and field in {"date", "seasonal_date", "schedule_start"}
         and failure_code == "past_date"
     ):
-        message = {
-            "ru": (
-                "Эта дата уже прошла. Напишите сегодняшнюю или будущую дату либо "
-                "период; подтверждённые данные не изменены."
-            ),
-            "en": (
-                "That date has already passed. Type today, a future date, or a "
-                "future range; confirmed data was not changed."
-            ),
-            "es": (
-                "Esa fecha ya ha pasado. Escriba hoy, una fecha futura o un "
-                "periodo futuro; los datos confirmados no cambiaron."
-            ),
-            "fr": (
-                "Cette date est déjà passée. Saisissez aujourd’hui, une date future "
-                "ou une période future ; les données confirmées sont inchangées."
-            ),
-        }[locale]
+        if field == "date":
+            message = {
+                "ru": (
+                    "Эта дата или начало периода уже прошли. Напишите сегодняшнюю "
+                    "или будущую дату либо период; подтверждённые данные не изменены."
+                ),
+                "en": (
+                    "That date or range start has already passed. Type today, a future "
+                    "date, or a future range; confirmed data was not changed."
+                ),
+                "es": (
+                    "Esa fecha o el inicio del periodo ya han pasado. Escriba hoy, "
+                    "una fecha futura o un periodo futuro; los datos confirmados no cambiaron."
+                ),
+                "fr": (
+                    "Cette date ou le début de la période sont déjà passés. Saisissez "
+                    "aujourd’hui, une date future ou une période future ; les données "
+                    "confirmées sont inchangées."
+                ),
+            }[locale]
+        elif field == "seasonal_date":
+            message = {
+                "ru": (
+                    "Эта дата уже прошла. Напишите сегодняшнюю или будущую дату "
+                    "начала перехода; подтверждённые данные не изменены."
+                ),
+                "en": (
+                    "That date has already passed. Type today or a future move start "
+                    "date; confirmed data was not changed."
+                ),
+                "es": (
+                    "Esa fecha ya ha pasado. Escriba hoy o una fecha futura de inicio "
+                    "del cambio; los datos confirmados no cambiaron."
+                ),
+                "fr": (
+                    "Cette date est déjà passée. Saisissez aujourd’hui ou une date "
+                    "future de début du changement ; les données confirmées sont inchangées."
+                ),
+            }[locale]
+        else:
+            message = {
+                "ru": (
+                    "Эта дата уже прошла. Напишите сегодняшнюю или будущую дату "
+                    "начала расписания либо «неважно»; подтверждённые данные не изменены."
+                ),
+                "en": (
+                    "That date has already passed. Type today, a future Schedule start "
+                    "date, or “any”; confirmed data was not changed."
+                ),
+                "es": (
+                    "Esa fecha ya ha pasado. Escriba hoy, una fecha futura de inicio "
+                    "del horario o «cualquiera»; los datos confirmados no cambiaron."
+                ),
+                "fr": (
+                    "Cette date est déjà passée. Saisissez aujourd’hui, une date future "
+                    "de début du planning ou «peu importe» ; les données confirmées "
+                    "sont inchangées."
+                ),
+            }[locale]
     elif status == "unresolved":
         message = {
             "ru": (

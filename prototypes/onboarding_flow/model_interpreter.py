@@ -254,7 +254,6 @@ def resolve_free_text(
         field in DATE_FIELDS
         and status == "accepted"
         and isinstance(proposed_ids, list)
-        and proposed_ids
         and all(isinstance(item, str) for item in proposed_ids)
         and len(proposed_ids) == len(set(proposed_ids))
         and isinstance(resolved, dict)
