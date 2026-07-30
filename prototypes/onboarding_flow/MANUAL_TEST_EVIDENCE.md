@@ -465,3 +465,31 @@ loaded the pre-correction modules into memory. A fresh process is required for
 the next manual check. The optional Seasonal Timing and Schedule start-date
 editors and the first-message/free-language copy-fidelity gap remain unchanged
 pending separate one-question-at-a-time confirmation.
+
+## 2026-07-30 confirmed AI-native optional dates
+
+The Bot User confirmed the following prototype behavior: the Seasonal Timing
+start-date and Schedule start-date nested editors accept natural-language text
+in the active Conversation Language and expose only Back; Schedule also accepts
+localized `Any`; an accepted answer returns to the parent detail editor as
+temporary state; and only the parent `Done` action commits the detail. The
+saved `b42d3ac` artifact is the durable state immediately before this change.
+This is confirmed prototype behavior, not yet a published product verdict.
+
+| Evidence ID | Correction/check | Observed result | Assessment |
+| --- | --- | --- | --- |
+| FIX-OPTIONAL-DATE-SCREENS-01 | Render Seasonal Timing start-date and Schedule start-date prompts in Russian, English, Spanish, and French | All `8` screens use localized natural-language guidance, wait for model-backed text, and expose exactly one Back action. The old strict `YYYY-MM-DD` guidance and Schedule `Any` button are absent. | Corrected to confirmed prototype behavior |
+| FIX-SEASONAL-DATE-LIVE-01 | Send live Russian Seasonal Timing text `с 15 августа` with Moscow selected | `gpt-5.6-sol` returned the single local date `2026-08-15` in `10598 ms`. The local validator accepted it as temporary `start_date`; confirmed criteria remained unchanged until parent `Done`. | Passed focused live seam |
+| FIX-SCHEDULE-START-LIVE-01 | Send live Russian Schedule text `начиная с 20 августа` with Moscow selected | `gpt-5.6-sol` returned `clear=False` and the single local date `2026-08-20` in `4914 ms`. The machine returned to the Schedule parent with only temporary `start_date`; confirmed Schedule remained unchanged until parent `Done`. | Passed focused live seam |
+| FIX-SCHEDULE-ANY-01 | Send exact localized `Any` phrases in all four locales | `неважно`, `any`, `cualquiera`, and `peu importe` resolved deterministically to canonical `any`. Each cleared only temporary Schedule `start_date`; weekdays, day parts, exact interval, confirmed Schedule, and unrelated criteria were preserved until `Done`. | Passed `4` locale aliases and scoped clearing |
+| FIX-OPTIONAL-DATE-BACK-DONE-01 | Exercise accepted value → parent, parent `Done`, and nested Back for both optional-date editors | Accepted values returned to the parent as temporary state. `Done` committed only the edited detail. Back restored the nested snapshot and left confirmed criteria unchanged. | Passed ADR 0005 temporary-state semantics |
+| FIX-OPTIONAL-DATE-VALIDATION-01 | Submit a range and a past date where one future local start date is required | Both invalid candidates were rejected without changing temporary or confirmed state. A live `с 1 июля` model call also returned `unresolved/past_date` in `11247 ms`. | Passed local temporal authority and visible failure path |
+| FIX-OPTIONAL-DATE-FALLBACK-01 | Replay ambiguous, unresolved/past, and technical-failure outcomes for both optional-date fields in every locale | All `24` cases preserved the complete Discovery Draft, retained the one-button nested editor, and rendered the localized fallback marker. | Passed failure preservation |
+| FIX-REQUIRED-DATE-CANDIDATE-ID-01 | Recheck required range `с 5 по 7 августа` after introducing the stricter optional-date schemas | The first regression probe exposed `invalid_model_result`: the model could encode correct endpoints using more than one internal candidate ID. The local adapter now derives one canonical ID from validated `start/end`. A repeat live call accepted `2026-08-05..2026-08-07` as `2026-08-05/2026-08-07` in `4416 ms`. | Regression found from evidence and corrected; required-date behavior restored |
+| RETEST-OPTIONAL-DATE-CORE-DETAIL-01 | Rerun the full cross-locale core/detail matrix | All `40` locale/intent core routes, `260` detail entry screens, and `32` eight-value Playing Level editors passed. | Passed regression matrix |
+| RETEST-OPTIONAL-DATE-FALLBACK-01 | Rerun fallback preservation including Language, Direction, Country, City, Area, required Date, Seasonal start date, and Schedule start date | All `96` locale/field/outcome cases preserved account and draft state and rendered their localized fallback. | Passed expanded regression matrix |
+| RETEST-OPTIONAL-DATE-ONE-COMMAND-01 | Run `python3 prototypes/onboarding_flow/telegram_tui.py --no-clear` from the repository root | Model preflight succeeded, the first Active Chat View rendered with full state, and EOF exited cleanly. | Passed one-command startup |
+
+The pre-change interactive process was stopped before these checks because it
+had loaded older modules into memory. The first-message/free-language reviewed
+copy-fidelity gap remains unchanged and is the next unresolved closure item.

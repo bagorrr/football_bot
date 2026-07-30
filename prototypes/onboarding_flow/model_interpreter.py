@@ -26,10 +26,27 @@ from state_machine import (
 
 
 MODEL_ID = "gpt-5.6-sol"
-PROMPT_VERSION = "onboarding-free-text-v3"
-MODEL_FIELDS = {"language", "direction", "country", "city", "area", "date"}
+PROMPT_VERSION = "onboarding-free-text-v4"
+MODEL_FIELDS = {
+    "language",
+    "direction",
+    "country",
+    "city",
+    "area",
+    "date",
+    "seasonal_date",
+    "schedule_start",
+}
 BOUNDED_FIELDS = {"language", "direction"}
-OPEN_FIELDS = {"country", "city", "area", "date"}
+OPEN_FIELDS = {
+    "country",
+    "city",
+    "area",
+    "date",
+    "seasonal_date",
+    "schedule_start",
+}
+DATE_FIELDS = {"date", "seasonal_date", "schedule_start"}
 MODEL_TIMEOUT_SECONDS = 45
 MAX_INPUT_CHARS = 500
 
@@ -233,6 +250,16 @@ def resolve_free_text(
     status = payload.get("status") if isinstance(payload, dict) else None
     proposed_ids = payload.get("candidate_ids") if isinstance(payload, dict) else None
     resolved = _resolved_payload(field, payload, context)
+    if (
+        field in DATE_FIELDS
+        and status == "accepted"
+        and isinstance(proposed_ids, list)
+        and proposed_ids
+        and all(isinstance(item, str) for item in proposed_ids)
+        and len(proposed_ids) == len(set(proposed_ids))
+        and isinstance(resolved, dict)
+    ):
+        proposed_ids = [_normalized_date_candidate_id(resolved)]
     if not _valid_model_result(
         field,
         status,
@@ -248,7 +275,11 @@ def resolve_free_text(
             started,
             failure_code="invalid_model_result",
         )
-    if field == "date" and status == "accepted":
+    if (
+        field in DATE_FIELDS
+        and status == "accepted"
+        and not resolved.get("clear", False)
+    ):
         start = date.fromisoformat(resolved["start"])
         current = date.fromisoformat(resolved["current_date"])
         if start < current:
@@ -316,6 +347,21 @@ def _prompt(
             "context.current_local_date, including a date in the past. For accepted, "
             "return ISO date_start and date_end. The local resolver, not you, decides "
             "whether the interpreted date is still valid."
+        ),
+        "seasonal_date": (
+            "Interpret exactly one clear local start date using "
+            "context.current_local_date, including a date in the past. A range is "
+            "not valid. For accepted, return the same ISO date as date_start and "
+            "date_end. The local resolver, not you, decides whether the date is "
+            "still valid."
+        ),
+        "schedule_start": (
+            "Interpret exactly one clear local Schedule start date, or an explicit "
+            "statement that the start date does not matter. Use "
+            "context.current_local_date and allow a date in the past for local "
+            "validation. For a date, return clear=false and the same ISO date as "
+            "date_start and date_end. For no date preference, return clear=true, "
+            "null dates, and candidate_ids=['any']. A range is not valid."
         ),
     }[field]
     accepted_rule = (
@@ -406,6 +452,23 @@ def _output_schema(field: str, candidate_ids: list[str]) -> dict[str, Any]:
             }
         )
         required += ["areas", "whole_city"]
+    elif field in {"date", "seasonal_date"}:
+        properties.update(
+            {
+                "date_start": {"type": ["string", "null"]},
+                "date_end": {"type": ["string", "null"]},
+            }
+        )
+        required += ["date_start", "date_end"]
+    elif field == "schedule_start":
+        properties.update(
+            {
+                "date_start": {"type": ["string", "null"]},
+                "date_end": {"type": ["string", "null"]},
+                "clear": {"type": ["boolean", "null"]},
+            }
+        )
+        required += ["date_start", "date_end", "clear"]
     else:
         properties.update(
             {
@@ -467,6 +530,10 @@ def _valid_model_result(
             return candidate_ids == [
                 area["canonical_id"] for area in resolved["areas"]
             ]
+        if field == "schedule_start":
+            if resolved["clear"]:
+                return candidate_ids == ["any"]
+            return candidate_ids != ["any"]
         return True
     if status == "ambiguous":
         return len(candidate_ids) >= 2 and resolved is None
@@ -493,6 +560,14 @@ def _result(
     }
 
 
+def _normalized_date_candidate_id(resolved: dict[str, Any]) -> str:
+    if resolved.get("clear") is True:
+        return "any"
+    start = str(resolved.get("start"))
+    end = str(resolved.get("end"))
+    return start if start == end else f"{start}/{end}"
+
+
 def _resolved_exact_value(
     state: dict[str, Any],
     field: str,
@@ -506,6 +581,8 @@ def _resolved_exact_value(
             "whole_city": True,
             "areas": [],
         }
+    if field == "schedule_start" and exact == "any":
+        return {"clear": True}
     candidate = next((item for item in candidates if item["id"] == exact), None)
     if candidate is None:
         return None
@@ -527,8 +604,16 @@ def _resolved_payload(
         return None
     if payload.get("status") != "accepted":
         return None
-    if field == "date":
+    if field in {"date", "seasonal_date"}:
         return {
+            "start": payload.get("date_start"),
+            "end": payload.get("date_end"),
+            "timezone": context.get("city_timezone"),
+            "current_date": context.get("current_local_date"),
+        }
+    if field == "schedule_start":
+        return {
+            "clear": payload.get("clear"),
             "start": payload.get("date_start"),
             "end": payload.get("date_end"),
             "timezone": context.get("city_timezone"),
@@ -555,14 +640,31 @@ def _valid_resolved_value(
 ) -> bool:
     if not isinstance(resolved, dict):
         return False
-    if field == "date":
+    if field in {"date", "seasonal_date"}:
         try:
             start = date.fromisoformat(str(resolved.get("start")))
             end = date.fromisoformat(str(resolved.get("end")))
             current = date.fromisoformat(str(resolved.get("current_date")))
         except ValueError:
             return False
-        return end >= start
+        return end >= start if field == "date" else end == start
+
+    if field == "schedule_start":
+        clear = resolved.get("clear")
+        if not isinstance(clear, bool):
+            return False
+        if clear:
+            return (
+                resolved.get("start") is None
+                and resolved.get("end") is None
+            )
+        try:
+            start = date.fromisoformat(str(resolved.get("start")))
+            end = date.fromisoformat(str(resolved.get("end")))
+            current = date.fromisoformat(str(resolved.get("current_date")))
+        except ValueError:
+            return False
+        return start == end
 
     if field == "area":
         whole_city = resolved.get("whole_city")

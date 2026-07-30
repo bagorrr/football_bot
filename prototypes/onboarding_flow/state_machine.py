@@ -1338,22 +1338,35 @@ def _apply_product_event(
         _effect(state, "Opened nested Seasonal Timing input; confirmed value unchanged.")
         return True, True
 
+    if kind == "seasonal_date_resolution":
+        resolution = _validated_interpretation(
+            state,
+            "seasonal_date",
+            event.get("value"),
+        )
+        if resolution is None:
+            return False, True
+        draft = _draft(state)
+        draft["temp_edit"] = {
+            "kind": "start_date",
+            "value": resolution["resolved"]["start"],
+        }
+        _return_to_parent_detail(draft)
+        _effect(
+            state,
+            "Model-resolved Seasonal Timing start date stored temporarily; "
+            f"press Done to commit.{_resolution_source_note(resolution['source'])}",
+        )
+        return True, True
+
     if kind == "seasonal_nested_text":
         draft = _draft(state)
-        if draft["nested_kind"] == "seasonal_date":
-            parsed = _parse_date_range(str(value))
-            if parsed is None or parsed[0] != parsed[1]:
-                _effect(state, f"{value!r} is not one valid local date; no change.")
-                return False, True
-            draft["temp_edit"] = {"kind": "start_date", "value": parsed[0].isoformat()}
-        elif not str(value).strip():
+        if not str(value).strip():
             _effect(state, "An empty season is invalid; no change.")
             return False, True
         else:
             draft["temp_edit"] = {"kind": "stated_season", "value": str(value).strip()}
-        draft["stage"] = "detail"
-        draft["nested_kind"] = None
-        draft["nested_snapshot"] = None
+        _return_to_parent_detail(draft)
         _effect(state, "Nested Seasonal Timing candidate stored temporarily; press Done to commit.")
         return True, True
 
@@ -1411,30 +1424,30 @@ def _apply_product_event(
         )
         return True, True
 
-    if kind == "schedule_start_text":
-        draft = _draft(state)
-        parsed = _parse_date_range(str(value))
-        if parsed is None or parsed[0] != parsed[1]:
-            _effect(state, f"Schedule start {value!r} is invalid; no change.")
+    if kind == "schedule_start_resolution":
+        resolution = _validated_interpretation(
+            state,
+            "schedule_start",
+            event.get("value"),
+        )
+        if resolution is None:
             return False, True
-        draft["temp_edit"]["start_date"] = parsed[0].isoformat()
-        draft["stage"] = "detail"
-        draft["nested_kind"] = None
-        draft["nested_snapshot"] = None
-        draft["nested_parent"] = None
-        draft["nested_parent_snapshot"] = None
-        _effect(state, "Schedule start date stored temporarily; confirmed Schedule unchanged.")
-        return True, True
-
-    if kind == "schedule_clear_start":
         draft = _draft(state)
-        draft["temp_edit"]["start_date"] = None
-        draft["stage"] = "detail"
-        draft["nested_kind"] = None
-        draft["nested_snapshot"] = None
-        draft["nested_parent"] = None
-        draft["nested_parent_snapshot"] = None
-        _effect(state, "Cleared temporary Schedule start date.")
+        resolved = resolution["resolved"]
+        draft["temp_edit"]["start_date"] = (
+            None if resolved["clear"] else resolved["start"]
+        )
+        _return_to_parent_detail(draft)
+        _effect(
+            state,
+            (
+                "Cleared temporary Schedule start date via AI-native input."
+                if resolved["clear"]
+                else "Model-resolved Schedule start date stored temporarily; "
+                "confirmed Schedule unchanged."
+            )
+            + _resolution_source_note(resolution["source"]),
+        )
         return True, True
 
     if kind == "done_nested":
@@ -1875,7 +1888,7 @@ def _valid_resolved_interpretation(
 ) -> bool:
     if not isinstance(resolved, dict):
         return False
-    if field == "date":
+    if field in {"date", "seasonal_date"}:
         start_value = resolved.get("start")
         end_value = resolved.get("end")
         current_value = resolved.get("current_date")
@@ -1892,7 +1905,36 @@ def _valid_resolved_interpretation(
             ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError):
             return False
-        return start >= current and end >= start
+        if start < current:
+            return False
+        return end >= start if field == "date" else end == start
+
+    if field == "schedule_start":
+        clear = resolved.get("clear")
+        if not isinstance(clear, bool):
+            return False
+        if clear:
+            return (
+                resolved.get("start") is None
+                and resolved.get("end") is None
+            )
+        start_value = resolved.get("start")
+        end_value = resolved.get("end")
+        current_value = resolved.get("current_date")
+        timezone = resolved.get("timezone")
+        try:
+            start = date.fromisoformat(start_value)
+            end = date.fromisoformat(end_value)
+            current = date.fromisoformat(current_value)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(timezone, str):
+            return False
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return False
+        return start >= current and start == end
 
     if field == "area":
         whole_city = resolved.get("whole_city")
@@ -2120,6 +2162,14 @@ def _finish_detail(draft: dict[str, Any]) -> None:
     draft["stage"] = "details_hub"
     draft["detail_key"] = None
     draft["temp_edit"] = None
+    draft["nested_kind"] = None
+    draft["nested_snapshot"] = None
+    draft["nested_parent"] = None
+    draft["nested_parent_snapshot"] = None
+
+
+def _return_to_parent_detail(draft: dict[str, Any]) -> None:
+    draft["stage"] = "detail"
     draft["nested_kind"] = None
     draft["nested_snapshot"] = None
     draft["nested_parent"] = None
@@ -2809,10 +2859,10 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
     if nested in {"seasonal_date", "seasonal_text"}:
         prompt = {
             "seasonal_date": L(
-                "Введите одну местную дату в формате YYYY-MM-DD.",
-                "Enter one local date as YYYY-MM-DD.",
-                "Introduzca una fecha local en formato YYYY-MM-DD.",
-                "Saisissez une date locale au format YYYY-MM-DD.",
+                "Напишите, с какой даты возможен переход. Например: «с 15 августа».",
+                "Type the date from which the move can happen. For example: “from 15 August”.",
+                "Escriba la fecha a partir de la cual puede realizarse el cambio. Por ejemplo: «desde el 15 de agosto».",
+                "Saisissez la date à partir de laquelle le changement est possible. Par exemple : « à partir du 15 août ».",
             ),
             "seasonal_text": L(
                 "Введите название сезона.",
@@ -2821,10 +2871,20 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
                 "Saisissez le nom de la saison.",
             ),
         }[nested][locale]
+        if nested == "seasonal_date":
+            prompt = _with_resolution_notice(
+                state,
+                "seasonal_date",
+                prompt,
+            )
         return _screen(
             prompt,
             [_button(tr(state, "back"), "back_nested")],
-            expects_text="seasonal",
+            expects_text=(
+                "seasonal_date"
+                if nested == "seasonal_date"
+                else "seasonal"
+            ),
         )
 
     if nested == "schedule_days":
@@ -2913,17 +2973,15 @@ def _build_nested_screen(state: dict[str, Any]) -> dict[str, Any]:
         )
 
     if nested == "schedule_start":
+        text = L(
+            "Напишите дату начала расписания или «неважно». Например: «с 15 августа».",
+            "Type the Schedule start date or “any”. For example: “from 15 August”.",
+            "Escriba la fecha de inicio del horario o «cualquiera». Por ejemplo: «desde el 15 de agosto».",
+            "Saisissez la date de début du planning ou «peu importe». Par exemple : « à partir du 15 août ».",
+        )[locale]
         return _screen(
-            L(
-                "Введите местную дату начала в формате YYYY-MM-DD или очистите её.",
-                "Enter one local start date as YYYY-MM-DD, or clear it.",
-                "Introduzca una fecha local de inicio en formato YYYY-MM-DD o bórrela.",
-                "Saisissez une date locale de début au format YYYY-MM-DD ou effacez-la.",
-            )[locale],
-            [
-                _button(tr(state, "any"), "schedule_clear_start"),
-                _button(tr(state, "back"), "back_nested"),
-            ],
+            _with_resolution_notice(state, "schedule_start", text),
+            [_button(tr(state, "back"), "back_nested")],
             expects_text="schedule_start",
         )
 
@@ -2974,7 +3032,11 @@ def _with_resolution_notice(
                 "Saisissez un choix plus précisément. Les données confirmées sont inchangées."
             ),
         }[locale]
-    elif status == "unresolved" and field == "date" and failure_code == "past_date":
+    elif (
+        status == "unresolved"
+        and field in {"date", "seasonal_date", "schedule_start"}
+        and failure_code == "past_date"
+    ):
         message = {
             "ru": (
                 "Эта дата уже прошла. Напишите сегодняшнюю или будущую дату либо "
@@ -3122,7 +3184,6 @@ def event_for_text(state: dict[str, Any], value: str, update_id: int) -> dict[st
         "exact_time": "exact_time_text",
         "seasonal": "seasonal_nested_text",
         "schedule_interval": "schedule_interval_text",
-        "schedule_start": "schedule_start_text",
     }
     return {
         "kind": kind_by_input.get(expected, "text"),
@@ -3302,6 +3363,14 @@ def exact_interpretation_candidate(
             "toute la ville",
         }:
             return "whole_city"
+    if field == "schedule_start":
+        if value.strip().casefold() in {
+            "неважно",
+            "any",
+            "cualquiera",
+            "peu importe",
+        }:
+            return "any"
     return None
 
 

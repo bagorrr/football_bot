@@ -26,8 +26,9 @@ python3 prototypes/onboarding_flow/telegram_tui.py
 The prototype uses only the Python 3 standard library and keeps all state in
 memory. It requires a locally installed Codex CLI already signed in with
 ChatGPT. Exact reviewed aliases resolve locally. Other language, Direction,
-country, city, area/place, and required-date text starts one isolated
-`codex exec --ephemeral` call using `gpt-5.6-sol`.
+country, city, area/place, required-date, Seasonal Timing start-date, and
+Schedule start-date text starts one isolated `codex exec --ephemeral` call
+using `gpt-5.6-sol`.
 
 Direction proposals are constrained to the ten confirmed terminal intents and
 must be explicitly confirmed before they become draft state. Country and city
@@ -39,6 +40,11 @@ the accepted normalized list completes Search Area immediately, while
 whole-city input remains mutually exclusive. Dates are resolved against the
 selected city's local calendar, and past or ambiguous input preserves the
 previously confirmed date.
+
+The optional Seasonal Timing and Schedule start-date prompts also use natural
+language and expose only Back. An accepted value returns to its parent detail
+editor as temporary state and is committed only by Done. Schedule additionally
+accepts the localized `Any` phrase to clear only its temporary start date.
 
 The model subprocess runs in a temporary empty workspace with a read-only
 sandbox, no user config, project rules, apps, plugins, MCP servers, web search,
