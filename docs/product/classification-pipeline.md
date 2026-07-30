@@ -11,6 +11,9 @@ requirements are defined in
 [`docs/product/opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md).
 The current PoC execution adapter is recorded in
 [Use ChatGPT-authenticated Codex CLI for PoC classification](https://github.com/bagorrr/football_bot/issues/13).
+Source Publisher, Source Author, retention, withdrawal, and deletion boundaries
+are defined in
+[`docs/product/source-author-data-lifecycle.md`](source-author-data-lifecycle.md).
 
 ## Decision
 
@@ -84,7 +87,12 @@ smallest consented context required to understand it:
 
 Do not provide an unrestricted chat history. Context selection must be
 deterministic, auditable, and covered by the same consent boundary as the Source
-Message.
+Message. The classifier receives opaque author references and only the bounded
+message relationships required for the current classification; it never
+receives the Source Author's full profile or unrestricted message history.
+Attachment binaries and profile-photo contents are not classifier inputs.
+Forwarded content from outside an enabled Source Chat does not disclose the
+external origin's identity or become a contact route.
 
 ## Structured classification result
 

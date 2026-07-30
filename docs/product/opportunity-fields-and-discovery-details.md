@@ -882,8 +882,11 @@ The following remain deliberately unresolved here:
 - day-part clock boundaries and interval overlap;
 - geographic compatibility, distance, and widening;
 - result ordering, explanations, contact presentation, and result cards;
-- saved-search, notification, freshness, deduplication, moderation, and abuse
-  behavior.
+- saved-search and notification behavior.
+
+Opportunity freshness, deduplication, revision and withdrawal suppression,
+reactivation, moderation, and abuse handling belong to
+[Define Opportunity publication lifecycle, deduplication, and moderation](https://github.com/bagorrr/football_bot/issues/23).
 
 The complete onboarding state machine, revisiting prior stages, and dependent
 answer invalidation belong to

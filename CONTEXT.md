@@ -254,6 +254,18 @@ _Avoid_: Scraped chat, sampled chat, partially monitored group
 Every account-visible message or post published in a Source Chat, regardless of author or football relevance; edits are revisions of the same Source Message.
 _Avoid_: Selected Post, Match Post, Offer, Listing before classification
 
+**Source Publisher**:
+The Telegram principal visibly presented as publishing a Source Message, which may be a user account, chat, channel, or unknown principal.
+_Avoid_: Source Author when Telegram hides the account, inferred administrator
+
 **Source Author**:
-The Telegram account that published a Source Message, regardless of whether the account belongs to an administrator or an ordinary chat participant.
-_Avoid_: Lead, prospect, future user
+A Telegram user account visibly attributable as the author of a Source Message. A Source Message may have a Source Publisher without an identifiable Source Author.
+_Avoid_: Source Publisher, hidden administrator, Lead, prospect, future user
+
+**Consent Withdrawal**:
+A Source Author's explicit revocation of Source Chat processing consent for one named Source Chat.
+_Avoid_: ordinary chat departure, Source Data Deletion Request
+
+**Source Data Deletion Request**:
+A verified request to erase retained Source Author data from one named Source Chat or, when explicitly requested, every enabled Source Chat.
+_Avoid_: Consent Withdrawal, Telegram message deletion
