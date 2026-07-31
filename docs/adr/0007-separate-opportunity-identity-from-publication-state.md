@@ -47,8 +47,8 @@ The detailed contract lives in
   false-suppression risk and could merge independent opportunities.
 - **Premoderate every accepted Opportunity:** makes normal result freshness
   depend on operator throughput.
-- **Restore older exact reposts after a complaint or moderation action:** lets
-  an identical prior message bypass the safety decision.
+- **Restore older exact reposts after a moderation action:** lets an identical
+  prior message bypass the safety decision.
 - **Automatically restore all Opportunities after Source Chat re-attestation:**
   can republish stale, deleted, or no-longer-contactable content.
 
@@ -61,6 +61,6 @@ The detailed contract lives in
 - Exact and near-duplicate behavior is deterministic and testable, but
   materially rewritten duplicates may appear independently in the MVP.
 - Completed-search history and live Opportunity eligibility are separate:
-  historical cards may remain while their contact routes become restricted or
+  historical cards may remain after their contact routes are hidden or
   deleted.
 - User-managed Favorites remain a separate post-MVP lifecycle.

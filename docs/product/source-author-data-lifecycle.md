@@ -125,7 +125,7 @@ Retention follows the Source Message's purpose and disposition:
 | Terminal `irrelevant` Source Message | Delete text, contact data, and name snapshots within 7 days of the terminal disposition. Retain a body-free processing record for 90 days, then delete it or irreversibly aggregate it. |
 | Accepted Opportunity source | Retain the current source revision, evidence, and Response Route while the Opportunity is active. Delete replaced raw revision bodies within 7 days of successful reclassification. After normal expiry or deactivation, delete source text, name and username snapshots, and contact data within 30 days. |
 | `needs_second_pass` or `needs_review` Source Message | Retain permitted content while review is active, for at most 30 days. If no decision is reached, finalize as `unresolved`; delete text and contact data within 7 further days and the body-free processing record after 90 days. |
-| Previous first or last name or username | Retain for 90 days after replacement, only for audit, complaint handling, and correction of a recent Response Route. Never expose it to Bot Users. |
+| Previous first or last name or username | Retain for 90 days after replacement, only for audit, operator moderation, and correction of a recent Response Route. Never expose it to Bot Users. |
 | Per-author message count | Retain an exact rolling 90-day count per enabled Source Chat. Older values may remain only as irreversible author-free aggregates. |
 | Reply, mention, or permitted forward relationship | Delete the text under its own Source Message rule and delete the body-free relationship within 90 days. |
 | Access and operator audit | Retain for 90 days without message text, names, usernames, or contact data. |

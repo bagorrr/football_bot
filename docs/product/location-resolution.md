@@ -310,5 +310,5 @@ the direction-specific interaction sequence are canonical in
 [`opportunity-fields-and-discovery-details.md`](opportunity-fields-and-discovery-details.md).
 
 Hard-versus-ranked geographic compatibility, distance, ordering, explanations,
-and result-card behavior remain with
-[Define matching and result-card semantics across directions](https://github.com/bagorrr/football_bot/issues/8).
+and result-card behavior are canonical in
+[`matching-and-result-cards.md`](matching-and-result-cards.md).
