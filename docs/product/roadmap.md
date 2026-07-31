@@ -25,6 +25,10 @@ This roadmap records the stable delivery flow and transition gates. Active statu
   `docs/product/opportunity-fields-and-discovery-details.md`
 - Opportunity publication lifecycle:
   `docs/product/opportunity-publication-lifecycle.md`
+- Matching and result cards:
+  `docs/product/matching-and-result-cards.md`
+- Free-form Bot Assistant conversation style:
+  `docs/product/bot-assistant-conversation-style.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
 - Source consent basis: `docs/product/source-consent.md`
 - Open decision space: GitHub Wayfinder map, when needed
@@ -71,6 +75,8 @@ Do not duplicate detailed decisions or ticket status in this file.
 - Notification behaviour.
 - Moderation, abuse, privacy, and retention.
 - Bot conversation flow.
+- Bot User input modalities. Voice-message input is deferred until a post-MVP
+  decision defines native speech-to-text integration and data handling.
 - Need for a Telegram Mini App or administrative web UI.
 - MVP boundary and explicit out-of-scope work.
 

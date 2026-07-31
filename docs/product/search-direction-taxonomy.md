@@ -48,7 +48,8 @@ the classifier preserves competing interpretations and returns an unresolved
 candidate rather than defaulting.
 
 Type compatibility only creates a candidate match. Geography, time, and later
-direction-specific details decide whether two records actually match.
+direction-specific details decide whether two records actually match under
+[`matching-and-result-cards.md`](matching-and-result-cards.md).
 
 ## Intent branches
 

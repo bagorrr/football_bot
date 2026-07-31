@@ -14,6 +14,8 @@ Search Area resolution is canonical in
 [`docs/product/location-resolution.md`](location-resolution.md). The canonical
 direction taxonomy and reviewed direction copy live in
 [`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md).
+Free-form model-generated conversation follows
+[`docs/product/bot-assistant-conversation-style.md`](bot-assistant-conversation-style.md).
 
 ## State model
 
@@ -415,8 +417,8 @@ following remain a separate Wayfinder decision:
 The future root results menu has no Back action. Any Back action belongs only
 to a defined results submenu. Its complete contract belongs to
 [Define the search-results menu and history navigation](https://github.com/bagorrr/football_bot/issues/19).
-Matching, ordering, explanations, and result-card content remain with
-[Define matching and result-card semantics across directions](https://github.com/bagorrr/football_bot/issues/8).
+Matching, ordering, explanations, and result-card content are canonical in
+[`matching-and-result-cards.md`](matching-and-result-cards.md).
 
 ## Post-MVP boundaries
 
@@ -424,3 +426,9 @@ The MVP exposes placeholders but does not define full Feed or Premium
 behavior. Continuous online discovery with persistent result cards, Premium
 plans and entitlements, and model training on consented external project data
 must each return to Wayfinder as separate post-MVP product efforts.
+
+Bot User voice-message input is also post-MVP. Its future decision must cover
+Telegram media handling, an established speech-to-text engine or service,
+transcription uncertainty, language, temporary audio retention, privacy,
+limits, failures, credentials, and cost. A separate third-party Telegram bot
+is not the proposed integration boundary.

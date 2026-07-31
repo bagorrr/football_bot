@@ -176,6 +176,26 @@ _Avoid_: Opportunity Attribute, inferred preference, classifier output
 A user-facing input or setting through which a Bot User confirms or clears one Discovery Criterion.
 _Avoid_: Opportunity Attribute, unconfirmed suggestion, matching rule
 
+**Confirmed Match**:
+An active compatible Opportunity for which every selected Discovery Criterion is confirmed by accepted Opportunity Attributes.
+_Avoid_: Possible Match, Partial Result, model similarity score
+
+**Partial Result**:
+A Player Search result in which a confirmed jointly available group contributes fewer Players than the requested total while every other selected Discovery Criterion is confirmed.
+_Avoid_: Possible Match, combined reservation, full group
+
+**Possible Match**:
+An active compatible Opportunity with no conflicting selected Discovery Criterion and at least one selected criterion whose corresponding Opportunity Attribute is unknown.
+_Avoid_: Confirmed Match, Variant with Difference, inferred fact
+
+**Variant with Difference**:
+An Opportunity with one explicitly identified, relaxable criterion conflict that is shown only after the Bot User asks to change or relax that criterion; it is not an ordinary match.
+_Avoid_: Possible Match, hidden widening, model similarity
+
+**Result Card**:
+A localized Telegram presentation rendered from accepted Opportunity Attributes, structured matching evidence, current source metadata, and one usable Response Route.
+_Avoid_: Source Message, free model summary, Active Chat View
+
 **Active Chat View**:
 The current Telegram presentation of one logical bot screen. It may contain one message or a bounded group of result-card messages and is never the source of truth for a Discovery Draft.
 _Avoid_: Discovery Draft, Telegram chat history, completed search

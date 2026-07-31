@@ -25,10 +25,10 @@ The canonical User Intent and Opportunity Type compatibility table remains in
 Opportunity Location remain in
 [`location-resolution.md`](location-resolution.md).
 
-This decision does not define hard-versus-ranked compatibility, handling of an
-unknown candidate value during matching, result ordering, explanations,
-result-card presentation, saved searches, or notifications. Those belong to
-[Define matching and result-card semantics across directions](https://github.com/bagorrr/football_bot/issues/8).
+Hard-versus-ranked compatibility, unknown values, ordering, explanations, and
+result-card presentation are canonical in
+[`matching-and-result-cards.md`](matching-and-result-cards.md). Saved searches
+and notifications remain outside this document.
 
 ## Data boundary
 
@@ -135,8 +135,9 @@ evening
 night
 ```
 
-Day-part clock boundaries and temporal compatibility belong to matching
-semantics. `Any` clears the direct Time criterion.
+Day-part clock boundaries and temporal compatibility are canonical in
+[`matching-and-result-cards.md`](matching-and-result-cards.md). `Any` clears
+the direct Time criterion.
 
 In a coaching Schedule, several day parts may be selected together. One exact
 local interval is an alternative to those day parts: entering the interval
@@ -872,17 +873,13 @@ Schedule status labels:
 
 Team Format values `5x5` through `11x11` are identical in every locale.
 
-## Deferred behavior
+## Related and deferred behavior
 
-The following remain deliberately unresolved here:
-
-- whether an unknown Opportunity Attribute satisfies, weakly satisfies, or
-  fails a Discovery Criterion;
-- hard versus ranked criteria and how criteria combine;
-- day-part clock boundaries and interval overlap;
-- geographic compatibility, distance, and widening;
-- result ordering, explanations, contact presentation, and result cards;
-- saved-search and notification behavior.
+Unknown attributes, hard and ranked criteria, time overlap, geographic
+compatibility, ordering, explanations, Contacts, and result cards are
+canonical in
+[`matching-and-result-cards.md`](matching-and-result-cards.md). Saved-search
+and notification behavior remains unresolved here.
 
 Opportunity freshness, exact repost handling, revision and withdrawal
 suppression, reactivation, moderation, and abuse handling are canonical in

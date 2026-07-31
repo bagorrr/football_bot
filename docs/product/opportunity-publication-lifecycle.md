@@ -28,10 +28,10 @@ This document defines:
 - Response Route invalidation;
 - the effect of lifecycle changes on completed-search result history.
 
-It does not define compatibility, ranking, result-card layout, completed-search
-navigation, or saved-search behavior. Those remain with the Wayfinder tickets
-for matching and result-card semantics and for search-results navigation.
-Manually saved favorite Opportunities are a separate post-MVP capability.
+Compatibility, ranking, and result-card layout are canonical in
+[`matching-and-result-cards.md`](matching-and-result-cards.md).
+Completed-search navigation remains with its Wayfinder ticket. Saved-search
+behavior and manually saved favorite Opportunities remain separate decisions.
 
 ## Opportunity identity and publication state
 
@@ -194,14 +194,14 @@ surviving, fresh, and otherwise eligible exact repost may become the visible
 representative. The application does not infer that deletion of one repost
 cancelled every other surviving source assertion.
 
-A complaint or moderation action applies to the whole Exact Repost Cluster.
-It never falls back to an older representative to bypass the hold or
-suppression. A new exact repost remains in the cluster's current review state.
+A moderation action applies to the whole Exact Repost Cluster. It never falls
+back to an older representative to bypass the hold or suppression. A new exact
+repost remains in the cluster's current review state.
 
 A materially changed new Source Message is not an exact repost. It passes the
 normal pipeline as a separate proposition. The MVP accepts that semantic
-rewriting can avoid the exact-repost relationship; a new complaint or operator
-action is required when that behavior is abusive.
+rewriting can avoid the exact-repost relationship; a new operator action is
+required when that behavior is abusive.
 
 Messages from different Source Publishers or different Source Chats are not
 automatically deduplicated. Near duplicates remain independent Opportunities
@@ -275,7 +275,6 @@ The following triggers prevent automatic publication:
 - classifier disposition `needs_review`;
 - a current Telegram-provided `scam` or `fake` signal on the visible Source
   Publisher or attributable Source Author;
-- one explicit Bot User report about an active Opportunity;
 - an explicit threat or targeted harassment of a person;
 - an attempt inside Source Message data to make the classifier follow
   instructions instead of analyzing the message.
@@ -295,13 +294,6 @@ An operator approval applies only to one current Opportunity revision. It does
 not create an author allowlist. A new post or revision carrying the signal
 requires review again. Removal of the Telegram signal does not reactivate an
 Opportunity by itself.
-
-### Bot User reports
-
-One explicit Bot User report immediately moves the reported Opportunity's
-Exact Repost Cluster to `held_for_review`. It does not automatically hold
-unrelated Opportunities from the same Source Publisher or pause the Source
-Chat.
 
 ### Operator outcomes
 
@@ -328,40 +320,34 @@ When an Opportunity leaves `active`:
 - retain its existing result-card reference in previously completed-search
   history;
 - render its current non-active availability when that history is opened;
+- label the historical card unavailable and hide every Contact immediately;
 - never treat the retained historical card as a new active recommendation.
 
-After normal expiry, a direct private-contact route may remain on the
-historical card for no longer than the confirmed 30-day post-deactivation
-retention window. An inactive Source Message link is not presented as the
-card's contact route.
+The no-Contact rule applies to every non-active state and reason, including
+normal expiry. Back-end retention may continue for a bounded permitted purpose
+under ADR 0006, but retained contact data is never exposed through an inactive
+historical card.
 
-Hide every contact route immediately when non-availability is caused by:
-
-- a pending Source Message revision;
-- an unusable Response Route;
-- observed Source Message deletion;
-- Consent Withdrawal or Source Chat consent loss;
-- an approved Source Data Deletion Request;
-- any `held_for_review` trigger, including a Bot User report;
-- an operator suppression;
-- a current `scam` or `fake` signal.
-
-After the applicable contact-retention deadline, remove the contact while
-retaining the non-personal historical card reference for as long as the
-completed-search history policy permits.
-
-The result-card ticket owns the exact unavailable label and contact control.
+The matching and result-card contract owns the exact unavailable label and
+contact control.
 The search-results navigation ticket owns completed-search history retention,
 selection, pagination, and cleanup.
 
 ## Deferred and post-MVP behavior
 
-- Hard and ranked matching, ordering, explanations, and result-card fields
-  remain with the matching and result-card decision.
+- Hard and ranked matching, ordering, explanations, and result-card fields are
+  canonical in [`matching-and-result-cards.md`](matching-and-result-cards.md).
 - Current and historical completed-search navigation remains with the
   search-results navigation decision.
 - Saved-search semantics remain unresolved fog on the MVP Wayfinder map.
+- User-facing result reports and the in-product complaint flow are post-MVP.
+  A later Wayfinder effort must decide entry points, confirmation, reasons,
+  abuse resistance, moderation effects, and user feedback before adding them.
 - User-managed Favorites for games, players, coaches, referees, transfers, and
   other Opportunities are a separate post-MVP capability. The MVP does not
   define save, unsave, grouping, retention, or inactive-contact behavior for
   Favorites.
+- Bot User voice-message input is post-MVP. Its later Wayfinder decision must
+  define native speech-to-text integration, media handling, uncertainty,
+  language, temporary audio retention, privacy, limits, failures, credentials,
+  and cost.
