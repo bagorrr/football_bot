@@ -117,9 +117,12 @@ copy is:
 Other Conversation Languages use a direct localized equivalent. The Bot
 Assistant does not send a second explanatory prompt automatically.
 
-A Telegram reply to a result card identifies the card being discussed. If the
-message is not a reply and more than one card could be meant, ask one short
-question. In Russian:
+For a pageable result message, Telegram Reply identifies the containing result
+view but not a historical edit of that message. The current card is the primary
+referent. Explicit details may identify another card from the same Active
+Result Context; cards from other Completed Searches are not candidates. If
+more than one active-set card could be meant, ask one short distinguishing
+question. Russian fallback copy is:
 
 ```text
 О какой карточке речь?
@@ -135,6 +138,9 @@ When the user asks about a card:
   a new immutable Search snapshot without another confirmation message;
 - ask one brief question only when the requested change is ambiguous;
 - never create a new Opportunity Attribute from conversation.
+
+The complete reference-resolution and reset contract is canonical in
+[`search-results-navigation.md`](search-results-navigation.md).
 
 Examples:
 

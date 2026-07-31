@@ -25,9 +25,9 @@ This document defines:
   shown in a result card;
 - ordinary Bot Assistant clarification and search refinement from a card.
 
-Search-results menus, pagination, and completed-search history navigation
-remain with
-[Define the search-results menu and history navigation](https://github.com/bagorrr/football_bot/issues/19).
+Search-results presentation, pagination, Active Result Context, and the
+post-MVP completed-search history boundary are canonical in
+[`search-results-navigation.md`](search-results-navigation.md).
 Saved searches, continuous Feed delivery, user-managed Favorites, user-facing
 reports, and Bot User voice-message input are outside the MVP.
 
@@ -384,10 +384,14 @@ The invitation does not create a button and does not trigger a second message.
 
 ## Clarification in Telegram chat
 
-The Bot User uses Telegram's ordinary reply action on a result card to identify
-the result being discussed. When a separate message could refer to several
-cards, the Bot Assistant asks one short localized question. Russian master
-copy:
+The application supplies the current Result Card as the primary referent and
+only cards from the Active Result Context as alternative referents. An ordinary
+question that naturally refers to the current card needs no clarification.
+Explicit details may identify another card in the same active result set.
+
+When more than one active-set card remains plausible, the Bot Assistant asks
+one short localized question that distinguishes those candidates. If no useful
+distinction is available, Russian master fallback copy is:
 
 ```text
 О какой карточке речь?
@@ -395,7 +399,9 @@ copy:
 
 The Bot Assistant answers from the accepted Opportunity Attributes and
 matching evidence. If the requested fact is absent, it says so directly and
-points to the card's Contact when available.
+points to the resolved card's Contact when available. It never consults a
+different Completed Search, invents a Result identifier, or treats Telegram
+callback logs as proof of the user's exact viewport.
 
 ## Confirmed Russian example
 
