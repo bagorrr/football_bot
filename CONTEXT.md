@@ -168,6 +168,10 @@ _Avoid_: Telegram chat history, saved search, result list
 The one durable, unfinished, and user-scoped state record for a Discovery Flow. It stores confirmed inputs, temporary editing state, and the current logical stage independently from Telegram messages.
 _Avoid_: Active Chat View, completed search, per-intent draft cache
 
+**Completed Search**:
+An immutable Bot User-scoped record of one successful Search submission, its confirmed discovery inputs, and its ordered Result records, including a valid zero-result outcome.
+_Avoid_: Discovery Draft, Saved Search, Active Result Context
+
 **Discovery Criterion**:
 A constraint explicitly confirmed by a Bot User for one discovery flow. An unopened, empty, or cleared optional criterion imposes no constraint and never asserts an Opportunity Attribute.
 _Avoid_: Opportunity Attribute, inferred preference, classifier output
@@ -196,9 +200,13 @@ _Avoid_: Possible Match, hidden widening, model similarity
 A localized Telegram presentation rendered from accepted Opportunity Attributes, structured matching evidence, current source metadata, and one usable Response Route.
 _Avoid_: Source Message, free model summary, Active Chat View
 
+**Active Result Context**:
+The durable Bot User-scoped pointer to the one Completed Search whose Result Cards may be presented and discussed, together with its current Result identifier, absolute position, and result-screen revision.
+_Avoid_: Active Chat View, Completed Search history, model-selected chat context
+
 **Active Chat View**:
 The current Telegram presentation of one logical bot screen. It may contain one message or a bounded group of result-card messages and is never the source of truth for a Discovery Draft.
-_Avoid_: Discovery Draft, Telegram chat history, completed search
+_Avoid_: Discovery Draft, Telegram chat history, Completed Search, Active Result Context
 
 **Event Time**:
 One local date or bounded inclusive date range for a particular game, tournament, or event-specific request, with an optional exact local time or day part.

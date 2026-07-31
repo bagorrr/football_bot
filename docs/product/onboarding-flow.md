@@ -155,9 +155,8 @@ screen is earlier in the flow.
 | Mode submenu | Settings |
 | Settings | a newly rendered Main Menu |
 
-Language Selection itself, root Main Menu, and the future root results menu
-have no Back action. A future results submenu may define Back to its owning
-results screen.
+Language Selection itself, root Main Menu, and the root result screen have no
+Back action. The MVP has no results submenu.
 
 Returning from an onboarding stage reconstructs the destination as a new
 Active Chat View from durable state; it never depends on an old Telegram
@@ -376,9 +375,10 @@ returns to Settings in the new language. There is no `/language` command.
 ## Active Chat View lifecycle
 
 An `Active Chat View` is the current logical presentation. It may be one
-message or a bounded set of messages, such as separately rendered result
-cards. The Bot Assistant never initiates deletion of the current Active Chat
-View.
+message or a bounded set of messages. The MVP result presentation is the one
+message defined in
+[`search-results-navigation.md`](search-results-navigation.md). The Bot
+Assistant never initiates deletion of the current Active Chat View.
 
 To replace a view:
 
@@ -405,19 +405,16 @@ remove those cards from their own chat.
 
 ## Result-navigation boundary
 
-The successful Search snapshot and result records are in scope here. The
-following remain a separate Wayfinder decision:
+The successful Search snapshot and Result records feed one durable Active
+Result Context. The Main Menu `Search results` action directly renders that
+context as one pageable message, one unpaginated card, or a confirmed empty
+state. The root result screen has no Back action and the MVP has no results
+submenu or user-facing completed-search history.
 
-- whether results use one pageable message or several card messages;
-- the root results message and actions;
-- current versus historical completed searches;
-- pagination, empty states, and result submenus;
-- which ordinary result messages become old when another view is rendered.
-
-The future root results menu has no Back action. Any Back action belongs only
-to a defined results submenu. Its complete contract belongs to
-[Define the search-results menu and history navigation](https://github.com/bagorrr/football_bot/issues/19).
-Matching, ordering, explanations, and result-card content are canonical in
+The complete pagination, conversational context, empty-state, stale-control,
+and replacement contract is canonical in
+[`search-results-navigation.md`](search-results-navigation.md). Matching,
+ordering, explanations, and Result Card content are canonical in
 [`matching-and-result-cards.md`](matching-and-result-cards.md).
 
 ## Post-MVP boundaries
@@ -426,6 +423,11 @@ The MVP exposes placeholders but does not define full Feed or Premium
 behavior. Continuous online discovery with persistent result cards, Premium
 plans and entitlements, and model training on consented external project data
 must each return to Wayfinder as separate post-MVP product efforts.
+
+User-facing Completed Search History is also post-MVP. Completed Searches and
+Result records remain durable in the MVP, but browsing, selecting, and paging
+historical result sets requires a separate Wayfinder decision that also keeps
+Saved Search semantics distinct.
 
 Bot User voice-message input is also post-MVP. Its future decision must cover
 Telegram media handling, an established speech-to-text engine or service,

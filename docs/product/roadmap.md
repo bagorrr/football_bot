@@ -27,6 +27,8 @@ This roadmap records the stable delivery flow and transition gates. Active statu
   `docs/product/opportunity-publication-lifecycle.md`
 - Matching and result cards:
   `docs/product/matching-and-result-cards.md`
+- Search-results navigation and active result context:
+  `docs/product/search-results-navigation.md`
 - Free-form Bot Assistant conversation style:
   `docs/product/bot-assistant-conversation-style.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
