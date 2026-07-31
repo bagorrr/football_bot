@@ -2,6 +2,12 @@
 
 Research date: 2026-07-28. Sources are limited to Telegram's first-party documentation.
 
+Status: Research input. The confirmed product contract in
+[`docs/product/language-onboarding.md`](../product/language-onboarding.md)
+supersedes the UX recommendations in this report. In particular, Conversation
+Language changes are available only through Main Menu → Settings → Language,
+and the MVP has no `/language` command.
+
 ## Recommendation
 
 The Bot Assistant can localize its first bot-authored reply after a Player presses **Start**. Use `message.from.language_code` as an initial hint, not as a confirmed preference: it describes the Player's **Telegram app UI language**, not the device's OS language, and it is optional. Immediately use a supported match, show a compact inline language selector, persist an explicit selection by Telegram user ID, and always offer `/language` (or the equivalent setting) later.

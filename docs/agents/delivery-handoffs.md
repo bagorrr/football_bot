@@ -36,6 +36,10 @@ Before telling the user to leave the current thread:
 
 Once these conditions hold, the user does not need to return to the old thread.
 
+If a later decision changes an earlier issue resolution, add a supersession
+comment to the earlier issue that identifies the changed conclusions and links
+to the replacing decision before the next lifecycle handoff.
+
 ## Mandatory final block
 
 When work reaches or pauses at a gate, end the final response with:
@@ -63,7 +67,7 @@ prompt for the action that actually clears the gate.
 | --- | --- | --- | --- | --- |
 | Product grilling / Wayfinder | One non-research decision ticket | New thread after every resolved non-research ticket | No decision, task, research result, prototype, or fog blocks a buildable specification | `$wayfinder` audit, then `$to-spec` |
 | Specification | One product specification | New thread after the Wayfinder exit gate | User approves test seams and the published specification is complete and labelled `ready-for-agent` | `$to-tickets` |
-| Ticketing | One approved specification | New thread after implementation tickets and native dependencies are published | User approves tracer-bullet granularity; at least one implementation ticket is unblocked | `$tdd` on a frontier ticket |
+| Ticketing | One approved specification | New thread after implementation tickets and native dependencies are published | User approves tracer-bullet granularity; at least one implementation ticket is unblocked | `$implement` on a frontier ticket |
 | Implementation | One implementation ticket | New thread for every ticket | Acceptance criteria and proportional checks pass; implementation PR exists | `$code-review` |
 | Review | One implementation PR | New thread for review; fixes use a separate implementation/fix thread | No blocking standards or specification findings remain | Next frontier implementation ticket, or release-readiness audit |
 | Release readiness | One release candidate against the approved specification | New thread after all implementation tickets and reviews are complete | CI, acceptance, operational, privacy, rollback, migration, monitoring, and support gates pass | Explicitly authorized deployment |
@@ -179,14 +183,14 @@ End with the Next handoff block from docs/agents/delivery-handoffs.md.
 Take one unblocked `ready-for-agent` implementation ticket per fresh thread:
 
 ```text
-$tdd
+$implement
 
 Implement this frontier ticket:
 <IMPLEMENTATION TICKET URL>
 
 Claim it before work. Read its parent specification, AGENTS.md, CONTEXT.md,
-relevant ADRs, and blocking-ticket outcomes. Implement only this ticket in
-small red-green-refactor slices.
+relevant ADRs, and blocking-ticket outcomes. Implement only this ticket, using
+`$tdd` internally in small red-green-refactor slices.
 
 Run proportional static, test, classifier-regression, operational, and failure
 checks required by the specification. Publish an implementation PR and end
@@ -214,7 +218,8 @@ End with the Next handoff block from docs/agents/delivery-handoffs.md.
 
 If blocking findings exist, use a separate fix thread scoped to those findings,
 then run review again. If the PR is clear and more implementation tickets are
-unblocked, the next handoff returns to `$tdd` with the next frontier ticket.
+unblocked, the next handoff returns to `$implement` with the next frontier
+ticket.
 
 ## Release-readiness and production protocol
 
