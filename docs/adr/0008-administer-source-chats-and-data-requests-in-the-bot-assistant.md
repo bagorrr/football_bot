@@ -119,7 +119,8 @@ The detailed contract lives in
   intake, re-enable conditions, and deletion scope. ADR 0007 is superseded for
   consent-specific activation and re-attestation conditions. Their remaining
   identity, retention, publication, and moderation conclusions remain active.
-- Dynamic private-chat admission and protected-content event behavior require
-  the bounded
-  [Source Chat admission prototype](https://github.com/bagorrr/football_bot/issues/32)
-  before the ingestion architecture can be finalized.
+- Dynamic private-chat admission and protected-content event behavior were
+  validated by the bounded
+  [Source Chat admission prototype](https://github.com/bagorrr/football_bot/issues/32).
+  Its checkpoint and event-handoff constraints are adopted by
+  [ADR 0001](0001-use-a-durable-model-classification-service.md).

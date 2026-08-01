@@ -4,12 +4,15 @@ Greenfield Telegram product for turning consent-covered football posts into
 normalized opportunities with model-assisted classification and recommending
 relevant results to users.
 
-The confirmed PoC architecture calls for a durable application worker, not
-Codex, to own Telegram state and the job queue. It will ingest every observable
-and copy-permitted Source Message after each enabled Source Chat's processing
-start boundary and perform bounded model classification through Codex CLI
-authenticated with ChatGPT-managed Codex access. The runnable PoC has not yet
-been implemented.
+The confirmed architecture uses application-owned Telegram checkpoints, a
+PostgreSQL inbox/outbox and durable queue, and separate ingestion,
+classification, recommendation, and Bot Assistant process roles. Every
+observable and copy-permitted Source Message after an enabled Source Chat's
+processing start boundary is classified with `gpt-5.6-sol` at `high` reasoning.
+The bounded test-MVP/PoC adapter uses Codex CLI with ChatGPT-managed access; a
+direct Responses API or suitable service-credential adapter is the
+production-oriented migration path. The runnable product has not been
+implemented.
 
 ## Project documents
 
@@ -23,7 +26,7 @@ been implemented.
 - [Source Chat consent basis](docs/product/source-consent.md)
 - [Source Chat and data-request administration](docs/product/source-chat-administration.md)
 - [Source Author data lifecycle](docs/product/source-author-data-lifecycle.md)
-- [Proposed repository structure](docs/product/repository-structure.md)
+- [Repository structure](docs/product/repository-structure.md)
 - [Architecture decisions](docs/adr/)
 - [Agent workflow](AGENTS.md)
 
