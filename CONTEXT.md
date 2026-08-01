@@ -287,12 +287,20 @@ _Avoid_: Telegram Language Hint, system language
 ### Source ingestion
 
 **Source Chat**:
-A Telegram chat approved as a complete source stream while its continuing consent process covers every participant.
+A Telegram chat registered by the authorized administrator as a complete source stream with one immutable Initial Consent Attestation and one processing start boundary.
 _Avoid_: Scraped chat, sampled chat, partially monitored group
 
+**Initial Consent Attestation**:
+The administrator's record, created by successfully adding a Source Chat, that the required initial consent for that chat has already been obtained outside the Bot Assistant.
+_Avoid_: consent created by the bot, participant verification, periodic re-attestation
+
 **Source Message**:
-Every account-visible message or post published in a Source Chat, regardless of author or football relevance; edits are revisions of the same Source Message.
+Every account-visible, copy-permitted message or post published in a Source Chat after its processing start boundary, regardless of author or football relevance; edits are revisions of the same Source Message.
 _Avoid_: Selected Post, Match Post, Offer, Listing before classification
+
+**Protected Content Skip**:
+A body-free record that an event from an accessible Source Chat was not copied, stored, classified, or published because Telegram content protection prohibited copying it.
+_Avoid_: Source Message, retained protected content, failed classification
 
 **Source Publisher**:
 The Telegram principal visibly presented as publishing a Source Message, which may be a user account, chat, channel, or unknown principal.
@@ -307,5 +315,5 @@ A Source Author's explicit revocation of Source Chat processing consent for one 
 _Avoid_: ordinary chat departure, Source Data Deletion Request
 
 **Source Data Deletion Request**:
-A verified request to erase retained Source Author data from one named Source Chat or, when explicitly requested, every enabled Source Chat.
+A verified request to erase retained Source Author data from exactly one named Source Chat.
 _Avoid_: Consent Withdrawal, Telegram message deletion

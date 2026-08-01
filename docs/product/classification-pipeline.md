@@ -41,8 +41,9 @@ or queue state.
 
 ## Source coverage
 
-Every account-visible message or post in every enabled Source Chat is admitted
-to ingestion and classification:
+Every account-visible, copy-permitted message or post observed after the
+processing start boundary of every enabled Source Chat is admitted to ingestion
+and classification:
 
 - all administrators, ordinary users, anonymous administrators, and
   channel-authored posts;
@@ -50,27 +51,38 @@ to ingestion and classification:
 - edits as new revisions and deletion events as tombstones;
 - relevant, irrelevant, ambiguous, malformed, and non-football messages.
 
-There is no keyword or rules pre-screen before model classification. “Parse all
-messages” means ingest and classify every observable message; it does not mean
+There is no author, keyword, language, or relevance pre-screen before model
+classification. “Parse all messages” means ingest and classify every
+copy-permitted observable message after the start boundary; it does not mean
 publish every message or retain every raw body indefinitely.
+
+Content protection is the one pre-storage content boundary. When Telegram
+prohibits copying an event, create only the body-free Protected Content Skip in
+[`source-chat-administration.md`](source-chat-administration.md). Do not create
+a Source Message, classification job, model input, Opportunity Candidate, or
+result from that event. Resume automatically for future copy-permitted events
+and never backfill a protected skip.
 
 ## Processing flow
 
-1. A Telethon ingestion process receives a new, edited, or deleted Source
-   Message from an enabled Source Chat.
-2. The process durably records the Telegram event and advances its update state
-   only after the event can be recovered.
-3. A durable queue creates an idempotent classification job keyed by Source
+1. A Telethon ingestion process receives a new, edited, or deleted event from
+   an enabled Source Chat.
+2. The process checks the current protection boundary before retaining content.
+   A prohibited event creates only a recoverable body-free Protected Content
+   Skip and no classification work.
+3. For a copy-permitted event, the process durably records the Telegram event
+   and advances its update state only after the event can be recovered.
+4. A durable queue creates an idempotent classification job keyed by Source
    Chat, Telegram message ID, and current message revision.
-4. A context builder creates a minimal permitted context bundle.
-5. A classification worker starts a finite Codex CLI process in an isolated
+5. A context builder creates a minimal permitted context bundle.
+6. A classification worker starts a finite Codex CLI process in an isolated
    minimal workspace and requests a strict structured result. The process uses
    saved ChatGPT authentication, an ephemeral session, a read-only sandbox, no
    MCP servers or plugins, no application secrets, bounded input/output, and a
    hard timeout.
-6. Deterministic validators reject impossible or incomplete combinations and
+7. Deterministic validators reject impossible or incomplete combinations and
    normalize accepted fields.
-7. The application either accepts and activates a normalized football
+8. The application either accepts and activates a normalized football
    Opportunity under the publication-lifecycle gates, routes the result for
    another bounded classification/review step, or marks the message as
    irrelevant or unresolved.

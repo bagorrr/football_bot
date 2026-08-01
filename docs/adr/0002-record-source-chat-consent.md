@@ -3,6 +3,13 @@
 - Status: Accepted
 - Date: 2026-07-28
 
+Superseded in part by
+[ADR 0008](0008-administer-source-chats-and-data-requests-in-the-bot-assistant.md).
+The original configured-chat attestation and complete processing of
+copy-permitted Source Messages remain active. ADR 0008 replaces the
+participant-level evidence, later-member coverage, renewed Source Chat
+attestation, and protected-content conclusions below.
+
 ## Context
 
 Telegram's current API and Content Licensing terms restrict AI/ML processing of

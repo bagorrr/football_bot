@@ -33,6 +33,9 @@ This roadmap records the stable delivery flow and transition gates. Active statu
   `docs/product/bot-assistant-conversation-style.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
 - Source consent basis: `docs/product/source-consent.md`
+- Source Chat and data-request administration:
+  `docs/product/source-chat-administration.md`
+- Source Author data lifecycle: `docs/product/source-author-data-lifecycle.md`
 - Open decision space: GitHub Wayfinder map, when needed
 - Product specification: GitHub spec issue
 - Implementation work: GitHub tracer-bullet issues

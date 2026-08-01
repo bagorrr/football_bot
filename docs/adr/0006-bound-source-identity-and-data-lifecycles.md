@@ -3,6 +3,12 @@
 - Status: Accepted
 - Date: 2026-07-30
 
+Superseded in part by
+[ADR 0008](0008-administer-source-chats-and-data-requests-in-the-bot-assistant.md).
+The identity, minimization, retention, observed-deletion, audit, and replay
+barrier conclusions remain active. ADR 0008 replaces the request-intake,
+re-enable, and all-Source-Chats deletion conclusions below.
+
 ## Context
 
 Complete Source Chat ingestion includes ordinary accounts, bots, anonymous

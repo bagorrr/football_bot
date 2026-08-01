@@ -6,9 +6,10 @@ The durable boundary decision is recorded in
 [ADR 0006](../adr/0006-bound-source-identity-and-data-lifecycles.md). The
 originating Wayfinder decision is
 [Define Source Author identity, retention, and withdrawal](https://github.com/bagorrr/football_bot/issues/6).
-The complete-chat consent precondition remains canonical in
-[`source-consent.md`](source-consent.md) and
-[ADR 0002](../adr/0002-record-source-chat-consent.md).
+Source Chat administration and the superseding attestation, withdrawal,
+re-enable, and request-scope decisions are canonical in
+[`source-chat-administration.md`](source-chat-administration.md) and
+[ADR 0008](../adr/0008-administer-source-chats-and-data-requests-in-the-bot-assistant.md).
 
 ## Scope
 
@@ -131,8 +132,8 @@ Retention follows the Source Message's purpose and disposition:
 | Access and operator audit | Retain for 90 days without message text, names, usernames, or contact data. |
 
 Identity fields do not acquire a separate indefinite lifetime. Each field
-follows the longest retained Source Message, active Opportunity, current
-consent record, Response Route, or bounded audit purpose that requires it.
+follows the longest retained Source Message, active Opportunity, Initial
+Consent Attestation, Response Route, or bounded audit purpose that requires it.
 
 ## Observed Telegram deletion
 
@@ -149,16 +150,20 @@ An observed deletion of one Source Message is neither Consent Withdrawal nor a
 reason to pause the whole Source Chat. Telegram deletion delivery is
 best-effort, so this rule applies to events the application actually observes.
 
-## Consent registry
+## Initial attestation and Source Chat state
 
-The current consent state is retained while the Source Chat remains configured.
-A `withdrawn` state remains current while that chat is paused. After a new
-attestation supersedes a withdrawal, the superseded entry remains for 90 days.
-After permanent removal of a Source Chat from the product, its consent history
-remains for 90 days.
+Successful administrator registration records one immutable Initial Consent
+Attestation and one processing start boundary for the Source Chat. The
+application does not retain participant-level consent evidence, inspect
+membership, or run re-attestation. The attestation remains while the Source
+Chat is configured and for 90 days after permanent removal as body-free audit
+state.
 
-Consent evidence stays in the access-controlled registry. It is not stored in
-Git, ordinary logs, prompts, analytics, or the classifier workspace.
+Current enabled, paused, or removed state and the detailed administrator
+workflow are canonical in
+[`source-chat-administration.md`](source-chat-administration.md). Personal or
+operational evidence stays outside Git, ordinary logs, prompts, analytics, and
+the classifier workspace.
 
 ## Consent Withdrawal
 
@@ -166,13 +171,12 @@ Consent Withdrawal is explicit and scoped to the one Source Chat for which the
 request was made. It does not automatically affect another enabled Source Chat
 containing the same Telegram account.
 
-The preferred request path is a private Bot Assistant interaction from the same
-Telegram account. The Telegram user ID must match the retained Source Author
-ID mapping. A name, username, profile image, or screenshot is insufficient.
-When the person cannot use that route, an operator may perform a separate
-identity check and retain only a protected evidence pointer.
+The participant sends the request privately to the configured support bot. The
+administrator manually selects and pauses the one named Source Chat in the Bot
+Assistant. The application performs no participant identity check, membership
+check, or re-attestation for this workflow.
 
-After a verified withdrawal:
+After the administrator confirms the pause:
 
 1. mark the named Source Chat paused before accepting further content for
    processing;
@@ -185,18 +189,15 @@ Withdrawal does not create a separate frozen copy, reset a retention clock, or
 accelerate deletion. Existing data stays in its ordinary storage class and
 follows the 7-, 30-, and 90-day rules above.
 
-The technical account does not remove a participant from the Source Chat. The
-participant leaves or a Source Chat administrator removes them. The chat may be
-re-enabled only after an operator confirms that the withdrawing participant is
-absent, confirms current universal coverage, and records a new attestation and
-effective time.
+The technical account does not remove a participant from the Source Chat. Only
+the configured administrator may re-enable the chat, with one explicit
+confirmation and without participant verification or a new attestation.
 
 Messages created during the pause are never backfilled or classified. Previously
 suppressed Opportunities do not reactivate automatically. A retained
 pre-pause source may be reconsidered only after verifying its current revision,
-freshness, Response Route, and current consent coverage; deleted source data
-cannot be reconstructed. A withdrawing Source Author's content remains
-ineligible without new consent.
+freshness, Response Route, classification, duplicate, and moderation gates;
+deleted source data cannot be reconstructed.
 
 An ordinary participant departure or removal without explicit Consent
 Withdrawal triggers no special pause, suppression, or retention change.
@@ -208,18 +209,25 @@ alone does not end consent for future Source Messages, and the request flow
 must state that new messages will continue to be processed unless the person
 also withdraws consent.
 
-The default scope is one named Source Chat. Deletion across every enabled
-Source Chat containing the same Telegram account occurs only when the requester
-explicitly selects that broader scope. The request uses the same exact
-Telegram-ID verification or protected operator-assisted path as withdrawal and
-is never collected through a public Source Chat message.
+Every request has exactly one named Source Chat. There is no all-Source-Chats
+scope. Intake occurs through the configured support bot, which retains the
+conversation and identity evidence and provides an opaque protected case ID.
+The Bot Assistant retains only that pointer, received time, exact requester
+Telegram user ID, and named Source Chat. A name, username, profile image, or
+screenshot is insufficient. When the exact ID cannot be resolved, the
+administrator may perform a separate identity check and retain only its
+protected evidence pointer; otherwise the request is rejected.
 
-Every deletion request requires explicit operator approval. The operator must
-approve or reject it within 7 days and must record a reason for rejection. The
-request, scope, decision, reason, and operator action stay in the body-free
-90-day audit.
+Every deletion request requires explicit administrator approval. The
+administrator must approve or reject it within 7 days and record a reason for
+rejection. Approval sets `approved_awaiting_execution`; it does not delete
+anything automatically. The request, scope, decision, reason, notification
+status, and administrator action stay in the body-free 90-day audit.
 
-After approval:
+The administrator opens one exact request, starts deletion, selects a public
+chat with the text trigger `/@username` or a private chat with an eligible
+button, reviews the requester/chat summary, and explicitly confirms execution.
+Only then does the application:
 
 1. suppress affected Opportunities and Response Routes immediately;
 2. stop using the in-scope data;
@@ -227,11 +235,24 @@ After approval:
    snapshots, relationship records, and derived data within 30 days;
 4. remove the deleted source from other retained context and suppress or
    re-evaluate any candidate that no longer has sufficient evidence;
-5. retain only current consent state, the bounded body-free audit, and the
+5. retain only the Initial Consent Attestation, bounded body-free audit, and the
    minimum replay barrier described below.
 
+The request becomes `completed` only after successful execution and the
+administrator's manual confirmation of completion time and protected proof
+pointer. `data_not_found` is a valid manually confirmed outcome. A partial or
+failed operation sets `execution_error`, keeps already found data suppressed,
+and remains incomplete until a successful retry and manual completion.
+
+The Bot Assistant notifies the administrator 24 hours before the 7-day
+decision deadline and 30-day completion deadline, then once daily after a
+missed deadline. It never auto-decides or auto-deletes. The administrator
+notifies the requester manually through the support bot; only notification
+time and status are retained in the Bot Assistant.
+
 Deletion without withdrawal does not pause the Source Chat. New Source Messages
-after the deletion boundary remain eligible under the current consent state.
+after the deletion boundary remain eligible under the Source Chat's current
+enabled state.
 
 ## Replay barrier
 
@@ -242,7 +263,7 @@ but no name, username, contact, or Source Message text.
 
 The replay barrier remains while the Source Chat is configured and for 90 days
 after its permanent removal. New messages after the boundary remain
-processable when consent remains current.
+processable when the Source Chat is enabled.
 
 ## Independent Bot Assistant entry
 
@@ -257,10 +278,11 @@ Source Chats, contact data, or activity statistics. Starting the Bot Assistant
 does not create, renew, withdraw, or otherwise change Source Chat consent.
 
 The application does not create or persist a Source Author-to-Bot User link.
-When a person explicitly starts a Consent Withdrawal or Source Data Deletion
-Request through the Bot Assistant, the application may compare the current
-Telegram user ID with the retained Source Author mapping for that request only.
-It must not retain the comparison result as a link between the roles.
+Consent Withdrawal and Source Data Deletion Request intake occurs through the
+separate configured support bot, not ordinary Bot Assistant onboarding. The
+request may carry an exact requester Telegram user ID for its one scoped
+administrative purpose, but the application must not retain a Source
+Author-to-Bot User role link.
 
 No name, username, photo, message history, Opportunity history, consent state,
 Discovery Draft, settings, or other role state transfers in either direction.

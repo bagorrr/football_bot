@@ -2,6 +2,25 @@
 
 Research date: 2026-07-28. Sources are limited to Telegram's first-party documentation and official Telethon documentation. No Telegram account, credentials, session, or message data was accessed. Here, a private Source Chat means an access-controlled cloud group, supergroup, or channel, not a Secret Chat.
 
+## Product policy update: 2026-08-01
+
+[ADR 0008](../adr/0008-administer-source-chats-and-data-requests-in-the-bot-assistant.md)
+supersedes three operational recommendations while leaving the technical
+findings in this report unchanged:
+
+- the test MVP uses its protected configured user-authorized ingestion account
+  rather than requiring a separate non-personal account;
+- any accessible public or private Source Chat may be registered, but an event
+  that Telegram prohibits copying becomes only a body-free Protected Content
+  Skip and is never stored or model-processed; and
+- successful administrator registration records the Initial Consent
+  Attestation without participant inspection or re-attestation.
+
+These are product-owner decisions, not new findings about Telegram's terms.
+The current terms assessment, including the absence of a test-mode exception,
+is in
+[`telegram-ai-ingestion-consent-audit-2026-08-01.md`](telegram-ai-ingestion-consent-audit-2026-08-01.md).
+
 ## Recommendation
 
 Use a **dedicated user-authorized MTProto account through Telethon**, joined to every approved Source Chat. Do not use the Bot API for ingestion: it has no general history method, group privacy can hide ordinary messages, ordinary message deletions are absent from its update model, and pending updates expire after 24 hours.
