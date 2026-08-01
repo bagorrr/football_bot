@@ -56,6 +56,13 @@ support conversations, and session credentials are operational data. Store
 them only in protected configuration or operational storage, never in Git,
 ordinary logs, prompts, analytics, or GitHub Issues.
 
+Administration and Source Data Deletion Request turns use deterministic
+application commands and fixed presentation. They never expose the free-form
+model, Location Resolver, general web access, or another external model tool to
+administrator input. Bot Assistant terminal-failure alarms are the separate
+protected operational exception defined in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
+
 ## Source Chat registration
 
 `Source Chats` contains `Добавить Source Chat`. After selecting it, the Bot

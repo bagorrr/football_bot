@@ -8,6 +8,10 @@ This contract applies to every free-form model-generated Bot Assistant reply in
 all supported Conversation Languages. It covers result explanations, search
 refinement, clarification, recovery, and ordinary conversation.
 
+The permitted inputs, Result Conversation, execution adapters, current-time
+boundary, no-general-web rule, failures, and observability are canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
+
 Fixed card layouts, exact Source Message evidence, proper names, Contacts,
 phone numbers, URLs, canonical identifiers, and compact structured date or time
 ranges are not free-form conversation and retain their own formats.
@@ -139,6 +143,11 @@ When the user asks about a card:
 - ask one brief question only when the requested change is ambiguous;
 - never create a new Opportunity Attribute from conversation.
 
+The MVP does not search the general web or use model memory to fill an absent
+or current external fact. A question outside search, settings, Result Cards,
+or other Bot Assistant marketplace behavior receives one short redirection to
+those capabilities.
+
 The complete reference-resolution and reset contract is canonical in
 [`search-results-navigation.md`](search-results-navigation.md).
 
@@ -165,6 +174,8 @@ must verify:
   attributions do not appear;
 - routine answers contain no redundant preamble, recap, or next-step offer;
 - unknown facts remain unknown;
+- off-topic requests and requests for general web access receive a short
+  marketplace redirection;
 - one clear search change is applied once without a redundant confirmation;
 - an ambiguous request produces one short clarification question;
 - fixed cards, proper names, Contacts, and structured ranges are not corrupted

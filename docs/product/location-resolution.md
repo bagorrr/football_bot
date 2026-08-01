@@ -197,7 +197,17 @@ Persist language-neutral normalized geography:
 - the Bot User's explicit confirmation event.
 
 Localized strings are presentation, not identity. The exact gazetteer provider
-is not selected by this product decision, but it must satisfy this contract.
+is not selected by this product decision, but it must expose a current external
+gazetteer backed by a geographic database, such as OpenStreetMap data accessed
+through Nominatim or a compatible provider, and must satisfy this contract. It
+is not the application database or the model's general knowledge.
+
+The application owns the Location Resolver request. Send only the place phrase
+and confirmed parent geography and locale needed for resolution. The Bot
+Assistant model may propose that phrase or select among returned candidates,
+but it receives no general web-search capability and cannot accept a candidate
+without resolver validation. Provider policy, caching, attribution, privacy,
+and rate limits are adapter responsibilities.
 
 Pressing Back from the Search Area text stage returns to City and does not
 delete confirmed geography. An ambiguous, unresolved, invalid, or technical
@@ -220,6 +230,14 @@ changes only through an explicit reclassification revision. A confirmed Search
 Area retains stable place identities; if a place is split, merged, or retired,
 the Bot Assistant asks the Bot User to resolve it on the next use. A translation
 change may update display text without changing identity.
+
+A confirmed city also binds to one IANA timezone identifier. The application
+uses its authoritative UTC clock and current installed IANA timezone data to
+compute local dates and times; it records the timezone-data version used for a
+temporal interpretation. The model receives those computed values and never
+derives current local time from memory or general web access. The full model
+boundary is canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
 
 ## Source Message normalization
 

@@ -166,5 +166,6 @@ observability contract is
   An edit still suppresses its prior revision immediately.
 - Matching and Bot Assistant presentation remain testable without the model
   because they consume accepted persisted facts and structured evidence.
-- Free-form Bot Assistant model execution requires its own Wayfinder decision;
-  this ADR does not define that conversation contract.
+- Free-form Bot Assistant model execution is governed separately by
+  [ADR 0009](0009-keep-bot-assistant-execution-direct-and-application-authoritative.md);
+  its direct interactive adapter does not change this classification contract.

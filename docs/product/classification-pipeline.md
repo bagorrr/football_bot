@@ -425,9 +425,13 @@ delivery. The Bot Assistant renders Result Cards only from accepted facts,
 structured matching evidence, current source metadata, and one usable Response
 Route. Telegram send/edit success changes presentation state, not domain truth.
 
-Free-form Bot Assistant model execution is a separate decision. It may explain
-accepted facts and interpret Bot User input, but it cannot own Source Message
-classification or the authoritative state described here.
+Free-form Bot Assistant model execution is separately canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md). It may
+explain accepted facts and interpret Bot User input, but it cannot own Source
+Message classification or the authoritative state described here. Its direct
+interactive adapter, Result Conversation, 60-second deadline, and controlled
+Location Resolver do not change this classifier's queue, context, tool-free
+execution, retries, or credentials.
 
 ## Privacy and observability
 
