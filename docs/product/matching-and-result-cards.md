@@ -12,6 +12,8 @@ Opportunity publication eligibility remains in
 [`opportunity-publication-lifecycle.md`](opportunity-publication-lifecycle.md).
 Free-form explanations and search-refinement replies follow
 [`bot-assistant-conversation-style.md`](bot-assistant-conversation-style.md).
+Their model execution and authoritative-fact boundary is canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
 
 ## Scope
 
@@ -403,6 +405,10 @@ points to the resolved card's Contact when available. It never consults a
 different Completed Search, invents a Result identifier, or treats Telegram
 callback logs as proof of the user's exact viewport.
 
+The MVP does not search the general web to supplement a card. Model memory,
+an arbitrary URL, or another external source cannot fill a missing attribute,
+change matching evidence, or alter publication state.
+
 ## Confirmed Russian example
 
 ```text
@@ -447,3 +453,8 @@ language, temporary audio retention, privacy, limits, failures, provider
 credentials, and cost must be decided before implementation. A successful
 transcript should enter the same conversational input path as typed text while
 the Bot User receives only the ordinary final Bot Assistant response.
+
+General public-web search and arbitrary page retrieval are also deferred. A
+future Wayfinder decision must define topic boundaries, privacy, source
+quality, citations, prompt-injection defenses, cost, latency, retention, and
+failure behavior before the model receives that capability.

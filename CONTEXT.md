@@ -204,6 +204,10 @@ _Avoid_: Source Message, free model summary, Active Chat View
 The durable Bot User-scoped pointer to the one Completed Search whose Result Cards may be presented and discussed, together with its current Result identifier, absolute position, and result-screen revision.
 _Avoid_: Active Chat View, Completed Search history, model-selected chat context
 
+**Result Conversation**:
+The protected Bot User and Bot Assistant transcript associated with the latest successfully presented Completed Search and available only while that result conversation remains active and retained.
+_Avoid_: Telegram chat history, Active Result Context, Completed Search history
+
 **Active Chat View**:
 The current Telegram presentation of one logical bot screen. It may contain one message or a bounded group of result-card messages and is never the source of truth for a Discovery Draft.
 _Avoid_: Discovery Draft, Telegram chat history, Completed Search, Active Result Context

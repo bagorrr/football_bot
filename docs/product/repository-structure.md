@@ -7,6 +7,9 @@ The originating decision is
 Runtime and data-flow details are canonical in
 [`classification-pipeline.md`](classification-pipeline.md) and
 [ADR 0001](../adr/0001-use-a-durable-model-classification-service.md).
+Free-form Bot Assistant model execution is canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md) and
+[ADR 0009](../adr/0009-keep-bot-assistant-execution-direct-and-application-authoritative.md).
 
 ## Repository boundary
 
@@ -36,6 +39,8 @@ several runtime roles share one language, release, or container image.
 │   ├── telegram-bot-adapter/
 │   ├── codex-classification-adapter/
 │   ├── responses-classification-adapter/
+│   ├── codex-assistant-adapter/
+│   ├── responses-assistant-adapter/
 │   ├── postgres-adapter/
 │   ├── classification/
 │   ├── normalization/
@@ -50,6 +55,10 @@ several runtime roles share one language, release, or container image.
 │   ├── glossaries/
 │   ├── context-policies/
 │   └── routing-policies/
+├── assistant/
+│   ├── prompts/
+│   ├── response-contracts/
+│   └── context-policies/
 ├── config/
 │   └── source-chats.yaml
 ├── db/
@@ -93,6 +102,8 @@ container per folder.
 - `classifier/*` contains immutable versioned model artifacts. An active
   classifier deployment binds exact prompt, schema, glossary, context-policy,
   and routing-policy versions.
+- `assistant/*` contains the separate versioned Bot Assistant prompt,
+  response-contract, and context-policy artifacts.
 
 Shared DTOs do not become a second domain model. Cross-process messages use
 versioned contracts and carry stable identifiers, not adapter-specific objects.
@@ -112,8 +123,11 @@ Run five independently restartable roles:
    publication.
 4. **Recommendation worker** — performs deterministic matching and persists
    Completed Searches and ordered Results.
-5. **Telegram Bot Assistant** — receives Bot API updates and processes the
-   delivery outbox, Active Chat Views, and user-facing presentation.
+5. **Telegram Bot Assistant** — receives Bot API updates, invokes the direct
+   bounded Bot Assistant model adapter when needed, validates proposed actions,
+   and processes the delivery outbox, Active Chat Views, and user-facing
+   presentation. It has no separate conversation worker or durable model
+   queue.
 
 The backend may expose health, administration, and application endpoints
 without becoming a sixth owner of domain state. Application and recommendation
@@ -150,7 +164,7 @@ weaken the transactional handoff or replay contract.
 | --- | --- | --- |
 | Ingestion | Telegram `api_id`/`api_hash`, protected Telethon authentication, least-privilege checkpoint/inbox database credential | Bot token, Codex/Responses credential, Bot User data access |
 | Classification | Dedicated ChatGPT/Codex or service credential and least-privilege job/context access | Telethon session, Bot token, publication or matching write authority |
-| Bot Assistant | Bot token and user/delivery database access | Telethon session, classifier credential, unrestricted raw Source Message access |
+| Bot Assistant | Bot token, dedicated Bot Assistant model credential, and user/delivery database access | Telethon session, classifier credential, unrestricted raw Source Message access, general web or write-capable model tools |
 | Application and recommendation | Least-privilege domain-state database access | Telegram or classifier authentication unless a specific adapter composition requires it |
 
 The Codex CLI PoC runs under its own unprivileged OS identity with a dedicated
@@ -158,6 +172,12 @@ The Codex CLI PoC runs under its own unprivileged OS identity with a dedicated
 personal configuration, an isolated minimal workspace, and no application
 secrets. Runtime model policy never comes from an operator's personal Codex
 configuration.
+
+The test-MVP Bot Assistant adapter uses a separate dedicated service identity,
+credential boundary, `CODEX_HOME`, prompt, response contract, and context
+policy. It invokes one direct ephemeral process per permitted turn, disables
+Codex web search and every other model tool, and has no classifier queue or raw
+Source Message access.
 
 The Telethon `StringSession` remains an authentication secret only. It is not a
 Telegram checkpoint. PostgreSQL stores the application-owned recoverable

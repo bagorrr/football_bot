@@ -102,7 +102,11 @@ iana_timezone
 
 Both date boundaries are inclusive. A single date uses the same start and end
 date. `Today` and `Tomorrow` are calculated from the selected city's local
-calendar date. The IANA timezone comes from the confirmed city.
+calendar date. The IANA timezone comes from the confirmed city through the
+Location Resolver. The application uses an authoritative UTC clock and current
+installed IANA timezone data, records the timezone-data version, and supplies
+the resulting instant and local values to the model. It does not ask the model
+or the general web for the current local time.
 
 An exact event time has this conceptual shape:
 
@@ -124,6 +128,9 @@ timestamp and source timezone. The model may propose the resolved values and
 must cite the expression it interpreted; the application validates the
 calendar values, ordering, and timezone before acceptance. Model output alone
 is never treated as proof that a temporal value is correct.
+
+The separate free-form Bot Assistant execution boundary is canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
 
 The direct `Time` criterion accepts exactly one of:
 

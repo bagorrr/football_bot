@@ -31,6 +31,8 @@ This roadmap records the stable delivery flow and transition gates. Active statu
   `docs/product/search-results-navigation.md`
 - Free-form Bot Assistant conversation style:
   `docs/product/bot-assistant-conversation-style.md`
+- Bot Assistant model execution and conversation boundary:
+  `docs/product/bot-assistant-model-execution.md`
 - Model classification boundary: `docs/product/classification-pipeline.md`
 - Source consent basis: `docs/product/source-consent.md`
 - Source Chat and data-request administration:
@@ -80,6 +82,8 @@ Do not duplicate detailed decisions or ticket status in this file.
 - Notification behaviour.
 - Moderation, abuse, privacy, and retention.
 - Bot conversation flow.
+- Bot Assistant model execution, permitted conversation context, and current
+  external-fact boundary. General public-web search is deferred to post-MVP.
 - Bot User input modalities. Voice-message input is deferred until a post-MVP
   decision defines native speech-to-text integration and data handling.
 - Need for a Telegram Mini App or administrative web UI.

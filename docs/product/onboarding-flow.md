@@ -16,6 +16,8 @@ direction taxonomy and reviewed direction copy live in
 [`docs/product/search-direction-taxonomy.md`](search-direction-taxonomy.md).
 Free-form model-generated conversation follows
 [`docs/product/bot-assistant-conversation-style.md`](bot-assistant-conversation-style.md).
+Model execution, current-time inputs, progress indication, and failures follow
+[`docs/product/bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
 
 ## State model
 
@@ -224,7 +226,8 @@ phrases such as Today, Tomorrow, or a weekday resolve against the selected
 city's local calendar.
 
 The model may propose calendar boundaries, but the application validates the
-city timezone, calendar values, ordering, and that the start has not passed.
+city's IANA timezone, the UTC instant and local date computed from current
+timezone data, calendar values, ordering, and that the start has not passed.
 One accepted interpretation commits concrete local dates immediately and
 advances to the post-core screen. Ambiguous, unresolved, invalid, past, and
 technical outcomes preserve the confirmed date and keep the Bot Assistant
@@ -286,6 +289,16 @@ Success, including a valid zero-result response:
 
 A technical failure restores the draft at the post-core screen with a Retry
 action. It does not discard any confirmed input.
+
+## Model-generated response progress
+
+For any permitted model-generated reply, wait one second before showing a
+progress indication. If the reply is still pending, show Telegram's native
+`Thinking...` draft and refresh it until the final reply or bounded failure.
+Use the ordinary `typing...` chat action as fallback. Never stream model text
+or reasoning. The complete 60-second deadline and failure behavior are
+canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
 
 ## Native Menu and Main Menu
 
@@ -457,3 +470,7 @@ A separate administrator web panel, delegated administrator roles, and
 user-facing self-service consent, withdrawal, or Source Data Deletion Request
 controls are also post-MVP. The MVP uses the administrator-only Settings action
 and the configured support bot path instead.
+
+General public-web search, arbitrary URL retrieval, current weather and route
+lookups, and other open-ended external facts are post-MVP. The MVP uses only
+the controlled Location Resolver and application-owned current timezone data.

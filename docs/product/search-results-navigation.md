@@ -1,7 +1,7 @@
 # Search Results Navigation
 
-Status: Confirmed product baseline on 2026-07-31. The originating Wayfinder
-decision is
+Status: Confirmed product baseline on 2026-07-31, with Result Conversation
+retention refined on 2026-08-01. The originating Wayfinder decision is
 [Define the search-results menu and history navigation](https://github.com/bagorrr/football_bot/issues/19).
 
 Matching, ordering, result classes, card fields, explanations, and Contact are
@@ -28,10 +28,11 @@ A newly completed Search, including a valid zero-result Search, replaces the
 Active Result Context only after its result presentation is successfully
 rendered and recorded. A non-empty new Search starts at its first ordered
 Result. A zero-result Search has no current Result. Activation clears every
-card-reference binding from the previous context but does not delete ordinary
-conversation history, any Completed Search, or any Result record. If the new
-presentation cannot be rendered, the previous Active Result Context and view
-remain current.
+card-reference binding from the previous context, starts a new Result
+Conversation, and schedules the prior Result Conversation for deletion within
+24 hours. It does not delete any Completed Search or Result record. If the new
+presentation cannot be rendered, the previous Active Result Context, Result
+Conversation, and view remain current.
 
 Every successful arrow transition durably records the target Result and
 position. Leaving results for Main Menu, restarting the service, changing the
@@ -61,6 +62,21 @@ The resolved Result identifier and basis are application state supplied to
 the response path; the model does not invent an identifier or treat callback
 logs as proof of the Telegram viewport. An explicit `Ask about this card`
 button is not required in the MVP.
+
+## Result Conversation
+
+The application stores one protected Result Conversation for the latest
+successfully presented Completed Search. Permitted model turns receive its
+retained Bot User and Bot Assistant messages together with the current Result
+Card and application-selected alternative referents. They receive no
+conversation from an older Completed Search and do not reconstruct context
+from Telegram history.
+
+Retain the current Result Conversation no longer than 30 days after its most
+recent result-related message. Expiry removes the transcript but preserves the
+Active Result Context, Completed Search, Result records, and current structured
+card. The full execution and retention boundary is canonical in
+[`bot-assistant-model-execution.md`](bot-assistant-model-execution.md).
 
 ## Root result screen
 
