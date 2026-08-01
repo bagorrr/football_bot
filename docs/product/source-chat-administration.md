@@ -23,7 +23,7 @@ independent legal conclusion or a claim that Telegram granted an exception.
 The current primary-source assessment is
 [`telegram-ai-ingestion-consent-audit-2026-08-01.md`](../research/telegram-ai-ingestion-consent-audit-2026-08-01.md).
 Private-chat admission and protection detection are validated separately in
-[the bounded Source Chat prototype](https://github.com/bagorrr/football_bot/issues/32).
+[`telegram-source-chat-admission-validation-2026-08-01.md`](../research/telegram-source-chat-admission-validation-2026-08-01.md).
 
 ## Administrator boundary
 
@@ -76,6 +76,13 @@ Successful registration atomically records:
 - enabled status; and
 - the immutable status `Исходное согласие подтверждено`.
 
+The application also owns the durable Telegram transport boundary needed to
+reject updates from before registration. A username or invite resolution does
+not create that boundary, and a recovered update's application observation
+time is not a substitute for it. The current Telethon `StringSession` is an
+authentication credential, not a durable update checkpoint; the ingestion
+architecture must provide a protected recoverable checkpoint and handoff.
+
 The act of registration is the administrator's attestation that the required
 initial consent already exists outside the Bot Assistant. The bot does not
 create consent, inspect participants, keep participant-level evidence, or run
@@ -107,6 +114,14 @@ chat-level and message-level copy protection. When copying is prohibited:
   Route from that event; and
 - never backfill the skipped content.
 
+For chat-wide group or channel protection, use the current
+`Chat.noforwards` or `Channel.noforwards` peer flag. Telegram does not set
+`Message.noforwards` merely because the containing group or channel is
+protected. Treat `Message.noforwards` as an additional standalone
+message-level signal, not as a replacement for current peer state. If current
+peer protection cannot be established before persistence, fail closed without
+retaining the body.
+
 If protection later permits copying, future copy-permitted events enter the
 ordinary complete-stream pipeline automatically.
 
@@ -123,6 +138,11 @@ audit and deletion replay barriers remain for their ordinary bounded periods.
 
 Re-adding the same Telegram chat creates a new processing start boundary and
 does not backfill the removed interval.
+
+A basic group migrated by Telegram to a supergroup receives a new stable
+channel identity. Stop the old Source Chat stream and require admission of the
+successor with a new processing start boundary; do not treat migration as a
+username-only address change or backfill the migration gap.
 
 ## Consent Withdrawal, pause, and re-enable
 
