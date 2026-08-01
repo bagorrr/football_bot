@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+quality_python="${QUALITY_PYTHON:-python3}"
+quality_postgres_container=""
+
+cleanup() {
+  if [[ -n "${quality_postgres_container}" ]]; then
+    docker stop "${quality_postgres_container}" >/dev/null
+  fi
+}
+trap cleanup EXIT
+
+if [[ -z "${TEST_DATABASE_URL:-}" ]]; then
+  quality_postgres_container="football-bot-quality-$$"
+  docker run --rm --detach \
+    --name "${quality_postgres_container}" \
+    --env POSTGRES_PASSWORD=postgres \
+    --publish 127.0.0.1::5432 \
+    postgres:16-alpine >/dev/null
+  quality_postgres_port="$(
+    docker port "${quality_postgres_container}" 5432/tcp | sed 's/.*://'
+  )"
+  export TEST_DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:${quality_postgres_port}/postgres"
+  for _ in {1..30}; do
+    if docker exec "${quality_postgres_container}" pg_isready -U postgres >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+  docker exec "${quality_postgres_container}" pg_isready -U postgres >/dev/null
+fi
+
+"${quality_python}" -m ruff check .
+"${quality_python}" -m ruff format --check .
+"${quality_python}" -m mypy
+"${quality_python}" -m pytest
