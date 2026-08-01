@@ -13,7 +13,9 @@ Classifier dispositions and evidence requirements remain canonical in
 [`classification-pipeline.md`](classification-pipeline.md). Source identity,
 consent, withdrawal, deletion, and retention boundaries remain canonical in
 [`source-author-data-lifecycle.md`](source-author-data-lifecycle.md),
-[`source-consent.md`](source-consent.md), ADR 0002, and ADR 0006.
+[`source-consent.md`](source-consent.md),
+[`source-chat-administration.md`](source-chat-administration.md), ADR 0002,
+ADR 0006, and ADR 0008.
 
 ## Scope
 
@@ -23,7 +25,7 @@ This document defines:
 - activation and freshness gates;
 - Source Message revision and deletion effects;
 - exact-repost handling without semantic near-duplicate detection;
-- Source Chat pause and re-attestation behavior;
+- Source Chat pause and re-enable behavior;
 - moderation triggers, outcomes, and timeouts;
 - Response Route invalidation;
 - the effect of lifecycle changes on completed-search result history.
@@ -72,7 +74,8 @@ hold:
    evidence;
 3. its Opportunity Location is accepted;
 4. its Response Route is currently usable;
-5. its Source Chat is enabled and covered by current universal consent;
+5. its Source Chat is enabled and has its immutable Initial Consent
+   Attestation;
 6. it is fresh under the temporal rules below;
 7. it is the current visible representative of any Exact Repost Cluster;
 8. no review, deletion, or suppression rule applies.
@@ -126,9 +129,8 @@ The 30-day clock restarts only after:
 
 Spelling, punctuation, whitespace, and other cosmetic edits do not restart the
 clock. Reclassification caused by a prompt, model, schema, glossary, or
-application change does not restart it. Re-attestation, operator-triggered
-revalidation, and time spent in a Source Chat pause do not restart or extend
-it.
+application change does not restart it. Operator-triggered revalidation and
+time spent in a Source Chat pause do not restart or extend it.
 
 ## Source Message revisions
 
@@ -209,6 +211,9 @@ and may appear as separate results.
 
 ## Source deletion and Response Route loss
 
+A Protected Content Skip is not a Source Message and creates no Opportunity
+Candidate, Opportunity, or Response Route.
+
 An observed Telegram deletion:
 
 1. immediately suppresses every Opportunity derived only from that Source
@@ -232,10 +237,10 @@ the Source Publisher to test responsiveness and does not try to determine
 whether the real-world place is still open; Bot Users resolve those facts in
 the Source Chat or private conversation.
 
-## Consent pause and re-attestation
+## Source Chat pause and re-enable
 
-Consent Withdrawal and loss of universal coverage retain the chat-level
-behavior in ADR 0002 and ADR 0006:
+An administrator-initiated Source Chat pause, including one made after Consent
+Withdrawal through the support path, follows ADR 0008:
 
 - pause the complete Source Chat before accepting more content for processing;
 - stop classification, retries, and queued review work;
@@ -243,28 +248,26 @@ behavior in ADR 0002 and ADR 0006:
   one hour;
 - never backfill the non-ingested pause gap.
 
-Re-attestation and re-enabling the Source Chat do not reactivate Opportunities
-by themselves. An operator may explicitly start revalidation of retained
+Re-enabling the Source Chat does not reactivate Opportunities by itself. The
+application performs no participant verification or re-attestation. An
+administrator may explicitly start revalidation of retained
 pre-pause sources. Each Opportunity returns to `active` only when:
 
 - the current Source Message revision still exists;
 - its ordinary freshness window has not ended;
 - its current Response Route is usable;
 - its current classification and evidence pass acceptance;
-- the Source Chat has current universal consent coverage;
-- the relevant Source Author remains consent-covered;
+- the Source Chat is enabled and retains its Initial Consent Attestation;
 - every duplicate and moderation gate passes.
 
-Deleted source data cannot be reconstructed. Content from the withdrawing
-Source Author remains ineligible without that person's new consent. An
-ordinary departure without explicit Consent Withdrawal creates no special
-publication-state change.
+Deleted source data cannot be reconstructed. An ordinary departure without an
+administrator pause creates no special publication-state change.
 
 An approved Source Data Deletion Request follows ADR 0006: suppress affected
 results immediately, remove the in-scope derived data, and preserve only the
 permitted audit and replay barrier. Deletion without withdrawal still permits
-genuinely new messages after the deletion boundary when current consent
-continues.
+genuinely new messages after the deletion boundary while the Source Chat is
+enabled and retains its Initial Consent Attestation.
 
 ## Moderation
 

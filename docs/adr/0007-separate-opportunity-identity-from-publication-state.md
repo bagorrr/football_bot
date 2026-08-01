@@ -3,6 +3,12 @@
 - Status: Accepted
 - Date: 2026-07-30
 
+Superseded in part by
+[ADR 0008](0008-administer-source-chats-and-data-requests-in-the-bot-assistant.md)
+for Source Chat attestation and re-enable conditions. Opportunity identity,
+publication states, freshness, exact reposts, moderation, and all other
+conclusions remain active.
+
 ## Context
 
 An accepted Opportunity can later expire, enter review, lose its Response

@@ -6,7 +6,9 @@ Status: Proposed. Finalize through `grill-with-docs` and, if needed, a Wayfinder
 
 Start with one private product monorepository.
 
-The Telegram bot is the initial user-facing frontend. A separate web application is optional and should not be built until a confirmed user or administrative workflow requires it.
+The Telegram bot is the initial user-facing and administrator frontend. A
+separate administrator web application is post-MVP and should not be built
+before its own confirmed Wayfinder decision.
 
 ## Proposed logical layout
 
@@ -68,6 +70,14 @@ The recommendation role matches accepted normalized opportunities to confirmed
 user details. See
 [`docs/product/classification-pipeline.md`](classification-pipeline.md) and
 [`ADR 0001`](../adr/0001-use-a-durable-model-classification-service.md).
+
+The application also owns a mutable Source Chat registry keyed by stable
+Telegram chat ID. `config/source-chats.yaml` is initial seed input, not the
+runtime system of record. The registry carries the current address, processing
+start boundary, Initial Consent Attestation, enabled/pause/removal state, and
+the minimum metadata required for body-free Protected Content Skips. The exact
+persistence and queue topology remains with the ingestion-architecture
+Wayfinder decision.
 
 ## Repository split triggers
 

@@ -1,3 +1,6 @@
+# Initial seed for the future mutable Source Chat registry. Runtime additions,
+# stable Telegram chat IDs, processing boundaries, and state belong to
+# protected application storage rather than this checked-in file.
 ingestion_policy:
   scope: all_messages
   include_edits: true

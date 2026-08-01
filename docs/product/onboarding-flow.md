@@ -334,6 +334,24 @@ Russian master Settings actions:
 [ Назад ]
 ```
 
+For the one configured administrator, the same Settings view adds one action:
+
+```text
+[ Язык ]
+[ Поддержка ]
+[ Администрирование ]
+[ Режим ]
+[ Премиум ]
+[ Назад ]
+```
+
+`Администрирование` is visible and callable only when the incoming exact
+Telegram user ID equals the protected configured `TELEGRAM_ADMIN_USER_ID`.
+There is no `/admin` command, separate administrator bot, username check, or
+administrator allowlist. Its Source Chat, deletion-request, and audit flows are
+canonical in
+[`source-chat-administration.md`](source-chat-administration.md).
+
 `Поддержка` is an inline URL action pointing to
 `https://telegram.me/myfootball_support_bot`. It opens the configured support
 bot and leaves Settings as the current view.
@@ -434,3 +452,8 @@ Telegram media handling, an established speech-to-text engine or service,
 transcription uncertainty, language, temporary audio retention, privacy,
 limits, failures, credentials, and cost. A separate third-party Telegram bot
 is not the proposed integration boundary.
+
+A separate administrator web panel, delegated administrator roles, and
+user-facing self-service consent, withdrawal, or Source Data Deletion Request
+controls are also post-MVP. The MVP uses the administrator-only Settings action
+and the configured support bot path instead.

@@ -6,9 +6,10 @@ relevant results to users.
 
 The confirmed PoC architecture calls for a durable application worker, not
 Codex, to own Telegram state and the job queue. It will ingest every observable
-Source Message from each enabled Source Chat and perform bounded model
-classification through Codex CLI authenticated with ChatGPT-managed Codex
-access. The runnable PoC has not yet been implemented.
+and copy-permitted Source Message after each enabled Source Chat's processing
+start boundary and perform bounded model classification through Codex CLI
+authenticated with ChatGPT-managed Codex access. The runnable PoC has not yet
+been implemented.
 
 ## Project documents
 
@@ -20,6 +21,8 @@ access. The runnable PoC has not yet been implemented.
 - [Opportunity fields and discovery details](docs/product/opportunity-fields-and-discovery-details.md)
 - [Source Message classification pipeline](docs/product/classification-pipeline.md)
 - [Source Chat consent basis](docs/product/source-consent.md)
+- [Source Chat and data-request administration](docs/product/source-chat-administration.md)
+- [Source Author data lifecycle](docs/product/source-author-data-lifecycle.md)
 - [Proposed repository structure](docs/product/repository-structure.md)
 - [Architecture decisions](docs/adr/)
 - [Agent workflow](AGENTS.md)

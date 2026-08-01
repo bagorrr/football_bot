@@ -123,9 +123,12 @@ See [Agent approvals and security](https://learn.chatgpt.com/docs/agent-approval
 
 ## Recommended integration boundary
 
-1. Telethon receives and durably records every observable new message, edit, or
-   deletion event from every enabled Source Chat.
-2. A durable queue creates one classification job per message revision.
+1. Telethon receives every observable new message, edit, or deletion event
+   after the enabled Source Chat's processing start boundary. A prohibited
+   event creates only a body-free Protected Content Skip; every copy-permitted
+   event is durably recorded.
+2. A durable queue creates one classification job per copy-permitted message
+   revision.
 3. A deterministic context builder adds only the permitted reply, bounded
    adjacent context, chat geography, glossary, timestamp, and timezone.
 4. A stateless worker launches one isolated `codex exec --ephemeral` process
