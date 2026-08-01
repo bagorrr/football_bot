@@ -13,6 +13,13 @@ The
 [throwaway prototype commit](https://github.com/bagorrr/football_bot/commit/ee29ac4)
 is retained outside `main` as primary evidence.
 
+[Choose the ingestion and model-classification architecture](https://github.com/bagorrr/football_bot/issues/11)
+and
+[ADR 0001](../adr/0001-use-a-durable-model-classification-service.md)
+subsequently adopted the protected application-owned difference checkpoint and
+atomic PostgreSQL inbox handoff required by this validation. The technical
+findings below are unchanged.
+
 ## Scope and safety boundary
 
 This validation addressed only public/private chat resolution, stable

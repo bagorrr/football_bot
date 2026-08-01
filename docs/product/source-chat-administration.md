@@ -80,8 +80,11 @@ The application also owns the durable Telegram transport boundary needed to
 reject updates from before registration. A username or invite resolution does
 not create that boundary, and a recovered update's application observation
 time is not a substitute for it. The current Telethon `StringSession` is an
-authentication credential, not a durable update checkpoint; the ingestion
-architecture must provide a protected recoverable checkpoint and handoff.
+authentication credential, not a durable update checkpoint. The ingestion
+architecture uses the protected application-owned difference checkpoint and
+atomic PostgreSQL inbox handoff defined in
+[`classification-pipeline.md`](classification-pipeline.md) and
+[ADR 0001](../adr/0001-use-a-durable-model-classification-service.md).
 
 The act of registration is the administrator's attestation that the required
 initial consent already exists outside the Bot Assistant. The bot does not
