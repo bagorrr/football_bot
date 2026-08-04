@@ -11,8 +11,22 @@ observable and copy-permitted Source Message after an enabled Source Chat's
 processing start boundary is classified with `gpt-5.6-sol` at `high` reasoning.
 The bounded test-MVP/PoC adapter uses Codex CLI with ChatGPT-managed access; a
 direct Responses API or suitable service-credential adapter is the
-production-oriented migration path. The runnable product has not been
-implemented.
+production-oriented migration path.
+
+## Quality checks
+
+Install the pinned development dependencies with
+`python3 -m pip install --requirement requirements-dev.txt`, then run the one
+repository-local CI entry point:
+
+```text
+./quality
+```
+
+When `TEST_DATABASE_URL` is absent, the command starts a temporary local
+PostgreSQL 16 container. Pull-request and `main` CI supplies its own PostgreSQL
+service. The checks use only synthetic data and make no live Telegram, model,
+Location Resolver, or other provider calls.
 
 ## Project documents
 

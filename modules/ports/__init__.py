@@ -1,0 +1,178 @@
+"""Inward-facing runtime ports."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
+from typing import Protocol
+from uuid import UUID
+
+from modules.contracts import (
+    ContractEnvelope,
+    ContractName,
+    OperatorAlert,
+    RawContractEnvelope,
+    RuntimeRole,
+)
+
+
+class Clock(Protocol):
+    """Application-owned source of authoritative UTC instants."""
+
+    def now(self) -> datetime:
+        """Return one timezone-aware current instant."""
+        ...
+
+
+class TelegramIngestionAdapter(Protocol):
+    """Controlled Source Chat input boundary."""
+
+    def source_event_id(self, probe_id: str) -> str:
+        """Return a synthetic Source Event identity."""
+        ...
+
+
+class TelegramDeliveryAdapter(Protocol):
+    """Controlled Bot API presentation boundary."""
+
+    def present(self, delivery_id: str) -> None:
+        """Record one controlled Telegram presentation."""
+        ...
+
+
+class ModelAdapter(Protocol):
+    """Controlled model boundary for the acceptance spine."""
+
+    def proposal_id(self, revision_id: str) -> str:
+        """Return one non-authoritative synthetic proposal identity."""
+        ...
+
+
+class LocationResolverAdapter(Protocol):
+    """Controlled location boundary for accepted publication facts."""
+
+    def opportunity_revision_id(self, proposal_id: str) -> str:
+        """Return one synthetic accepted Opportunity revision identity."""
+        ...
+
+
+class OutboxConflictError(RuntimeError):
+    """A distinct message attempted to reuse an outbox identity."""
+
+
+class ConsumeResult(StrEnum):
+    """Durable disposition of one inbox delivery."""
+
+    APPLIED = "applied"
+    REPLAYED = "replayed"
+    REJECTED = "rejected"
+
+
+class AcceptanceRoleStore(Protocol):
+    """Persistence operations available to exactly one runtime owner."""
+
+    @property
+    def role(self) -> RuntimeRole:
+        """Return the sole owner represented by this store."""
+        ...
+
+    def commit_initial(
+        self,
+        *,
+        probe_id: str,
+        envelope: RawContractEnvelope,
+    ) -> None:
+        """Atomically commit initial owner state and its outbox."""
+        ...
+
+    def claim_next(
+        self,
+        *,
+        supported_versions: Mapping[ContractName, Iterable[int]],
+        claimed_at: datetime,
+    ) -> RawContractEnvelope | None:
+        """Claim the next recoverable handoff visible to this role."""
+        ...
+
+    def claim_presentation(
+        self,
+        *,
+        claimed_at: datetime,
+    ) -> RawContractEnvelope | None:
+        """Claim one committed Telegram presentation owned by this role."""
+        ...
+
+    def record_presentation_attempt(
+        self,
+        *,
+        envelope: RawContractEnvelope,
+        delivery_id: str,
+        attempted_at: datetime,
+    ) -> None:
+        """Durably record an external attempt before presenting."""
+        ...
+
+    def record_presentation_success(
+        self,
+        *,
+        message_id: UUID,
+        presented_at: datetime,
+    ) -> None:
+        """Durably record one confirmed idempotent presentation."""
+        ...
+
+    def consume(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        supported_versions: Iterable[int],
+        received_at: datetime,
+        outgoing: ContractEnvelope | None,
+    ) -> ConsumeResult:
+        """Deduplicate and atomically commit one accepted handoff."""
+        ...
+
+    def attempt_owner_write(
+        self,
+        *,
+        owner: RuntimeRole,
+        probe_id: str,
+        attempt: ContractEnvelope,
+    ) -> bool:
+        """Attempt a write used to verify the database owner boundary."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceObservation:
+    """Typed durable outcomes exposed by the observer port."""
+
+    roles: frozenset[RuntimeRole]
+    owner_state_records: int
+    outbox_records: int
+    accepted_inbox_records: int
+    rejected_inbox_records: int
+    operator_alerts: tuple[OperatorAlert, ...]
+    completed: bool
+
+
+class AcceptanceObserver(Protocol):
+    """Administrative observation surface used only by the testkit."""
+
+    def reset(self) -> None:
+        """Clear synthetic acceptance records."""
+        ...
+
+    def envelope(self, message_id: UUID) -> RawContractEnvelope:
+        """Recover one durable envelope."""
+        ...
+
+    def operator_alert(self, message_id: UUID) -> OperatorAlert:
+        """Observe one body-free operator alert."""
+        ...
+
+    def snapshot(self, probe_id: str) -> AcceptanceObservation:
+        """Observe durable outcomes without exposing physical tables."""
+        ...

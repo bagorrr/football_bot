@@ -10,8 +10,12 @@
 .vscode/
 
 node_modules/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 .venv/
 __pycache__/
+*.egg-info/
 
 coverage/
 dist/
