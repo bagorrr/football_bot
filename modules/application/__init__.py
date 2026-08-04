@@ -902,8 +902,8 @@ class ConversationOnboarding:
         intent_branch: IntentBranch,
     ) -> None:
         locale = current.locale
-        if locale is None or locale not in _BRANCH_COPY:
-            raise RuntimeError("Conversation Language has no reviewed discovery copy")
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
         now = self._clock.now()
         state = replace(
             current,
@@ -944,8 +944,8 @@ class ConversationOnboarding:
         user_intent: UserIntent,
     ) -> None:
         locale = current.locale
-        if locale is None or locale not in _COUNTRY_COPY:
-            raise RuntimeError("Conversation Language has no reviewed discovery copy")
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
         if draft.user_intent is user_intent:
             self._queue_current_view(update_id=update_id, state=current)
             return
@@ -1019,8 +1019,8 @@ class ConversationOnboarding:
         draft: DiscoveryDraft,
     ) -> None:
         locale = current.locale
-        if locale is None or locale not in _DIRECTION_COPY:
-            raise RuntimeError("Conversation Language has no reviewed discovery copy")
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
         if draft.stage is ConversationStage.COUNTRY:
             if draft.user_intent is None:
                 raise RuntimeError("country stage has no confirmed User Intent")
@@ -1082,11 +1082,19 @@ class ConversationOnboarding:
             last_activity_at=now,
         )
         if intent_branch is None:
+            selection = None
+            if locale not in SUPPORTED_LOCALES:
+                selection = self._conversation_language.render(locale)
+                if selection is None or selection.locale != locale:
+                    raise RuntimeError(
+                        "saved Conversation Language could not be rendered"
+                    )
             message = _direction_message(
                 update_id=update_id,
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
+                selection=selection,
             )
         else:
             message = _intent_branch_message(
@@ -1415,8 +1423,6 @@ def _discovery_message(
             screen_revision=screen_revision,
             selection=selection,
         )
-    if selection is not None:
-        raise RuntimeError("non-static discovery copy is unavailable past direction")
     if draft.stage is ConversationStage.INTENT_BRANCH:
         if draft.intent_branch is None:
             raise RuntimeError("Intent Branch stage has no Intent Branch")
@@ -1485,7 +1491,10 @@ def _intent_branch_message(
     screen_revision: int,
     intent_branch: IntentBranch,
 ) -> TelegramMessage:
-    heading, first_label, second_label, back_label = _BRANCH_COPY[locale][intent_branch]
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    heading, first_label, second_label, back_label = _BRANCH_COPY[copy_locale][
+        intent_branch
+    ]
     first_intent, second_intent = _BRANCH_USER_INTENTS[intent_branch]
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
@@ -1511,12 +1520,13 @@ def _country_message(
     screen_revision: int,
     user_intent: UserIntent,
 ) -> TelegramMessage:
-    back_label = _DIRECTION_COPY[locale][2][5]
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    back_label = _DIRECTION_COPY[copy_locale][2][5]
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
-        text=_COUNTRY_COPY[locale][user_intent],
+        text=_COUNTRY_COPY[copy_locale][user_intent],
         button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
     )

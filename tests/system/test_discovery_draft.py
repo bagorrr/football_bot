@@ -593,7 +593,7 @@ def test_discovery_draft_is_isolated_to_its_bot_user_and_runtime_owner(
         )
 
 
-def test_free_text_language_confirmation_creates_the_same_durable_draft(
+def test_free_text_language_can_confirm_a_direct_terminal_user_intent(
     spine: AcceptanceSpine,
 ) -> None:
     user_id = 41_009
@@ -616,6 +616,193 @@ def test_free_text_language_confirmation_creates_the_same_durable_draft(
     assert draft.stage == "direction_menu"
     assert draft.intent_branch is None
     assert draft.user_intent is None
+
+    spine.select_direction(
+        update_id="confirm-free-text-game-search",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+
+    confirmed = spine.discovery_draft(user_id)
+    assert confirmed.stage == "country"
+    assert confirmed.user_intent == "game_search"
+
+
+def test_free_text_language_can_confirm_an_intent_branch_subtype(
+    spine: AcceptanceSpine,
+    telegram_delivery: ControlledTelegramDeliveryAdapter,
+) -> None:
+    user_id = 41_015
+    spine.start_bot_user(
+        update_id="start-free-text-branch",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    spine.open_language_input(
+        update_id="open-free-text-branch-language",
+        telegram_user_id=user_id,
+    )
+    spine.submit_language_text(
+        update_id="confirm-free-text-branch-language",
+        telegram_user_id=user_id,
+        text="Deutsch",
+    )
+
+    spine.select_direction(
+        update_id="open-free-text-competition-search",
+        telegram_user_id=user_id,
+        direction="competition_search",
+    )
+    opened = spine.discovery_draft(user_id)
+    assert opened.stage == "intent_branch"
+    assert opened.intent_branch == "competition_search"
+    assert opened.user_intent is None
+
+    spine.select_direction(
+        update_id="confirm-free-text-tournament-search",
+        telegram_user_id=user_id,
+        direction="tournament_search",
+    )
+
+    confirmed = spine.discovery_draft(user_id)
+    assert confirmed.stage == "country"
+    assert confirmed.intent_branch is None
+    assert confirmed.user_intent == "tournament_search"
+    assert spine.conversation_state(user_id).locale == "de"
+    assert telegram_delivery.messages[-1].display_locale == "de"
+
+
+def test_free_text_language_can_go_back_from_the_direction_menu(
+    spine: AcceptanceSpine,
+    telegram_delivery: ControlledTelegramDeliveryAdapter,
+) -> None:
+    user_id = 41_016
+    spine.start_bot_user(
+        update_id="start-free-text-direction-back",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    spine.open_language_input(
+        update_id="open-free-text-direction-back-language",
+        telegram_user_id=user_id,
+    )
+    spine.submit_language_text(
+        update_id="confirm-free-text-direction-back-language",
+        telegram_user_id=user_id,
+        text="Deutsch",
+    )
+
+    spine.go_back(
+        update_id="back-from-free-text-direction-menu",
+        telegram_user_id=user_id,
+    )
+
+    draft = spine.discovery_draft(user_id)
+    assert draft.stage == "direction_menu"
+    assert spine.conversation_state(user_id).stage == "language_selection"
+    assert spine.conversation_state(user_id).locale == "de"
+    assert telegram_delivery.messages[-1].display_locale == "en"
+
+
+@pytest.mark.parametrize(
+    ("user_id", "direction"),
+    [
+        (41_019, "competition_search"),
+        (41_020, "game_search"),
+    ],
+)
+def test_back_returns_to_the_direction_menu_for_a_free_text_language(
+    spine: AcceptanceSpine,
+    telegram_delivery: ControlledTelegramDeliveryAdapter,
+    user_id: int,
+    direction: str,
+) -> None:
+    spine.start_bot_user(
+        update_id=f"start-free-text-back-{user_id}",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    spine.open_language_input(
+        update_id=f"open-free-text-back-{user_id}",
+        telegram_user_id=user_id,
+    )
+    spine.submit_language_text(
+        update_id=f"confirm-free-text-back-{user_id}",
+        telegram_user_id=user_id,
+        text="Deutsch",
+    )
+    spine.select_direction(
+        update_id=f"select-free-text-back-{user_id}",
+        telegram_user_id=user_id,
+        direction=direction,
+    )
+
+    spine.go_back(
+        update_id=f"return-to-free-text-direction-{user_id}",
+        telegram_user_id=user_id,
+    )
+
+    draft = spine.discovery_draft(user_id)
+    assert draft.stage == "direction_menu"
+    assert spine.conversation_state(user_id).locale == "de"
+    assert telegram_delivery.messages[-1].display_locale == "de"
+    assert "Was möchten Sie tun?" in telegram_delivery.messages[-1].text
+
+
+@pytest.mark.parametrize(
+    ("user_id", "terminal_intent", "expected_stage"),
+    [
+        (41_017, None, "intent_branch"),
+        (41_018, "tournament_search", "country"),
+    ],
+)
+def test_start_resumes_the_current_discovery_stage_for_a_free_text_language(
+    spine: AcceptanceSpine,
+    telegram_delivery: ControlledTelegramDeliveryAdapter,
+    user_id: int,
+    terminal_intent: str | None,
+    expected_stage: str,
+) -> None:
+    spine.start_bot_user(
+        update_id=f"start-free-text-resume-{user_id}",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    spine.open_language_input(
+        update_id=f"open-free-text-resume-{user_id}",
+        telegram_user_id=user_id,
+    )
+    spine.submit_language_text(
+        update_id=f"confirm-free-text-resume-{user_id}",
+        telegram_user_id=user_id,
+        text="Deutsch",
+    )
+    spine.select_direction(
+        update_id=f"open-free-text-resume-branch-{user_id}",
+        telegram_user_id=user_id,
+        direction="competition_search",
+    )
+    if terminal_intent is not None:
+        spine.select_direction(
+            update_id=f"confirm-free-text-resume-intent-{user_id}",
+            telegram_user_id=user_id,
+            direction=terminal_intent,
+        )
+
+    before_restart = spine.discovery_draft(user_id)
+    spine.restart(RuntimeRole.BOT_ASSISTANT)
+    spine.start_bot_user(
+        update_id=f"resume-free-text-stage-{user_id}",
+        telegram_user_id=user_id,
+        telegram_language_hint="fr",
+    )
+
+    resumed = spine.discovery_draft(user_id)
+    assert resumed.stage == expected_stage
+    assert resumed.intent_branch == before_restart.intent_branch
+    assert resumed.user_intent == before_restart.user_intent
+    assert spine.conversation_state(user_id).locale == "de"
+    assert telegram_delivery.messages[-1].display_locale == "de"
 
 
 def test_direction_back_preserves_the_draft_while_language_is_reselected(
