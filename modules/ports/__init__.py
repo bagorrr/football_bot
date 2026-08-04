@@ -20,6 +20,7 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ConversationState,
+    DiscoveryDraft,
     LanguageSelection,
     TelegramDeliveryClaim,
     TelegramMessage,
@@ -127,6 +128,14 @@ class ConversationStore(Protocol):
         """Return account-level presentation state through a stable query."""
         ...
 
+    def discovery_draft(self, telegram_user_id: int) -> DiscoveryDraft | None:
+        """Return the Bot User's one durable unfinished Discovery Draft."""
+        ...
+
+    def expire_inactive_discovery_drafts(self, *, inactive_before: datetime) -> int:
+        """Expire only unfinished drafts inactive through the cutoff."""
+        ...
+
     def commit_conversation_update(
         self,
         *,
@@ -135,6 +144,7 @@ class ConversationStore(Protocol):
         state: ConversationState,
         message: TelegramMessage,
         recorded_at: datetime,
+        draft: DiscoveryDraft | None = None,
     ) -> bool:
         """Commit one idempotent Telegram update and its owned state."""
         ...

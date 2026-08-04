@@ -27,10 +27,13 @@ from modules.domain import (
     ActiveChatView,
     ConversationStage,
     ConversationState,
+    DiscoveryDraft,
+    IntentBranch,
     LocaleSource,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramMessage,
+    UserIntent,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -81,6 +84,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.bot_delivery_alerts,
                      football_runtime.bot_message_outbox,
                      football_runtime.bot_updates,
+                     football_runtime.bot_discovery_drafts,
                      football_runtime.bot_users,
                      football_runtime.telegram_presentations,
                      football_runtime.operator_alerts,
@@ -550,6 +554,51 @@ class PostgresRoleStore:
             revision=row["revision"],
         )
 
+    def discovery_draft(self, telegram_user_id: int) -> DiscoveryDraft | None:
+        """Read the Bot User's one durable unfinished Discovery Draft."""
+        try:
+            with psycopg.connect(
+                self._database_url,
+                row_factory=dict_row,
+            ) as connection:
+                row = connection.execute(
+                    """
+                    SELECT telegram_user_id, stage, intent_branch, user_intent,
+                           screen_revision, revision, last_activity_at
+                    FROM football_runtime.bot_discovery_drafts
+                    WHERE telegram_user_id = %s
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+        except psycopg.errors.InsufficientPrivilege as error:
+            raise ConversationAccessDeniedError from error
+        if row is None:
+            return None
+        branch = row["intent_branch"]
+        intent = row["user_intent"]
+        return DiscoveryDraft(
+            telegram_user_id=row["telegram_user_id"],
+            stage=ConversationStage(row["stage"]),
+            intent_branch=IntentBranch(branch) if branch is not None else None,
+            user_intent=UserIntent(intent) if intent is not None else None,
+            screen_revision=row["screen_revision"],
+            revision=row["revision"],
+            last_activity_at=row["last_activity_at"],
+        )
+
+    def expire_inactive_discovery_drafts(self, *, inactive_before: datetime) -> int:
+        """Delete only Bot Assistant-owned drafts inactive through a cutoff."""
+        with psycopg.connect(self._database_url) as connection:
+            expired = connection.execute(
+                """
+                DELETE FROM football_runtime.bot_discovery_drafts
+                WHERE last_activity_at <= %s
+                RETURNING telegram_user_id
+                """,
+                (inactive_before,),
+            ).fetchall()
+        return len(expired)
+
     def commit_conversation_update(
         self,
         *,
@@ -558,6 +607,7 @@ class PostgresRoleStore:
         state: ConversationState,
         message: TelegramMessage,
         recorded_at: datetime,
+        draft: DiscoveryDraft | None = None,
     ) -> bool:
         """Commit one Telegram update and its account-level state atomically."""
         with psycopg.connect(self._database_url) as connection:
@@ -625,6 +675,58 @@ class PostgresRoleStore:
             if changed is None:
                 msg = "Conversation Language state changed concurrently"
                 raise RuntimeError(msg)
+            if draft is not None:
+                draft_values = (
+                    draft.stage.value,
+                    (
+                        draft.intent_branch.value
+                        if draft.intent_branch is not None
+                        else None
+                    ),
+                    (
+                        draft.user_intent.value
+                        if draft.user_intent is not None
+                        else None
+                    ),
+                    draft.screen_revision,
+                    draft.revision,
+                    draft.last_activity_at,
+                    recorded_at,
+                )
+                if draft.revision == 1:
+                    changed_draft = connection.execute(
+                        """
+                        INSERT INTO football_runtime.bot_discovery_drafts (
+                            telegram_user_id, stage, intent_branch, user_intent,
+                            screen_revision, revision, last_activity_at, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING revision
+                        """,
+                        (draft.telegram_user_id, *draft_values),
+                    ).fetchone()
+                else:
+                    changed_draft = connection.execute(
+                        """
+                        UPDATE football_runtime.bot_discovery_drafts
+                        SET stage = %s,
+                            intent_branch = %s,
+                            user_intent = %s,
+                            screen_revision = %s,
+                            revision = %s,
+                            last_activity_at = %s,
+                            updated_at = %s
+                        WHERE telegram_user_id = %s AND revision = %s
+                        RETURNING revision
+                        """,
+                        (
+                            *draft_values,
+                            draft.telegram_user_id,
+                            draft.revision - 1,
+                        ),
+                    ).fetchone()
+                if changed_draft is None:
+                    raise RuntimeError("Discovery Draft changed concurrently")
             _supersede_pending_conversation_messages(
                 connection,
                 telegram_user_id=state.telegram_user_id,
