@@ -24,6 +24,7 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ConversationState,
+    DiscoveryDraft,
     LanguageSelection,
     TelegramMessage,
 )
@@ -632,6 +633,44 @@ class AcceptanceSpine:
             ),
         )
 
+    def select_direction(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        direction: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Direction Menu callback through the Bot Assistant."""
+        self._conversation_onboarding().select_direction(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            direction=direction,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def go_back(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one current-screen Back callback through the Bot Assistant."""
+        self._conversation_onboarding().go_back(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
     def submit_language_text(
         self,
         *,
@@ -656,6 +695,10 @@ class AcceptanceSpine:
         """Retry one durable onboarding presentation after interruption."""
         return self._conversation_onboarding().deliver_pending()
 
+    def expire_inactive_discovery_drafts(self) -> int:
+        """Run the deterministic Discovery Draft inactivity expiry use case."""
+        return self._conversation_onboarding().expire_inactive_drafts()
+
     def conversation_state(self, telegram_user_id: int) -> ConversationState:
         """Observe durable account state through the Bot Assistant query port."""
         state = self._roles[RuntimeRole.BOT_ASSISTANT].store.conversation_state(
@@ -664,6 +707,24 @@ class AcceptanceSpine:
         if state is None:
             raise LookupError(telegram_user_id)
         return state
+
+    def discovery_draft(self, telegram_user_id: int) -> DiscoveryDraft:
+        """Observe one durable unfinished Discovery Draft through its owner."""
+        draft = self._roles[RuntimeRole.BOT_ASSISTANT].store.discovery_draft(
+            telegram_user_id
+        )
+        if draft is None:
+            raise LookupError(telegram_user_id)
+        return draft
+
+    def has_discovery_draft(self, telegram_user_id: int) -> bool:
+        """Observe whether one unfinished Discovery Draft still exists."""
+        return (
+            self._roles[RuntimeRole.BOT_ASSISTANT].store.discovery_draft(
+                telegram_user_id
+            )
+            is not None
+        )
 
     def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView:
         """Observe the latest successfully presented Bot User screen."""
@@ -690,6 +751,23 @@ class AcceptanceSpine:
         if state is None:
             raise LookupError(telegram_user_id)
         return state
+
+    def read_discovery_draft_as(
+        self,
+        *,
+        actor: RuntimeRole,
+        telegram_user_id: int,
+    ) -> DiscoveryDraft:
+        """Exercise least-privilege Discovery Draft read isolation."""
+        try:
+            draft = self._roles[actor].store.discovery_draft(telegram_user_id)
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+        if actor is not RuntimeRole.BOT_ASSISTANT and draft is None:
+            raise OwnershipViolationError(UUID(int=0))
+        if draft is None:
+            raise LookupError(telegram_user_id)
+        return draft
 
 
 def boot_acceptance_spine(

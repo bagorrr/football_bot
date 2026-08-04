@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 
@@ -19,6 +20,32 @@ class ConversationStage(StrEnum):
     LANGUAGE_SELECTION = "language_selection"
     LANGUAGE_INPUT = "language_input"
     DIRECTION_MENU = "direction_menu"
+    INTENT_BRANCH = "intent_branch"
+    COUNTRY = "country"
+
+
+class UserIntent(StrEnum):
+    """A Bot User's explicitly confirmed terminal discovery goal."""
+
+    GAME_SEARCH = "game_search"
+    PLAYER_SEARCH = "player_search"
+    TOURNAMENT_SEARCH = "tournament_search"
+    OPPONENT_SEARCH = "opponent_search"
+    NEW_TEAM_SEARCH = "new_team_search"
+    TRANSFER_PLAYER_SEARCH = "transfer_player_search"
+    COACH_SEARCH = "coach_search"
+    COACHING_SERVICE_OFFER = "coaching_service_offer"
+    REFEREE_SEARCH = "referee_search"
+    REFEREEING_SERVICE_OFFER = "refereeing_service_offer"
+
+
+class IntentBranch(StrEnum):
+    """A non-terminal onboarding group that can never be a User Intent."""
+
+    COMPETITION_SEARCH = "competition_search"
+    TRANSFER_SEARCH = "transfer_search"
+    COACHING_SERVICES = "coaching_services"
+    REFEREEING_SERVICES = "refereeing_services"
 
 
 class TelegramDeliveryMode(StrEnum):
@@ -39,6 +66,19 @@ class ConversationState:
     stage: ConversationStage
     screen_revision: int
     revision: int
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryDraft:
+    """The one durable unfinished Discovery Flow owned by a Bot User."""
+
+    telegram_user_id: int
+    stage: ConversationStage
+    intent_branch: IntentBranch | None
+    user_intent: UserIntent | None
+    screen_revision: int
+    revision: int
+    last_activity_at: datetime
 
 
 Button = tuple[str, str]
