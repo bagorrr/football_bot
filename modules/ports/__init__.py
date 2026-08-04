@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
-from modules.contracts import ContractEnvelope, OperatorAlert, RuntimeRole
+from modules.contracts import (
+    ContractEnvelope,
+    ContractName,
+    OperatorAlert,
+    RawContractEnvelope,
+    RuntimeRole,
+)
 
 
 class Clock(Protocol):
@@ -72,14 +78,55 @@ class AcceptanceRoleStore(Protocol):
         """Return the sole owner represented by this store."""
         ...
 
-    def commit_initial(self, *, probe_id: str, envelope: ContractEnvelope) -> None:
+    def commit_initial(
+        self,
+        *,
+        probe_id: str,
+        envelope: RawContractEnvelope,
+    ) -> None:
         """Atomically commit initial owner state and its outbox."""
+        ...
+
+    def claim_next(
+        self,
+        *,
+        supported_versions: Mapping[ContractName, Iterable[int]],
+        claimed_at: datetime,
+    ) -> RawContractEnvelope | None:
+        """Claim the next recoverable handoff visible to this role."""
+        ...
+
+    def claim_presentation(
+        self,
+        *,
+        claimed_at: datetime,
+    ) -> RawContractEnvelope | None:
+        """Claim one committed Telegram presentation owned by this role."""
+        ...
+
+    def record_presentation_attempt(
+        self,
+        *,
+        envelope: RawContractEnvelope,
+        delivery_id: str,
+        attempted_at: datetime,
+    ) -> None:
+        """Durably record an external attempt before presenting."""
+        ...
+
+    def record_presentation_success(
+        self,
+        *,
+        message_id: UUID,
+        presented_at: datetime,
+    ) -> None:
+        """Durably record one confirmed idempotent presentation."""
         ...
 
     def consume(
         self,
         *,
-        incoming: ContractEnvelope,
+        incoming: RawContractEnvelope,
         supported_versions: Iterable[int],
         received_at: datetime,
         outgoing: ContractEnvelope | None,
@@ -118,7 +165,7 @@ class AcceptanceObserver(Protocol):
         """Clear synthetic acceptance records."""
         ...
 
-    def envelope(self, message_id: UUID) -> ContractEnvelope:
+    def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover one durable envelope."""
         ...
 

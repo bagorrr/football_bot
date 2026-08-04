@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,8 @@ from modules.contracts import (
     ContractDefinition,
     ContractEnvelope,
     ContractName,
+    JsonValue,
+    RawContractEnvelope,
     RuntimeRole,
 )
 from modules.contracts import (
@@ -21,7 +24,6 @@ from modules.ports import (
     AcceptanceObserver,
     AcceptanceRoleStore,
     Clock,
-    ConsumeResult,
     LocationResolverAdapter,
     ModelAdapter,
     OutboxConflictError,
@@ -108,12 +110,21 @@ class InjectedFailureError(RuntimeError):
     """A controlled invalid outbox identity rolled back its transaction."""
 
 
+class InjectedInterruptionError(RuntimeError):
+    """A controlled process exit interrupted work after a durable commit."""
+
+
 @dataclass(slots=True)
 class AcceptanceRole:
     """One independently reconnectable runtime responsibility."""
 
     role: RuntimeRole
     store: AcceptanceRoleStore
+    clock: Clock
+    telegram_ingestion: TelegramIngestionAdapter | None = None
+    telegram_delivery: TelegramDeliveryAdapter | None = None
+    model: ModelAdapter | None = None
+    location_resolver: LocationResolverAdapter | None = None
     supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -131,6 +142,174 @@ class AcceptanceRole:
         """Return explicit versions supported by this consumer."""
         return set(self.supported_versions.get(contract_name, set()))
 
+    def record_source_event(
+        self,
+        probe_id: str,
+        *,
+        contract_version: int,
+        payload: JsonValue | None = None,
+    ) -> None:
+        """Commit one synthetic Source Event through the ingestion role."""
+        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
+            msg = "only the ingestion runtime can record a Source Event"
+            raise RuntimeError(msg)
+        correlation_id = _identifier(probe_id, "correlation")
+        source_event_id = self.telegram_ingestion.source_event_id(probe_id)
+        definition = _CONTRACTS.get(
+            (ContractName.SOURCE_EVENT_RECORDED, contract_version)
+        )
+        if definition is not None and payload is None:
+            envelope: RawContractEnvelope = _envelope(
+                definition=definition,
+                probe_id=probe_id,
+                version=contract_version,
+                fact=source_event_id,
+                causation_id=correlation_id,
+                correlation_id=correlation_id,
+                recorded_at=self.clock.now(),
+            )
+        else:
+            envelope = RawContractEnvelope(
+                contract_name=ContractName.SOURCE_EVENT_RECORDED,
+                contract_version=contract_version,
+                message_id=_identifier(
+                    probe_id,
+                    ContractName.SOURCE_EVENT_RECORDED.value,
+                ),
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=probe_id,
+                subject_revision=1,
+                idempotency_key=(
+                    f"{probe_id}:{ContractName.SOURCE_EVENT_RECORDED.value}"
+                ),
+                causation_id=correlation_id,
+                correlation_id=correlation_id,
+                recorded_at=self.clock.now(),
+                payload=payload
+                if payload is not None
+                else {"probe_id": probe_id, "source_event_id": source_event_id},
+            )
+        self.store.commit_initial(probe_id=probe_id, envelope=envelope)
+
+    def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
+        """Discover and process one durable handoff addressed to this role."""
+        incoming = self.store.claim_next(
+            supported_versions=self.supported_versions,
+            claimed_at=self.clock.now(),
+        )
+        if incoming is None:
+            return False
+        outgoing = None
+        if incoming.contract_version in self.versions_for(incoming.contract_name):
+            supported_incoming = ContractEnvelope.from_raw(incoming)
+            definition, fact = self._next_handoff(supported_incoming)
+            outgoing = _envelope(
+                definition=definition,
+                probe_id=incoming.subject_id,
+                version=definition.version,
+                fact=fact,
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=self.clock.now(),
+            )
+            if inject_outbox_conflict:
+                outgoing = _with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise InjectedFailureError from error
+        return True
+
+    def present_next(self) -> bool:
+        """Retry one committed presentation through the idempotent Bot API port."""
+        if self.role is not RuntimeRole.BOT_ASSISTANT:
+            return False
+        if self.telegram_delivery is None:
+            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+        envelope = self.store.claim_presentation(claimed_at=self.clock.now())
+        if envelope is None:
+            return False
+        delivery_id = _payload_text(envelope, "delivery_id")
+        self.store.record_presentation_attempt(
+            envelope=envelope,
+            delivery_id=delivery_id,
+            attempted_at=self.clock.now(),
+        )
+        self.telegram_delivery.present(delivery_id)
+        self.store.record_presentation_success(
+            message_id=envelope.message_id,
+            presented_at=self.clock.now(),
+        )
+        return True
+
+    def attempt_owner_write(self, *, owner: RuntimeRole, probe_id: str) -> bool:
+        """Attempt one cross-owner write through this role's credential."""
+        message_id = _identifier(probe_id, f"{self.role.value}:{owner.value}:denied")
+        attempt = ContractEnvelope(
+            contract_name=ContractName.OWNER_STATE_WRITE,
+            contract_version=1,
+            message_id=message_id,
+            producer=self.role,
+            consumer=owner,
+            subject_id=probe_id,
+            subject_revision=1,
+            idempotency_key=f"{probe_id}:{self.role.value}:{owner.value}:denied",
+            causation_id=message_id,
+            correlation_id=message_id,
+            recorded_at=self.clock.now(),
+            payload={},
+        )
+        return self.store.attempt_owner_write(
+            owner=owner,
+            probe_id=probe_id,
+            attempt=attempt,
+        )
+
+    def _next_handoff(
+        self,
+        incoming: ContractEnvelope,
+    ) -> tuple[ContractDefinition, str]:
+        if incoming.contract_name is ContractName.SOURCE_EVENT_RECORDED:
+            source_event_id = _payload_text(incoming, "source_event_id")
+            return (
+                _CONTRACTS[(ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION, 1)],
+                f"source-message-revision:{source_event_id}",
+            )
+        if incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION:
+            if self.model is None:
+                raise RuntimeError("classification runtime has no model adapter")
+            revision_id = _payload_text(incoming, "source_message_revision_id")
+            return (
+                _CONTRACTS[(ContractName.CLASSIFICATION_PROPOSAL, 1)],
+                self.model.proposal_id(revision_id),
+            )
+        if incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL:
+            if self.location_resolver is None:
+                raise RuntimeError("application runtime has no resolver adapter")
+            proposal_id = _payload_text(incoming, "proposal_id")
+            return (
+                _CONTRACTS[(ContractName.OPPORTUNITY_PUBLICATION_CHANGED, 1)],
+                self.location_resolver.opportunity_revision_id(proposal_id),
+            )
+        if incoming.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED:
+            return (
+                _CONTRACTS[(ContractName.SEARCH_COMPLETED, 1)],
+                f"completed-search:{incoming.subject_id}",
+            )
+        if incoming.contract_name is ContractName.SEARCH_COMPLETED:
+            return (
+                _CONTRACTS[(ContractName.TELEGRAM_PRESENTATION_REQUESTED, 1)],
+                f"delivery:{incoming.subject_id}",
+            )
+        msg = f"{self.role.value} has no handoff for {incoming.contract_name.value}"
+        raise RuntimeError(msg)
+
 
 class AcceptanceSpine:
     """Drive independently restartable roles through public ports."""
@@ -140,33 +319,21 @@ class AcceptanceSpine:
         *,
         roles: Mapping[RuntimeRole, AcceptanceRole],
         observer: AcceptanceObserver,
-        clock: Clock,
-        telegram_ingestion: TelegramIngestionAdapter,
-        telegram_delivery: TelegramDeliveryAdapter,
-        model: ModelAdapter,
-        location_resolver: LocationResolverAdapter,
-        restart_store: Callable[[RuntimeRole], AcceptanceRoleStore],
+        restart_role: Callable[[RuntimeRole], AcceptanceRole],
     ) -> None:
         self._roles = dict(roles)
         self._observer = observer
-        self._clock = clock
-        self._telegram_ingestion = telegram_ingestion
-        self._telegram_delivery = telegram_delivery
-        self._model = model
-        self._location_resolver = location_resolver
-        self._restart_store = restart_store
+        self._restart_role = restart_role
 
     def restart(self, role: RuntimeRole) -> AcceptanceSpine:
         """Reconnect exactly one runtime role without replacing the others."""
         previous = self._roles[role]
-        self._roles[role] = AcceptanceRole(
-            role=role,
-            store=self._restart_store(role),
-            supported_versions={
-                name: set(versions)
-                for name, versions in previous.supported_versions.items()
-            },
-        )
+        restarted = self._restart_role(role)
+        restarted.supported_versions = {
+            name: set(versions)
+            for name, versions in previous.supported_versions.items()
+        }
+        self._roles[role] = restarted
         return self
 
     def support_version(
@@ -195,86 +362,64 @@ class AcceptanceSpine:
         probe_id: str,
         *,
         source_contract_version: int = 1,
+        source_payload: JsonValue | None = None,
         fail_after_state: RuntimeRole | None = None,
+        interrupt_after_presentation_commit: bool = False,
     ) -> AcceptanceSnapshot:
         """Drive one versioned contract round trip through all five roles."""
-        correlation_id = _identifier(probe_id, "correlation")
-        source_event_id = self._telegram_ingestion.source_event_id(probe_id)
-        incoming = self._envelope(
-            definition=_CONTRACTS[
-                (ContractName.SOURCE_EVENT_RECORDED, source_contract_version)
-            ],
-            probe_id=probe_id,
-            version=source_contract_version,
-            fact=source_event_id,
-            causation_id=correlation_id,
-            correlation_id=correlation_id,
+        self.record_source_event(
+            probe_id,
+            source_contract_version=source_contract_version,
+            source_payload=source_payload,
         )
-        self._roles[RuntimeRole.INGESTION].store.commit_initial(
-            probe_id=probe_id,
-            envelope=incoming,
+        return self.run_until_idle(
+            probe_id,
+            fail_after_state=fail_after_state,
+            interrupt_after_presentation_commit=(interrupt_after_presentation_commit),
         )
 
-        revision_id = f"source-message-revision:{source_event_id}"
-        proposal_id = self._model.proposal_id(revision_id)
-        stages = (
-            (
-                RuntimeRole.APPLICATION,
-                ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
-                revision_id,
-            ),
-            (
-                RuntimeRole.CLASSIFICATION,
-                ContractName.CLASSIFICATION_PROPOSAL,
-                proposal_id,
-            ),
-            (
-                RuntimeRole.APPLICATION,
-                ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                self._location_resolver.opportunity_revision_id(
-                    proposal_id,
-                ),
-            ),
-            (
-                RuntimeRole.RECOMMENDATION,
-                ContractName.SEARCH_COMPLETED,
-                f"completed-search:{probe_id}",
-            ),
-            (
-                RuntimeRole.BOT_ASSISTANT,
-                ContractName.TELEGRAM_PRESENTATION_REQUESTED,
-                f"delivery:{probe_id}",
-            ),
+    def record_source_event(
+        self,
+        probe_id: str,
+        *,
+        source_contract_version: int = 1,
+        source_payload: JsonValue | None = None,
+    ) -> None:
+        """Commit ingestion work without consuming its durable handoff."""
+        self._roles[RuntimeRole.INGESTION].record_source_event(
+            probe_id,
+            contract_version=source_contract_version,
+            payload=source_payload,
         )
-        for actor, outgoing_name, fact in stages:
-            outgoing = self._envelope(
-                definition=_CONTRACTS[(outgoing_name, 1)],
-                probe_id=probe_id,
-                version=1,
-                fact=fact,
-                causation_id=incoming.message_id,
-                correlation_id=correlation_id,
-            )
-            if actor is fail_after_state:
-                outgoing = _with_message_id(outgoing, incoming.message_id)
-            try:
-                result = self._roles[actor].store.consume(
-                    incoming=incoming,
-                    supported_versions=self._roles[actor].versions_for(
-                        incoming.contract_name,
-                    ),
-                    received_at=self._clock.now(),
-                    outgoing=outgoing,
+
+    def run_until_idle(
+        self,
+        probe_id: str,
+        *,
+        fail_after_state: RuntimeRole | None = None,
+        interrupt_after_presentation_commit: bool = False,
+    ) -> AcceptanceSnapshot:
+        """Let each role discover durable work until no handoff remains."""
+        injected = False
+        while True:
+            progressed = False
+            bot_handoff_committed = False
+            for role in RuntimeRole:
+                should_inject = role is fail_after_state and not injected
+                processed = self._roles[role].process_next(
+                    inject_outbox_conflict=should_inject,
                 )
-            except OutboxConflictError as error:
-                raise InjectedFailureError from error
-            if result is ConsumeResult.REJECTED:
-                break
-            if actor is RuntimeRole.BOT_ASSISTANT and result is ConsumeResult.APPLIED:
-                self._telegram_delivery.present(fact)
-            incoming = outgoing
-
-        return self.observe(probe_id)
+                progressed = processed or progressed
+                bot_handoff_committed = (
+                    role is RuntimeRole.BOT_ASSISTANT and processed
+                ) or bot_handoff_committed
+                injected = (should_inject and processed) or injected
+            if interrupt_after_presentation_commit and bot_handoff_committed:
+                raise InjectedInterruptionError
+            presented = self._roles[RuntimeRole.BOT_ASSISTANT].present_next()
+            progressed = presented or progressed
+            if not progressed:
+                return self.observe(probe_id)
 
     def observe(self, probe_id: str) -> AcceptanceSnapshot:
         """Observe business-neutral durable outcomes through the testkit."""
@@ -294,7 +439,7 @@ class AcceptanceSpine:
         probe_id: str,
         *,
         contract_name: ContractName = ContractName.SOURCE_EVENT_RECORDED,
-    ) -> ContractEnvelope:
+    ) -> RawContractEnvelope:
         """Recover a rejected or pending envelope without acknowledging it."""
         return self._observer.envelope(_identifier(probe_id, contract_name.value))
 
@@ -307,24 +452,9 @@ class AcceptanceSpine:
     ) -> None:
         """Verify that a process credential cannot mutate another owner."""
         message_id = _identifier(probe_id, f"{actor.value}:{owner.value}:denied")
-        attempt = ContractEnvelope(
-            contract_name=ContractName.OWNER_STATE_WRITE,
-            contract_version=1,
-            message_id=message_id,
-            producer=actor,
-            consumer=owner,
-            subject_id=probe_id,
-            subject_revision=1,
-            idempotency_key=f"{probe_id}:{actor.value}:{owner.value}:denied",
-            causation_id=message_id,
-            correlation_id=message_id,
-            recorded_at=self._clock.now(),
-            payload={},
-        )
-        allowed = self._roles[actor].store.attempt_owner_write(
+        allowed = self._roles[actor].attempt_owner_write(
             owner=owner,
             probe_id=probe_id,
-            attempt=attempt,
         )
         if allowed:
             msg = "PostgreSQL accepted a cross-owner state write"
@@ -335,38 +465,102 @@ class AcceptanceSpine:
         """Observe one durable body-free operator alert."""
         return self._observer.operator_alert(message_id)
 
-    def _envelope(
-        self,
-        *,
-        definition: ContractDefinition,
-        probe_id: str,
-        version: int,
-        fact: str,
-        causation_id: UUID,
-        correlation_id: UUID,
-    ) -> ContractEnvelope:
-        return ContractEnvelope(
-            contract_name=definition.name,
-            contract_version=version,
-            message_id=_identifier(probe_id, definition.name.value),
-            producer=definition.producer,
-            consumer=definition.consumer,
-            subject_id=probe_id,
-            subject_revision=1,
-            idempotency_key=f"{probe_id}:{definition.name.value}",
-            causation_id=causation_id,
-            correlation_id=correlation_id,
-            recorded_at=self._clock.now(),
-            payload={
-                "probe_id": probe_id,
-                definition.required_fact: fact,
-                **{name: 1 for name in definition.required_integer_facts},
-            },
+
+def boot_acceptance_spine(
+    *,
+    admin_database_url: str,
+    clock: Clock,
+    telegram_ingestion: TelegramIngestionAdapter | None = None,
+    telegram_delivery: TelegramDeliveryAdapter | None = None,
+    model: ModelAdapter | None = None,
+    location_resolver: LocationResolverAdapter | None = None,
+) -> AcceptanceSpine:
+    """Provision the administrative test seam and boot each role separately."""
+    from apps.system_acceptance import boot_acceptance_role
+    from modules.postgres_adapter import (
+        PostgresAcceptanceMigrator,
+        PostgresAcceptanceObserver,
+        runtime_database_url,
+    )
+
+    migrator = PostgresAcceptanceMigrator(admin_database_url)
+    migrator.migrate()
+    passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    role_urls = {
+        role: runtime_database_url(admin_database_url, role, passwords[role])
+        for role in RuntimeRole
+    }
+    controlled_ingestion = telegram_ingestion or ControlledTelegramIngestionAdapter()
+    controlled_delivery = telegram_delivery or ControlledTelegramDeliveryAdapter()
+    controlled_model = model or ControlledModelAdapter()
+    controlled_resolver = location_resolver or ControlledLocationResolverAdapter()
+
+    def restart_role(role: RuntimeRole) -> AcceptanceRole:
+        return boot_acceptance_role(
+            role=role,
+            database_url=role_urls[role],
+            clock=clock,
+            telegram_ingestion=(
+                controlled_ingestion if role is RuntimeRole.INGESTION else None
+            ),
+            telegram_delivery=(
+                controlled_delivery if role is RuntimeRole.BOT_ASSISTANT else None
+            ),
+            model=controlled_model if role is RuntimeRole.CLASSIFICATION else None,
+            location_resolver=(
+                controlled_resolver if role is RuntimeRole.APPLICATION else None
+            ),
         )
+
+    return AcceptanceSpine(
+        roles={role: restart_role(role) for role in RuntimeRole},
+        observer=PostgresAcceptanceObserver(admin_database_url),
+        restart_role=restart_role,
+    )
 
 
 def _identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
+
+
+def _envelope(
+    *,
+    definition: ContractDefinition,
+    probe_id: str,
+    version: int,
+    fact: str,
+    causation_id: UUID,
+    correlation_id: UUID,
+    recorded_at: datetime,
+) -> ContractEnvelope:
+    return ContractEnvelope(
+        contract_name=definition.name,
+        contract_version=version,
+        message_id=_identifier(probe_id, definition.name.value),
+        producer=definition.producer,
+        consumer=definition.consumer,
+        subject_id=probe_id,
+        subject_revision=1,
+        idempotency_key=f"{probe_id}:{definition.name.value}",
+        causation_id=causation_id,
+        correlation_id=correlation_id,
+        recorded_at=recorded_at,
+        payload={
+            "probe_id": probe_id,
+            definition.required_fact: fact,
+            **{name: 1 for name in definition.required_integer_facts},
+        },
+    )
+
+
+def _payload_text(envelope: RawContractEnvelope, name: str) -> str:
+    if not isinstance(envelope.payload, dict):
+        raise TypeError("supported contract payload must be a JSON object")
+    value = envelope.payload.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"supported contract requires {name}")
+    return value
 
 
 def _with_message_id(envelope: ContractEnvelope, message_id: UUID) -> ContractEnvelope:

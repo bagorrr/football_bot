@@ -1,8 +1,6 @@
-"""Composition root for the five-role system acceptance seam."""
+"""Composition root for one system-acceptance runtime role."""
 
 from __future__ import annotations
-
-import secrets
 
 from modules.contracts import RuntimeRole
 from modules.ports import (
@@ -13,53 +11,30 @@ from modules.ports import (
     TelegramIngestionAdapter,
 )
 from modules.postgres_adapter import (
-    PostgresAcceptanceMigrator,
-    PostgresAcceptanceObserver,
     PostgresRoleStore,
-    runtime_database_url,
 )
 from modules.testkit import (
     AcceptanceRole,
-    AcceptanceSpine,
-    ControlledLocationResolverAdapter,
-    ControlledModelAdapter,
-    ControlledTelegramDeliveryAdapter,
-    ControlledTelegramIngestionAdapter,
 )
 
 
-def boot_acceptance_spine(
+def boot_acceptance_role(
     *,
-    admin_database_url: str,
+    role: RuntimeRole,
+    database_url: str,
     clock: Clock,
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
-) -> AcceptanceSpine:
-    """Provision and boot five separately credentialed runtime roles."""
-    migrator = PostgresAcceptanceMigrator(admin_database_url)
-    migrator.migrate()
-    passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
-    migrator.provision_runtime_credentials(passwords)
-    role_urls = {
-        role: runtime_database_url(admin_database_url, role, passwords[role])
-        for role in RuntimeRole
-    }
-
-    def role_store(role: RuntimeRole) -> PostgresRoleStore:
-        return PostgresRoleStore(role, role_urls[role])
-
-    roles = {
-        role: AcceptanceRole(role=role, store=role_store(role)) for role in RuntimeRole
-    }
-    return AcceptanceSpine(
-        roles=roles,
-        observer=PostgresAcceptanceObserver(admin_database_url),
+) -> AcceptanceRole:
+    """Boot exactly one role with its own least-privilege database credential."""
+    return AcceptanceRole(
+        role=role,
+        store=PostgresRoleStore(role, database_url),
         clock=clock,
-        telegram_ingestion=telegram_ingestion or ControlledTelegramIngestionAdapter(),
-        telegram_delivery=telegram_delivery or ControlledTelegramDeliveryAdapter(),
-        model=model or ControlledModelAdapter(),
-        location_resolver=location_resolver or ControlledLocationResolverAdapter(),
-        restart_store=role_store,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=telegram_delivery,
+        model=model,
+        location_resolver=location_resolver,
     )

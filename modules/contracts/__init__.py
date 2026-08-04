@@ -125,8 +125,8 @@ SUPPORTED_CONTRACTS = (
 
 
 @dataclass(frozen=True, slots=True)
-class ContractEnvelope:
-    """Stable metadata and JSON facts passed between runtime owners."""
+class RawContractEnvelope:
+    """Recoverable wire metadata and JSON payload not yet locally interpreted."""
 
     contract_name: ContractName
     contract_version: int
@@ -158,11 +158,38 @@ class ContractEnvelope:
             msg = "recorded_at must be timezone-aware"
             raise ValueError(msg)
         _validate_json(self.payload)
-        self._validate_supported_semantics()
 
     def json_payload(self) -> JsonValue:
-        """Return the already validated adapter-neutral payload."""
+        """Return the adapter-neutral payload retained from the wire."""
         return self.payload
+
+
+@dataclass(frozen=True, slots=True)
+class ContractEnvelope(RawContractEnvelope):
+    """A locally registered contract with validated schema semantics."""
+
+    def __post_init__(self) -> None:
+        """Validate transport metadata and the registered local semantics."""
+        RawContractEnvelope.__post_init__(self)
+        self._validate_supported_semantics()
+
+    @classmethod
+    def from_raw(cls, envelope: RawContractEnvelope) -> ContractEnvelope:
+        """Interpret a recoverable envelope only after support is established."""
+        return cls(
+            contract_name=envelope.contract_name,
+            contract_version=envelope.contract_version,
+            message_id=envelope.message_id,
+            producer=envelope.producer,
+            consumer=envelope.consumer,
+            subject_id=envelope.subject_id,
+            subject_revision=envelope.subject_revision,
+            idempotency_key=envelope.idempotency_key,
+            causation_id=envelope.causation_id,
+            correlation_id=envelope.correlation_id,
+            recorded_at=envelope.recorded_at,
+            payload=envelope.payload,
+        )
 
     def _validate_supported_semantics(self) -> None:
         if self.contract_name is ContractName.OWNER_STATE_WRITE:

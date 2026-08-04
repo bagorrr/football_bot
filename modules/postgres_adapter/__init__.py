@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -14,10 +14,12 @@ from psycopg import conninfo, sql
 from psycopg.rows import dict_row
 
 from modules.contracts import (
+    SUPPORTED_CONTRACTS,
     ContractEnvelope,
     ContractName,
     FailureCode,
     OperatorAlert,
+    RawContractEnvelope,
     RuntimeRole,
 )
 from modules.ports import AcceptanceObservation, ConsumeResult, OutboxConflictError
@@ -60,7 +62,8 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.operator_alerts,
+            TRUNCATE football_runtime.telegram_presentations,
+                     football_runtime.operator_alerts,
                      football_runtime.contract_inbox,
                      football_runtime.contract_outbox,
                      football_runtime.acceptance_state
@@ -71,7 +74,7 @@ class PostgresAcceptanceObserver:
         ) as connection:
             connection.execute(statement)
 
-    def envelope(self, message_id: UUID) -> ContractEnvelope:
+    def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover an immutable envelope through the administrative testkit."""
         with psycopg.connect(
             self._admin_database_url,
@@ -206,7 +209,7 @@ class PostgresRoleStore:
         self,
         *,
         probe_id: str,
-        envelope: ContractEnvelope,
+        envelope: RawContractEnvelope,
     ) -> None:
         """Atomically commit initial owner state and the first outbox record."""
         with psycopg.connect(self._database_url) as connection:
@@ -229,10 +232,153 @@ class PostgresRoleStore:
             if inserted is not None:
                 _insert_outbox(connection, envelope)
 
+    def claim_next(
+        self,
+        *,
+        supported_versions: Mapping[ContractName, Iterable[int]],
+        claimed_at: datetime,
+    ) -> RawContractEnvelope | None:
+        """Claim durable work addressed to this role using only its credential."""
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT outbox.*, inbox.processing_status AS inbox_status
+                FROM football_runtime.contract_outbox AS outbox
+                LEFT JOIN football_runtime.contract_inbox AS inbox
+                  ON inbox.consumer_role = %s
+                 AND inbox.message_id = outbox.message_id
+                WHERE outbox.consumer_role = %s
+                  AND inbox.processing_status IS DISTINCT FROM 'accepted'
+                  AND (
+                      outbox.claimed_until IS NULL
+                      OR outbox.claimed_until <= %s
+                  )
+                ORDER BY outbox.recorded_at, outbox.message_id
+                FOR UPDATE OF outbox SKIP LOCKED
+                """,
+                (self._role.value, self._role.value, claimed_at),
+            ).fetchall()
+            for row in rows:
+                versions = frozenset(
+                    supported_versions.get(ContractName(row["contract_name"]), ())
+                )
+                if (
+                    row["inbox_status"] == "rejected_unsupported_version"
+                    and row["contract_version"] not in versions
+                ):
+                    continue
+                connection.execute(
+                    """
+                    UPDATE football_runtime.contract_outbox
+                    SET claimed_until = %s, claim_attempts = claim_attempts + 1
+                    WHERE message_id = %s
+                    """,
+                    (claimed_at + timedelta(seconds=30), row["message_id"]),
+                )
+                return _row_to_envelope(row)
+        return None
+
+    def claim_presentation(
+        self,
+        *,
+        claimed_at: datetime,
+    ) -> RawContractEnvelope | None:
+        """Claim one pending Telegram presentation with this role's credential."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            return None
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT outbox.*
+                FROM football_runtime.contract_outbox AS outbox
+                LEFT JOIN football_runtime.telegram_presentations AS presentation
+                  ON presentation.message_id = outbox.message_id
+                WHERE outbox.producer_role = %s
+                  AND outbox.consumer_role IS NULL
+                  AND outbox.contract_name = %s
+                  AND presentation.presented_at IS NULL
+                  AND (
+                      outbox.claimed_until IS NULL
+                      OR outbox.claimed_until <= %s
+                  )
+                ORDER BY outbox.recorded_at, outbox.message_id
+                FOR UPDATE OF outbox SKIP LOCKED
+                LIMIT 1
+                """,
+                (
+                    self._role.value,
+                    ContractName.TELEGRAM_PRESENTATION_REQUESTED.value,
+                    claimed_at,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET claimed_until = %s, claim_attempts = claim_attempts + 1
+                WHERE message_id = %s
+                """,
+                (claimed_at + timedelta(seconds=30), row["message_id"]),
+            )
+            return _row_to_envelope(row)
+
+    def record_presentation_attempt(
+        self,
+        *,
+        envelope: RawContractEnvelope,
+        delivery_id: str,
+        attempted_at: datetime,
+    ) -> None:
+        """Persist the Bot API attempt before crossing the external boundary."""
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_presentations (
+                    owner_role, message_id, delivery_id,
+                    attempt_count, last_attempt_at, presented_at
+                ) VALUES (%s, %s, %s, 1, %s, NULL)
+                ON CONFLICT (message_id) DO UPDATE
+                SET attempt_count =
+                        football_runtime.telegram_presentations.attempt_count + 1,
+                    last_attempt_at = EXCLUDED.last_attempt_at
+                """,
+                (
+                    self._role.value,
+                    envelope.message_id,
+                    delivery_id,
+                    attempted_at,
+                ),
+            )
+            _release_claim(connection, envelope.message_id)
+
+    def record_presentation_success(
+        self,
+        *,
+        message_id: UUID,
+        presented_at: datetime,
+    ) -> None:
+        """Record confirmed Telegram presentation after adapter success."""
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_presentations
+                SET presented_at = COALESCE(presented_at, %s)
+                WHERE owner_role = %s AND message_id = %s
+                """,
+                (presented_at, self._role.value, message_id),
+            )
+
     def consume(
         self,
         *,
-        incoming: ContractEnvelope,
+        incoming: RawContractEnvelope,
         supported_versions: Iterable[int],
         received_at: datetime,
         outgoing: ContractEnvelope | None,
@@ -251,6 +397,7 @@ class PostgresRoleStore:
                     (self._role.value, incoming.message_id),
                 ).fetchone()
                 if existing is not None and existing[0] == "accepted":
+                    _release_claim(connection, incoming.message_id)
                     return ConsumeResult.REPLAYED
                 if existing is None:
                     status = "accepted" if supported else "rejected_unsupported_version"
@@ -290,6 +437,7 @@ class PostgresRoleStore:
                             failure_code=FailureCode.UNSUPPORTED_CONTRACT_VERSION,
                             observed_at=received_at,
                         )
+                    _release_claim(connection, incoming.message_id)
                     return ConsumeResult.REJECTED
                 connection.execute(
                     """
@@ -309,6 +457,7 @@ class PostgresRoleStore:
                 )
                 if outgoing is not None:
                     _insert_outbox(connection, outgoing)
+                _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
         except psycopg.errors.UniqueViolation as error:
             raise OutboxConflictError from error
@@ -367,7 +516,7 @@ def runtime_database_url(
 
 def _insert_outbox(
     connection: psycopg.Connection[tuple[Any, ...]],
-    envelope: ContractEnvelope,
+    envelope: RawContractEnvelope,
 ) -> None:
     connection.execute(
         """
@@ -398,7 +547,7 @@ def _insert_alert(
     connection: psycopg.Connection[tuple[Any, ...]],
     *,
     observer: RuntimeRole,
-    incoming: ContractEnvelope,
+    incoming: RawContractEnvelope,
     consumer: RuntimeRole,
     failure_code: FailureCode,
     observed_at: datetime,
@@ -424,9 +573,23 @@ def _insert_alert(
     )
 
 
-def _row_to_envelope(row: dict[str, Any]) -> ContractEnvelope:
+def _release_claim(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    message_id: UUID,
+) -> None:
+    connection.execute(
+        """
+        UPDATE football_runtime.contract_outbox
+        SET claimed_until = NULL
+        WHERE message_id = %s
+        """,
+        (message_id,),
+    )
+
+
+def _row_to_envelope(row: dict[str, Any]) -> RawContractEnvelope:
     consumer = row["consumer_role"]
-    return ContractEnvelope(
+    envelope = RawContractEnvelope(
         contract_name=ContractName(row["contract_name"]),
         contract_version=row["contract_version"],
         message_id=row["message_id"],
@@ -440,3 +603,10 @@ def _row_to_envelope(row: dict[str, Any]) -> ContractEnvelope:
         recorded_at=row["recorded_at"],
         payload=row["payload"],
     )
+    if any(
+        definition.name is envelope.contract_name
+        and definition.version == envelope.contract_version
+        for definition in SUPPORTED_CONTRACTS
+    ):
+        return ContractEnvelope.from_raw(envelope)
+    return envelope
