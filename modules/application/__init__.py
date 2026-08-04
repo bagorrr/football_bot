@@ -7,15 +7,25 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 from datetime import timedelta
+from enum import IntEnum
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.domain import (
+    AcceptedLocation,
     ConversationStage,
     ConversationState,
     DiscoveryDraft,
+    GeographicType,
+    GeographyConfirmation,
+    GeographyConfirmationKind,
+    GeographySuggestion,
     IntentBranch,
     LanguageSelection,
     LocaleSource,
+    LocationCandidate,
+    LocationInterpretation,
+    LocationResolutionQuery,
     TelegramDeliveryMode,
     TelegramMessage,
     UserIntent,
@@ -24,6 +34,8 @@ from modules.ports import (
     Clock,
     ConversationLanguageAdapter,
     ConversationStore,
+    LocationResolverAdapter,
+    LocationResolverError,
     TelegramDeliveryAdapter,
     TelegramDeliveryPreEffectError,
 )
@@ -217,6 +229,16 @@ APPLICATION_LOCALES = frozenset(
         "zu",
     ]
 )
+
+
+class _ResolutionOutcome(IntEnum):
+    """Named resolver outcomes used to select localized clarification copy."""
+
+    UNKNOWN = 0
+    INVALID = 1
+    AMBIGUOUS = 2
+    FAILURE = 3
+
 
 _WELCOME = {
     "ru": (
@@ -468,6 +490,224 @@ _COUNTRY_COPY = {
     },
 }
 
+_CITY_COPY = {
+    "en": ("✅ Search country: **{country}**.", "🏙 In which city should we search?"),
+    "ru": ("✅ Страна поиска: **{country}**.", "🏙 В каком городе ищем?"),
+    "es": ("✅ País de búsqueda: **{country}**.", "🏙 ¿En qué ciudad buscamos?"),
+    "fr": (
+        "✅ Pays de recherche : **{country}**.",
+        "🏙 Dans quelle ville cherchons-nous ?",
+    ),
+}
+
+_OTHER_LOCATION_COPY = {
+    "en": ("🌍 Another country", "🏙 Another city"),
+    "ru": ("🌍 Другая страна", "🏙 Другой город"),
+    "es": ("🌍 Otro país", "🏙 Otra ciudad"),
+    "fr": ("🌍 Un autre pays", "🏙 Une autre ville"),
+}
+
+_LIST_CONJUNCTION = {
+    "en": "and",
+    "ru": "и",
+    "es": "y",
+    "fr": "et",
+}
+
+_SEARCH_AREA_COPY = {
+    "en": (
+        "📍 Refine the search area.",
+        "Selected city: {city}.",
+        "In one message, type one or several districts, metro stations, streets, "
+        "stadiums, or other places. If anywhere in the city works, type “whole city”.",
+    ),
+    "ru": (
+        "📍 Уточните зону поиска.",
+        "Выбранный город: {city}.",
+        "Одним сообщением напишите один или несколько районов, станций метро, "
+        "улиц, стадионов или других мест. Если подходит весь город, напишите "
+        "«весь город».",
+    ),
+    "es": (
+        "📍 Precise la zona de búsqueda.",
+        "Ciudad elegida: {city}.",
+        "En un solo mensaje, escriba uno o varios barrios, estaciones de metro, "
+        "calles, estadios u otros lugares. Si sirve toda la ciudad, escriba "
+        "«toda la ciudad».",
+    ),
+    "fr": (
+        "📍 Précisez la zone de recherche.",
+        "Ville choisie : {city}.",
+        "Dans un seul message, saisissez un ou plusieurs quartiers, stations de "
+        "métro, rues, stades ou autres lieux. Si toute la ville convient, écrivez "
+        "«toute la ville».",
+    ),
+}
+
+_AMBIGUOUS_COUNTRY_COPY = {
+    "en": ("I found several countries: {candidates}. Type the country more precisely."),
+    "ru": ("Нашлось несколько стран: {candidates}. Напишите название страны точнее."),
+    "es": ("Encontré varios países: {candidates}. Escriba el país con más precisión."),
+    "fr": ("J’ai trouvé plusieurs pays : {candidates}. Précisez le nom du pays."),
+}
+
+_COUNTRY_RESOLUTION_COPY = {
+    "en": (
+        "I couldn't find that country. Type another country.",
+        "That result is not a valid country. Type another country.",
+        "I found several countries. Type the country more precisely.",
+        "Location search is temporarily unavailable. Your confirmed location "
+        "is unchanged; please try again.",
+    ),
+    "ru": (
+        "Не удалось найти такую страну. Напишите другую страну.",
+        "Этот результат не является допустимой страной. Напишите другую страну.",
+        "Нашлось несколько стран. Напишите название страны точнее.",
+        "Поиск мест временно недоступен. Подтверждённое место не изменилось; "
+        "попробуйте ещё раз.",
+    ),
+    "es": (
+        "No pude encontrar ese país. Escriba otro país.",
+        "Ese resultado no es un país válido. Escriba otro país.",
+        "Encontré varios países. Escriba el país con más precisión.",
+        "La búsqueda de lugares no está disponible temporalmente. La ubicación "
+        "confirmada no ha cambiado; inténtelo de nuevo.",
+    ),
+    "fr": (
+        "Je n’ai pas trouvé ce pays. Saisissez un autre pays.",
+        "Ce résultat n’est pas un pays valide. Saisissez un autre pays.",
+        "J’ai trouvé plusieurs pays. Précisez le nom du pays.",
+        "La recherche de lieux est temporairement indisponible. Le lieu confirmé "
+        "n’a pas changé ; réessayez.",
+    ),
+}
+
+_CITY_RESOLUTION_COPY = {
+    "en": (
+        "I couldn't find that city. Type another city.",
+        "That result is not a valid city in {country}. Type another city.",
+        "I found several matching cities: {candidates}. Type the city more precisely.",
+        "Location search is temporarily unavailable. Your confirmed country "
+        "is unchanged; please try again.",
+    ),
+    "ru": (
+        "Не удалось найти такой город. Напишите другой город.",
+        "Этот результат не является городом в стране {country}. Напишите другой город.",
+        "Нашлось несколько подходящих городов: {candidates}. "
+        "Напишите название города точнее.",
+        "Поиск мест временно недоступен. Подтверждённая страна не изменилась; "
+        "попробуйте ещё раз.",
+    ),
+    "es": (
+        "No pude encontrar esa ciudad. Escriba otra ciudad.",
+        "Ese resultado no es una ciudad válida en {country}. Escriba otra ciudad.",
+        "Encontré varias ciudades coincidentes: {candidates}. "
+        "Escriba la ciudad con más precisión.",
+        "La búsqueda de lugares no está disponible temporalmente. El país "
+        "confirmado no ha cambiado; inténtelo de nuevo.",
+    ),
+    "fr": (
+        "Je n’ai pas trouvé cette ville. Saisissez une autre ville.",
+        "Ce résultat n’est pas une ville valide en {country}. "
+        "Saisissez une autre ville.",
+        "J’ai trouvé plusieurs villes correspondantes : {candidates}. "
+        "Précisez le nom de la ville.",
+        "La recherche de lieux est temporairement indisponible. Le pays confirmé "
+        "n’a pas changé ; réessayez.",
+    ),
+}
+
+_SEARCH_AREA_RESOLUTION_COPY = {
+    "en": (
+        "I couldn't identify that Search Area. Type one or several places, "
+        "or type “whole city”.",
+        "That result is outside {city} or has an unsupported place type. "
+        "Your confirmed Search Area is unchanged.",
+        "I found several possible Search Areas. Type the places more precisely.",
+        "Location search is temporarily unavailable. Your confirmed Search Area "
+        "is unchanged; please try again.",
+    ),
+    "ru": (
+        "Не удалось определить зону поиска. Напишите одно или несколько мест "
+        "либо «весь город».",
+        "Этот результат находится вне города {city} или имеет неподдерживаемый "
+        "тип места. Подтверждённая зона поиска не изменилась.",
+        "Нашлось несколько возможных зон поиска. Уточните места.",
+        "Поиск мест временно недоступен. Подтверждённая зона поиска не изменилась; "
+        "попробуйте ещё раз.",
+    ),
+    "es": (
+        "No pude identificar esa zona de búsqueda. Escriba uno o varios lugares "
+        "o «toda la ciudad».",
+        "Ese resultado está fuera de {city} o tiene un tipo de lugar no admitido. "
+        "La zona de búsqueda confirmada no ha cambiado.",
+        "Encontré varias zonas de búsqueda posibles. Precise los lugares.",
+        "La búsqueda de lugares no está disponible temporalmente. La zona de "
+        "búsqueda confirmada no ha cambiado; inténtelo de nuevo.",
+    ),
+    "fr": (
+        "Je n’ai pas pu identifier cette zone de recherche. Saisissez un ou "
+        "plusieurs lieux, ou « toute la ville ».",
+        "Ce résultat est hors de {city} ou possède un type de lieu non pris en "
+        "charge. La zone de recherche confirmée n’a pas changé.",
+        "J’ai trouvé plusieurs zones de recherche possibles. Précisez les lieux.",
+        "La recherche de lieux est temporairement indisponible. La zone de "
+        "recherche confirmée n’a pas changé ; réessayez.",
+    ),
+}
+
+_REQUIRED_DATE_COPY = {
+    "en": "📅 When?\n\nType a date or range in your own words.",
+    "ru": "📅 Когда?\n\nНапишите дату или период своими словами.",
+    "es": "📅 ¿Cuándo?\n\nEscriba una fecha o periodo con sus palabras.",
+    "fr": "📅 Quand ?\n\nSaisissez une date ou une période avec vos mots.",
+}
+
+_POST_CORE_COPY = {
+    "en": ("You can add details or start searching now.", "Details", "Search"),
+    "ru": ("Можно уточнить детали или сразу начать поиск.", "Детали", "Поиск"),
+    "es": (
+        "Puedes añadir detalles o empezar a buscar ahora.",
+        "Detalles",
+        "Buscar",
+    ),
+    "fr": (
+        "Vous pouvez ajouter des détails ou lancer la recherche maintenant.",
+        "Détails",
+        "Rechercher",
+    ),
+}
+
+_SEARCH_AREA_RESULT_COPY = {
+    "en": ("Search area", "whole city"),
+    "ru": ("Зона поиска", "весь город"),
+    "es": ("Zona de búsqueda", "toda la ciudad"),
+    "fr": ("Zone de recherche", "toute la ville"),
+}
+
+_SUB_CITY_TYPES = frozenset(
+    {
+        GeographicType.ADMINISTRATIVE_DISTRICT,
+        GeographicType.NEIGHBORHOOD,
+        GeographicType.LOCALITY,
+        GeographicType.STATION,
+        GeographicType.TRANSPORT_HUB,
+        GeographicType.LANDMARK,
+        GeographicType.ADDRESS,
+    }
+)
+
+_DATE_REQUIRED_INTENTS = frozenset(
+    {
+        UserIntent.GAME_SEARCH,
+        UserIntent.PLAYER_SEARCH,
+        UserIntent.TOURNAMENT_SEARCH,
+        UserIntent.OPPONENT_SEARCH,
+        UserIntent.REFEREE_SEARCH,
+        UserIntent.REFEREEING_SERVICE_OFFER,
+    }
+)
+
 _DIRECT_USER_INTENTS = frozenset({UserIntent.GAME_SEARCH, UserIntent.PLAYER_SEARCH})
 _BRANCH_USER_INTENTS = {
     IntentBranch.COMPETITION_SEARCH: (
@@ -610,11 +850,13 @@ class ConversationOnboarding:
         store: ConversationStore,
         telegram_delivery: TelegramDeliveryAdapter,
         conversation_language: ConversationLanguageAdapter,
+        location_resolver: LocationResolverAdapter,
         clock: Clock,
     ) -> None:
         self._store = store
         self._telegram_delivery = telegram_delivery
         self._conversation_language = conversation_language
+        self._location_resolver = location_resolver
         self._clock = clock
 
     def start(
@@ -710,6 +952,14 @@ class ConversationOnboarding:
                 screen_revision=state.screen_revision,
                 draft=draft,
                 selection=selection,
+                suggestion=(
+                    self._store.geography_suggestion(
+                        telegram_user_id=telegram_user_id,
+                        user_intent=draft.user_intent,
+                    )
+                    if draft.user_intent is not None
+                    else None
+                ),
             )
         else:
             display_locale = supported_hint or "en"
@@ -893,6 +1143,697 @@ class ConversationOnboarding:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
 
+    def select_location_suggestion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        kind: str,
+        place_id: str,
+        screen_revision: int,
+    ) -> None:
+        """Explicitly confirm one current same-Intent geography shortcut."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                draft = self._store.discovery_draft(telegram_user_id)
+                if current is None or draft is None or draft.user_intent is None:
+                    return
+                suggestion = self._store.geography_suggestion(
+                    telegram_user_id=telegram_user_id,
+                    user_intent=draft.user_intent,
+                )
+                if (
+                    current.stage is not draft.stage
+                    or draft.screen_revision != screen_revision
+                    or suggestion is None
+                ):
+                    self._queue_current_view(update_id=update_id, state=current)
+                elif (
+                    kind == "country"
+                    and draft.stage is ConversationStage.COUNTRY
+                    and draft.country is None
+                    and suggestion.country.place_id == place_id
+                    and _valid_country(suggestion.country)
+                ):
+                    self._confirm_country_candidate(
+                        update_id=update_id,
+                        current=current,
+                        draft=draft,
+                        country=suggestion.country,
+                    )
+                elif (
+                    kind == "city"
+                    and draft.stage is ConversationStage.CITY
+                    and draft.city is None
+                    and suggestion.city is not None
+                    and suggestion.city.place_id == place_id
+                    and draft.country is not None
+                    and suggestion.city.country_id == draft.country.place_id
+                    and _valid_city(suggestion.city, draft.country)
+                ):
+                    self._confirm_city_candidate(
+                        update_id=update_id,
+                        current=current,
+                        draft=draft,
+                        city=suggestion.city,
+                    )
+                else:
+                    self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def dismiss_location_suggestion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        kind: str,
+        screen_revision: int,
+    ) -> None:
+        """Continue on the current free-text path without a prior-value shortcut."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                draft = self._store.discovery_draft(telegram_user_id)
+                if current is None or draft is None or current.locale is None:
+                    return
+                expected_stage = {
+                    "country": ConversationStage.COUNTRY,
+                    "city": ConversationStage.CITY,
+                }.get(kind)
+                if (
+                    expected_stage is None
+                    or current.stage is not expected_stage
+                    or draft.stage is not expected_stage
+                    or draft.screen_revision != screen_revision
+                    or draft.user_intent is None
+                ):
+                    self._queue_current_view(update_id=update_id, state=current)
+                else:
+                    now = self._clock.now()
+                    state = replace(
+                        current,
+                        screen_revision=current.screen_revision + 1,
+                        revision=current.revision + 1,
+                    )
+                    changed_draft = replace(
+                        draft,
+                        screen_revision=state.screen_revision,
+                        revision=draft.revision + 1,
+                        last_activity_at=now,
+                    )
+                    if expected_stage is ConversationStage.COUNTRY:
+                        message = _country_message(
+                            update_id=update_id,
+                            telegram_user_id=telegram_user_id,
+                            locale=current.locale,
+                            screen_revision=state.screen_revision,
+                            user_intent=draft.user_intent,
+                        )
+                    else:
+                        if draft.country is None:
+                            raise RuntimeError("city stage has no confirmed country")
+                        message = _city_message(
+                            update_id=update_id,
+                            telegram_user_id=telegram_user_id,
+                            locale=current.locale,
+                            screen_revision=state.screen_revision,
+                            country=draft.country,
+                        )
+                    self._store.commit_conversation_update(
+                        update_id=update_id,
+                        expected_revision=current.revision,
+                        state=state,
+                        message=message,
+                        recorded_at=now,
+                        draft=changed_draft,
+                    )
+        self.deliver_pending()
+
+    def submit_location_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        screen_revision: int,
+    ) -> None:
+        """Resolve and validate one natural-language geography answer."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                draft = self._store.discovery_draft(telegram_user_id)
+                if current is None or draft is None:
+                    return
+                if (
+                    current.stage is not draft.stage
+                    or draft.screen_revision != screen_revision
+                    or draft.stage
+                    not in {
+                        ConversationStage.COUNTRY,
+                        ConversationStage.CITY,
+                        ConversationStage.SEARCH_AREA,
+                    }
+                ):
+                    self._queue_current_view(update_id=update_id, state=current)
+                elif draft.stage is ConversationStage.COUNTRY:
+                    self._apply_country_text(
+                        update_id=update_id,
+                        current=current,
+                        draft=draft,
+                        text=text,
+                    )
+                elif draft.stage is ConversationStage.CITY:
+                    self._apply_city_text(
+                        update_id=update_id,
+                        current=current,
+                        draft=draft,
+                        text=text,
+                    )
+                else:
+                    self._apply_search_area_text(
+                        update_id=update_id,
+                        current=current,
+                        draft=draft,
+                        text=text,
+                    )
+        self.deliver_pending()
+
+    def _apply_country_text(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        text: str,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        try:
+            resolution = self._location_resolver.resolve(
+                LocationResolutionQuery(
+                    text=text,
+                    locale=locale,
+                    stage=ConversationStage.COUNTRY,
+                )
+            )
+        except LocationResolverError:
+            self._queue_country_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                outcome=_ResolutionOutcome.FAILURE,
+            )
+            return
+        candidates = tuple(
+            interpretation.places[0]
+            for interpretation in resolution.interpretations
+            if len(interpretation.places) == 1
+            and _valid_country(interpretation.places[0])
+        )
+        if len(candidates) > 1:
+            self._queue_country_ambiguity(
+                update_id=update_id,
+                current=current,
+                candidates=tuple(candidate.display_name for candidate in candidates),
+            )
+            return
+        if not candidates:
+            self._queue_country_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                outcome=(
+                    _ResolutionOutcome.INVALID
+                    if resolution.interpretations
+                    else _ResolutionOutcome.UNKNOWN
+                ),
+            )
+            return
+        self._confirm_country_candidate(
+            update_id=update_id,
+            current=current,
+            draft=draft,
+            country=candidates[0],
+        )
+
+    def _queue_country_resolution_feedback(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        outcome: _ResolutionOutcome,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+        back_label = _DIRECTION_COPY[copy_locale][2][5]
+        message = TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=current.telegram_user_id,
+            display_locale=locale,
+            screen_revision=current.screen_revision,
+            text=_COUNTRY_RESOLUTION_COPY[copy_locale][outcome],
+            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+        )
+        self._store.commit_conversation_presentation(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            message=message,
+            recorded_at=self._clock.now(),
+        )
+
+    def _confirm_country_candidate(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        country: LocationCandidate | AcceptedLocation,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        if draft.user_intent is None:
+            raise RuntimeError("country stage has no confirmed User Intent")
+        accepted_country = _accept_location(country)
+        now = self._clock.now()
+        state = replace(
+            current,
+            stage=ConversationStage.CITY,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        changed_country = (
+            draft.country is None or draft.country.place_id != accepted_country.place_id
+        )
+        changed_draft = replace(
+            draft,
+            stage=ConversationStage.CITY,
+            country=accepted_country,
+            city=None if changed_country else draft.city,
+            sub_city_areas=() if changed_country else draft.sub_city_areas,
+            whole_city=False if changed_country else draft.whole_city,
+            screen_revision=state.screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        message = _city_message(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            locale=locale,
+            screen_revision=state.screen_revision,
+            country=accepted_country,
+            suggestion=self._store.geography_suggestion(
+                telegram_user_id=current.telegram_user_id,
+                user_intent=draft.user_intent,
+            ),
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            recorded_at=now,
+            draft=changed_draft,
+            geography_confirmation=GeographyConfirmation(
+                kind=GeographyConfirmationKind.COUNTRY,
+                user_intent=draft.user_intent,
+                country=accepted_country,
+                city=changed_draft.city,
+                sub_city_areas=changed_draft.sub_city_areas,
+                whole_city=changed_draft.whole_city,
+                resolver_versions=(country.resolver_version,),
+                glossary_version=country.glossary_version,
+            ),
+        )
+
+    def _queue_country_ambiguity(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        candidates: tuple[str, ...],
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+        back_label = _DIRECTION_COPY[copy_locale][2][5]
+        candidate_text = _format_list(copy_locale, candidates)
+        message = TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=current.telegram_user_id,
+            display_locale=locale,
+            screen_revision=current.screen_revision,
+            text=_AMBIGUOUS_COUNTRY_COPY[copy_locale].format(candidates=candidate_text),
+            button_rows=(
+                (
+                    (
+                        back_label,
+                        f"direction:back:{current.screen_revision}",
+                    ),
+                ),
+            ),
+        )
+        self._store.commit_conversation_presentation(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            message=message,
+            recorded_at=self._clock.now(),
+        )
+
+    def _apply_city_text(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        text: str,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        if draft.country is None:
+            raise RuntimeError("city stage has no confirmed country")
+        try:
+            resolution = self._location_resolver.resolve(
+                LocationResolutionQuery(
+                    text=text,
+                    locale=locale,
+                    stage=ConversationStage.CITY,
+                    country_id=draft.country.place_id,
+                )
+            )
+        except LocationResolverError:
+            self._queue_city_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                country=draft.country,
+                outcome=_ResolutionOutcome.FAILURE,
+            )
+            return
+        candidates = tuple(
+            interpretation.places[0]
+            for interpretation in resolution.interpretations
+            if len(interpretation.places) == 1
+            and _valid_city(interpretation.places[0], draft.country)
+        )
+        if len(candidates) > 1:
+            self._queue_city_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                country=draft.country,
+                outcome=_ResolutionOutcome.AMBIGUOUS,
+                candidates=candidates,
+            )
+            return
+        if not candidates:
+            self._queue_city_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                country=draft.country,
+                outcome=(
+                    _ResolutionOutcome.INVALID
+                    if resolution.interpretations
+                    else _ResolutionOutcome.UNKNOWN
+                ),
+            )
+            return
+        self._confirm_city_candidate(
+            update_id=update_id,
+            current=current,
+            draft=draft,
+            city=candidates[0],
+        )
+
+    def _queue_city_resolution_feedback(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        country: AcceptedLocation,
+        outcome: _ResolutionOutcome,
+        candidates: tuple[LocationCandidate, ...] = (),
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+        back_label = _DIRECTION_COPY[copy_locale][2][5]
+        message = TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=current.telegram_user_id,
+            display_locale=locale,
+            screen_revision=current.screen_revision,
+            text=_CITY_RESOLUTION_COPY[copy_locale][outcome].format(
+                country=country.display_name,
+                candidates=_format_city_candidates(copy_locale, candidates),
+            ),
+            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+        )
+        self._store.commit_conversation_presentation(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            message=message,
+            recorded_at=self._clock.now(),
+        )
+
+    def _confirm_city_candidate(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        city: LocationCandidate | AcceptedLocation,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        if draft.user_intent is None or draft.country is None:
+            raise RuntimeError("city stage has no confirmed hierarchy")
+        accepted_city = _accept_location(city)
+        now = self._clock.now()
+        state = replace(
+            current,
+            stage=ConversationStage.SEARCH_AREA,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        changed_city = (
+            draft.city is None or draft.city.place_id != accepted_city.place_id
+        )
+        changed_draft = replace(
+            draft,
+            stage=ConversationStage.SEARCH_AREA,
+            city=accepted_city,
+            sub_city_areas=() if changed_city else draft.sub_city_areas,
+            whole_city=False if changed_city else draft.whole_city,
+            screen_revision=state.screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        message = _search_area_message(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            locale=locale,
+            screen_revision=state.screen_revision,
+            city=accepted_city,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            recorded_at=now,
+            draft=changed_draft,
+            geography_confirmation=GeographyConfirmation(
+                kind=GeographyConfirmationKind.CITY,
+                user_intent=draft.user_intent,
+                country=draft.country,
+                city=accepted_city,
+                sub_city_areas=changed_draft.sub_city_areas,
+                whole_city=changed_draft.whole_city,
+                resolver_versions=(city.resolver_version,),
+                glossary_version=city.glossary_version,
+            ),
+        )
+
+    def _apply_search_area_text(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        text: str,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        if draft.country is None or draft.city is None:
+            raise RuntimeError("Search Area stage has no confirmed city hierarchy")
+        if draft.user_intent is None:
+            raise RuntimeError("Search Area stage has no confirmed User Intent")
+        try:
+            resolution = self._location_resolver.resolve(
+                LocationResolutionQuery(
+                    text=text,
+                    locale=locale,
+                    stage=ConversationStage.SEARCH_AREA,
+                    country_id=draft.country.place_id,
+                    city_id=draft.city.place_id,
+                )
+            )
+        except LocationResolverError:
+            self._queue_search_area_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                city=draft.city,
+                outcome=_ResolutionOutcome.FAILURE,
+            )
+            return
+        validated = tuple(
+            (interpretation, accepted_areas)
+            for interpretation in resolution.interpretations
+            if (
+                accepted_areas := _validated_search_area(
+                    interpretation,
+                    country=draft.country,
+                    city=draft.city,
+                )
+            )
+            is not None
+        )
+        if len(validated) > 1:
+            self._queue_search_area_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                city=draft.city,
+                outcome=_ResolutionOutcome.AMBIGUOUS,
+            )
+            return
+        if not validated:
+            self._queue_search_area_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                city=draft.city,
+                outcome=(
+                    _ResolutionOutcome.INVALID
+                    if resolution.interpretations
+                    else _ResolutionOutcome.UNKNOWN
+                ),
+            )
+            return
+        interpretation, accepted_areas = validated[0]
+        next_stage = (
+            ConversationStage.REQUIRED_DATE
+            if draft.user_intent in _DATE_REQUIRED_INTENTS
+            else ConversationStage.POST_CORE
+        )
+        now = self._clock.now()
+        state = replace(
+            current,
+            stage=next_stage,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        changed_draft = replace(
+            draft,
+            stage=next_stage,
+            sub_city_areas=accepted_areas,
+            whole_city=interpretation.whole_city,
+            screen_revision=state.screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        if next_stage is ConversationStage.REQUIRED_DATE:
+            message = _required_date_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                country=draft.country,
+                city=draft.city,
+                areas=accepted_areas,
+                whole_city=interpretation.whole_city,
+            )
+        else:
+            message = _post_core_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                country=draft.country,
+                city=draft.city,
+                areas=accepted_areas,
+                whole_city=interpretation.whole_city,
+            )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            recorded_at=now,
+            draft=changed_draft,
+            geography_confirmation=GeographyConfirmation(
+                kind=GeographyConfirmationKind.SEARCH_AREA,
+                user_intent=draft.user_intent,
+                country=draft.country,
+                city=draft.city,
+                sub_city_areas=accepted_areas,
+                whole_city=interpretation.whole_city,
+                resolver_versions=tuple(
+                    dict.fromkeys(
+                        place.resolver_version for place in interpretation.places
+                    )
+                ),
+                glossary_version=interpretation.glossary_version,
+            ),
+        )
+
+    def _queue_search_area_resolution_feedback(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        city: AcceptedLocation,
+        outcome: _ResolutionOutcome,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+        back_label = _DIRECTION_COPY[copy_locale][2][5]
+        message = TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=current.telegram_user_id,
+            display_locale=locale,
+            screen_revision=current.screen_revision,
+            text=_SEARCH_AREA_RESOLUTION_COPY[copy_locale][outcome].format(
+                city=city.display_name
+            ),
+            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+        )
+        self._store.commit_conversation_presentation(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            message=message,
+            recorded_at=self._clock.now(),
+        )
+
     def _open_intent_branch(
         self,
         *,
@@ -961,6 +1902,10 @@ class ConversationOnboarding:
             stage=ConversationStage.COUNTRY,
             intent_branch=None,
             user_intent=user_intent,
+            country=None,
+            city=None,
+            sub_city_areas=(),
+            whole_city=False,
             screen_revision=state.screen_revision,
             revision=draft.revision + 1,
             last_activity_at=now,
@@ -971,6 +1916,10 @@ class ConversationOnboarding:
             locale=locale,
             screen_revision=state.screen_revision,
             user_intent=user_intent,
+            suggestion=self._store.geography_suggestion(
+                telegram_user_id=current.telegram_user_id,
+                user_intent=user_intent,
+            ),
         )
         self._store.commit_conversation_update(
             update_id=update_id,
@@ -1021,6 +1970,78 @@ class ConversationOnboarding:
         locale = current.locale
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
+        geography_stage = {
+            ConversationStage.REQUIRED_DATE: ConversationStage.SEARCH_AREA,
+            ConversationStage.POST_CORE: ConversationStage.SEARCH_AREA,
+            ConversationStage.SEARCH_AREA: ConversationStage.CITY,
+            ConversationStage.CITY: ConversationStage.COUNTRY,
+        }.get(draft.stage)
+        if geography_stage is not None:
+            if draft.user_intent is None:
+                raise RuntimeError("geography stage has no confirmed User Intent")
+            if draft.country is None:
+                raise RuntimeError("geography stage has no confirmed country")
+            if geography_stage is ConversationStage.SEARCH_AREA and draft.city is None:
+                raise RuntimeError("Search Area stage has no confirmed city")
+            now = self._clock.now()
+            state = replace(
+                current,
+                stage=geography_stage,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                stage=geography_stage,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+            )
+            suggestion = None
+            if (
+                geography_stage is ConversationStage.COUNTRY and draft.country is None
+            ) or (geography_stage is ConversationStage.CITY and draft.city is None):
+                suggestion = self._store.geography_suggestion(
+                    telegram_user_id=current.telegram_user_id,
+                    user_intent=draft.user_intent,
+                )
+            if geography_stage is ConversationStage.COUNTRY:
+                message = _country_message(
+                    update_id=update_id,
+                    telegram_user_id=current.telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    user_intent=draft.user_intent,
+                    suggestion=suggestion,
+                )
+            elif geography_stage is ConversationStage.CITY:
+                message = _city_message(
+                    update_id=update_id,
+                    telegram_user_id=current.telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    suggestion=suggestion,
+                )
+            else:
+                if draft.city is None:
+                    raise AssertionError("Search Area stage has no confirmed city")
+                message = _search_area_message(
+                    update_id=update_id,
+                    telegram_user_id=current.telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    city=draft.city,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                message=message,
+                recorded_at=now,
+                draft=changed_draft,
+            )
+            return
         if draft.stage is ConversationStage.COUNTRY:
             if draft.user_intent is None:
                 raise RuntimeError("country stage has no confirmed User Intent")
@@ -1374,6 +2395,142 @@ def _supported_hint(language_hint: str | None) -> str | None:
     return primary if primary in SUPPORTED_LOCALES else None
 
 
+def _format_list(locale: str, values: tuple[str, ...]) -> str:
+    if len(values) < 2:
+        return "".join(values)
+    return f"{', '.join(values[:-1])} {_LIST_CONJUNCTION[locale]} {values[-1]}"
+
+
+def _format_city_candidates(
+    locale: str, candidates: tuple[LocationCandidate, ...]
+) -> str:
+    labels = tuple(
+        f"{candidate.display_name} ({' → '.join(candidate.parent_display_names)})"
+        for candidate in candidates
+    )
+    return _format_list(locale, labels)
+
+
+def _accept_location(
+    location: LocationCandidate | AcceptedLocation,
+) -> AcceptedLocation:
+    if isinstance(location, AcceptedLocation):
+        return location
+    return AcceptedLocation(
+        place_id=location.place_id,
+        display_name=location.display_name,
+        geographic_type=location.geographic_type,
+        country_id=location.country_id,
+        city_id=location.city_id,
+        verified_parent_ids=location.verified_parent_ids,
+        parent_display_names=location.parent_display_names,
+        iana_timezone=location.iana_timezone,
+        resolver_version=location.resolver_version,
+        glossary_version=location.glossary_version,
+    )
+
+
+def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
+    return (
+        bool(candidate.place_id)
+        and bool(candidate.display_name)
+        and bool(candidate.resolver_version)
+        and bool(candidate.glossary_version)
+        and candidate.geographic_type is GeographicType.COUNTRY
+        and candidate.country_id == candidate.place_id
+        and candidate.city_id is None
+        and not candidate.verified_parent_ids
+        and not candidate.parent_display_names
+        and candidate.iana_timezone is None
+    )
+
+
+def _valid_city(
+    candidate: LocationCandidate | AcceptedLocation,
+    country: AcceptedLocation,
+) -> bool:
+    if candidate.iana_timezone is None:
+        return False
+    try:
+        ZoneInfo(candidate.iana_timezone)
+    except (ValueError, ZoneInfoNotFoundError):
+        return False
+    parents = candidate.verified_parent_ids
+    return (
+        bool(candidate.place_id)
+        and bool(candidate.display_name)
+        and bool(candidate.resolver_version)
+        and bool(candidate.glossary_version)
+        and candidate.geographic_type is GeographicType.CITY
+        and candidate.country_id == country.place_id
+        and candidate.city_id == candidate.place_id
+        and bool(parents)
+        and parents[-1] == country.place_id
+        and candidate.place_id not in parents
+        and len(set(parents)) == len(parents)
+        and len(candidate.parent_display_names) == len(parents)
+        and all(candidate.parent_display_names)
+    )
+
+
+def _valid_sub_city_areas(
+    candidates: tuple[LocationCandidate, ...],
+    *,
+    country: AcceptedLocation,
+    city: AcceptedLocation,
+) -> bool:
+    if not candidates or len({candidate.place_id for candidate in candidates}) != len(
+        candidates
+    ):
+        return False
+    for candidate in candidates:
+        parents = candidate.verified_parent_ids
+        if (
+            not candidate.place_id
+            or not candidate.display_name
+            or not candidate.resolver_version
+            or not candidate.glossary_version
+            or candidate.geographic_type not in _SUB_CITY_TYPES
+            or candidate.country_id != country.place_id
+            or candidate.city_id != city.place_id
+            or candidate.iana_timezone is not None
+            or candidate.place_id in parents
+            or len(set(parents)) != len(parents)
+            or len(candidate.parent_display_names) != len(parents)
+            or not all(candidate.parent_display_names)
+            or city.place_id not in parents
+            or country.place_id not in parents
+            or parents.index(city.place_id) >= parents.index(country.place_id)
+        ):
+            return False
+    return True
+
+
+def _validated_search_area(
+    interpretation: LocationInterpretation,
+    *,
+    country: AcceptedLocation,
+    city: AcceptedLocation,
+) -> tuple[AcceptedLocation, ...] | None:
+    if not interpretation.glossary_version:
+        return None
+    if interpretation.whole_city:
+        if not (
+            len(interpretation.places) == 1
+            and interpretation.places[0].place_id == city.place_id
+            and _valid_city(interpretation.places[0], country)
+        ):
+            return None
+        return ()
+    if not _valid_sub_city_areas(
+        interpretation.places,
+        country=country,
+        city=city,
+    ):
+        return None
+    return tuple(_accept_location(candidate) for candidate in interpretation.places)
+
+
 def _language_selection_message(
     *,
     update_id: str,
@@ -1414,6 +2571,7 @@ def _discovery_message(
     screen_revision: int,
     draft: DiscoveryDraft,
     selection: LanguageSelection | None = None,
+    suggestion: GeographySuggestion | None = None,
 ) -> TelegramMessage:
     if draft.stage is ConversationStage.DIRECTION_MENU:
         return _direction_message(
@@ -1442,6 +2600,54 @@ def _discovery_message(
             locale=locale,
             screen_revision=screen_revision,
             user_intent=draft.user_intent,
+            suggestion=suggestion if draft.country is None else None,
+        )
+    if draft.stage is ConversationStage.CITY:
+        if draft.country is None:
+            raise RuntimeError("city stage has no confirmed country")
+        return _city_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            country=draft.country,
+            suggestion=suggestion if draft.city is None else None,
+        )
+    if draft.stage is ConversationStage.SEARCH_AREA:
+        if draft.city is None:
+            raise RuntimeError("Search Area stage has no confirmed city")
+        return _search_area_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            city=draft.city,
+        )
+    if draft.stage is ConversationStage.REQUIRED_DATE:
+        if draft.country is None or draft.city is None:
+            raise RuntimeError("required date stage has no Search Area")
+        return _required_date_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            country=draft.country,
+            city=draft.city,
+            areas=draft.sub_city_areas,
+            whole_city=draft.whole_city,
+        )
+    if draft.stage is ConversationStage.POST_CORE:
+        if draft.country is None or draft.city is None:
+            raise RuntimeError("post-core stage has no Search Area")
+        return _post_core_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            country=draft.country,
+            city=draft.city,
+            areas=draft.sub_city_areas,
+            whole_city=draft.whole_city,
         )
     raise RuntimeError(f"unsupported Discovery Draft stage: {draft.stage}")
 
@@ -1519,14 +2725,172 @@ def _country_message(
     locale: str,
     screen_revision: int,
     user_intent: UserIntent,
+    suggestion: GeographySuggestion | None = None,
 ) -> TelegramMessage:
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     back_label = _DIRECTION_COPY[copy_locale][2][5]
+    button_rows: tuple[tuple[tuple[str, str], ...], ...] = (
+        ((back_label, f"direction:back:{screen_revision}"),),
+    )
+    if suggestion is not None:
+        other_country, _ = _OTHER_LOCATION_COPY[copy_locale]
+        button_rows = (
+            (
+                (
+                    suggestion.country.display_name,
+                    "location-suggestion:country:"
+                    f"{suggestion.country.place_id}:{screen_revision}",
+                ),
+            ),
+            ((other_country, f"location:other-country:{screen_revision}"),),
+            ((back_label, f"direction:back:{screen_revision}"),),
+        )
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
         text=_COUNTRY_COPY[copy_locale][user_intent],
+        button_rows=button_rows,
+    )
+
+
+def _city_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    country: AcceptedLocation,
+    suggestion: GeographySuggestion | None = None,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    confirmation, question = _CITY_COPY[copy_locale]
+    back_label = _DIRECTION_COPY[copy_locale][2][5]
+    button_rows: tuple[tuple[tuple[str, str], ...], ...] = (
+        ((back_label, f"direction:back:{screen_revision}"),),
+    )
+    if (
+        suggestion is not None
+        and suggestion.city is not None
+        and suggestion.city.country_id == country.place_id
+    ):
+        _, other_city = _OTHER_LOCATION_COPY[copy_locale]
+        button_rows = (
+            (
+                (
+                    suggestion.city.display_name,
+                    "location-suggestion:city:"
+                    f"{suggestion.city.place_id}:{screen_revision}",
+                ),
+            ),
+            ((other_city, f"location:other-city:{screen_revision}"),),
+            ((back_label, f"direction:back:{screen_revision}"),),
+        )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"{confirmation.format(country=country.display_name)}\n\n{question}",
+        button_rows=button_rows,
+    )
+
+
+def _search_area_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    city: AcceptedLocation,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    heading, selected_city, instruction = _SEARCH_AREA_COPY[copy_locale]
+    back_label = _DIRECTION_COPY[copy_locale][2][5]
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=(
+            f"{heading}\n\n{selected_city.format(city=city.display_name)}"
+            f"\n\n{instruction}"
+        ),
         button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
     )
+
+
+def _required_date_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    country: AcceptedLocation,
+    city: AcceptedLocation,
+    areas: tuple[AcceptedLocation, ...],
+    whole_city: bool,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    back_label = _DIRECTION_COPY[copy_locale][2][5]
+    heading, whole_city_label = _SEARCH_AREA_RESULT_COPY[copy_locale]
+    scope = _search_area_summary(
+        country, city, areas, whole_city, whole_city_label=whole_city_label
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"✅ {heading}: **{scope}**.\n\n{_REQUIRED_DATE_COPY[copy_locale]}",
+        button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+    )
+
+
+def _post_core_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    country: AcceptedLocation,
+    city: AcceptedLocation,
+    areas: tuple[AcceptedLocation, ...],
+    whole_city: bool,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    body, details_label, search_label = _POST_CORE_COPY[copy_locale]
+    back_label = _DIRECTION_COPY[copy_locale][2][5]
+    heading, whole_city_label = _SEARCH_AREA_RESULT_COPY[copy_locale]
+    scope = _search_area_summary(
+        country, city, areas, whole_city, whole_city_label=whole_city_label
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"✅ {heading}: **{scope}**.\n\n{body}",
+        button_rows=(
+            ((back_label, f"direction:back:{screen_revision}"),),
+            ((details_label, f"details:open:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _search_area_summary(
+    country: AcceptedLocation,
+    city: AcceptedLocation,
+    areas: tuple[AcceptedLocation, ...],
+    whole_city: bool,
+    *,
+    whole_city_label: str,
+) -> str:
+    scope = (
+        whole_city_label
+        if whole_city
+        else ", ".join(area.display_name for area in areas)
+    )
+    return f"{country.display_name} → {city.display_name} → {scope}"

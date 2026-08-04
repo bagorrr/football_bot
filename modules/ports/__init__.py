@@ -21,9 +21,15 @@ from modules.domain import (
     ActiveChatView,
     ConversationState,
     DiscoveryDraft,
+    GeographyConfirmation,
+    GeographyConfirmationEvent,
+    GeographySuggestion,
     LanguageSelection,
+    LocationResolution,
+    LocationResolutionQuery,
     TelegramDeliveryClaim,
     TelegramMessage,
+    UserIntent,
 )
 
 
@@ -86,6 +92,14 @@ class LocationResolverAdapter(Protocol):
         """Return one synthetic accepted Opportunity revision identity."""
         ...
 
+    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
+        """Return non-authoritative interpretations for application validation."""
+        ...
+
+
+class LocationResolverError(RuntimeError):
+    """The controlled resolver could not complete one request."""
+
 
 class ConversationLanguageAdapter(Protocol):
     """Bounded semantic adapter for free-text language names."""
@@ -132,6 +146,12 @@ class ConversationStore(Protocol):
         """Return the Bot User's one durable unfinished Discovery Draft."""
         ...
 
+    def geography_suggestion(
+        self, *, telegram_user_id: int, user_intent: UserIntent
+    ) -> GeographySuggestion | None:
+        """Return the latest confirmed same-Intent country and optional city."""
+        ...
+
     def expire_inactive_discovery_drafts(self, *, inactive_before: datetime) -> int:
         """Expire only unfinished drafts inactive through the cutoff."""
         ...
@@ -151,6 +171,7 @@ class ConversationStore(Protocol):
         message: TelegramMessage,
         recorded_at: datetime,
         draft: DiscoveryDraft | None = None,
+        geography_confirmation: GeographyConfirmation | None = None,
     ) -> bool:
         """Commit one idempotent Telegram update and its owned state."""
         ...
@@ -328,6 +349,12 @@ class AcceptanceObserver(Protocol):
 
     def unresolved_delivery_alerts(self) -> tuple[str, ...]:
         """Observe body-free delivery identities requiring reconciliation."""
+        ...
+
+    def geography_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[GeographyConfirmationEvent, ...]:
+        """Observe append-only explicit geography confirmations."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:

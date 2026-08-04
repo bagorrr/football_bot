@@ -8,7 +8,11 @@ ALTER TABLE football_runtime.bot_users
             'language_input',
             'direction_menu',
             'intent_branch',
-            'country'
+            'country',
+            'city',
+            'search_area',
+            'required_date',
+            'post_core'
         )
     );
 
@@ -27,7 +31,15 @@ CREATE TABLE IF NOT EXISTS football_runtime.bot_discovery_drafts (
         CHECK (owner_role = 'bot_assistant'),
     telegram_user_id bigint PRIMARY KEY REFERENCES football_runtime.bot_users,
     stage text NOT NULL CHECK (
-        stage IN ('direction_menu', 'intent_branch', 'country')
+        stage IN (
+            'direction_menu',
+            'intent_branch',
+            'country',
+            'city',
+            'search_area',
+            'required_date',
+            'post_core'
+        )
     ),
     intent_branch text CHECK (
         intent_branch IN (
@@ -61,7 +73,15 @@ ALTER TABLE football_runtime.bot_discovery_drafts
     DROP CONSTRAINT IF EXISTS bot_discovery_drafts_stage_check;
 ALTER TABLE football_runtime.bot_discovery_drafts
     ADD CONSTRAINT bot_discovery_drafts_stage_check CHECK (
-        stage IN ('direction_menu', 'intent_branch', 'country')
+        stage IN (
+            'direction_menu',
+            'intent_branch',
+            'country',
+            'city',
+            'search_area',
+            'required_date',
+            'post_core'
+        )
     );
 
 ALTER TABLE football_runtime.bot_discovery_drafts ENABLE ROW LEVEL SECURITY;

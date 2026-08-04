@@ -23,9 +23,16 @@ from modules.contracts import (
 )
 from modules.domain import (
     ActiveChatView,
+    ConversationStage,
     ConversationState,
     DiscoveryDraft,
+    GeographicType,
+    GeographyConfirmationEvent,
     LanguageSelection,
+    LocationCandidate,
+    LocationInterpretation,
+    LocationResolution,
+    LocationResolutionQuery,
     TelegramMessage,
 )
 from modules.ports import (
@@ -35,6 +42,7 @@ from modules.ports import (
     ConversationAccessDeniedError,
     ConversationLanguageAdapter,
     LocationResolverAdapter,
+    LocationResolverError,
     ModelAdapter,
     OutboxConflictError,
     TelegramDeliveryAdapter,
@@ -140,12 +148,226 @@ class ControlledModelAdapter:
         return f"proposal:{revision_id}"
 
 
+@dataclass(slots=True)
 class ControlledLocationResolverAdapter:
     """Deterministic resolver adapter with no provider access."""
+
+    _resolutions: dict[tuple[ConversationStage, str], LocationResolution] = field(
+        default_factory=dict
+    )
+    _failures: set[tuple[ConversationStage, str]] = field(default_factory=set)
+
+    def return_for(
+        self,
+        *,
+        stage: ConversationStage,
+        text: str,
+        resolution: LocationResolution,
+    ) -> None:
+        """Configure one deterministic controlled resolver response."""
+        self._resolutions[(stage, text)] = resolution
+
+    def fail_for(self, *, stage: ConversationStage, text: str) -> None:
+        """Configure one deterministic controlled resolver failure."""
+        self._failures.add((stage, text))
 
     def opportunity_revision_id(self, proposal_id: str) -> str:
         """Return a stable accepted Opportunity revision identity."""
         return f"opportunity-revision:{proposal_id}"
+
+    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
+        """Resolve deterministic acceptance phrases without provider access."""
+        country_label = {
+            "en": "Russia",
+            "ru": "Россия",
+            "es": "Rusia",
+            "fr": "Russie",
+        }.get(query.locale, "Russia")
+        city_label = {
+            "en": "Saint Petersburg",
+            "ru": "Санкт-Петербург",
+            "es": "San Petersburgo",
+            "fr": "Saint-Pétersbourg",
+        }.get(query.locale, "Saint Petersburg")
+        key = (query.stage, query.text)
+        if key in self._failures:
+            raise LocationResolverError("controlled resolver failure")
+        configured = self._resolutions.get(key)
+        if configured is not None:
+            return configured
+        if (
+            query.stage is ConversationStage.COUNTRY
+            and "russia" in query.text.casefold()
+        ):
+            return LocationResolution(
+                interpretations=(
+                    LocationInterpretation(
+                        glossary_version="controlled-glossary-v1",
+                        places=(
+                            LocationCandidate(
+                                place_id="country:ru",
+                                display_name=country_label,
+                                geographic_type=GeographicType.COUNTRY,
+                                country_id="country:ru",
+                                city_id=None,
+                                verified_parent_ids=(),
+                                parent_display_names=(),
+                                iana_timezone=None,
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        if (
+            query.stage is ConversationStage.CITY
+            and query.country_id == "country:ru"
+            and "saint petersburg" in query.text.casefold()
+        ):
+            return LocationResolution(
+                interpretations=(
+                    LocationInterpretation(
+                        glossary_version="controlled-glossary-v1",
+                        places=(
+                            LocationCandidate(
+                                place_id="city:ru:saint-petersburg",
+                                display_name=city_label,
+                                geographic_type=GeographicType.CITY,
+                                country_id="country:ru",
+                                city_id="city:ru:saint-petersburg",
+                                verified_parent_ids=("country:ru",),
+                                parent_display_names=(country_label,),
+                                iana_timezone="Europe/Moscow",
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        if query.stage is ConversationStage.COUNTRY and query.text == "Georgia":
+            return LocationResolution(
+                interpretations=(
+                    LocationInterpretation(
+                        glossary_version="controlled-glossary-v1",
+                        places=(
+                            LocationCandidate(
+                                place_id="country:ge",
+                                display_name="Georgia",
+                                geographic_type=GeographicType.COUNTRY,
+                                country_id="country:ge",
+                                city_id=None,
+                                verified_parent_ids=(),
+                                parent_display_names=(),
+                                iana_timezone=None,
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                        ),
+                    ),
+                    LocationInterpretation(
+                        glossary_version="controlled-glossary-v1",
+                        places=(
+                            LocationCandidate(
+                                place_id="country:gs",
+                                display_name=(
+                                    "South Georgia and the South Sandwich Islands"
+                                ),
+                                geographic_type=GeographicType.COUNTRY,
+                                country_id="country:gs",
+                                city_id=None,
+                                verified_parent_ids=(),
+                                parent_display_names=(),
+                                iana_timezone=None,
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        if (
+            query.stage is ConversationStage.SEARCH_AREA
+            and query.country_id == "country:ru"
+            and query.city_id == "city:ru:saint-petersburg"
+            and "whole city" in query.text.casefold()
+        ):
+            return LocationResolution(
+                interpretations=(
+                    LocationInterpretation(
+                        glossary_version="controlled-glossary-v1",
+                        places=(
+                            LocationCandidate(
+                                place_id="city:ru:saint-petersburg",
+                                display_name=city_label,
+                                geographic_type=GeographicType.CITY,
+                                country_id="country:ru",
+                                city_id="city:ru:saint-petersburg",
+                                verified_parent_ids=("country:ru",),
+                                parent_display_names=(country_label,),
+                                iana_timezone="Europe/Moscow",
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                        ),
+                        whole_city=True,
+                    ),
+                )
+            )
+        if (
+            query.stage is ConversationStage.SEARCH_AREA
+            and query.country_id == "country:ru"
+            and query.city_id == "city:ru:saint-petersburg"
+            and query.text == "Near Komendantsky metro and in Primorsky District"
+        ):
+            return LocationResolution(
+                interpretations=(
+                    LocationInterpretation(
+                        glossary_version="controlled-glossary-v1",
+                        places=(
+                            LocationCandidate(
+                                place_id=("station:ru:spb:komendantsky-prospekt"),
+                                display_name="Komendantsky Prospekt",
+                                geographic_type=GeographicType.STATION,
+                                country_id="country:ru",
+                                city_id="city:ru:saint-petersburg",
+                                verified_parent_ids=(
+                                    "district:ru:spb:primorsky",
+                                    "city:ru:saint-petersburg",
+                                    "country:ru",
+                                ),
+                                parent_display_names=(
+                                    "Primorsky District",
+                                    city_label,
+                                    country_label,
+                                ),
+                                iana_timezone=None,
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                            LocationCandidate(
+                                place_id="district:ru:spb:primorsky",
+                                display_name="Primorsky District",
+                                geographic_type=(
+                                    GeographicType.ADMINISTRATIVE_DISTRICT
+                                ),
+                                country_id="country:ru",
+                                city_id="city:ru:saint-petersburg",
+                                verified_parent_ids=(
+                                    "city:ru:saint-petersburg",
+                                    "country:ru",
+                                ),
+                                parent_display_names=(city_label, country_label),
+                                iana_timezone=None,
+                                resolver_version="controlled-resolver-v1",
+                                glossary_version="controlled-glossary-v1",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        return LocationResolution(interpretations=())
 
 
 class ControlledConversationLanguageAdapter:
@@ -570,14 +792,23 @@ class AcceptanceSpine:
         """Observe body-free delivery identities requiring reconciliation."""
         return self._observer.unresolved_delivery_alerts()
 
+    def geography_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[GeographyConfirmationEvent, ...]:
+        """Observe append-only explicit geography confirmations."""
+        return self._observer.geography_confirmations(telegram_user_id)
+
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
         if role.telegram_delivery is None:
             raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+        if role.location_resolver is None:
+            raise RuntimeError("Bot Assistant runtime has no resolver adapter")
         return ConversationOnboarding(
             store=role.store,
             telegram_delivery=role.telegram_delivery,
             conversation_language=_conversation_language(role),
+            location_resolver=role.location_resolver,
             clock=role.clock,
         )
 
@@ -664,6 +895,68 @@ class AcceptanceSpine:
         self._conversation_onboarding().go_back(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_location_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one natural-language geography answer through the Bot Assistant."""
+        self._conversation_onboarding().submit_location_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_location_suggestion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        kind: str,
+        place_id: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Confirm one offered country or city through the public callback seam."""
+        self._conversation_onboarding().select_location_suggestion(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            kind=kind,
+            place_id=place_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def dismiss_location_suggestion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        kind: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Continue with free text instead of accepting an offered shortcut."""
+        self._conversation_onboarding().dismiss_location_suggestion(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            kind=kind,
             screen_revision=(
                 screen_revision
                 if screen_revision is not None
@@ -817,7 +1110,9 @@ def boot_acceptance_spine(
             ),
             model=controlled_model if role is RuntimeRole.CLASSIFICATION else None,
             location_resolver=(
-                controlled_resolver if role is RuntimeRole.APPLICATION else None
+                controlled_resolver
+                if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
+                else None
             ),
             conversation_language=(
                 controlled_conversation_language
