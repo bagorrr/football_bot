@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -15,6 +16,13 @@ from modules.contracts import (
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
+)
+from modules.domain import (
+    ActiveChatView,
+    ConversationState,
+    LanguageSelection,
+    TelegramDeliveryClaim,
+    TelegramMessage,
 )
 
 
@@ -41,6 +49,26 @@ class TelegramDeliveryAdapter(Protocol):
         """Record one controlled Telegram presentation."""
         ...
 
+    def send(self, message: TelegramMessage) -> str:
+        """Make the sole initial send and return its presentation identity.
+
+        Only a ``TelegramDeliveryPreEffectError`` proves that another initial
+        send is safe. Every other failure is an unknown external outcome.
+        """
+        ...
+
+    def reconcile(self, message: TelegramMessage) -> str | None:
+        """Return a known accepted identity without sending, or ``None``."""
+        ...
+
+
+class TelegramDeliveryPreEffectError(RuntimeError):
+    """The adapter proves that no external Telegram effect occurred."""
+
+
+class TelegramDeliveryOutcomeUnknownError(RuntimeError):
+    """Telegram may have accepted a send whose identity was not returned."""
+
 
 class ModelAdapter(Protocol):
     """Controlled model boundary for the acceptance spine."""
@@ -58,8 +86,24 @@ class LocationResolverAdapter(Protocol):
         ...
 
 
+class ConversationLanguageAdapter(Protocol):
+    """Bounded semantic adapter for free-text language names."""
+
+    def interpret(self, text: str) -> LanguageSelection | None:
+        """Propose one unambiguous language or request clarification."""
+        ...
+
+    def render(self, locale: str) -> LanguageSelection | None:
+        """Render one previously validated non-static Conversation Language."""
+        ...
+
+
 class OutboxConflictError(RuntimeError):
     """A distinct message attempted to reuse an outbox identity."""
+
+
+class ConversationAccessDeniedError(RuntimeError):
+    """A non-owning runtime attempted to access Bot User state."""
 
 
 class ConsumeResult(StrEnum):
@@ -70,7 +114,100 @@ class ConsumeResult(StrEnum):
     REJECTED = "rejected"
 
 
-class AcceptanceRoleStore(Protocol):
+class ConversationStore(Protocol):
+    """Bot Assistant-owned persistence boundary for onboarding."""
+
+    def serialize_conversation_update(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> AbstractContextManager[bool]:
+        """Serialize one user's update and expose its durable replay state."""
+        ...
+
+    def conversation_state(self, telegram_user_id: int) -> ConversationState | None:
+        """Return account-level presentation state through a stable query."""
+        ...
+
+    def commit_conversation_update(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one idempotent Telegram update and its owned state."""
+        ...
+
+    def commit_conversation_presentation(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one idempotent presentation without changing account state."""
+        ...
+
+    def current_conversation_message(
+        self, telegram_user_id: int
+    ) -> TelegramMessage | None:
+        """Return the desired presentation for the current logical screen."""
+        ...
+
+    def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView | None:
+        """Return the latest successfully presented account view."""
+        ...
+
+    def claim_conversation_message(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramDeliveryClaim | None:
+        """Claim the oldest presentation with its safe send or reconcile mode."""
+        ...
+
+    def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
+        """Release one pre-effect failure for a later send retry."""
+        ...
+
+    def mark_conversation_message_outcome_unknown(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Record that Telegram may have accepted the presentation."""
+        ...
+
+    def mark_conversation_message_reconciliation_required(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Stop automatic delivery and raise a body-free operator condition."""
+        ...
+
+    def mark_conversation_message_delivered(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        telegram_message_id: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Record one confirmed Bot API delivery."""
+        ...
+
+
+class AcceptanceRoleStore(ConversationStore, Protocol):
     """Persistence operations available to exactly one runtime owner."""
 
     @property
@@ -171,6 +308,10 @@ class AcceptanceObserver(Protocol):
 
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free operator alert."""
+        ...
+
+    def unresolved_delivery_alerts(self) -> tuple[str, ...]:
+        """Observe body-free delivery identities requiring reconciliation."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
