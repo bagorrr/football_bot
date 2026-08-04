@@ -378,6 +378,121 @@ def test_stale_repeated_and_other_screen_inputs_are_inert(
     assert telegram_delivery.messages[-1].screen_revision == before.screen_revision
 
 
+def test_direction_input_for_the_language_screen_cannot_mutate_the_draft(
+    spine: AcceptanceSpine,
+) -> None:
+    user_id = 41_012
+    spine.start_bot_user(
+        update_id="start-before-other-screen-direction",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    spine.select_fixed_language(
+        update_id="language-before-other-screen-direction",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    spine.select_direction(
+        update_id="intent-before-other-screen-direction",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    spine.go_back(
+        update_id="back-to-direction-before-language-screen",
+        telegram_user_id=user_id,
+    )
+    spine.go_back(
+        update_id="back-to-language-screen",
+        telegram_user_id=user_id,
+    )
+    before = spine.discovery_draft(user_id)
+    language_screen = spine.conversation_state(user_id)
+
+    spine.select_direction(
+        update_id="direction-on-language-screen",
+        telegram_user_id=user_id,
+        direction="player_search",
+        screen_revision=language_screen.screen_revision,
+    )
+
+    assert spine.discovery_draft(user_id) == before
+    assert spine.conversation_state(user_id).stage == "language_selection"
+
+
+def test_reselecting_the_confirmed_terminal_user_intent_is_a_no_op(
+    spine: AcceptanceSpine,
+) -> None:
+    user_id = 41_013
+    spine.start_bot_user(
+        update_id="start-before-same-intent",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    spine.select_fixed_language(
+        update_id="language-before-same-intent",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    spine.select_direction(
+        update_id="confirm-intent-before-same-intent",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    spine.go_back(
+        update_id="back-before-same-intent",
+        telegram_user_id=user_id,
+    )
+    before = spine.discovery_draft(user_id)
+
+    spine.select_direction(
+        update_id="reselect-same-intent",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+
+    assert spine.discovery_draft(user_id) == before
+    assert spine.conversation_state(user_id).stage == "direction_menu"
+
+
+def test_every_bot_user_action_restarts_the_draft_inactivity_window() -> None:
+    clock = _AdjustableClock(datetime(2026, 8, 4, 12, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+    )
+    system.reset()
+    user_id = 41_014
+    system.start_bot_user(
+        update_id="start-before-inactivity-reset",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language-before-inactivity-reset",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    before = system.discovery_draft(user_id)
+
+    clock.advance(timedelta(days=29))
+    system.submit_language_text(
+        update_id="other-screen-action-resets-inactivity",
+        telegram_user_id=user_id,
+        text="Deutsch",
+        screen_revision=before.screen_revision,
+    )
+    assert system.discovery_draft(user_id) == before
+
+    clock.advance(timedelta(days=2))
+    assert system.expire_inactive_discovery_drafts() == 0
+    assert system.discovery_draft(user_id) == before
+
+    clock.advance(timedelta(days=28))
+    assert system.expire_inactive_discovery_drafts() == 1
+    assert system.has_discovery_draft(user_id) is False
+
+
 def test_thirty_inactive_days_expire_only_the_discovery_draft() -> None:
     clock = _AdjustableClock(datetime(2026, 8, 4, 12, 0, tzinfo=UTC))
     telegram_delivery = ControlledTelegramDeliveryAdapter()

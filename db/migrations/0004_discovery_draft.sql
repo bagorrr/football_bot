@@ -12,6 +12,16 @@ ALTER TABLE football_runtime.bot_users
         )
     );
 
+ALTER TABLE football_runtime.bot_users
+    ADD COLUMN IF NOT EXISTS last_bot_user_action_at timestamptz;
+
+UPDATE football_runtime.bot_users
+SET last_bot_user_action_at = updated_at
+WHERE last_bot_user_action_at IS NULL;
+
+ALTER TABLE football_runtime.bot_users
+    ALTER COLUMN last_bot_user_action_at DROP NOT NULL;
+
 CREATE TABLE IF NOT EXISTS football_runtime.bot_discovery_drafts (
     owner_role text NOT NULL DEFAULT 'bot_assistant'
         CHECK (owner_role = 'bot_assistant'),

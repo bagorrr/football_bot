@@ -591,13 +591,39 @@ class PostgresRoleStore:
         with psycopg.connect(self._database_url) as connection:
             expired = connection.execute(
                 """
-                DELETE FROM football_runtime.bot_discovery_drafts
-                WHERE last_activity_at <= %s
-                RETURNING telegram_user_id
+                DELETE FROM football_runtime.bot_discovery_drafts AS draft
+                USING football_runtime.bot_users AS bot_user
+                WHERE draft.telegram_user_id = bot_user.telegram_user_id
+                  AND COALESCE(
+                      bot_user.last_bot_user_action_at,
+                      bot_user.updated_at
+                  ) <= %s
+                RETURNING draft.telegram_user_id
                 """,
                 (inactive_before,),
             ).fetchall()
         return len(expired)
+
+    def expire_inactive_discovery_draft(
+        self, *, telegram_user_id: int, inactive_before: datetime
+    ) -> bool:
+        """Delete one Bot User's draft after 30 consecutive inactive days."""
+        with psycopg.connect(self._database_url) as connection:
+            expired = connection.execute(
+                """
+                DELETE FROM football_runtime.bot_discovery_drafts AS draft
+                USING football_runtime.bot_users AS bot_user
+                WHERE draft.telegram_user_id = bot_user.telegram_user_id
+                  AND draft.telegram_user_id = %s
+                  AND COALESCE(
+                      bot_user.last_bot_user_action_at,
+                      bot_user.updated_at
+                  ) <= %s
+                RETURNING draft.telegram_user_id
+                """,
+                (telegram_user_id, inactive_before),
+            ).fetchone()
+        return expired is not None
 
     def commit_conversation_update(
         self,
@@ -630,8 +656,8 @@ class PostgresRoleStore:
                     INSERT INTO football_runtime.bot_users (
                         telegram_user_id, locale, locale_source,
                         last_seen_language_code, stage, screen_revision,
-                        revision, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        revision, last_bot_user_action_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING revision
                     """,
@@ -643,6 +669,7 @@ class PostgresRoleStore:
                         state.stage.value,
                         state.screen_revision,
                         state.revision,
+                        recorded_at,
                         recorded_at,
                     ),
                 ).fetchone()
@@ -656,6 +683,7 @@ class PostgresRoleStore:
                         stage = %s,
                         screen_revision = %s,
                         revision = %s,
+                        last_bot_user_action_at = %s,
                         updated_at = %s
                     WHERE telegram_user_id = %s AND revision = %s
                     RETURNING revision
@@ -667,6 +695,7 @@ class PostgresRoleStore:
                         state.stage.value,
                         state.screen_revision,
                         state.revision,
+                        recorded_at,
                         recorded_at,
                         state.telegram_user_id,
                         expected_revision,
@@ -786,6 +815,14 @@ class PostgresRoleStore:
             if current is None or current[0] != expected_revision:
                 msg = "Conversation Language state changed concurrently"
                 raise RuntimeError(msg)
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET last_bot_user_action_at = %s
+                WHERE telegram_user_id = %s
+                """,
+                (recorded_at, telegram_user_id),
+            )
             _supersede_pending_conversation_messages(
                 connection,
                 telegram_user_id=telegram_user_id,

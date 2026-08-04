@@ -136,6 +136,12 @@ class ConversationStore(Protocol):
         """Expire only unfinished drafts inactive through the cutoff."""
         ...
 
+    def expire_inactive_discovery_draft(
+        self, *, telegram_user_id: int, inactive_before: datetime
+    ) -> bool:
+        """Expire one Bot User's draft if its inactivity reached the cutoff."""
+        ...
+
     def commit_conversation_update(
         self,
         *,

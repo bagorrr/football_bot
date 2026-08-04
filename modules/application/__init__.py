@@ -651,9 +651,14 @@ class ConversationOnboarding:
         telegram_language_hint: str | None,
     ) -> None:
         current = self._store.conversation_state(telegram_user_id)
-        draft = self._store.discovery_draft(telegram_user_id)
         supported_hint = _supported_hint(telegram_language_hint)
         now = self._clock.now()
+        if current is not None:
+            self._store.expire_inactive_discovery_draft(
+                telegram_user_id=telegram_user_id,
+                inactive_before=now - timedelta(days=30),
+            )
+        draft = self._store.discovery_draft(telegram_user_id)
         if current is None:
             current = ConversationState(
                 telegram_user_id=telegram_user_id,
@@ -675,16 +680,6 @@ class ConversationOnboarding:
                     user_intent=None,
                     screen_revision=current.screen_revision + 1,
                     revision=1,
-                    last_activity_at=now,
-                )
-            elif now - draft.last_activity_at >= timedelta(days=30):
-                draft = replace(
-                    draft,
-                    stage=ConversationStage.DIRECTION_MENU,
-                    intent_branch=None,
-                    user_intent=None,
-                    screen_revision=current.screen_revision + 1,
-                    revision=draft.revision + 1,
                     last_activity_at=now,
                 )
             else:
@@ -854,7 +849,10 @@ class ConversationOnboarding:
                 draft = self._store.discovery_draft(telegram_user_id)
                 if current is None or draft is None:
                     return
-                if draft.screen_revision != screen_revision:
+                if (
+                    current.stage is not draft.stage
+                    or draft.screen_revision != screen_revision
+                ):
                     self._queue_current_view(update_id=update_id, state=current)
                 elif (
                     draft.stage is ConversationStage.DIRECTION_MENU
@@ -948,6 +946,9 @@ class ConversationOnboarding:
         locale = current.locale
         if locale is None or locale not in _COUNTRY_COPY:
             raise RuntimeError("Conversation Language has no reviewed discovery copy")
+        if draft.user_intent is user_intent:
+            self._queue_current_view(update_id=update_id, state=current)
+            return
         now = self._clock.now()
         state = replace(
             current,
@@ -997,7 +998,10 @@ class ConversationOnboarding:
                 draft = self._store.discovery_draft(telegram_user_id)
                 if current is None or draft is None:
                     return
-                if draft.screen_revision != screen_revision:
+                if (
+                    current.stage is not draft.stage
+                    or draft.screen_revision != screen_revision
+                ):
                     self._queue_current_view(update_id=update_id, state=current)
                 else:
                     self._apply_back(
