@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -15,6 +16,12 @@ from modules.contracts import (
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
+)
+from modules.domain import (
+    ActiveChatView,
+    ConversationState,
+    LanguageSelection,
+    TelegramMessage,
 )
 
 
@@ -41,6 +48,10 @@ class TelegramDeliveryAdapter(Protocol):
         """Record one controlled Telegram presentation."""
         ...
 
+    def send(self, message: TelegramMessage) -> str:
+        """Send one message and return its stable Telegram presentation identity."""
+        ...
+
 
 class ModelAdapter(Protocol):
     """Controlled model boundary for the acceptance spine."""
@@ -58,8 +69,24 @@ class LocationResolverAdapter(Protocol):
         ...
 
 
+class ConversationLanguageAdapter(Protocol):
+    """Bounded semantic adapter for free-text language names."""
+
+    def interpret(self, text: str) -> LanguageSelection | None:
+        """Propose one unambiguous language or request clarification."""
+        ...
+
+    def render(self, locale: str) -> LanguageSelection | None:
+        """Render one previously validated non-static Conversation Language."""
+        ...
+
+
 class OutboxConflictError(RuntimeError):
     """A distinct message attempted to reuse an outbox identity."""
+
+
+class ConversationAccessDeniedError(RuntimeError):
+    """A non-owning runtime attempted to access Bot User state."""
 
 
 class ConsumeResult(StrEnum):
@@ -70,7 +97,80 @@ class ConsumeResult(StrEnum):
     REJECTED = "rejected"
 
 
-class AcceptanceRoleStore(Protocol):
+class ConversationStore(Protocol):
+    """Bot Assistant-owned persistence boundary for onboarding."""
+
+    def serialize_conversation_update(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> AbstractContextManager[bool]:
+        """Serialize one user's update and expose its durable replay state."""
+        ...
+
+    def conversation_state(self, telegram_user_id: int) -> ConversationState | None:
+        """Return account-level presentation state through a stable query."""
+        ...
+
+    def commit_conversation_update(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one idempotent Telegram update and its owned state."""
+        ...
+
+    def commit_conversation_presentation(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one idempotent presentation without changing account state."""
+        ...
+
+    def current_conversation_message(
+        self, telegram_user_id: int
+    ) -> TelegramMessage | None:
+        """Return the desired presentation for the current logical screen."""
+        ...
+
+    def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView | None:
+        """Return the latest successfully presented account view."""
+        ...
+
+    def claim_conversation_message(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramMessage | None:
+        """Claim the oldest recoverable Bot Assistant presentation."""
+        ...
+
+    def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
+        """Release one failed external delivery for immediate retry."""
+        ...
+
+    def mark_conversation_message_delivered(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        telegram_message_id: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Record one confirmed Bot API delivery."""
+        ...
+
+
+class AcceptanceRoleStore(ConversationStore, Protocol):
     """Persistence operations available to exactly one runtime owner."""
 
     @property

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from modules.application import ConversationOnboarding
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
     ContractDefinition,
@@ -20,10 +21,18 @@ from modules.contracts import (
 from modules.contracts import (
     OperatorAlert as OperatorAlert,
 )
+from modules.domain import (
+    ActiveChatView,
+    ConversationState,
+    LanguageSelection,
+    TelegramMessage,
+)
 from modules.ports import (
     AcceptanceObserver,
     AcceptanceRoleStore,
     Clock,
+    ConversationAccessDeniedError,
+    ConversationLanguageAdapter,
     LocationResolverAdapter,
     ModelAdapter,
     OutboxConflictError,
@@ -62,11 +71,25 @@ class ControlledTelegramDeliveryAdapter:
     """Synthetic Bot API output with no live Bot credential."""
 
     presentations: list[str] = field(default_factory=list)
+    messages: list[TelegramMessage] = field(default_factory=list)
+    failures_remaining: int = 0
+
+    def fail_next(self) -> None:
+        """Inject one controlled Bot API delivery failure."""
+        self.failures_remaining += 1
 
     def present(self, delivery_id: str) -> None:
         """Record one idempotent controlled presentation."""
         if delivery_id not in self.presentations:
             self.presentations.append(delivery_id)
+
+    def send(self, message: TelegramMessage) -> str:
+        """Record one deterministic Bot Assistant message without Telegram."""
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise InjectedTelegramDeliveryError
+        self.messages.append(message)
+        return f"telegram-message:{len(self.messages)}"
 
 
 class ControlledModelAdapter:
@@ -83,6 +106,35 @@ class ControlledLocationResolverAdapter:
     def opportunity_revision_id(self, proposal_id: str) -> str:
         """Return a stable accepted Opportunity revision identity."""
         return f"opportunity-revision:{proposal_id}"
+
+
+class ControlledConversationLanguageAdapter:
+    """Deterministic free-text interpretation with no live model call."""
+
+    def interpret(self, text: str) -> LanguageSelection | None:
+        """Recognize one acceptance fixture and reject every ambiguous input."""
+        if text.strip().casefold() != "deutsch":
+            return None
+        return self.render("de")
+
+    def render(self, locale: str) -> LanguageSelection | None:
+        """Render the one validated non-static acceptance locale."""
+        if locale != "de":
+            return None
+        return LanguageSelection(
+            locale="de",
+            confirmation="✅ Wir sprechen ab jetzt Deutsch.",
+            direction_question="Was möchten Sie tun?",
+            direction_labels=(
+                "Ein Spiel für mich finden",
+                "Spieler für ein Spiel finden",
+                "Turnier oder gegnerisches Team",
+                "Trainer",
+                "Schiedsrichter",
+                "⬅️ Zurück",
+                "Transfers",
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +166,10 @@ class InjectedInterruptionError(RuntimeError):
     """A controlled process exit interrupted work after a durable commit."""
 
 
+class InjectedTelegramDeliveryError(RuntimeError):
+    """A controlled Bot API failure left durable presentation work pending."""
+
+
 @dataclass(slots=True)
 class AcceptanceRole:
     """One independently reconnectable runtime responsibility."""
@@ -125,6 +181,7 @@ class AcceptanceRole:
     telegram_delivery: TelegramDeliveryAdapter | None = None
     model: ModelAdapter | None = None
     location_resolver: LocationResolverAdapter | None = None
+    conversation_language: ConversationLanguageAdapter | None = None
     supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -465,6 +522,128 @@ class AcceptanceSpine:
         """Observe one durable body-free operator alert."""
         return self._observer.operator_alert(message_id)
 
+    def _conversation_onboarding(self) -> ConversationOnboarding:
+        role = self._roles[RuntimeRole.BOT_ASSISTANT]
+        if role.telegram_delivery is None:
+            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+        return ConversationOnboarding(
+            store=role.store,
+            telegram_delivery=role.telegram_delivery,
+            conversation_language=_conversation_language(role),
+            clock=role.clock,
+        )
+
+    def start_bot_user(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        telegram_language_hint: str | None,
+    ) -> None:
+        """Drive one synthetic private-chat /start through the Bot Assistant."""
+        self._conversation_onboarding().start(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            telegram_language_hint=telegram_language_hint,
+        )
+
+    def select_fixed_language(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        locale: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one fixed-language callback through the Bot Assistant."""
+        self._conversation_onboarding().select_fixed_language(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def open_language_input(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive the free-text language prompt through the Bot Assistant."""
+        self._conversation_onboarding().open_language_input(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_language_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one free-text language answer through the Bot Assistant."""
+        self._conversation_onboarding().submit_language_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def retry_bot_presentations(self) -> bool:
+        """Retry one durable onboarding presentation after interruption."""
+        return self._conversation_onboarding().deliver_pending()
+
+    def conversation_state(self, telegram_user_id: int) -> ConversationState:
+        """Observe durable account state through the Bot Assistant query port."""
+        state = self._roles[RuntimeRole.BOT_ASSISTANT].store.conversation_state(
+            telegram_user_id
+        )
+        if state is None:
+            raise LookupError(telegram_user_id)
+        return state
+
+    def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView:
+        """Observe the latest successfully presented Bot User screen."""
+        view = self._roles[RuntimeRole.BOT_ASSISTANT].store.active_conversation_view(
+            telegram_user_id
+        )
+        if view is None:
+            raise LookupError(telegram_user_id)
+        return view
+
+    def read_conversation_state_as(
+        self,
+        *,
+        actor: RuntimeRole,
+        telegram_user_id: int,
+    ) -> ConversationState:
+        """Exercise least-privilege read isolation through a runtime credential."""
+        try:
+            state = self._roles[actor].store.conversation_state(telegram_user_id)
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+        if actor is not RuntimeRole.BOT_ASSISTANT and state is None:
+            raise OwnershipViolationError(UUID(int=0))
+        if state is None:
+            raise LookupError(telegram_user_id)
+        return state
+
 
 def boot_acceptance_spine(
     *,
@@ -474,6 +653,7 @@ def boot_acceptance_spine(
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
+    conversation_language: ConversationLanguageAdapter | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately."""
     from apps.system_acceptance import boot_acceptance_role
@@ -495,6 +675,9 @@ def boot_acceptance_spine(
     controlled_delivery = telegram_delivery or ControlledTelegramDeliveryAdapter()
     controlled_model = model or ControlledModelAdapter()
     controlled_resolver = location_resolver or ControlledLocationResolverAdapter()
+    controlled_conversation_language = (
+        conversation_language or ControlledConversationLanguageAdapter()
+    )
 
     def restart_role(role: RuntimeRole) -> AcceptanceRole:
         return boot_acceptance_role(
@@ -511,6 +694,11 @@ def boot_acceptance_spine(
             location_resolver=(
                 controlled_resolver if role is RuntimeRole.APPLICATION else None
             ),
+            conversation_language=(
+                controlled_conversation_language
+                if role is RuntimeRole.BOT_ASSISTANT
+                else None
+            ),
         )
 
     return AcceptanceSpine(
@@ -522,6 +710,12 @@ def boot_acceptance_spine(
 
 def _identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
+
+
+def _conversation_language(role: AcceptanceRole) -> ConversationLanguageAdapter:
+    if role.conversation_language is None:
+        raise RuntimeError("Bot Assistant runtime has no language adapter")
+    return role.conversation_language
 
 
 def _envelope(

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,19 @@ from modules.contracts import (
     RawContractEnvelope,
     RuntimeRole,
 )
-from modules.ports import AcceptanceObservation, ConsumeResult, OutboxConflictError
+from modules.domain import (
+    ActiveChatView,
+    ConversationStage,
+    ConversationState,
+    LocaleSource,
+    TelegramMessage,
+)
+from modules.ports import (
+    AcceptanceObservation,
+    ConsumeResult,
+    ConversationAccessDeniedError,
+    OutboxConflictError,
+)
 
 
 class PostgresAcceptanceMigrator:
@@ -62,7 +75,11 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.telegram_presentations,
+            TRUNCATE football_runtime.bot_active_chat_views,
+                     football_runtime.bot_message_outbox,
+                     football_runtime.bot_updates,
+                     football_runtime.bot_users,
+                     football_runtime.telegram_presentations,
                      football_runtime.operator_alerts,
                      football_runtime.contract_inbox,
                      football_runtime.contract_outbox,
@@ -462,6 +479,363 @@ class PostgresRoleStore:
         except psycopg.errors.UniqueViolation as error:
             raise OutboxConflictError from error
 
+    @contextmanager
+    def serialize_conversation_update(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> Iterator[bool]:
+        """Serialize one Bot User transition before semantic interpretation."""
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute("SELECT pg_advisory_lock(%s)", (telegram_user_id,))
+            try:
+                processed = (
+                    connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.bot_updates
+                        WHERE update_id = %s
+                        """,
+                        (update_id,),
+                    ).fetchone()
+                    is not None
+                )
+                yield processed
+            finally:
+                connection.execute("SELECT pg_advisory_unlock(%s)", (telegram_user_id,))
+
+    def conversation_state(self, telegram_user_id: int) -> ConversationState | None:
+        """Read Bot Assistant-owned account presentation state."""
+        try:
+            with psycopg.connect(
+                self._database_url,
+                row_factory=dict_row,
+            ) as connection:
+                row = connection.execute(
+                    """
+                    SELECT telegram_user_id, locale, locale_source,
+                           last_seen_language_code, stage,
+                           screen_revision, revision
+                    FROM football_runtime.bot_users
+                    WHERE telegram_user_id = %s
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+        except psycopg.errors.InsufficientPrivilege as error:
+            raise ConversationAccessDeniedError from error
+        if row is None:
+            return None
+        source = row["locale_source"]
+        return ConversationState(
+            telegram_user_id=row["telegram_user_id"],
+            locale=row["locale"],
+            locale_source=LocaleSource(source) if source is not None else None,
+            last_seen_language_code=row["last_seen_language_code"],
+            stage=ConversationStage(row["stage"]),
+            screen_revision=row["screen_revision"],
+            revision=row["revision"],
+        )
+
+    def commit_conversation_update(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one Telegram update and its account-level state atomically."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, state.telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            source = state.locale_source.value if state.locale_source else None
+            if expected_revision == 0:
+                changed = connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_users (
+                        telegram_user_id, locale, locale_source,
+                        last_seen_language_code, stage, screen_revision,
+                        revision, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    RETURNING revision
+                    """,
+                    (
+                        state.telegram_user_id,
+                        state.locale,
+                        source,
+                        state.last_seen_language_code,
+                        state.stage.value,
+                        state.screen_revision,
+                        state.revision,
+                        recorded_at,
+                    ),
+                ).fetchone()
+            else:
+                changed = connection.execute(
+                    """
+                    UPDATE football_runtime.bot_users
+                    SET locale = %s,
+                        locale_source = %s,
+                        last_seen_language_code = %s,
+                        stage = %s,
+                        screen_revision = %s,
+                        revision = %s,
+                        updated_at = %s
+                    WHERE telegram_user_id = %s AND revision = %s
+                    RETURNING revision
+                    """,
+                    (
+                        state.locale,
+                        source,
+                        state.last_seen_language_code,
+                        state.stage.value,
+                        state.screen_revision,
+                        state.revision,
+                        recorded_at,
+                        state.telegram_user_id,
+                        expected_revision,
+                    ),
+                ).fetchone()
+            if changed is None:
+                msg = "Conversation Language state changed concurrently"
+                raise RuntimeError(msg)
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=state.telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    recorded_at,
+                ),
+            )
+            return True
+
+    def commit_conversation_presentation(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit a replay-safe presentation while preserving account state."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            current = connection.execute(
+                """
+                SELECT revision
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if current is None or current[0] != expected_revision:
+                msg = "Conversation Language state changed concurrently"
+                raise RuntimeError(msg)
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    recorded_at,
+                ),
+            )
+            return True
+
+    def current_conversation_message(
+        self, telegram_user_id: int
+    ) -> TelegramMessage | None:
+        """Read the desired payload for the account's current logical screen."""
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT outbox.delivery_id, outbox.telegram_user_id,
+                       outbox.display_locale, outbox.screen_revision,
+                       outbox.message_text, outbox.button_rows
+                FROM football_runtime.bot_message_outbox AS outbox
+                JOIN football_runtime.bot_users AS account
+                  ON account.telegram_user_id = outbox.telegram_user_id
+                 AND account.screen_revision = outbox.screen_revision
+                WHERE outbox.telegram_user_id = %s
+                  AND outbox.superseded_at IS NULL
+                ORDER BY outbox.sequence_id DESC
+                LIMIT 1
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+        return _telegram_message(row)
+
+    def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView | None:
+        """Read the last successfully activated account presentation."""
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT telegram_user_id, screen_revision, delivery_id,
+                       telegram_message_id
+                FROM football_runtime.bot_active_chat_views
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ActiveChatView(
+            telegram_user_id=row["telegram_user_id"],
+            screen_revision=row["screen_revision"],
+            delivery_id=row["delivery_id"],
+            telegram_message_id=row["telegram_message_id"],
+        )
+
+    def claim_conversation_message(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramMessage | None:
+        """Claim the oldest recoverable Bot API presentation."""
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(4040)")
+            row = connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = %s, claimed_at = %s
+                WHERE delivery_id = (
+                    SELECT delivery_id
+                    FROM football_runtime.bot_message_outbox
+                    WHERE delivered_at IS NULL
+                      AND superseded_at IS NULL
+                    ORDER BY sequence_id
+                    FOR UPDATE
+                    LIMIT 1
+                )
+                  AND (claim_token IS NULL OR claimed_at <= %s)
+                RETURNING delivery_id, telegram_user_id, display_locale,
+                          screen_revision,
+                          message_text, button_rows
+                """,
+                (claim_token, claimed_at, stale_before),
+            ).fetchone()
+        return _telegram_message(row)
+
+    def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
+        """Release a claim after a controlled external failure."""
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = NULL, claimed_at = NULL
+                WHERE claim_token = %s AND delivered_at IS NULL
+                """,
+                (claim_token,),
+            )
+
+    def mark_conversation_message_delivered(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        telegram_message_id: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Confirm an external delivery without changing conversation state."""
+        with psycopg.connect(self._database_url) as connection:
+            delivered = connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET delivered_at = COALESCE(delivered_at, %s),
+                    telegram_message_id = COALESCE(telegram_message_id, %s),
+                    claim_token = NULL,
+                    claimed_at = NULL
+                WHERE delivery_id = %s AND claim_token = %s
+                RETURNING telegram_user_id, screen_revision, superseded_at
+                """,
+                (delivered_at, telegram_message_id, delivery_id, claim_token),
+            ).fetchone()
+            if delivered is None:
+                raise RuntimeError("conversation presentation claim was lost")
+            telegram_user_id, screen_revision, superseded_at = delivered
+            if superseded_at is None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_active_chat_views (
+                        telegram_user_id, screen_revision, delivery_id,
+                        telegram_message_id, activated_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (telegram_user_id) DO UPDATE
+                    SET screen_revision = EXCLUDED.screen_revision,
+                        delivery_id = EXCLUDED.delivery_id,
+                        telegram_message_id = EXCLUDED.telegram_message_id,
+                        activated_at = EXCLUDED.activated_at
+                    """,
+                    (
+                        telegram_user_id,
+                        screen_revision,
+                        delivery_id,
+                        telegram_message_id,
+                        delivered_at,
+                    ),
+                )
+
     def attempt_owner_write(
         self,
         *,
@@ -499,6 +873,40 @@ class PostgresRoleStore:
                 )
             return False
         return True
+
+
+def _supersede_pending_conversation_messages(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    *,
+    telegram_user_id: int,
+    superseded_at: datetime,
+) -> None:
+    connection.execute(
+        """
+        UPDATE football_runtime.bot_message_outbox
+        SET superseded_at = %s
+        WHERE telegram_user_id = %s
+          AND delivered_at IS NULL
+          AND superseded_at IS NULL
+        """,
+        (superseded_at, telegram_user_id),
+    )
+
+
+def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
+    if row is None:
+        return None
+    return TelegramMessage(
+        delivery_id=row["delivery_id"],
+        telegram_user_id=row["telegram_user_id"],
+        display_locale=row["display_locale"],
+        screen_revision=row["screen_revision"],
+        text=row["message_text"],
+        button_rows=tuple(
+            tuple((button[0], button[1]) for button in button_row)
+            for button_row in row["button_rows"]
+        ),
+    )
 
 
 def runtime_database_url(

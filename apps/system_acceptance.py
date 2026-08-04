@@ -5,6 +5,7 @@ from __future__ import annotations
 from modules.contracts import RuntimeRole
 from modules.ports import (
     Clock,
+    ConversationLanguageAdapter,
     LocationResolverAdapter,
     ModelAdapter,
     TelegramDeliveryAdapter,
@@ -27,6 +28,7 @@ def boot_acceptance_role(
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
+    conversation_language: ConversationLanguageAdapter | None = None,
 ) -> AcceptanceRole:
     """Boot exactly one role with its own least-privilege database credential."""
     return AcceptanceRole(
@@ -37,4 +39,5 @@ def boot_acceptance_role(
         telegram_delivery=telegram_delivery,
         model=model,
         location_resolver=location_resolver,
+        conversation_language=conversation_language,
     )
