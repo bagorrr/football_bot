@@ -21,6 +21,7 @@ from modules.domain import (
     ActiveChatView,
     ConversationState,
     LanguageSelection,
+    TelegramDeliveryClaim,
     TelegramMessage,
 )
 
@@ -49,8 +50,24 @@ class TelegramDeliveryAdapter(Protocol):
         ...
 
     def send(self, message: TelegramMessage) -> str:
-        """Send one message and return its stable Telegram presentation identity."""
+        """Make the sole initial send and return its presentation identity.
+
+        Only a ``TelegramDeliveryPreEffectError`` proves that another initial
+        send is safe. Every other failure is an unknown external outcome.
+        """
         ...
+
+    def reconcile(self, message: TelegramMessage) -> str | None:
+        """Return a known accepted identity without sending, or ``None``."""
+        ...
+
+
+class TelegramDeliveryPreEffectError(RuntimeError):
+    """The adapter proves that no external Telegram effect occurred."""
+
+
+class TelegramDeliveryOutcomeUnknownError(RuntimeError):
+    """Telegram may have accepted a send whose identity was not returned."""
 
 
 class ModelAdapter(Protocol):
@@ -150,12 +167,32 @@ class ConversationStore(Protocol):
         claim_token: UUID,
         claimed_at: datetime,
         stale_before: datetime,
-    ) -> TelegramMessage | None:
-        """Claim the oldest recoverable Bot Assistant presentation."""
+    ) -> TelegramDeliveryClaim | None:
+        """Claim the oldest presentation with its safe send or reconcile mode."""
         ...
 
     def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
-        """Release one failed external delivery for immediate retry."""
+        """Release one pre-effect failure for a later send retry."""
+        ...
+
+    def mark_conversation_message_outcome_unknown(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Record that Telegram may have accepted the presentation."""
+        ...
+
+    def mark_conversation_message_reconciliation_required(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Stop automatic delivery and raise a body-free operator condition."""
         ...
 
     def mark_conversation_message_delivered(
@@ -271,6 +308,10 @@ class AcceptanceObserver(Protocol):
 
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free operator alert."""
+        ...
+
+    def unresolved_delivery_alerts(self) -> tuple[str, ...]:
+        """Observe body-free delivery identities requiring reconciliation."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:

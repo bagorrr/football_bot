@@ -7,9 +7,11 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Barrier, Event
+from uuid import uuid4
 
+import psycopg
 import pytest
 
 from modules.contracts import RuntimeRole
@@ -19,11 +21,14 @@ from modules.domain import (
     LocaleSource,
     TelegramMessage,
 )
+from modules.ports import TelegramDeliveryOutcomeUnknownError
+from modules.postgres_adapter import PostgresAcceptanceMigrator
 from modules.testkit import (
     AcceptanceSpine,
     ControlledTelegramDeliveryAdapter,
     FrozenClock,
     InjectedTelegramDeliveryError,
+    InjectedTelegramDeliveryInterruptionError,
     OwnershipViolationError,
     boot_acceptance_spine,
 )
@@ -409,6 +414,299 @@ class _BlockingTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
             if not self.release_delivery.wait(timeout=2):
                 raise TimeoutError("controlled Telegram delivery was not released")
         return super().send(message)
+
+
+class _AdjustableClock:
+    def __init__(self, instant: datetime) -> None:
+        self.instant = instant
+
+    def now(self) -> datetime:
+        return self.instant
+
+    def advance(self, delta: timedelta) -> None:
+        self.instant += delta
+
+
+def test_post_effect_interruption_reconciles_one_stable_presentation() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    user_id = 5_008
+    system.start_bot_user(
+        update_id="start-before-post-effect-interruption",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    first_view = system.active_conversation_view(user_id)
+    telegram_delivery.interrupt_after_next_effect()
+
+    with pytest.raises(InjectedTelegramDeliveryInterruptionError):
+        system.open_language_input(
+            update_id="open-before-post-effect-interruption",
+            telegram_user_id=user_id,
+        )
+
+    assert len(telegram_delivery.messages) == 2
+    assert system.active_conversation_view(user_id) == first_view
+
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+    clock.advance(timedelta(minutes=5))
+    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
+
+    assert len(telegram_delivery.messages) == 2
+    recovered_view = system.active_conversation_view(user_id)
+    assert recovered_view.delivery_id == (
+        "onboarding:open-before-post-effect-interruption"
+    )
+    assert recovered_view.telegram_message_id == "telegram-message:2"
+
+
+def test_lost_send_confirmation_reconciles_without_an_external_replay() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    user_id = 5_010
+    system.start_bot_user(
+        update_id="start-before-lost-confirmation",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    telegram_delivery.lose_next_confirmation()
+
+    with pytest.raises(TelegramDeliveryOutcomeUnknownError):
+        system.open_language_input(
+            update_id="open-before-lost-confirmation",
+            telegram_user_id=user_id,
+        )
+
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
+
+    assert len(telegram_delivery.messages) == 2
+    recovered_view = system.active_conversation_view(user_id)
+    assert recovered_view.delivery_id == "onboarding:open-before-lost-confirmation"
+    assert recovered_view.telegram_message_id == "telegram-message:2"
+
+
+class _UnreconcilableTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
+    def reconcile(self, message: TelegramMessage) -> str | None:
+        return None
+
+
+def test_unknown_delivery_without_reconciliation_stops_blind_resend() -> None:
+    telegram_delivery = _UnreconcilableTelegramDeliveryAdapter()
+    clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    user_id = 5_009
+    system.start_bot_user(
+        update_id="start-before-unreconcilable-delivery",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    telegram_delivery.interrupt_after_next_effect()
+
+    with pytest.raises(InjectedTelegramDeliveryInterruptionError):
+        system.open_language_input(
+            update_id="open-before-unreconcilable-delivery",
+            telegram_user_id=user_id,
+        )
+
+    clock.advance(timedelta(minutes=5))
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+    assert system.retry_bot_presentations() is False
+    assert system.retry_bot_presentations() is False
+
+    assert len(telegram_delivery.messages) == 2
+    assert system.unresolved_delivery_alerts() == (
+        "onboarding:open-before-unreconcilable-delivery",
+    )
+
+
+class _UnclassifiedPostEffectFailureAdapter(_UnreconcilableTelegramDeliveryAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lose_next_response = False
+
+    def lose_next_response(self) -> None:
+        self._lose_next_response = True
+
+    def send(self, message: TelegramMessage) -> str:
+        telegram_message_id = super().send(message)
+        if self._lose_next_response:
+            self._lose_next_response = False
+            raise RuntimeError("unclassified transport failure")
+        return telegram_message_id
+
+
+def test_unclassified_send_failure_defaults_to_unknown_without_resend() -> None:
+    telegram_delivery = _UnclassifiedPostEffectFailureAdapter()
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    user_id = 5_011
+    system.start_bot_user(
+        update_id="start-before-unclassified-failure",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    telegram_delivery.lose_next_response()
+
+    with pytest.raises(RuntimeError, match="unclassified transport failure"):
+        system.open_language_input(
+            update_id="open-before-unclassified-failure",
+            telegram_user_id=user_id,
+        )
+
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+    assert system.retry_bot_presentations() is False
+    assert system.retry_bot_presentations() is False
+
+    assert len(telegram_delivery.messages) == 2
+    assert system.unresolved_delivery_alerts() == (
+        "onboarding:open-before-unclassified-failure",
+    )
+
+
+def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    user_id = 5_012
+    system.start_bot_user(
+        update_id="start-before-superseded-unknown",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    telegram_delivery.interrupt_after_next_effect()
+    with pytest.raises(InjectedTelegramDeliveryInterruptionError):
+        system.open_language_input(
+            update_id="open-superseded-unknown",
+            telegram_user_id=user_id,
+        )
+
+    system.start_bot_user(
+        update_id="start-superseding-unknown",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    winning_view = system.active_conversation_view(user_id)
+    clock.advance(timedelta(minutes=5))
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+
+    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
+    assert len(telegram_delivery.messages) == 3
+    assert system.active_conversation_view(user_id) == winning_view
+
+
+def test_current_screen_precedes_superseded_reconciliation() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    user_id = 5_014
+    system.start_bot_user(
+        update_id="start-before-immediate-supersession",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    telegram_delivery.lose_next_confirmation()
+    with pytest.raises(TelegramDeliveryOutcomeUnknownError):
+        system.open_language_input(
+            update_id="open-before-immediate-supersession",
+            telegram_user_id=user_id,
+        )
+
+    system.start_bot_user(
+        update_id="start-immediately-superseding-unknown",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+
+    winning_view = system.active_conversation_view(user_id)
+    assert winning_view.delivery_id == (
+        "onboarding:start-immediately-superseding-unknown"
+    )
+    assert len(telegram_delivery.messages) == 3
+
+    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
+    assert system.active_conversation_view(user_id) == winning_view
+
+
+def test_migration_recovers_a_legacy_claim_as_outcome_unknown() -> None:
+    database_url = os.environ["TEST_DATABASE_URL"]
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=database_url,
+        clock=clock,
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    delivery_id = "onboarding:legacy-claimed-delivery"
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_users (
+                telegram_user_id, locale, locale_source,
+                last_seen_language_code, stage, screen_revision,
+                revision, updated_at
+            ) VALUES (
+                5013, 'en', 'telegram_hint', 'en',
+                'language_selection', 1, 1, %s
+            )
+            """,
+            (clock.now(),),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_message_outbox (
+                delivery_id, telegram_user_id, display_locale,
+                screen_revision, message_text, button_rows,
+                recorded_at, claim_token, claimed_at
+            ) VALUES (%s, 5013, 'en', 1, 'legacy payload', '[]', %s, %s, %s)
+            """,
+            (
+                delivery_id,
+                clock.now() - timedelta(minutes=10),
+                uuid4(),
+                clock.now() - timedelta(minutes=10),
+            ),
+        )
+
+    PostgresAcceptanceMigrator(database_url).migrate()
+
+    assert system.retry_bot_presentations() is False
+    assert telegram_delivery.messages == []
+    assert system.unresolved_delivery_alerts() == (delivery_id,)
 
 
 def test_competing_dispatchers_claim_one_pending_language_presentation() -> None:

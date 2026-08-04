@@ -21,6 +21,13 @@ class ConversationStage(StrEnum):
     DIRECTION_MENU = "direction_menu"
 
 
+class TelegramDeliveryMode(StrEnum):
+    """Safe external operation for one claimed presentation."""
+
+    SEND = "send"
+    RECONCILE = "reconcile"
+
+
 @dataclass(frozen=True, slots=True)
 class ConversationState:
     """Durable account-level Conversation Language state."""
@@ -48,6 +55,14 @@ class TelegramMessage:
     screen_revision: int
     text: str
     button_rows: tuple[ButtonRow, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramDeliveryClaim:
+    """One durable delivery claim and its safe external operation."""
+
+    message: TelegramMessage
+    mode: TelegramDeliveryMode
 
 
 @dataclass(frozen=True, slots=True)

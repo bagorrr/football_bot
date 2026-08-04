@@ -37,6 +37,8 @@ from modules.ports import (
     ModelAdapter,
     OutboxConflictError,
     TelegramDeliveryAdapter,
+    TelegramDeliveryOutcomeUnknownError,
+    TelegramDeliveryPreEffectError,
     TelegramIngestionAdapter,
 )
 
@@ -73,10 +75,23 @@ class ControlledTelegramDeliveryAdapter:
     presentations: list[str] = field(default_factory=list)
     messages: list[TelegramMessage] = field(default_factory=list)
     failures_remaining: int = 0
+    lost_confirmations_remaining: int = 0
+    interruptions_after_effect_remaining: int = 0
+    _delivery_ledger: dict[str, tuple[TelegramMessage, str]] = field(
+        default_factory=dict
+    )
 
     def fail_next(self) -> None:
-        """Inject one controlled Bot API delivery failure."""
+        """Inject one controlled failure before the external effect."""
         self.failures_remaining += 1
+
+    def lose_next_confirmation(self) -> None:
+        """Lose one response after Telegram accepts the external effect."""
+        self.lost_confirmations_remaining += 1
+
+    def interrupt_after_next_effect(self) -> None:
+        """Interrupt the process after one accepted external effect."""
+        self.interruptions_after_effect_remaining += 1
 
     def present(self, delivery_id: str) -> None:
         """Record one idempotent controlled presentation."""
@@ -84,12 +99,36 @@ class ControlledTelegramDeliveryAdapter:
             self.presentations.append(delivery_id)
 
     def send(self, message: TelegramMessage) -> str:
-        """Record one deterministic Bot Assistant message without Telegram."""
+        """Idempotently record one Bot Assistant message by delivery ID."""
         if self.failures_remaining:
             self.failures_remaining -= 1
             raise InjectedTelegramDeliveryError
+        recorded = self._delivery_ledger.get(message.delivery_id)
+        if recorded is not None:
+            recorded_message, telegram_message_id = recorded
+            if recorded_message != message:
+                raise ValueError("delivery ID was reused for a different message")
+            return telegram_message_id
         self.messages.append(message)
-        return f"telegram-message:{len(self.messages)}"
+        telegram_message_id = f"telegram-message:{len(self.messages)}"
+        self._delivery_ledger[message.delivery_id] = (message, telegram_message_id)
+        if self.interruptions_after_effect_remaining:
+            self.interruptions_after_effect_remaining -= 1
+            raise InjectedTelegramDeliveryInterruptionError
+        if self.lost_confirmations_remaining:
+            self.lost_confirmations_remaining -= 1
+            raise TelegramDeliveryOutcomeUnknownError
+        return telegram_message_id
+
+    def reconcile(self, message: TelegramMessage) -> str | None:
+        """Return the original identity without creating another presentation."""
+        recorded = self._delivery_ledger.get(message.delivery_id)
+        if recorded is None:
+            return None
+        recorded_message, telegram_message_id = recorded
+        if recorded_message != message:
+            raise ValueError("delivery ID was reused for a different message")
+        return telegram_message_id
 
 
 class ControlledModelAdapter:
@@ -166,8 +205,12 @@ class InjectedInterruptionError(RuntimeError):
     """A controlled process exit interrupted work after a durable commit."""
 
 
-class InjectedTelegramDeliveryError(RuntimeError):
+class InjectedTelegramDeliveryError(TelegramDeliveryPreEffectError):
     """A controlled Bot API failure left durable presentation work pending."""
+
+
+class InjectedTelegramDeliveryInterruptionError(BaseException):
+    """A process stopped after Telegram accepted an unconfirmed presentation."""
 
 
 @dataclass(slots=True)
@@ -521,6 +564,10 @@ class AcceptanceSpine:
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one durable body-free operator alert."""
         return self._observer.operator_alert(message_id)
+
+    def unresolved_delivery_alerts(self) -> tuple[str, ...]:
+        """Observe body-free delivery identities requiring reconciliation."""
+        return self._observer.unresolved_delivery_alerts()
 
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]

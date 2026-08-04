@@ -28,6 +28,8 @@ from modules.domain import (
     ConversationStage,
     ConversationState,
     LocaleSource,
+    TelegramDeliveryClaim,
+    TelegramDeliveryMode,
     TelegramMessage,
 )
 from modules.ports import (
@@ -76,6 +78,7 @@ class PostgresAcceptanceObserver:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
             TRUNCATE football_runtime.bot_active_chat_views,
+                     football_runtime.bot_delivery_alerts,
                      football_runtime.bot_message_outbox,
                      football_runtime.bot_updates,
                      football_runtime.bot_users,
@@ -132,6 +135,19 @@ class PostgresAcceptanceObserver:
             contract_version=row["contract_version"],
             failure_code=FailureCode(row["failure_code"]),
         )
+
+    def unresolved_delivery_alerts(self) -> tuple[str, ...]:
+        """Observe body-free delivery identities requiring reconciliation."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            rows = connection.execute(
+                """
+                SELECT delivery_id
+                FROM football_runtime.bot_delivery_alerts
+                WHERE resolved_at IS NULL
+                ORDER BY observed_at, delivery_id
+                """
+            ).fetchall()
+        return tuple(row[0] for row in rows)
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
@@ -748,8 +764,8 @@ class PostgresRoleStore:
         claim_token: UUID,
         claimed_at: datetime,
         stale_before: datetime,
-    ) -> TelegramMessage | None:
-        """Claim the oldest recoverable Bot API presentation."""
+    ) -> TelegramDeliveryClaim | None:
+        """Claim one safe initial send or reconciliation attempt."""
         with psycopg.connect(
             self._database_url,
             row_factory=dict_row,
@@ -757,36 +773,144 @@ class PostgresRoleStore:
             connection.execute("SELECT pg_advisory_xact_lock(4040)")
             row = connection.execute(
                 """
-                UPDATE football_runtime.bot_message_outbox
-                SET claim_token = %s, claimed_at = %s
-                WHERE delivery_id = (
-                    SELECT delivery_id
+                WITH candidate AS (
+                    SELECT delivery_id, delivery_status
                     FROM football_runtime.bot_message_outbox
                     WHERE delivered_at IS NULL
-                      AND superseded_at IS NULL
-                    ORDER BY sequence_id
+                      AND (
+                          (
+                              delivery_status = 'pending'
+                              AND claim_token IS NULL
+                              AND superseded_at IS NULL
+                          )
+                          OR (
+                              delivery_status = 'attempting'
+                              AND claimed_at <= %s
+                          )
+                          OR (
+                              delivery_status = 'outcome_unknown'
+                              AND (
+                                  claim_token IS NULL
+                                  OR claimed_at <= %s
+                              )
+                          )
+                      )
+                    ORDER BY (superseded_at IS NOT NULL), sequence_id
                     FOR UPDATE
                     LIMIT 1
                 )
-                  AND (claim_token IS NULL OR claimed_at <= %s)
-                RETURNING delivery_id, telegram_user_id, display_locale,
-                          screen_revision,
-                          message_text, button_rows
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = %s, claimed_at = %s
+                    , delivery_status = CASE
+                        WHEN candidate.delivery_status = 'pending'
+                        THEN 'attempting'
+                        ELSE 'outcome_unknown'
+                      END
+                    , outcome_unknown_at = CASE
+                        WHEN candidate.delivery_status = 'attempting'
+                        THEN COALESCE(outcome_unknown_at, %s)
+                        ELSE outcome_unknown_at
+                      END
+                FROM candidate
+                WHERE bot_message_outbox.delivery_id = candidate.delivery_id
+                RETURNING bot_message_outbox.delivery_id,
+                          bot_message_outbox.telegram_user_id,
+                          bot_message_outbox.display_locale,
+                          bot_message_outbox.screen_revision,
+                          bot_message_outbox.message_text,
+                          bot_message_outbox.button_rows,
+                          candidate.delivery_status AS prior_delivery_status
                 """,
-                (claim_token, claimed_at, stale_before),
+                (stale_before, stale_before, claim_token, claimed_at, claimed_at),
             ).fetchone()
-        return _telegram_message(row)
+        message = _telegram_message(row)
+        if message is None or row is None:
+            return None
+        mode = (
+            TelegramDeliveryMode.SEND
+            if row["prior_delivery_status"] == "pending"
+            else TelegramDeliveryMode.RECONCILE
+        )
+        return TelegramDeliveryClaim(message=message, mode=mode)
 
     def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
-        """Release a claim after a controlled external failure."""
+        """Release a claim after a known pre-effect failure."""
         with psycopg.connect(self._database_url) as connection:
             connection.execute(
                 """
                 UPDATE football_runtime.bot_message_outbox
-                SET claim_token = NULL, claimed_at = NULL
-                WHERE claim_token = %s AND delivered_at IS NULL
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    delivery_status = 'pending'
+                WHERE claim_token = %s
+                  AND delivered_at IS NULL
+                  AND delivery_status = 'attempting'
                 """,
                 (claim_token,),
+            )
+
+    def mark_conversation_message_outcome_unknown(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Keep an accepted-or-not delivery recoverable only by reconciliation."""
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    delivery_status = 'outcome_unknown',
+                    outcome_unknown_at = COALESCE(outcome_unknown_at, %s)
+                WHERE delivery_id = %s
+                  AND claim_token = %s
+                  AND delivered_at IS NULL
+                RETURNING delivery_id
+                """,
+                (observed_at, delivery_id, claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("conversation presentation claim was lost")
+
+    def mark_conversation_message_reconciliation_required(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Stop blind retry and expose one body-free delivery alert."""
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    delivery_status = 'reconciliation_required',
+                    reconciliation_required_at = COALESCE(
+                        reconciliation_required_at,
+                        %s
+                    )
+                WHERE delivery_id = %s
+                  AND claim_token = %s
+                  AND delivered_at IS NULL
+                RETURNING delivery_id
+                """,
+                (observed_at, delivery_id, claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("conversation presentation claim was lost")
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_delivery_alerts (
+                    delivery_id, failure_code, observed_at
+                ) VALUES (%s, 'outcome_unknown_unreconciled', %s)
+                ON CONFLICT (delivery_id) DO NOTHING
+                """,
+                (delivery_id, observed_at),
             )
 
     def mark_conversation_message_delivered(
@@ -805,7 +929,8 @@ class PostgresRoleStore:
                 SET delivered_at = COALESCE(delivered_at, %s),
                     telegram_message_id = COALESCE(telegram_message_id, %s),
                     claim_token = NULL,
-                    claimed_at = NULL
+                    claimed_at = NULL,
+                    delivery_status = 'confirmed'
                 WHERE delivery_id = %s AND claim_token = %s
                 RETURNING telegram_user_id, screen_revision, superseded_at
                 """,
@@ -814,6 +939,14 @@ class PostgresRoleStore:
             if delivered is None:
                 raise RuntimeError("conversation presentation claim was lost")
             telegram_user_id, screen_revision, superseded_at = delivered
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_delivery_alerts
+                SET resolved_at = COALESCE(resolved_at, %s)
+                WHERE delivery_id = %s
+                """,
+                (delivered_at, delivery_id),
+            )
             if superseded_at is None:
                 connection.execute(
                     """

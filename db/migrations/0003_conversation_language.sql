@@ -43,7 +43,18 @@ CREATE TABLE IF NOT EXISTS football_runtime.bot_message_outbox (
     claimed_at timestamptz,
     superseded_at timestamptz,
     telegram_message_id text,
-    delivered_at timestamptz
+    delivered_at timestamptz,
+    delivery_status text NOT NULL DEFAULT 'pending' CHECK (
+        delivery_status IN (
+            'pending',
+            'attempting',
+            'outcome_unknown',
+            'reconciliation_required',
+            'confirmed'
+        )
+    ),
+    outcome_unknown_at timestamptz,
+    reconciliation_required_at timestamptz
 );
 
 ALTER TABLE football_runtime.bot_message_outbox
@@ -53,7 +64,48 @@ ALTER TABLE football_runtime.bot_message_outbox
     ADD COLUMN IF NOT EXISTS claim_token uuid,
     ADD COLUMN IF NOT EXISTS claimed_at timestamptz,
     ADD COLUMN IF NOT EXISTS superseded_at timestamptz,
-    ADD COLUMN IF NOT EXISTS telegram_message_id text;
+    ADD COLUMN IF NOT EXISTS telegram_message_id text,
+    ADD COLUMN IF NOT EXISTS delivery_status text NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS outcome_unknown_at timestamptz,
+    ADD COLUMN IF NOT EXISTS reconciliation_required_at timestamptz;
+
+UPDATE football_runtime.bot_message_outbox
+SET delivery_status = 'confirmed'
+WHERE delivered_at IS NOT NULL
+  AND delivery_status = 'pending';
+
+UPDATE football_runtime.bot_message_outbox
+SET delivery_status = 'outcome_unknown',
+    outcome_unknown_at = COALESCE(
+        outcome_unknown_at,
+        claimed_at,
+        recorded_at
+    )
+WHERE delivered_at IS NULL
+  AND claim_token IS NOT NULL
+  AND delivery_status = 'pending';
+
+DO $delivery_status_constraint$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'bot_message_outbox_delivery_status_check'
+          AND conrelid = 'football_runtime.bot_message_outbox'::regclass
+    ) THEN
+        ALTER TABLE football_runtime.bot_message_outbox
+            ADD CONSTRAINT bot_message_outbox_delivery_status_check CHECK (
+                delivery_status IN (
+                    'pending',
+                    'attempting',
+                    'outcome_unknown',
+                    'reconciliation_required',
+                    'confirmed'
+                )
+            );
+    END IF;
+END
+$delivery_status_constraint$;
 
 CREATE TABLE IF NOT EXISTS football_runtime.bot_active_chat_views (
     owner_role text NOT NULL DEFAULT 'bot_assistant'
@@ -65,6 +117,17 @@ CREATE TABLE IF NOT EXISTS football_runtime.bot_active_chat_views (
     activated_at timestamptz NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS football_runtime.bot_delivery_alerts (
+    owner_role text NOT NULL DEFAULT 'bot_assistant'
+        CHECK (owner_role = 'bot_assistant'),
+    delivery_id text PRIMARY KEY,
+    failure_code text NOT NULL CHECK (
+        failure_code = 'outcome_unknown_unreconciled'
+    ),
+    observed_at timestamptz NOT NULL,
+    resolved_at timestamptz
+);
+
 ALTER TABLE football_runtime.bot_users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_users FORCE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_updates ENABLE ROW LEVEL SECURITY;
@@ -73,6 +136,8 @@ ALTER TABLE football_runtime.bot_message_outbox ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_message_outbox FORCE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_active_chat_views ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_active_chat_views FORCE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.bot_delivery_alerts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.bot_delivery_alerts FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS bot_users_owner ON football_runtime.bot_users;
 CREATE POLICY bot_users_owner ON football_runtime.bot_users
@@ -122,6 +187,19 @@ CREATE POLICY bot_active_chat_views_owner
         AND owner_role = 'bot_assistant'
     );
 
+DROP POLICY IF EXISTS bot_delivery_alerts_owner
+    ON football_runtime.bot_delivery_alerts;
+CREATE POLICY bot_delivery_alerts_owner
+    ON football_runtime.bot_delivery_alerts
+    USING (
+        football_runtime.current_runtime_role() = 'bot_assistant'
+        AND owner_role = 'bot_assistant'
+    )
+    WITH CHECK (
+        football_runtime.current_runtime_role() = 'bot_assistant'
+        AND owner_role = 'bot_assistant'
+    );
+
 GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_users
     TO football_bot_assistant;
 GRANT SELECT, INSERT ON football_runtime.bot_updates
@@ -129,4 +207,6 @@ GRANT SELECT, INSERT ON football_runtime.bot_updates
 GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_message_outbox
     TO football_bot_assistant;
 GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_active_chat_views
+    TO football_bot_assistant;
+GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_delivery_alerts
     TO football_bot_assistant;

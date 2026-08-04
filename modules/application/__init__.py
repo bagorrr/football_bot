@@ -14,6 +14,7 @@ from modules.domain import (
     ConversationState,
     LanguageSelection,
     LocaleSource,
+    TelegramDeliveryMode,
     TelegramMessage,
 )
 from modules.ports import (
@@ -21,6 +22,7 @@ from modules.ports import (
     ConversationLanguageAdapter,
     ConversationStore,
     TelegramDeliveryAdapter,
+    TelegramDeliveryPreEffectError,
 )
 
 SUPPORTED_LOCALES = frozenset({"en", "es", "fr", "ru"})
@@ -707,18 +709,45 @@ class ConversationOnboarding:
         """Retry one durable Bot API presentation and confirm its success."""
         claim_token = uuid4()
         claimed_at = self._clock.now()
-        message = self._store.claim_conversation_message(
+        claim = self._store.claim_conversation_message(
             claim_token=claim_token,
             claimed_at=claimed_at,
             stale_before=claimed_at - timedelta(minutes=5),
         )
-        if message is None:
+        if claim is None:
             return False
-        try:
-            telegram_message_id = self._telegram_delivery.send(message)
-        except Exception:
-            self._store.release_conversation_message_claim(claim_token=claim_token)
-            raise
+        message = claim.message
+        if claim.mode is TelegramDeliveryMode.SEND:
+            try:
+                telegram_message_id = self._telegram_delivery.send(message)
+            except TelegramDeliveryPreEffectError:
+                self._store.release_conversation_message_claim(claim_token=claim_token)
+                raise
+            except Exception:
+                self._store.mark_conversation_message_outcome_unknown(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                raise
+        else:
+            try:
+                reconciled_message_id = self._telegram_delivery.reconcile(message)
+            except Exception:
+                self._store.mark_conversation_message_outcome_unknown(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                raise
+            if reconciled_message_id is None:
+                self._store.mark_conversation_message_reconciliation_required(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                return False
+            telegram_message_id = reconciled_message_id
         self._store.mark_conversation_message_delivered(
             delivery_id=message.delivery_id,
             claim_token=claim_token,
