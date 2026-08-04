@@ -1,0 +1,209 @@
+# Ticket Orchestration
+
+This document is the normative operating policy for coordinating implementation
+tickets. GitHub remains the durable source of truth for specifications, native
+dependencies, tickets, pull requests, checks, reviews, and transition records.
+Codex callbacks wake a coordinator; they never replace GitHub reconciliation.
+
+## Ownership and activation
+
+Exactly one ticket-level coordinator owns one implementation ticket. A
+coordinator must not own a second ticket, and no ticket may have two
+coordinators. Multiple live frontiers may have separate coordinators only when
+the current native dependency graph permits those frontiers to proceed in
+parallel.
+
+The coordinator that completes a ticket creates the next coordinator. It may
+do so only after all of these facts are durable and verified:
+
+1. the authorized implementation pull request was merged and the merge was
+   verified;
+2. the implementation ticket was closed or otherwise reconciled, with a
+   completion record on its canonical GitHub artifact; and
+3. the `quality` run for the exact merge commit on `main` succeeded.
+
+The completing coordinator then recomputes the native dependency graph and
+automatically creates one fresh coordinator for each permitted next frontier.
+Each new coordinator receives a structured handoff naming the specification,
+ticket, dependency state, exact `main`, completed predecessors and artifacts,
+applicable authorization state, required credentials or services, and known
+scope constraints.
+
+A new coordinator initially has read-only readiness authority. It reconciles
+routing, exact `main`, the live frontier, required credentials and services,
+the applicability of any standing authorization, GitHub transition records,
+branches and pull requests, and active Codex tasks. It then stops and waits for
+an unambiguous product-owner start approval that either names the ticket or is
+exactly `Согласен` or `Утверждаю`.
+
+Before that approval, the coordinator must not:
+
+- claim or assign the ticket;
+- dispatch implementation, review, or fix work;
+- create or change a branch or pull request;
+- change GitHub state, the repository, or any external system; or
+- infer approval from the handoff, readiness result, silence, or an earlier
+  ticket's authorization.
+
+Each parallel frontier requires its own coordinator and its own start
+approval.
+
+## Automatic ticket lifecycle after approval
+
+One valid start approval authorizes the coordinator to drive the following
+ticket lifecycle without asking the product owner to relay handoffs or approve
+ordinary transitions:
+
+1. Reconcile durable state and claim the ticket.
+2. Create a fresh implementation task and worktree using `gpt-5.6-sol` with
+   reasoning effort `high`; require one dedicated `codex/` branch and one
+   non-draft implementation pull request containing `Closes #<ticket>`.
+3. Receive the implementation task's terminal callback only after its durable
+   GitHub status is published.
+4. Reconcile the callback against GitHub, the native graph, durable transition
+   comments, branches and pull requests, and active Codex tasks.
+5. After successful exact-head CI, dispatch a fresh independent review that
+   evaluates Standards and specification fidelity separately.
+6. If a blocking finding exists, dispatch a separate fresh fix task scoped to
+   the published finding. After every fix commit, require exact-head CI and a
+   fresh independent Standards and Spec review of the complete pull-request
+   diff. Repeat until no blocking finding remains or a stop condition applies.
+7. Immediately before merge, revalidate every gate for the exact current head,
+   including the applicable product-owner merge authorization. Merge only
+   when all exact-head gates are valid.
+8. Verify the merge and ticket closure or reconcile them explicitly, publish
+   the completion record, and wait for successful `quality` on the exact merge
+   commit on `main`.
+9. Recompute the native graph and create the fresh next-frontier coordinators
+   permitted by it.
+
+Every implementation, independent-review, and fix task is fresh and uses
+`gpt-5.6-sol` with reasoning effort `high`. Review and fix tasks receive only
+the branch and mutation authority required by their stage; an independent
+review remains read-only.
+
+Every new commit invalidates prior exact-head CI, mergeability, review-thread
+counts, Standards review, Spec review, and merge-authorization revalidation.
+No earlier review or check may be carried forward to the new head.
+
+Non-blocking heuristic smells do not block delivery. They also grant no
+authority to change scope, refactor, create a ticket, or alter dependencies.
+
+## Idempotency and reconciliation
+
+Use this idempotency key for each coordination transition:
+
+```text
+<spec>:<ticket>:<stage>:<base-or-head>
+```
+
+Before every dispatch or mutation, the coordinator must reconcile:
+
+- the canonical GitHub issue and pull-request state;
+- the live native dependency graph;
+- durable transition and completion comments;
+- current remote branches and pull requests; and
+- active Codex tasks and their ownership.
+
+If the intended transition is already durable or its task is already active,
+the coordinator exits that transition without duplicating it. A callback is a
+wake-up signal, not evidence that the reported transition is still current.
+
+## Terminal task callbacks
+
+Every implementation, review, and fix task follows one terminal reporting
+sequence:
+
+1. Publish its terminal status to the canonical GitHub issue or pull request.
+2. Send exactly one `codex_app__send_message_to_thread` callback to the dynamic
+   `<COORDINATOR_THREAD_ID>` and `<COORDINATOR_HOST_ID>` supplied in its
+   handoff.
+3. End without a progress callback, a retry after a successful send, or a
+   request that the product owner relay the result.
+
+The callback must include:
+
+- task kind and terminal status;
+- specification, ticket, and pull request;
+- fixed base and exact head;
+- commit list;
+- local and hosted check results;
+- mergeability;
+- total and unresolved review-thread counts;
+- separate Standards and Spec findings;
+- the durable artifact URL;
+- whether a new commit appeared after verification;
+- scope deviations; and
+- the exact next coordinator action.
+
+GitHub is authoritative if a callback and durable state disagree. The
+coordinator must not accept progress callbacks, hard-coded coordinator IDs in
+repository documentation, duplicate terminal callbacks, or product-owner
+relay as substitutes for this protocol.
+
+## One-shot heartbeat
+
+One idempotent coordinator heartbeat is permitted only when the active turn
+cannot keep waiting and a terminal callback cannot continue the lifecycle. It
+must use a supported platform mechanism, reconcile durable state before any
+action, use the transition idempotency key, and exit when no transition is
+needed.
+
+The heartbeat is one-shot. It must never become a cron job, recurring reminder,
+repository automation, Git hook, scheduler, daemon, state file, or duplicate
+Codex task.
+
+## Merge authorization and standing authorization
+
+An implementation pull request may merge only when, for its exact current
+head:
+
+- `quality` succeeded;
+- GitHub reports it mergeable without conflicts;
+- independent Standards review has no blocking finding;
+- independent Spec review has no blocking finding;
+- no review thread is unresolved; and
+- the applicable product-owner merge authorization has been revalidated.
+
+A specification-level standing authorization is applicable only when a
+durable GitHub amendment freezes the existing tickets it covers. It excludes
+later-created tickets, material scope or dependency changes, process-document
+pull requests, release readiness, and deployment. If it does not apply, the
+current exact authorization rule remains in force.
+
+For Specification #38, no standing authorization is active until a later
+durable GitHub amendment is published after independent review. The
+[current delivery amendment](https://github.com/bagorrr/football_bot/issues/38#issuecomment-5153808765)
+remains authoritative until then. Ticket #42 remains on its in-flight workflow;
+this fresh coordinator and readiness boundary begins with the next ticket
+after #42.
+
+Release readiness and production deployment are separate lifecycle stages and
+always require explicit product-owner authorization. No start approval or
+standing implementation-merge authorization permits deployment.
+
+## Test-first evidence
+
+Implementation tasks use one public-seam test at a time, red then minimal
+green. Refactor during review, not within red→green. Only then take the next
+test.
+
+The terminal implementation status includes concise red→green evidence for
+each material slice. It must not publish large logs, secrets, credentials,
+personal data, or other sensitive content.
+
+## Stop conditions
+
+The coordinator stops and requests the required product-owner decision or
+authority when it encounters:
+
+- a genuine product decision;
+- an unavailable required credential or service;
+- a repeated or unfixable gate failure;
+- a specification or Accepted ADR conflict;
+- work that requires a new ticket;
+- a material scope or dependency change; or
+- release-readiness or deployment authorization.
+
+It must not use a stop condition to authorize a workaround, silently change
+the graph, or expand an implementation ticket.

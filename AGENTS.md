@@ -18,6 +18,13 @@ Before starting and before finishing work that advances product grilling,
 Wayfinder, specification, ticketing, implementation, review, release, or
 production deployment, read `docs/agents/delivery-handoffs.md`.
 
+Implementation-ticket coordination must also follow the normative policy in
+`docs/agents/ticket-orchestration.md`. A fresh ticket coordinator is read-only
+until the product owner gives the required unambiguous start approval. Before
+every dispatch or mutation, reconcile GitHub, native dependencies, durable
+transition records, branches and pull requests, and active Codex tasks; never
+create a duplicate coordinator or task.
+
 Do not cross a fresh-thread boundary defined there. When a task reaches or
 stops at a lifecycle gate, end the final response with the required
 `Next handoff` block and a paste-ready prompt for the correct next thread.
