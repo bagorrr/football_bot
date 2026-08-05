@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -29,6 +29,7 @@ from modules.domain import (
     GeographicType,
     GeographyConfirmationEvent,
     LanguageSelection,
+    LocaleSource,
     LocationCandidate,
     LocationInterpretation,
     LocationResolution,
@@ -156,6 +157,7 @@ class ControlledLocationResolverAdapter:
         default_factory=dict
     )
     _failures: set[tuple[ConversationStage, str]] = field(default_factory=set)
+    queries: list[LocationResolutionQuery] = field(default_factory=list)
 
     def return_for(
         self,
@@ -177,6 +179,7 @@ class ControlledLocationResolverAdapter:
 
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
         """Resolve deterministic acceptance phrases without provider access."""
+        self.queries.append(query)
         country_label = {
             "en": "Russia",
             "ru": "Россия",
@@ -189,6 +192,18 @@ class ControlledLocationResolverAdapter:
             "es": "San Petersburgo",
             "fr": "Saint-Pétersbourg",
         }.get(query.locale, "Saint Petersburg")
+        country_labels = (
+            ("en", "Russia"),
+            ("ru", "Россия"),
+            ("es", "Rusia"),
+            ("fr", "Russie"),
+        )
+        city_labels = (
+            ("en", "Saint Petersburg"),
+            ("ru", "Санкт-Петербург"),
+            ("es", "San Petersburgo"),
+            ("fr", "Saint-Pétersbourg"),
+        )
         key = (query.stage, query.text)
         if key in self._failures:
             raise LocationResolverError("controlled resolver failure")
@@ -215,6 +230,7 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone=None,
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=country_labels,
                             ),
                         ),
                     ),
@@ -241,6 +257,7 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone="Europe/Moscow",
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=city_labels,
                             ),
                         ),
                     ),
@@ -263,6 +280,12 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone=None,
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=(
+                                    ("en", "Georgia"),
+                                    ("ru", "Грузия"),
+                                    ("es", "Georgia"),
+                                    ("fr", "Géorgie"),
+                                ),
                             ),
                         ),
                     ),
@@ -282,6 +305,24 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone=None,
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=(
+                                    (
+                                        "en",
+                                        "South Georgia and the South Sandwich Islands",
+                                    ),
+                                    (
+                                        "ru",
+                                        "Южная Георгия и Южные Сандвичевы Острова",
+                                    ),
+                                    (
+                                        "es",
+                                        "Islas Georgias del Sur y Sandwich del Sur",
+                                    ),
+                                    (
+                                        "fr",
+                                        "Géorgie du Sud-et-les îles Sandwich du Sud",
+                                    ),
+                                ),
                             ),
                         ),
                     ),
@@ -309,6 +350,7 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone="Europe/Moscow",
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=city_labels,
                             ),
                         ),
                         whole_city=True,
@@ -345,6 +387,12 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone=None,
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=(
+                                    ("en", "Komendantsky Prospekt"),
+                                    ("ru", "Комендантский проспект"),
+                                    ("es", "Prospekt Komendantski"),
+                                    ("fr", "Prospekt Komendantski"),
+                                ),
                             ),
                             LocationCandidate(
                                 place_id="district:ru:spb:primorsky",
@@ -362,6 +410,12 @@ class ControlledLocationResolverAdapter:
                                 iana_timezone=None,
                                 resolver_version="controlled-resolver-v1",
                                 glossary_version="controlled-glossary-v1",
+                                localized_display_names=(
+                                    ("en", "Primorsky District"),
+                                    ("ru", "Приморский район"),
+                                    ("es", "Distrito Primorski"),
+                                    ("fr", "District Primorski"),
+                                ),
                             ),
                         ),
                     ),
@@ -846,6 +900,50 @@ class AcceptanceSpine:
             ),
         )
 
+    def change_controlled_conversation_language(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        locale: str,
+    ) -> None:
+        """Persist an account-language change before current-screen re-rendering."""
+        role = self._roles[RuntimeRole.BOT_ASSISTANT]
+        current = self.conversation_state(telegram_user_id)
+        draft = self.discovery_draft(telegram_user_id)
+        now = role.clock.now()
+        state = replace(
+            current,
+            locale=locale,
+            locale_source=LocaleSource.EXPLICIT,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        changed_draft = replace(
+            draft,
+            screen_revision=state.screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        committed = role.store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=TelegramMessage(
+                delivery_id=f"controlled-language:{update_id}",
+                telegram_user_id=telegram_user_id,
+                display_locale=locale,
+                screen_revision=state.screen_revision,
+                text="Controlled Conversation Language changed.",
+                button_rows=(),
+            ),
+            recorded_at=now,
+            draft=changed_draft,
+        )
+        if not committed:
+            raise RuntimeError("controlled language change was replayed")
+        self.retry_bot_presentations()
+
     def open_language_input(
         self,
         *,
@@ -901,6 +999,56 @@ class AcceptanceSpine:
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
         )
+
+    def accept_controlled_required_date(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+    ) -> None:
+        """Advance a date-required flow after controlled date validation."""
+        role = self._roles[RuntimeRole.BOT_ASSISTANT]
+        current = self.conversation_state(telegram_user_id)
+        draft = self.discovery_draft(telegram_user_id)
+        if (
+            current.stage is not ConversationStage.REQUIRED_DATE
+            or draft.stage is not ConversationStage.REQUIRED_DATE
+        ):
+            raise RuntimeError(
+                "controlled date acceptance requires required-date stage"
+            )
+        now = role.clock.now()
+        state = replace(
+            current,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        changed_draft = replace(
+            draft,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=state.screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        committed = role.store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=TelegramMessage(
+                delivery_id=f"controlled-date:{update_id}",
+                telegram_user_id=telegram_user_id,
+                display_locale=current.locale or "en",
+                screen_revision=state.screen_revision,
+                text="Controlled required date accepted.",
+                button_rows=(),
+            ),
+            recorded_at=now,
+            draft=changed_draft,
+        )
+        if not committed:
+            raise RuntimeError("controlled date acceptance was replayed")
+        self.retry_bot_presentations()
 
     def submit_location_text(
         self,

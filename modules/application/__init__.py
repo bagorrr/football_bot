@@ -657,10 +657,22 @@ _SEARCH_AREA_RESOLUTION_COPY = {
 }
 
 _REQUIRED_DATE_COPY = {
-    "en": "📅 When?\n\nType a date or range in your own words.",
-    "ru": "📅 Когда?\n\nНапишите дату или период своими словами.",
-    "es": "📅 ¿Cuándo?\n\nEscriba una fecha o periodo con sus palabras.",
-    "fr": "📅 Quand ?\n\nSaisissez une date ou une période avec vos mots.",
+    "en": (
+        "📅 When?\n\nType a date or range in your own words — for example, "
+        "“tomorrow”, “on Saturday”, or “August 5–7”."
+    ),
+    "ru": (
+        "📅 Когда?\n\nНапишите дату или период своими словами — например: "
+        "«завтра», «в субботу» или «с 5 по 7 августа»."
+    ),
+    "es": (
+        "📅 ¿Cuándo?\n\nEscriba una fecha o periodo con sus palabras — por "
+        "ejemplo, «mañana», «el sábado» o «del 5 al 7 de agosto»."
+    ),
+    "fr": (
+        "📅 Quand ?\n\nSaisissez une date ou une période avec vos mots — par "
+        "exemple « demain », « samedi » ou « du 5 au 7 août »."
+    ),
 }
 
 _POST_CORE_COPY = {
@@ -1354,17 +1366,27 @@ class ConversationOnboarding:
                 outcome=_ResolutionOutcome.FAILURE,
             )
             return
-        candidates = tuple(
+        raw_candidates = tuple(
             interpretation.places[0]
             for interpretation in resolution.interpretations
             if len(interpretation.places) == 1
             and _valid_country(interpretation.places[0])
         )
+        candidates = _deduplicate_location_candidates(raw_candidates)
+        if candidates is None:
+            self._queue_country_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                outcome=_ResolutionOutcome.INVALID,
+            )
+            return
         if len(candidates) > 1:
             self._queue_country_ambiguity(
                 update_id=update_id,
                 current=current,
-                candidates=tuple(candidate.display_name for candidate in candidates),
+                candidates=tuple(
+                    _location_label(candidate, locale) for candidate in candidates
+                ),
             )
             return
         if not candidates:
@@ -1544,12 +1566,21 @@ class ConversationOnboarding:
                 outcome=_ResolutionOutcome.FAILURE,
             )
             return
-        candidates = tuple(
+        raw_candidates = tuple(
             interpretation.places[0]
             for interpretation in resolution.interpretations
             if len(interpretation.places) == 1
             and _valid_city(interpretation.places[0], draft.country)
         )
+        candidates = _deduplicate_location_candidates(raw_candidates)
+        if candidates is None:
+            self._queue_city_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                country=draft.country,
+                outcome=_ResolutionOutcome.INVALID,
+            )
+            return
         if len(candidates) > 1:
             self._queue_city_resolution_feedback(
                 update_id=update_id,
@@ -1598,7 +1629,7 @@ class ConversationOnboarding:
             display_locale=locale,
             screen_revision=current.screen_revision,
             text=_CITY_RESOLUTION_COPY[copy_locale][outcome].format(
-                country=country.display_name,
+                country=_location_label(country, copy_locale),
                 candidates=_format_city_candidates(copy_locale, candidates),
             ),
             button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
@@ -1704,7 +1735,7 @@ class ConversationOnboarding:
                 outcome=_ResolutionOutcome.FAILURE,
             )
             return
-        validated = tuple(
+        raw_validated = tuple(
             (interpretation, accepted_areas)
             for interpretation in resolution.interpretations
             if (
@@ -1716,6 +1747,15 @@ class ConversationOnboarding:
             )
             is not None
         )
+        validated = _deduplicate_search_areas(raw_validated)
+        if validated is None:
+            self._queue_search_area_resolution_feedback(
+                update_id=update_id,
+                current=current,
+                city=draft.city,
+                outcome=_ResolutionOutcome.INVALID,
+            )
+            return
         if len(validated) > 1:
             self._queue_search_area_resolution_feedback(
                 update_id=update_id,
@@ -1822,7 +1862,7 @@ class ConversationOnboarding:
             display_locale=locale,
             screen_revision=current.screen_revision,
             text=_SEARCH_AREA_RESOLUTION_COPY[copy_locale][outcome].format(
-                city=city.display_name
+                city=_location_label(city, copy_locale)
             ),
             button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
         )
@@ -1970,12 +2010,19 @@ class ConversationOnboarding:
         locale = current.locale
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
-        geography_stage = {
-            ConversationStage.REQUIRED_DATE: ConversationStage.SEARCH_AREA,
-            ConversationStage.POST_CORE: ConversationStage.SEARCH_AREA,
-            ConversationStage.SEARCH_AREA: ConversationStage.CITY,
-            ConversationStage.CITY: ConversationStage.COUNTRY,
-        }.get(draft.stage)
+        geography_stage: ConversationStage | None
+        if draft.stage is ConversationStage.POST_CORE:
+            geography_stage = (
+                ConversationStage.REQUIRED_DATE
+                if draft.user_intent in _DATE_REQUIRED_INTENTS
+                else ConversationStage.SEARCH_AREA
+            )
+        else:
+            geography_stage = {
+                ConversationStage.REQUIRED_DATE: ConversationStage.SEARCH_AREA,
+                ConversationStage.SEARCH_AREA: ConversationStage.CITY,
+                ConversationStage.CITY: ConversationStage.COUNTRY,
+            }.get(draft.stage)
         if geography_stage is not None:
             if draft.user_intent is None:
                 raise RuntimeError("geography stage has no confirmed User Intent")
@@ -2022,6 +2069,19 @@ class ConversationOnboarding:
                     screen_revision=state.screen_revision,
                     country=draft.country,
                     suggestion=suggestion,
+                )
+            elif geography_stage is ConversationStage.REQUIRED_DATE:
+                if draft.city is None:
+                    raise AssertionError("required date stage has no confirmed city")
+                message = _required_date_message(
+                    update_id=update_id,
+                    telegram_user_id=current.telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
                 )
             else:
                 if draft.city is None:
@@ -2405,7 +2465,8 @@ def _format_city_candidates(
     locale: str, candidates: tuple[LocationCandidate, ...]
 ) -> str:
     labels = tuple(
-        f"{candidate.display_name} ({' → '.join(candidate.parent_display_names)})"
+        f"{_location_label(candidate, locale)} "
+        f"({' → '.join(candidate.parent_display_names)})"
         for candidate in candidates
     )
     return _format_list(locale, labels)
@@ -2427,6 +2488,123 @@ def _accept_location(
         iana_timezone=location.iana_timezone,
         resolver_version=location.resolver_version,
         glossary_version=location.glossary_version,
+        localized_display_names=location.localized_display_names,
+    )
+
+
+def _location_label(
+    location: LocationCandidate | AcceptedLocation,
+    locale: str,
+) -> str:
+    labels = dict(location.localized_display_names)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    return labels.get(copy_locale, location.display_name)
+
+
+def _merge_location_candidates(
+    first: LocationCandidate,
+    second: LocationCandidate,
+) -> LocationCandidate | None:
+    if (
+        first.place_id != second.place_id
+        or first.display_name != second.display_name
+        or first.geographic_type is not second.geographic_type
+        or first.country_id != second.country_id
+        or first.city_id != second.city_id
+        or first.verified_parent_ids != second.verified_parent_ids
+        or first.parent_display_names != second.parent_display_names
+        or first.iana_timezone != second.iana_timezone
+        or first.resolver_version != second.resolver_version
+        or first.glossary_version != second.glossary_version
+    ):
+        return None
+    localized_display_names = dict(first.localized_display_names)
+    for locale, label in second.localized_display_names:
+        existing = localized_display_names.get(locale)
+        if existing is not None and existing != label:
+            return None
+        localized_display_names[locale] = label
+    return replace(
+        first,
+        localized_display_names=tuple(localized_display_names.items()),
+    )
+
+
+def _deduplicate_location_candidates(
+    candidates: tuple[LocationCandidate, ...],
+) -> tuple[LocationCandidate, ...] | None:
+    deduplicated: list[LocationCandidate] = []
+    indexes: dict[str, int] = {}
+    for candidate in candidates:
+        index = indexes.get(candidate.place_id)
+        if index is None:
+            indexes[candidate.place_id] = len(deduplicated)
+            deduplicated.append(candidate)
+            continue
+        merged = _merge_location_candidates(deduplicated[index], candidate)
+        if merged is None:
+            return None
+        deduplicated[index] = merged
+    return tuple(deduplicated)
+
+
+def _deduplicate_search_areas(
+    validated: tuple[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]], ...],
+) -> tuple[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]], ...] | None:
+    deduplicated: list[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]]] = []
+    indexes: dict[tuple[bool, frozenset[str]], int] = {}
+    for interpretation, accepted_areas in validated:
+        identity = (
+            interpretation.whole_city,
+            frozenset(candidate.place_id for candidate in interpretation.places),
+        )
+        index = indexes.get(identity)
+        if index is None:
+            indexes[identity] = len(deduplicated)
+            deduplicated.append((interpretation, accepted_areas))
+            continue
+        first_interpretation, _ = deduplicated[index]
+        if first_interpretation.glossary_version != interpretation.glossary_version:
+            return None
+        candidates_by_id = {
+            candidate.place_id: candidate for candidate in interpretation.places
+        }
+        merged_candidates: list[LocationCandidate] = []
+        for first_candidate in first_interpretation.places:
+            merged = _merge_location_candidates(
+                first_candidate,
+                candidates_by_id[first_candidate.place_id],
+            )
+            if merged is None:
+                return None
+            merged_candidates.append(merged)
+        merged_interpretation = replace(
+            first_interpretation,
+            places=tuple(merged_candidates),
+        )
+        deduplicated[index] = (
+            merged_interpretation,
+            (
+                ()
+                if merged_interpretation.whole_city
+                else tuple(
+                    _accept_location(candidate) for candidate in merged_candidates
+                )
+            ),
+        )
+    return tuple(deduplicated)
+
+
+def _valid_location_presentation(
+    candidate: LocationCandidate | AcceptedLocation,
+) -> bool:
+    if isinstance(candidate, AcceptedLocation):
+        return True
+    localized_display_names = dict(candidate.localized_display_names)
+    return (
+        len(localized_display_names) == len(candidate.localized_display_names)
+        and localized_display_names.keys() >= SUPPORTED_LOCALES
+        and all(localized_display_names[locale] for locale in SUPPORTED_LOCALES)
     )
 
 
@@ -2434,6 +2612,7 @@ def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
     return (
         bool(candidate.place_id)
         and bool(candidate.display_name)
+        and _valid_location_presentation(candidate)
         and bool(candidate.resolver_version)
         and bool(candidate.glossary_version)
         and candidate.geographic_type is GeographicType.COUNTRY
@@ -2459,6 +2638,7 @@ def _valid_city(
     return (
         bool(candidate.place_id)
         and bool(candidate.display_name)
+        and _valid_location_presentation(candidate)
         and bool(candidate.resolver_version)
         and bool(candidate.glossary_version)
         and candidate.geographic_type is GeographicType.CITY
@@ -2488,6 +2668,7 @@ def _valid_sub_city_areas(
         if (
             not candidate.place_id
             or not candidate.display_name
+            or not _valid_location_presentation(candidate)
             or not candidate.resolver_version
             or not candidate.glossary_version
             or candidate.geographic_type not in _SUB_CITY_TYPES
@@ -2498,9 +2679,8 @@ def _valid_sub_city_areas(
             or len(set(parents)) != len(parents)
             or len(candidate.parent_display_names) != len(parents)
             or not all(candidate.parent_display_names)
-            or city.place_id not in parents
-            or country.place_id not in parents
-            or parents.index(city.place_id) >= parents.index(country.place_id)
+            or len(parents) < 2
+            or parents[-2:] != (city.place_id, country.place_id)
         ):
             return False
     return True
@@ -2737,7 +2917,7 @@ def _country_message(
         button_rows = (
             (
                 (
-                    suggestion.country.display_name,
+                    _location_label(suggestion.country, copy_locale),
                     "location-suggestion:country:"
                     f"{suggestion.country.place_id}:{screen_revision}",
                 ),
@@ -2779,7 +2959,7 @@ def _city_message(
         button_rows = (
             (
                 (
-                    suggestion.city.display_name,
+                    _location_label(suggestion.city, copy_locale),
                     "location-suggestion:city:"
                     f"{suggestion.city.place_id}:{screen_revision}",
                 ),
@@ -2792,7 +2972,10 @@ def _city_message(
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
-        text=f"{confirmation.format(country=country.display_name)}\n\n{question}",
+        text=(
+            f"{confirmation.format(country=_location_label(country, copy_locale))}"
+            f"\n\n{question}"
+        ),
         button_rows=button_rows,
     )
 
@@ -2814,7 +2997,8 @@ def _search_area_message(
         display_locale=locale,
         screen_revision=screen_revision,
         text=(
-            f"{heading}\n\n{selected_city.format(city=city.display_name)}"
+            f"{heading}\n\n"
+            f"{selected_city.format(city=_location_label(city, copy_locale))}"
             f"\n\n{instruction}"
         ),
         button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
@@ -2836,7 +3020,12 @@ def _required_date_message(
     back_label = _DIRECTION_COPY[copy_locale][2][5]
     heading, whole_city_label = _SEARCH_AREA_RESULT_COPY[copy_locale]
     scope = _search_area_summary(
-        country, city, areas, whole_city, whole_city_label=whole_city_label
+        country,
+        city,
+        areas,
+        whole_city,
+        locale=copy_locale,
+        whole_city_label=whole_city_label,
     )
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
@@ -2864,7 +3053,12 @@ def _post_core_message(
     back_label = _DIRECTION_COPY[copy_locale][2][5]
     heading, whole_city_label = _SEARCH_AREA_RESULT_COPY[copy_locale]
     scope = _search_area_summary(
-        country, city, areas, whole_city, whole_city_label=whole_city_label
+        country,
+        city,
+        areas,
+        whole_city,
+        locale=copy_locale,
+        whole_city_label=whole_city_label,
     )
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
@@ -2886,11 +3080,15 @@ def _search_area_summary(
     areas: tuple[AcceptedLocation, ...],
     whole_city: bool,
     *,
+    locale: str,
     whole_city_label: str,
 ) -> str:
     scope = (
         whole_city_label
         if whole_city
-        else ", ".join(area.display_name for area in areas)
+        else ", ".join(_location_label(area, locale) for area in areas)
     )
-    return f"{country.display_name} → {city.display_name} → {scope}"
+    return (
+        f"{_location_label(country, locale)} → {_location_label(city, locale)}"
+        f" → {scope}"
+    )

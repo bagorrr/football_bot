@@ -1361,6 +1361,7 @@ def _accepted_location(value: Any) -> AcceptedLocation:
         iana_timezone=value["iana_timezone"],
         resolver_version=value["resolver_version"],
         glossary_version=value["glossary_version"],
+        localized_display_names=tuple(value.get("localized_display_names", {}).items()),
     )
 
 
@@ -1382,6 +1383,7 @@ def _accepted_location_json(location: AcceptedLocation | None) -> Any:
         "iana_timezone": location.iana_timezone,
         "resolver_version": location.resolver_version,
         "glossary_version": location.glossary_version,
+        "localized_display_names": dict(location.localized_display_names),
     }
 
 

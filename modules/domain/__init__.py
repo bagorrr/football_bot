@@ -125,6 +125,7 @@ class LocationCandidate:
     iana_timezone: str | None
     resolver_version: str
     glossary_version: str
+    localized_display_names: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +142,7 @@ class AcceptedLocation:
     iana_timezone: str | None
     resolver_version: str
     glossary_version: str
+    localized_display_names: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -35,6 +36,10 @@ class _AdjustableClock:
 
     def advance(self, delta: timedelta) -> None:
         self.instant += delta
+
+
+def _all_locale_labels(label: str) -> tuple[tuple[str, str], ...]:
+    return tuple((locale, label) for locale in ("en", "es", "fr", "ru"))
 
 
 def test_unique_validated_country_from_natural_language_advances_to_city() -> None:
@@ -223,7 +228,8 @@ def test_natural_language_whole_city_scope_completes_the_search_area() -> None:
     assert draft.city.iana_timezone == "Europe/Moscow"
     assert telegram_delivery.messages[-1].text == (
         "✅ Search area: **Russia → Saint Petersburg → whole city**.\n\n"
-        "📅 When?\n\nType a date or range in your own words."
+        "📅 When?\n\nType a date or range in your own words — for example, "
+        "“tomorrow”, “on Saturday”, or “August 5–7”."
     )
 
 
@@ -462,6 +468,7 @@ def test_city_resolution_outcomes_are_distinct_and_preserve_confirmed_country() 
         iana_timezone="America/New_York",
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Saint Petersburg, Florida"),
     )
     alternate_city = LocationCandidate(
         place_id="city:ru:saint-petersburg-leningrad",
@@ -474,6 +481,7 @@ def test_city_resolution_outcomes_are_distinct_and_preserve_confirmed_country() 
         iana_timezone="Europe/Moscow",
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Saint Petersburg"),
     )
     ambiguous_city = LocationResolution(
         interpretations=(
@@ -494,6 +502,7 @@ def test_city_resolution_outcomes_are_distinct_and_preserve_confirmed_country() 
                         iana_timezone="Europe/Moscow",
                         resolver_version="controlled-resolver-v1",
                         glossary_version="controlled-glossary-v1",
+                        localized_display_names=_all_locale_labels("Saint Petersburg"),
                     ),
                 ),
             ),
@@ -772,6 +781,7 @@ def test_search_area_outcomes_are_distinct_and_preserve_confirmed_scope() -> Non
         iana_timezone=None,
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Central District"),
     )
     valid_area = LocationCandidate(
         place_id="district:ru:spb:primorsky",
@@ -784,6 +794,7 @@ def test_search_area_outcomes_are_distinct_and_preserve_confirmed_scope() -> Non
         iana_timezone=None,
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Primorsky District"),
     )
     alternate_valid_area = LocationCandidate(
         place_id="neighborhood:ru:spb:central",
@@ -796,6 +807,7 @@ def test_search_area_outcomes_are_distinct_and_preserve_confirmed_scope() -> Non
         iana_timezone=None,
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Central Neighborhood"),
     )
     resolver.return_for(
         stage=ConversationStage.SEARCH_AREA,
@@ -939,7 +951,8 @@ def test_search_area_flow_preserves_explicit_conversation_language() -> None:
     assert telegram_delivery.messages[-1].display_locale == "ru"
     assert telegram_delivery.messages[-1].text == (
         "✅ Зона поиска: **Россия → Санкт-Петербург → весь город**.\n\n"
-        "📅 Когда?\n\nНапишите дату или период своими словами."
+        "📅 Когда?\n\nНапишите дату или период своими словами — например: "
+        "«завтра», «в субботу» или «с 5 по 7 августа»."
     )
 
 
@@ -964,6 +977,12 @@ def test_whole_city_uses_validated_identity_not_localized_candidate_equality() -
                             iana_timezone="Europe/Moscow",
                             resolver_version="controlled-resolver-v2",
                             glossary_version="controlled-glossary-v2",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                                ("ru", "Санкт-Петербург"),
+                            ),
                         ),
                     ),
                     glossary_version="controlled-glossary-v2",
@@ -1035,6 +1054,7 @@ def test_only_application_valid_candidate_advances_among_resolver_proposals() ->
         iana_timezone=None,
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Russia"),
     )
     invalid_country = LocationCandidate(
         place_id="city:ru:moscow",
@@ -1047,6 +1067,7 @@ def test_only_application_valid_candidate_advances_among_resolver_proposals() ->
         iana_timezone="Europe/Moscow",
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Moscow"),
     )
     valid_city = LocationCandidate(
         place_id="city:ru:saint-petersburg",
@@ -1059,6 +1080,7 @@ def test_only_application_valid_candidate_advances_among_resolver_proposals() ->
         iana_timezone="Europe/Moscow",
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Saint Petersburg"),
     )
     invalid_city = LocationCandidate(
         place_id="city:us:saint-petersburg",
@@ -1071,6 +1093,7 @@ def test_only_application_valid_candidate_advances_among_resolver_proposals() ->
         iana_timezone="America/New_York",
         resolver_version="controlled-resolver-v1",
         glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Saint Petersburg"),
     )
     resolver.return_for(
         stage=ConversationStage.COUNTRY,
@@ -1241,3 +1264,540 @@ def test_location_transition_survives_delivery_failure_and_restart() -> None:
     assert system.retry_bot_presentations() is False
     assert len(telegram_delivery.messages) == delivered_before_retry + 1
     assert telegram_delivery.messages[-1].screen_revision == committed.screen_revision
+
+
+def test_post_core_back_returns_to_required_date_for_date_required_intent() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        location_resolver=ControlledLocationResolverAdapter(),
+    )
+    system.reset()
+    user_id = 42_016
+    system.start_bot_user(
+        update_id="start-date-required-back",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language-date-required-back",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    system.select_direction(
+        update_id="intent-date-required-back",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    system.submit_location_text(
+        update_id="country-date-required-back",
+        telegram_user_id=user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id="city-date-required-back",
+        telegram_user_id=user_id,
+        text="Saint Petersburg",
+    )
+    system.submit_location_text(
+        update_id="area-date-required-back",
+        telegram_user_id=user_id,
+        text="whole city",
+    )
+    system.accept_controlled_required_date(
+        update_id="date-date-required-back",
+        telegram_user_id=user_id,
+    )
+    confirmed = system.discovery_draft(user_id)
+    assert confirmed.stage == "post_core"
+
+    system.go_back(
+        update_id="back-date-required-back",
+        telegram_user_id=user_id,
+    )
+
+    returned = system.discovery_draft(user_id)
+    assert returned.stage == "required_date"
+    assert returned.user_intent == confirmed.user_intent
+    assert returned.country == confirmed.country
+    assert returned.city == confirmed.city
+    assert returned.sub_city_areas == confirmed.sub_city_areas
+    assert returned.whole_city is confirmed.whole_city
+    assert "📅 When?" in telegram_delivery.messages[-1].text
+
+
+def test_confirmed_search_area_rerenders_in_each_supported_language_offline() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="area without offline labels",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="controlled-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="district:ru:spb:unlocalized",
+                            display_name="Unlocalized District",
+                            geographic_type=GeographicType.ADMINISTRATIVE_DISTRICT,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=(
+                                "city:ru:saint-petersburg",
+                                "country:ru",
+                            ),
+                            parent_display_names=("Saint Petersburg", "Russia"),
+                            iana_timezone=None,
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="controlled-glossary-v1",
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        location_resolver=resolver,
+    )
+    system.reset()
+    user_id = 42_017
+    system.start_bot_user(
+        update_id="start-localized-search-area",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language-localized-search-area",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    system.select_direction(
+        update_id="open-localized-transfer",
+        telegram_user_id=user_id,
+        direction="transfer_search",
+    )
+    system.select_direction(
+        update_id="intent-localized-search-area",
+        telegram_user_id=user_id,
+        direction="new_team_search",
+    )
+    system.submit_location_text(
+        update_id="country-localized-search-area",
+        telegram_user_id=user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id="city-localized-search-area",
+        telegram_user_id=user_id,
+        text="Saint Petersburg",
+    )
+    system.submit_location_text(
+        update_id="reject-unlocalized-search-area",
+        telegram_user_id=user_id,
+        text="area without offline labels",
+    )
+    assert system.discovery_draft(user_id).stage == "search_area"
+
+    system.submit_location_text(
+        update_id="area-localized-search-area",
+        telegram_user_id=user_id,
+        text="Near Komendantsky metro and in Primorsky District",
+    )
+    accepted = system.discovery_draft(user_id)
+    assert accepted.stage == "post_core"
+    assert accepted.country is not None
+    assert accepted.city is not None
+    stable_identity = (
+        accepted.country.place_id,
+        accepted.city.place_id,
+        tuple(area.place_id for area in accepted.sub_city_areas),
+    )
+    resolver_calls_at_confirmation = len(resolver.queries)
+    expected_summaries = {
+        "en": ("Russia → Saint Petersburg → Komendantsky Prospekt, Primorsky District"),
+        "ru": ("Россия → Санкт-Петербург → Комендантский проспект, Приморский район"),
+        "es": ("Rusia → San Petersburgo → Prospekt Komendantski, Distrito Primorski"),
+        "fr": (
+            "Russie → Saint-Pétersbourg → Prospekt Komendantski, District Primorski"
+        ),
+    }
+
+    for locale, expected_summary in expected_summaries.items():
+        system.change_controlled_conversation_language(
+            update_id=f"change-search-area-language-{locale}",
+            telegram_user_id=user_id,
+            locale=locale,
+        )
+        system.start_bot_user(
+            update_id=f"rerender-search-area-{locale}",
+            telegram_user_id=user_id,
+            telegram_language_hint="de",
+        )
+        rerendered = system.discovery_draft(user_id)
+        assert rerendered.country is not None
+        assert rerendered.city is not None
+        assert rerendered.sub_city_areas
+        assert (
+            rerendered.country.place_id,
+            rerendered.city.place_id,
+            tuple(area.place_id for area in rerendered.sub_city_areas),
+        ) == stable_identity
+        assert expected_summary in telegram_delivery.messages[-1].text
+        assert len(resolver.queries) == resolver_calls_at_confirmation
+
+
+@pytest.mark.parametrize(
+    ("locale", "expected_prompt"),
+    [
+        (
+            "ru",
+            "📅 Когда?\n\nНапишите дату или период своими словами — например: "
+            "«завтра», «в субботу» или «с 5 по 7 августа».",
+        ),
+        (
+            "en",
+            "📅 When?\n\nType a date or range in your own words — for example, "
+            "“tomorrow”, “on Saturday”, or “August 5–7”.",
+        ),
+        (
+            "es",
+            "📅 ¿Cuándo?\n\nEscriba una fecha o periodo con sus palabras — por "
+            "ejemplo, «mañana», «el sábado» o «del 5 al 7 de agosto».",
+        ),
+        (
+            "fr",
+            "📅 Quand ?\n\nSaisissez une date ou une période avec vos mots — par "
+            "exemple « demain », « samedi » ou « du 5 au 7 août ».",
+        ),
+    ],
+)
+def test_required_date_prompt_uses_approved_ai_native_examples(
+    locale: str,
+    expected_prompt: str,
+) -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        location_resolver=ControlledLocationResolverAdapter(),
+    )
+    system.reset()
+    user_id = 42_020 + ("ru", "en", "es", "fr").index(locale)
+    system.start_bot_user(
+        update_id=f"start-date-copy-{locale}",
+        telegram_user_id=user_id,
+        telegram_language_hint=locale,
+    )
+    system.select_fixed_language(
+        update_id=f"language-date-copy-{locale}",
+        telegram_user_id=user_id,
+        locale=locale,
+    )
+    system.select_direction(
+        update_id=f"intent-date-copy-{locale}",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    system.submit_location_text(
+        update_id=f"country-date-copy-{locale}",
+        telegram_user_id=user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id=f"city-date-copy-{locale}",
+        telegram_user_id=user_id,
+        text="Saint Petersburg",
+    )
+
+    system.submit_location_text(
+        update_id=f"area-date-copy-{locale}",
+        telegram_user_id=user_id,
+        text="whole city",
+    )
+
+    assert system.discovery_draft(user_id).stage == "required_date"
+    assert telegram_delivery.messages[-1].text.endswith(expected_prompt)
+
+
+def test_sub_city_area_rejects_a_parent_after_the_confirmed_country() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="contradictory parent hierarchy",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="controlled-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="district:ru:spb:contradictory",
+                            display_name="Contradictory District",
+                            geographic_type=GeographicType.ADMINISTRATIVE_DISTRICT,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=(
+                                "city:ru:saint-petersburg",
+                                "country:ru",
+                                "country:fi",
+                            ),
+                            parent_display_names=(
+                                "Saint Petersburg",
+                                "Russia",
+                                "Finland",
+                            ),
+                            iana_timezone=None,
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="controlled-glossary-v1",
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        location_resolver=resolver,
+    )
+    system.reset()
+    user_id = 42_024
+    system.start_bot_user(
+        update_id="start-contradictory-hierarchy",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language-contradictory-hierarchy",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    system.select_direction(
+        update_id="intent-contradictory-hierarchy",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    system.submit_location_text(
+        update_id="country-contradictory-hierarchy",
+        telegram_user_id=user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id="city-contradictory-hierarchy",
+        telegram_user_id=user_id,
+        text="Saint Petersburg",
+    )
+    before = system.discovery_draft(user_id)
+    confirmations_before = system.geography_confirmations(user_id)
+
+    system.submit_location_text(
+        update_id="area-contradictory-hierarchy",
+        telegram_user_id=user_id,
+        text="contradictory parent hierarchy",
+    )
+
+    assert system.discovery_draft(user_id) == before
+    assert system.geography_confirmations(user_id) == confirmations_before
+    assert telegram_delivery.messages[-1].text.startswith(
+        "That result is outside Saint Petersburg"
+    )
+
+
+def test_canonical_resolver_duplicates_advance_once_and_conflicts_fail_closed() -> None:
+    resolver = ControlledLocationResolverAdapter()
+    country = LocationCandidate(
+        place_id="country:ru",
+        display_name="Russia",
+        geographic_type=GeographicType.COUNTRY,
+        country_id="country:ru",
+        city_id=None,
+        verified_parent_ids=(),
+        parent_display_names=(),
+        iana_timezone=None,
+        resolver_version="controlled-resolver-v1",
+        glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Russia"),
+    )
+    city = LocationCandidate(
+        place_id="city:ru:saint-petersburg",
+        display_name="Saint Petersburg",
+        geographic_type=GeographicType.CITY,
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+        verified_parent_ids=("country:ru",),
+        parent_display_names=("Russia",),
+        iana_timezone="Europe/Moscow",
+        resolver_version="controlled-resolver-v1",
+        glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Saint Petersburg"),
+    )
+    station = LocationCandidate(
+        place_id="station:ru:spb:komendantsky-prospekt",
+        display_name="Komendantsky Prospekt",
+        geographic_type=GeographicType.STATION,
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+        verified_parent_ids=(
+            "district:ru:spb:primorsky",
+            "city:ru:saint-petersburg",
+            "country:ru",
+        ),
+        parent_display_names=("Primorsky District", "Saint Petersburg", "Russia"),
+        iana_timezone=None,
+        resolver_version="controlled-resolver-v1",
+        glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Komendantsky Prospekt"),
+    )
+    district = LocationCandidate(
+        place_id="district:ru:spb:primorsky",
+        display_name="Primorsky District",
+        geographic_type=GeographicType.ADMINISTRATIVE_DISTRICT,
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+        verified_parent_ids=("city:ru:saint-petersburg", "country:ru"),
+        parent_display_names=("Saint Petersburg", "Russia"),
+        iana_timezone=None,
+        resolver_version="controlled-resolver-v1",
+        glossary_version="controlled-glossary-v1",
+        localized_display_names=_all_locale_labels("Primorsky District"),
+    )
+    resolver.return_for(
+        stage=ConversationStage.COUNTRY,
+        text="duplicate country",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    places=(country,), glossary_version="controlled-glossary-v1"
+                ),
+                LocationInterpretation(
+                    places=(country,), glossary_version="controlled-glossary-v1"
+                ),
+            )
+        ),
+    )
+    resolver.return_for(
+        stage=ConversationStage.CITY,
+        text="duplicate city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    places=(city,), glossary_version="controlled-glossary-v1"
+                ),
+                LocationInterpretation(
+                    places=(city,), glossary_version="controlled-glossary-v1"
+                ),
+            )
+        ),
+    )
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="duplicate complete Search Area",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    places=(station, district),
+                    glossary_version="controlled-glossary-v1",
+                ),
+                LocationInterpretation(
+                    places=(district, station),
+                    glossary_version="controlled-glossary-v1",
+                ),
+            )
+        ),
+    )
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="contradictory duplicate metadata",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    places=(district,),
+                    glossary_version="controlled-glossary-v1",
+                ),
+                LocationInterpretation(
+                    places=(
+                        replace(
+                            district,
+                            geographic_type=GeographicType.NEIGHBORHOOD,
+                        ),
+                    ),
+                    glossary_version="controlled-glossary-v1",
+                ),
+            )
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        location_resolver=resolver,
+    )
+    system.reset()
+    user_id = 42_025
+    system.start_bot_user(
+        update_id="start-canonical-duplicates",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language-canonical-duplicates",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    system.select_direction(
+        update_id="open-canonical-duplicate-transfer",
+        telegram_user_id=user_id,
+        direction="transfer_search",
+    )
+    system.select_direction(
+        update_id="intent-canonical-duplicates",
+        telegram_user_id=user_id,
+        direction="new_team_search",
+    )
+
+    system.submit_location_text(
+        update_id="country-canonical-duplicates",
+        telegram_user_id=user_id,
+        text="duplicate country",
+    )
+    assert system.discovery_draft(user_id).stage == "city"
+    system.submit_location_text(
+        update_id="city-canonical-duplicates",
+        telegram_user_id=user_id,
+        text="duplicate city",
+    )
+    assert system.discovery_draft(user_id).stage == "search_area"
+    system.submit_location_text(
+        update_id="area-canonical-duplicates",
+        telegram_user_id=user_id,
+        text="duplicate complete Search Area",
+    )
+    accepted = system.discovery_draft(user_id)
+    assert accepted.stage == "post_core"
+    assert [area.place_id for area in accepted.sub_city_areas] == [
+        station.place_id,
+        district.place_id,
+    ]
+    assert len(system.geography_confirmations(user_id)) == 3
+    system.go_back(
+        update_id="back-before-contradictory-duplicates",
+        telegram_user_id=user_id,
+    )
+    before_conflict = system.discovery_draft(user_id)
+
+    system.submit_location_text(
+        update_id="area-contradictory-duplicates",
+        telegram_user_id=user_id,
+        text="contradictory duplicate metadata",
+    )
+
+    assert system.discovery_draft(user_id) == before_conflict
+    assert len(system.geography_confirmations(user_id)) == 3
