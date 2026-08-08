@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -58,6 +59,141 @@ from modules.ports import (
     OutboxConflictError,
 )
 
+_LEGACY_MIGRATION_NAMES = (
+    "0001_acceptance_spine.sql",
+    "0002_durable_role_handoffs.sql",
+    "0003_conversation_language.sql",
+    "0004_discovery_draft.sql",
+    "0005_search_area.sql",
+    "0006_required_date.sql",
+    "0007_zero_result_search.sql",
+)
+
+_LEGACY_MIGRATION_MARKERS = (
+    """
+    SELECT to_regclass('football_runtime.acceptance_state') IS NOT NULL
+       AND to_regclass('football_runtime.contract_outbox') IS NOT NULL
+       AND to_regclass('football_runtime.contract_inbox') IS NOT NULL
+       AND to_regclass('football_runtime.operator_alerts') IS NOT NULL
+    """,
+    """
+    SELECT to_regclass('football_runtime.telegram_presentations') IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'contract_outbox'
+              AND column_name = 'claimed_until'
+       )
+    """,
+    """
+    SELECT to_regclass('football_runtime.bot_users') IS NOT NULL
+       AND to_regclass('football_runtime.bot_updates') IS NOT NULL
+       AND to_regclass('football_runtime.bot_message_outbox') IS NOT NULL
+       AND to_regclass('football_runtime.bot_active_chat_views') IS NOT NULL
+       AND to_regclass('football_runtime.bot_delivery_alerts') IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'bot_message_outbox'
+              AND column_name = 'delivery_status'
+       )
+    """,
+    """
+    SELECT to_regclass('football_runtime.bot_discovery_drafts') IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'bot_users'
+              AND column_name = 'last_bot_user_action_at'
+       )
+    """,
+    """
+    SELECT to_regclass(
+               'football_runtime.bot_geography_confirmation_events'
+           ) IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'bot_discovery_drafts'
+              AND column_name = 'country'
+       )
+    """,
+    """
+    SELECT to_regclass(
+               'football_runtime.bot_required_date_confirmation_events'
+           ) IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'bot_discovery_drafts'
+              AND column_name = 'required_date'
+       )
+    """,
+    """
+    SELECT to_regclass(
+               'football_runtime.recommendation_completed_searches'
+           ) IS NOT NULL
+       AND to_regclass('football_runtime.recommendation_results') IS NOT NULL
+       AND to_regclass(
+               'football_runtime.bot_active_result_contexts'
+           ) IS NOT NULL
+       AND to_regclass('football_runtime.bot_search_presentations') IS NOT NULL
+       AND to_regclass('football_runtime.bot_old_chat_views') IS NOT NULL
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'bot_discovery_drafts'
+              AND column_name = 'search_submission_update_id'
+       )
+       AND EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND table_name = 'bot_message_outbox'
+              AND column_name = 'reply_keyboard_action'
+       )
+       AND EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'bot_users_stage_check'
+              AND conrelid = to_regclass('football_runtime.bot_users')
+              AND pg_get_constraintdef(oid) LIKE '%submitting%'
+              AND pg_get_constraintdef(oid) LIKE '%results%'
+       )
+       AND EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conname = 'bot_discovery_drafts_stage_check'
+              AND conrelid = to_regclass(
+                  'football_runtime.bot_discovery_drafts'
+              )
+              AND pg_get_constraintdef(oid) LIKE '%submitting%'
+       )
+    """,
+)
+
+
+def _legacy_migration_prefix(connection: psycopg.Connection[Any]) -> int:
+    markers: list[bool] = []
+    for marker_query in _LEGACY_MIGRATION_MARKERS:
+        marker_row = connection.execute(marker_query).fetchone()
+        if marker_row is None:
+            raise RuntimeError("Could not inspect untracked migration state")
+        markers.append(bool(marker_row[0]))
+    applied_count = next(
+        (index for index, marker_exists in enumerate(markers) if not marker_exists),
+        len(markers),
+    )
+    if applied_count == 0 or any(markers[applied_count:]):
+        raise RuntimeError("Untracked migration state is not a known prefix")
+    return applied_count
+
 
 class PostgresAcceptanceMigrator:
     """Administrative schema setup kept outside every runtime process."""
@@ -66,11 +202,98 @@ class PostgresAcceptanceMigrator:
         self._admin_database_url = admin_database_url
 
     def migrate(self) -> None:
-        """Apply repository-owned migrations in lexical order."""
+        """Apply each immutable repository migration exactly once."""
         migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
-        with psycopg.connect(self._admin_database_url, autocommit=True) as connection:
-            for migration_path in sorted(migration_root.glob("*.sql")):
-                connection.execute(migration_path.read_text(encoding="utf-8"))
+        migration_paths = sorted(migration_root.glob("*.sql"))
+        migration_names = tuple(path.name for path in migration_paths)
+        with psycopg.connect(self._admin_database_url) as connection:
+            connection.execute(
+                """
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(
+                        current_database() || ':football_bot:migrations',
+                        0
+                    )
+                )
+                """,
+            )
+            migration_state = connection.execute(
+                """
+                SELECT to_regclass(
+                           'football_migrations.applied_migrations'
+                       ) IS NOT NULL,
+                       to_regnamespace('football_runtime') IS NOT NULL
+                """,
+            ).fetchone()
+            if migration_state is None:
+                raise RuntimeError("Could not inspect migration state")
+            history_existed, runtime_schema_existed = migration_state
+            if history_existed and not runtime_schema_existed:
+                raise RuntimeError("Migration history exists without runtime schema")
+            connection.execute("CREATE SCHEMA IF NOT EXISTS football_migrations")
+            connection.execute("REVOKE ALL ON SCHEMA football_migrations FROM PUBLIC")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS football_migrations.applied_migrations (
+                    migration_name text PRIMARY KEY,
+                    checksum text NOT NULL CHECK (checksum <> ''),
+                    applied_at timestamptz NOT NULL DEFAULT transaction_timestamp()
+                )
+                """,
+            )
+            connection.execute(
+                """
+                REVOKE ALL ON football_migrations.applied_migrations FROM PUBLIC
+                """,
+            )
+            applied_migrations: dict[str, str] = dict(
+                connection.execute(
+                    """
+                    SELECT migration_name, checksum
+                    FROM football_migrations.applied_migrations
+                    """,
+                ).fetchall(),
+            )
+            if history_existed and runtime_schema_existed and not applied_migrations:
+                raise RuntimeError("Migration history is empty for an existing schema")
+            if not history_existed and runtime_schema_existed:
+                applied_count = _legacy_migration_prefix(connection)
+                expected_legacy_names = _LEGACY_MIGRATION_NAMES[:applied_count]
+                if migration_names[:applied_count] != expected_legacy_names:
+                    raise RuntimeError("Legacy migration files do not match")
+                for migration_path in migration_paths[:applied_count]:
+                    migration_checksum = sha256(migration_path.read_bytes()).hexdigest()
+                    connection.execute(
+                        """
+                        INSERT INTO football_migrations.applied_migrations (
+                            migration_name, checksum
+                        ) VALUES (%s, %s)
+                        """,
+                        (migration_path.name, migration_checksum),
+                    )
+                    applied_migrations[migration_path.name] = migration_checksum
+            expected_applied_names = set(migration_names[: len(applied_migrations)])
+            if set(applied_migrations) != expected_applied_names:
+                raise RuntimeError("Migration history is not a contiguous prefix")
+            for migration_path in migration_paths:
+                migration_bytes = migration_path.read_bytes()
+                migration_checksum = sha256(migration_bytes).hexdigest()
+                applied_checksum = applied_migrations.get(migration_path.name)
+                if applied_checksum is not None:
+                    if applied_checksum != migration_checksum:
+                        raise RuntimeError(
+                            f"Applied migration was modified: {migration_path.name}",
+                        )
+                    continue
+                connection.execute(migration_bytes.decode("utf-8"))
+                connection.execute(
+                    """
+                    INSERT INTO football_migrations.applied_migrations (
+                        migration_name, checksum
+                    ) VALUES (%s, %s)
+                    """,
+                    (migration_path.name, migration_checksum),
+                )
 
     def provision_runtime_credentials(
         self,

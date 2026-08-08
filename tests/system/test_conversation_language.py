@@ -8,6 +8,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Barrier, Event
 from uuid import uuid4
 
@@ -661,39 +662,71 @@ def test_current_screen_precedes_superseded_reconciliation() -> None:
     assert system.active_conversation_view(user_id) == winning_view
 
 
-def test_migration_recovers_a_legacy_claim_as_outcome_unknown() -> None:
-    database_url = os.environ["TEST_DATABASE_URL"]
+def test_migration_recovers_a_legacy_claim_as_outcome_unknown(
+    fresh_database_url: str,
+) -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
-        admin_database_url=database_url,
-        clock=clock,
-        telegram_delivery=telegram_delivery,
-    )
-    system.reset()
     delivery_id = "onboarding:legacy-claimed-delivery"
-    with psycopg.connect(database_url) as connection:
+    migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
+    with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+        for migration_name in (
+            "0001_acceptance_spine.sql",
+            "0002_durable_role_handoffs.sql",
+        ):
+            connection.execute(
+                (migration_root / migration_name).read_text(encoding="utf-8"),
+            )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            CREATE TABLE football_runtime.bot_users (
+                owner_role text NOT NULL DEFAULT 'bot_assistant',
+                telegram_user_id bigint PRIMARY KEY,
+                locale text,
+                locale_source text,
+                last_seen_language_code text,
+                revision integer NOT NULL,
+                updated_at timestamptz NOT NULL
+            )
+            """,
+        )
+        connection.execute(
+            """
+            CREATE TABLE football_runtime.bot_message_outbox (
+                owner_role text NOT NULL DEFAULT 'bot_assistant',
+                delivery_id text PRIMARY KEY,
+                telegram_user_id bigint NOT NULL,
+                display_locale text NOT NULL,
+                message_text text NOT NULL,
+                button_rows jsonb NOT NULL,
+                recorded_at timestamptz NOT NULL,
+                claim_token uuid,
+                claimed_at timestamptz,
+                delivered_at timestamptz
+            )
+            """,
+        )
         connection.execute(
             """
             INSERT INTO football_runtime.bot_users (
                 telegram_user_id, locale, locale_source,
-                last_seen_language_code, stage, screen_revision,
-                revision, updated_at
+                last_seen_language_code, revision, updated_at
             ) VALUES (
                 5013, 'en', 'telegram_hint', 'en',
-                'language_selection', 1, 1, %s
+                1, %s
             )
             """,
             (clock.now(),),
         )
         connection.execute(
             """
-            INSERT INTO football_runtime.bot_message_outbox (
-                delivery_id, telegram_user_id, display_locale,
-                screen_revision, message_text, button_rows,
-                recorded_at, claim_token, claimed_at
-            ) VALUES (%s, 5013, 'en', 1, 'legacy payload', '[]', %s, %s, %s)
-            """,
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale,
+                    message_text, button_rows,
+                    recorded_at, claim_token, claimed_at
+                ) VALUES (%s, 5013, 'en', 'legacy payload', '[]', %s, %s, %s)
+                """,
             (
                 delivery_id,
                 clock.now() - timedelta(minutes=10),
@@ -702,7 +735,12 @@ def test_migration_recovers_a_legacy_claim_as_outcome_unknown() -> None:
             ),
         )
 
-    PostgresAcceptanceMigrator(database_url).migrate()
+    PostgresAcceptanceMigrator(fresh_database_url).migrate()
+    system = boot_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_delivery=telegram_delivery,
+    )
 
     assert system.retry_bot_presentations() is False
     assert telegram_delivery.messages == []
