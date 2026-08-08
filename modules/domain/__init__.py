@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from uuid import UUID
 
 
 class LocaleSource(StrEnum):
@@ -338,6 +339,16 @@ class ActiveChatView:
     screen_revision: int
     delivery_id: str
     telegram_message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class OldChatViewCleanup:
+    """One claimed best-effort cleanup for a replaced Telegram view."""
+
+    delivery_id: str
+    telegram_user_id: int
+    telegram_message_id: str
+    claim_token: UUID
 
 
 @dataclass(frozen=True, slots=True)

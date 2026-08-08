@@ -159,6 +159,31 @@ def test_technical_search_failure_preserves_confirmed_values_and_exposes_retry()
     system.reset()
 
 
+def test_first_search_submission_disables_actions_and_shows_typing_once() -> None:
+    system, telegram = _boot_search_system()
+    user_id = 44_005
+    _advance_to_complete_draft(system, user_id=user_id)
+    active_view = system.active_conversation_view(user_id)
+    screen_revision = system.discovery_draft(user_id).screen_revision
+
+    system.submit_search(
+        update_id="accepted-search",
+        telegram_user_id=user_id,
+        screen_revision=screen_revision,
+    )
+    system.submit_search(
+        update_id="duplicate-accepted-search",
+        telegram_user_id=user_id,
+        screen_revision=screen_revision,
+    )
+
+    assert telegram.inline_action_removals == [
+        (user_id, active_view.telegram_message_id)
+    ]
+    assert telegram.typing_actions == [user_id]
+    system.reset()
+
+
 def test_duplicate_search_updates_remain_idempotent_across_role_restarts() -> None:
     system, telegram = _boot_search_system()
     user_id = 44_003
@@ -227,6 +252,7 @@ def test_failed_result_presentation_keeps_the_prior_authoritative_context() -> N
     assert system.has_discovery_draft(user_id) is True
     assert system.active_result_context(user_id) == first_context
     assert system.active_conversation_view(user_id) == prior_view
+    assert (user_id, prior_view.telegram_message_id) not in telegram.deletion_attempts
 
     system.restart(RuntimeRole.BOT_ASSISTANT)
     system.process_searches_until_idle()
@@ -234,6 +260,22 @@ def test_failed_result_presentation_keeps_the_prior_authoritative_context() -> N
     assert system.active_result_context(user_id).completed_search_id == (
         second_search.completed_search_id
     )
+    system.reset()
+
+
+def test_successful_result_replacement_cleans_only_the_previous_view() -> None:
+    system, telegram = _boot_search_system()
+    user_id = 44_006
+    _advance_to_complete_draft(system, user_id=user_id)
+    previous_view = system.active_conversation_view(user_id)
+
+    system.submit_search(update_id="replacement-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+
+    active_view = system.active_conversation_view(user_id)
+    assert active_view.delivery_id != previous_view.delivery_id
+    assert (user_id, previous_view.telegram_message_id) in telegram.deletion_attempts
+    assert (user_id, active_view.telegram_message_id) not in telegram.deletion_attempts
     system.reset()
 
 

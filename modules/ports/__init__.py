@@ -31,6 +31,7 @@ from modules.domain import (
     LanguageSelection,
     LocationResolution,
     LocationResolutionQuery,
+    OldChatViewCleanup,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
@@ -94,6 +95,22 @@ class TelegramDeliveryAdapter(Protocol):
 
     def reconcile(self, message: TelegramMessage) -> str | None:
         """Return a known accepted identity without sending, or ``None``."""
+        ...
+
+    def remove_inline_actions(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> None:
+        """Remove actions from one already rendered Telegram message."""
+        ...
+
+    def show_typing(self, *, telegram_user_id: int) -> None:
+        """Show Telegram's native typing chat action."""
+        ...
+
+    def delete_message(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> bool:
+        """Best-effort delete one old Telegram message."""
         ...
 
 
@@ -323,6 +340,27 @@ class ConversationStore(Protocol):
         delivered_at: datetime,
     ) -> None:
         """Record one confirmed Bot API delivery."""
+        ...
+
+    def claim_old_chat_view_cleanup(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> OldChatViewCleanup | None:
+        """Claim one replaced view for best-effort Telegram cleanup."""
+        ...
+
+    def mark_old_chat_view_cleanup_attempted(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        deleted: bool,
+        attempted_at: datetime,
+    ) -> None:
+        """Finish one old-view cleanup attempt regardless of platform outcome."""
         ...
 
 

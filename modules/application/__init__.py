@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, timedelta
 from enum import IntEnum
@@ -1084,7 +1085,7 @@ class ConversationOnboarding:
                     "required_date": _required_date_payload(draft.required_date),
                 },
             )
-            self._store.commit_search_submission(
+            accepted = self._store.commit_search_submission(
                 update_id=update_id,
                 expected_revision=current.revision,
                 state=state,
@@ -1092,6 +1093,14 @@ class ConversationOnboarding:
                 command=command,
                 recorded_at=now,
             )
+            if accepted:
+                active_view = self._store.active_conversation_view(telegram_user_id)
+                if active_view is not None:
+                    self._telegram_delivery.remove_inline_actions(
+                        telegram_user_id=telegram_user_id,
+                        telegram_message_id=active_view.telegram_message_id,
+                    )
+                self._telegram_delivery.show_typing(telegram_user_id=telegram_user_id)
 
     def accept_zero_result_search_completion(
         self, *, incoming: RawContractEnvelope
@@ -2908,7 +2917,7 @@ class ConversationOnboarding:
             stale_before=claimed_at - timedelta(minutes=5),
         )
         if claim is None:
-            return False
+            return self._cleanup_old_chat_view()
         message = claim.message
         if claim.mode is TelegramDeliveryMode.SEND:
             try:
@@ -2946,6 +2955,40 @@ class ConversationOnboarding:
             claim_token=claim_token,
             telegram_message_id=telegram_message_id,
             delivered_at=self._clock.now(),
+        )
+        self._cleanup_old_chat_view()
+        return True
+
+    def _cleanup_old_chat_view(self) -> bool:
+        """Attempt one durable cleanup without making it a correctness dependency."""
+        claim_token = uuid4()
+        claimed_at = self._clock.now()
+        cleanup = self._store.claim_old_chat_view_cleanup(
+            claim_token=claim_token,
+            claimed_at=claimed_at,
+            stale_before=claimed_at - timedelta(minutes=5),
+        )
+        if cleanup is None:
+            return False
+        deleted = False
+        try:
+            deleted = self._telegram_delivery.delete_message(
+                telegram_user_id=cleanup.telegram_user_id,
+                telegram_message_id=cleanup.telegram_message_id,
+            )
+        except Exception:
+            deleted = False
+        if not deleted:
+            with suppress(Exception):
+                self._telegram_delivery.remove_inline_actions(
+                    telegram_user_id=cleanup.telegram_user_id,
+                    telegram_message_id=cleanup.telegram_message_id,
+                )
+        self._store.mark_old_chat_view_cleanup_attempted(
+            delivery_id=cleanup.delivery_id,
+            claim_token=cleanup.claim_token,
+            deleted=deleted,
+            attempted_at=self._clock.now(),
         )
         return True
 

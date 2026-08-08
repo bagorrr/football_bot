@@ -91,6 +91,27 @@ CREATE TABLE IF NOT EXISTS football_runtime.bot_search_presentations (
     accepted_at timestamptz NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS football_runtime.bot_old_chat_views (
+    owner_role text NOT NULL DEFAULT 'bot_assistant'
+        CHECK (owner_role = 'bot_assistant'),
+    delivery_id text PRIMARY KEY,
+    telegram_user_id bigint NOT NULL,
+    telegram_message_id text NOT NULL,
+    replacement_delivery_id text NOT NULL,
+    classified_at timestamptz NOT NULL,
+    cleanup_status text NOT NULL DEFAULT 'pending'
+        CHECK (cleanup_status IN ('pending', 'claimed', 'attempted')),
+    claim_token uuid,
+    claimed_at timestamptz,
+    cleanup_attempted_at timestamptz,
+    deleted boolean,
+    CHECK (delivery_id <> replacement_delivery_id),
+    CHECK ((cleanup_status = 'claimed') = (claim_token IS NOT NULL)),
+    CHECK ((cleanup_status = 'claimed') = (claimed_at IS NOT NULL)),
+    CHECK ((cleanup_status = 'attempted') = (cleanup_attempted_at IS NOT NULL)),
+    CHECK ((cleanup_status = 'attempted') = (deleted IS NOT NULL))
+);
+
 ALTER TABLE football_runtime.recommendation_completed_searches
     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.recommendation_completed_searches
@@ -101,6 +122,8 @@ ALTER TABLE football_runtime.bot_active_result_contexts ENABLE ROW LEVEL SECURIT
 ALTER TABLE football_runtime.bot_active_result_contexts FORCE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_search_presentations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.bot_search_presentations FORCE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.bot_old_chat_views ENABLE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.bot_old_chat_views FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS completed_searches_owner
     ON football_runtime.recommendation_completed_searches;
@@ -154,6 +177,19 @@ CREATE POLICY bot_search_presentations_owner
         AND owner_role = 'bot_assistant'
     );
 
+DROP POLICY IF EXISTS bot_old_chat_views_owner
+    ON football_runtime.bot_old_chat_views;
+CREATE POLICY bot_old_chat_views_owner
+    ON football_runtime.bot_old_chat_views
+    USING (
+        football_runtime.current_runtime_role() = 'bot_assistant'
+        AND owner_role = 'bot_assistant'
+    )
+    WITH CHECK (
+        football_runtime.current_runtime_role() = 'bot_assistant'
+        AND owner_role = 'bot_assistant'
+    );
+
 REVOKE ALL ON football_runtime.recommendation_completed_searches FROM
     football_ingestion,
     football_application,
@@ -188,4 +224,13 @@ REVOKE ALL ON football_runtime.bot_search_presentations FROM
     football_recommendation,
     football_bot_assistant;
 GRANT SELECT, INSERT ON football_runtime.bot_search_presentations
+    TO football_bot_assistant;
+
+REVOKE ALL ON football_runtime.bot_old_chat_views FROM
+    football_ingestion,
+    football_application,
+    football_classification,
+    football_recommendation,
+    football_bot_assistant;
+GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_old_chat_views
     TO football_bot_assistant;

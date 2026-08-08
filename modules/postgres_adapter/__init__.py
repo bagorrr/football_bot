@@ -38,6 +38,7 @@ from modules.domain import (
     GeographySuggestion,
     IntentBranch,
     LocaleSource,
+    OldChatViewCleanup,
     RequiredDate,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
@@ -92,7 +93,8 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.bot_search_presentations,
+            TRUNCATE football_runtime.bot_old_chat_views,
+                     football_runtime.bot_search_presentations,
                      football_runtime.bot_active_result_contexts,
                      football_runtime.recommendation_results,
                      football_runtime.recommendation_completed_searches,
@@ -1688,6 +1690,15 @@ class PostgresRoleStore:
                 (delivered_at, delivery_id),
             )
             if superseded_at is None:
+                previous_view = connection.execute(
+                    """
+                    SELECT delivery_id, telegram_message_id
+                    FROM football_runtime.bot_active_chat_views
+                    WHERE telegram_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
                 connection.execute(
                     """
                     INSERT INTO football_runtime.bot_active_chat_views (
@@ -1708,6 +1719,23 @@ class PostgresRoleStore:
                         delivered_at,
                     ),
                 )
+                if previous_view is not None and previous_view[0] != delivery_id:
+                    connection.execute(
+                        """
+                        INSERT INTO football_runtime.bot_old_chat_views (
+                            delivery_id, telegram_user_id, telegram_message_id,
+                            replacement_delivery_id, classified_at
+                        ) VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (delivery_id) DO NOTHING
+                        """,
+                        (
+                            previous_view[0],
+                            telegram_user_id,
+                            previous_view[1],
+                            delivery_id,
+                            delivered_at,
+                        ),
+                    )
                 search_presentation = connection.execute(
                     """
                     SELECT completed_search_id
@@ -1763,6 +1791,67 @@ class PostgresRoleStore:
                             delivered_at,
                         ),
                     )
+
+    def claim_old_chat_view_cleanup(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> OldChatViewCleanup | None:
+        """Claim one pending or abandoned old-view cleanup."""
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                WITH candidate AS (
+                    SELECT delivery_id
+                    FROM football_runtime.bot_old_chat_views
+                    WHERE cleanup_status = 'pending'
+                       OR (cleanup_status = 'claimed' AND claimed_at < %s)
+                    ORDER BY classified_at, delivery_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE football_runtime.bot_old_chat_views AS old_view
+                SET cleanup_status = 'claimed', claim_token = %s, claimed_at = %s
+                FROM candidate
+                WHERE old_view.delivery_id = candidate.delivery_id
+                RETURNING old_view.delivery_id, old_view.telegram_user_id,
+                          old_view.telegram_message_id
+                """,
+                (stale_before, claim_token, claimed_at),
+            ).fetchone()
+        if row is None:
+            return None
+        return OldChatViewCleanup(
+            delivery_id=row[0],
+            telegram_user_id=row[1],
+            telegram_message_id=row[2],
+            claim_token=claim_token,
+        )
+
+    def mark_old_chat_view_cleanup_attempted(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        deleted: bool,
+        attempted_at: datetime,
+    ) -> None:
+        """Record the terminal best-effort outcome for one old view."""
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_old_chat_views
+                SET cleanup_status = 'attempted', claim_token = NULL,
+                    claimed_at = NULL, cleanup_attempted_at = %s, deleted = %s
+                WHERE delivery_id = %s AND claim_token = %s
+                RETURNING delivery_id
+                """,
+                (attempted_at, deleted, delivery_id, claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("old-view cleanup claim was lost")
 
     def attempt_owner_write(
         self,

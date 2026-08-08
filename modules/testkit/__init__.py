@@ -108,6 +108,9 @@ class ControlledTelegramDeliveryAdapter:
 
     presentations: list[str] = field(default_factory=list)
     messages: list[TelegramMessage] = field(default_factory=list)
+    inline_action_removals: list[tuple[int, str]] = field(default_factory=list)
+    typing_actions: list[int] = field(default_factory=list)
+    deletion_attempts: list[tuple[int, str]] = field(default_factory=list)
     failures_remaining: int = 0
     lost_confirmations_remaining: int = 0
     interruptions_after_effect_remaining: int = 0
@@ -163,6 +166,27 @@ class ControlledTelegramDeliveryAdapter:
         if recorded_message != message:
             raise ValueError("delivery ID was reused for a different message")
         return telegram_message_id
+
+    def remove_inline_actions(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> None:
+        """Record one idempotent removal of an existing inline keyboard."""
+        action = (telegram_user_id, telegram_message_id)
+        if action not in self.inline_action_removals:
+            self.inline_action_removals.append(action)
+
+    def show_typing(self, *, telegram_user_id: int) -> None:
+        """Record one native typing action for an accepted Search."""
+        self.typing_actions.append(telegram_user_id)
+
+    def delete_message(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> bool:
+        """Record one idempotent successful old-message deletion."""
+        attempt = (telegram_user_id, telegram_message_id)
+        if attempt not in self.deletion_attempts:
+            self.deletion_attempts.append(attempt)
+        return True
 
 
 class ControlledModelAdapter:
