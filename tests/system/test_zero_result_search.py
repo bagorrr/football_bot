@@ -279,6 +279,33 @@ def test_successful_result_replacement_cleans_only_the_previous_view() -> None:
     system.reset()
 
 
+def test_start_resumes_an_in_flight_search_without_submitting_again() -> None:
+    system, telegram = _boot_search_system()
+    user_id = 44_007
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="in-flight-search", telegram_user_id=user_id)
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+
+    system.start_bot_user(
+        update_id="resume-in-flight-search",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+
+    assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
+    assert system.completed_searches(user_id) == ()
+    assert telegram.messages[-1].text == (
+        "🔎 **Searching**\n\n"
+        "I am looking for matches using your confirmed search details."
+    )
+    assert telegram.messages[-1].button_rows == ()
+
+    system.process_searches_until_idle()
+    assert len(system.completed_searches(user_id)) == 1
+    assert system.has_discovery_draft(user_id) is False
+    system.reset()
+
+
 def _advance_to_complete_draft(system: AcceptanceSpine, *, user_id: int) -> None:
     system.start_bot_user(
         update_id=f"start:{user_id}",

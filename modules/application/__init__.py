@@ -760,6 +760,24 @@ _SEARCH_FAILURE_COPY = {
     ),
 }
 
+_SUBMITTING_COPY = {
+    "en": (
+        "🔎 **Searching**\n\n"
+        "I am looking for matches using your confirmed search details."
+    ),
+    "ru": (
+        "🔎 **Ищу варианты**\n\n"
+        "Проверяю совпадения по подтверждённым параметрам поиска."
+    ),
+    "es": (
+        "🔎 **Buscando**\n\nEstoy buscando coincidencias con tus criterios confirmados."
+    ),
+    "fr": (
+        "🔎 **Recherche en cours**\n\n"
+        "Je cherche des résultats selon vos critères confirmés."
+    ),
+}
+
 _REQUIRED_DATE_FEEDBACK = {
     "en": (
         "I couldn't identify one date or bounded range. Please try again.",
@@ -3374,6 +3392,13 @@ def _discovery_message(
             areas=draft.sub_city_areas,
             whole_city=draft.whole_city,
         )
+    if draft.stage is ConversationStage.SUBMITTING:
+        return _submitting_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+        )
     raise RuntimeError(f"unsupported Discovery Draft stage: {draft.stage}")
 
 
@@ -3636,6 +3661,24 @@ def _zero_result_message(
         text=text,
         button_rows=(((new_search_label, f"menu:new-search:{screen_revision}"),),),
         reply_button=menu_label,
+    )
+
+
+def _submitting_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=_SUBMITTING_COPY[copy_locale],
+        button_rows=(),
     )
 
 
