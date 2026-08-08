@@ -38,6 +38,28 @@ ALTER TABLE football_runtime.bot_discovery_drafts
 ALTER TABLE football_runtime.bot_message_outbox
     ADD COLUMN IF NOT EXISTS reply_button text;
 
+ALTER TABLE football_runtime.contract_inbox
+    DROP CONSTRAINT IF EXISTS contract_inbox_processing_status_check;
+ALTER TABLE football_runtime.contract_inbox
+    ADD CONSTRAINT contract_inbox_processing_status_check CHECK (
+        processing_status IN (
+            'accepted',
+            'rejected_unsupported_version',
+            'rejected_invalid_contract'
+        )
+    );
+
+ALTER TABLE football_runtime.operator_alerts
+    DROP CONSTRAINT IF EXISTS operator_alerts_failure_code_check;
+ALTER TABLE football_runtime.operator_alerts
+    ADD CONSTRAINT operator_alerts_failure_code_check CHECK (
+        failure_code IN (
+            'unsupported_contract_version',
+            'invalid_contract',
+            'owner_write_denied'
+        )
+    );
+
 CREATE TABLE IF NOT EXISTS football_runtime.recommendation_completed_searches (
     owner_role text NOT NULL DEFAULT 'recommendation'
         CHECK (owner_role = 'recommendation'),

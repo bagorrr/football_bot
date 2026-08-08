@@ -750,33 +750,40 @@ class AcceptanceRole:
         )
         if incoming is None:
             return False
+        supported_incoming = None
+        if incoming.contract_version in self.versions_for(incoming.contract_name):
+            try:
+                supported_incoming = ContractEnvelope.from_raw(incoming)
+            except (TypeError, ValueError):
+                self.store.reject_invalid_contract(
+                    incoming=incoming,
+                    received_at=self.clock.now(),
+                )
+                return True
         if (
             incoming.contract_name is ContractName.RUN_SEARCH
-            and incoming.contract_version in self.versions_for(incoming.contract_name)
+            and supported_incoming is not None
         ):
-            self._complete_zero_result_search(incoming)
+            self._complete_zero_result_search(supported_incoming)
             return True
         if (
-            incoming.contract_name is ContractName.SEARCH_COMPLETED
-            and incoming.contract_version in self.versions_for(incoming.contract_name)
-            and isinstance(incoming.payload, dict)
-            and "telegram_user_id" in incoming.payload
+            incoming.contract_name is ContractName.ZERO_RESULT_SEARCH_COMPLETED
+            and supported_incoming is not None
         ):
             _conversation_onboarding_for_role(
                 self
-            ).accept_zero_result_search_completion(incoming=incoming)
+            ).accept_zero_result_search_completion(incoming=supported_incoming)
             return True
         if (
             incoming.contract_name is ContractName.SEARCH_FAILED
-            and incoming.contract_version in self.versions_for(incoming.contract_name)
+            and supported_incoming is not None
         ):
             _conversation_onboarding_for_role(self).accept_search_failure(
-                incoming=incoming
+                incoming=supported_incoming
             )
             return True
         outgoing = None
-        if incoming.contract_version in self.versions_for(incoming.contract_name):
-            supported_incoming = ContractEnvelope.from_raw(incoming)
+        if supported_incoming is not None:
             definition, fact = self._next_handoff(supported_incoming)
             outgoing = _envelope(
                 definition=definition,
@@ -872,14 +879,14 @@ class AcceptanceRole:
             completed_at=self.clock.now(),
         )
         outgoing = ContractEnvelope(
-            contract_name=ContractName.SEARCH_COMPLETED,
+            contract_name=ContractName.ZERO_RESULT_SEARCH_COMPLETED,
             contract_version=1,
-            message_id=_identifier(completed_search_id, "SearchCompleted"),
+            message_id=_identifier(completed_search_id, "ZeroResultSearchCompleted"),
             producer=RuntimeRole.RECOMMENDATION,
             consumer=RuntimeRole.BOT_ASSISTANT,
             subject_id=completed_search_id,
             subject_revision=1,
-            idempotency_key=f"search-completed:{completed_search_id}",
+            idempotency_key=f"zero-result-search-completed:{completed_search_id}",
             causation_id=incoming.message_id,
             correlation_id=incoming.correlation_id,
             recorded_at=self.clock.now(),
@@ -1070,38 +1077,42 @@ class AcceptanceSpine:
         contract_name: ContractName,
         contract_version: int,
         telegram_user_id: int,
+        producer: RuntimeRole = RuntimeRole.RECOMMENDATION,
+        include_telegram_user_id: bool = True,
     ) -> None:
         """Record one synthetic Recommendation event for contract-boundary tests."""
         if contract_name not in {
-            ContractName.SEARCH_COMPLETED,
+            ContractName.ZERO_RESULT_SEARCH_COMPLETED,
             ContractName.SEARCH_FAILED,
         }:
             raise ValueError("only Search outcome events can use this testkit port")
         required_fact = (
             "completed_search_id"
-            if contract_name is ContractName.SEARCH_COMPLETED
+            if contract_name is ContractName.ZERO_RESULT_SEARCH_COMPLETED
             else "search_update_id"
         )
+        payload: dict[str, JsonValue] = {
+            "probe_id": probe_id,
+            required_fact: f"{required_fact}:{probe_id}",
+            "search_update_id": f"search-update:{probe_id}",
+        }
+        if include_telegram_user_id:
+            payload["telegram_user_id"] = telegram_user_id
         envelope = RawContractEnvelope(
             contract_name=contract_name,
             contract_version=contract_version,
             message_id=_identifier(probe_id, contract_name.value),
-            producer=RuntimeRole.RECOMMENDATION,
+            producer=producer,
             consumer=RuntimeRole.BOT_ASSISTANT,
             subject_id=probe_id,
             subject_revision=1,
             idempotency_key=f"{probe_id}:{contract_name.value}",
             causation_id=_identifier(probe_id, "causation"),
             correlation_id=_identifier(probe_id, "correlation"),
-            recorded_at=self._roles[RuntimeRole.RECOMMENDATION].clock.now(),
-            payload={
-                "probe_id": probe_id,
-                required_fact: f"{required_fact}:{probe_id}",
-                "search_update_id": f"search-update:{probe_id}",
-                "telegram_user_id": telegram_user_id,
-            },
+            recorded_at=self._roles[producer].clock.now(),
+            payload=payload,
         )
-        self._roles[RuntimeRole.RECOMMENDATION].store.commit_initial(
+        self._roles[producer].store.commit_initial(
             probe_id=probe_id,
             envelope=envelope,
         )

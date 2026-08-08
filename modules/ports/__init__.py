@@ -449,6 +449,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically persist a zero-result Completed Search and its event."""
         ...
 
+    def reject_invalid_contract(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Durably reject one supported-version envelope with invalid semantics."""
+        ...
+
     def attempt_owner_write(
         self,
         *,

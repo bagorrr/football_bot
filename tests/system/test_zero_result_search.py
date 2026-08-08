@@ -335,9 +335,35 @@ def test_start_preserves_a_completed_search_awaiting_result_delivery() -> None:
     system.reset()
 
 
+def test_deferred_start_refreshes_draft_activity_when_result_delivery_fails() -> None:
+    system, telegram, clock = _boot_search_system_with_clock()
+    user_id = 44_010
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="activity-search", telegram_user_id=user_id)
+    system.process_next_search_handoff(RuntimeRole.RECOMMENDATION)
+    system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT)
+    clock.advance_to(datetime(2026, 8, 28, 12, 0, tzinfo=UTC))
+    telegram.fail_next()
+
+    with pytest.raises(InjectedTelegramDeliveryError):
+        system.start_bot_user(
+            update_id="activity-refresh-start",
+            telegram_user_id=user_id,
+            telegram_language_hint="en",
+        )
+
+    clock.advance_to(datetime(2026, 9, 17, 12, 0, tzinfo=UTC))
+    assert system.expire_inactive_discovery_drafts() == 0
+    assert system.has_discovery_draft(user_id) is True
+    system.reset()
+
+
 @pytest.mark.parametrize(
     "contract_name",
-    (ContractName.SEARCH_COMPLETED, ContractName.SEARCH_FAILED),
+    (
+        ContractName.ZERO_RESULT_SEARCH_COMPLETED,
+        ContractName.SEARCH_FAILED,
+    ),
 )
 def test_future_search_event_versions_fail_closed(
     contract_name: ContractName,
@@ -359,6 +385,37 @@ def test_future_search_event_versions_fail_closed(
     assert len(snapshot.operator_alerts) == 1
     assert snapshot.operator_alerts[0].contract_name is contract_name
     assert snapshot.operator_alerts[0].contract_version == 2
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("producer", "include_telegram_user_id"),
+    (
+        (RuntimeRole.RECOMMENDATION, False),
+        (RuntimeRole.APPLICATION, True),
+    ),
+)
+def test_invalid_supported_search_events_fail_closed(
+    producer: RuntimeRole,
+    include_telegram_user_id: bool,
+) -> None:
+    system, _telegram = _boot_search_system()
+    probe_id = f"invalid-SearchFailed:{producer.value}:{include_telegram_user_id}"
+    system.record_search_event(
+        probe_id=probe_id,
+        contract_name=ContractName.SEARCH_FAILED,
+        contract_version=1,
+        telegram_user_id=44_011,
+        producer=producer,
+        include_telegram_user_id=include_telegram_user_id,
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    snapshot = system.observe(probe_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert len(snapshot.operator_alerts) == 1
     system.reset()
 
 
@@ -436,7 +493,15 @@ def _advance_existing_user_to_complete_draft(
 
 
 def _boot_search_system() -> tuple[AcceptanceSpine, ControlledTelegramDeliveryAdapter]:
+    system, telegram, _clock = _boot_search_system_with_clock()
+    return system, telegram
+
+
+def _boot_search_system_with_clock() -> tuple[
+    AcceptanceSpine, ControlledTelegramDeliveryAdapter, FrozenClock
+]:
     telegram = ControlledTelegramDeliveryAdapter()
+    clock = FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC))
     dates = ControlledDateInterpretationAdapter()
     dates.return_for(
         text="tomorrow",
@@ -457,7 +522,7 @@ def _boot_search_system() -> tuple[AcceptanceSpine, ControlledTelegramDeliveryAd
     )
     system = boot_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
-        clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
+        clock=clock,
         telegram_delivery=telegram,
         model=ControlledModelAdapter(),
         location_resolver=ControlledLocationResolverAdapter(),
@@ -465,4 +530,4 @@ def _boot_search_system() -> tuple[AcceptanceSpine, ControlledTelegramDeliveryAd
         timezone_data=timezones,
     )
     system.reset()
-    return system, telegram
+    return system, telegram, clock

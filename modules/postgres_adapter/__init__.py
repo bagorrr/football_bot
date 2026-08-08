@@ -318,7 +318,7 @@ class PostgresAcceptanceObserver:
                 SELECT
                     count(*) FILTER (WHERE processing_status = 'accepted') AS accepted,
                     count(*) FILTER (
-                        WHERE processing_status = 'rejected_unsupported_version'
+                        WHERE processing_status <> 'accepted'
                     ) AS rejected
                 FROM football_runtime.contract_inbox AS inbox
                 JOIN football_runtime.contract_outbox AS outbox
@@ -421,7 +421,9 @@ class PostgresRoleStore:
                   ON inbox.consumer_role = %s
                  AND inbox.message_id = outbox.message_id
                 WHERE outbox.consumer_role = %s
-                  AND inbox.processing_status IS DISTINCT FROM 'accepted'
+                  AND COALESCE(inbox.processing_status, '') NOT IN (
+                      'accepted', 'rejected_invalid_contract'
+                  )
                   AND (
                       outbox.claimed_until IS NULL
                       OR outbox.claimed_until <= %s
@@ -448,7 +450,7 @@ class PostgresRoleStore:
                     """,
                     (claimed_at + timedelta(seconds=30), row["message_id"]),
                 )
-                return _row_to_envelope(row)
+                return _row_to_envelope(row, validate_registered=False)
         return None
 
     def claim_presentation(
@@ -705,6 +707,70 @@ class PostgresRoleStore:
             _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
             return ConsumeResult.APPLIED
+
+    def reject_invalid_contract(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Reject malformed supported-version work without applying owner state."""
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.contract_inbox (
+                        consumer_role, message_id, producer_role, contract_name,
+                        contract_version, processing_status, received_at
+                    ) VALUES (%s, %s, %s, %s, %s, 'rejected_invalid_contract', %s)
+                    """,
+                    (
+                        self._role.value,
+                        incoming.message_id,
+                        incoming.producer.value,
+                        incoming.contract_name.value,
+                        incoming.contract_version,
+                        received_at,
+                    ),
+                )
+                _insert_alert(
+                    connection,
+                    observer=self._role,
+                    incoming=incoming,
+                    consumer=self._role,
+                    failure_code=FailureCode.INVALID_CONTRACT,
+                    observed_at=received_at,
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.contract_inbox
+                    SET processing_status = 'rejected_invalid_contract',
+                        received_at = %s
+                    WHERE consumer_role = %s AND message_id = %s
+                    """,
+                    (received_at, self._role.value, incoming.message_id),
+                )
+                if existing[0] != "rejected_invalid_contract":
+                    _insert_alert(
+                        connection,
+                        observer=self._role,
+                        incoming=incoming,
+                        consumer=self._role,
+                        failure_code=FailureCode.INVALID_CONTRACT,
+                        observed_at=received_at,
+                    )
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.REJECTED
 
     @contextmanager
     def serialize_conversation_update(
@@ -1252,6 +1318,23 @@ class PostgresRoleStore:
                 """,
                 (update_id, telegram_user_id, recorded_at, telegram_user_id),
             ).fetchone()
+            if inserted is not None:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_users
+                    SET last_bot_user_action_at = %s, updated_at = %s
+                    WHERE telegram_user_id = %s
+                    """,
+                    (recorded_at, recorded_at, telegram_user_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_discovery_drafts
+                    SET last_activity_at = %s, updated_at = %s
+                    WHERE telegram_user_id = %s AND stage = 'submitting'
+                    """,
+                    (recorded_at, recorded_at, telegram_user_id),
+                )
         return inserted is not None
 
     def accept_zero_result_search_completion(
@@ -2121,7 +2204,9 @@ def _release_claim(
     )
 
 
-def _row_to_envelope(row: dict[str, Any]) -> RawContractEnvelope:
+def _row_to_envelope(
+    row: dict[str, Any], *, validate_registered: bool = True
+) -> RawContractEnvelope:
     consumer = row["consumer_role"]
     envelope = RawContractEnvelope(
         contract_name=ContractName(row["contract_name"]),
@@ -2137,7 +2222,7 @@ def _row_to_envelope(row: dict[str, Any]) -> RawContractEnvelope:
         recorded_at=row["recorded_at"],
         payload=row["payload"],
     )
-    if any(
+    if validate_registered and any(
         definition.name is envelope.contract_name
         and definition.version == envelope.contract_version
         for definition in SUPPORTED_CONTRACTS

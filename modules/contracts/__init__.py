@@ -37,6 +37,7 @@ class ContractName(StrEnum):
     OPPORTUNITY_PUBLICATION_CHANGED = "OpportunityPublicationChanged"
     RUN_SEARCH = "RunSearch"
     SEARCH_COMPLETED = "SearchCompleted"
+    ZERO_RESULT_SEARCH_COMPLETED = "ZeroResultSearchCompleted"
     SEARCH_FAILED = "SearchFailed"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
@@ -46,6 +47,7 @@ class FailureCode(StrEnum):
     """Low-cardinality contract-spine failures."""
 
     UNSUPPORTED_CONTRACT_VERSION = "unsupported_contract_version"
+    INVALID_CONTRACT = "invalid_contract"
     OWNER_WRITE_DENIED = "owner_write_denied"
 
 
@@ -123,6 +125,14 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.RECOMMENDATION,
         RuntimeRole.BOT_ASSISTANT,
         "completed_search_id",
+    ),
+    ContractDefinition(
+        ContractName.ZERO_RESULT_SEARCH_COMPLETED,
+        1,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "completed_search_id",
+        ("telegram_user_id",),
     ),
     ContractDefinition(
         ContractName.SEARCH_FAILED,
