@@ -6,15 +6,18 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, date, timedelta
 from enum import IntEnum
+from pathlib import Path
 from uuid import uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import TZPATH, ZoneInfo, ZoneInfoNotFoundError
 
 from modules.domain import (
     AcceptedLocation,
     ConversationStage,
     ConversationState,
+    DateInterpretation,
+    DateInterpretationQuery,
     DiscoveryDraft,
     GeographicType,
     GeographyConfirmation,
@@ -26,6 +29,8 @@ from modules.domain import (
     LocationCandidate,
     LocationInterpretation,
     LocationResolutionQuery,
+    RequiredDate,
+    RequiredDateConfirmation,
     TelegramDeliveryMode,
     TelegramMessage,
     UserIntent,
@@ -34,6 +39,8 @@ from modules.ports import (
     Clock,
     ConversationLanguageAdapter,
     ConversationStore,
+    DateInterpretationAdapter,
+    DateInterpretationError,
     LocationResolverAdapter,
     LocationResolverError,
     TelegramDeliveryAdapter,
@@ -690,6 +697,37 @@ _POST_CORE_COPY = {
     ),
 }
 
+_REQUIRED_DATE_FEEDBACK = {
+    "en": (
+        "I couldn't identify one date or bounded range. Please try again.",
+        "That date or range is invalid or has already started. Please try again.",
+        "I found several possible dates. Please be more specific.",
+        "Date interpretation is temporarily unavailable. Your confirmed date "
+        "is unchanged; please try again.",
+    ),
+    "ru": (
+        "Не удалось определить одну дату или ограниченный период. Попробуйте ещё раз.",
+        "Эта дата или период недействительны либо уже начались. Попробуйте ещё раз.",
+        "Нашлось несколько возможных дат. Уточните ответ.",
+        "Распознавание даты временно недоступно. Подтверждённая дата не "
+        "изменилась; попробуйте ещё раз.",
+    ),
+    "es": (
+        "No pude identificar una fecha o un periodo limitado. Inténtelo de nuevo.",
+        "La fecha o el periodo no es válido o ya ha comenzado. Inténtelo de nuevo.",
+        "Encontré varias fechas posibles. Sea más preciso.",
+        "La interpretación de fechas no está disponible temporalmente. La fecha "
+        "confirmada no ha cambiado; inténtelo de nuevo.",
+    ),
+    "fr": (
+        "Je n’ai pas pu identifier une date ou une période limitée. Réessayez.",
+        "Cette date ou période est invalide ou a déjà commencé. Réessayez.",
+        "J’ai trouvé plusieurs dates possibles. Précisez votre réponse.",
+        "L’interprétation des dates est temporairement indisponible. La date "
+        "confirmée n’a pas changé ; réessayez.",
+    ),
+}
+
 _SEARCH_AREA_RESULT_COPY = {
     "en": ("Search area", "whole city"),
     "ru": ("Зона поиска", "весь город"),
@@ -863,12 +901,14 @@ class ConversationOnboarding:
         telegram_delivery: TelegramDeliveryAdapter,
         conversation_language: ConversationLanguageAdapter,
         location_resolver: LocationResolverAdapter,
+        date_interpretation: DateInterpretationAdapter,
         clock: Clock,
     ) -> None:
         self._store = store
         self._telegram_delivery = telegram_delivery
         self._conversation_language = conversation_language
         self._location_resolver = location_resolver
+        self._date_interpretation = date_interpretation
         self._clock = clock
 
     def start(
@@ -1340,6 +1380,207 @@ class ConversationOnboarding:
                     )
         self.deliver_pending()
 
+    def submit_required_date_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        screen_revision: int,
+    ) -> None:
+        """Interpret and confirm one local date or bounded inclusive range."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                draft = self._store.discovery_draft(telegram_user_id)
+                if current is None or draft is None:
+                    return
+                if (
+                    current.stage is not ConversationStage.REQUIRED_DATE
+                    or draft.stage is not ConversationStage.REQUIRED_DATE
+                    or draft.screen_revision != screen_revision
+                ):
+                    self._queue_current_view(update_id=update_id, state=current)
+                else:
+                    self._apply_required_date_text(
+                        update_id=update_id,
+                        current=current,
+                        draft=draft,
+                        text=text,
+                    )
+        self.deliver_pending()
+
+    def _apply_required_date_text(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        text: str,
+    ) -> None:
+        if current.locale is None or draft.city is None or draft.country is None:
+            raise RuntimeError("Required Date stage has incomplete confirmed context")
+        if draft.user_intent not in _DATE_REQUIRED_INTENTS:
+            raise RuntimeError("Required Date stage has a non-date User Intent")
+        timezone_name = draft.city.iana_timezone
+        if not timezone_name:
+            self._queue_required_date_feedback(
+                update_id=update_id,
+                current=current,
+                draft=draft,
+                outcome=_ResolutionOutcome.INVALID,
+            )
+            return
+        now = self._clock.now()
+        if now.tzinfo is None:
+            raise RuntimeError("authoritative UTC clock returned a naive instant")
+        authoritative_utc = now.astimezone(UTC)
+        try:
+            timezone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            self._queue_required_date_feedback(
+                update_id=update_id,
+                current=current,
+                draft=draft,
+                outcome=_ResolutionOutcome.INVALID,
+            )
+            return
+        timezone_data_version = _timezone_data_version()
+        if timezone_data_version is None:
+            self._queue_required_date_feedback(
+                update_id=update_id,
+                current=current,
+                draft=draft,
+                outcome=_ResolutionOutcome.INVALID,
+            )
+            return
+        local_date = authoritative_utc.astimezone(timezone).date()
+        try:
+            resolution = self._date_interpretation.interpret(
+                DateInterpretationQuery(
+                    text=text,
+                    locale=current.locale,
+                    authoritative_utc=authoritative_utc,
+                    current_local_date=local_date,
+                    iana_timezone=timezone_name,
+                    timezone_data_version=timezone_data_version,
+                )
+            )
+        except DateInterpretationError:
+            self._queue_required_date_feedback(
+                update_id=update_id,
+                current=current,
+                draft=draft,
+                outcome=_ResolutionOutcome.FAILURE,
+            )
+            return
+        interpretations = tuple(
+            dict.fromkeys(
+                proposal
+                for proposal in resolution.interpretations
+                if _valid_required_date_proposal(
+                    proposal,
+                    timezone_name=timezone_name,
+                    current_local_date=local_date,
+                )
+            )
+        )
+        if len(interpretations) != 1:
+            self._queue_required_date_feedback(
+                update_id=update_id,
+                current=current,
+                draft=draft,
+                outcome=(
+                    _ResolutionOutcome.AMBIGUOUS
+                    if len(interpretations) > 1
+                    else (
+                        _ResolutionOutcome.INVALID
+                        if resolution.interpretations
+                        else _ResolutionOutcome.UNKNOWN
+                    )
+                ),
+            )
+            return
+        proposal = interpretations[0]
+        accepted = RequiredDate(
+            start_local_date=proposal.start_local_date,
+            end_local_date=proposal.end_local_date,
+            iana_timezone=timezone_name,
+            timezone_data_version=timezone_data_version,
+        )
+        state = replace(
+            current,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        changed_draft = replace(
+            draft,
+            stage=ConversationStage.POST_CORE,
+            required_date=accepted,
+            screen_revision=state.screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        message = _post_core_message(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            locale=current.locale,
+            screen_revision=state.screen_revision,
+            country=draft.country,
+            city=draft.city,
+            areas=draft.sub_city_areas,
+            whole_city=draft.whole_city,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            recorded_at=now,
+            draft=changed_draft,
+            required_date_confirmation=RequiredDateConfirmation(
+                user_intent=draft.user_intent,
+                required_date=accepted,
+            ),
+        )
+
+    def _queue_required_date_feedback(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        draft: DiscoveryDraft,
+        outcome: _ResolutionOutcome,
+    ) -> None:
+        if current.locale is None or draft.country is None or draft.city is None:
+            raise RuntimeError("Required Date feedback has incomplete context")
+        copy_locale = current.locale if current.locale in SUPPORTED_LOCALES else "en"
+        prompt = _required_date_message(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            locale=current.locale,
+            screen_revision=current.screen_revision,
+            country=draft.country,
+            city=draft.city,
+            areas=draft.sub_city_areas,
+            whole_city=draft.whole_city,
+        )
+        message = replace(
+            prompt,
+            text=f"{_REQUIRED_DATE_FEEDBACK[copy_locale][outcome]}\n\n{prompt.text}",
+        )
+        self._store.commit_conversation_presentation(
+            update_id=update_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            message=message,
+            recorded_at=self._clock.now(),
+        )
+
     def _apply_country_text(
         self,
         *,
@@ -1466,6 +1707,7 @@ class ConversationOnboarding:
             city=None if changed_country else draft.city,
             sub_city_areas=() if changed_country else draft.sub_city_areas,
             whole_city=False if changed_country else draft.whole_city,
+            required_date=None if changed_country else draft.required_date,
             screen_revision=state.screen_revision,
             revision=draft.revision + 1,
             last_activity_at=now,
@@ -1672,6 +1914,7 @@ class ConversationOnboarding:
             city=accepted_city,
             sub_city_areas=() if changed_city else draft.sub_city_areas,
             whole_city=False if changed_city else draft.whole_city,
+            required_date=None if changed_city else draft.required_date,
             screen_revision=state.screen_revision,
             revision=draft.revision + 1,
             last_activity_at=now,
@@ -1946,6 +2189,7 @@ class ConversationOnboarding:
             city=None,
             sub_city_areas=(),
             whole_city=False,
+            required_date=None,
             screen_revision=state.screen_revision,
             revision=draft.revision + 1,
             last_activity_at=now,
@@ -3072,6 +3316,32 @@ def _post_core_message(
             ((search_label, f"search:submit:{screen_revision}"),),
         ),
     )
+
+
+def _valid_required_date_proposal(
+    proposal: DateInterpretation,
+    *,
+    timezone_name: str,
+    current_local_date: date,
+) -> bool:
+    return (
+        proposal.iana_timezone == timezone_name
+        and proposal.start_local_date <= proposal.end_local_date
+        and proposal.start_local_date >= current_local_date
+    )
+
+
+def _timezone_data_version() -> str | None:
+    for root in TZPATH:
+        version_file = Path(root) / "tzdata.zi"
+        try:
+            first_line = version_file.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError):
+            continue
+        match = re.fullmatch(r"# version (\S+)", first_line)
+        if match is not None:
+            return match.group(1)
+    return None
 
 
 def _search_area_summary(

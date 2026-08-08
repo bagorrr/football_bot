@@ -25,6 +25,8 @@ from modules.domain import (
     ActiveChatView,
     ConversationStage,
     ConversationState,
+    DateInterpretationQuery,
+    DateInterpretationResolution,
     DiscoveryDraft,
     GeographicType,
     GeographyConfirmationEvent,
@@ -34,6 +36,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    RequiredDateConfirmationEvent,
     TelegramMessage,
 )
 from modules.ports import (
@@ -42,6 +45,8 @@ from modules.ports import (
     Clock,
     ConversationAccessDeniedError,
     ConversationLanguageAdapter,
+    DateInterpretationAdapter,
+    DateInterpretationError,
     LocationResolverAdapter,
     LocationResolverError,
     ModelAdapter,
@@ -147,6 +152,34 @@ class ControlledModelAdapter:
     def proposal_id(self, revision_id: str) -> str:
         """Return a stable non-authoritative proposal identity."""
         return f"proposal:{revision_id}"
+
+
+@dataclass(slots=True)
+class ControlledDateInterpretationAdapter:
+    """Deterministic natural-language date boundary with no provider access."""
+
+    _resolutions: dict[str, DateInterpretationResolution] = field(default_factory=dict)
+    _failures: set[str] = field(default_factory=set)
+    queries: list[DateInterpretationQuery] = field(default_factory=list)
+
+    def return_for(
+        self, *, text: str, resolution: DateInterpretationResolution
+    ) -> None:
+        """Configure one deterministic interpretation response."""
+        self._resolutions[text] = resolution
+
+    def fail_for(self, *, text: str) -> None:
+        """Configure one deterministic technical failure."""
+        self._failures.add(text)
+
+    def interpret(self, query: DateInterpretationQuery) -> DateInterpretationResolution:
+        """Return only configured proposals and record supplied local context."""
+        self.queries.append(query)
+        if query.text in self._failures:
+            raise DateInterpretationError("controlled date interpretation failure")
+        return self._resolutions.get(
+            query.text, DateInterpretationResolution(interpretations=())
+        )
 
 
 @dataclass(slots=True)
@@ -502,6 +535,7 @@ class AcceptanceRole:
     model: ModelAdapter | None = None
     location_resolver: LocationResolverAdapter | None = None
     conversation_language: ConversationLanguageAdapter | None = None
+    date_interpretation: DateInterpretationAdapter | None = None
     supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -852,17 +886,26 @@ class AcceptanceSpine:
         """Observe append-only explicit geography confirmations."""
         return self._observer.geography_confirmations(telegram_user_id)
 
+    def required_date_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[RequiredDateConfirmationEvent, ...]:
+        """Observe append-only explicit Required Date confirmations."""
+        return self._observer.required_date_confirmations(telegram_user_id)
+
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
         if role.telegram_delivery is None:
             raise RuntimeError("Bot Assistant runtime has no delivery adapter")
         if role.location_resolver is None:
             raise RuntimeError("Bot Assistant runtime has no resolver adapter")
+        if role.date_interpretation is None:
+            raise RuntimeError("Bot Assistant runtime has no date interpreter")
         return ConversationOnboarding(
             store=role.store,
             telegram_delivery=role.telegram_delivery,
             conversation_language=_conversation_language(role),
             location_resolver=role.location_resolver,
+            date_interpretation=role.date_interpretation,
             clock=role.clock,
         )
 
@@ -1050,6 +1093,26 @@ class AcceptanceSpine:
             raise RuntimeError("controlled date acceptance was replayed")
         self.retry_bot_presentations()
 
+    def submit_required_date_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one natural-language Required Date answer through the Bot Assistant."""
+        self._conversation_onboarding().submit_required_date_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
     def submit_location_text(
         self,
         *,
@@ -1220,6 +1283,7 @@ def boot_acceptance_spine(
     model: ModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
     conversation_language: ConversationLanguageAdapter | None = None,
+    date_interpretation: DateInterpretationAdapter | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately."""
     from apps.system_acceptance import boot_acceptance_role
@@ -1244,6 +1308,9 @@ def boot_acceptance_spine(
     controlled_conversation_language = (
         conversation_language or ControlledConversationLanguageAdapter()
     )
+    controlled_date_interpretation = (
+        date_interpretation or ControlledDateInterpretationAdapter()
+    )
 
     def restart_role(role: RuntimeRole) -> AcceptanceRole:
         return boot_acceptance_role(
@@ -1264,6 +1331,11 @@ def boot_acceptance_spine(
             ),
             conversation_language=(
                 controlled_conversation_language
+                if role is RuntimeRole.BOT_ASSISTANT
+                else None
+            ),
+            date_interpretation=(
+                controlled_date_interpretation
                 if role is RuntimeRole.BOT_ASSISTANT
                 else None
             ),

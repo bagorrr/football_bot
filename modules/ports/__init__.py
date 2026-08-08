@@ -20,6 +20,8 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ConversationState,
+    DateInterpretationQuery,
+    DateInterpretationResolution,
     DiscoveryDraft,
     GeographyConfirmation,
     GeographyConfirmationEvent,
@@ -27,6 +29,8 @@ from modules.domain import (
     LanguageSelection,
     LocationResolution,
     LocationResolutionQuery,
+    RequiredDateConfirmation,
+    RequiredDateConfirmationEvent,
     TelegramDeliveryClaim,
     TelegramMessage,
     UserIntent,
@@ -101,6 +105,18 @@ class LocationResolverError(RuntimeError):
     """The controlled resolver could not complete one request."""
 
 
+class DateInterpretationAdapter(Protocol):
+    """Controlled natural-language date interpretation boundary."""
+
+    def interpret(self, query: DateInterpretationQuery) -> DateInterpretationResolution:
+        """Propose calendar boundaries from application-supplied local context."""
+        ...
+
+
+class DateInterpretationError(RuntimeError):
+    """The controlled date interpreter could not complete one request."""
+
+
 class ConversationLanguageAdapter(Protocol):
     """Bounded semantic adapter for free-text language names."""
 
@@ -172,6 +188,7 @@ class ConversationStore(Protocol):
         recorded_at: datetime,
         draft: DiscoveryDraft | None = None,
         geography_confirmation: GeographyConfirmation | None = None,
+        required_date_confirmation: RequiredDateConfirmation | None = None,
     ) -> bool:
         """Commit one idempotent Telegram update and its owned state."""
         ...
@@ -355,6 +372,12 @@ class AcceptanceObserver(Protocol):
         self, telegram_user_id: int
     ) -> tuple[GeographyConfirmationEvent, ...]:
         """Observe append-only explicit geography confirmations."""
+        ...
+
+    def required_date_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[RequiredDateConfirmationEvent, ...]:
+        """Observe append-only explicit Required Date confirmations."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
