@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -1281,6 +1282,16 @@ class AcceptanceSpine:
         if role not in {RuntimeRole.RECOMMENDATION, RuntimeRole.BOT_ASSISTANT}:
             raise ValueError("Search handoff role must own the Search pipeline")
         return self._roles[role].process_next()
+
+    @contextmanager
+    def hold_bot_user_transition(self, telegram_user_id: int) -> Iterator[None]:
+        """Hold the real Bot User serialization boundary for concurrency tests."""
+        store = self._roles[RuntimeRole.BOT_ASSISTANT].store
+        with store.serialize_conversation_update(
+            update_id=f"controlled-transition:{telegram_user_id}",
+            telegram_user_id=telegram_user_id,
+        ):
+            yield
 
     def fail_next_search(self) -> None:
         """Inject one controlled technical failure in Recommendation."""

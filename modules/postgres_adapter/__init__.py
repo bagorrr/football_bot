@@ -1356,6 +1356,10 @@ class PostgresRoleStore:
     ) -> ConsumeResult:
         """Queue one zero-result screen and defer activation until delivery."""
         with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (message.telegram_user_id,),
+            )
             existing = connection.execute(
                 """
                 SELECT processing_status

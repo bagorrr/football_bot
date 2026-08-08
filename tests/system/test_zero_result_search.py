@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime
 
 import pytest
@@ -332,6 +333,34 @@ def test_start_preserves_a_completed_search_awaiting_result_delivery() -> None:
     assert telegram.messages[-1].delivery_id == (
         f"search-result:{completed.completed_search_id}"
     )
+    system.reset()
+
+
+def test_search_completion_uses_bot_user_transition_serialization() -> None:
+    system, telegram = _boot_search_system()
+    user_id = 44_013
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="serialized-search", telegram_user_id=user_id)
+    system.process_next_search_handoff(RuntimeRole.RECOMMENDATION)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with system.hold_bot_user_transition(user_id):
+            completion = executor.submit(
+                system.process_next_search_handoff,
+                RuntimeRole.BOT_ASSISTANT,
+            )
+            assert wait((completion,), timeout=0.25).done == set()
+        assert completion.result(timeout=5) is True
+
+    system.start_bot_user(
+        update_id="start-after-serialized-completion",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.retry_bot_presentations()
+
+    assert telegram.messages[-1].reply_button == "Menu"
+    assert system.has_discovery_draft(user_id) is False
     system.reset()
 
 
