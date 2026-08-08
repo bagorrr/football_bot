@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -36,6 +36,9 @@ from modules.domain import (
     GeographySuggestion,
     IntentBranch,
     LocaleSource,
+    RequiredDate,
+    RequiredDateConfirmation,
+    RequiredDateConfirmationEvent,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramMessage,
@@ -89,8 +92,9 @@ class PostgresAcceptanceObserver:
             TRUNCATE football_runtime.bot_active_chat_views,
                      football_runtime.bot_delivery_alerts,
                      football_runtime.bot_message_outbox,
-                     football_runtime.bot_updates,
+                     football_runtime.bot_required_date_confirmation_events,
                      football_runtime.bot_geography_confirmation_events,
+                     football_runtime.bot_updates,
                      football_runtime.bot_discovery_drafts,
                      football_runtime.bot_users,
                      football_runtime.telegram_presentations,
@@ -192,6 +196,39 @@ class PostgresAcceptanceObserver:
                 whole_city=row["whole_city"],
                 resolver_versions=tuple(row["resolver_versions"]),
                 glossary_version=row["glossary_version"],
+                confirmed_at=row["confirmed_at"],
+            )
+            for row in rows
+        )
+
+    def required_date_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[RequiredDateConfirmationEvent, ...]:
+        """Observe explicit Required Date confirmations through the testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT update_id, user_intent, start_local_date, end_local_date,
+                       iana_timezone, timezone_data_version, confirmed_at
+                FROM football_runtime.bot_required_date_confirmation_events
+                WHERE telegram_user_id = %s
+                ORDER BY event_sequence
+                """,
+                (telegram_user_id,),
+            ).fetchall()
+        return tuple(
+            RequiredDateConfirmationEvent(
+                update_id=row["update_id"],
+                user_intent=UserIntent(row["user_intent"]),
+                required_date=RequiredDate(
+                    start_local_date=row["start_local_date"],
+                    end_local_date=row["end_local_date"],
+                    iana_timezone=row["iana_timezone"],
+                    timezone_data_version=row["timezone_data_version"],
+                ),
                 confirmed_at=row["confirmed_at"],
             )
             for row in rows
@@ -609,7 +646,7 @@ class PostgresRoleStore:
                     """
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
                            screen_revision, revision, last_activity_at,
-                           country, city, sub_city_areas, whole_city
+                           country, city, sub_city_areas, whole_city, required_date
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
                     """,
@@ -637,6 +674,7 @@ class PostgresRoleStore:
                 if (candidate := _optional_accepted_location(value)) is not None
             ),
             whole_city=row["whole_city"],
+            required_date=_optional_required_date(row["required_date"]),
         )
 
     def geography_suggestion(
@@ -694,6 +732,7 @@ class PostgresRoleStore:
         recorded_at: datetime,
         draft: DiscoveryDraft | None = None,
         geography_confirmation: GeographyConfirmation | None = None,
+        required_date_confirmation: RequiredDateConfirmation | None = None,
     ) -> bool:
         """Commit one Telegram update and its account-level state atomically."""
         with psycopg.connect(self._database_url) as connection:
@@ -789,6 +828,7 @@ class PostgresRoleStore:
                         ]
                     ),
                     draft.whole_city,
+                    json.dumps(_required_date_json(draft.required_date)),
                     recorded_at,
                 )
                 if draft.revision == 1:
@@ -797,10 +837,11 @@ class PostgresRoleStore:
                         INSERT INTO football_runtime.bot_discovery_drafts (
                             telegram_user_id, stage, intent_branch, user_intent,
                             screen_revision, revision, last_activity_at,
-                            country, city, sub_city_areas, whole_city, updated_at
+                            country, city, sub_city_areas, whole_city,
+                            required_date, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s,
-                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
+                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -821,6 +862,7 @@ class PostgresRoleStore:
                             city = %s::jsonb,
                             sub_city_areas = %s::jsonb,
                             whole_city = %s,
+                            required_date = %s::jsonb,
                             updated_at = %s
                         WHERE telegram_user_id = %s AND revision = %s
                         RETURNING revision
@@ -866,6 +908,28 @@ class PostgresRoleStore:
                         confirmation.whole_city,
                         json.dumps(confirmation.resolver_versions),
                         confirmation.glossary_version,
+                        recorded_at,
+                    ),
+                )
+            if required_date_confirmation is not None:
+                date_confirmation = required_date_confirmation
+                required_date = date_confirmation.required_date
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_required_date_confirmation_events (
+                        update_id, telegram_user_id, user_intent,
+                        start_local_date, end_local_date, iana_timezone,
+                        timezone_data_version, confirmed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        update_id,
+                        state.telegram_user_id,
+                        date_confirmation.user_intent.value,
+                        required_date.start_local_date,
+                        required_date.end_local_date,
+                        required_date.iana_timezone,
+                        required_date.timezone_data_version,
                         recorded_at,
                     ),
                 )
@@ -1331,6 +1395,28 @@ def _accepted_location_json(location: AcceptedLocation | None) -> Any:
         "resolver_version": location.resolver_version,
         "glossary_version": location.glossary_version,
         "localized_display_names": dict(location.localized_display_names),
+    }
+
+
+def _optional_required_date(value: Any) -> RequiredDate | None:
+    if value is None:
+        return None
+    return RequiredDate(
+        start_local_date=date.fromisoformat(value["start_local_date"]),
+        end_local_date=date.fromisoformat(value["end_local_date"]),
+        iana_timezone=value["iana_timezone"],
+        timezone_data_version=value["timezone_data_version"],
+    )
+
+
+def _required_date_json(required_date: RequiredDate | None) -> Any:
+    if required_date is None:
+        return None
+    return {
+        "start_local_date": required_date.start_local_date.isoformat(),
+        "end_local_date": required_date.end_local_date.isoformat(),
+        "iana_timezone": required_date.iana_timezone,
+        "timezone_data_version": required_date.timezone_data_version,
     }
 
 

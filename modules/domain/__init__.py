@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 
@@ -109,6 +109,63 @@ class DiscoveryDraft:
     city: AcceptedLocation | None = None
     sub_city_areas: tuple[AcceptedLocation, ...] = ()
     whole_city: bool = False
+    required_date: RequiredDate | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredDate:
+    """Confirmed concrete inclusive local boundaries for one Discovery Flow."""
+
+    start_local_date: date
+    end_local_date: date
+    iana_timezone: str
+    timezone_data_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class DateInterpretation:
+    """One non-authoritative calendar proposal from the controlled adapter."""
+
+    start_local_date: date
+    end_local_date: date
+    iana_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class DateInterpretationResolution:
+    """All supported interpretations proposed for one natural-language answer."""
+
+    interpretations: tuple[DateInterpretation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DateInterpretationQuery:
+    """Application-owned temporal context supplied to the interpretation boundary."""
+
+    text: str
+    locale: str
+    authoritative_utc: datetime
+    current_local_date: date
+    iana_timezone: str
+    timezone_data_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredDateConfirmation:
+    """Application command to append one explicit Required Date confirmation."""
+
+    user_intent: UserIntent
+    required_date: RequiredDate
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredDateConfirmationEvent:
+    """Durable Required Date confirmation exposed by the acceptance seam."""
+
+    update_id: str
+    user_intent: UserIntent
+    required_date: RequiredDate
+    confirmed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

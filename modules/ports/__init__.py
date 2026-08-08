@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
@@ -20,6 +20,8 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ConversationState,
+    DateInterpretationQuery,
+    DateInterpretationResolution,
     DiscoveryDraft,
     GeographyConfirmation,
     GeographyConfirmationEvent,
@@ -27,6 +29,8 @@ from modules.domain import (
     LanguageSelection,
     LocationResolution,
     LocationResolutionQuery,
+    RequiredDateConfirmation,
+    RequiredDateConfirmationEvent,
     TelegramDeliveryClaim,
     TelegramMessage,
     UserIntent,
@@ -39,6 +43,27 @@ class Clock(Protocol):
     def now(self) -> datetime:
         """Return one timezone-aware current instant."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTimezoneData:
+    """One timezone and version resolved from the same installed source."""
+
+    iana_timezone: str
+    timezone: tzinfo
+    version: str
+
+
+class TimezoneDataAdapter(Protocol):
+    """Application-owned boundary for installed IANA timezone data."""
+
+    def resolve(self, iana_timezone: str) -> ResolvedTimezoneData:
+        """Resolve one zone and its exact source-bound database version."""
+        ...
+
+
+class TimezoneDataError(RuntimeError):
+    """Installed timezone data was missing, invalid, or unverifiable."""
 
 
 class TelegramIngestionAdapter(Protocol):
@@ -99,6 +124,18 @@ class LocationResolverAdapter(Protocol):
 
 class LocationResolverError(RuntimeError):
     """The controlled resolver could not complete one request."""
+
+
+class DateInterpretationAdapter(Protocol):
+    """Controlled natural-language date interpretation boundary."""
+
+    def interpret(self, query: DateInterpretationQuery) -> DateInterpretationResolution:
+        """Propose calendar boundaries from application-supplied local context."""
+        ...
+
+
+class DateInterpretationError(RuntimeError):
+    """The controlled date interpreter could not complete one request."""
 
 
 class ConversationLanguageAdapter(Protocol):
@@ -172,6 +209,7 @@ class ConversationStore(Protocol):
         recorded_at: datetime,
         draft: DiscoveryDraft | None = None,
         geography_confirmation: GeographyConfirmation | None = None,
+        required_date_confirmation: RequiredDateConfirmation | None = None,
     ) -> bool:
         """Commit one idempotent Telegram update and its owned state."""
         ...
@@ -355,6 +393,12 @@ class AcceptanceObserver(Protocol):
         self, telegram_user_id: int
     ) -> tuple[GeographyConfirmationEvent, ...]:
         """Observe append-only explicit geography confirmations."""
+        ...
+
+    def required_date_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[RequiredDateConfirmationEvent, ...]:
+        """Observe append-only explicit Required Date confirmations."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
