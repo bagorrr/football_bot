@@ -113,6 +113,7 @@ class DiscoveryDraft:
     sub_city_areas: tuple[AcceptedLocation, ...] = ()
     whole_city: bool = False
     required_date: RequiredDate | None = None
+    search_submission_update_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +275,13 @@ Button = tuple[str, str]
 ButtonRow = tuple[Button, ...]
 
 
+class ReplyKeyboardAction(StrEnum):
+    """Explicit Telegram reply-keyboard instruction for one presentation."""
+
+    REMOVE = "remove"
+    BUTTON = "button"
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramMessage:
     """One application-owned Telegram presentation request."""
@@ -285,6 +293,14 @@ class TelegramMessage:
     text: str
     button_rows: tuple[ButtonRow, ...]
     reply_button: str | None = None
+    reply_keyboard_action: ReplyKeyboardAction = ReplyKeyboardAction.REMOVE
+
+    def __post_init__(self) -> None:
+        """Require a button label exactly when reply-keyboard markup is requested."""
+        if (self.reply_button is not None) != (
+            self.reply_keyboard_action is ReplyKeyboardAction.BUTTON
+        ):
+            raise ValueError("reply keyboard button action requires one button label")
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +326,14 @@ class SearchResult:
     result_id: str
     completed_search_id: str
     absolute_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSearchView:
+    """Immutable response returned by the GetCompletedSearch query."""
+
+    completed_search: CompletedSearch
+    results: tuple[SearchResult, ...]
 
 
 @dataclass(frozen=True, slots=True)

@@ -37,7 +37,6 @@ class ContractName(StrEnum):
     OPPORTUNITY_PUBLICATION_CHANGED = "OpportunityPublicationChanged"
     RUN_SEARCH = "RunSearch"
     SEARCH_COMPLETED = "SearchCompleted"
-    ZERO_RESULT_SEARCH_COMPLETED = "ZeroResultSearchCompleted"
     SEARCH_FAILED = "SearchFailed"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
@@ -72,6 +71,20 @@ class ContractDefinition:
     consumer: RuntimeRole | None
     required_fact: str
     required_integer_facts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class GetCompletedSearch:
+    """Versioned immutable query for one Recommendation-owned Completed Search."""
+
+    completed_search_id: str
+    contract_version: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.completed_search_id:
+            raise ValueError("GetCompletedSearch requires completed_search_id")
+        if self.contract_version != 1:
+            raise ValueError("GetCompletedSearch contract version is unsupported")
 
 
 SUPPORTED_CONTRACTS = (
@@ -125,14 +138,6 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.RECOMMENDATION,
         RuntimeRole.BOT_ASSISTANT,
         "completed_search_id",
-    ),
-    ContractDefinition(
-        ContractName.ZERO_RESULT_SEARCH_COMPLETED,
-        1,
-        RuntimeRole.RECOMMENDATION,
-        RuntimeRole.BOT_ASSISTANT,
-        "completed_search_id",
-        ("telegram_user_id",),
     ),
     ContractDefinition(
         ContractName.SEARCH_FAILED,
@@ -254,8 +259,8 @@ class ContractEnvelope(RawContractEnvelope):
                 raise ValueError(msg)
         if self.contract_name is ContractName.RUN_SEARCH:
             _validate_run_search(self.payload)
-        elif self.contract_name is ContractName.ZERO_RESULT_SEARCH_COMPLETED:
-            _validate_zero_result_search_completed(self.payload)
+        elif self.contract_name is ContractName.SEARCH_COMPLETED:
+            _validate_search_completed(self.payload)
 
 
 def _validate_json(value: object) -> None:
@@ -341,15 +346,21 @@ def _validate_required_date(value: JsonValue) -> None:
         raise ValueError("RunSearch Required Date range must be ordered")
 
 
-def _validate_zero_result_search_completed(payload: dict[str, JsonValue]) -> None:
+def _validate_search_completed(payload: dict[str, JsonValue]) -> None:
+    search_fields = ("telegram_user_id", "search_update_id", "result_count")
+    if not any(field_name in payload for field_name in search_fields):
+        return
+    telegram_user_id = payload.get("telegram_user_id")
+    if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+        raise ValueError("SearchCompleted requires telegram_user_id")
     _required_text(payload, "search_update_id")
     result_count = payload.get("result_count")
     if (
         not isinstance(result_count, int)
         or isinstance(result_count, bool)
-        or result_count != 0
+        or result_count < 0
     ):
-        raise ValueError("ZeroResultSearchCompleted requires result_count 0")
+        raise ValueError("SearchCompleted requires a non-negative result_count")
 
 
 def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:

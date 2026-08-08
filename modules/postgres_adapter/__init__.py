@@ -19,6 +19,7 @@ from modules.contracts import (
     ContractEnvelope,
     ContractName,
     FailureCode,
+    GetCompletedSearch,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
@@ -28,6 +29,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     CompletedSearch,
+    CompletedSearchView,
     ConversationStage,
     ConversationState,
     DiscoveryDraft,
@@ -39,6 +41,7 @@ from modules.domain import (
     IntentBranch,
     LocaleSource,
     OldChatViewCleanup,
+    ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
@@ -293,6 +296,26 @@ class PostgresAcceptanceObserver:
             )
             for row in rows
         )
+
+    def search_completions(
+        self, search_update_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Search completion contracts by stable command identity."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'SearchCompleted'
+                  AND payload ->> 'search_update_id' = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (search_update_id,),
+            ).fetchall()
+        return tuple(_row_to_envelope(row) for row in rows)
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
@@ -642,7 +665,7 @@ class PostgresRoleStore:
         except psycopg.errors.UniqueViolation as error:
             raise OutboxConflictError from error
 
-    def complete_zero_result_search(
+    def complete_search(
         self,
         *,
         incoming: RawContractEnvelope,
@@ -691,13 +714,33 @@ class PostgresRoleStore:
                     (received_at, self._role.value, incoming.message_id),
                 )
             connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    f"search:{completed_search.telegram_user_id}:"
+                    f"{completed_search.search_update_id}",
+                ),
+            )
+            existing_search = connection.execute(
+                """
+                SELECT completed_search_id
+                FROM football_runtime.recommendation_completed_searches
+                WHERE telegram_user_id = %s AND search_update_id = %s
+                """,
+                (
+                    completed_search.telegram_user_id,
+                    completed_search.search_update_id,
+                ),
+            ).fetchone()
+            if existing_search is not None:
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            connection.execute(
                 """
                 INSERT INTO football_runtime.recommendation_completed_searches (
                     completed_search_id, telegram_user_id, search_update_id,
                     user_intent, country_id, city_id, sub_city_area_ids,
                     whole_city, required_date, completed_at
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s)
-                ON CONFLICT DO NOTHING
                 """,
                 (
                     completed_search.completed_search_id,
@@ -846,7 +889,8 @@ class PostgresRoleStore:
                     """
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
                            screen_revision, revision, last_activity_at,
-                           country, city, sub_city_areas, whole_city, required_date
+                           country, city, sub_city_areas, whole_city, required_date,
+                           search_submission_update_id
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
                     """,
@@ -875,6 +919,7 @@ class PostgresRoleStore:
             ),
             whole_city=row["whole_city"],
             required_date=_optional_required_date(row["required_date"]),
+            search_submission_update_id=row["search_submission_update_id"],
         )
 
     def geography_suggestion(
@@ -1142,8 +1187,9 @@ class PostgresRoleStore:
                 """
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
-                    message_text, button_rows, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -1152,6 +1198,8 @@ class PostgresRoleStore:
                     message.screen_revision,
                     message.text,
                     json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
                     recorded_at,
                 ),
             )
@@ -1209,8 +1257,9 @@ class PostgresRoleStore:
                 """
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
-                    message_text, button_rows, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -1219,6 +1268,8 @@ class PostgresRoleStore:
                     message.screen_revision,
                     message.text,
                     json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
                     recorded_at,
                 ),
             )
@@ -1278,6 +1329,7 @@ class PostgresRoleStore:
                     screen_revision = %s,
                     revision = %s,
                     last_activity_at = %s,
+                    search_submission_update_id = %s,
                     updated_at = %s
                 WHERE telegram_user_id = %s AND revision = %s
                 RETURNING revision
@@ -1287,6 +1339,7 @@ class PostgresRoleStore:
                     draft.screen_revision,
                     draft.revision,
                     draft.last_activity_at,
+                    draft.search_submission_update_id,
                     recorded_at,
                     draft.telegram_user_id,
                     draft.revision - 1,
@@ -1345,7 +1398,7 @@ class PostgresRoleStore:
                 )
         return inserted is not None
 
-    def accept_zero_result_search_completion(
+    def accept_search_completion(
         self,
         *,
         incoming: RawContractEnvelope,
@@ -1356,6 +1409,15 @@ class PostgresRoleStore:
     ) -> ConsumeResult:
         """Queue one zero-result screen and defer activation until delivery."""
         with psycopg.connect(self._database_url) as connection:
+            payload = incoming.payload
+            if not isinstance(payload, dict):
+                raise TypeError("SearchCompleted payload must be an object")
+            completed_search_id = payload.get("completed_search_id")
+            search_update_id = payload.get("search_update_id")
+            if not isinstance(completed_search_id, str) or not completed_search_id:
+                raise ValueError("SearchCompleted requires completed_search_id")
+            if not isinstance(search_update_id, str) or not search_update_id:
+                raise ValueError("SearchCompleted requires search_update_id")
             connection.execute(
                 "SELECT pg_advisory_xact_lock(%s)",
                 (message.telegram_user_id,),
@@ -1383,7 +1445,7 @@ class PostgresRoleStore:
             ).fetchone()
             draft = connection.execute(
                 """
-                SELECT revision, stage
+                SELECT revision, stage, search_submission_update_id
                 FROM football_runtime.bot_discovery_drafts
                 WHERE telegram_user_id = %s
                 FOR UPDATE
@@ -1393,31 +1455,22 @@ class PostgresRoleStore:
             if state != (expected_state_revision, "submitting") or draft != (
                 expected_draft_revision,
                 "submitting",
+                search_update_id,
             ):
-                raise RuntimeError("Search result state changed concurrently")
-            payload = incoming.payload
-            if not isinstance(payload, dict):
-                raise TypeError("SearchCompleted payload must be an object")
-            completed_search_id = payload.get("completed_search_id")
-            if not isinstance(completed_search_id, str) or not completed_search_id:
-                raise ValueError("SearchCompleted requires completed_search_id")
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO football_runtime.contract_inbox (
-                        consumer_role, message_id, producer_role, contract_name,
-                        contract_version, processing_status, received_at
-                    ) VALUES (%s, %s, %s, %s, %s, 'accepted', %s)
-                    """,
-                    (
-                        self._role.value,
-                        incoming.message_id,
-                        incoming.producer.value,
-                        incoming.contract_name.value,
-                        incoming.contract_version,
-                        received_at,
-                    ),
+                _accept_contract_inbox(
+                    connection,
+                    consumer=self._role,
+                    incoming=incoming,
+                    received_at=received_at,
                 )
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
             _supersede_pending_conversation_messages(
                 connection,
                 telegram_user_id=message.telegram_user_id,
@@ -1427,8 +1480,9 @@ class PostgresRoleStore:
                 """
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
-                    message_text, button_rows, reply_button, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -1438,6 +1492,7 @@ class PostgresRoleStore:
                     message.text,
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
+                    message.reply_keyboard_action.value,
                     received_at,
                 ),
             )
@@ -1468,6 +1523,16 @@ class PostgresRoleStore:
     ) -> ConsumeResult:
         """Restore one confirmed draft and queue its Retry presentation."""
         with psycopg.connect(self._database_url) as connection:
+            payload = incoming.payload
+            if not isinstance(payload, dict):
+                raise TypeError("SearchFailed payload must be an object")
+            search_update_id = payload.get("search_update_id")
+            if not isinstance(search_update_id, str) or not search_update_id:
+                raise ValueError("SearchFailed requires search_update_id")
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (message.telegram_user_id,),
+            )
             existing = connection.execute(
                 """
                 SELECT processing_status
@@ -1480,32 +1545,43 @@ class PostgresRoleStore:
             if existing is not None and existing[0] == "accepted":
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.REPLAYED
-            if existing is None:
-                connection.execute(
-                    """
-                    INSERT INTO football_runtime.contract_inbox (
-                        consumer_role, message_id, producer_role, contract_name,
-                        contract_version, processing_status, received_at
-                    ) VALUES (%s, %s, %s, %s, %s, 'accepted', %s)
-                    """,
-                    (
-                        self._role.value,
-                        incoming.message_id,
-                        incoming.producer.value,
-                        incoming.contract_name.value,
-                        incoming.contract_version,
-                        received_at,
-                    ),
+            current = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            current_draft = connection.execute(
+                """
+                SELECT revision, stage, search_submission_update_id
+                FROM football_runtime.bot_discovery_drafts
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            if current != (state.revision - 1, "submitting") or current_draft != (
+                draft.revision - 1,
+                "submitting",
+                search_update_id,
+            ):
+                _accept_contract_inbox(
+                    connection,
+                    consumer=self._role,
+                    incoming=incoming,
+                    received_at=received_at,
                 )
-            else:
-                connection.execute(
-                    """
-                    UPDATE football_runtime.contract_inbox
-                    SET processing_status = 'accepted', received_at = %s
-                    WHERE consumer_role = %s AND message_id = %s
-                    """,
-                    (received_at, self._role.value, incoming.message_id),
-                )
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
             changed = connection.execute(
                 """
                 UPDATE football_runtime.bot_users
@@ -1530,7 +1606,8 @@ class PostgresRoleStore:
                 """
                 UPDATE football_runtime.bot_discovery_drafts
                 SET stage = %s, screen_revision = %s, revision = %s,
-                    last_activity_at = %s, updated_at = %s
+                    last_activity_at = %s, search_submission_update_id = %s,
+                    updated_at = %s
                 WHERE telegram_user_id = %s AND revision = %s
                 RETURNING revision
                 """,
@@ -1539,6 +1616,7 @@ class PostgresRoleStore:
                     draft.screen_revision,
                     draft.revision,
                     draft.last_activity_at,
+                    draft.search_submission_update_id,
                     received_at,
                     draft.telegram_user_id,
                     draft.revision - 1,
@@ -1555,8 +1633,9 @@ class PostgresRoleStore:
                 """
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
-                    message_text, button_rows, reply_button, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -1566,11 +1645,85 @@ class PostgresRoleStore:
                     message.text,
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
+                    message.reply_keyboard_action.value,
                     received_at,
                 ),
             )
             _release_claim(connection, incoming.message_id)
             return ConsumeResult.APPLIED
+
+    def dispose_search_outcome(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Durably consume one stale Search outcome without Bot state mutation."""
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
+            _release_claim(connection, incoming.message_id)
+        return (
+            ConsumeResult.REPLAYED
+            if existing is not None and existing[0] == "accepted"
+            else ConsumeResult.APPLIED
+        )
+
+    def get_completed_search(
+        self, query: GetCompletedSearch
+    ) -> CompletedSearchView | None:
+        """Read one immutable Recommendation snapshot through its versioned query."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant consumes GetCompletedSearch")
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            search_row = connection.execute(
+                """
+                SELECT completed_search_id, telegram_user_id, search_update_id,
+                       user_intent, country_id, city_id, sub_city_area_ids,
+                       whole_city, required_date, completed_at
+                FROM football_runtime.recommendation_completed_searches
+                WHERE completed_search_id = %s
+                """,
+                (query.completed_search_id,),
+            ).fetchone()
+            if search_row is None:
+                return None
+            result_rows = connection.execute(
+                """
+                SELECT result_id, completed_search_id, absolute_position
+                FROM football_runtime.recommendation_results
+                WHERE completed_search_id = %s
+                ORDER BY absolute_position
+                """,
+                (query.completed_search_id,),
+            ).fetchall()
+        return CompletedSearchView(
+            completed_search=_completed_search(search_row),
+            results=tuple(
+                SearchResult(
+                    result_id=row["result_id"],
+                    completed_search_id=row["completed_search_id"],
+                    absolute_position=row["absolute_position"],
+                )
+                for row in result_rows
+            ),
+        )
 
     def current_conversation_message(
         self, telegram_user_id: int
@@ -1585,7 +1738,7 @@ class PostgresRoleStore:
                 SELECT outbox.delivery_id, outbox.telegram_user_id,
                        outbox.display_locale, outbox.screen_revision,
                        outbox.message_text, outbox.button_rows,
-                       outbox.reply_button
+                       outbox.reply_button, outbox.reply_keyboard_action
                 FROM football_runtime.bot_message_outbox AS outbox
                 JOIN football_runtime.bot_users AS account
                   ON account.telegram_user_id = outbox.telegram_user_id
@@ -1712,6 +1865,7 @@ class PostgresRoleStore:
                           bot_message_outbox.message_text,
                           bot_message_outbox.button_rows,
                           bot_message_outbox.reply_button,
+                          bot_message_outbox.reply_keyboard_action,
                           candidate.delivery_status AS prior_delivery_status
                 """,
                 (stale_before, stale_before, claim_token, claimed_at, claimed_at),
@@ -2075,6 +2229,7 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
             for button_row in row["button_rows"]
         ),
         reply_button=row.get("reply_button"),
+        reply_keyboard_action=ReplyKeyboardAction(row["reply_keyboard_action"]),
     )
 
 
@@ -2193,6 +2348,34 @@ def _insert_outbox(
             envelope.correlation_id,
             envelope.recorded_at,
             json.dumps(envelope.json_payload()),
+        ),
+    )
+
+
+def _accept_contract_inbox(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    *,
+    consumer: RuntimeRole,
+    incoming: RawContractEnvelope,
+    received_at: datetime,
+) -> None:
+    """Persist terminal acceptance for one supported incoming envelope."""
+    connection.execute(
+        """
+        INSERT INTO football_runtime.contract_inbox (
+            consumer_role, message_id, producer_role, contract_name,
+            contract_version, processing_status, received_at
+        ) VALUES (%s, %s, %s, %s, %s, 'accepted', %s)
+        ON CONFLICT (consumer_role, message_id) DO UPDATE
+        SET processing_status = 'accepted', received_at = EXCLUDED.received_at
+        """,
+        (
+            consumer.value,
+            incoming.message_id,
+            incoming.producer.value,
+            incoming.contract_name.value,
+            incoming.contract_version,
+            received_at,
         ),
     )
 

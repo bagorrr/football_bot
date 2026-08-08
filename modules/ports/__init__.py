@@ -13,6 +13,7 @@ from uuid import UUID
 from modules.contracts import (
     ContractEnvelope,
     ContractName,
+    GetCompletedSearch,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
@@ -21,6 +22,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     CompletedSearch,
+    CompletedSearchView,
     ConversationState,
     DateInterpretationQuery,
     DateInterpretationResolution,
@@ -269,7 +271,7 @@ class ConversationStore(Protocol):
         """Record /start without replacing a queued Search result presentation."""
         ...
 
-    def accept_zero_result_search_completion(
+    def accept_search_completion(
         self,
         *,
         incoming: RawContractEnvelope,
@@ -291,6 +293,21 @@ class ConversationStore(Protocol):
         received_at: datetime,
     ) -> ConsumeResult:
         """Restore a confirmed draft and queue Retry after technical failure."""
+        ...
+
+    def dispose_search_outcome(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Durably consume a stale Search outcome without changing Bot state."""
+        ...
+
+    def get_completed_search(
+        self, query: GetCompletedSearch
+    ) -> CompletedSearchView | None:
+        """Execute the canonical immutable Completed Search query."""
         ...
 
     def current_conversation_message(
@@ -440,7 +457,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Deduplicate and atomically commit one accepted handoff."""
         ...
 
-    def complete_zero_result_search(
+    def complete_search(
         self,
         *,
         incoming: RawContractEnvelope,
@@ -521,6 +538,12 @@ class AcceptanceObserver(Protocol):
 
     def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
         """Observe ordered immutable Results through the public testkit."""
+        ...
+
+    def search_completions(
+        self, search_update_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe canonical completion events for one Search command identity."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:

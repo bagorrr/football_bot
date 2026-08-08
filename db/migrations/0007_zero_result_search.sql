@@ -35,8 +35,16 @@ ALTER TABLE football_runtime.bot_discovery_drafts
         )
     );
 
+ALTER TABLE football_runtime.bot_discovery_drafts
+    ADD COLUMN IF NOT EXISTS search_submission_update_id text
+        CHECK (search_submission_update_id <> '');
+
 ALTER TABLE football_runtime.bot_message_outbox
     ADD COLUMN IF NOT EXISTS reply_button text;
+
+ALTER TABLE football_runtime.bot_message_outbox
+    ADD COLUMN IF NOT EXISTS reply_keyboard_action text NOT NULL DEFAULT 'remove'
+        CHECK (reply_keyboard_action IN ('remove', 'button'));
 
 ALTER TABLE football_runtime.contract_inbox
     DROP CONSTRAINT IF EXISTS contract_inbox_processing_status_check;
@@ -152,8 +160,11 @@ DROP POLICY IF EXISTS completed_searches_owner
 CREATE POLICY completed_searches_owner
     ON football_runtime.recommendation_completed_searches
     USING (
-        football_runtime.current_runtime_role() = 'recommendation'
-        AND owner_role = 'recommendation'
+        (
+            football_runtime.current_runtime_role() = 'recommendation'
+            AND owner_role = 'recommendation'
+        )
+        OR football_runtime.current_runtime_role() = 'bot_assistant'
     )
     WITH CHECK (
         football_runtime.current_runtime_role() = 'recommendation'
@@ -165,8 +176,11 @@ DROP POLICY IF EXISTS recommendation_results_owner
 CREATE POLICY recommendation_results_owner
     ON football_runtime.recommendation_results
     USING (
-        football_runtime.current_runtime_role() = 'recommendation'
-        AND owner_role = 'recommendation'
+        (
+            football_runtime.current_runtime_role() = 'recommendation'
+            AND owner_role = 'recommendation'
+        )
+        OR football_runtime.current_runtime_role() = 'bot_assistant'
     )
     WITH CHECK (
         football_runtime.current_runtime_role() = 'recommendation'
@@ -218,7 +232,9 @@ REVOKE ALL ON football_runtime.recommendation_completed_searches FROM
     football_classification,
     football_recommendation,
     football_bot_assistant;
-GRANT SELECT, INSERT ON football_runtime.recommendation_completed_searches
+GRANT SELECT ON football_runtime.recommendation_completed_searches
+    TO football_recommendation, football_bot_assistant;
+GRANT INSERT ON football_runtime.recommendation_completed_searches
     TO football_recommendation;
 
 REVOKE ALL ON football_runtime.recommendation_results FROM
@@ -227,7 +243,9 @@ REVOKE ALL ON football_runtime.recommendation_results FROM
     football_classification,
     football_recommendation,
     football_bot_assistant;
-GRANT SELECT, INSERT ON football_runtime.recommendation_results
+GRANT SELECT ON football_runtime.recommendation_results
+    TO football_recommendation, football_bot_assistant;
+GRANT INSERT ON football_runtime.recommendation_results
     TO football_recommendation;
 
 REVOKE ALL ON football_runtime.bot_active_result_contexts FROM

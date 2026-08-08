@@ -76,6 +76,9 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
     assert completed.required_date is not None
     assert completed.required_date.start_local_date == date(2026, 8, 10)
     assert system.results(completed.completed_search_id) == ()
+    completion = system.search_completions(completed.search_update_id)
+    assert len(completion) == 1
+    assert completion[0].contract_name is ContractName.SEARCH_COMPLETED
     assert system.has_discovery_draft(user_id) is False
 
     context = system.active_result_context(user_id)
@@ -93,6 +96,34 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
         (("New search", f"menu:new-search:{context.screen_revision}"),),
     )
     assert result_message.reply_button == "Menu"
+    system.reset()
+
+
+def test_first_and_repeated_onboarding_explicitly_remove_reply_keyboard() -> None:
+    system, telegram = _boot_search_system()
+    user_id = 44_017
+
+    system.start_bot_user(
+        update_id="first-onboarding",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    assert telegram.messages[-1].reply_keyboard_action.value == "remove"
+
+    system.reset()
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="first-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    result_message = telegram.messages[-1]
+    assert result_message.reply_keyboard_action.value == "button"
+
+    system.start_bot_user(
+        update_id="repeated-onboarding",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    repeated_onboarding_message = telegram.messages[-1]
+    assert repeated_onboarding_message.reply_keyboard_action.value == "remove"
     system.reset()
 
 
@@ -156,6 +187,137 @@ def test_technical_search_failure_preserves_confirmed_values_and_exposes_retry()
     )
     assert failure_message.button_rows == (
         (("Retry", f"search:retry:{after.screen_revision}"),),
+    )
+    system.reset()
+
+
+def test_stale_search_failure_is_consumed_without_mutating_active_submission() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_014
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="active-search", telegram_user_id=user_id)
+    system.record_search_event(
+        probe_id="stale-search-failure",
+        contract_name=ContractName.SEARCH_FAILED,
+        contract_version=1,
+        telegram_user_id=user_id,
+        payload={
+            "probe_id": "stale-search-failure",
+            "search_update_id": "stale-search",
+            "telegram_user_id": user_id,
+        },
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
+    assert system.observe("stale-search-failure").accepted_inbox_records == 1
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is False
+
+    system.process_searches_until_idle()
+    assert len(system.completed_searches(user_id)) == 1
+    assert system.has_discovery_draft(user_id) is False
+    system.reset()
+
+
+def test_stale_search_completion_is_consumed_without_presenting_it() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_015
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="active-search", telegram_user_id=user_id)
+    system.record_search_event(
+        probe_id="stale-search-completion",
+        contract_name=ContractName.SEARCH_COMPLETED,
+        contract_version=1,
+        telegram_user_id=user_id,
+        payload={
+            "probe_id": "stale-search-completion",
+            "completed_search_id": "completed-search:stale",
+            "search_update_id": "stale-search",
+            "telegram_user_id": user_id,
+            "result_count": 0,
+        },
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    assert system.retry_bot_presentations() is False
+    assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
+    assert system.observe("stale-search-completion").accepted_inbox_records == 1
+
+    system.process_searches_until_idle()
+    assert len(system.completed_searches(user_id)) == 1
+    assert system.has_discovery_draft(user_id) is False
+    system.reset()
+
+
+def test_search_completion_reads_the_canonical_completed_search() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_018
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="active-search", telegram_user_id=user_id)
+    system.record_search_event(
+        probe_id="missing-completed-search",
+        contract_name=ContractName.SEARCH_COMPLETED,
+        contract_version=1,
+        telegram_user_id=user_id,
+        payload={
+            "probe_id": "missing-completed-search",
+            "completed_search_id": "completed-search:missing",
+            "search_update_id": "active-search",
+            "telegram_user_id": user_id,
+            "result_count": 0,
+        },
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    assert system.retry_bot_presentations() is False
+    assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
+    assert system.observe("missing-completed-search").accepted_inbox_records == 1
+    system.reset()
+
+
+def test_conflicting_search_envelopes_reproduce_one_existing_completion() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_016
+    payload: dict[str, JsonValue] = {
+        "probe_id": "conflicting-search",
+        "search_update_id": "shared-search-update",
+        "telegram_user_id": user_id,
+        "display_locale": "en",
+        "user_intent": "new_team_search",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+        "sub_city_area_ids": [],
+        "whole_city": True,
+        "required_date": None,
+    }
+    system.record_search_event(
+        probe_id="first-conflicting-envelope",
+        contract_name=ContractName.RUN_SEARCH,
+        contract_version=1,
+        telegram_user_id=user_id,
+        payload=payload,
+    )
+    assert system.process_next_search_handoff(RuntimeRole.RECOMMENDATION) is True
+    system.record_search_event(
+        probe_id="second-conflicting-envelope",
+        contract_name=ContractName.RUN_SEARCH,
+        contract_version=1,
+        telegram_user_id=user_id,
+        payload=payload,
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.RECOMMENDATION) is True
+
+    searches = system.completed_searches(user_id)
+    completions = system.search_completions("shared-search-update")
+    assert len(searches) == 1
+    assert len(completions) == 1
+    assert isinstance(completions[0].payload, dict)
+    assert completions[0].payload["completed_search_id"] == (
+        searches[0].completed_search_id
     )
     system.reset()
 
@@ -391,7 +553,7 @@ def test_deferred_start_refreshes_draft_activity_when_result_delivery_fails() ->
     ("contract_name", "consumer"),
     (
         (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION),
-        (ContractName.ZERO_RESULT_SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT),
+        (ContractName.SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT),
         (ContractName.SEARCH_FAILED, RuntimeRole.BOT_ASSISTANT),
     ),
 )
@@ -485,14 +647,14 @@ def test_invalid_supported_search_events_fail_closed(
             },
         ),
         (
-            ContractName.ZERO_RESULT_SEARCH_COMPLETED,
+            ContractName.SEARCH_COMPLETED,
             RuntimeRole.BOT_ASSISTANT,
             {
-                "probe_id": "invalid-ZeroResultSearchCompleted",
+                "probe_id": "invalid-SearchCompleted",
                 "completed_search_id": "completed-search:invalid",
                 "search_update_id": "invalid-completion",
                 "telegram_user_id": 44_012,
-                "result_count": 1,
+                "result_count": -1,
             },
         ),
     ),

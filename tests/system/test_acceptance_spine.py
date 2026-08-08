@@ -179,7 +179,7 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
         },
     }
     zero_result_payload: dict[str, JsonValue] = {
-        "probe_id": "compatibility-ZeroResultSearchCompleted",
+        "probe_id": "compatibility-SearchCompleted",
         "completed_search_id": "completed-search:compatibility",
         "search_update_id": "compatibility-search-update",
         "telegram_user_id": 501,
@@ -187,7 +187,7 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
     }
     for contract_name, payload in (
         (ContractName.RUN_SEARCH, run_search_payload),
-        (ContractName.ZERO_RESULT_SEARCH_COMPLETED, zero_result_payload),
+        (ContractName.SEARCH_COMPLETED, zero_result_payload),
         (ContractName.SEARCH_FAILED, None),
     ):
         spine.record_search_event(
@@ -241,10 +241,10 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
             "compatibility-RunSearch",
         ),
         (
-            ContractName.ZERO_RESULT_SEARCH_COMPLETED,
+            ContractName.SEARCH_COMPLETED,
             RuntimeRole.RECOMMENDATION,
             RuntimeRole.BOT_ASSISTANT,
-            "compatibility-ZeroResultSearchCompleted",
+            "compatibility-SearchCompleted",
         ),
         (
             ContractName.SEARCH_FAILED,
