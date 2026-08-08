@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
@@ -43,6 +43,27 @@ class Clock(Protocol):
     def now(self) -> datetime:
         """Return one timezone-aware current instant."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTimezoneData:
+    """One timezone and version resolved from the same installed source."""
+
+    iana_timezone: str
+    timezone: tzinfo
+    version: str
+
+
+class TimezoneDataAdapter(Protocol):
+    """Application-owned boundary for installed IANA timezone data."""
+
+    def resolve(self, iana_timezone: str) -> ResolvedTimezoneData:
+        """Resolve one zone and its exact source-bound database version."""
+        ...
+
+
+class TimezoneDataError(RuntimeError):
+    """Installed timezone data was missing, invalid, or unverifiable."""
 
 
 class TelegramIngestionAdapter(Protocol):

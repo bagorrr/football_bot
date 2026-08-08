@@ -8,9 +8,8 @@ import re
 from dataclasses import replace
 from datetime import UTC, date, timedelta
 from enum import IntEnum
-from pathlib import Path
 from uuid import uuid4
-from zoneinfo import TZPATH, ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.domain import (
     AcceptedLocation,
@@ -45,6 +44,8 @@ from modules.ports import (
     LocationResolverError,
     TelegramDeliveryAdapter,
     TelegramDeliveryPreEffectError,
+    TimezoneDataAdapter,
+    TimezoneDataError,
 )
 
 SUPPORTED_LOCALES = frozenset({"en", "es", "fr", "ru"})
@@ -902,6 +903,7 @@ class ConversationOnboarding:
         conversation_language: ConversationLanguageAdapter,
         location_resolver: LocationResolverAdapter,
         date_interpretation: DateInterpretationAdapter,
+        timezone_data: TimezoneDataAdapter,
         clock: Clock,
     ) -> None:
         self._store = store
@@ -909,6 +911,7 @@ class ConversationOnboarding:
         self._conversation_language = conversation_language
         self._location_resolver = location_resolver
         self._date_interpretation = date_interpretation
+        self._timezone_data = timezone_data
         self._clock = clock
 
     def start(
@@ -1439,8 +1442,8 @@ class ConversationOnboarding:
             raise RuntimeError("authoritative UTC clock returned a naive instant")
         authoritative_utc = now.astimezone(UTC)
         try:
-            timezone = ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError:
+            resolved_timezone = self._timezone_data.resolve(timezone_name)
+        except TimezoneDataError:
             self._queue_required_date_feedback(
                 update_id=update_id,
                 current=current,
@@ -1448,8 +1451,10 @@ class ConversationOnboarding:
                 outcome=_ResolutionOutcome.INVALID,
             )
             return
-        timezone_data_version = _timezone_data_version()
-        if timezone_data_version is None:
+        if (
+            resolved_timezone.iana_timezone != timezone_name
+            or re.fullmatch(r"\S+", resolved_timezone.version) is None
+        ):
             self._queue_required_date_feedback(
                 update_id=update_id,
                 current=current,
@@ -1457,6 +1462,8 @@ class ConversationOnboarding:
                 outcome=_ResolutionOutcome.INVALID,
             )
             return
+        timezone = resolved_timezone.timezone
+        timezone_data_version = resolved_timezone.version
         local_date = authoritative_utc.astimezone(timezone).date()
         try:
             resolution = self._date_interpretation.interpret(
@@ -3329,19 +3336,6 @@ def _valid_required_date_proposal(
         and proposal.start_local_date <= proposal.end_local_date
         and proposal.start_local_date >= current_local_date
     )
-
-
-def _timezone_data_version() -> str | None:
-    for root in TZPATH:
-        version_file = Path(root) / "tzdata.zi"
-        try:
-            first_line = version_file.read_text(encoding="utf-8").splitlines()[0]
-        except (OSError, IndexError):
-            continue
-        match = re.fullmatch(r"# version (\S+)", first_line)
-        if match is not None:
-            return match.group(1)
-    return None
 
 
 def _search_area_summary(

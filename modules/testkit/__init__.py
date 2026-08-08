@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.application import ConversationOnboarding
 from modules.contracts import (
@@ -51,10 +52,17 @@ from modules.ports import (
     LocationResolverError,
     ModelAdapter,
     OutboxConflictError,
+    ResolvedTimezoneData,
     TelegramDeliveryAdapter,
     TelegramDeliveryOutcomeUnknownError,
     TelegramDeliveryPreEffectError,
     TelegramIngestionAdapter,
+    TimezoneDataAdapter,
+    TimezoneDataError,
+)
+from modules.timezone_data_adapter import (
+    InstalledTimezoneDataAdapter,
+    SourceBoundTimezoneDataAdapter,
 )
 
 _CONTRACTS = {
@@ -63,7 +71,7 @@ _CONTRACTS = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class FrozenClock:
     """Controllable clock for deterministic system acceptance."""
 
@@ -72,6 +80,12 @@ class FrozenClock:
     def now(self) -> datetime:
         """Return the configured acceptance instant."""
         return self.instant
+
+    def advance_to(self, instant: datetime) -> None:
+        """Advance acceptance time without replacing the injected clock."""
+        if instant < self.instant:
+            raise ValueError("FrozenClock cannot move backwards")
+        self.instant = instant
 
 
 @dataclass(slots=True)
@@ -179,6 +193,100 @@ class ControlledDateInterpretationAdapter:
             raise DateInterpretationError("controlled date interpretation failure")
         return self._resolutions.get(
             query.text, DateInterpretationResolution(interpretations=())
+        )
+
+
+@dataclass(slots=True)
+class _ControlledTimezoneDataSource:
+    version: str | None
+    timezones: frozenset[str]
+    invalid_timezones: frozenset[str] = frozenset()
+
+    def load_timezone(self, iana_timezone: str) -> ZoneInfo | None:
+        if iana_timezone in self.invalid_timezones:
+            raise TimezoneDataError("controlled invalid timezone data")
+        if iana_timezone not in self.timezones:
+            return None
+        try:
+            return ZoneInfo(iana_timezone)
+        except ZoneInfoNotFoundError as error:
+            raise TimezoneDataError("controlled timezone is not installed") from error
+
+    def load_version(self) -> str | None:
+        return self.version
+
+
+@dataclass(slots=True)
+class ControlledTimezoneDataAdapter:
+    """Ordered timezone sources controlled at the public acceptance boundary."""
+
+    _sources: list[_ControlledTimezoneDataSource] = field(default_factory=list)
+    _direct_results: dict[str, ResolvedTimezoneData] = field(default_factory=dict)
+
+    def add_source(
+        self,
+        *,
+        version: str | None,
+        timezones: tuple[str, ...] = (),
+        invalid_timezones: tuple[str, ...] = (),
+    ) -> None:
+        """Add one earlier installed source with controlled data and version."""
+        self._sources.append(
+            _ControlledTimezoneDataSource(
+                version=version,
+                timezones=frozenset(timezones),
+                invalid_timezones=frozenset(invalid_timezones),
+            )
+        )
+
+    def add_package_fallback(
+        self,
+        *,
+        version: str | None,
+        timezones: tuple[str, ...] = (),
+        invalid_timezones: tuple[str, ...] = (),
+    ) -> None:
+        """Add the final controlled equivalent of Python's package fallback."""
+        self.add_source(
+            version=version,
+            timezones=timezones,
+            invalid_timezones=invalid_timezones,
+        )
+
+    def return_mismatch_for(
+        self,
+        *,
+        requested_timezone: str,
+        returned_timezone: str,
+        version: str,
+    ) -> None:
+        """Return a controlled provider result for a different timezone."""
+        self._direct_results[requested_timezone] = ResolvedTimezoneData(
+            iana_timezone=returned_timezone,
+            timezone=ZoneInfo(returned_timezone),
+            version=version,
+        )
+
+    def fail_for(self, *, iana_timezone: str, failure: str) -> None:
+        """Configure missing-version or invalid-data failure for one zone."""
+        if failure == "missing_version":
+            self.add_source(version=None, timezones=(iana_timezone,))
+            return
+        if failure == "invalid_data":
+            self.add_source(
+                version="controlled-version",
+                invalid_timezones=(iana_timezone,),
+            )
+            return
+        raise ValueError(f"unsupported controlled timezone-data failure: {failure}")
+
+    def resolve(self, iana_timezone: str) -> ResolvedTimezoneData:
+        """Resolve through the same ordered, source-bound production policy."""
+        direct = self._direct_results.get(iana_timezone)
+        if direct is not None:
+            return direct
+        return SourceBoundTimezoneDataAdapter(tuple(self._sources)).resolve(
+            iana_timezone
         )
 
 
@@ -536,6 +644,7 @@ class AcceptanceRole:
     location_resolver: LocationResolverAdapter | None = None
     conversation_language: ConversationLanguageAdapter | None = None
     date_interpretation: DateInterpretationAdapter | None = None
+    timezone_data: TimezoneDataAdapter | None = None
     supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -900,12 +1009,15 @@ class AcceptanceSpine:
             raise RuntimeError("Bot Assistant runtime has no resolver adapter")
         if role.date_interpretation is None:
             raise RuntimeError("Bot Assistant runtime has no date interpreter")
+        if role.timezone_data is None:
+            raise RuntimeError("Bot Assistant runtime has no timezone-data adapter")
         return ConversationOnboarding(
             store=role.store,
             telegram_delivery=role.telegram_delivery,
             conversation_language=_conversation_language(role),
             location_resolver=role.location_resolver,
             date_interpretation=role.date_interpretation,
+            timezone_data=role.timezone_data,
             clock=role.clock,
         )
 
@@ -1284,6 +1396,7 @@ def boot_acceptance_spine(
     location_resolver: LocationResolverAdapter | None = None,
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
+    timezone_data: TimezoneDataAdapter | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately."""
     from apps.system_acceptance import boot_acceptance_role
@@ -1311,6 +1424,7 @@ def boot_acceptance_spine(
     controlled_date_interpretation = (
         date_interpretation or ControlledDateInterpretationAdapter()
     )
+    installed_timezone_data = timezone_data or InstalledTimezoneDataAdapter()
 
     def restart_role(role: RuntimeRole) -> AcceptanceRole:
         return boot_acceptance_role(
@@ -1338,6 +1452,9 @@ def boot_acceptance_spine(
                 controlled_date_interpretation
                 if role is RuntimeRole.BOT_ASSISTANT
                 else None
+            ),
+            timezone_data=(
+                installed_timezone_data if role is RuntimeRole.BOT_ASSISTANT else None
             ),
         )
 

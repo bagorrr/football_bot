@@ -22,9 +22,11 @@ from modules.testkit import (
     ControlledDateInterpretationAdapter,
     ControlledLocationResolverAdapter,
     ControlledTelegramDeliveryAdapter,
+    ControlledTimezoneDataAdapter,
     FrozenClock,
     boot_acceptance_spine,
 )
+from modules.timezone_data_adapter import InstalledTimezoneDataAdapter
 
 
 def test_relative_date_uses_the_confirmed_city_local_calendar() -> None:
@@ -42,11 +44,14 @@ def test_relative_date_uses_the_confirmed_city_local_calendar() -> None:
             )
         ),
     )
+    timezone_data = InstalledTimezoneDataAdapter()
+    real_timezone_data_version = timezone_data.resolve("Europe/Moscow").version
     system = boot_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
         telegram_delivery=telegram,
         date_interpretation=dates,
+        timezone_data=timezone_data,
     )
     system.reset()
     user_id = 43_001
@@ -64,7 +69,8 @@ def test_relative_date_uses_the_confirmed_city_local_calendar() -> None:
     assert draft.required_date.start_local_date == date(2026, 8, 10)
     assert draft.required_date.end_local_date == date(2026, 8, 10)
     assert draft.required_date.iana_timezone == "Europe/Moscow"
-    assert draft.required_date.timezone_data_version
+    assert dates.queries[0].timezone_data_version == real_timezone_data_version
+    assert draft.required_date.timezone_data_version == real_timezone_data_version
     assert dates.queries[0].authoritative_utc == datetime(
         2026, 8, 8, 21, 30, tzinfo=UTC
     )
@@ -72,9 +78,149 @@ def test_relative_date_uses_the_confirmed_city_local_calendar() -> None:
     confirmations = system.required_date_confirmations(user_id)
     assert len(confirmations) == 1
     assert confirmations[0].required_date == draft.required_date
+    assert (
+        confirmations[0].required_date.timezone_data_version
+        == real_timezone_data_version
+    )
     assert telegram.messages[-1].text.startswith(
         "✅ Search area: **Russia → Saint Petersburg → whole city**."
     )
+
+
+def test_timezone_data_version_comes_from_the_package_fallback_with_the_zone() -> None:
+    dates = ControlledDateInterpretationAdapter()
+    dates.return_for(
+        text="tomorrow",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 10),
+                    end_local_date=date(2026, 8, 10),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.add_source(version="earlier-source-version")
+    timezone_data.add_package_fallback(
+        version="fallback-source-version",
+        timezones=("Europe/Moscow",),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
+        date_interpretation=dates,
+        timezone_data=timezone_data,
+    )
+    system.reset()
+    user_id = 43_006
+    _advance_to_required_date(system, user_id=user_id, intent="game_search")
+
+    system.submit_required_date_text(
+        update_id="date-from-package-fallback",
+        telegram_user_id=user_id,
+        text="tomorrow",
+    )
+
+    draft = system.discovery_draft(user_id)
+    assert draft.required_date is not None
+    assert dates.queries[0].timezone_data_version == "fallback-source-version"
+    assert draft.required_date.timezone_data_version == "fallback-source-version"
+    confirmations = system.required_date_confirmations(user_id)
+    assert len(confirmations) == 1
+    assert (
+        confirmations[0].required_date.timezone_data_version
+        == "fallback-source-version"
+    )
+
+
+def test_mismatched_timezone_data_fails_without_temporal_persistence() -> None:
+    dates = ControlledDateInterpretationAdapter()
+    dates.return_for(
+        text="tomorrow",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 10),
+                    end_local_date=date(2026, 8, 10),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.return_mismatch_for(
+        requested_timezone="Europe/Moscow",
+        returned_timezone="UTC",
+        version="mismatched-source-version",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
+        date_interpretation=dates,
+        timezone_data=timezone_data,
+    )
+    system.reset()
+    user_id = 43_007
+    _advance_to_required_date(system, user_id=user_id, intent="game_search")
+
+    system.submit_required_date_text(
+        update_id="date-with-mismatched-timezone-data",
+        telegram_user_id=user_id,
+        text="tomorrow",
+    )
+
+    draft = system.discovery_draft(user_id)
+    assert draft.stage == "required_date"
+    assert draft.required_date is None
+    assert dates.queries == []
+    assert system.required_date_confirmations(user_id) == ()
+
+
+@pytest.mark.parametrize("failure", ("missing_version", "invalid_data"))
+def test_unverifiable_timezone_data_fails_without_temporal_persistence(
+    failure: str,
+) -> None:
+    dates = ControlledDateInterpretationAdapter()
+    dates.return_for(
+        text="tomorrow",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 10),
+                    end_local_date=date(2026, 8, 10),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.fail_for(iana_timezone="Europe/Moscow", failure=failure)
+    telegram = ControlledTelegramDeliveryAdapter()
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
+        telegram_delivery=telegram,
+        date_interpretation=dates,
+        timezone_data=timezone_data,
+    )
+    system.reset()
+    user_id = 43_008 + len(failure)
+    _advance_to_required_date(system, user_id=user_id, intent="game_search")
+
+    system.submit_required_date_text(
+        update_id=f"date-with-{failure}",
+        telegram_user_id=user_id,
+        text="tomorrow",
+    )
+
+    draft = system.discovery_draft(user_id)
+    assert draft.stage == "required_date"
+    assert draft.required_date is None
+    assert dates.queries == []
+    assert system.required_date_confirmations(user_id) == ()
+    assert "📅 When?" in telegram.messages[-1].text
 
 
 def test_confirming_a_different_city_invalidates_only_dependent_required_date() -> None:
@@ -157,6 +303,88 @@ def test_confirming_a_different_city_invalidates_only_dependent_required_date() 
     assert draft.required_date is None
     assert draft.country is not None
     assert draft.country.place_id == "country:ru"
+
+
+def test_confirming_a_different_country_invalidates_required_date() -> None:
+    dates = ControlledDateInterpretationAdapter()
+    dates.return_for(
+        text="August 10",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 10),
+                    end_local_date=date(2026, 8, 10),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.COUNTRY,
+        text="Germany",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="controlled-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="country:de",
+                            display_name="Germany",
+                            geographic_type=GeographicType.COUNTRY,
+                            country_id="country:de",
+                            city_id=None,
+                            verified_parent_ids=(),
+                            parent_display_names=(),
+                            iana_timezone=None,
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="controlled-glossary-v1",
+                            localized_display_names=tuple(
+                                (locale, "Germany")
+                                for locale in ("en", "es", "fr", "ru")
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
+        date_interpretation=dates,
+        location_resolver=resolver,
+    )
+    system.reset()
+    user_id = 43_009
+    _advance_to_required_date(system, user_id=user_id, intent="game_search")
+    system.submit_required_date_text(
+        update_id="date-before-country-change",
+        telegram_user_id=user_id,
+        text="August 10",
+    )
+    confirmed = system.discovery_draft(user_id).required_date
+    for index in range(4):
+        system.go_back(
+            update_id=f"back-before-country-change-{index}",
+            telegram_user_id=user_id,
+        )
+
+    system.submit_location_text(
+        update_id="confirm-different-country",
+        telegram_user_id=user_id,
+        text="Germany",
+    )
+
+    draft = system.discovery_draft(user_id)
+    assert draft.country is not None
+    assert draft.country.place_id == "country:de"
+    assert draft.city is None
+    assert draft.sub_city_areas == ()
+    assert draft.required_date is None
+    confirmations = system.required_date_confirmations(user_id)
+    assert len(confirmations) == 1
+    assert confirmations[0].required_date == confirmed
 
 
 def test_confirming_a_different_terminal_intent_clears_required_date() -> None:
@@ -390,6 +618,56 @@ def test_back_restart_stale_and_replayed_input_preserve_concrete_date() -> None:
     resumed = system.discovery_draft(user_id)
     assert resumed.stage == "required_date"
     assert resumed.required_date == confirmed
+
+
+def test_clock_advancement_across_restart_does_not_roll_relative_date_forward() -> None:
+    dates = ControlledDateInterpretationAdapter()
+    dates.return_for(
+        text="tomorrow",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 10),
+                    end_local_date=date(2026, 8, 10),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    clock = FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        date_interpretation=dates,
+    )
+    system.reset()
+    user_id = 43_010
+    _advance_to_required_date(system, user_id=user_id, intent="game_search")
+    system.submit_required_date_text(
+        update_id="relative-date-before-clock-advance",
+        telegram_user_id=user_id,
+        text="tomorrow",
+    )
+    confirmed = system.discovery_draft(user_id).required_date
+    assert confirmed is not None
+    assert confirmed.start_local_date == date(2026, 8, 10)
+    assert confirmed.end_local_date == date(2026, 8, 10)
+
+    clock.advance_to(datetime(2026, 8, 9, 21, 30, tzinfo=UTC))
+    system.restart(role=RuntimeRole.BOT_ASSISTANT)
+    system.start_bot_user(
+        update_id="restart-after-clock-advance",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+
+    resumed = system.discovery_draft(user_id)
+    assert resumed.stage == "post_core"
+    assert resumed.required_date == confirmed
+    assert len(dates.queries) == 1
+    confirmations = system.required_date_confirmations(user_id)
+    assert len(confirmations) == 1
+    assert confirmations[0].required_date == confirmed
 
 
 @pytest.mark.parametrize(
