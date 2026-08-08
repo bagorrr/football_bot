@@ -160,6 +160,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
 def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
     spine: AcceptanceSpine,
 ) -> None:
+    get_completed_search = ContractName("GetCompletedSearch")
     spine.run("contract-compatibility")
     run_search_payload: dict[str, JsonValue] = {
         "probe_id": "compatibility-RunSearch",
@@ -185,10 +186,18 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
         "telegram_user_id": 501,
         "result_count": 0,
     }
+    get_completed_search_payload: dict[str, JsonValue] = {
+        "probe_id": "compatibility-GetCompletedSearch",
+        "completed_search_id": "compatibility-GetCompletedSearch",
+    }
     for contract_name, payload in (
         (ContractName.RUN_SEARCH, run_search_payload),
         (ContractName.SEARCH_COMPLETED, zero_result_payload),
         (ContractName.SEARCH_FAILED, None),
+        (
+            get_completed_search,
+            get_completed_search_payload,
+        ),
     ):
         spine.record_search_event(
             probe_id=f"compatibility-{contract_name.value}",
@@ -251,6 +260,12 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
             RuntimeRole.RECOMMENDATION,
             RuntimeRole.BOT_ASSISTANT,
             "compatibility-SearchFailed",
+        ),
+        (
+            get_completed_search,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+            "compatibility-GetCompletedSearch",
         ),
     )
 

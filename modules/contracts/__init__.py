@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from typing import TypeAlias
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 JsonValue: TypeAlias = (
     bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None
@@ -38,6 +38,7 @@ class ContractName(StrEnum):
     RUN_SEARCH = "RunSearch"
     SEARCH_COMPLETED = "SearchCompleted"
     SEARCH_FAILED = "SearchFailed"
+    GET_COMPLETED_SEARCH = "GetCompletedSearch"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
 
@@ -71,20 +72,6 @@ class ContractDefinition:
     consumer: RuntimeRole | None
     required_fact: str
     required_integer_facts: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class GetCompletedSearch:
-    """Versioned immutable query for one Recommendation-owned Completed Search."""
-
-    completed_search_id: str
-    contract_version: int = 1
-
-    def __post_init__(self) -> None:
-        if not self.completed_search_id:
-            raise ValueError("GetCompletedSearch requires completed_search_id")
-        if self.contract_version != 1:
-            raise ValueError("GetCompletedSearch contract version is unsupported")
 
 
 SUPPORTED_CONTRACTS = (
@@ -146,6 +133,13 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.BOT_ASSISTANT,
         "search_update_id",
         ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.GET_COMPLETED_SEARCH,
+        1,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "completed_search_id",
     ),
     ContractDefinition(
         ContractName.TELEGRAM_PRESENTATION_REQUESTED,
@@ -261,6 +255,75 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_run_search(self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
             _validate_search_completed(self.payload)
+        elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
+            completed_search_id = _required_text(
+                self.payload,
+                "completed_search_id",
+            )
+            if completed_search_id != self.subject_id:
+                raise ValueError(
+                    "GetCompletedSearch subject must identify its Completed Search"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class GetCompletedSearch(ContractEnvelope):
+    """Public Recommendation query consumed by Bot Assistant."""
+
+    def __post_init__(self) -> None:
+        super(GetCompletedSearch, self).__post_init__()
+        if self.contract_name is not ContractName.GET_COMPLETED_SEARCH:
+            raise ValueError("GetCompletedSearch requires its stable contract name")
+
+    @classmethod
+    def request_id(cls, completed_search_id: str) -> UUID:
+        """Return the stable request identity for one Completed Search."""
+        if not completed_search_id:
+            raise ValueError("GetCompletedSearch requires completed_search_id")
+        return uuid5(
+            NAMESPACE_URL,
+            (
+                "football-bot:"
+                f"{completed_search_id}:"
+                f"{ContractName.GET_COMPLETED_SEARCH.value}"
+            ),
+        )
+
+    @classmethod
+    def from_search_completed(
+        cls,
+        completion: RawContractEnvelope,
+    ) -> GetCompletedSearch:
+        """Derive the stable query request paired with one completion event."""
+        if completion.contract_name is not ContractName.SEARCH_COMPLETED:
+            raise ValueError("GetCompletedSearch requires SearchCompleted causation")
+        if not isinstance(completion.payload, dict):
+            raise TypeError("SearchCompleted payload must be an object")
+        completed_search_id = completion.payload.get("completed_search_id")
+        if not isinstance(completed_search_id, str) or not completed_search_id:
+            raise ValueError("SearchCompleted requires completed_search_id")
+        return cls(
+            contract_name=ContractName.GET_COMPLETED_SEARCH,
+            contract_version=1,
+            message_id=cls.request_id(completed_search_id),
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=completed_search_id,
+            subject_revision=completion.subject_revision,
+            idempotency_key=f"get-completed-search:{completed_search_id}",
+            causation_id=completion.causation_id,
+            correlation_id=completion.correlation_id,
+            recorded_at=completion.recorded_at,
+            payload={"completed_search_id": completed_search_id},
+        )
+
+    @property
+    def completed_search_id(self) -> str:
+        """Return the validated stable Completed Search identity."""
+        assert isinstance(self.payload, dict)
+        value = self.payload["completed_search_id"]
+        assert isinstance(value, str)
+        return value
 
 
 def _validate_json(value: object) -> None:

@@ -188,6 +188,23 @@ class ConsumeResult(StrEnum):
     REJECTED = "rejected"
 
 
+class CompletedSearchQueryStatus(StrEnum):
+    """Disposition of one public GetCompletedSearch request."""
+
+    ACCEPTED = "accepted"
+    MISSING = "missing"
+    UNSUPPORTED_VERSION = "unsupported_version"
+    INVALID_CONTRACT = "invalid_contract"
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSearchQueryResult:
+    """Query disposition plus an optional immutable Recommendation snapshot."""
+
+    status: CompletedSearchQueryStatus
+    view: CompletedSearchView | None = None
+
+
 class ConversationStore(Protocol):
     """Bot Assistant-owned persistence boundary for onboarding."""
 
@@ -305,9 +322,13 @@ class ConversationStore(Protocol):
         ...
 
     def get_completed_search(
-        self, query: GetCompletedSearch
-    ) -> CompletedSearchView | None:
-        """Execute the canonical immutable Completed Search query."""
+        self,
+        query_request_id: UUID,
+        *,
+        supported_versions: Iterable[int],
+        received_at: datetime,
+    ) -> CompletedSearchQueryResult:
+        """Consume and execute the canonical Completed Search query contract."""
         ...
 
     def current_conversation_message(
@@ -462,6 +483,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: RawContractEnvelope,
         completed_search: CompletedSearch,
+        query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:

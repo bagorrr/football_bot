@@ -8,7 +8,13 @@ from datetime import UTC, date, datetime
 
 import pytest
 
-from modules.contracts import ContractName, JsonValue, RuntimeRole
+from modules.contracts import (
+    ContractName,
+    FailureCode,
+    JsonValue,
+    OperatorAlert,
+    RuntimeRole,
+)
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -79,6 +85,20 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
     completion = system.search_completions(completed.search_update_id)
     assert len(completion) == 1
     assert completion[0].contract_name is ContractName.SEARCH_COMPLETED
+    query = system.recoverable_contract(
+        completed.completed_search_id,
+        contract_name=ContractName.GET_COMPLETED_SEARCH,
+    )
+    assert query.contract_version == 1
+    assert query.producer is RuntimeRole.RECOMMENDATION
+    assert query.consumer is RuntimeRole.BOT_ASSISTANT
+    assert query.subject_id == completed.completed_search_id
+    assert query.subject_revision == 1
+    assert query.idempotency_key
+    assert query.causation_id == completion[0].causation_id
+    assert query.correlation_id == completion[0].correlation_id
+    assert query.recorded_at.tzinfo is not None
+    assert query.payload == {"completed_search_id": completed.completed_search_id}
     assert system.has_discovery_draft(user_id) is False
 
     context = system.active_result_context(user_id)
@@ -555,6 +575,7 @@ def test_deferred_start_refreshes_draft_activity_when_result_delivery_fails() ->
         (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION),
         (ContractName.SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT),
         (ContractName.SEARCH_FAILED, RuntimeRole.BOT_ASSISTANT),
+        (ContractName.GET_COMPLETED_SEARCH, RuntimeRole.BOT_ASSISTANT),
     ),
 )
 def test_future_search_event_versions_fail_closed(
@@ -586,6 +607,64 @@ def test_future_search_event_versions_fail_closed(
     assert recoverable.payload["probe_id"] == probe_id
     assert recoverable.contract_name is contract_name
     assert recoverable.contract_version == 2
+    system.reset()
+
+
+def test_unsupported_completed_search_query_does_not_poison_its_completion() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_019
+    completed_search_id = "completed-search:future-query"
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="active-search", telegram_user_id=user_id)
+    system.record_search_event(
+        probe_id=completed_search_id,
+        contract_name=ContractName.GET_COMPLETED_SEARCH,
+        contract_version=2,
+        telegram_user_id=user_id,
+        payload={
+            "probe_id": completed_search_id,
+            "completed_search_id": completed_search_id,
+        },
+    )
+    system.record_search_event(
+        probe_id=completed_search_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+        contract_version=1,
+        telegram_user_id=user_id,
+        payload={
+            "probe_id": completed_search_id,
+            "completed_search_id": completed_search_id,
+            "search_update_id": "active-search",
+            "telegram_user_id": user_id,
+            "result_count": 0,
+        },
+    )
+
+    while system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT):
+        pass
+
+    snapshot = system.observe(completed_search_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert snapshot.operator_alerts == (
+        OperatorAlert(
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            contract_name=ContractName.GET_COMPLETED_SEARCH,
+            contract_version=2,
+            failure_code=FailureCode.UNSUPPORTED_CONTRACT_VERSION,
+        ),
+    )
+    assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
+    recoverable = system.recoverable_contract(
+        completed_search_id,
+        contract_name=ContractName.GET_COMPLETED_SEARCH,
+    )
+    assert recoverable.payload == {
+        "probe_id": completed_search_id,
+        "completed_search_id": completed_search_id,
+        "telegram_user_id": user_id,
+    }
     system.reset()
 
 

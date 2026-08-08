@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -50,6 +51,7 @@ from modules.domain import (
 from modules.ports import (
     AcceptanceRoleStore,
     Clock,
+    CompletedSearchQueryStatus,
     ConversationLanguageAdapter,
     ConversationStore,
     DateInterpretationAdapter,
@@ -994,6 +996,7 @@ class ConversationOnboarding:
         date_interpretation: DateInterpretationAdapter,
         timezone_data: TimezoneDataAdapter,
         clock: Clock,
+        supported_query_versions: Iterable[int] = (1,),
     ) -> None:
         self._store = store
         self._telegram_delivery = telegram_delivery
@@ -1002,6 +1005,7 @@ class ConversationOnboarding:
         self._date_interpretation = date_interpretation
         self._timezone_data = timezone_data
         self._clock = clock
+        self._supported_query_versions = frozenset(supported_query_versions)
 
     def start(
         self,
@@ -1162,9 +1166,15 @@ class ConversationOnboarding:
                 received_at=self._clock.now(),
             )
             return
-        completed_search = self._store.get_completed_search(
-            GetCompletedSearch(completed_search_id=completed_search_id)
+        now = self._clock.now()
+        query_result = self._store.get_completed_search(
+            GetCompletedSearch.request_id(completed_search_id),
+            supported_versions=self._supported_query_versions,
+            received_at=now,
         )
+        if query_result.status is CompletedSearchQueryStatus.UNSUPPORTED_VERSION:
+            return
+        completed_search = query_result.view
         result_count = payload.get("result_count")
         if (
             completed_search is None
@@ -1174,7 +1184,7 @@ class ConversationOnboarding:
         ):
             self._store.dispose_search_outcome(
                 incoming=incoming,
-                received_at=self._clock.now(),
+                received_at=now,
             )
             return
         message = _zero_result_message(
@@ -3906,6 +3916,14 @@ class RuntimeApplication:
                 incoming=supported_incoming
             )
             return True
+        if incoming.contract_name is ContractName.GET_COMPLETED_SEARCH:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return True
         outgoing = None
         if supported_incoming is not None:
             definition, fact = self._next_handoff(supported_incoming)
@@ -4028,9 +4046,11 @@ class RuntimeApplication:
                 "result_count": 0,
             },
         )
+        query = GetCompletedSearch.from_search_completed(outgoing)
         self.store.complete_search(
             incoming=incoming,
             completed_search=completed_search,
+            query=query,
             outgoing=outgoing,
             received_at=self.clock.now(),
         )
@@ -4142,6 +4162,9 @@ class RuntimeApplication:
             date_interpretation=self.date_interpretation,
             timezone_data=self.timezone_data,
             clock=self.clock,
+            supported_query_versions=self.versions_for(
+                ContractName.GET_COMPLETED_SEARCH
+            ),
         )
 
 

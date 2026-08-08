@@ -54,6 +54,8 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObservation,
+    CompletedSearchQueryResult,
+    CompletedSearchQueryStatus,
     ConsumeResult,
     ConversationAccessDeniedError,
     OutboxConflictError,
@@ -69,130 +71,313 @@ _LEGACY_MIGRATION_NAMES = (
     "0007_zero_result_search.sql",
 )
 
-_LEGACY_MIGRATION_MARKERS = (
-    """
-    SELECT to_regclass('football_runtime.acceptance_state') IS NOT NULL
-       AND to_regclass('football_runtime.contract_outbox') IS NOT NULL
-       AND to_regclass('football_runtime.contract_inbox') IS NOT NULL
-       AND to_regclass('football_runtime.operator_alerts') IS NOT NULL
-    """,
-    """
-    SELECT to_regclass('football_runtime.telegram_presentations') IS NOT NULL
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'contract_outbox'
-              AND column_name = 'claimed_until'
-       )
-    """,
-    """
-    SELECT to_regclass('football_runtime.bot_users') IS NOT NULL
-       AND to_regclass('football_runtime.bot_updates') IS NOT NULL
-       AND to_regclass('football_runtime.bot_message_outbox') IS NOT NULL
-       AND to_regclass('football_runtime.bot_active_chat_views') IS NOT NULL
-       AND to_regclass('football_runtime.bot_delivery_alerts') IS NOT NULL
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'bot_message_outbox'
-              AND column_name = 'delivery_status'
-       )
-    """,
-    """
-    SELECT to_regclass('football_runtime.bot_discovery_drafts') IS NOT NULL
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'bot_users'
-              AND column_name = 'last_bot_user_action_at'
-       )
-    """,
-    """
-    SELECT to_regclass(
-               'football_runtime.bot_geography_confirmation_events'
-           ) IS NOT NULL
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'bot_discovery_drafts'
-              AND column_name = 'country'
-       )
-    """,
-    """
-    SELECT to_regclass(
-               'football_runtime.bot_required_date_confirmation_events'
-           ) IS NOT NULL
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'bot_discovery_drafts'
-              AND column_name = 'required_date'
-       )
-    """,
-    """
-    SELECT to_regclass(
-               'football_runtime.recommendation_completed_searches'
-           ) IS NOT NULL
-       AND to_regclass('football_runtime.recommendation_results') IS NOT NULL
-       AND to_regclass(
-               'football_runtime.bot_active_result_contexts'
-           ) IS NOT NULL
-       AND to_regclass('football_runtime.bot_search_presentations') IS NOT NULL
-       AND to_regclass('football_runtime.bot_old_chat_views') IS NOT NULL
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'bot_discovery_drafts'
-              AND column_name = 'search_submission_update_id'
-       )
-       AND EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'football_runtime'
-              AND table_name = 'bot_message_outbox'
-              AND column_name = 'reply_keyboard_action'
-       )
-       AND EXISTS (
-            SELECT 1
-            FROM pg_constraint
-            WHERE conname = 'bot_users_stage_check'
-              AND conrelid = to_regclass('football_runtime.bot_users')
-              AND pg_get_constraintdef(oid) LIKE '%submitting%'
-              AND pg_get_constraintdef(oid) LIKE '%results%'
-       )
-       AND EXISTS (
-            SELECT 1
-            FROM pg_constraint
-            WHERE conname = 'bot_discovery_drafts_stage_check'
-              AND conrelid = to_regclass(
-                  'football_runtime.bot_discovery_drafts'
-              )
-              AND pg_get_constraintdef(oid) LIKE '%submitting%'
-       )
-    """,
+_MATERIAL_SCHEMA_FINGERPRINTS = (
+    "2f330e7c3a51b0bbcab1830086972f8c37f48327330d88ccebcd91cc3ad15dac",
+    "fa186689f5194e06a5d677c84c25822de702f0ca5ba11a7a1e7bc716d63adcb0",
+    "49e142cf45b175ee6f9fadacc5ce758d2d2e74a88bf6169c52e1c2beb799e2a3",
+    "b01abd5b128fa47637a33f32a90b31280dd32002d3d78c57a6a0eb24f05fd81e",
+    "ac917af3fb449642c17c5d1b3706c829b015d67fcf7fcd0f5f42dcf9a0120b65",
+    "7389eab3a7b467625a668c33f409954e0a27684b5ba2b225ceeea8f353e7d7a8",
+    "247f82bd58f5d817e0364318bd7648bd0c4d8fcd1de8a62b0c4744c7c005ee6e",
 )
 
+_SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
+    # Pre-0003 delivery tables upgraded in place by 0003.
+    "b669892eed34bae911a8c3ae3a7940e6981d24eab3bec4b47ee975df2721e10f": 2,
+}
 
-def _legacy_migration_prefix(connection: psycopg.Connection[Any]) -> int:
-    markers: list[bool] = []
-    for marker_query in _LEGACY_MIGRATION_MARKERS:
-        marker_row = connection.execute(marker_query).fetchone()
-        if marker_row is None:
-            raise RuntimeError("Could not inspect untracked migration state")
-        markers.append(bool(marker_row[0]))
-    applied_count = next(
-        (index for index, marker_exists in enumerate(markers) if not marker_exists),
-        len(markers),
-    )
-    if applied_count == 0 or any(markers[applied_count:]):
-        raise RuntimeError("Untracked migration state is not a known prefix")
-    return applied_count
+_PRE_0003_DELIVERY_RECONCILIATION = """
+ALTER TABLE football_runtime.bot_users
+    ALTER COLUMN stage DROP DEFAULT,
+    ALTER COLUMN screen_revision DROP DEFAULT,
+    ADD CHECK (owner_role = 'bot_assistant'),
+    ADD CHECK (locale_source IN ('explicit', 'telegram_hint')),
+    ADD CHECK (revision > 0),
+    ADD CHECK ((locale IS NULL) = (locale_source IS NULL));
+
+ALTER TABLE football_runtime.bot_message_outbox
+    ALTER COLUMN screen_revision DROP DEFAULT,
+    ADD CHECK (owner_role = 'bot_assistant'),
+    ADD UNIQUE (sequence_id);
+"""
+
+_RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
+
+_MATERIAL_SCHEMA_QUERY = """
+WITH runtime_roles AS (
+    SELECT *
+    FROM pg_roles
+    WHERE rolname = ANY(%s)
+), material AS (
+    SELECT 'role'::text AS object_kind,
+           role.rolname::text AS object_identity,
+           concat_ws('|', role.rolsuper::text, role.rolinherit::text,
+                     role.rolcreaterole::text, role.rolcreatedb::text,
+                     role.rolreplication::text, role.rolbypassrls::text,
+                     role.rolconnlimit::text) AS object_definition
+    FROM runtime_roles AS role
+
+    UNION ALL
+
+    SELECT 'role_login_mode', 'runtime_roles',
+           CASE WHEN bool_and(role.rolcanlogin)
+                      OR bool_and(NOT role.rolcanlogin)
+                THEN 'uniform'
+                ELSE string_agg(
+                    role.rolname || ':' || role.rolcanlogin::text,
+                    ',' ORDER BY role.rolname
+                ) END
+    FROM runtime_roles AS role
+
+    UNION ALL
+
+    SELECT 'role_membership', member.rolname || '->' || granted_role.rolname,
+           concat_ws('|', membership.admin_option::text,
+                     membership.inherit_option::text,
+                     membership.set_option::text)
+    FROM pg_auth_members AS membership
+    JOIN pg_roles AS member ON member.oid = membership.member
+    JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    WHERE member.oid IN (SELECT oid FROM runtime_roles)
+       OR granted_role.oid IN (SELECT oid FROM runtime_roles)
+
+    UNION ALL
+
+    SELECT 'schema', namespace.nspname,
+           CASE WHEN owner.oid IN (SELECT oid FROM runtime_roles)
+                THEN 'runtime:' || owner.rolname
+                ELSE 'administrative' END
+    FROM pg_namespace AS namespace
+    JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+    WHERE namespace.nspname = 'football_runtime'
+
+    UNION ALL
+
+    SELECT 'relation', namespace.nspname || '.' || relation.relname,
+           concat_ws('|', relation.relkind, relation.relpersistence,
+                     relation.relrowsecurity::text,
+                     relation.relforcerowsecurity::text,
+                     relation.relreplident,
+                     CASE WHEN owner.oid IN (SELECT oid FROM runtime_roles)
+                          THEN 'runtime:' || owner.rolname
+                          ELSE 'administrative' END)
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    JOIN pg_roles AS owner ON owner.oid = relation.relowner
+    WHERE namespace.nspname = 'football_runtime'
+      AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+
+    UNION ALL
+
+    SELECT 'sequence', namespace.nspname || '.' || relation.relname,
+           concat_ws('|', format_type(sequence.seqtypid, -1),
+                     sequence.seqstart::text, sequence.seqincrement::text,
+                     sequence.seqmax::text, sequence.seqmin::text,
+                     sequence.seqcache::text, sequence.seqcycle::text)
+    FROM pg_sequence AS sequence
+    JOIN pg_class AS relation ON relation.oid = sequence.seqrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'football_runtime'
+
+    UNION ALL
+
+    SELECT 'column',
+           namespace.nspname || '.' || relation.relname || '.' || attribute.attname,
+           concat_ws('|', format_type(attribute.atttypid, attribute.atttypmod),
+                     attribute.attnotnull::text, attribute.attidentity,
+                     attribute.attgenerated,
+                     COALESCE(collation_row.collname, ''),
+                     COALESCE(pg_get_expr(default_value.adbin,
+                                          default_value.adrelid, true), ''))
+    FROM pg_attribute AS attribute
+    JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    LEFT JOIN pg_attrdef AS default_value
+      ON default_value.adrelid = attribute.attrelid
+     AND default_value.adnum = attribute.attnum
+    LEFT JOIN pg_collation AS collation_row
+      ON collation_row.oid = attribute.attcollation
+    WHERE namespace.nspname = 'football_runtime'
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+
+    UNION ALL
+
+    SELECT 'constraint',
+           namespace.nspname || '.' || relation.relname || '.' ||
+           constraint_row.conname,
+           concat_ws('|', constraint_row.contype,
+                     constraint_row.condeferrable::text,
+                     constraint_row.condeferred::text,
+                     constraint_row.convalidated::text,
+                     pg_get_constraintdef(constraint_row.oid, true))
+    FROM pg_constraint AS constraint_row
+    JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'football_runtime'
+
+    UNION ALL
+
+    SELECT 'index', namespace.nspname || '.' || index_relation.relname,
+           pg_get_indexdef(index_relation.oid, 0, true)
+    FROM pg_class AS index_relation
+    JOIN pg_namespace AS namespace ON namespace.oid = index_relation.relnamespace
+    WHERE namespace.nspname = 'football_runtime'
+      AND index_relation.relkind = 'i'
+
+    UNION ALL
+
+    SELECT 'function', namespace.nspname || '.' || procedure.proname ||
+           '(' || pg_get_function_identity_arguments(procedure.oid) || ')',
+           pg_get_functiondef(procedure.oid) || '|owner:' ||
+           CASE WHEN owner.oid IN (SELECT oid FROM runtime_roles)
+                THEN 'runtime:' || owner.rolname
+                ELSE 'administrative' END
+    FROM pg_proc AS procedure
+    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    JOIN pg_roles AS owner ON owner.oid = procedure.proowner
+    WHERE namespace.nspname = 'football_runtime'
+
+    UNION ALL
+
+    SELECT 'policy',
+           namespace.nspname || '.' || relation.relname || '.' || policy.polname,
+           concat_ws('|', policy.polpermissive::text, policy.polcmd,
+                     array_to_string(
+                         ARRAY(
+                             SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                                         ELSE pg_get_userbyid(role_oid) END
+                             FROM unnest(policy.polroles) AS role_oid
+                             ORDER BY 1
+                         ), ','
+                     ),
+                     COALESCE(pg_get_expr(policy.polqual, policy.polrelid, true), ''),
+                     COALESCE(pg_get_expr(policy.polwithcheck,
+                                          policy.polrelid, true), ''))
+    FROM pg_policy AS policy
+    JOIN pg_class AS relation ON relation.oid = policy.polrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'football_runtime'
+
+    UNION ALL
+
+    SELECT 'trigger',
+           namespace.nspname || '.' || relation.relname || '.' || trigger.tgname,
+           pg_get_triggerdef(trigger.oid, true)
+    FROM pg_trigger AS trigger
+    JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'football_runtime'
+      AND NOT trigger.tgisinternal
+
+    UNION ALL
+
+    SELECT 'schema_grant', namespace.nspname || ':' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_namespace AS namespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(namespace.nspacl, acldefault('n', namespace.nspowner))
+    ) AS acl
+    WHERE namespace.nspname = 'football_runtime'
+      AND acl.grantee <> namespace.nspowner
+
+    UNION ALL
+
+    SELECT 'relation_grant', namespace.nspname || '.' || relation.relname || ':' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(
+            relation.relacl,
+            acldefault(
+                CASE WHEN relation.relkind = 'S' THEN 'S'::"char"
+                     ELSE 'r'::"char" END,
+                relation.relowner
+            )
+        )
+    ) AS acl
+    WHERE namespace.nspname = 'football_runtime'
+      AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+      AND acl.grantee <> relation.relowner
+
+    UNION ALL
+
+    SELECT 'column_grant', namespace.nspname || '.' || relation.relname || '.' ||
+           attribute.attname || ':' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_attribute AS attribute
+    JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+    WHERE namespace.nspname = 'football_runtime'
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+      AND acl.grantee <> relation.relowner
+
+    UNION ALL
+
+    SELECT 'function_grant', namespace.nspname || '.' || procedure.proname ||
+           '(' || pg_get_function_identity_arguments(procedure.oid) || '):' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_proc AS procedure
+    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
+    ) AS acl
+    WHERE namespace.nspname = 'football_runtime'
+      AND acl.grantee <> procedure.proowner
+)
+SELECT object_kind, object_identity, object_definition
+FROM material
+ORDER BY object_kind, object_identity, object_definition
+"""
+
+
+def _material_schema_fingerprint(connection: psycopg.Connection[Any]) -> str:
+    """Hash the complete migration-owned runtime schema contract."""
+    rows = connection.execute(
+        _MATERIAL_SCHEMA_QUERY,
+        (list(_RUNTIME_DATABASE_ROLES),),
+    ).fetchall()
+    canonical = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _assert_material_schema(
+    connection: psycopg.Connection[Any],
+    applied_count: int,
+) -> None:
+    if applied_count < 1:
+        return
+    expected = _MATERIAL_SCHEMA_FINGERPRINTS[applied_count - 1]
+    if _material_schema_fingerprint(connection) != expected:
+        raise RuntimeError("Migration history has material schema drift")
+
+
+def _legacy_migration_prefix(
+    connection: psycopg.Connection[Any],
+) -> tuple[int, bool]:
+    fingerprint = _material_schema_fingerprint(connection)
+    try:
+        return _MATERIAL_SCHEMA_FINGERPRINTS.index(fingerprint) + 1, False
+    except ValueError as error:
+        supported_prefix = _SUPPORTED_LEGACY_SCHEMA_PREFIXES.get(fingerprint)
+        if supported_prefix is not None:
+            return supported_prefix, True
+        raise RuntimeError(
+            "Untracked migration state is not a known prefix: material schema drift "
+            f"({fingerprint})"
+        ) from error
 
 
 class PostgresAcceptanceMigrator:
@@ -256,8 +441,13 @@ class PostgresAcceptanceMigrator:
             )
             if history_existed and runtime_schema_existed and not applied_migrations:
                 raise RuntimeError("Migration history is empty for an existing schema")
+            adopted_untracked_schema = False
+            reconcile_pre_0003_delivery = False
             if not history_existed and runtime_schema_existed:
-                applied_count = _legacy_migration_prefix(connection)
+                applied_count, reconcile_pre_0003_delivery = _legacy_migration_prefix(
+                    connection
+                )
+                adopted_untracked_schema = True
                 expected_legacy_names = _LEGACY_MIGRATION_NAMES[:applied_count]
                 if migration_names[:applied_count] != expected_legacy_names:
                     raise RuntimeError("Legacy migration files do not match")
@@ -275,6 +465,8 @@ class PostgresAcceptanceMigrator:
             expected_applied_names = set(migration_names[: len(applied_migrations)])
             if set(applied_migrations) != expected_applied_names:
                 raise RuntimeError("Migration history is not a contiguous prefix")
+            if not adopted_untracked_schema:
+                _assert_material_schema(connection, len(applied_migrations))
             for migration_path in migration_paths:
                 migration_bytes = migration_path.read_bytes()
                 migration_checksum = sha256(migration_bytes).hexdigest()
@@ -286,6 +478,11 @@ class PostgresAcceptanceMigrator:
                         )
                     continue
                 connection.execute(migration_bytes.decode("utf-8"))
+                applied_count = migration_names.index(migration_path.name) + 1
+                if reconcile_pre_0003_delivery and applied_count == 3:
+                    connection.execute(_PRE_0003_DELIVERY_RECONCILIATION)
+                    reconcile_pre_0003_delivery = False
+                _assert_material_schema(connection, applied_count)
                 connection.execute(
                     """
                     INSERT INTO football_migrations.applied_migrations (
@@ -893,6 +1090,7 @@ class PostgresRoleStore:
         *,
         incoming: RawContractEnvelope,
         completed_search: CompletedSearch,
+        query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
@@ -978,6 +1176,7 @@ class PostgresRoleStore:
                     completed_search.completed_at,
                 ),
             )
+            _insert_outbox(connection, query)
             _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
             return ConsumeResult.APPLIED
@@ -1906,11 +2105,70 @@ class PostgresRoleStore:
         )
 
     def get_completed_search(
-        self, query: GetCompletedSearch
-    ) -> CompletedSearchView | None:
-        """Read one immutable Recommendation snapshot through its versioned query."""
+        self,
+        query_request_id: UUID,
+        *,
+        supported_versions: Iterable[int],
+        received_at: datetime,
+    ) -> CompletedSearchQueryResult:
+        """Consume one query contract before reading its immutable snapshot."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
             raise RuntimeError("only Bot Assistant consumes GetCompletedSearch")
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND consumer_role = %s
+                """,
+                (query_request_id, self._role.value),
+            ).fetchone()
+        if row is None:
+            return CompletedSearchQueryResult(CompletedSearchQueryStatus.MISSING)
+        persisted_query = _row_to_envelope(row, validate_registered=False)
+        supported_versions_set = frozenset(supported_versions)
+        supported = persisted_query.contract_version in supported_versions_set
+        if not supported:
+            self.consume(
+                incoming=persisted_query,
+                supported_versions=(),
+                received_at=received_at,
+                outgoing=None,
+            )
+            return CompletedSearchQueryResult(
+                CompletedSearchQueryStatus.UNSUPPORTED_VERSION
+            )
+        try:
+            supported_query = ContractEnvelope.from_raw(persisted_query)
+        except (TypeError, ValueError):
+            self.reject_invalid_contract(
+                incoming=persisted_query,
+                received_at=received_at,
+            )
+            return CompletedSearchQueryResult(
+                CompletedSearchQueryStatus.INVALID_CONTRACT
+            )
+        disposition = self.consume(
+            incoming=persisted_query,
+            supported_versions=supported_versions_set,
+            received_at=received_at,
+            outgoing=None,
+        )
+        if disposition is ConsumeResult.REJECTED:
+            return CompletedSearchQueryResult(
+                CompletedSearchQueryStatus.UNSUPPORTED_VERSION
+            )
+        if supported_query.contract_name is not ContractName.GET_COMPLETED_SEARCH:
+            raise RuntimeError("Completed Search read requires GetCompletedSearch")
+        if not isinstance(supported_query.payload, dict):
+            raise TypeError("GetCompletedSearch payload must be an object")
+        completed_search_id = supported_query.payload.get("completed_search_id")
+        if not isinstance(completed_search_id, str) or not completed_search_id:
+            raise ValueError("GetCompletedSearch requires completed_search_id")
         with psycopg.connect(
             self._database_url,
             row_factory=dict_row,
@@ -1923,10 +2181,10 @@ class PostgresRoleStore:
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
                 """,
-                (query.completed_search_id,),
+                (completed_search_id,),
             ).fetchone()
             if search_row is None:
-                return None
+                return CompletedSearchQueryResult(CompletedSearchQueryStatus.ACCEPTED)
             result_rows = connection.execute(
                 """
                 SELECT result_id, completed_search_id, absolute_position
@@ -1934,17 +2192,20 @@ class PostgresRoleStore:
                 WHERE completed_search_id = %s
                 ORDER BY absolute_position
                 """,
-                (query.completed_search_id,),
+                (completed_search_id,),
             ).fetchall()
-        return CompletedSearchView(
-            completed_search=_completed_search(search_row),
-            results=tuple(
-                SearchResult(
-                    result_id=row["result_id"],
-                    completed_search_id=row["completed_search_id"],
-                    absolute_position=row["absolute_position"],
-                )
-                for row in result_rows
+        return CompletedSearchQueryResult(
+            CompletedSearchQueryStatus.ACCEPTED,
+            CompletedSearchView(
+                completed_search=_completed_search(search_row),
+                results=tuple(
+                    SearchResult(
+                        result_id=row["result_id"],
+                        completed_search_id=row["completed_search_id"],
+                        absolute_position=row["absolute_position"],
+                    )
+                    for row in result_rows
+                ),
             ),
         )
 

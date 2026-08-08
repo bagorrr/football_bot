@@ -761,6 +761,7 @@ class AcceptanceSpine:
             ContractName.RUN_SEARCH,
             ContractName.SEARCH_COMPLETED,
             ContractName.SEARCH_FAILED,
+            ContractName.GET_COMPLETED_SEARCH,
         }:
             raise ValueError("only Search outcome events can use this testkit port")
         event_producer = producer or (
@@ -781,7 +782,11 @@ class AcceptanceSpine:
                 "probe_id": probe_id,
                 (
                     "completed_search_id"
-                    if contract_name is ContractName.SEARCH_COMPLETED
+                    if contract_name
+                    in {
+                        ContractName.SEARCH_COMPLETED,
+                        ContractName.GET_COMPLETED_SEARCH,
+                    }
                     else "search_update_id"
                 ): f"search-fact:{probe_id}",
                 "search_update_id": f"search-update:{probe_id}",
@@ -1452,6 +1457,7 @@ def _conversation_onboarding_for_role(
         date_interpretation=role.date_interpretation,
         timezone_data=role.timezone_data,
         clock=role.clock,
+        supported_query_versions=role.versions_for(ContractName.GET_COMPLETED_SEARCH),
     )
 
 
