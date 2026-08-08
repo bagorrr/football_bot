@@ -24,10 +24,16 @@ from modules.contracts import (
     RuntimeRole,
 )
 from modules.domain import (
+    AcceptedLocation,
     ActiveChatView,
     ConversationStage,
     ConversationState,
     DiscoveryDraft,
+    GeographicType,
+    GeographyConfirmation,
+    GeographyConfirmationEvent,
+    GeographyConfirmationKind,
+    GeographySuggestion,
     IntentBranch,
     LocaleSource,
     TelegramDeliveryClaim,
@@ -84,6 +90,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.bot_delivery_alerts,
                      football_runtime.bot_message_outbox,
                      football_runtime.bot_updates,
+                     football_runtime.bot_geography_confirmation_events,
                      football_runtime.bot_discovery_drafts,
                      football_runtime.bot_users,
                      football_runtime.telegram_presentations,
@@ -152,6 +159,43 @@ class PostgresAcceptanceObserver:
                 """
             ).fetchall()
         return tuple(row[0] for row in rows)
+
+    def geography_confirmations(
+        self, telegram_user_id: int
+    ) -> tuple[GeographyConfirmationEvent, ...]:
+        """Observe explicit confirmations without exposing physical table layout."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT update_id, confirmation_kind, user_intent, country, city,
+                       sub_city_areas, whole_city, resolver_versions,
+                       glossary_version, confirmed_at
+                FROM football_runtime.bot_geography_confirmation_events
+                WHERE telegram_user_id = %s
+                ORDER BY event_sequence
+                """,
+                (telegram_user_id,),
+            ).fetchall()
+        return tuple(
+            GeographyConfirmationEvent(
+                update_id=row["update_id"],
+                kind=GeographyConfirmationKind(row["confirmation_kind"]),
+                user_intent=UserIntent(row["user_intent"]),
+                country=_accepted_location(row["country"]),
+                city=_optional_accepted_location(row["city"]),
+                sub_city_areas=tuple(
+                    _accepted_location(value) for value in row["sub_city_areas"]
+                ),
+                whole_city=row["whole_city"],
+                resolver_versions=tuple(row["resolver_versions"]),
+                glossary_version=row["glossary_version"],
+                confirmed_at=row["confirmed_at"],
+            )
+            for row in rows
+        )
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
@@ -564,7 +608,8 @@ class PostgresRoleStore:
                 row = connection.execute(
                     """
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
-                           screen_revision, revision, last_activity_at
+                           screen_revision, revision, last_activity_at,
+                           country, city, sub_city_areas, whole_city
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
                     """,
@@ -584,7 +629,21 @@ class PostgresRoleStore:
             screen_revision=row["screen_revision"],
             revision=row["revision"],
             last_activity_at=row["last_activity_at"],
+            country=_optional_accepted_location(row["country"]),
+            city=_optional_accepted_location(row["city"]),
+            sub_city_areas=tuple(
+                candidate
+                for value in row["sub_city_areas"]
+                if (candidate := _optional_accepted_location(value)) is not None
+            ),
+            whole_city=row["whole_city"],
         )
+
+    def geography_suggestion(
+        self, *, telegram_user_id: int, user_intent: UserIntent
+    ) -> GeographySuggestion | None:
+        """Offer no shortcut until Completed Search history has an owning source."""
+        return None
 
     def expire_inactive_discovery_drafts(self, *, inactive_before: datetime) -> int:
         """Delete only Bot Assistant-owned drafts inactive through a cutoff."""
@@ -634,6 +693,7 @@ class PostgresRoleStore:
         message: TelegramMessage,
         recorded_at: datetime,
         draft: DiscoveryDraft | None = None,
+        geography_confirmation: GeographyConfirmation | None = None,
     ) -> bool:
         """Commit one Telegram update and its account-level state atomically."""
         with psycopg.connect(self._database_url) as connection:
@@ -720,6 +780,15 @@ class PostgresRoleStore:
                     draft.screen_revision,
                     draft.revision,
                     draft.last_activity_at,
+                    json.dumps(_accepted_location_json(draft.country)),
+                    json.dumps(_accepted_location_json(draft.city)),
+                    json.dumps(
+                        [
+                            _accepted_location_json(candidate)
+                            for candidate in draft.sub_city_areas
+                        ]
+                    ),
+                    draft.whole_city,
                     recorded_at,
                 )
                 if draft.revision == 1:
@@ -727,8 +796,12 @@ class PostgresRoleStore:
                         """
                         INSERT INTO football_runtime.bot_discovery_drafts (
                             telegram_user_id, stage, intent_branch, user_intent,
-                            screen_revision, revision, last_activity_at, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            screen_revision, revision, last_activity_at,
+                            country, city, sub_city_areas, whole_city, updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
+                        )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
                         """,
@@ -744,6 +817,10 @@ class PostgresRoleStore:
                             screen_revision = %s,
                             revision = %s,
                             last_activity_at = %s,
+                            country = %s::jsonb,
+                            city = %s::jsonb,
+                            sub_city_areas = %s::jsonb,
+                            whole_city = %s,
                             updated_at = %s
                         WHERE telegram_user_id = %s AND revision = %s
                         RETURNING revision
@@ -756,6 +833,42 @@ class PostgresRoleStore:
                     ).fetchone()
                 if changed_draft is None:
                     raise RuntimeError("Discovery Draft changed concurrently")
+            if geography_confirmation is not None:
+                confirmation = geography_confirmation
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_geography_confirmation_events (
+                        update_id, telegram_user_id, confirmation_kind,
+                        user_intent, country, city, sub_city_areas, whole_city,
+                        resolver_versions, glossary_version, confirmed_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s,
+                        %s::jsonb, %s, %s
+                    )
+                    """,
+                    (
+                        update_id,
+                        state.telegram_user_id,
+                        confirmation.kind.value,
+                        confirmation.user_intent.value,
+                        json.dumps(_accepted_location_json(confirmation.country)),
+                        (
+                            json.dumps(_accepted_location_json(confirmation.city))
+                            if confirmation.city is not None
+                            else None
+                        ),
+                        json.dumps(
+                            [
+                                _accepted_location_json(location)
+                                for location in confirmation.sub_city_areas
+                            ]
+                        ),
+                        confirmation.whole_city,
+                        json.dumps(confirmation.resolver_versions),
+                        confirmation.glossary_version,
+                        recorded_at,
+                    ),
+                )
             _supersede_pending_conversation_messages(
                 connection,
                 telegram_user_id=state.telegram_user_id,
@@ -1179,6 +1292,46 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
             for button_row in row["button_rows"]
         ),
     )
+
+
+def _accepted_location(value: Any) -> AcceptedLocation:
+    if value is None:
+        raise RuntimeError("accepted location is missing")
+    return AcceptedLocation(
+        place_id=value["place_id"],
+        display_name=value["display_name"],
+        geographic_type=GeographicType(value["geographic_type"]),
+        country_id=value["country_id"],
+        city_id=value["city_id"],
+        verified_parent_ids=tuple(value["verified_parent_ids"]),
+        parent_display_names=tuple(value["parent_display_names"]),
+        iana_timezone=value["iana_timezone"],
+        resolver_version=value["resolver_version"],
+        glossary_version=value["glossary_version"],
+        localized_display_names=tuple(value.get("localized_display_names", {}).items()),
+    )
+
+
+def _optional_accepted_location(value: Any) -> AcceptedLocation | None:
+    return None if value is None else _accepted_location(value)
+
+
+def _accepted_location_json(location: AcceptedLocation | None) -> Any:
+    if location is None:
+        return None
+    return {
+        "place_id": location.place_id,
+        "display_name": location.display_name,
+        "geographic_type": location.geographic_type.value,
+        "country_id": location.country_id,
+        "city_id": location.city_id,
+        "verified_parent_ids": list(location.verified_parent_ids),
+        "parent_display_names": list(location.parent_display_names),
+        "iana_timezone": location.iana_timezone,
+        "resolver_version": location.resolver_version,
+        "glossary_version": location.glossary_version,
+        "localized_display_names": dict(location.localized_display_names),
+    }
 
 
 def runtime_database_url(
