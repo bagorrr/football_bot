@@ -26,6 +26,8 @@ class ConversationStage(StrEnum):
     SEARCH_AREA = "search_area"
     REQUIRED_DATE = "required_date"
     POST_CORE = "post_core"
+    SUBMITTING = "submitting"
+    RESULTS = "results"
 
 
 class GeographicType(StrEnum):
@@ -281,6 +283,43 @@ class TelegramMessage:
     screen_revision: int
     text: str
     button_rows: tuple[ButtonRow, ...]
+    reply_button: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSearch:
+    """One immutable successful Search snapshot owned by recommendation."""
+
+    completed_search_id: str
+    telegram_user_id: int
+    search_update_id: str
+    user_intent: UserIntent
+    country_id: str
+    city_id: str
+    sub_city_area_ids: tuple[str, ...]
+    whole_city: bool
+    required_date: RequiredDate | None
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResult:
+    """One immutable ordered Result belonging to a Completed Search."""
+
+    result_id: str
+    completed_search_id: str
+    absolute_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveResultContext:
+    """The latest successfully presented Completed Search for one Bot User."""
+
+    telegram_user_id: int
+    completed_search_id: str
+    current_result_id: str | None
+    absolute_position: int | None
+    screen_revision: int
 
 
 @dataclass(frozen=True, slots=True)

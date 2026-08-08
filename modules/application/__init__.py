@@ -8,9 +8,16 @@ import re
 from dataclasses import replace
 from datetime import UTC, date, timedelta
 from enum import IntEnum
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from modules.contracts import (
+    ContractEnvelope,
+    ContractName,
+    JsonValue,
+    RawContractEnvelope,
+    RuntimeRole,
+)
 from modules.domain import (
     AcceptedLocation,
     ConversationStage,
@@ -698,6 +705,60 @@ _POST_CORE_COPY = {
     ),
 }
 
+_ZERO_RESULT_COPY = {
+    "en": (
+        "🔎 **No matches found**\n\n"
+        "No suitable options match your current criteria.\n"
+        "Tell me what to change in the search, or start a new search.",
+        "New search",
+        "Menu",
+    ),
+    "ru": (
+        "🔎 **Совпадений не найдено**\n\n"
+        "По текущим условиям подходящих вариантов нет.\n"
+        "Напишите, что изменить в поиске, или начните новый поиск.",
+        "Новый поиск",
+        "Меню",
+    ),
+    "es": (
+        "🔎 **No se encontraron coincidencias**\n\n"
+        "No hay opciones adecuadas para las condiciones actuales.\n"
+        "Indique qué desea cambiar o inicie una nueva búsqueda.",
+        "Nueva búsqueda",
+        "Menú",
+    ),
+    "fr": (
+        "🔎 **Aucune correspondance trouvée**\n\n"
+        "Aucune option ne correspond aux critères actuels.\n"
+        "Indiquez ce qu’il faut modifier ou lancez une nouvelle recherche.",
+        "Nouvelle recherche",
+        "Menu",
+    ),
+}
+
+_SEARCH_FAILURE_COPY = {
+    "en": (
+        "⚠️ **Search couldn't be completed**\n\n"
+        "Your confirmed search details are safe. Try again.",
+        "Retry",
+    ),
+    "ru": (
+        "⚠️ **Не удалось выполнить поиск**\n\n"
+        "Все подтверждённые параметры сохранены. Попробуйте снова.",
+        "Повторить",
+    ),
+    "es": (
+        "⚠️ **No se pudo completar la búsqueda**\n\n"
+        "Tus datos confirmados están a salvo. Inténtalo de nuevo.",
+        "Reintentar",
+    ),
+    "fr": (
+        "⚠️ **La recherche n’a pas abouti**\n\n"
+        "Vos critères confirmés sont conservés. Réessayez.",
+        "Réessayer",
+    ),
+}
+
 _REQUIRED_DATE_FEEDBACK = {
     "en": (
         "I couldn't identify one date or bounded range. Please try again.",
@@ -938,6 +999,196 @@ class ConversationOnboarding:
         """Expire Discovery Drafts after 30 consecutive inactive days."""
         return self._store.expire_inactive_discovery_drafts(
             inactive_before=self._clock.now() - timedelta(days=30)
+        )
+
+    def submit_search(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Submit one complete Discovery Draft through the RunSearch contract."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            if (
+                draft.user_intent is None
+                or draft.country is None
+                or draft.city is None
+                or draft.whole_city is None
+                or (not draft.whole_city and not draft.sub_city_areas)
+                or (
+                    draft.user_intent in _DATE_REQUIRED_INTENTS
+                    and draft.required_date is None
+                )
+            ):
+                raise RuntimeError(
+                    "Search requires a complete confirmed discovery core"
+                )
+            now = self._clock.now()
+            state = replace(
+                current,
+                stage=ConversationStage.SUBMITTING,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                stage=ConversationStage.SUBMITTING,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+            )
+            message_id = uuid5(
+                NAMESPACE_URL,
+                f"football-bot:run-search:{telegram_user_id}:{update_id}",
+            )
+            command = ContractEnvelope(
+                contract_name=ContractName.RUN_SEARCH,
+                contract_version=1,
+                message_id=message_id,
+                producer=RuntimeRole.BOT_ASSISTANT,
+                consumer=RuntimeRole.RECOMMENDATION,
+                subject_id=f"bot-user:{telegram_user_id}",
+                subject_revision=changed_draft.revision,
+                idempotency_key=f"run-search:{telegram_user_id}:{update_id}",
+                causation_id=message_id,
+                correlation_id=message_id,
+                recorded_at=now,
+                payload={
+                    "search_update_id": update_id,
+                    "telegram_user_id": telegram_user_id,
+                    "display_locale": current.locale,
+                    "user_intent": draft.user_intent.value,
+                    "country_id": draft.country.place_id,
+                    "city_id": draft.city.place_id,
+                    "sub_city_area_ids": [
+                        area.place_id for area in draft.sub_city_areas
+                    ],
+                    "whole_city": draft.whole_city,
+                    "required_date": _required_date_payload(draft.required_date),
+                },
+            )
+            self._store.commit_search_submission(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                draft=changed_draft,
+                command=command,
+                recorded_at=now,
+            )
+
+    def accept_zero_result_search_completion(
+        self, *, incoming: RawContractEnvelope
+    ) -> None:
+        """Queue the result screen while preserving the prior authoritative view."""
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SearchCompleted payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        completed_search_id = payload.get("completed_search_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SearchCompleted requires telegram_user_id")
+        if not isinstance(completed_search_id, str) or not completed_search_id:
+            raise ValueError("SearchCompleted requires completed_search_id")
+        current = self._store.conversation_state(telegram_user_id)
+        draft = self._store.discovery_draft(telegram_user_id)
+        if current is None or draft is None:
+            raise RuntimeError("Search completion has no submitting Discovery Draft")
+        if (
+            current.stage is not ConversationStage.SUBMITTING
+            or draft.stage is not ConversationStage.SUBMITTING
+        ):
+            self._store.accept_zero_result_search_completion(
+                incoming=incoming,
+                message=_zero_result_message(
+                    delivery_id=f"search-result:{completed_search_id}",
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=current.screen_revision,
+                ),
+                received_at=self._clock.now(),
+            )
+            return
+        message = _zero_result_message(
+            delivery_id=f"search-result:{completed_search_id}",
+            telegram_user_id=telegram_user_id,
+            locale=current.locale or "en",
+            screen_revision=current.screen_revision + 1,
+        )
+        self._store.accept_zero_result_search_completion(
+            incoming=incoming,
+            message=message,
+            received_at=self._clock.now(),
+        )
+
+    def accept_search_failure(self, *, incoming: RawContractEnvelope) -> None:
+        """Restore the confirmed draft and expose an idempotent Retry action."""
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SearchFailed payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        search_update_id = payload.get("search_update_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SearchFailed requires telegram_user_id")
+        if not isinstance(search_update_id, str) or not search_update_id:
+            raise ValueError("SearchFailed requires search_update_id")
+        current = self._store.conversation_state(telegram_user_id)
+        draft = self._store.discovery_draft(telegram_user_id)
+        if current is None or draft is None:
+            raise RuntimeError("Search failure has no submitting Discovery Draft")
+        if (
+            current.stage is not ConversationStage.SUBMITTING
+            or draft.stage is not ConversationStage.SUBMITTING
+        ):
+            return
+        now = self._clock.now()
+        screen_revision = current.screen_revision + 1
+        state = replace(
+            current,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=screen_revision,
+            revision=current.revision + 1,
+        )
+        restored_draft = replace(
+            draft,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+        )
+        locale = current.locale or "en"
+        copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+        text, retry_label = _SEARCH_FAILURE_COPY[copy_locale]
+        message = TelegramMessage(
+            delivery_id=f"search-failed:{search_update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=text,
+            button_rows=(((retry_label, f"search:retry:{screen_revision}"),),),
+        )
+        self._store.accept_search_failure(
+            incoming=incoming,
+            state=state,
+            draft=restored_draft,
+            message=message,
+            received_at=now,
         )
 
     def _apply_start(
@@ -3323,6 +3574,37 @@ def _post_core_message(
             ((search_label, f"search:submit:{screen_revision}"),),
         ),
     )
+
+
+def _zero_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    text, new_search_label, menu_label = _ZERO_RESULT_COPY[copy_locale]
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(((new_search_label, f"menu:new-search:{screen_revision}"),),),
+        reply_button=menu_label,
+    )
+
+
+def _required_date_payload(required_date: RequiredDate | None) -> JsonValue:
+    if required_date is None:
+        return None
+    return {
+        "start_local_date": required_date.start_local_date.isoformat(),
+        "end_local_date": required_date.end_local_date.isoformat(),
+        "iana_timezone": required_date.iana_timezone,
+        "timezone_data_version": required_date.timezone_data_version,
+    }
 
 
 def _valid_required_date_proposal(

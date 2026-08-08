@@ -35,7 +35,9 @@ class ContractName(StrEnum):
     CLASSIFY_SOURCE_MESSAGE_REVISION = "ClassifySourceMessageRevision"
     CLASSIFICATION_PROPOSAL = "ClassificationProposal"
     OPPORTUNITY_PUBLICATION_CHANGED = "OpportunityPublicationChanged"
+    RUN_SEARCH = "RunSearch"
     SEARCH_COMPLETED = "SearchCompleted"
+    SEARCH_FAILED = "SearchFailed"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
 
@@ -108,11 +110,27 @@ SUPPORTED_CONTRACTS = (
         "opportunity_revision_id",
     ),
     ContractDefinition(
+        ContractName.RUN_SEARCH,
+        1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.RECOMMENDATION,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
         ContractName.SEARCH_COMPLETED,
         1,
         RuntimeRole.RECOMMENDATION,
         RuntimeRole.BOT_ASSISTANT,
         "completed_search_id",
+    ),
+    ContractDefinition(
+        ContractName.SEARCH_FAILED,
+        1,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "search_update_id",
+        ("telegram_user_id",),
     ),
     ContractDefinition(
         ContractName.TELEGRAM_PRESENTATION_REQUESTED,

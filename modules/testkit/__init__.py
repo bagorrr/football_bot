@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -24,6 +24,8 @@ from modules.contracts import (
 )
 from modules.domain import (
     ActiveChatView,
+    ActiveResultContext,
+    CompletedSearch,
     ConversationStage,
     ConversationState,
     DateInterpretationQuery,
@@ -37,8 +39,11 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    RequiredDate,
     RequiredDateConfirmationEvent,
+    SearchResult,
     TelegramMessage,
+    UserIntent,
 )
 from modules.ports import (
     AcceptanceObserver,
@@ -646,6 +651,7 @@ class AcceptanceRole:
     date_interpretation: DateInterpretationAdapter | None = None
     timezone_data: TimezoneDataAdapter | None = None
     supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
+    search_failures_remaining: int = 0
 
     def __post_init__(self) -> None:
         if self.supported_versions:
@@ -720,6 +726,26 @@ class AcceptanceRole:
         )
         if incoming is None:
             return False
+        if (
+            incoming.contract_name is ContractName.RUN_SEARCH
+            and incoming.contract_version in self.versions_for(incoming.contract_name)
+        ):
+            self._complete_zero_result_search(incoming)
+            return True
+        if (
+            incoming.contract_name is ContractName.SEARCH_COMPLETED
+            and isinstance(incoming.payload, dict)
+            and "telegram_user_id" in incoming.payload
+        ):
+            _conversation_onboarding_for_role(
+                self
+            ).accept_zero_result_search_completion(incoming=incoming)
+            return True
+        if incoming.contract_name is ContractName.SEARCH_FAILED:
+            _conversation_onboarding_for_role(self).accept_search_failure(
+                incoming=incoming
+            )
+            return True
         outgoing = None
         if incoming.contract_version in self.versions_for(incoming.contract_name):
             supported_incoming = ContractEnvelope.from_raw(incoming)
@@ -745,6 +771,103 @@ class AcceptanceRole:
         except OutboxConflictError as error:
             raise InjectedFailureError from error
         return True
+
+    def _complete_zero_result_search(self, incoming: RawContractEnvelope) -> None:
+        if self.role is not RuntimeRole.RECOMMENDATION:
+            raise RuntimeError("only recommendation can complete a Search")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("RunSearch payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        search_update_id = payload.get("search_update_id")
+        user_intent = payload.get("user_intent")
+        country_id = payload.get("country_id")
+        city_id = payload.get("city_id")
+        area_ids = payload.get("sub_city_area_ids")
+        whole_city = payload.get("whole_city")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("RunSearch requires telegram_user_id")
+        if not isinstance(search_update_id, str) or not search_update_id:
+            raise ValueError("RunSearch requires search_update_id")
+        if not isinstance(user_intent, str):
+            raise TypeError("RunSearch requires user_intent")
+        if not isinstance(country_id, str) or not country_id:
+            raise ValueError("RunSearch requires country_id")
+        if not isinstance(city_id, str) or not city_id:
+            raise ValueError("RunSearch requires city_id")
+        if not isinstance(area_ids, list) or not all(
+            isinstance(value, str) and value for value in area_ids
+        ):
+            raise TypeError("RunSearch requires sub_city_area_ids")
+        if not isinstance(whole_city, bool):
+            raise TypeError("RunSearch requires whole_city")
+        if self.search_failures_remaining:
+            self.search_failures_remaining -= 1
+            outgoing = ContractEnvelope(
+                contract_name=ContractName.SEARCH_FAILED,
+                contract_version=1,
+                message_id=_identifier(str(incoming.message_id), "SearchFailed"),
+                producer=RuntimeRole.RECOMMENDATION,
+                consumer=RuntimeRole.BOT_ASSISTANT,
+                subject_id=incoming.subject_id,
+                subject_revision=incoming.subject_revision,
+                idempotency_key=f"search-failed:{incoming.message_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=self.clock.now(),
+                payload={
+                    "search_update_id": search_update_id,
+                    "telegram_user_id": telegram_user_id,
+                },
+            )
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=outgoing,
+            )
+            return
+        confirmed_area_ids = tuple(
+            value for value in area_ids if isinstance(value, str)
+        )
+        completed_search_id = f"completed-search:{incoming.message_id}"
+        completed_search = CompletedSearch(
+            completed_search_id=completed_search_id,
+            telegram_user_id=telegram_user_id,
+            search_update_id=search_update_id,
+            user_intent=UserIntent(user_intent),
+            country_id=country_id,
+            city_id=city_id,
+            sub_city_area_ids=confirmed_area_ids,
+            whole_city=whole_city,
+            required_date=_required_date_from_payload(payload.get("required_date")),
+            completed_at=self.clock.now(),
+        )
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SEARCH_COMPLETED,
+            contract_version=1,
+            message_id=_identifier(completed_search_id, "SearchCompleted"),
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=completed_search_id,
+            subject_revision=1,
+            idempotency_key=f"search-completed:{completed_search_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=self.clock.now(),
+            payload={
+                "completed_search_id": completed_search_id,
+                "telegram_user_id": telegram_user_id,
+                "search_update_id": search_update_id,
+                "result_count": 0,
+            },
+        )
+        self.store.complete_zero_result_search(
+            incoming=incoming,
+            completed_search=completed_search,
+            outgoing=outgoing,
+            received_at=self.clock.now(),
+        )
 
     def present_next(self) -> bool:
         """Retry one committed presentation through the idempotent Bot API port."""
@@ -1001,25 +1124,17 @@ class AcceptanceSpine:
         """Observe append-only explicit Required Date confirmations."""
         return self._observer.required_date_confirmations(telegram_user_id)
 
+    def completed_searches(self, telegram_user_id: int) -> tuple[CompletedSearch, ...]:
+        """Observe immutable Completed Searches through the public seam."""
+        return self._observer.completed_searches(telegram_user_id)
+
+    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+        """Observe one Completed Search's ordered Results through the seam."""
+        return self._observer.results(completed_search_id)
+
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
-        if role.telegram_delivery is None:
-            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
-        if role.location_resolver is None:
-            raise RuntimeError("Bot Assistant runtime has no resolver adapter")
-        if role.date_interpretation is None:
-            raise RuntimeError("Bot Assistant runtime has no date interpreter")
-        if role.timezone_data is None:
-            raise RuntimeError("Bot Assistant runtime has no timezone-data adapter")
-        return ConversationOnboarding(
-            store=role.store,
-            telegram_delivery=role.telegram_delivery,
-            conversation_language=_conversation_language(role),
-            location_resolver=role.location_resolver,
-            date_interpretation=role.date_interpretation,
-            timezone_data=role.timezone_data,
-            clock=role.clock,
-        )
+        return _conversation_onboarding_for_role(role)
 
     def start_bot_user(
         self,
@@ -1034,6 +1149,39 @@ class AcceptanceSpine:
             telegram_user_id=telegram_user_id,
             telegram_language_hint=telegram_language_hint,
         )
+
+    def submit_search(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Search callback through the external Bot Assistant port."""
+        self._conversation_onboarding().submit_search(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def process_searches_until_idle(self) -> None:
+        """Let recommendation and Bot Assistant finish durable Search work."""
+        while True:
+            progressed = self._roles[RuntimeRole.RECOMMENDATION].process_next()
+            progressed = (
+                self._roles[RuntimeRole.BOT_ASSISTANT].process_next() or progressed
+            )
+            delivered = self._conversation_onboarding().deliver_pending()
+            if not progressed and not delivered:
+                return
+
+    def fail_next_search(self) -> None:
+        """Inject one controlled technical failure in Recommendation."""
+        self._roles[RuntimeRole.RECOMMENDATION].search_failures_remaining += 1
 
     def select_fixed_language(
         self,
@@ -1351,6 +1499,15 @@ class AcceptanceSpine:
             raise LookupError(telegram_user_id)
         return view
 
+    def active_result_context(self, telegram_user_id: int) -> ActiveResultContext:
+        """Observe the latest successfully presented Completed Search."""
+        context = self._roles[RuntimeRole.BOT_ASSISTANT].store.active_result_context(
+            telegram_user_id
+        )
+        if context is None:
+            raise LookupError(telegram_user_id)
+        return context
+
     def read_conversation_state_as(
         self,
         *,
@@ -1473,6 +1630,56 @@ def _conversation_language(role: AcceptanceRole) -> ConversationLanguageAdapter:
     if role.conversation_language is None:
         raise RuntimeError("Bot Assistant runtime has no language adapter")
     return role.conversation_language
+
+
+def _conversation_onboarding_for_role(
+    role: AcceptanceRole,
+) -> ConversationOnboarding:
+    if role.role is not RuntimeRole.BOT_ASSISTANT:
+        raise RuntimeError("only Bot Assistant owns Search presentation")
+    if role.telegram_delivery is None:
+        raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+    if role.location_resolver is None:
+        raise RuntimeError("Bot Assistant runtime has no resolver adapter")
+    if role.date_interpretation is None:
+        raise RuntimeError("Bot Assistant runtime has no date interpreter")
+    if role.timezone_data is None:
+        raise RuntimeError("Bot Assistant runtime has no timezone-data adapter")
+    return ConversationOnboarding(
+        store=role.store,
+        telegram_delivery=role.telegram_delivery,
+        conversation_language=_conversation_language(role),
+        location_resolver=role.location_resolver,
+        date_interpretation=role.date_interpretation,
+        timezone_data=role.timezone_data,
+        clock=role.clock,
+    )
+
+
+def _required_date_from_payload(value: JsonValue) -> RequiredDate | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch required_date must be an object")
+    start = value.get("start_local_date")
+    end = value.get("end_local_date")
+    iana_timezone = value.get("iana_timezone")
+    timezone_data_version = value.get("timezone_data_version")
+    if not all(
+        isinstance(item, str) and item
+        for item in (start, end, iana_timezone, timezone_data_version)
+    ):
+        raise ValueError("RunSearch required_date is incomplete")
+    assert isinstance(start, str)
+    assert isinstance(end, str)
+    assert isinstance(iana_timezone, str)
+    assert isinstance(timezone_data_version, str)
+    return RequiredDate(
+        start_local_date=date.fromisoformat(start),
+        end_local_date=date.fromisoformat(end),
+        iana_timezone=iana_timezone,
+        timezone_data_version=timezone_data_version,
+    )
 
 
 def _envelope(

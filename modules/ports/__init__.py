@@ -19,6 +19,8 @@ from modules.contracts import (
 )
 from modules.domain import (
     ActiveChatView,
+    ActiveResultContext,
+    CompletedSearch,
     ConversationState,
     DateInterpretationQuery,
     DateInterpretationResolution,
@@ -31,6 +33,7 @@ from modules.domain import (
     LocationResolutionQuery,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
+    SearchResult,
     TelegramDeliveryClaim,
     TelegramMessage,
     UserIntent,
@@ -226,6 +229,41 @@ class ConversationStore(Protocol):
         """Commit one idempotent presentation without changing account state."""
         ...
 
+    def commit_search_submission(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        draft: DiscoveryDraft,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one Search action, submitting draft, and RunSearch command."""
+        ...
+
+    def accept_zero_result_search_completion(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Queue zero-result presentation without activating it prematurely."""
+        ...
+
+    def accept_search_failure(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        state: ConversationState,
+        draft: DiscoveryDraft,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Restore a confirmed draft and queue Retry after technical failure."""
+        ...
+
     def current_conversation_message(
         self, telegram_user_id: int
     ) -> TelegramMessage | None:
@@ -234,6 +272,12 @@ class ConversationStore(Protocol):
 
     def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView | None:
         """Return the latest successfully presented account view."""
+        ...
+
+    def active_result_context(
+        self, telegram_user_id: int
+    ) -> ActiveResultContext | None:
+        """Return the latest successfully presented Completed Search."""
         ...
 
     def claim_conversation_message(
@@ -346,6 +390,17 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Deduplicate and atomically commit one accepted handoff."""
         ...
 
+    def complete_zero_result_search(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        completed_search: CompletedSearch,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically persist a zero-result Completed Search and its event."""
+        ...
+
     def attempt_owner_write(
         self,
         *,
@@ -399,6 +454,14 @@ class AcceptanceObserver(Protocol):
         self, telegram_user_id: int
     ) -> tuple[RequiredDateConfirmationEvent, ...]:
         """Observe append-only explicit Required Date confirmations."""
+        ...
+
+    def completed_searches(self, telegram_user_id: int) -> tuple[CompletedSearch, ...]:
+        """Observe immutable Completed Searches through the public testkit."""
+        ...
+
+    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+        """Observe ordered immutable Results through the public testkit."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
