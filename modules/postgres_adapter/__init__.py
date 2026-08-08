@@ -126,14 +126,22 @@ class PostgresAcceptanceObserver:
         ) as connection:
             row = connection.execute(
                 """
-                SELECT * FROM football_runtime.contract_outbox
-                WHERE message_id = %s
+                SELECT contract_outbox.*,
+                       contract_inbox.processing_status AS inbox_status
+                FROM football_runtime.contract_outbox
+                LEFT JOIN football_runtime.contract_inbox
+                  ON contract_inbox.message_id = contract_outbox.message_id
+                 AND contract_inbox.consumer_role = contract_outbox.consumer_role
+                WHERE contract_outbox.message_id = %s
                 """,
                 (message_id,),
             ).fetchone()
         if row is None:
             raise LookupError(message_id)
-        return _row_to_envelope(row)
+        return _row_to_envelope(
+            row,
+            validate_registered=(row["inbox_status"] != "rejected_invalid_contract"),
+        )
 
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free alert by its technical message identity."""
@@ -1341,6 +1349,8 @@ class PostgresRoleStore:
         self,
         *,
         incoming: RawContractEnvelope,
+        expected_state_revision: int,
+        expected_draft_revision: int,
         message: TelegramMessage,
         received_at: datetime,
     ) -> ConsumeResult:
@@ -1358,6 +1368,29 @@ class PostgresRoleStore:
             if existing is not None and existing[0] == "accepted":
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.REPLAYED
+            state = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            draft = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_discovery_drafts
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            if state != (expected_state_revision, "submitting") or draft != (
+                expected_draft_revision,
+                "submitting",
+            ):
+                raise RuntimeError("Search result state changed concurrently")
             payload = incoming.payload
             if not isinstance(payload, dict):
                 raise TypeError("SearchCompleted payload must be an object")

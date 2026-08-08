@@ -161,53 +161,114 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
     spine: AcceptanceSpine,
 ) -> None:
     spine.run("contract-compatibility")
+    run_search_payload: dict[str, JsonValue] = {
+        "probe_id": "compatibility-RunSearch",
+        "search_update_id": "compatibility-search-update",
+        "telegram_user_id": 501,
+        "display_locale": "en",
+        "user_intent": "game_search",
+        "country_id": "country:ru",
+        "city_id": "city:ru:moscow",
+        "sub_city_area_ids": [],
+        "whole_city": True,
+        "required_date": {
+            "start_local_date": "2026-08-10",
+            "end_local_date": "2026-08-10",
+            "iana_timezone": "Europe/Moscow",
+            "timezone_data_version": "compatibility-tzdb",
+        },
+    }
+    zero_result_payload: dict[str, JsonValue] = {
+        "probe_id": "compatibility-ZeroResultSearchCompleted",
+        "completed_search_id": "completed-search:compatibility",
+        "search_update_id": "compatibility-search-update",
+        "telegram_user_id": 501,
+        "result_count": 0,
+    }
+    for contract_name, payload in (
+        (ContractName.RUN_SEARCH, run_search_payload),
+        (ContractName.ZERO_RESULT_SEARCH_COMPLETED, zero_result_payload),
+        (ContractName.SEARCH_FAILED, None),
+    ):
+        spine.record_search_event(
+            probe_id=f"compatibility-{contract_name.value}",
+            contract_name=contract_name,
+            contract_version=1,
+            telegram_user_id=501,
+            payload=payload,
+        )
     expected_pairs = (
         (
             ContractName.SOURCE_EVENT_RECORDED,
             RuntimeRole.INGESTION,
             RuntimeRole.APPLICATION,
+            "contract-compatibility",
         ),
         (
             ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
             RuntimeRole.APPLICATION,
             RuntimeRole.CLASSIFICATION,
+            "contract-compatibility",
         ),
         (
             ContractName.CLASSIFICATION_PROPOSAL,
             RuntimeRole.CLASSIFICATION,
             RuntimeRole.APPLICATION,
+            "contract-compatibility",
         ),
         (
             ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
             RuntimeRole.APPLICATION,
             RuntimeRole.RECOMMENDATION,
+            "contract-compatibility",
         ),
         (
             ContractName.SEARCH_COMPLETED,
             RuntimeRole.RECOMMENDATION,
             RuntimeRole.BOT_ASSISTANT,
+            "contract-compatibility",
         ),
         (
             ContractName.TELEGRAM_PRESENTATION_REQUESTED,
             RuntimeRole.BOT_ASSISTANT,
             None,
+            "contract-compatibility",
+        ),
+        (
+            ContractName.RUN_SEARCH,
+            RuntimeRole.BOT_ASSISTANT,
+            RuntimeRole.RECOMMENDATION,
+            "compatibility-RunSearch",
+        ),
+        (
+            ContractName.ZERO_RESULT_SEARCH_COMPLETED,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+            "compatibility-ZeroResultSearchCompleted",
+        ),
+        (
+            ContractName.SEARCH_FAILED,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+            "compatibility-SearchFailed",
         ),
     )
 
     correlation_ids = set()
-    for contract_name, producer, consumer in expected_pairs:
+    for contract_name, producer, consumer, probe_id in expected_pairs:
         envelope = spine.recoverable_contract(
-            "contract-compatibility",
+            probe_id,
             contract_name=contract_name,
         )
         assert envelope.contract_version == 1
         assert envelope.producer is producer
         assert envelope.consumer is consumer
-        assert envelope.subject_id == "contract-compatibility"
+        assert envelope.subject_id == probe_id
         assert envelope.subject_revision == 1
         assert envelope.idempotency_key
         assert envelope.causation_id
-        correlation_ids.add(envelope.correlation_id)
+        if probe_id == "contract-compatibility":
+            correlation_ids.add(envelope.correlation_id)
         json.dumps(envelope.payload)
 
     assert len(correlation_ids) == 1

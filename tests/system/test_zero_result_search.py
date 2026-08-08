@@ -359,14 +359,16 @@ def test_deferred_start_refreshes_draft_activity_when_result_delivery_fails() ->
 
 
 @pytest.mark.parametrize(
-    "contract_name",
+    ("contract_name", "consumer"),
     (
-        ContractName.ZERO_RESULT_SEARCH_COMPLETED,
-        ContractName.SEARCH_FAILED,
+        (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION),
+        (ContractName.ZERO_RESULT_SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT),
+        (ContractName.SEARCH_FAILED, RuntimeRole.BOT_ASSISTANT),
     ),
 )
 def test_future_search_event_versions_fail_closed(
     contract_name: ContractName,
+    consumer: RuntimeRole,
 ) -> None:
     system, _telegram = _boot_search_system()
     probe_id = f"future-{contract_name.value}"
@@ -377,7 +379,7 @@ def test_future_search_event_versions_fail_closed(
         telegram_user_id=44_009,
     )
 
-    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+    assert system.process_next_search_handoff(consumer) is True
 
     snapshot = system.observe(probe_id)
     assert snapshot.accepted_inbox_records == 0
@@ -385,6 +387,14 @@ def test_future_search_event_versions_fail_closed(
     assert len(snapshot.operator_alerts) == 1
     assert snapshot.operator_alerts[0].contract_name is contract_name
     assert snapshot.operator_alerts[0].contract_version == 2
+    recoverable = system.recoverable_contract(
+        probe_id,
+        contract_name=contract_name,
+    )
+    assert isinstance(recoverable.payload, dict)
+    assert recoverable.payload["probe_id"] == probe_id
+    assert recoverable.contract_name is contract_name
+    assert recoverable.contract_version == 2
     system.reset()
 
 
@@ -416,6 +426,14 @@ def test_invalid_supported_search_events_fail_closed(
     assert snapshot.accepted_inbox_records == 0
     assert snapshot.rejected_inbox_records == 1
     assert len(snapshot.operator_alerts) == 1
+    recoverable = system.recoverable_contract(
+        probe_id,
+        contract_name=ContractName.SEARCH_FAILED,
+    )
+    assert isinstance(recoverable.payload, dict)
+    assert recoverable.payload["probe_id"] == probe_id
+    assert recoverable.producer is producer
+    assert ("telegram_user_id" in recoverable.payload) is include_telegram_user_id
     system.reset()
 
 
@@ -471,6 +489,11 @@ def test_search_contract_payload_semantics_fail_closed(
     assert snapshot.accepted_inbox_records == 0
     assert snapshot.rejected_inbox_records == 1
     assert len(snapshot.operator_alerts) == 1
+    recoverable = system.recoverable_contract(
+        probe_id,
+        contract_name=contract_name,
+    )
+    assert recoverable.payload == payload
     system.reset()
 
 

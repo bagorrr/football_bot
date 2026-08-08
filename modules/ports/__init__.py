@@ -273,6 +273,8 @@ class ConversationStore(Protocol):
         self,
         *,
         incoming: RawContractEnvelope,
+        expected_state_revision: int,
+        expected_draft_revision: int,
         message: TelegramMessage,
         received_at: datetime,
     ) -> ConsumeResult:

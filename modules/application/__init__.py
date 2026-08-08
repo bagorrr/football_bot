@@ -1143,6 +1143,8 @@ class ConversationOnboarding:
         ):
             self._store.accept_zero_result_search_completion(
                 incoming=incoming,
+                expected_state_revision=current.revision,
+                expected_draft_revision=draft.revision,
                 message=_zero_result_message(
                     delivery_id=f"search-result:{completed_search_id}",
                     telegram_user_id=telegram_user_id,
@@ -1160,6 +1162,8 @@ class ConversationOnboarding:
         )
         self._store.accept_zero_result_search_completion(
             incoming=incoming,
+            expected_state_revision=current.revision,
+            expected_draft_revision=draft.revision,
             message=message,
             received_at=self._clock.now(),
         )
