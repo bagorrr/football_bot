@@ -313,7 +313,7 @@ def test_one_answer_accepts_several_typed_areas_with_verified_hierarchy() -> Non
     )
 
 
-def test_same_intent_country_and_city_history_is_only_an_unconfirmed_shortcut() -> None:
+def test_unfinished_search_area_never_becomes_repeated_search_history() -> None:
     clock = _AdjustableClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC))
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     system = boot_acceptance_spine(
@@ -349,109 +349,62 @@ def test_same_intent_country_and_city_history_is_only_an_unconfirmed_shortcut() 
         telegram_user_id=user_id,
         text="Saint Petersburg",
     )
-    other_user_id = 42_066
-    system.start_bot_user(
-        update_id="start-other-suggestion-owner",
-        telegram_user_id=other_user_id,
-        telegram_language_hint="en",
+    system.submit_location_text(
+        update_id="area-before-suggestion-history",
+        telegram_user_id=user_id,
+        text="Near Komendantsky metro and in Primorsky District",
     )
-    system.select_fixed_language(
-        update_id="language-other-suggestion-owner",
-        telegram_user_id=other_user_id,
-        locale="en",
-    )
-    system.select_direction(
-        update_id="intent-other-suggestion-owner",
-        telegram_user_id=other_user_id,
-        direction="game_search",
-    )
-    assert all(
-        label != "Russia"
-        for row in telegram_delivery.messages[-1].button_rows
-        for label, _ in row
-    )
+    assert system.discovery_draft(user_id).stage == "required_date"
     clock.advance(timedelta(days=30))
-    assert system.expire_inactive_discovery_drafts() == 2
+    assert system.expire_inactive_discovery_drafts() == 1
     system.start_bot_user(
         update_id="start-suggestion-flow",
         telegram_user_id=user_id,
         telegram_language_hint="fr",
     )
     system.select_direction(
-        update_id="different-intent-has-no-suggestion",
-        telegram_user_id=user_id,
-        direction="player_search",
-    )
-    assert all(
-        label != "Russia"
-        for row in telegram_delivery.messages[-1].button_rows
-        for label, _ in row
-    )
-    system.go_back(
-        update_id="back-before-same-intent-suggestion",
-        telegram_user_id=user_id,
-    )
-    system.select_direction(
-        update_id="same-intent-has-suggestion",
+        update_id="same-intent-after-unfinished-draft",
         telegram_user_id=user_id,
         direction="game_search",
     )
 
-    unconfirmed_country = system.discovery_draft(user_id)
-    assert unconfirmed_country.country is None
-    assert (
-        "Russia",
-        f"location-suggestion:country:country:ru:{unconfirmed_country.screen_revision}",
-    ) in telegram_delivery.messages[-1].button_rows[0]
-
-    offered_revision = unconfirmed_country.screen_revision
-    system.dismiss_location_suggestion(
-        update_id="choose-another-country",
+    country_prompt = system.discovery_draft(user_id)
+    assert country_prompt.country is None
+    assert telegram_delivery.messages[-1].button_rows == (
+        (("⬅️ Back", f"direction:back:{country_prompt.screen_revision}"),),
+    )
+    assert telegram_delivery.messages[-1].text == (
+        "🌍 In which country should we look for a match for you?"
+    )
+    system.submit_location_text(
+        update_id="country-after-unfinished-draft",
         telegram_user_id=user_id,
-        kind="country",
+        text="Russia",
     )
-    free_text_country = system.discovery_draft(user_id)
-    assert free_text_country.country is None
-    assert all(
-        label != "Russia"
-        for row in telegram_delivery.messages[-1].button_rows
-        for label, _ in row
+    city_prompt = system.discovery_draft(user_id)
+    assert city_prompt.city is None
+    assert telegram_delivery.messages[-1].button_rows == (
+        (("⬅️ Back", f"direction:back:{city_prompt.screen_revision}"),),
     )
-    system.select_location_suggestion(
-        update_id="stale-country-suggestion",
+    assert telegram_delivery.messages[-1].text == (
+        "✅ Search country: **Russia**.\n\n🏙 In which city should we search?"
+    )
+    system.submit_location_text(
+        update_id="city-after-unfinished-draft",
         telegram_user_id=user_id,
-        kind="country",
-        place_id="country:ru",
-        screen_revision=offered_revision,
+        text="Saint Petersburg",
     )
-    assert system.discovery_draft(user_id) == free_text_country
-    system.start_bot_user(
-        update_id="resume-country-suggestion",
-        telegram_user_id=user_id,
-        telegram_language_hint="ru",
+    area_prompt = system.discovery_draft(user_id)
+    assert area_prompt.sub_city_areas == ()
+    assert telegram_delivery.messages[-1].button_rows == (
+        (("⬅️ Back", f"direction:back:{area_prompt.screen_revision}"),),
     )
-
-    system.select_location_suggestion(
-        update_id="accept-country-suggestion",
-        telegram_user_id=user_id,
-        kind="country",
-        place_id="country:ru",
+    assert telegram_delivery.messages[-1].text == (
+        "📍 Refine the search area.\n\n"
+        "Selected city: Saint Petersburg.\n\n"
+        "In one message, type one or several districts, metro stations, streets, "
+        "stadiums, or other places. If anywhere in the city works, type “whole city”."
     )
-    system.restart(RuntimeRole.BOT_ASSISTANT)
-    system.start_bot_user(
-        update_id="resume-before-city-suggestion",
-        telegram_user_id=user_id,
-        telegram_language_hint="es",
-    )
-
-    unconfirmed_city = system.discovery_draft(user_id)
-    assert unconfirmed_city.country is not None
-    assert unconfirmed_city.city is None
-    assert (
-        "Saint Petersburg",
-        "location-suggestion:city:city:ru:saint-petersburg:"
-        f"{unconfirmed_city.screen_revision}",
-    ) in telegram_delivery.messages[-1].button_rows[0]
 
 
 def test_city_resolution_outcomes_are_distinct_and_preserve_confirmed_country() -> None:

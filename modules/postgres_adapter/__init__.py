@@ -91,7 +91,6 @@ class PostgresAcceptanceObserver:
                      football_runtime.bot_message_outbox,
                      football_runtime.bot_updates,
                      football_runtime.bot_geography_confirmation_events,
-                     football_runtime.bot_geography_history,
                      football_runtime.bot_discovery_drafts,
                      football_runtime.bot_users,
                      football_runtime.telegram_presentations,
@@ -643,31 +642,8 @@ class PostgresRoleStore:
     def geography_suggestion(
         self, *, telegram_user_id: int, user_intent: UserIntent
     ) -> GeographySuggestion | None:
-        """Read only the most recent confirmed geography for one User Intent."""
-        try:
-            with psycopg.connect(
-                self._database_url,
-                row_factory=dict_row,
-            ) as connection:
-                row = connection.execute(
-                    """
-                    SELECT country, city
-                    FROM football_runtime.bot_geography_history
-                    WHERE telegram_user_id = %s AND user_intent = %s
-                    """,
-                    (telegram_user_id, user_intent.value),
-                ).fetchone()
-        except psycopg.errors.InsufficientPrivilege as error:
-            raise ConversationAccessDeniedError from error
-        if row is None:
-            return None
-        country = _optional_accepted_location(row["country"])
-        if country is None:
-            raise RuntimeError("geography history has no country")
-        return GeographySuggestion(
-            country=country,
-            city=_optional_accepted_location(row["city"]),
-        )
+        """Offer no shortcut until Completed Search history has an owning source."""
+        return None
 
     def expire_inactive_discovery_drafts(self, *, inactive_before: datetime) -> int:
         """Delete only Bot Assistant-owned drafts inactive through a cutoff."""
@@ -890,35 +866,6 @@ class PostgresRoleStore:
                         confirmation.whole_city,
                         json.dumps(confirmation.resolver_versions),
                         confirmation.glossary_version,
-                        recorded_at,
-                    ),
-                )
-                connection.execute(
-                    """
-                    INSERT INTO football_runtime.bot_geography_history (
-                        telegram_user_id, user_intent, country, city,
-                        confirmed_at
-                    ) VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)
-                    ON CONFLICT (telegram_user_id, user_intent) DO UPDATE
-                    SET country = EXCLUDED.country,
-                        city = CASE
-                            WHEN bot_geography_history.country ->> 'place_id'
-                                 = EXCLUDED.country ->> 'place_id'
-                                 AND EXCLUDED.city IS NULL
-                            THEN bot_geography_history.city
-                            ELSE EXCLUDED.city
-                        END,
-                        confirmed_at = EXCLUDED.confirmed_at
-                    """,
-                    (
-                        state.telegram_user_id,
-                        confirmation.user_intent.value,
-                        json.dumps(_accepted_location_json(confirmation.country)),
-                        (
-                            json.dumps(_accepted_location_json(confirmation.city))
-                            if confirmation.city is not None
-                            else None
-                        ),
                         recorded_at,
                     ),
                 )

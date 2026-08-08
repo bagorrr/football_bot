@@ -38,30 +38,6 @@ ALTER TABLE football_runtime.bot_discovery_drafts
     ADD COLUMN IF NOT EXISTS sub_city_areas jsonb NOT NULL DEFAULT '[]'::jsonb,
     ADD COLUMN IF NOT EXISTS whole_city boolean NOT NULL DEFAULT false;
 
-CREATE TABLE IF NOT EXISTS football_runtime.bot_geography_history (
-    owner_role text NOT NULL DEFAULT 'bot_assistant'
-        CHECK (owner_role = 'bot_assistant'),
-    telegram_user_id bigint NOT NULL REFERENCES football_runtime.bot_users,
-    user_intent text NOT NULL CHECK (
-        user_intent IN (
-            'game_search',
-            'player_search',
-            'tournament_search',
-            'opponent_search',
-            'new_team_search',
-            'transfer_player_search',
-            'coach_search',
-            'coaching_service_offer',
-            'referee_search',
-            'refereeing_service_offer'
-        )
-    ),
-    country jsonb NOT NULL,
-    city jsonb,
-    confirmed_at timestamptz NOT NULL,
-    PRIMARY KEY (telegram_user_id, user_intent)
-);
-
 CREATE TABLE IF NOT EXISTS football_runtime.bot_geography_confirmation_events (
     event_sequence bigint GENERATED ALWAYS AS IDENTITY,
     owner_role text NOT NULL DEFAULT 'bot_assistant'
@@ -87,25 +63,6 @@ ALTER TABLE football_runtime.bot_geography_confirmation_events
     ADD COLUMN IF NOT EXISTS glossary_version text NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS bot_geography_confirmation_events_sequence
     ON football_runtime.bot_geography_confirmation_events (event_sequence);
-
-ALTER TABLE football_runtime.bot_geography_history ENABLE ROW LEVEL SECURITY;
-ALTER TABLE football_runtime.bot_geography_history FORCE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS bot_geography_history_owner
-    ON football_runtime.bot_geography_history;
-CREATE POLICY bot_geography_history_owner
-    ON football_runtime.bot_geography_history
-    USING (
-        football_runtime.current_runtime_role() = 'bot_assistant'
-        AND owner_role = 'bot_assistant'
-    )
-    WITH CHECK (
-        football_runtime.current_runtime_role() = 'bot_assistant'
-        AND owner_role = 'bot_assistant'
-    );
-
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON football_runtime.bot_geography_history TO football_bot_assistant;
 
 ALTER TABLE football_runtime.bot_geography_confirmation_events
     ENABLE ROW LEVEL SECURITY;
