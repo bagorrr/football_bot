@@ -758,6 +758,7 @@ class AcceptanceRole:
             return True
         if (
             incoming.contract_name is ContractName.SEARCH_COMPLETED
+            and incoming.contract_version in self.versions_for(incoming.contract_name)
             and isinstance(incoming.payload, dict)
             and "telegram_user_id" in incoming.payload
         ):
@@ -765,7 +766,10 @@ class AcceptanceRole:
                 self
             ).accept_zero_result_search_completion(incoming=incoming)
             return True
-        if incoming.contract_name is ContractName.SEARCH_FAILED:
+        if (
+            incoming.contract_name is ContractName.SEARCH_FAILED
+            and incoming.contract_version in self.versions_for(incoming.contract_name)
+        ):
             _conversation_onboarding_for_role(self).accept_search_failure(
                 incoming=incoming
             )
@@ -1059,6 +1063,49 @@ class AcceptanceSpine:
             payload=source_payload,
         )
 
+    def record_search_event(
+        self,
+        *,
+        probe_id: str,
+        contract_name: ContractName,
+        contract_version: int,
+        telegram_user_id: int,
+    ) -> None:
+        """Record one synthetic Recommendation event for contract-boundary tests."""
+        if contract_name not in {
+            ContractName.SEARCH_COMPLETED,
+            ContractName.SEARCH_FAILED,
+        }:
+            raise ValueError("only Search outcome events can use this testkit port")
+        required_fact = (
+            "completed_search_id"
+            if contract_name is ContractName.SEARCH_COMPLETED
+            else "search_update_id"
+        )
+        envelope = RawContractEnvelope(
+            contract_name=contract_name,
+            contract_version=contract_version,
+            message_id=_identifier(probe_id, contract_name.value),
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=probe_id,
+            subject_revision=1,
+            idempotency_key=f"{probe_id}:{contract_name.value}",
+            causation_id=_identifier(probe_id, "causation"),
+            correlation_id=_identifier(probe_id, "correlation"),
+            recorded_at=self._roles[RuntimeRole.RECOMMENDATION].clock.now(),
+            payload={
+                "probe_id": probe_id,
+                required_fact: f"{required_fact}:{probe_id}",
+                "search_update_id": f"search-update:{probe_id}",
+                "telegram_user_id": telegram_user_id,
+            },
+        )
+        self._roles[RuntimeRole.RECOMMENDATION].store.commit_initial(
+            probe_id=probe_id,
+            envelope=envelope,
+        )
+
     def run_until_idle(
         self,
         probe_id: str,
@@ -1202,6 +1249,12 @@ class AcceptanceSpine:
             delivered = self._conversation_onboarding().deliver_pending()
             if not progressed and not delivered:
                 return
+
+    def process_next_search_handoff(self, role: RuntimeRole) -> bool:
+        """Process one durable Search handoff without presenting Telegram output."""
+        if role not in {RuntimeRole.RECOMMENDATION, RuntimeRole.BOT_ASSISTANT}:
+            raise ValueError("Search handoff role must own the Search pipeline")
+        return self._roles[role].process_next()
 
     def fail_next_search(self) -> None:
         """Inject one controlled technical failure in Recommendation."""

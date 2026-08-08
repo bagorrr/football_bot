@@ -1234,6 +1234,16 @@ class ConversationOnboarding:
                 inactive_before=now - timedelta(days=30),
             )
         draft = self._store.discovery_draft(telegram_user_id)
+        if (
+            current is not None
+            and current.stage is ConversationStage.SUBMITTING
+            and self._store.defer_start_to_pending_search_result(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                recorded_at=now,
+            )
+        ):
+            return
         if current is None:
             current = ConversationState(
                 telegram_user_id=telegram_user_id,

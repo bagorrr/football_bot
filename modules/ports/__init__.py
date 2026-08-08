@@ -259,6 +259,16 @@ class ConversationStore(Protocol):
         """Commit one Search action, submitting draft, and RunSearch command."""
         ...
 
+    def defer_start_to_pending_search_result(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Record /start without replacing a queued Search result presentation."""
+        ...
+
     def accept_zero_result_search_completion(
         self,
         *,

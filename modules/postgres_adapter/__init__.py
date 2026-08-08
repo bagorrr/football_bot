@@ -1223,6 +1223,37 @@ class PostgresRoleStore:
             _insert_outbox(connection, command)
             return True
 
+    def defer_start_to_pending_search_result(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Keep a queued Search result authoritative over a concurrent /start."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                )
+                SELECT %s, %s, %s
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM football_runtime.bot_search_presentations AS presentation
+                    JOIN football_runtime.bot_message_outbox AS outbox
+                      ON outbox.delivery_id = presentation.delivery_id
+                    WHERE presentation.telegram_user_id = %s
+                      AND outbox.delivered_at IS NULL
+                      AND outbox.superseded_at IS NULL
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at, telegram_user_id),
+            ).fetchone()
+        return inserted is not None
+
     def accept_zero_result_search_completion(
         self,
         *,

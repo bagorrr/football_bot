@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
-from modules.contracts import RuntimeRole
+from modules.contracts import ContractName, RuntimeRole
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -303,6 +303,62 @@ def test_start_resumes_an_in_flight_search_without_submitting_again() -> None:
     system.process_searches_until_idle()
     assert len(system.completed_searches(user_id)) == 1
     assert system.has_discovery_draft(user_id) is False
+    system.reset()
+
+
+def test_start_preserves_a_completed_search_awaiting_result_delivery() -> None:
+    system, telegram = _boot_search_system()
+    user_id = 44_008
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="queued-result-search", telegram_user_id=user_id)
+    assert system.process_next_search_handoff(RuntimeRole.RECOMMENDATION) is True
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+    assert len(system.completed_searches(user_id)) == 1
+    assert system.has_discovery_draft(user_id) is True
+
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+    system.start_bot_user(
+        update_id="start-before-result-delivery",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.process_searches_until_idle()
+
+    completed = system.completed_searches(user_id)[0]
+    assert system.has_discovery_draft(user_id) is False
+    assert system.active_result_context(user_id).completed_search_id == (
+        completed.completed_search_id
+    )
+    assert telegram.messages[-1].delivery_id == (
+        f"search-result:{completed.completed_search_id}"
+    )
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    "contract_name",
+    (ContractName.SEARCH_COMPLETED, ContractName.SEARCH_FAILED),
+)
+def test_future_search_event_versions_fail_closed(
+    contract_name: ContractName,
+) -> None:
+    system, _telegram = _boot_search_system()
+    probe_id = f"future-{contract_name.value}"
+    system.record_search_event(
+        probe_id=probe_id,
+        contract_name=contract_name,
+        contract_version=2,
+        telegram_user_id=44_009,
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    snapshot = system.observe(probe_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert len(snapshot.operator_alerts) == 1
+    assert snapshot.operator_alerts[0].contract_name is contract_name
+    assert snapshot.operator_alerts[0].contract_version == 2
     system.reset()
 
 
