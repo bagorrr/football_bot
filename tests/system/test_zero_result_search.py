@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
-from modules.contracts import ContractName, RuntimeRole
+from modules.contracts import ContractName, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -411,6 +411,61 @@ def test_invalid_supported_search_events_fail_closed(
     )
 
     assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    snapshot = system.observe(probe_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert len(snapshot.operator_alerts) == 1
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("contract_name", "consumer", "payload"),
+    (
+        (
+            ContractName.RUN_SEARCH,
+            RuntimeRole.RECOMMENDATION,
+            {
+                "probe_id": "invalid-RunSearch",
+                "search_update_id": "invalid-run-search",
+                "telegram_user_id": 44_012,
+                "display_locale": "en",
+                "user_intent": "game_search",
+                "country_id": "country:ru",
+                "sub_city_area_ids": [],
+                "whole_city": True,
+                "required_date": None,
+            },
+        ),
+        (
+            ContractName.ZERO_RESULT_SEARCH_COMPLETED,
+            RuntimeRole.BOT_ASSISTANT,
+            {
+                "probe_id": "invalid-ZeroResultSearchCompleted",
+                "completed_search_id": "completed-search:invalid",
+                "search_update_id": "invalid-completion",
+                "telegram_user_id": 44_012,
+                "result_count": 1,
+            },
+        ),
+    ),
+)
+def test_search_contract_payload_semantics_fail_closed(
+    contract_name: ContractName,
+    consumer: RuntimeRole,
+    payload: dict[str, JsonValue],
+) -> None:
+    system, _telegram = _boot_search_system()
+    probe_id = str(payload["probe_id"])
+    system.record_search_event(
+        probe_id=probe_id,
+        contract_name=contract_name,
+        contract_version=1,
+        telegram_user_id=44_012,
+        payload=payload,
+    )
+
+    assert system.process_next_search_handoff(consumer) is True
 
     snapshot = system.observe(probe_id)
     assert snapshot.accepted_inbox_records == 0

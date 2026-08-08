@@ -1077,42 +1077,57 @@ class AcceptanceSpine:
         contract_name: ContractName,
         contract_version: int,
         telegram_user_id: int,
-        producer: RuntimeRole = RuntimeRole.RECOMMENDATION,
+        producer: RuntimeRole | None = None,
         include_telegram_user_id: bool = True,
+        payload: dict[str, JsonValue] | None = None,
     ) -> None:
         """Record one synthetic Recommendation event for contract-boundary tests."""
         if contract_name not in {
+            ContractName.RUN_SEARCH,
             ContractName.ZERO_RESULT_SEARCH_COMPLETED,
             ContractName.SEARCH_FAILED,
         }:
             raise ValueError("only Search outcome events can use this testkit port")
-        required_fact = (
-            "completed_search_id"
-            if contract_name is ContractName.ZERO_RESULT_SEARCH_COMPLETED
-            else "search_update_id"
+        event_producer = producer or (
+            RuntimeRole.BOT_ASSISTANT
+            if contract_name is ContractName.RUN_SEARCH
+            else RuntimeRole.RECOMMENDATION
         )
-        payload: dict[str, JsonValue] = {
-            "probe_id": probe_id,
-            required_fact: f"{required_fact}:{probe_id}",
-            "search_update_id": f"search-update:{probe_id}",
-        }
-        if include_telegram_user_id:
-            payload["telegram_user_id"] = telegram_user_id
+        consumer = (
+            RuntimeRole.RECOMMENDATION
+            if contract_name is ContractName.RUN_SEARCH
+            else RuntimeRole.BOT_ASSISTANT
+        )
+        event_payload: dict[str, JsonValue]
+        if payload is not None:
+            event_payload = dict(payload)
+        else:
+            event_payload = {
+                "probe_id": probe_id,
+                (
+                    "completed_search_id"
+                    if contract_name is ContractName.ZERO_RESULT_SEARCH_COMPLETED
+                    else "search_update_id"
+                ): f"search-fact:{probe_id}",
+                "search_update_id": f"search-update:{probe_id}",
+            }
+        if include_telegram_user_id and "telegram_user_id" not in event_payload:
+            event_payload["telegram_user_id"] = telegram_user_id
         envelope = RawContractEnvelope(
             contract_name=contract_name,
             contract_version=contract_version,
             message_id=_identifier(probe_id, contract_name.value),
-            producer=producer,
-            consumer=RuntimeRole.BOT_ASSISTANT,
+            producer=event_producer,
+            consumer=consumer,
             subject_id=probe_id,
             subject_revision=1,
             idempotency_key=f"{probe_id}:{contract_name.value}",
             causation_id=_identifier(probe_id, "causation"),
             correlation_id=_identifier(probe_id, "correlation"),
-            recorded_at=self._roles[producer].clock.now(),
-            payload=payload,
+            recorded_at=self._roles[event_producer].clock.now(),
+            payload=event_payload,
         )
-        self._roles[producer].store.commit_initial(
+        self._roles[event_producer].store.commit_initial(
             probe_id=probe_id,
             envelope=envelope,
         )

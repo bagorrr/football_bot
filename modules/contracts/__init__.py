@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import TypeAlias
 from uuid import UUID
@@ -252,6 +252,10 @@ class ContractEnvelope(RawContractEnvelope):
             if not isinstance(integer_fact, int) or isinstance(integer_fact, bool):
                 msg = f"supported contract requires integer {field_name}"
                 raise ValueError(msg)
+        if self.contract_name is ContractName.RUN_SEARCH:
+            _validate_run_search(self.payload)
+        elif self.contract_name is ContractName.ZERO_RESULT_SEARCH_COMPLETED:
+            _validate_zero_result_search_completed(self.payload)
 
 
 def _validate_json(value: object) -> None:
@@ -270,3 +274,86 @@ def _validate_json(value: object) -> None:
         return
     msg = "contract payloads may contain only JSON values"
     raise TypeError(msg)
+
+
+_USER_INTENTS = frozenset(
+    {
+        "game_search",
+        "player_search",
+        "tournament_search",
+        "opponent_search",
+        "new_team_search",
+        "transfer_player_search",
+        "coach_search",
+        "coaching_service_offer",
+        "referee_search",
+        "refereeing_service_offer",
+    }
+)
+_DATE_REQUIRED_USER_INTENTS = frozenset(
+    {
+        "game_search",
+        "player_search",
+        "tournament_search",
+        "opponent_search",
+        "referee_search",
+        "refereeing_service_offer",
+    }
+)
+
+
+def _validate_run_search(payload: dict[str, JsonValue]) -> None:
+    """Validate the complete confirmed discovery snapshot on the wire."""
+    _required_text(payload, "display_locale")
+    user_intent = _required_text(payload, "user_intent")
+    if user_intent not in _USER_INTENTS:
+        raise ValueError("RunSearch requires a canonical user_intent")
+    _required_text(payload, "country_id")
+    _required_text(payload, "city_id")
+    area_ids = payload.get("sub_city_area_ids")
+    if not isinstance(area_ids, list) or not all(
+        isinstance(value, str) and value for value in area_ids
+    ):
+        raise ValueError("RunSearch requires string sub_city_area_ids")
+    whole_city = payload.get("whole_city")
+    if not isinstance(whole_city, bool):
+        raise ValueError("RunSearch requires boolean whole_city")
+    if whole_city == bool(area_ids):
+        raise ValueError("RunSearch requires exactly one Search Area mode")
+    required_date = payload.get("required_date")
+    if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
+        _validate_required_date(required_date)
+
+
+def _validate_required_date(value: JsonValue) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("RunSearch requires a Required Date object")
+    start_text = _required_text(value, "start_local_date")
+    end_text = _required_text(value, "end_local_date")
+    _required_text(value, "iana_timezone")
+    _required_text(value, "timezone_data_version")
+    try:
+        start = date.fromisoformat(start_text)
+        end = date.fromisoformat(end_text)
+    except ValueError as error:
+        raise ValueError("RunSearch Required Date must use ISO local dates") from error
+    if start > end:
+        raise ValueError("RunSearch Required Date range must be ordered")
+
+
+def _validate_zero_result_search_completed(payload: dict[str, JsonValue]) -> None:
+    _required_text(payload, "search_update_id")
+    result_count = payload.get("result_count")
+    if (
+        not isinstance(result_count, int)
+        or isinstance(result_count, bool)
+        or result_count != 0
+    ):
+        raise ValueError("ZeroResultSearchCompleted requires result_count 0")
+
+
+def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"contract requires {field_name}")
+    return value
