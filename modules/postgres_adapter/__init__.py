@@ -779,10 +779,16 @@ class PostgresAcceptanceObserver:
         ) as connection:
             state_rows = connection.execute(
                 """
-                SELECT owner_role FROM football_runtime.acceptance_state
+                SELECT owner_role
+                FROM football_runtime.acceptance_state
                 WHERE probe_id = %s
+                   OR probe_id IN (
+                       SELECT subject_id
+                       FROM football_runtime.contract_outbox
+                       WHERE payload ->> 'probe_id' = %s
+                   )
                 """,
-                (probe_id,),
+                (probe_id, probe_id),
             ).fetchall()
             counts = connection.execute(
                 """

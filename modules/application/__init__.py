@@ -3815,8 +3815,16 @@ class RuntimeApplication:
         if self.supported_versions:
             return
         for definition in SUPPORTED_CONTRACTS:
-            if definition.consumer is self.role and definition.version == 1:
-                self.supported_versions.setdefault(definition.name, set()).add(1)
+            if definition.consumer is self.role and (
+                definition.version == 1
+                or (
+                    definition.name is ContractName.SEARCH_COMPLETED
+                    and definition.version == 2
+                )
+            ):
+                self.supported_versions.setdefault(definition.name, set()).add(
+                    definition.version
+                )
 
     def supports(self, contract_name: ContractName, version: int) -> None:
         """Add one explicit consumer contract version."""
@@ -3902,7 +3910,7 @@ class RuntimeApplication:
         if (
             incoming.contract_name is ContractName.SEARCH_COMPLETED
             and supported_incoming is not None
-            and _is_bot_search_outcome(supported_incoming)
+            and incoming.contract_version == 2
         ):
             self._conversation_onboarding().accept_search_completion(
                 incoming=supported_incoming
@@ -3929,9 +3937,14 @@ class RuntimeApplication:
             definition, fact = self._next_handoff(supported_incoming)
             outgoing = _runtime_envelope(
                 definition=definition,
-                probe_id=incoming.subject_id,
+                probe_id=_runtime_probe_id(supported_incoming),
                 version=definition.version,
                 fact=fact,
+                subject_id=(
+                    fact
+                    if definition.name is ContractName.SEARCH_COMPLETED
+                    else incoming.subject_id
+                ),
                 causation_id=incoming.message_id,
                 correlation_id=incoming.correlation_id,
                 recorded_at=self.clock.now(),
@@ -4029,7 +4042,7 @@ class RuntimeApplication:
         )
         outgoing = ContractEnvelope(
             contract_name=ContractName.SEARCH_COMPLETED,
-            contract_version=1,
+            contract_version=2,
             message_id=_runtime_identifier(completed_search_id, "SearchCompleted"),
             producer=RuntimeRole.RECOMMENDATION,
             consumer=RuntimeRole.BOT_ASSISTANT,
@@ -4168,12 +4181,6 @@ class RuntimeApplication:
         )
 
 
-def _is_bot_search_outcome(incoming: RawContractEnvelope) -> bool:
-    return isinstance(incoming.payload, dict) and isinstance(
-        incoming.payload.get("search_update_id"), str
-    )
-
-
 def _runtime_identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
 
@@ -4213,6 +4220,7 @@ def _runtime_envelope(
     causation_id: UUID,
     correlation_id: UUID,
     recorded_at: datetime,
+    subject_id: str | None = None,
 ) -> ContractEnvelope:
     payload: dict[str, JsonValue] = {
         "probe_id": probe_id,
@@ -4225,7 +4233,7 @@ def _runtime_envelope(
         message_id=_runtime_identifier(probe_id, definition.name.value),
         producer=definition.producer,
         consumer=definition.consumer,
-        subject_id=probe_id,
+        subject_id=subject_id or probe_id,
         subject_revision=1,
         idempotency_key=f"{probe_id}:{definition.name.value}",
         causation_id=causation_id,
@@ -4242,6 +4250,14 @@ def _runtime_payload_text(envelope: RawContractEnvelope, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"supported contract requires {name}")
     return value
+
+
+def _runtime_probe_id(envelope: RawContractEnvelope) -> str:
+    if isinstance(envelope.payload, dict):
+        probe_id = envelope.payload.get("probe_id")
+        if isinstance(probe_id, str) and probe_id:
+            return probe_id
+    return envelope.subject_id
 
 
 def _runtime_with_message_id(

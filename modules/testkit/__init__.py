@@ -795,6 +795,7 @@ class AcceptanceSpine:
             event_payload["telegram_user_id"] = telegram_user_id
         if (
             contract_name is ContractName.SEARCH_COMPLETED
+            and contract_version == 2
             and "result_count" not in event_payload
         ):
             event_payload["result_count"] = 0

@@ -85,6 +85,14 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
     completion = system.search_completions(completed.search_update_id)
     assert len(completion) == 1
     assert completion[0].contract_name is ContractName.SEARCH_COMPLETED
+    assert completion[0].contract_version == 2
+    assert completion[0].subject_id == completed.completed_search_id
+    assert completion[0].payload == {
+        "completed_search_id": completed.completed_search_id,
+        "telegram_user_id": user_id,
+        "search_update_id": completed.search_update_id,
+        "result_count": 0,
+    }
     query = system.recoverable_contract(
         completed.completed_search_id,
         contract_name=ContractName.GET_COMPLETED_SEARCH,
@@ -248,11 +256,11 @@ def test_stale_search_completion_is_consumed_without_presenting_it() -> None:
     system.record_search_event(
         probe_id="stale-search-completion",
         contract_name=ContractName.SEARCH_COMPLETED,
-        contract_version=1,
+        contract_version=2,
         telegram_user_id=user_id,
         payload={
             "probe_id": "stale-search-completion",
-            "completed_search_id": "completed-search:stale",
+            "completed_search_id": "stale-search-completion",
             "search_update_id": "stale-search",
             "telegram_user_id": user_id,
             "result_count": 0,
@@ -279,11 +287,11 @@ def test_search_completion_reads_the_canonical_completed_search() -> None:
     system.record_search_event(
         probe_id="missing-completed-search",
         contract_name=ContractName.SEARCH_COMPLETED,
-        contract_version=1,
+        contract_version=2,
         telegram_user_id=user_id,
         payload={
             "probe_id": "missing-completed-search",
-            "completed_search_id": "completed-search:missing",
+            "completed_search_id": "missing-completed-search",
             "search_update_id": "active-search",
             "telegram_user_id": user_id,
             "result_count": 0,
@@ -570,24 +578,25 @@ def test_deferred_start_refreshes_draft_activity_when_result_delivery_fails() ->
 
 
 @pytest.mark.parametrize(
-    ("contract_name", "consumer"),
+    ("contract_name", "consumer", "future_version"),
     (
-        (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION),
-        (ContractName.SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT),
-        (ContractName.SEARCH_FAILED, RuntimeRole.BOT_ASSISTANT),
-        (ContractName.GET_COMPLETED_SEARCH, RuntimeRole.BOT_ASSISTANT),
+        (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION, 2),
+        (ContractName.SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT, 3),
+        (ContractName.SEARCH_FAILED, RuntimeRole.BOT_ASSISTANT, 2),
+        (ContractName.GET_COMPLETED_SEARCH, RuntimeRole.BOT_ASSISTANT, 2),
     ),
 )
 def test_future_search_event_versions_fail_closed(
     contract_name: ContractName,
     consumer: RuntimeRole,
+    future_version: int,
 ) -> None:
     system, _telegram = _boot_search_system()
     probe_id = f"future-{contract_name.value}"
     system.record_search_event(
         probe_id=probe_id,
         contract_name=contract_name,
-        contract_version=2,
+        contract_version=future_version,
         telegram_user_id=44_009,
     )
 
@@ -598,7 +607,7 @@ def test_future_search_event_versions_fail_closed(
     assert snapshot.rejected_inbox_records == 1
     assert len(snapshot.operator_alerts) == 1
     assert snapshot.operator_alerts[0].contract_name is contract_name
-    assert snapshot.operator_alerts[0].contract_version == 2
+    assert snapshot.operator_alerts[0].contract_version == future_version
     recoverable = system.recoverable_contract(
         probe_id,
         contract_name=contract_name,
@@ -606,7 +615,7 @@ def test_future_search_event_versions_fail_closed(
     assert isinstance(recoverable.payload, dict)
     assert recoverable.payload["probe_id"] == probe_id
     assert recoverable.contract_name is contract_name
-    assert recoverable.contract_version == 2
+    assert recoverable.contract_version == future_version
     system.reset()
 
 
@@ -629,7 +638,7 @@ def test_unsupported_completed_search_query_does_not_poison_its_completion() -> 
     system.record_search_event(
         probe_id=completed_search_id,
         contract_name=ContractName.SEARCH_COMPLETED,
-        contract_version=1,
+        contract_version=2,
         telegram_user_id=user_id,
         payload={
             "probe_id": completed_search_id,
@@ -708,10 +717,11 @@ def test_invalid_supported_search_events_fail_closed(
 
 
 @pytest.mark.parametrize(
-    ("contract_name", "consumer", "payload"),
+    ("contract_name", "contract_version", "consumer", "payload"),
     (
         (
             ContractName.RUN_SEARCH,
+            1,
             RuntimeRole.RECOMMENDATION,
             {
                 "probe_id": "invalid-RunSearch",
@@ -727,10 +737,11 @@ def test_invalid_supported_search_events_fail_closed(
         ),
         (
             ContractName.SEARCH_COMPLETED,
+            2,
             RuntimeRole.BOT_ASSISTANT,
             {
                 "probe_id": "invalid-SearchCompleted",
-                "completed_search_id": "completed-search:invalid",
+                "completed_search_id": "invalid-SearchCompleted",
                 "search_update_id": "invalid-completion",
                 "telegram_user_id": 44_012,
                 "result_count": -1,
@@ -740,6 +751,7 @@ def test_invalid_supported_search_events_fail_closed(
 )
 def test_search_contract_payload_semantics_fail_closed(
     contract_name: ContractName,
+    contract_version: int,
     consumer: RuntimeRole,
     payload: dict[str, JsonValue],
 ) -> None:
@@ -748,7 +760,7 @@ def test_search_contract_payload_semantics_fail_closed(
     system.record_search_event(
         probe_id=probe_id,
         contract_name=contract_name,
-        contract_version=1,
+        contract_version=contract_version,
         telegram_user_id=44_012,
         payload=payload,
     )

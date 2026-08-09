@@ -127,6 +127,14 @@ SUPPORTED_CONTRACTS = (
         "completed_search_id",
     ),
     ContractDefinition(
+        ContractName.SEARCH_COMPLETED,
+        2,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "completed_search_id",
+        ("telegram_user_id", "result_count"),
+    ),
+    ContractDefinition(
         ContractName.SEARCH_FAILED,
         1,
         RuntimeRole.RECOMMENDATION,
@@ -254,7 +262,11 @@ class ContractEnvelope(RawContractEnvelope):
         if self.contract_name is ContractName.RUN_SEARCH:
             _validate_run_search(self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
-            _validate_search_completed(self.payload)
+            _validate_search_completed(
+                self.payload,
+                contract_version=self.contract_version,
+                subject_id=self.subject_id,
+            )
         elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
             completed_search_id = _required_text(
                 self.payload,
@@ -297,6 +309,8 @@ class GetCompletedSearch(ContractEnvelope):
         """Derive the stable query request paired with one completion event."""
         if completion.contract_name is not ContractName.SEARCH_COMPLETED:
             raise ValueError("GetCompletedSearch requires SearchCompleted causation")
+        if completion.contract_version != 2:
+            raise ValueError("GetCompletedSearch requires canonical SearchCompleted v2")
         if not isinstance(completion.payload, dict):
             raise TypeError("SearchCompleted payload must be an object")
         completed_search_id = completion.payload.get("completed_search_id")
@@ -409,10 +423,28 @@ def _validate_required_date(value: JsonValue) -> None:
         raise ValueError("RunSearch Required Date range must be ordered")
 
 
-def _validate_search_completed(payload: dict[str, JsonValue]) -> None:
+def _validate_search_completed(
+    payload: dict[str, JsonValue],
+    *,
+    contract_version: int,
+    subject_id: str,
+) -> None:
+    completed_search_id = _required_text(payload, "completed_search_id")
+    if completed_search_id != subject_id:
+        raise ValueError("SearchCompleted subject must identify its Completed Search")
     search_fields = ("telegram_user_id", "search_update_id", "result_count")
-    if not any(field_name in payload for field_name in search_fields):
+    allowed_fields = {"probe_id", "completed_search_id"}
+    if contract_version == 1:
+        if set(payload) - allowed_fields or any(
+            field_name in payload for field_name in search_fields
+        ):
+            raise ValueError("SearchCompleted v1 uses the legacy completion schema")
         return
+    if contract_version != 2:
+        raise ValueError("SearchCompleted version has no registered semantics")
+    allowed_fields.update(search_fields)
+    if set(payload) - allowed_fields:
+        raise ValueError("SearchCompleted v2 contains unsupported facts")
     telegram_user_id = payload.get("telegram_user_id")
     if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
         raise ValueError("SearchCompleted requires telegram_user_id")
