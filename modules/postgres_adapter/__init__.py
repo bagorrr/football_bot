@@ -72,18 +72,18 @@ _LEGACY_MIGRATION_NAMES = (
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
-    "2f330e7c3a51b0bbcab1830086972f8c37f48327330d88ccebcd91cc3ad15dac",
-    "fa186689f5194e06a5d677c84c25822de702f0ca5ba11a7a1e7bc716d63adcb0",
-    "49e142cf45b175ee6f9fadacc5ce758d2d2e74a88bf6169c52e1c2beb799e2a3",
-    "b01abd5b128fa47637a33f32a90b31280dd32002d3d78c57a6a0eb24f05fd81e",
-    "ac917af3fb449642c17c5d1b3706c829b015d67fcf7fcd0f5f42dcf9a0120b65",
-    "7389eab3a7b467625a668c33f409954e0a27684b5ba2b225ceeea8f353e7d7a8",
-    "247f82bd58f5d817e0364318bd7648bd0c4d8fcd1de8a62b0c4744c7c005ee6e",
+    "d90ca567731af934dec2b3417e7a2f4bab8066eeeed3def9c73d4f93bc8355d2",
+    "bafda1b2f143add6a90138b176279410c9968087294bc24e88bbfedde0cfe3a1",
+    "8bbd9a505d1c4a992796e186539bb519361d85f9da96e078a1742219f0d4c084",
+    "0862e2984895c6f0abfb4492ff3b32201ac8af47aa35fc07c9f221a966e3ead5",
+    "0ed51b9232f016c595860a2296129328167051363915f5bda4d552c37dcb2fde",
+    "24e3a984d5f411b22b86486eeb2c95d48ce62bc6348c5a43b432bcb706bac6af",
+    "2b3373bbba4780664716388d50c6e8e4d211ca5e4886a50587ac1041e7751ecc",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
     # Pre-0003 delivery tables upgraded in place by 0003.
-    "b669892eed34bae911a8c3ae3a7940e6981d24eab3bec4b47ee975df2721e10f": 2,
+    "9961714eaf7d3a8489b64541df0ed941618a2efcbcf9d6ad784742d1022d46b4": 2,
 }
 
 _PRE_0003_DELIVERY_RECONCILIATION = """
@@ -108,6 +108,10 @@ WITH runtime_roles AS (
     SELECT *
     FROM pg_roles
     WHERE rolname = ANY(%s)
+), migration_owner AS (
+    SELECT oid, rolname
+    FROM pg_roles
+    WHERE rolname = current_user
 ), material AS (
     SELECT 'role'::text AS object_kind,
            role.rolname::text AS object_identity,
@@ -144,12 +148,12 @@ WITH runtime_roles AS (
     UNION ALL
 
     SELECT 'schema', namespace.nspname,
-           CASE WHEN owner.oid IN (SELECT oid FROM runtime_roles)
-                THEN 'runtime:' || owner.rolname
-                ELSE 'administrative' END
+           CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                THEN 'authorized_migration_owner'
+                ELSE 'unauthorized:' || owner.rolname END
     FROM pg_namespace AS namespace
     JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
 
     UNION ALL
 
@@ -158,13 +162,13 @@ WITH runtime_roles AS (
                      relation.relrowsecurity::text,
                      relation.relforcerowsecurity::text,
                      relation.relreplident,
-                     CASE WHEN owner.oid IN (SELECT oid FROM runtime_roles)
-                          THEN 'runtime:' || owner.rolname
-                          ELSE 'administrative' END)
+                     CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                          THEN 'authorized_migration_owner'
+                          ELSE 'unauthorized:' || owner.rolname END)
     FROM pg_class AS relation
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
     JOIN pg_roles AS owner ON owner.oid = relation.relowner
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
 
     UNION ALL
@@ -173,11 +177,41 @@ WITH runtime_roles AS (
            concat_ws('|', format_type(sequence.seqtypid, -1),
                      sequence.seqstart::text, sequence.seqincrement::text,
                      sequence.seqmax::text, sequence.seqmin::text,
-                     sequence.seqcache::text, sequence.seqcycle::text)
+                     sequence.seqcache::text, sequence.seqcycle::text,
+                     CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                          THEN 'authorized_migration_owner'
+                          ELSE 'unauthorized:' || owner.rolname END,
+                     COALESCE(
+                         ownership.dependency_type || ':' ||
+                         ownership.namespace_name || '.' ||
+                         ownership.relation_name || '.' ||
+                         ownership.column_name,
+                         'unowned'
+                     ))
     FROM pg_sequence AS sequence
     JOIN pg_class AS relation ON relation.oid = sequence.seqrelid
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-    WHERE namespace.nspname = 'football_runtime'
+    JOIN pg_roles AS owner ON owner.oid = relation.relowner
+    LEFT JOIN LATERAL (
+        SELECT dependency.deptype::text AS dependency_type,
+               owned_namespace.nspname::text AS namespace_name,
+               owned_relation.relname::text AS relation_name,
+               owned_column.attname::text AS column_name
+        FROM pg_depend AS dependency
+        JOIN pg_class AS owned_relation
+          ON owned_relation.oid = dependency.refobjid
+        JOIN pg_namespace AS owned_namespace
+          ON owned_namespace.oid = owned_relation.relnamespace
+        JOIN pg_attribute AS owned_column
+          ON owned_column.attrelid = dependency.refobjid
+         AND owned_column.attnum = dependency.refobjsubid
+        WHERE dependency.classid = 'pg_class'::regclass
+          AND dependency.objid = relation.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_class'::regclass
+          AND dependency.deptype IN ('a', 'i')
+    ) AS ownership ON true
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
 
     UNION ALL
 
@@ -197,7 +231,7 @@ WITH runtime_roles AS (
      AND default_value.adnum = attribute.attnum
     LEFT JOIN pg_collation AS collation_row
       ON collation_row.oid = attribute.attcollation
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
@@ -215,7 +249,7 @@ WITH runtime_roles AS (
     FROM pg_constraint AS constraint_row
     JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
 
     UNION ALL
 
@@ -223,7 +257,7 @@ WITH runtime_roles AS (
            pg_get_indexdef(index_relation.oid, 0, true)
     FROM pg_class AS index_relation
     JOIN pg_namespace AS namespace ON namespace.oid = index_relation.relnamespace
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND index_relation.relkind = 'i'
 
     UNION ALL
@@ -231,13 +265,13 @@ WITH runtime_roles AS (
     SELECT 'function', namespace.nspname || '.' || procedure.proname ||
            '(' || pg_get_function_identity_arguments(procedure.oid) || ')',
            pg_get_functiondef(procedure.oid) || '|owner:' ||
-           CASE WHEN owner.oid IN (SELECT oid FROM runtime_roles)
-                THEN 'runtime:' || owner.rolname
-                ELSE 'administrative' END
+           CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                THEN 'authorized_migration_owner'
+                ELSE 'unauthorized:' || owner.rolname END
     FROM pg_proc AS procedure
     JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
     JOIN pg_roles AS owner ON owner.oid = procedure.proowner
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
 
     UNION ALL
 
@@ -258,7 +292,7 @@ WITH runtime_roles AS (
     FROM pg_policy AS policy
     JOIN pg_class AS relation ON relation.oid = policy.polrelid
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
 
     UNION ALL
 
@@ -268,7 +302,7 @@ WITH runtime_roles AS (
     FROM pg_trigger AS trigger
     JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND NOT trigger.tgisinternal
 
     UNION ALL
@@ -281,7 +315,7 @@ WITH runtime_roles AS (
     CROSS JOIN LATERAL aclexplode(
         COALESCE(namespace.nspacl, acldefault('n', namespace.nspowner))
     ) AS acl
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND acl.grantee <> namespace.nspowner
 
     UNION ALL
@@ -302,7 +336,7 @@ WITH runtime_roles AS (
             )
         )
     ) AS acl
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
       AND acl.grantee <> relation.relowner
 
@@ -317,7 +351,7 @@ WITH runtime_roles AS (
     JOIN pg_class AS relation ON relation.oid = attribute.attrelid
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
     CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND attribute.attnum > 0
       AND NOT attribute.attisdropped
       AND acl.grantee <> relation.relowner
@@ -334,7 +368,7 @@ WITH runtime_roles AS (
     CROSS JOIN LATERAL aclexplode(
         COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
     ) AS acl
-    WHERE namespace.nspname = 'football_runtime'
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
       AND acl.grantee <> procedure.proowner
 )
 SELECT object_kind, object_identity, object_definition

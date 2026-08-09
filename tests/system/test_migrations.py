@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier
+from uuid import UUID
 
 import psycopg
 import pytest
@@ -28,6 +31,459 @@ def _apply_untracked_repository_migrations(
         migration_paths = _migration_paths()
         for migration_path in migration_paths[:applied_count]:
             connection.execute(migration_path.read_text(encoding="utf-8"))
+
+
+def _apply_supported_pre_0003_legacy(database_url: str) -> None:
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        for migration_path in _migration_paths()[:2]:
+            connection.execute(migration_path.read_text(encoding="utf-8"))
+        fixture_path = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "pre_0003_legacy_delivery.sql"
+        )
+        connection.execute(fixture_path.read_text(encoding="utf-8"))
+
+
+def _seed_owned_prefix_data(
+    database_url: str,
+    *,
+    applied_count: int,
+    legacy_delivery: bool = False,
+) -> None:
+    recorded_at = datetime(2026, 8, 8, 20, 0, tzinfo=UTC)
+    with psycopg.connect(database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.acceptance_state (
+                owner_role, probe_id, contract_name, incoming_message_id, applied_at
+            ) VALUES (
+                'bot_assistant', 'migration-preservation', 'RunSearch',
+                '00000000-0000-0000-0000-000000000044', %s
+            )
+            """,
+            (recorded_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000044',
+                'bot_assistant', 'recommendation', 'RunSearch', 1,
+                'search:migration-preservation', 1, 'migration-preservation',
+                '00000000-0000-0000-0000-000000000045',
+                '00000000-0000-0000-0000-000000000046', %s,
+                '{"search": "preserved"}'
+            )
+            """,
+            (recorded_at,),
+        )
+        if applied_count >= 2:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_presentations (
+                    owner_role, message_id, delivery_id, attempt_count,
+                    last_attempt_at, presented_at
+                ) VALUES (
+                    'bot_assistant',
+                    '00000000-0000-0000-0000-000000000044',
+                    'delivery:migration-preservation', 1, %s, %s
+                )
+                """,
+                (recorded_at, recorded_at),
+            )
+        if applied_count >= 3 or legacy_delivery:
+            if legacy_delivery:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_users (
+                        telegram_user_id, locale, locale_source,
+                        last_seen_language_code, revision, updated_at
+                    ) VALUES (4460, 'en', 'explicit', 'en', 3, %s)
+                    """,
+                    (recorded_at,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_message_outbox (
+                        delivery_id, telegram_user_id, display_locale,
+                        message_text, button_rows, recorded_at, delivered_at
+                    ) VALUES (
+                        'bot:migration-preservation', 4460, 'en',
+                        'preserved delivery', '[]', %s, %s
+                    )
+                    """,
+                    (recorded_at, recorded_at),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_users (
+                        telegram_user_id, locale, locale_source,
+                        last_seen_language_code, stage, screen_revision,
+                        revision, updated_at
+                    ) VALUES (
+                        4460, 'en', 'explicit', 'en', 'direction_menu', 4, 3, %s
+                    )
+                    """,
+                    (recorded_at,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_updates (
+                        update_id, telegram_user_id, recorded_at
+                    ) VALUES ('update:migration-preservation', 4460, %s)
+                    """,
+                    (recorded_at,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_message_outbox (
+                        delivery_id, telegram_user_id, display_locale,
+                        screen_revision, message_text, button_rows,
+                        recorded_at, delivered_at
+                    ) VALUES (
+                        'bot:migration-preservation', 4460, 'en', 4,
+                        'preserved delivery', '[]', %s, %s
+                    )
+                    """,
+                    (recorded_at, recorded_at),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_active_chat_views (
+                        telegram_user_id, screen_revision, delivery_id,
+                        telegram_message_id, activated_at
+                    ) VALUES (
+                        4460, 4, 'bot:migration-preservation',
+                        'telegram:migration-preservation', %s
+                    )
+                    """,
+                    (recorded_at,),
+                )
+        if applied_count >= 4:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_discovery_drafts (
+                    telegram_user_id, stage, user_intent, screen_revision,
+                    revision, last_activity_at, updated_at
+                ) VALUES (
+                    4460, 'direction_menu', 'new_team_search', 4, 3, %s, %s
+                )
+                """,
+                (recorded_at, recorded_at),
+            )
+        if applied_count >= 5:
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_discovery_drafts
+                SET country = '{"id": "country:ru"}',
+                    city = '{"id": "city:moscow"}',
+                    sub_city_areas = '[{"id": "area:centre"}]',
+                    whole_city = false
+                WHERE telegram_user_id = 4460
+                """,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_geography_confirmation_events (
+                    update_id, telegram_user_id, confirmation_kind, user_intent,
+                    country, city, sub_city_areas, whole_city,
+                    resolver_versions, glossary_version, confirmed_at
+                ) VALUES (
+                    'update:migration-preservation', 4460, 'search_area',
+                    'new_team_search', '{"id": "country:ru"}',
+                    '{"id": "city:moscow"}', '[{"id": "area:centre"}]',
+                    false, '["resolver:v1"]', 'glossary:v1', %s
+                )
+                """,
+                (recorded_at,),
+            )
+        if applied_count >= 6:
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_discovery_drafts
+                SET required_date = '{
+                    "start_local_date": "2026-08-09",
+                    "end_local_date": "2026-08-09",
+                    "iana_timezone": "Europe/Moscow"
+                }'
+                WHERE telegram_user_id = 4460
+                """,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_required_date_confirmation_events (
+                    update_id, telegram_user_id, user_intent,
+                    start_local_date, end_local_date, iana_timezone,
+                    timezone_data_version, confirmed_at
+                ) VALUES (
+                    'update:migration-preservation', 4460, 'game_search',
+                    '2026-08-09', '2026-08-09', 'Europe/Moscow',
+                    'tzdata:2026a', %s
+                )
+                """,
+                (recorded_at,),
+            )
+
+
+def _assert_owned_prefix_data_preserved(
+    database_url: str,
+    *,
+    applied_count: int,
+    legacy_delivery: bool = False,
+) -> None:
+    recorded_at = datetime(2026, 8, 8, 20, 0, tzinfo=UTC)
+    with psycopg.connect(database_url) as connection:
+        acceptance_row = connection.execute(
+            """
+            SELECT owner_role, probe_id, contract_name, incoming_message_id,
+                   applied_at
+            FROM football_runtime.acceptance_state
+            WHERE probe_id = 'migration-preservation'
+            """,
+        ).fetchone()
+        outbox_row = connection.execute(
+            """
+            SELECT producer_role, consumer_role, contract_name, subject_id,
+                   idempotency_key, payload
+            FROM football_runtime.contract_outbox
+            WHERE message_id = '00000000-0000-0000-0000-000000000044'
+            """,
+        ).fetchone()
+        assert acceptance_row == (
+            "bot_assistant",
+            "migration-preservation",
+            "RunSearch",
+            UUID("00000000-0000-0000-0000-000000000044"),
+            recorded_at,
+        )
+        assert outbox_row == (
+            "bot_assistant",
+            "recommendation",
+            "RunSearch",
+            "search:migration-preservation",
+            "migration-preservation",
+            {"search": "preserved"},
+        )
+        if applied_count >= 2:
+            presentation = connection.execute(
+                """
+                SELECT owner_role, delivery_id, attempt_count,
+                       last_attempt_at, presented_at
+                FROM football_runtime.telegram_presentations
+                WHERE delivery_id = 'delivery:migration-preservation'
+                """,
+            ).fetchone()
+            assert presentation == (
+                "bot_assistant",
+                "delivery:migration-preservation",
+                1,
+                recorded_at,
+                recorded_at,
+            )
+        if applied_count >= 3 or legacy_delivery:
+            user_and_delivery = connection.execute(
+                """
+                SELECT users.owner_role, users.telegram_user_id, users.locale,
+                       users.locale_source, users.last_seen_language_code,
+                       users.revision, users.updated_at,
+                       delivery.owner_role, delivery.delivery_id,
+                       delivery.display_locale, delivery.message_text,
+                       delivery.button_rows, delivery.recorded_at,
+                       delivery.delivered_at
+                FROM football_runtime.bot_users AS users
+                JOIN football_runtime.bot_message_outbox AS delivery
+                  USING (telegram_user_id)
+                WHERE users.telegram_user_id = 4460
+                """,
+            ).fetchone()
+            assert user_and_delivery == (
+                "bot_assistant",
+                4460,
+                "en",
+                "explicit",
+                "en",
+                3,
+                recorded_at,
+                "bot_assistant",
+                "bot:migration-preservation",
+                "en",
+                "preserved delivery",
+                [],
+                recorded_at,
+                recorded_at,
+            )
+        if applied_count >= 4:
+            draft = connection.execute(
+                """
+                SELECT user_intent, country, city, sub_city_areas,
+                       whole_city, required_date
+                FROM football_runtime.bot_discovery_drafts
+                WHERE telegram_user_id = 4460
+                """,
+            ).fetchone()
+            assert draft is not None
+            assert draft[0] == "new_team_search"
+            if applied_count >= 5:
+                assert draft[1:5] == (
+                    {"id": "country:ru"},
+                    {"id": "city:moscow"},
+                    [{"id": "area:centre"}],
+                    False,
+                )
+            if applied_count >= 6:
+                assert draft[5] == {
+                    "start_local_date": "2026-08-09",
+                    "end_local_date": "2026-08-09",
+                    "iana_timezone": "Europe/Moscow",
+                }
+
+
+def _assert_final_migration_state(database_url: str) -> None:
+    with psycopg.connect(database_url) as connection:
+        applied_migrations = connection.execute(
+            """
+            SELECT migration_name, checksum
+            FROM football_migrations.applied_migrations
+            ORDER BY migration_name
+            """,
+        ).fetchall()
+        final_relation = connection.execute(
+            """
+            SELECT relrowsecurity, relforcerowsecurity
+            FROM pg_class
+            WHERE oid = (
+                'football_runtime.recommendation_completed_searches'::regclass
+            )
+            """,
+        ).fetchone()
+        unauthorized_owners = connection.execute(
+            """
+            WITH owned_objects AS (
+                SELECT owner.rolname AS owner_name
+                FROM pg_namespace AS namespace
+                JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+                WHERE namespace.nspname IN (
+                    'football_runtime', 'football_migrations'
+                )
+                UNION ALL
+                SELECT owner.rolname
+                FROM pg_class AS relation
+                JOIN pg_namespace AS namespace
+                  ON namespace.oid = relation.relnamespace
+                JOIN pg_roles AS owner ON owner.oid = relation.relowner
+                WHERE namespace.nspname IN (
+                    'football_runtime', 'football_migrations'
+                )
+                  AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+                UNION ALL
+                SELECT owner.rolname
+                FROM pg_proc AS procedure
+                JOIN pg_namespace AS namespace
+                  ON namespace.oid = procedure.pronamespace
+                JOIN pg_roles AS owner ON owner.oid = procedure.proowner
+                WHERE namespace.nspname IN (
+                    'football_runtime', 'football_migrations'
+                )
+            )
+            SELECT count(*) FILTER (WHERE owner_name <> current_user), count(*)
+            FROM owned_objects
+            """,
+        ).fetchone()
+        migration_privileges = connection.execute(
+            """
+            SELECT runtime_role,
+                   has_schema_privilege(
+                       runtime_role, 'football_migrations', 'USAGE'
+                   ),
+                   has_table_privilege(
+                       runtime_role,
+                       'football_migrations.applied_migrations',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       runtime_role,
+                       'football_migrations.applied_migrations',
+                       'INSERT,UPDATE,DELETE'
+                   )
+            FROM unnest(ARRAY[
+                'football_ingestion',
+                'football_application',
+                'football_classification',
+                'football_recommendation',
+                'football_bot_assistant'
+            ]) AS runtime_role
+            ORDER BY runtime_role
+            """,
+        ).fetchall()
+        sequence_dependencies = connection.execute(
+            """
+            SELECT sequence_relation.relname, dependency.deptype,
+                   owned_relation.relname, owned_column.attname
+            FROM pg_class AS sequence_relation
+            JOIN pg_namespace AS sequence_namespace
+              ON sequence_namespace.oid = sequence_relation.relnamespace
+            JOIN pg_depend AS dependency
+              ON dependency.classid = 'pg_class'::regclass
+             AND dependency.objid = sequence_relation.oid
+             AND dependency.objsubid = 0
+             AND dependency.refclassid = 'pg_class'::regclass
+             AND dependency.deptype IN ('a', 'i')
+            JOIN pg_class AS owned_relation
+              ON owned_relation.oid = dependency.refobjid
+            JOIN pg_attribute AS owned_column
+              ON owned_column.attrelid = dependency.refobjid
+             AND owned_column.attnum = dependency.refobjsubid
+            WHERE sequence_namespace.nspname = 'football_runtime'
+              AND sequence_relation.relkind = 'S'
+            ORDER BY sequence_relation.relname
+            """,
+        ).fetchall()
+
+    assert applied_migrations == [
+        (migration_path.name, sha256(migration_path.read_bytes()).hexdigest())
+        for migration_path in _migration_paths()
+    ]
+    assert final_relation == (True, True)
+    assert unauthorized_owners is not None
+    assert unauthorized_owners[0] == 0
+    assert unauthorized_owners[1] > 0
+    assert migration_privileges == [
+        (runtime_role, False, False, False)
+        for runtime_role in sorted(
+            (
+                "football_ingestion",
+                "football_application",
+                "football_classification",
+                "football_recommendation",
+                "football_bot_assistant",
+            )
+        )
+    ]
+    assert sequence_dependencies == [
+        (
+            "bot_geography_confirmation_events_event_sequence_seq",
+            "i",
+            "bot_geography_confirmation_events",
+            "event_sequence",
+        ),
+        (
+            "bot_message_outbox_sequence_id_seq",
+            "i",
+            "bot_message_outbox",
+            "sequence_id",
+        ),
+        (
+            "bot_required_date_confirmation_events_event_sequence_seq",
+            "i",
+            "bot_required_date_confirmation_events",
+            "event_sequence",
+        ),
+    ]
 
 
 def test_repeated_migrate_preserves_completed_and_submitting_search_state(
@@ -171,6 +627,23 @@ def test_repeated_migrate_preserves_completed_and_submitting_search_state(
     assert runtime_migration_privileges == [(False,)] * 5
 
 
+def test_concurrent_fresh_migrators_serialize_one_exact_history(
+    fresh_database_url: str,
+) -> None:
+    simultaneous_start = Barrier(2)
+
+    def migrate() -> None:
+        simultaneous_start.wait()
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(migrate) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    _assert_final_migration_state(fresh_database_url)
+
+
 def test_migrate_adopts_untracked_current_schema_without_replaying(
     fresh_database_url: str,
 ) -> None:
@@ -257,32 +730,42 @@ def test_migrate_adopts_each_exact_partial_prefix_and_upgrades_it(
         fresh_database_url,
         applied_count=applied_count,
     )
+    _seed_owned_prefix_data(
+        fresh_database_url,
+        applied_count=applied_count,
+    )
 
-    PostgresAcceptanceMigrator(fresh_database_url).migrate()
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
 
-    with psycopg.connect(fresh_database_url) as connection:
-        applied_migrations = connection.execute(
-            """
-            SELECT migration_name, checksum
-            FROM football_migrations.applied_migrations
-            ORDER BY migration_name
-            """,
-        ).fetchall()
-        final_relation = connection.execute(
-            """
-            SELECT relrowsecurity, relforcerowsecurity
-            FROM pg_class
-            WHERE oid = (
-                'football_runtime.recommendation_completed_searches'::regclass
-            )
-            """,
-        ).fetchone()
+    _assert_owned_prefix_data_preserved(
+        fresh_database_url,
+        applied_count=applied_count,
+    )
+    _assert_final_migration_state(fresh_database_url)
 
-    assert applied_migrations == [
-        (migration_path.name, sha256(migration_path.read_bytes()).hexdigest())
-        for migration_path in _migration_paths()
-    ]
-    assert final_relation == (True, True)
+
+def test_migrate_reconciles_supported_pre_0003_legacy_delivery_state(
+    fresh_database_url: str,
+) -> None:
+    _apply_supported_pre_0003_legacy(fresh_database_url)
+    _seed_owned_prefix_data(
+        fresh_database_url,
+        applied_count=2,
+        legacy_delivery=True,
+    )
+
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+
+    _assert_owned_prefix_data_preserved(
+        fresh_database_url,
+        applied_count=2,
+        legacy_delivery=True,
+    )
+    _assert_final_migration_state(fresh_database_url)
 
 
 def test_migrate_rejects_untracked_schema_with_disabled_row_security(
@@ -363,6 +846,193 @@ def test_migrate_rejects_tracked_history_with_material_schema_drift(
 
 @pytest.mark.parametrize("tracked_history", (False, True))
 @pytest.mark.parametrize(
+    "owner_drift",
+    (
+        "ALTER SCHEMA football_runtime OWNER TO pg_monitor",
+        """
+        ALTER TABLE football_runtime.recommendation_completed_searches
+        OWNER TO pg_monitor
+        """,
+        """
+        ALTER FUNCTION football_runtime.current_runtime_role()
+        OWNER TO pg_monitor
+        """,
+    ),
+)
+def test_migrate_rejects_unauthorized_administrative_object_owner(
+    fresh_database_url: str,
+    tracked_history: bool,
+    owner_drift: str,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    if tracked_history:
+        migrator.migrate()
+    else:
+        _apply_untracked_repository_migrations(fresh_database_url)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(owner_drift)
+
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+
+@pytest.mark.parametrize("tracked_history", (False, True))
+def test_migrate_rejects_unauthorized_sequence_owner(
+    fresh_database_url: str,
+    tracked_history: bool,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    if tracked_history:
+        migrator.migrate()
+    else:
+        _apply_untracked_repository_migrations(fresh_database_url)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            ALTER TABLE football_runtime.bot_message_outbox
+            OWNER TO pg_monitor
+            """,
+        )
+        changed_owners = connection.execute(
+            """
+            SELECT relation.relname, owner.rolname
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_roles AS owner ON owner.oid = relation.relowner
+            WHERE namespace.nspname = 'football_runtime'
+              AND relation.relname IN (
+                  'bot_message_outbox',
+                  'bot_message_outbox_sequence_id_seq'
+              )
+            ORDER BY relation.relname
+            """,
+        ).fetchall()
+
+    assert changed_owners == [
+        ("bot_message_outbox", "pg_monitor"),
+        ("bot_message_outbox_sequence_id_seq", "pg_monitor"),
+    ]
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+
+@pytest.mark.parametrize(
+    "owner_drift",
+    (
+        "ALTER SCHEMA football_migrations OWNER TO pg_monitor",
+        """
+        ALTER TABLE football_migrations.applied_migrations
+        OWNER TO pg_monitor
+        """,
+    ),
+)
+def test_migrate_rejects_migration_ledger_owner_drift(
+    fresh_database_url: str,
+    owner_drift: str,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(owner_drift)
+
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+
+def test_migrate_reconciles_public_migration_ledger_grants(
+    fresh_database_url: str,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            "GRANT USAGE ON SCHEMA football_migrations TO PUBLIC",
+        )
+        connection.execute(
+            """
+            GRANT SELECT, INSERT, UPDATE
+            ON football_migrations.applied_migrations TO PUBLIC
+            """,
+        )
+
+    migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        public_privileges = connection.execute(
+            """
+            SELECT (
+                       SELECT count(*)
+                       FROM pg_namespace AS namespace
+                       CROSS JOIN LATERAL aclexplode(namespace.nspacl) AS acl
+                       WHERE namespace.nspname = 'football_migrations'
+                         AND acl.grantee = 0
+                   ),
+                   (
+                       SELECT count(*)
+                       FROM pg_class AS relation
+                       CROSS JOIN LATERAL aclexplode(relation.relacl) AS acl
+                       WHERE relation.oid = (
+                           'football_migrations.applied_migrations'::regclass
+                       )
+                         AND acl.grantee = 0
+                   )
+            """,
+        ).fetchone()
+
+    assert public_privileges == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "grantee",
+    (
+        "football_ingestion",
+        "football_application",
+        "football_classification",
+        "football_recommendation",
+        "football_bot_assistant",
+        "pg_monitor",
+    ),
+)
+def test_migrate_rejects_migration_ledger_grantee_drift(
+    fresh_database_url: str,
+    grantee: str,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA football_migrations TO {}").format(
+                sql.Identifier(grantee),
+            ),
+        )
+        connection.execute(
+            sql.SQL(
+                "GRANT SELECT, INSERT, UPDATE ON "
+                "football_migrations.applied_migrations TO {}"
+            ).format(sql.Identifier(grantee)),
+        )
+
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            sql.SQL("REVOKE ALL ON SCHEMA football_migrations FROM {}").format(
+                sql.Identifier(grantee),
+            ),
+        )
+        connection.execute(
+            sql.SQL(
+                "REVOKE ALL ON football_migrations.applied_migrations FROM {}"
+            ).format(sql.Identifier(grantee)),
+        )
+
+    migrator.migrate()
+
+
+@pytest.mark.parametrize("tracked_history", (False, True))
+@pytest.mark.parametrize(
     "drift_statement",
     (
         """
@@ -420,6 +1090,54 @@ def test_migrate_rejects_material_drift_before_adoption_or_tracked_replay(
     with psycopg.connect(fresh_database_url) as connection:
         connection.execute(drift_statement)
 
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+
+@pytest.mark.parametrize("tracked_history", (False, True))
+def test_migrate_rejects_sequence_owned_by_dependency_drift(
+    fresh_database_url: str,
+    tracked_history: bool,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    if tracked_history:
+        migrator.migrate()
+    else:
+        _apply_untracked_repository_migrations(fresh_database_url)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            ALTER TABLE football_runtime.bot_message_outbox
+            ALTER COLUMN sequence_id DROP IDENTITY;
+            CREATE SEQUENCE
+                football_runtime.bot_message_outbox_sequence_id_seq AS bigint;
+            ALTER SEQUENCE
+                football_runtime.bot_message_outbox_sequence_id_seq
+            OWNED BY football_runtime.bot_users.telegram_user_id
+            """,
+        )
+        drifted_dependency = connection.execute(
+            """
+            SELECT dependency.deptype, owned_relation.relname,
+                   owned_column.attname
+            FROM pg_depend AS dependency
+            JOIN pg_class AS sequence_relation
+              ON sequence_relation.oid = dependency.objid
+            JOIN pg_class AS owned_relation
+              ON owned_relation.oid = dependency.refobjid
+            JOIN pg_attribute AS owned_column
+              ON owned_column.attrelid = dependency.refobjid
+             AND owned_column.attnum = dependency.refobjsubid
+            WHERE sequence_relation.oid = (
+                'football_runtime.bot_message_outbox_sequence_id_seq'::regclass
+            )
+              AND dependency.classid = 'pg_class'::regclass
+              AND dependency.refclassid = 'pg_class'::regclass
+              AND dependency.deptype IN ('a', 'i')
+            """,
+        ).fetchone()
+
+    assert drifted_dependency == ("a", "bot_users", "telegram_user_id")
     with pytest.raises(RuntimeError, match="material schema drift"):
         migrator.migrate()
 
