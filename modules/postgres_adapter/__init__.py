@@ -92,7 +92,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "c4975655de10c89b60dbfb9a1e1a3af21273486643d8f4b888d6df20500dde8f",
     "a47b752decc202f4cbefd6022f1399ca52242ba0886479ab3d40f38575965c9c",
     "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
-    "045050089dd36c72c51cda6aa3453d372b933de002e1394c5af9be86c3616ef2",
+    "7e259a5794debcb1edc94bc3bdf9bd95c2392c3f4d397ba22cc4892875f7a627",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1035,12 +1035,15 @@ class PostgresRoleStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.source_chat_registry (
-                    peer_kind, telegram_chat_id, address_kind, current_address,
+                    peer_kind, telegram_chat_id, registry_generation,
+                    address_kind, current_address,
                     processing_started_at, transport_boundary, enabled,
                     initial_consent_attestation, attested_at,
                     created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (peer_kind, telegram_chat_id) DO UPDATE
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (
+                    peer_kind, telegram_chat_id, registry_generation
+                ) DO UPDATE
                 SET address_kind = EXCLUDED.address_kind,
                     current_address = EXCLUDED.current_address,
                     updated_at = EXCLUDED.updated_at
@@ -1048,6 +1051,7 @@ class PostgresRoleStore:
                 (
                     entry.identity.kind.value,
                     entry.identity.telegram_id,
+                    entry.registry_generation,
                     entry.address_kind.value,
                     entry.current_address,
                     entry.processing_started_at,
@@ -1082,11 +1086,12 @@ class PostgresRoleStore:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT peer_kind, telegram_chat_id, address_kind, current_address,
+                SELECT peer_kind, telegram_chat_id, registry_generation,
+                       address_kind, current_address,
                        processing_started_at, transport_boundary, enabled,
                        initial_consent_attestation, attested_at
                 FROM football_runtime.source_chat_registry
-                ORDER BY peer_kind, telegram_chat_id
+                ORDER BY peer_kind, telegram_chat_id, registry_generation
                 """
             ).fetchall()
         return tuple(
@@ -1095,6 +1100,7 @@ class PostgresRoleStore:
                     kind=TelegramPeerKind(row["peer_kind"]),
                     telegram_id=row["telegram_chat_id"],
                 ),
+                registry_generation=row["registry_generation"],
                 address_kind=SourceChatAddressKind(row["address_kind"]),
                 current_address=row["current_address"],
                 processing_started_at=row["processing_started_at"],

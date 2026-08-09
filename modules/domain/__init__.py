@@ -139,6 +139,7 @@ class SourceChatRegistryEntry:
     """Application-owned enabled Source Chat admission state."""
 
     identity: TelegramPeerIdentity
+    registry_generation: int
     address_kind: SourceChatAddressKind
     current_address: str
     processing_started_at: datetime
@@ -146,6 +147,10 @@ class SourceChatRegistryEntry:
     enabled: bool
     initial_consent_attestation: InitialConsentAttestation
     attested_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.registry_generation < 1:
+            raise ValueError("Source Chat registry generation must be positive")
 
 
 @dataclass(frozen=True, slots=True)

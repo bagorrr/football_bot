@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from modules.contracts import ContractName
 from modules.domain import (
     ConversationStage,
     InitialConsentAttestation,
@@ -209,6 +210,7 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
     assert system.source_chats() == (
         SourceChatRegistryEntry(
             identity,
+            1,
             SourceChatAddressKind.PUBLIC_USERNAME,
             "@synthetic_public_source",
             datetime(2026, 9, 9, 13, 0, tzinfo=UTC),
@@ -225,6 +227,114 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
     assert telegram.messages[-1].text == (
         "✅ Source Chat registered.\n\nInitial consent confirmed."
     )
+    system.reset()
+
+
+def test_registry_generation_identifies_initial_and_later_admission_boundaries() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    initial_time = datetime(2026, 9, 9, 13, 30, tzinfo=UTC)
+    later_time = datetime(2026, 10, 9, 13, 30, tzinfo=UTC)
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 30, tzinfo=UTC))
+    administrator_id = 46_103
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_610_300,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_generation_one",
+        identity=identity,
+        transport_boundary="channel-pts:7401",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:registry-generation",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:registry-generation",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(initial_time)
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:registry-generation",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:registry-generation",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:registry-generation",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:registry-generation",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:registry-generation",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:registry-generation",
+        telegram_user_id=administrator_id,
+        address="@synthetic_generation_one",
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    initial_generation = system.source_chats()[0]
+    assert initial_generation.registry_generation == 1
+
+    later_generation = SourceChatRegistryEntry(
+        identity=identity,
+        registry_generation=2,
+        address_kind=SourceChatAddressKind.PRIVATE_INVITE,
+        current_address="https://t.me/+synthetic-generation-two",
+        processing_started_at=later_time,
+        transport_boundary="channel-pts:8402",
+        enabled=True,
+        initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+        attested_at=later_time,
+    )
+    clock.advance_to(later_time)
+    system.record_source_chat_generation(
+        probe_id="represent:registry-generation-two",
+        telegram_user_id=administrator_id,
+        entry=later_generation,
+    )
+
+    assert system.source_chats() == (initial_generation, later_generation)
+    changed = system.recoverable_contract(
+        "represent:registry-generation-two",
+        contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+    )
+    assert changed.subject_revision == 2
+    assert changed.payload == {
+        "source_chat_key": changed.subject_id,
+        "telegram_user_id": administrator_id,
+        "telegram_peer_kind": "channel",
+        "telegram_chat_id": 4_610_300,
+        "registry_generation": 2,
+    }
     system.reset()
 
 
@@ -302,6 +412,7 @@ def test_private_invite_registration_uses_existing_account_access_without_joinin
     assert system.source_chats() == (
         SourceChatRegistryEntry(
             identity,
+            1,
             SourceChatAddressKind.PRIVATE_INVITE,
             private_address,
             datetime(2026, 9, 9, 14, 0, tzinfo=UTC),
@@ -406,6 +517,7 @@ def test_new_address_for_the_same_identity_changes_only_the_protected_address() 
     assert system.source_chats() == (
         SourceChatRegistryEntry(
             identity,
+            1,
             SourceChatAddressKind.PRIVATE_INVITE,
             "https://t.me/+synthetic-new-address",
             initial_time,

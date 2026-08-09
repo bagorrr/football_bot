@@ -1261,6 +1261,87 @@ class AcceptanceSpine:
         """Process one Telegram-owned Source Chat admission handoff."""
         return self._roles[RuntimeRole.INGESTION].process_next()
 
+    def record_source_chat_generation(
+        self,
+        *,
+        probe_id: str,
+        telegram_user_id: int,
+        entry: SourceChatRegistryEntry,
+    ) -> None:
+        """Represent one later Application-owned registry generation."""
+        source_chat_key = str(
+            _identifier(
+                f"{entry.identity.kind.value}:{entry.identity.telegram_id}",
+                "source-chat",
+            )
+        )
+        correlation_id = _identifier(probe_id, "correlation")
+        incoming = RawContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+            contract_version=1,
+            message_id=_identifier(
+                probe_id,
+                ContractName.SOURCE_CHAT_ADMISSION_RESOLVED.value,
+            ),
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=source_chat_key,
+            subject_revision=entry.registry_generation,
+            idempotency_key=f"{probe_id}:source-chat-admission",
+            causation_id=correlation_id,
+            correlation_id=correlation_id,
+            recorded_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
+            payload={
+                "source_chat_key": source_chat_key,
+                "telegram_user_id": telegram_user_id,
+                "telegram_peer_kind": entry.identity.kind.value,
+                "telegram_chat_id": entry.identity.telegram_id,
+                "address_kind": entry.address_kind.value,
+                "current_address": entry.current_address,
+                "transport_boundary": entry.transport_boundary,
+                "registry_generation": entry.registry_generation,
+            },
+        )
+        self._roles[RuntimeRole.INGESTION].store.commit_initial(
+            probe_id=probe_id,
+            envelope=incoming,
+        )
+        claimed = self._roles[RuntimeRole.APPLICATION].store.claim_next(
+            supported_versions={ContractName.SOURCE_CHAT_ADMISSION_RESOLVED: (1,)},
+            claimed_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
+        )
+        if claimed is None:
+            raise RuntimeError("later Source Chat generation was not claimable")
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+            contract_version=1,
+            message_id=_identifier(
+                probe_id,
+                ContractName.SOURCE_CHAT_GENERATION_CHANGED.value,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=source_chat_key,
+            subject_revision=entry.registry_generation,
+            idempotency_key=f"{probe_id}:source-chat-generation",
+            causation_id=incoming.message_id,
+            correlation_id=correlation_id,
+            recorded_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
+            payload={
+                "source_chat_key": source_chat_key,
+                "telegram_user_id": telegram_user_id,
+                "telegram_peer_kind": entry.identity.kind.value,
+                "telegram_chat_id": entry.identity.telegram_id,
+                "registry_generation": entry.registry_generation,
+            },
+        )
+        self._roles[RuntimeRole.APPLICATION].store.register_source_chat(
+            incoming=claimed,
+            entry=entry,
+            outgoing=outgoing,
+            received_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
+        )
+
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
         """Observe the application-owned Source Chat registry."""
         return self._roles[RuntimeRole.APPLICATION].store.source_chats()

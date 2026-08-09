@@ -169,7 +169,7 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         RuntimeRole.INGESTION,
         "address",
-        ("telegram_user_id",),
+        ("telegram_user_id", "registry_generation"),
     ),
     ContractDefinition(
         ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
@@ -177,7 +177,7 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.INGESTION,
         RuntimeRole.APPLICATION,
         "source_chat_key",
-        ("telegram_user_id", "telegram_chat_id"),
+        ("telegram_user_id", "telegram_chat_id", "registry_generation"),
     ),
     ContractDefinition(
         ContractName.SOURCE_CHAT_ADMISSION_FAILED,
@@ -201,7 +201,7 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         RuntimeRole.BOT_ASSISTANT,
         "source_chat_key",
-        ("telegram_user_id",),
+        ("telegram_user_id", "telegram_chat_id", "registry_generation"),
     ),
     ContractDefinition(
         ContractName.TELEGRAM_PRESENTATION_REQUESTED,

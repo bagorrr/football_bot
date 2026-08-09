@@ -5443,7 +5443,11 @@ class RuntimeApplication:
             causation_id=incoming.message_id,
             correlation_id=incoming.correlation_id,
             recorded_at=recorded_at,
-            payload={"address": address, "telegram_user_id": telegram_user_id},
+            payload={
+                "address": address,
+                "telegram_user_id": telegram_user_id,
+                "registry_generation": 1,
+            },
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
@@ -5471,10 +5475,15 @@ class RuntimeApplication:
             raise TypeError("RequestSourceChatAdmission payload must be an object")
         address = incoming.payload.get("address")
         telegram_user_id = incoming.payload.get("telegram_user_id")
+        registry_generation = incoming.payload.get("registry_generation")
         if not isinstance(address, str) or not address:
             raise ValueError("RequestSourceChatAdmission requires address")
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("RequestSourceChatAdmission requires telegram_user_id")
+        if not isinstance(registry_generation, int) or isinstance(
+            registry_generation, bool
+        ):
+            raise TypeError("RequestSourceChatAdmission requires registry_generation")
         recorded_at = self.clock.now()
         try:
             resolution = self.telegram_ingestion.resolve_source_chat(address)
@@ -5522,7 +5531,7 @@ class RuntimeApplication:
                 producer=RuntimeRole.INGESTION,
                 consumer=RuntimeRole.APPLICATION,
                 subject_id=source_chat_key,
-                subject_revision=1,
+                subject_revision=registry_generation,
                 idempotency_key=f"source-chat-admission:{incoming.message_id}",
                 causation_id=incoming.message_id,
                 correlation_id=incoming.correlation_id,
@@ -5535,6 +5544,7 @@ class RuntimeApplication:
                     "address_kind": resolution.address_kind.value,
                     "current_address": resolution.current_address,
                     "transport_boundary": transport_boundary,
+                    "registry_generation": registry_generation,
                 },
             )
         if inject_outbox_conflict:
@@ -5616,6 +5626,7 @@ class RuntimeApplication:
         address_kind = incoming.payload.get("address_kind")
         current_address = incoming.payload.get("current_address")
         transport_boundary = incoming.payload.get("transport_boundary")
+        registry_generation = incoming.payload.get("registry_generation")
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("SourceChatAdmissionResolved requires telegram_user_id")
         if not isinstance(telegram_chat_id, int) or isinstance(telegram_chat_id, bool):
@@ -5628,12 +5639,17 @@ class RuntimeApplication:
             raise ValueError("SourceChatAdmissionResolved requires current_address")
         if not isinstance(transport_boundary, str) or not transport_boundary:
             raise ValueError("SourceChatAdmissionResolved requires transport_boundary")
+        if not isinstance(registry_generation, int) or isinstance(
+            registry_generation, bool
+        ):
+            raise TypeError("SourceChatAdmissionResolved requires registry_generation")
         registered_at = self.clock.now()
         entry = SourceChatRegistryEntry(
             identity=TelegramPeerIdentity(
                 kind=TelegramPeerKind(telegram_peer_kind),
                 telegram_id=telegram_chat_id,
             ),
+            registry_generation=registry_generation,
             address_kind=SourceChatAddressKind(address_kind),
             current_address=current_address,
             processing_started_at=registered_at,
@@ -5655,7 +5671,7 @@ class RuntimeApplication:
             producer=RuntimeRole.APPLICATION,
             consumer=RuntimeRole.BOT_ASSISTANT,
             subject_id=source_chat_key,
-            subject_revision=1,
+            subject_revision=registry_generation,
             idempotency_key=f"source-chat-generation:{incoming.message_id}",
             causation_id=incoming.message_id,
             correlation_id=incoming.correlation_id,
@@ -5663,6 +5679,9 @@ class RuntimeApplication:
             payload={
                 "source_chat_key": source_chat_key,
                 "telegram_user_id": telegram_user_id,
+                "telegram_peer_kind": telegram_peer_kind,
+                "telegram_chat_id": telegram_chat_id,
+                "registry_generation": registry_generation,
             },
         )
         if inject_outbox_conflict:

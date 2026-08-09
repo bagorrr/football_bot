@@ -32,6 +32,7 @@ CREATE TABLE football_runtime.source_chat_registry (
         CHECK (owner_role = 'application'),
     peer_kind text NOT NULL CHECK (peer_kind IN ('chat', 'channel')),
     telegram_chat_id bigint NOT NULL CHECK (telegram_chat_id > 0),
+    registry_generation bigint NOT NULL CHECK (registry_generation > 0),
     address_kind text NOT NULL
         CHECK (address_kind IN ('public_username', 'private_invite')),
     current_address text NOT NULL CHECK (current_address <> ''),
@@ -43,7 +44,7 @@ CREATE TABLE football_runtime.source_chat_registry (
     attested_at timestamptz NOT NULL,
     created_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL,
-    PRIMARY KEY (peer_kind, telegram_chat_id)
+    PRIMARY KEY (peer_kind, telegram_chat_id, registry_generation)
 );
 
 ALTER TABLE football_runtime.source_chat_registry ENABLE ROW LEVEL SECURITY;
