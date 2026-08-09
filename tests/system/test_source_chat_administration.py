@@ -338,6 +338,100 @@ def test_registry_generation_identifies_initial_and_later_admission_boundaries()
     system.reset()
 
 
+def test_registration_revalidates_the_current_administrator_before_mutation() -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 45, tzinfo=UTC))
+    former_administrator_id = 46_104
+    current_administrator_id = 46_105
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_610_400,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_revoked_administrator",
+        identity=identity,
+        transport_boundary="channel-pts:7501",
+    )
+    submitted_system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=former_administrator_id,
+    )
+    submitted_system.reset()
+    submitted_system.start_bot_user(
+        update_id="start:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        telegram_language_hint="en",
+    )
+    submitted_system.select_fixed_language(
+        update_id="language:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 45, tzinfo=UTC))
+    submitted_system.expire_inactive_discovery_drafts()
+    submitted_system.open_main_menu(
+        update_id="menu:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+    )
+    submitted_system.select_main_menu_action(
+        update_id="settings:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        action="settings",
+    )
+    submitted_system.select_settings_action(
+        update_id="administration:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        action="administration",
+    )
+    submitted_system.select_administration_action(
+        update_id="source-chats:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        action="source-chats",
+    )
+    submitted_system.select_source_chats_action(
+        update_id="add:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        action="add",
+    )
+    submitted_system.submit_source_chat_address(
+        update_id="address:revoked-administrator",
+        telegram_user_id=former_administrator_id,
+        address="@synthetic_revoked_administrator",
+    )
+    assert submitted_system.conversation_state(former_administrator_id).stage is (
+        ConversationStage.SOURCE_CHAT_REGISTRATION_PENDING
+    )
+    message_count_before_rotation = len(telegram.messages)
+
+    rotated_system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=current_administrator_id,
+    )
+    rotated_system.process_source_chat_registrations_until_idle()
+
+    assert rotated_system.source_chats() == ()
+    assert rotated_system.conversation_state(former_administrator_id).stage is (
+        ConversationStage.SETTINGS
+    )
+    assert all(
+        message.text != "✅ Source Chat registered.\n\nInitial consent confirmed."
+        for message in telegram.messages[message_count_before_rotation:]
+    )
+    assert telegram.messages[-1].text == "⚙️ **Settings**"
+    rotated_system.reset()
+
+
 def test_private_invite_registration_uses_existing_account_access_without_joining() -> (
     None
 ):

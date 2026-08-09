@@ -1809,7 +1809,9 @@ def boot_acceptance_spine(
                 installed_timezone_data if role is RuntimeRole.BOT_ASSISTANT else None
             ),
             telegram_admin_user_id=(
-                telegram_admin_user_id if role is RuntimeRole.BOT_ASSISTANT else None
+                telegram_admin_user_id
+                if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
+                else None
             ),
         )
 

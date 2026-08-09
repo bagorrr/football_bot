@@ -1556,19 +1556,37 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(telegram_user_id)
         locale = current.locale or "en"
-        state = replace(
-            current,
-            stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
-            screen_revision=current.screen_revision + 1,
-            revision=current.revision + 1,
-        )
-        message = _source_chat_address_message(
-            update_id=str(incoming.message_id),
-            telegram_user_id=telegram_user_id,
-            locale=locale,
-            screen_revision=state.screen_revision,
-            text=_SOURCE_CHAT_FAILED_COPY.get(locale, _SOURCE_CHAT_FAILED_COPY["en"]),
-        )
+        if self._is_administrator(telegram_user_id):
+            state = replace(
+                current,
+                stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            message = _source_chat_address_message(
+                update_id=str(incoming.message_id),
+                telegram_user_id=telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                text=_SOURCE_CHAT_FAILED_COPY.get(
+                    locale, _SOURCE_CHAT_FAILED_COPY["en"]
+                ),
+            )
+        else:
+            state = replace(
+                current,
+                stage=ConversationStage.SETTINGS,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            message = _settings_message(
+                update_id=str(incoming.message_id),
+                telegram_user_id=telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale),
+                is_administrator=False,
+            )
         self._store.accept_source_chat_registration(
             incoming=incoming,
             expected_revision=current.revision,
@@ -5451,6 +5469,55 @@ class RuntimeApplication:
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        if telegram_user_id != self.telegram_admin_user_id:
+            self._fail_source_chat_registration(
+                incoming,
+                telegram_user_id=telegram_user_id,
+                registration_request_id=str(incoming.message_id),
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=recorded_at,
+                outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def _fail_source_chat_registration(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        telegram_user_id: int,
+        registration_request_id: str,
+        inject_outbox_conflict: bool = False,
+    ) -> None:
+        recorded_at = self.clock.now()
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+            contract_version=1,
+            message_id=_runtime_identifier(
+                str(incoming.message_id),
+                ContractName.SOURCE_CHAT_REGISTRATION_FAILED.value,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=incoming.subject_id,
+            subject_revision=1,
+            idempotency_key=f"source-chat-registration-failed:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "registration_request_id": registration_request_id,
+                "telegram_user_id": telegram_user_id,
+            },
+        )
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
         try:
             self.store.consume(
                 incoming=incoming,
@@ -5686,6 +5753,14 @@ class RuntimeApplication:
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        if telegram_user_id != self.telegram_admin_user_id:
+            self._fail_source_chat_registration(
+                incoming,
+                telegram_user_id=telegram_user_id,
+                registration_request_id=str(incoming.causation_id),
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return
         try:
             self.store.register_source_chat(
                 incoming=incoming,
