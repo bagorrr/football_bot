@@ -748,6 +748,116 @@ _ZERO_RESULT_COPY = {
     ),
 }
 
+_MAIN_MENU_COPY = {
+    "en": (
+        "⚽️ **Main Menu**\n\nChoose what you would like to do.",
+        "New search",
+        "Search results",
+        "Settings",
+        "Menu",
+    ),
+    "ru": (
+        "⚽️ **Главное меню**\n\nВыберите, что хотите сделать.",
+        "Новый поиск",
+        "Результаты поиска",
+        "Настройки",
+        "Меню",
+    ),
+    "es": (
+        "⚽️ **Menú principal**\n\nElija qué desea hacer.",
+        "Nueva búsqueda",
+        "Resultados de búsqueda",
+        "Ajustes",
+        "Menú",
+    ),
+    "fr": (
+        "⚽️ **Menu principal**\n\nChoisissez ce que vous souhaitez faire.",
+        "Nouvelle recherche",
+        "Résultats de recherche",
+        "Paramètres",
+        "Menu",
+    ),
+}
+
+_NO_RESULTS_YET_COPY = {
+    "en": (
+        "🔎 **No results yet**\n\n"
+        "Complete a search first — found options will appear here.",
+        "New search",
+        "Menu",
+    ),
+    "ru": (
+        "🔎 **Результатов пока нет**\n\n"
+        "Сначала завершите поиск — найденные варианты появятся здесь.",
+        "Новый поиск",
+        "Меню",
+    ),
+    "es": (
+        "🔎 **Aún no hay resultados**\n\n"
+        "Complete primero una búsqueda; las opciones aparecerán aquí.",
+        "Nueva búsqueda",
+        "Menú",
+    ),
+    "fr": (
+        "🔎 **Aucun résultat pour le moment**\n\n"
+        "Terminez d’abord une recherche ; les résultats apparaîtront ici.",
+        "Nouvelle recherche",
+        "Menu",
+    ),
+}
+
+_SETTINGS_COPY = {
+    "en": ("⚙️ **Settings**", "Language", "Support", "Mode", "Premium", "Back", "Menu"),
+    "ru": ("⚙️ **Настройки**", "Язык", "Поддержка", "Режим", "Премиум", "Назад", "Меню"),
+    "es": ("⚙️ **Ajustes**", "Idioma", "Soporte", "Modo", "Premium", "Atrás", "Menú"),
+    "fr": (
+        "⚙️ **Paramètres**",
+        "Langue",
+        "Assistance",
+        "Mode",
+        "Premium",
+        "Retour",
+        "Menu",
+    ),
+}
+
+_MODE_COPY = {
+    "en": ("⚙️ **Mode**", "✅ Search", "Feed", "Back", "Menu"),
+    "ru": ("⚙️ **Режим**", "✅ Поиск", "Лента", "Назад", "Меню"),
+    "es": ("⚙️ **Modo**", "✅ Búsqueda", "Feed", "Atrás", "Menú"),
+    "fr": ("⚙️ **Mode**", "✅ Recherche", "Fil", "Retour", "Menu"),
+}
+
+_PLACEHOLDER_COPY = {
+    "en": (
+        "Feed will be available after the MVP.",
+        "Premium will be available later.",
+        "Search mode is active.",
+    ),
+    "ru": (
+        "Лента будет доступна после MVP.",
+        "Премиум будет доступен позже.",
+        "Режим поиска активен.",
+    ),
+    "es": (
+        "El Feed estará disponible después del MVP.",
+        "Premium estará disponible más adelante.",
+        "El modo de búsqueda está activo.",
+    ),
+    "fr": (
+        "Le Fil sera disponible après le MVP.",
+        "Premium sera disponible ultérieurement.",
+        "Le mode Recherche est actif.",
+    ),
+}
+
+_SETTINGS_LANGUAGE_COPY = {
+    "en": ("🌐 **Conversation language**", "Back", "Menu"),
+    "ru": ("🌐 **Язык общения**", "Назад", "Меню"),
+    "es": ("🌐 **Idioma de conversación**", "Atrás", "Menú"),
+    "fr": ("🌐 **Langue de conversation**", "Retour", "Menu"),
+}
+
 _SEARCH_FAILURE_COPY = {
     "en": (
         "⚠️ **Search couldn't be completed**\n\n"
@@ -1033,6 +1143,345 @@ class ConversationOnboarding:
             inactive_before=self._clock.now() - timedelta(days=30)
         )
 
+    def open_main_menu(self, *, update_id: str, telegram_user_id: int) -> None:
+        """Handle the native Menu text through the current logical screen."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                if current is None:
+                    return
+                draft = self._store.discovery_draft(telegram_user_id)
+                if current.stage in {
+                    ConversationStage.LANGUAGE_SELECTION,
+                    ConversationStage.LANGUAGE_INPUT,
+                } or (draft is not None and current.stage is draft.stage):
+                    self._queue_current_view(update_id=update_id, state=current)
+                else:
+                    self._show_main_menu(update_id=update_id, current=current)
+        self.deliver_pending()
+
+    def select_main_menu_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+    ) -> None:
+        """Apply one current Main Menu callback."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            if current is None:
+                return
+            if current.screen_revision != screen_revision:
+                self._queue_current_view(update_id=update_id, state=current)
+            elif action == "new-search" and current.stage in {
+                ConversationStage.MAIN_MENU,
+                ConversationStage.RESULTS,
+            }:
+                self._start_new_search(update_id=update_id, current=current)
+            elif (
+                action == "search-results"
+                and current.stage is ConversationStage.MAIN_MENU
+            ):
+                self._show_search_results(update_id=update_id, current=current)
+            elif action == "settings" and current.stage is ConversationStage.MAIN_MENU:
+                self._show_settings(update_id=update_id, current=current)
+            else:
+                self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def select_settings_action(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+    ) -> None:
+        """Apply one current Settings or Mode callback."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                if current is None:
+                    return
+                if current.screen_revision != screen_revision:
+                    self._queue_current_view(update_id=update_id, state=current)
+                elif current.stage is ConversationStage.SETTINGS and action == "mode":
+                    self._show_mode(update_id=update_id, current=current)
+                elif (
+                    current.stage is ConversationStage.SETTINGS and action == "language"
+                ):
+                    self._show_settings_language(update_id=update_id, current=current)
+                elif (
+                    current.stage is ConversationStage.SETTINGS and action == "premium"
+                ):
+                    selection = self._language_rendering(current.locale or "en")
+                    self._answer_placeholder_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                        text=_placeholder_copy(current.locale or "en", selection)[1],
+                    )
+                elif current.stage is ConversationStage.MODE and action == "feed":
+                    selection = self._language_rendering(current.locale or "en")
+                    self._answer_placeholder_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                        text=_placeholder_copy(current.locale or "en", selection)[0],
+                    )
+                elif (
+                    current.stage is ConversationStage.MODE and action == "mode-search"
+                ):
+                    selection = self._language_rendering(current.locale or "en")
+                    self._answer_placeholder_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                        text=_placeholder_copy(current.locale or "en", selection)[2],
+                    )
+                else:
+                    self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def _answer_placeholder_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        current: ConversationState,
+        text: str,
+    ) -> None:
+        if self._store.commit_conversation_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            text=text,
+            recorded_at=self._clock.now(),
+        ):
+            return
+
+    def _language_rendering(self, locale: str) -> LanguageSelection | None:
+        if locale in SUPPORTED_LOCALES:
+            return None
+        selection = self._conversation_language.render(locale)
+        if selection is None or selection.locale != locale:
+            raise RuntimeError("saved Conversation Language could not be rendered")
+        return selection
+
+    def _start_new_search(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        locale = current.locale
+        if locale is None:
+            raise RuntimeError("Conversation Language is missing")
+        paused = self._store.discovery_draft(current.telegram_user_id)
+        if paused is not None and paused.stage is not ConversationStage.DIRECTION_MENU:
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        now = self._clock.now()
+        state = replace(
+            current,
+            stage=ConversationStage.DIRECTION_MENU,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        draft = DiscoveryDraft(
+            telegram_user_id=current.telegram_user_id,
+            stage=ConversationStage.DIRECTION_MENU,
+            intent_branch=None,
+            user_intent=None,
+            screen_revision=state.screen_revision,
+            revision=1 if paused is None else paused.revision + 1,
+            last_activity_at=now,
+        )
+        selection = self._language_rendering(locale)
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_direction_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            ),
+            recorded_at=now,
+            draft=draft,
+        )
+
+    def _show_main_menu(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        locale = current.locale or "en"
+        selection = self._language_rendering(locale)
+        state = replace(
+            current,
+            stage=ConversationStage.MAIN_MENU,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_main_menu_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_search_results(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        locale = current.locale or "en"
+        selection = self._language_rendering(locale)
+        state = replace(
+            current,
+            stage=ConversationStage.RESULTS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        context = self._store.active_result_context(current.telegram_user_id)
+        if context is None:
+            message = _no_results_yet_message(
+                delivery_id=f"menu:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            )
+        elif context.current_result_id is None:
+            message = _zero_result_message(
+                delivery_id=f"menu:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            )
+        else:
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_settings(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        locale = current.locale or "en"
+        selection = self._language_rendering(locale)
+        state = replace(
+            current,
+            stage=ConversationStage.SETTINGS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_settings_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_mode(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        locale = current.locale or "en"
+        selection = self._language_rendering(locale)
+        state = replace(
+            current,
+            stage=ConversationStage.MODE,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_mode_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_settings_language(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        locale = current.locale or "en"
+        selection = self._language_rendering(locale)
+        state = replace(
+            current,
+            stage=ConversationStage.SETTINGS_LANGUAGE_SELECTION,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_settings_language_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
     def submit_search(
         self,
         *,
@@ -1196,6 +1645,7 @@ class ConversationOnboarding:
             telegram_user_id=telegram_user_id,
             locale=current.locale or "en",
             screen_revision=current.screen_revision + 1,
+            selection=self._language_rendering(current.locale or "en"),
         )
         self._store.accept_search_completion(
             incoming=incoming,
@@ -1417,6 +1867,31 @@ class ConversationOnboarding:
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
             raise LookupError(telegram_user_id)
+        if (
+            current.stage is ConversationStage.SETTINGS_LANGUAGE_SELECTION
+            and current.screen_revision == screen_revision
+        ):
+            state = replace(
+                current,
+                locale=locale,
+                locale_source=LocaleSource.EXPLICIT,
+                stage=ConversationStage.SETTINGS,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                message=_settings_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                ),
+                recorded_at=self._clock.now(),
+            )
+            return
         if (
             current.stage is not ConversationStage.LANGUAGE_SELECTION
             or current.screen_revision != screen_revision
@@ -2575,9 +3050,20 @@ class ConversationOnboarding:
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 draft = self._store.discovery_draft(telegram_user_id)
-                if current is None or draft is None:
+                if current is None:
                     return
-                if (
+                if current.screen_revision != screen_revision:
+                    self._queue_current_view(update_id=update_id, state=current)
+                elif current.stage is ConversationStage.SETTINGS:
+                    self._show_main_menu(update_id=update_id, current=current)
+                elif current.stage in {
+                    ConversationStage.MODE,
+                    ConversationStage.SETTINGS_LANGUAGE_SELECTION,
+                }:
+                    self._show_settings(update_id=update_id, current=current)
+                elif current.stage is ConversationStage.SETTINGS_LANGUAGE_INPUT:
+                    self._show_settings_language(update_id=update_id, current=current)
+                elif draft is None or (
                     current.stage is not draft.stage
                     or draft.screen_revision != screen_revision
                 ):
@@ -2705,6 +3191,9 @@ class ConversationOnboarding:
             intent_branch = None
             stage = ConversationStage.DIRECTION_MENU
         elif draft.stage is ConversationStage.DIRECTION_MENU:
+            if self._store.active_result_context(current.telegram_user_id) is not None:
+                self._show_main_menu(update_id=update_id, current=current)
+                return
             now = self._clock.now()
             state = replace(
                 current,
@@ -2815,6 +3304,32 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(telegram_user_id)
         if (
+            current.stage is ConversationStage.SETTINGS_LANGUAGE_SELECTION
+            and current.screen_revision == screen_revision
+        ):
+            locale = current.locale or "en"
+            selection = self._language_rendering(locale)
+            state = replace(
+                current,
+                stage=ConversationStage.SETTINGS_LANGUAGE_INPUT,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                message=_settings_language_input_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    selection=selection,
+                ),
+                recorded_at=self._clock.now(),
+            )
+            return
+        if (
             current.stage is not ConversationStage.LANGUAGE_SELECTION
             or current.screen_revision != screen_revision
         ):
@@ -2876,7 +3391,11 @@ class ConversationOnboarding:
                 if current is None:
                     raise LookupError(telegram_user_id)
                 if (
-                    current.stage is not ConversationStage.LANGUAGE_INPUT
+                    current.stage
+                    not in {
+                        ConversationStage.LANGUAGE_INPUT,
+                        ConversationStage.SETTINGS_LANGUAGE_INPUT,
+                    }
                     or current.screen_revision != screen_revision
                 ):
                     self._queue_current_view(update_id=update_id, state=current)
@@ -2898,16 +3417,27 @@ class ConversationOnboarding:
         selection = self._conversation_language.interpret(text)
         if selection is None or selection.locale not in APPLICATION_LOCALES:
             locale = current.locale or "en"
-            if locale not in SUPPORTED_LOCALES:
-                locale = "en"
-            message = TelegramMessage(
-                delivery_id=f"onboarding:{update_id}",
-                telegram_user_id=current.telegram_user_id,
-                display_locale=locale,
-                screen_revision=current.screen_revision,
-                text=_LANGUAGE_CLARIFICATION[locale],
-                button_rows=(),
-            )
+            current_rendering = self._language_rendering(locale)
+            if current.stage is ConversationStage.SETTINGS_LANGUAGE_INPUT:
+                message = replace(
+                    _settings_language_input_message(
+                        update_id=update_id,
+                        telegram_user_id=current.telegram_user_id,
+                        locale=locale,
+                        screen_revision=current.screen_revision,
+                        selection=current_rendering,
+                    ),
+                    text=_language_clarification(locale, current_rendering),
+                )
+            else:
+                message = TelegramMessage(
+                    delivery_id=f"onboarding:{update_id}",
+                    telegram_user_id=current.telegram_user_id,
+                    display_locale=locale,
+                    screen_revision=current.screen_revision,
+                    text=_LANGUAGE_CLARIFICATION[locale],
+                    button_rows=(),
+                )
             self._store.commit_conversation_presentation(
                 update_id=update_id,
                 telegram_user_id=current.telegram_user_id,
@@ -2918,6 +3448,29 @@ class ConversationOnboarding:
             return
         if re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", selection.locale) is None:
             raise ValueError("language adapter proposed an invalid locale")
+        if current.stage is ConversationStage.SETTINGS_LANGUAGE_INPUT:
+            state = replace(
+                current,
+                locale=selection.locale,
+                locale_source=LocaleSource.EXPLICIT,
+                stage=ConversationStage.SETTINGS,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                message=_settings_message(
+                    update_id=update_id,
+                    telegram_user_id=current.telegram_user_id,
+                    locale=selection.locale,
+                    screen_revision=state.screen_revision,
+                    selection=selection,
+                ),
+                recorded_at=self._clock.now(),
+            )
+            return
         state = replace(
             current,
             locale=selection.locale,
@@ -2969,6 +3522,12 @@ class ConversationOnboarding:
             not in {
                 ConversationStage.LANGUAGE_SELECTION,
                 ConversationStage.LANGUAGE_INPUT,
+                ConversationStage.RESULTS,
+                ConversationStage.MAIN_MENU,
+                ConversationStage.SETTINGS,
+                ConversationStage.MODE,
+                ConversationStage.SETTINGS_LANGUAGE_SELECTION,
+                ConversationStage.SETTINGS_LANGUAGE_INPUT,
             }
             and self._store.discovery_draft(state.telegram_user_id) is None
         ):
@@ -2996,6 +3555,8 @@ class ConversationOnboarding:
             stale_before=claimed_at - timedelta(minutes=5),
         )
         if claim is None:
+            if self._deliver_pending_callback():
+                return True
             return self._cleanup_old_chat_view()
         message = claim.message
         if claim.mode is TelegramDeliveryMode.SEND:
@@ -3036,6 +3597,34 @@ class ConversationOnboarding:
             delivered_at=self._clock.now(),
         )
         self._cleanup_old_chat_view()
+        return True
+
+    def _deliver_pending_callback(self) -> bool:
+        """Retry one durable idempotent callback-query notification."""
+        claim_token = uuid4()
+        claimed_at = self._clock.now()
+        claim = self._store.claim_conversation_callback(
+            claim_token=claim_token,
+            claimed_at=claimed_at,
+            stale_before=claimed_at - timedelta(minutes=5),
+        )
+        if claim is None:
+            return False
+        try:
+            self._telegram_delivery.answer_callback(
+                callback_id=claim.callback_id,
+                text=claim.text,
+            )
+        except Exception:
+            self._store.release_conversation_callback_claim(
+                claim_token=claim.claim_token
+            )
+            raise
+        self._store.mark_conversation_callback_delivered(
+            delivery_id=claim.delivery_id,
+            claim_token=claim.claim_token,
+            delivered_at=self._clock.now(),
+        )
         return True
 
     def _cleanup_old_chat_view(self) -> bool:
@@ -3711,9 +4300,16 @@ def _zero_result_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
+    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
-    text, new_search_label, menu_label = _ZERO_RESULT_COPY[copy_locale]
+    if locale in SUPPORTED_LOCALES:
+        text, new_search_label, menu_label = _ZERO_RESULT_COPY[locale]
+    elif selection is not None and selection.locale == locale:
+        if selection.zero_result is None:
+            raise RuntimeError("Conversation Language has no zero-result rendering")
+        text, new_search_label, menu_label = selection.zero_result
+    else:
+        raise RuntimeError("Conversation Language has no zero-result rendering")
     return TelegramMessage(
         delivery_id=delivery_id,
         telegram_user_id=telegram_user_id,
@@ -3722,6 +4318,253 @@ def _zero_result_message(
         text=text,
         button_rows=(((new_search_label, f"menu:new-search:{screen_revision}"),),),
         reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _main_menu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, new_search, search_results, settings, menu = _MAIN_MENU_COPY[locale]
+    elif selection is not None and selection.locale == locale:
+        if selection.main_menu_text is None or selection.main_menu_labels is None:
+            raise RuntimeError("Conversation Language has no Main Menu rendering")
+        text = selection.main_menu_text
+        new_search, search_results, settings, menu = selection.main_menu_labels
+    else:
+        raise RuntimeError("Conversation Language has no Main Menu rendering")
+    return TelegramMessage(
+        delivery_id=f"menu:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(
+            ((new_search, f"menu:new-search:{screen_revision}"),),
+            ((search_results, f"menu:search-results:{screen_revision}"),),
+            ((settings, f"menu:settings:{screen_revision}"),),
+        ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _settings_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, language, support, mode, premium, back, menu = _SETTINGS_COPY[locale]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.settings_text is not None
+        and selection.settings_labels is not None
+    ):
+        text = selection.settings_text
+        language, support, mode, premium, back, menu = selection.settings_labels
+    else:
+        raise RuntimeError("Conversation Language has no Settings rendering")
+    return TelegramMessage(
+        delivery_id=f"settings:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(
+            ((language, f"settings:language:{screen_revision}"),),
+            ((support, "https://telegram.me/myfootball_support_bot"),),
+            ((mode, f"settings:mode:{screen_revision}"),),
+            ((premium, f"settings:premium:{screen_revision}"),),
+            ((back, f"settings:back:{screen_revision}"),),
+        ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _settings_language_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, back, menu = _SETTINGS_LANGUAGE_COPY[locale]
+        language_button = _LANGUAGE_BUTTON[locale]
+    elif selection is not None and selection.locale == locale:
+        if (
+            selection.settings_language_text is None
+            or selection.settings_language_labels is None
+        ):
+            raise RuntimeError(
+                "Conversation Language has no language-selector rendering"
+            )
+        text = selection.settings_language_text
+        language_button, back, menu = selection.settings_language_labels
+        language_button = f"🌐 {language_button}"
+    else:
+        raise RuntimeError("Conversation Language has no language-selector rendering")
+    return TelegramMessage(
+        delivery_id=f"settings:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(
+            (
+                ("English", f"settings-language:en:{screen_revision}"),
+                ("Español", f"settings-language:es:{screen_revision}"),
+            ),
+            (
+                ("Français", f"settings-language:fr:{screen_revision}"),
+                ("Русский", f"settings-language:ru:{screen_revision}"),
+            ),
+            (
+                (
+                    language_button,
+                    f"settings-language:free-text:{screen_revision}",
+                ),
+            ),
+            ((back, f"settings-language:back:{screen_revision}"),),
+        ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _settings_language_input_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        _, back, menu = _SETTINGS_LANGUAGE_COPY[locale]
+        prompt = _LANGUAGE_PROMPT[locale]
+    elif selection is not None and selection.locale == locale:
+        if (
+            selection.settings_language_prompt is None
+            or selection.settings_language_labels is None
+        ):
+            raise RuntimeError("Conversation Language has no language-input rendering")
+        prompt = selection.settings_language_prompt
+        _, back, menu = selection.settings_language_labels
+    else:
+        raise RuntimeError("Conversation Language has no language-input rendering")
+    return TelegramMessage(
+        delivery_id=f"settings:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=prompt,
+        button_rows=(((back, f"settings-language:back:{screen_revision}"),),),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _mode_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, search, feed, back, menu = _MODE_COPY[locale]
+    elif selection is not None and selection.locale == locale:
+        if selection.mode_text is None or selection.mode_labels is None:
+            raise RuntimeError("Conversation Language has no Mode rendering")
+        text = selection.mode_text
+        search, feed, back, menu = selection.mode_labels
+    else:
+        raise RuntimeError("Conversation Language has no Mode rendering")
+    return TelegramMessage(
+        delivery_id=f"settings:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(
+            ((search, f"settings:mode-search:{screen_revision}"),),
+            ((feed, f"settings:feed:{screen_revision}"),),
+            ((back, f"settings:back:{screen_revision}"),),
+        ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _placeholder_copy(
+    locale: str,
+    selection: LanguageSelection | None,
+) -> tuple[str, str, str]:
+    if locale in SUPPORTED_LOCALES:
+        return _PLACEHOLDER_COPY[locale]
+    if (
+        selection is not None
+        and selection.locale == locale
+        and selection.placeholder_notifications is not None
+    ):
+        return selection.placeholder_notifications
+    raise RuntimeError("Conversation Language has no placeholder rendering")
+
+
+def _language_clarification(
+    locale: str,
+    selection: LanguageSelection | None,
+) -> str:
+    if locale in SUPPORTED_LOCALES:
+        return _LANGUAGE_CLARIFICATION[locale]
+    if (
+        selection is not None
+        and selection.locale == locale
+        and selection.settings_language_clarification is not None
+    ):
+        return selection.settings_language_clarification
+    raise RuntimeError("Conversation Language has no language-input clarification")
+
+
+def _no_results_yet_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, new_search, menu = _NO_RESULTS_YET_COPY[locale]
+    elif selection is not None and selection.locale == locale:
+        if selection.no_results_yet is None:
+            raise RuntimeError("Conversation Language has no empty-results rendering")
+        text, new_search, menu = selection.no_results_yet
+    else:
+        raise RuntimeError("Conversation Language has no empty-results rendering")
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(((new_search, f"menu:new-search:{screen_revision}"),),),
+        reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
 

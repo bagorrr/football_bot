@@ -113,12 +113,16 @@ class ControlledTelegramDeliveryAdapter:
     inline_action_removals: list[tuple[int, str]] = field(default_factory=list)
     typing_actions: list[int] = field(default_factory=list)
     deletion_attempts: list[tuple[int, str]] = field(default_factory=list)
+    callback_notifications: list[tuple[str, str]] = field(default_factory=list)
     failures_remaining: int = 0
     lost_confirmations_remaining: int = 0
     interruptions_after_effect_remaining: int = 0
+    callback_failures_remaining: int = 0
+    callback_interruptions_after_effect_remaining: int = 0
     _delivery_ledger: dict[str, tuple[TelegramMessage, str]] = field(
         default_factory=dict
     )
+    _callback_ledger: dict[str, str] = field(default_factory=dict)
 
     def fail_next(self) -> None:
         """Inject one controlled failure before the external effect."""
@@ -131,6 +135,14 @@ class ControlledTelegramDeliveryAdapter:
     def interrupt_after_next_effect(self) -> None:
         """Interrupt the process after one accepted external effect."""
         self.interruptions_after_effect_remaining += 1
+
+    def fail_next_callback(self) -> None:
+        """Inject one callback-answer failure before the external effect."""
+        self.callback_failures_remaining += 1
+
+    def interrupt_after_next_callback_effect(self) -> None:
+        """Interrupt after one callback answer was externally accepted."""
+        self.callback_interruptions_after_effect_remaining += 1
 
     def present(self, delivery_id: str) -> None:
         """Record one idempotent controlled presentation."""
@@ -189,6 +201,22 @@ class ControlledTelegramDeliveryAdapter:
         if attempt not in self.deletion_attempts:
             self.deletion_attempts.append(attempt)
         return True
+
+    def answer_callback(self, *, callback_id: str, text: str) -> None:
+        """Idempotently record one callback notification by callback-query ID."""
+        if self.callback_failures_remaining:
+            self.callback_failures_remaining -= 1
+            raise InjectedTelegramDeliveryError
+        recorded_text = self._callback_ledger.get(callback_id)
+        if recorded_text is not None:
+            if recorded_text != text:
+                raise ValueError("callback ID was reused for different text")
+            return
+        self._callback_ledger[callback_id] = text
+        self.callback_notifications.append((callback_id, text))
+        if self.callback_interruptions_after_effect_remaining:
+            self.callback_interruptions_after_effect_remaining -= 1
+            raise InjectedTelegramDeliveryInterruptionError
 
 
 class ControlledModelAdapter:
@@ -622,6 +650,54 @@ class ControlledConversationLanguageAdapter:
                 "⬅️ Zurück",
                 "Transfers",
             ),
+            settings_text="⚙️ **Einstellungen**",
+            settings_labels=(
+                "Sprache",
+                "Support",
+                "Modus",
+                "Premium",
+                "Zurück",
+                "Menü",
+            ),
+            main_menu_text="⚽️ **Fußball-Marktplatz**",
+            main_menu_labels=(
+                "Neue Suche",
+                "Suchergebnisse",
+                "Einstellungen",
+                "Menü",
+            ),
+            mode_text="⚙️ **Modus**",
+            mode_labels=("✅ Suche", "Feed", "Zurück", "Menü"),
+            settings_language_text="🌐 **Gesprächssprache**",
+            settings_language_prompt=(
+                "🌐 Schreiben Sie den Namen der Sprache, in der Sie "
+                "kommunizieren möchten.\n\nZum Beispiel: Deutsch, Türkçe oder العربية."
+            ),
+            settings_language_clarification=(
+                "Ich konnte die Sprache nicht eindeutig erkennen. "
+                "Schreiben Sie den Namen bitte anders."
+            ),
+            settings_language_labels=("Sprache wählen", "Zurück", "Menü"),
+            placeholder_notifications=(
+                "Der Feed ist nach dem MVP verfügbar.",
+                "Premium ist später verfügbar.",
+                "Der Suchmodus ist aktiv.",
+            ),
+            no_results_yet=(
+                "🔎 **Noch keine Ergebnisse**\n\n"
+                "Schließen Sie zuerst eine Suche ab. Gefundene Optionen "
+                "erscheinen dann hier.",
+                "Neue Suche",
+                "Menü",
+            ),
+            zero_result=(
+                "🔎 **Keine Treffer gefunden**\n\n"
+                "Für die aktuellen Bedingungen gibt es keine passenden Optionen.\n"
+                "Schreiben Sie, was sich an der Suche ändern soll, oder starten Sie "
+                "eine neue Suche.",
+                "Neue Suche",
+                "Menü",
+            ),
         )
 
 
@@ -977,6 +1053,60 @@ class AcceptanceSpine:
             ),
         )
 
+    def open_main_menu(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+    ) -> None:
+        """Drive the native Menu text through the Bot Assistant port."""
+        self._conversation_onboarding().open_main_menu(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        )
+
+    def select_main_menu_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Main Menu callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_main_menu_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_settings_action(
+        self,
+        *,
+        update_id: str,
+        callback_id: str | None = None,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Settings or Mode callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_settings_action(
+            update_id=update_id,
+            callback_id=callback_id or update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
     def process_searches_until_idle(self) -> None:
         """Let recommendation and Bot Assistant finish durable Search work."""
         while True:
@@ -1124,7 +1254,7 @@ class AcceptanceSpine:
             screen_revision=(
                 screen_revision
                 if screen_revision is not None
-                else self.discovery_draft(telegram_user_id).screen_revision
+                else self.conversation_state(telegram_user_id).screen_revision
             ),
         )
 

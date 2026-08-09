@@ -37,6 +37,7 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
     TelegramMessage,
     UserIntent,
@@ -113,6 +114,10 @@ class TelegramDeliveryAdapter(Protocol):
         self, *, telegram_user_id: int, telegram_message_id: str
     ) -> bool:
         """Best-effort delete one old Telegram message."""
+        ...
+
+    def answer_callback(self, *, callback_id: str, text: str) -> None:
+        """Idempotently answer one callback-query identity without a chat message."""
         ...
 
 
@@ -263,6 +268,43 @@ class ConversationStore(Protocol):
         recorded_at: datetime,
     ) -> bool:
         """Commit one idempotent presentation without changing account state."""
+        ...
+
+    def commit_conversation_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        text: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one callback update and its durable notification outbox."""
+        ...
+
+    def claim_conversation_callback(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramCallbackDeliveryClaim | None:
+        """Claim one pending or abandoned callback notification."""
+        ...
+
+    def release_conversation_callback_claim(self, *, claim_token: UUID) -> None:
+        """Release a callback claim for safe idempotent retry."""
+        ...
+
+    def mark_conversation_callback_delivered(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        delivered_at: datetime,
+    ) -> None:
+        """Record one confirmed callback-query answer."""
         ...
 
     def commit_search_submission(

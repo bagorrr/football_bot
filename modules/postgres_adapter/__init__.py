@@ -47,6 +47,7 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramMessage,
@@ -69,6 +70,8 @@ _LEGACY_MIGRATION_NAMES = (
     "0005_search_area.sql",
     "0006_required_date.sql",
     "0007_zero_result_search.sql",
+    "0008_main_menu_settings.sql",
+    "0009_callback_notification_outbox.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -79,6 +82,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "0ed51b9232f016c595860a2296129328167051363915f5bda4d552c37dcb2fde",
     "24e3a984d5f411b22b86486eeb2c95d48ce62bc6348c5a43b432bcb706bac6af",
     "2b3373bbba4780664716388d50c6e8e4d211ca5e4886a50587ac1041e7751ecc",
+    "c4975655de10c89b60dbfb9a1e1a3af21273486643d8f4b888d6df20500dde8f",
+    "a47b752decc202f4cbefd6022f1399ca52242ba0886479ab3d40f38575965c9c",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -550,7 +555,8 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.bot_old_chat_views,
+            TRUNCATE football_runtime.bot_callback_outbox,
+                     football_runtime.bot_old_chat_views,
                      football_runtime.bot_search_presentations,
                      football_runtime.bot_active_result_contexts,
                      football_runtime.recommendation_results,
@@ -1835,6 +1841,145 @@ class PostgresRoleStore:
                 ),
             )
             return True
+
+    def commit_conversation_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        text: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one replay-safe callback and its delivery outbox."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            current = connection.execute(
+                """
+                SELECT revision
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if current is None or current[0] != expected_revision:
+                raise RuntimeError("Conversation state changed concurrently")
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET last_bot_user_action_at = %s
+                WHERE telegram_user_id = %s
+                """,
+                (recorded_at, telegram_user_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_callback_outbox (
+                    delivery_id, update_id, callback_query_id,
+                    telegram_user_id, notification_text, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (callback_query_id) DO NOTHING
+                """,
+                (
+                    f"callback:{update_id}",
+                    update_id,
+                    callback_id,
+                    telegram_user_id,
+                    text,
+                    recorded_at,
+                ),
+            )
+            return True
+
+    def claim_conversation_callback(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramCallbackDeliveryClaim | None:
+        """Claim one pending or abandoned callback notification."""
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                WITH candidate AS (
+                    SELECT delivery_id
+                    FROM football_runtime.bot_callback_outbox
+                    WHERE delivered_at IS NULL
+                      AND (
+                          claim_token IS NULL
+                          OR claimed_at <= %s
+                      )
+                    ORDER BY sequence_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE football_runtime.bot_callback_outbox AS callback
+                SET claim_token = %s, claimed_at = %s
+                FROM candidate
+                WHERE callback.delivery_id = candidate.delivery_id
+                RETURNING callback.delivery_id, callback.callback_query_id,
+                          callback.notification_text
+                """,
+                (stale_before, claim_token, claimed_at),
+            ).fetchone()
+        if row is None:
+            return None
+        return TelegramCallbackDeliveryClaim(
+            delivery_id=row[0],
+            callback_id=row[1],
+            text=row[2],
+            claim_token=claim_token,
+        )
+
+    def release_conversation_callback_claim(self, *, claim_token: UUID) -> None:
+        """Release one callback claim for a later idempotent retry."""
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_callback_outbox
+                SET claim_token = NULL, claimed_at = NULL
+                WHERE claim_token = %s AND delivered_at IS NULL
+                """,
+                (claim_token,),
+            )
+
+    def mark_conversation_callback_delivered(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        delivered_at: datetime,
+    ) -> None:
+        """Record one confirmed callback-query answer."""
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_callback_outbox
+                SET delivered_at = COALESCE(delivered_at, %s),
+                    claim_token = NULL, claimed_at = NULL
+                WHERE delivery_id = %s
+                  AND claim_token = %s
+                  AND delivered_at IS NULL
+                RETURNING delivery_id
+                """,
+                (delivered_at, delivery_id, claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("callback notification claim was lost")
 
     def commit_search_submission(
         self,
