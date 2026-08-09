@@ -14,6 +14,7 @@ from modules.contracts import (
     ContractEnvelope,
     ContractName,
     GetCompletedSearch,
+    JsonValue,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
@@ -594,8 +595,16 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: RawContractEnvelope,
         received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Durably reject one supported-version envelope with invalid semantics."""
+        ...
+
+    def source_chat_registration_context(
+        self,
+        correlation_id: UUID,
+    ) -> tuple[int, int] | None:
+        """Recover the authorized requester and generation for one admission."""
         ...
 
     def attempt_owner_write(
@@ -643,6 +652,14 @@ class AcceptanceObserver(Protocol):
         self, completed_search_id: str
     ) -> RawContractEnvelope:
         """Inject one invalid supported query at the privileged test seam."""
+        ...
+
+    def invalidate_source_chat_admission(
+        self,
+        correlation_id: UUID,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject invalid Source Chat facts at the privileged test seam."""
         ...
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:

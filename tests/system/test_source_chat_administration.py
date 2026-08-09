@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from modules.contracts import ContractName
+from modules.contracts import ContractName, FailureCode, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
     InitialConsentAttestation,
@@ -430,6 +430,150 @@ def test_registration_revalidates_the_current_administrator_before_mutation() ->
     )
     assert telegram.messages[-1].text == "⚙️ **Settings**"
     rotated_system.reset()
+
+
+def test_malformed_source_chat_admission_fails_closed_and_releases_pending_user() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 50, tzinfo=UTC))
+    administrator_id = 46_106
+    preserved_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_610_500,
+    )
+    candidate_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_610_501,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_preserved_boundary",
+        identity=preserved_identity,
+        transport_boundary="channel-pts:7601",
+    )
+    for index in range(7):
+        telethon.allow_public_username(
+            address="@synthetic_malformed_boundary",
+            identity=candidate_identity,
+            transport_boundary=f"channel-pts:{7602 + index}",
+        )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:malformed-boundary",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:malformed-boundary",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 50, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:malformed-boundary",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:malformed-boundary",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:malformed-boundary",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:malformed-boundary",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:preserved-boundary",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:preserved-boundary",
+        telegram_user_id=administrator_id,
+        address="@synthetic_preserved_boundary",
+    )
+    system.process_source_chat_registrations_until_idle()
+    previous_registry = system.source_chats()
+
+    malformed_payloads: tuple[dict[str, JsonValue], ...] = (
+        {"telegram_peer_kind": "user"},
+        {"telegram_chat_id": 4_610_599},
+        {"address_kind": "unsupported"},
+        {"current_address": "not-a-public-username"},
+        {"transport_boundary": ""},
+        {"registry_generation": 0},
+        {"registry_generation": 2},
+    )
+    for index, payload_updates in enumerate(malformed_payloads):
+        if index == 0:
+            system.select_source_chats_action(
+                update_id="add:malformed-boundary",
+                telegram_user_id=administrator_id,
+                action="add",
+            )
+        update_id = f"address:malformed-boundary:{index}"
+        system.submit_source_chat_address(
+            update_id=update_id,
+            telegram_user_id=administrator_id,
+            address="@synthetic_malformed_boundary",
+        )
+        assert system.process_next_source_chat_change_request()
+        assert system.process_next_source_chat_admission()
+        admission = system.invalidate_source_chat_admission(
+            update_id=update_id,
+            payload_updates=payload_updates,
+        )
+
+        assert system.process_next_source_chat_registration()
+        system.process_source_chat_registrations_until_idle()
+
+        assert system.source_chats() == previous_registry
+        assert system.conversation_state(administrator_id).stage is (
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+        )
+        alert = system.operator_alert(admission.message_id)
+        assert alert.failure_code is FailureCode.INVALID_CONTRACT
+        assert alert.producer is RuntimeRole.INGESTION
+        assert alert.consumer is RuntimeRole.APPLICATION
+        assert not system.process_next_source_chat_registration()
+
+    telethon.allow_public_username(
+        address="@synthetic_empty_adapter_boundary",
+        identity=candidate_identity,
+        transport_boundary="",
+    )
+    system.submit_source_chat_address(
+        update_id="address:empty-adapter-boundary",
+        telegram_user_id=administrator_id,
+        address="@synthetic_empty_adapter_boundary",
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    assert system.source_chats() == previous_registry
+    assert system.conversation_state(administrator_id).stage is (
+        ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+    )
+    assert telegram.messages[-1].text.startswith("Could not register this Source Chat")
+    assert not system.process_next_source_chat_admission()
+
+    system.reset()
 
 
 def test_private_invite_registration_uses_existing_account_access_without_joining() -> (

@@ -330,6 +330,20 @@ class ContractEnvelope(RawContractEnvelope):
                 raise ValueError(
                     "GetCompletedSearch subject must identify its Completed Search"
                 )
+        elif self.contract_name in {
+            ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+            ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+            ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+            ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+            ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+        }:
+            _validate_source_chat_contract(
+                self.contract_name,
+                self.payload,
+                subject_id=self.subject_id,
+                subject_revision=self.subject_revision,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,4 +530,107 @@ def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str) or not value:
         raise ValueError(f"contract requires {field_name}")
+    return value
+
+
+def _validate_source_chat_contract(
+    contract_name: ContractName,
+    payload: dict[str, JsonValue],
+    *,
+    subject_id: str,
+    subject_revision: int,
+) -> None:
+    telegram_user_id = payload.get("telegram_user_id")
+    if (
+        not isinstance(telegram_user_id, int)
+        or isinstance(telegram_user_id, bool)
+        or telegram_user_id < 1
+    ):
+        raise ValueError("Source Chat contract requires a positive telegram_user_id")
+    if contract_name in {
+        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+    }:
+        _validate_source_chat_address(_required_text(payload, "address"))
+    if contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION:
+        _validate_source_chat_generation(payload, subject_revision=subject_revision)
+    if contract_name in {
+        ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+        ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+    }:
+        _required_uuid_text(payload, "registration_request_id")
+    if contract_name not in {
+        ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+    }:
+        return
+    peer_kind = _required_text(payload, "telegram_peer_kind")
+    if peer_kind not in {"chat", "channel"}:
+        raise ValueError("Source Chat contract requires a chat or channel peer")
+    telegram_chat_id = payload.get("telegram_chat_id")
+    if (
+        not isinstance(telegram_chat_id, int)
+        or isinstance(telegram_chat_id, bool)
+        or telegram_chat_id < 1
+    ):
+        raise ValueError("Source Chat contract requires a positive telegram_chat_id")
+    source_chat_key = _required_text(payload, "source_chat_key")
+    expected_key = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{peer_kind}:{telegram_chat_id}:source-chat",
+        )
+    )
+    if source_chat_key != subject_id or source_chat_key != expected_key:
+        raise ValueError("Source Chat key must identify the stable Telegram peer")
+    _validate_source_chat_generation(payload, subject_revision=subject_revision)
+    if contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED:
+        return
+    address_kind = _required_text(payload, "address_kind")
+    current_address = _required_text(payload, "current_address")
+    if address_kind == "public_username":
+        if not current_address.startswith("@"):
+            raise ValueError("public Source Chat address must be a username")
+    elif address_kind == "private_invite":
+        if not current_address.startswith("https://t.me/+"):
+            raise ValueError("private Source Chat address must be a Telegram invite")
+    else:
+        raise ValueError("Source Chat contract requires a supported address kind")
+    if not _required_text(payload, "transport_boundary").strip():
+        raise ValueError("Source Chat contract requires a transport boundary")
+
+
+def _validate_source_chat_address(address: str) -> None:
+    if (
+        address.startswith("@")
+        and len(address) > 1
+        and not any(character.isspace() for character in address)
+    ):
+        return
+    if address.startswith("https://t.me/+") and len(address) > len("https://t.me/+"):
+        return
+    raise ValueError("Source Chat address must be a username or private invite")
+
+
+def _validate_source_chat_generation(
+    payload: dict[str, JsonValue],
+    *,
+    subject_revision: int,
+) -> None:
+    generation = payload.get("registry_generation")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or generation != subject_revision
+    ):
+        raise ValueError("Source Chat generation must match its subject revision")
+
+
+def _required_uuid_text(payload: dict[str, JsonValue], field_name: str) -> str:
+    value = _required_text(payload, field_name)
+    try:
+        UUID(value)
+    except ValueError as error:
+        raise ValueError(f"Source Chat contract requires UUID {field_name}") from error
     return value

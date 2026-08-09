@@ -5305,9 +5305,17 @@ class RuntimeApplication:
             try:
                 supported_incoming = ContractEnvelope.from_raw(incoming)
             except (TypeError, ValueError):
+                outgoing = None
+                if (
+                    self.role is RuntimeRole.APPLICATION
+                    and incoming.contract_name
+                    is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
+                ):
+                    outgoing = self._invalid_source_chat_registration_failure(incoming)
                 self.store.reject_invalid_contract(
                     incoming=incoming,
                     received_at=self.clock.now(),
+                    outgoing=outgoing,
                 )
                 return True
         if (
@@ -5528,6 +5536,36 @@ class RuntimeApplication:
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
 
+    def _invalid_source_chat_registration_failure(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> ContractEnvelope | None:
+        context = self.store.source_chat_registration_context(incoming.correlation_id)
+        if context is None:
+            return None
+        telegram_user_id, _registry_generation = context
+        recorded_at = self.clock.now()
+        return ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+            contract_version=1,
+            message_id=_runtime_identifier(
+                str(incoming.message_id),
+                ContractName.SOURCE_CHAT_REGISTRATION_FAILED.value,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=incoming.subject_id,
+            subject_revision=1,
+            idempotency_key=f"source-chat-registration-failed:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "registration_request_id": str(incoming.causation_id),
+                "telegram_user_id": telegram_user_id,
+            },
+        )
+
     def _admit_source_chat(
         self,
         incoming: ContractEnvelope,
@@ -5559,28 +5597,6 @@ class RuntimeApplication:
                     resolution.identity
                 )
             )
-        except SourceChatAdmissionError:
-            outgoing = ContractEnvelope(
-                contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
-                contract_version=1,
-                message_id=_runtime_identifier(
-                    str(incoming.message_id),
-                    ContractName.SOURCE_CHAT_ADMISSION_FAILED.value,
-                ),
-                producer=RuntimeRole.INGESTION,
-                consumer=RuntimeRole.APPLICATION,
-                subject_id=incoming.subject_id,
-                subject_revision=1,
-                idempotency_key=f"source-chat-admission-failed:{incoming.message_id}",
-                causation_id=incoming.message_id,
-                correlation_id=incoming.correlation_id,
-                recorded_at=recorded_at,
-                payload={
-                    "registration_request_id": str(incoming.message_id),
-                    "telegram_user_id": telegram_user_id,
-                },
-            )
-        else:
             source_chat_key = str(
                 _runtime_identifier(
                     f"{resolution.identity.kind.value}:"
@@ -5612,6 +5628,27 @@ class RuntimeApplication:
                     "current_address": resolution.current_address,
                     "transport_boundary": transport_boundary,
                     "registry_generation": registry_generation,
+                },
+            )
+        except (SourceChatAdmissionError, TypeError, ValueError):
+            outgoing = ContractEnvelope(
+                contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+                contract_version=1,
+                message_id=_runtime_identifier(
+                    str(incoming.message_id),
+                    ContractName.SOURCE_CHAT_ADMISSION_FAILED.value,
+                ),
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=incoming.subject_id,
+                subject_revision=1,
+                idempotency_key=f"source-chat-admission-failed:{incoming.message_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+                payload={
+                    "registration_request_id": str(incoming.message_id),
+                    "telegram_user_id": telegram_user_id,
                 },
             )
         if inject_outbox_conflict:
@@ -5753,6 +5790,17 @@ class RuntimeApplication:
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        registration_context = self.store.source_chat_registration_context(
+            incoming.correlation_id
+        )
+        if registration_context != (telegram_user_id, registry_generation):
+            failure = self._invalid_source_chat_registration_failure(incoming)
+            self.store.reject_invalid_contract(
+                incoming=incoming,
+                received_at=registered_at,
+                outgoing=failure,
+            )
+            return
         if telegram_user_id != self.telegram_admin_user_id:
             self._fail_source_chat_registration(
                 incoming,

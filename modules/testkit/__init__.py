@@ -1019,6 +1019,18 @@ class AcceptanceSpine:
         """Inject an invalid supported Completed Search query."""
         return self._observer.invalidate_completed_search_query(completed_search_id)
 
+    def invalidate_source_chat_admission(
+        self,
+        *,
+        update_id: str,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject invalid Source Chat admission facts at the wire boundary."""
+        return self._observer.invalidate_source_chat_admission(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            payload_updates,
+        )
+
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical Completed Search query."""
         self._observer.restore_completed_search_query(query)

@@ -21,6 +21,7 @@ from modules.contracts import (
     ContractName,
     FailureCode,
     GetCompletedSearch,
+    JsonValue,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
@@ -679,6 +680,49 @@ class PostgresAcceptanceObserver:
         if changed is None:
             raise LookupError(completed_search_id)
         return _row_to_envelope(row)
+
+    def invalidate_source_chat_admission(
+        self,
+        correlation_id: UUID,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Corrupt one Source Chat admission to inject a wire-boundary fault."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE correlation_id = %s
+                  AND contract_name = %s
+                FOR UPDATE
+                """,
+                (
+                    correlation_id,
+                    ContractName.SOURCE_CHAT_ADMISSION_RESOLVED.value,
+                ),
+            ).fetchone()
+            if row is None:
+                raise LookupError(correlation_id)
+            original = _row_to_envelope(row)
+            payload = row["payload"]
+            if not isinstance(payload, dict):
+                raise TypeError("SourceChatAdmissionResolved payload must be an object")
+            payload.update(payload_updates)
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = %s::jsonb
+                WHERE message_id = %s
+                RETURNING message_id
+                """,
+                (json.dumps(payload), row["message_id"]),
+            ).fetchone()
+        if changed is None:
+            raise LookupError(correlation_id)
+        return original
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical query after a controlled fault."""
@@ -1447,6 +1491,7 @@ class PostgresRoleStore:
         *,
         incoming: RawContractEnvelope,
         received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Reject malformed supported-version work without applying owner state."""
         with psycopg.connect(self._database_url) as connection:
@@ -1459,6 +1504,9 @@ class PostgresRoleStore:
                 """,
                 (self._role.value, incoming.message_id),
             ).fetchone()
+            should_publish = (
+                existing is None or existing[0] != "rejected_invalid_contract"
+            )
             if existing is None:
                 connection.execute(
                     """
@@ -1503,8 +1551,45 @@ class PostgresRoleStore:
                         failure_code=FailureCode.INVALID_CONTRACT,
                         observed_at=received_at,
                     )
+            if should_publish and outgoing is not None:
+                _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
             return ConsumeResult.REJECTED
+
+    def source_chat_registration_context(
+        self,
+        correlation_id: UUID,
+    ) -> tuple[int, int] | None:
+        """Read Application's own admission request context by correlation."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT payload -> 'telegram_user_id',
+                       payload -> 'registry_generation'
+                FROM football_runtime.contract_outbox
+                WHERE correlation_id = %s
+                  AND producer_role = %s
+                  AND contract_name = %s
+                """,
+                (
+                    correlation_id,
+                    RuntimeRole.APPLICATION.value,
+                    ContractName.REQUEST_SOURCE_CHAT_ADMISSION.value,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        telegram_user_id, registry_generation = row
+        if (
+            not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
+        ):
+            raise RuntimeError("Application admission context is invalid")
+        return telegram_user_id, registry_generation
 
     @contextmanager
     def serialize_conversation_update(
