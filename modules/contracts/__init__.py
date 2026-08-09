@@ -185,7 +185,6 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.INGESTION,
         RuntimeRole.APPLICATION,
         "registration_request_id",
-        ("telegram_user_id",),
     ),
     ContractDefinition(
         ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
@@ -540,13 +539,52 @@ def _validate_source_chat_contract(
     subject_id: str,
     subject_revision: int,
 ) -> None:
-    telegram_user_id = payload.get("telegram_user_id")
-    if (
-        not isinstance(telegram_user_id, int)
-        or isinstance(telegram_user_id, bool)
-        or telegram_user_id < 1
-    ):
-        raise ValueError("Source Chat contract requires a positive telegram_user_id")
+    if contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION and set(payload) - {
+        "address",
+        "telegram_user_id",
+        "registry_generation",
+    }:
+        raise ValueError("RequestSourceChatAdmission contains unsupported facts")
+    if contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED and set(payload) - {
+        "source_chat_key",
+        "telegram_user_id",
+        "telegram_peer_kind",
+        "telegram_chat_id",
+        "address_kind",
+        "current_address",
+        "transport_boundary",
+        "registry_generation",
+    }:
+        raise ValueError("SourceChatAdmissionResolved contains unsupported facts")
+    if contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED and set(payload) - {
+        "source_chat_key",
+        "telegram_user_id",
+        "telegram_peer_kind",
+        "telegram_chat_id",
+        "registry_generation",
+    }:
+        raise ValueError("SourceChatGenerationChanged contains unsupported facts")
+    if contract_name is ContractName.SOURCE_CHAT_ADMISSION_FAILED and set(payload) - {
+        "registration_request_id",
+    }:
+        raise ValueError("SourceChatAdmissionFailed contains unsupported facts")
+    if contract_name is ContractName.SOURCE_CHAT_REGISTRATION_FAILED and set(
+        payload
+    ) - {
+        "registration_request_id",
+        "telegram_user_id",
+    }:
+        raise ValueError("SourceChatRegistrationFailed contains unsupported facts")
+    if contract_name is not ContractName.SOURCE_CHAT_ADMISSION_FAILED:
+        telegram_user_id = payload.get("telegram_user_id")
+        if (
+            not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+            or telegram_user_id < 1
+        ):
+            raise ValueError(
+                "Source Chat contract requires a positive telegram_user_id"
+            )
     if contract_name in {
         ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
         ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
@@ -601,15 +639,20 @@ def _validate_source_chat_contract(
 
 
 def _validate_source_chat_address(address: str) -> None:
+    if is_valid_source_chat_address(address):
+        return
+    raise ValueError("Source Chat address must be a username or private invite")
+
+
+def is_valid_source_chat_address(address: str) -> bool:
+    """Return whether an administrator-entered Source Chat address is valid."""
     if (
         address.startswith("@")
         and len(address) > 1
         and not any(character.isspace() for character in address)
     ):
-        return
-    if address.startswith("https://t.me/+") and len(address) > len("https://t.me/+"):
-        return
-    raise ValueError("Source Chat address must be a username or private invite")
+        return True
+    return address.startswith("https://t.me/+") and len(address) > len("https://t.me/+")
 
 
 def _validate_source_chat_generation(

@@ -359,8 +359,26 @@ class ConversationStore(Protocol):
         state: ConversationState,
         message: TelegramMessage,
         received_at: datetime,
+        invalid_contract: bool = False,
     ) -> ConsumeResult:
         """Consume one admission result and queue its Bot presentation atomically."""
+        ...
+
+    def source_chat_registration_originator(
+        self,
+        correlation_id: UUID,
+    ) -> int | None:
+        """Recover the Bot-owned originator for one pending registration."""
+        ...
+
+    def reject_invalid_contract(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
+    ) -> ConsumeResult:
+        """Durably reject one supported-version envelope with invalid semantics."""
         ...
 
     def defer_start_to_pending_search_result(
@@ -531,6 +549,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read application-owned Source Chats through a stable query."""
         ...
 
+    def eligible_source_chat_generation(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> SourceChatRegistryEntry | None:
+        """Return only the enabled current generation for an incoming event."""
+        ...
+
     def claim_next(
         self,
         *,
@@ -588,16 +615,6 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         received_at: datetime,
     ) -> ConsumeResult:
         """Atomically persist a zero-result Completed Search and its event."""
-        ...
-
-    def reject_invalid_contract(
-        self,
-        *,
-        incoming: RawContractEnvelope,
-        received_at: datetime,
-        outgoing: ContractEnvelope | None = None,
-    ) -> ConsumeResult:
-        """Durably reject one supported-version envelope with invalid semantics."""
         ...
 
     def source_chat_registration_context(
@@ -660,6 +677,15 @@ class AcceptanceObserver(Protocol):
         payload_updates: dict[str, JsonValue],
     ) -> RawContractEnvelope:
         """Inject invalid Source Chat facts at the privileged test seam."""
+        ...
+
+    def invalidate_source_chat_contract(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject one selected Source Chat wire fault at the test seam."""
         ...
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:

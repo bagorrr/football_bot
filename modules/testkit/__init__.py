@@ -1051,6 +1051,20 @@ class AcceptanceSpine:
             payload_updates,
         )
 
+    def invalidate_source_chat_contract(
+        self,
+        *,
+        update_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject one selected Source Chat contract fault by originating update."""
+        return self._observer.invalidate_source_chat_contract(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            contract_name,
+            payload_updates,
+        )
+
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical Completed Search query."""
         self._observer.restore_completed_search_query(query)
@@ -1377,6 +1391,20 @@ class AcceptanceSpine:
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
         """Observe the application-owned Source Chat registry."""
         return self._roles[RuntimeRole.APPLICATION].store.source_chats()
+
+    def eligible_source_chat_generation(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> SourceChatRegistryEntry | None:
+        """Observe event eligibility through the Application registry owner."""
+        return self._roles[
+            RuntimeRole.APPLICATION
+        ].store.eligible_source_chat_generation(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
 
     def process_searches_until_idle(self) -> None:
         """Let recommendation and Bot Assistant finish durable Search work."""

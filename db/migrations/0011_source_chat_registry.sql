@@ -47,6 +47,10 @@ CREATE TABLE football_runtime.source_chat_registry (
     PRIMARY KEY (peer_kind, telegram_chat_id, registry_generation)
 );
 
+CREATE UNIQUE INDEX source_chat_registry_one_enabled_generation
+    ON football_runtime.source_chat_registry (peer_kind, telegram_chat_id)
+    WHERE enabled;
+
 ALTER TABLE football_runtime.source_chat_registry ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.source_chat_registry FORCE ROW LEVEL SECURITY;
 
@@ -69,5 +73,38 @@ REVOKE ALL ON football_runtime.source_chat_registry FROM
     football_bot_assistant;
 GRANT SELECT, INSERT
     ON football_runtime.source_chat_registry TO football_application;
-GRANT UPDATE (address_kind, current_address, updated_at)
+GRANT UPDATE (address_kind, current_address, enabled, updated_at)
     ON football_runtime.source_chat_registry TO football_application;
+
+CREATE TABLE football_runtime.source_chat_admission_requests (
+    owner_role text NOT NULL DEFAULT 'application'
+        CHECK (owner_role = 'application'),
+    correlation_id uuid PRIMARY KEY,
+    request_message_id uuid NOT NULL UNIQUE,
+    telegram_user_id bigint NOT NULL CHECK (telegram_user_id > 0),
+    registry_generation bigint NOT NULL CHECK (registry_generation > 0),
+    recorded_at timestamptz NOT NULL
+);
+
+ALTER TABLE football_runtime.source_chat_admission_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.source_chat_admission_requests FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY source_chat_admission_requests_application_owner
+    ON football_runtime.source_chat_admission_requests
+    USING (
+        football_runtime.current_runtime_role() = 'application'
+        AND owner_role = 'application'
+    )
+    WITH CHECK (
+        football_runtime.current_runtime_role() = 'application'
+        AND owner_role = 'application'
+    );
+
+REVOKE ALL ON football_runtime.source_chat_admission_requests FROM
+    football_ingestion,
+    football_application,
+    football_classification,
+    football_recommendation,
+    football_bot_assistant;
+GRANT SELECT, INSERT
+    ON football_runtime.source_chat_admission_requests TO football_application;
