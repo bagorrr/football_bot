@@ -5,14 +5,27 @@
 from __future__ import annotations
 
 import re
-from dataclasses import replace
-from datetime import UTC, date, timedelta
+from collections.abc import Iterable
+from contextlib import suppress
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime, timedelta
 from enum import IntEnum
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from modules.contracts import (
+    SUPPORTED_CONTRACTS,
+    ContractDefinition,
+    ContractEnvelope,
+    ContractName,
+    GetCompletedSearch,
+    JsonValue,
+    RawContractEnvelope,
+    RuntimeRole,
+)
 from modules.domain import (
     AcceptedLocation,
+    CompletedSearch,
     ConversationStage,
     ConversationState,
     DateInterpretation,
@@ -28,6 +41,7 @@ from modules.domain import (
     LocationCandidate,
     LocationInterpretation,
     LocationResolutionQuery,
+    ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
     TelegramDeliveryMode,
@@ -35,15 +49,20 @@ from modules.domain import (
     UserIntent,
 )
 from modules.ports import (
+    AcceptanceRoleStore,
     Clock,
+    CompletedSearchQueryStatus,
     ConversationLanguageAdapter,
     ConversationStore,
     DateInterpretationAdapter,
     DateInterpretationError,
     LocationResolverAdapter,
     LocationResolverError,
+    ModelAdapter,
+    OutboxConflictError,
     TelegramDeliveryAdapter,
     TelegramDeliveryPreEffectError,
+    TelegramIngestionAdapter,
     TimezoneDataAdapter,
     TimezoneDataError,
 )
@@ -698,6 +717,78 @@ _POST_CORE_COPY = {
     ),
 }
 
+_ZERO_RESULT_COPY = {
+    "en": (
+        "🔎 **No matches found**\n\n"
+        "No suitable options match your current criteria.\n"
+        "Tell me what to change in the search, or start a new search.",
+        "New search",
+        "Menu",
+    ),
+    "ru": (
+        "🔎 **Совпадений не найдено**\n\n"
+        "По текущим условиям подходящих вариантов нет.\n"
+        "Напишите, что изменить в поиске, или начните новый поиск.",
+        "Новый поиск",
+        "Меню",
+    ),
+    "es": (
+        "🔎 **No se encontraron coincidencias**\n\n"
+        "No hay opciones adecuadas para las condiciones actuales.\n"
+        "Indique qué desea cambiar o inicie una nueva búsqueda.",
+        "Nueva búsqueda",
+        "Menú",
+    ),
+    "fr": (
+        "🔎 **Aucune correspondance trouvée**\n\n"
+        "Aucune option ne correspond aux critères actuels.\n"
+        "Indiquez ce qu’il faut modifier ou lancez une nouvelle recherche.",
+        "Nouvelle recherche",
+        "Menu",
+    ),
+}
+
+_SEARCH_FAILURE_COPY = {
+    "en": (
+        "⚠️ **Search couldn't be completed**\n\n"
+        "Your confirmed search details are safe. Try again.",
+        "Retry",
+    ),
+    "ru": (
+        "⚠️ **Не удалось выполнить поиск**\n\n"
+        "Все подтверждённые параметры сохранены. Попробуйте снова.",
+        "Повторить",
+    ),
+    "es": (
+        "⚠️ **No se pudo completar la búsqueda**\n\n"
+        "Tus datos confirmados están a salvo. Inténtalo de nuevo.",
+        "Reintentar",
+    ),
+    "fr": (
+        "⚠️ **La recherche n’a pas abouti**\n\n"
+        "Vos critères confirmés sont conservés. Réessayez.",
+        "Réessayer",
+    ),
+}
+
+_SUBMITTING_COPY = {
+    "en": (
+        "🔎 **Searching**\n\n"
+        "I am looking for matches using your confirmed search details."
+    ),
+    "ru": (
+        "🔎 **Ищу варианты**\n\n"
+        "Проверяю совпадения по подтверждённым параметрам поиска."
+    ),
+    "es": (
+        "🔎 **Buscando**\n\nEstoy buscando coincidencias con tus criterios confirmados."
+    ),
+    "fr": (
+        "🔎 **Recherche en cours**\n\n"
+        "Je cherche des résultats selon vos critères confirmés."
+    ),
+}
+
 _REQUIRED_DATE_FEEDBACK = {
     "en": (
         "I couldn't identify one date or bounded range. Please try again.",
@@ -905,6 +996,7 @@ class ConversationOnboarding:
         date_interpretation: DateInterpretationAdapter,
         timezone_data: TimezoneDataAdapter,
         clock: Clock,
+        supported_query_versions: Iterable[int] = (1,),
     ) -> None:
         self._store = store
         self._telegram_delivery = telegram_delivery
@@ -913,6 +1005,7 @@ class ConversationOnboarding:
         self._date_interpretation = date_interpretation
         self._timezone_data = timezone_data
         self._clock = clock
+        self._supported_query_versions = frozenset(supported_query_versions)
 
     def start(
         self,
@@ -940,6 +1033,242 @@ class ConversationOnboarding:
             inactive_before=self._clock.now() - timedelta(days=30)
         )
 
+    def submit_search(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Submit one complete Discovery Draft through the RunSearch contract."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            if (
+                draft.user_intent is None
+                or draft.country is None
+                or draft.city is None
+                or draft.whole_city is None
+                or (not draft.whole_city and not draft.sub_city_areas)
+                or (
+                    draft.user_intent in _DATE_REQUIRED_INTENTS
+                    and draft.required_date is None
+                )
+            ):
+                raise RuntimeError(
+                    "Search requires a complete confirmed discovery core"
+                )
+            now = self._clock.now()
+            state = replace(
+                current,
+                stage=ConversationStage.SUBMITTING,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                stage=ConversationStage.SUBMITTING,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                search_submission_update_id=update_id,
+            )
+            message_id = uuid5(
+                NAMESPACE_URL,
+                f"football-bot:run-search:{telegram_user_id}:{update_id}",
+            )
+            command = ContractEnvelope(
+                contract_name=ContractName.RUN_SEARCH,
+                contract_version=1,
+                message_id=message_id,
+                producer=RuntimeRole.BOT_ASSISTANT,
+                consumer=RuntimeRole.RECOMMENDATION,
+                subject_id=f"bot-user:{telegram_user_id}",
+                subject_revision=changed_draft.revision,
+                idempotency_key=f"run-search:{telegram_user_id}:{update_id}",
+                causation_id=message_id,
+                correlation_id=message_id,
+                recorded_at=now,
+                payload={
+                    "search_update_id": update_id,
+                    "telegram_user_id": telegram_user_id,
+                    "display_locale": current.locale,
+                    "user_intent": draft.user_intent.value,
+                    "country_id": draft.country.place_id,
+                    "city_id": draft.city.place_id,
+                    "sub_city_area_ids": [
+                        area.place_id for area in draft.sub_city_areas
+                    ],
+                    "whole_city": draft.whole_city,
+                    "required_date": _required_date_payload(draft.required_date),
+                },
+            )
+            accepted = self._store.commit_search_submission(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                draft=changed_draft,
+                command=command,
+                recorded_at=now,
+            )
+            if accepted:
+                active_view = self._store.active_conversation_view(telegram_user_id)
+                if active_view is not None:
+                    self._telegram_delivery.remove_inline_actions(
+                        telegram_user_id=telegram_user_id,
+                        telegram_message_id=active_view.telegram_message_id,
+                    )
+                self._telegram_delivery.show_typing(telegram_user_id=telegram_user_id)
+
+    def accept_search_completion(self, *, incoming: RawContractEnvelope) -> None:
+        """Queue the result screen while preserving the prior authoritative view."""
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SearchCompleted payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        completed_search_id = payload.get("completed_search_id")
+        search_update_id = payload.get("search_update_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SearchCompleted requires telegram_user_id")
+        if not isinstance(completed_search_id, str) or not completed_search_id:
+            raise ValueError("SearchCompleted requires completed_search_id")
+        if not isinstance(search_update_id, str) or not search_update_id:
+            raise ValueError("SearchCompleted requires search_update_id")
+        current = self._store.conversation_state(telegram_user_id)
+        draft = self._store.discovery_draft(telegram_user_id)
+        if current is None or draft is None:
+            self._store.dispose_search_outcome(
+                incoming=incoming,
+                received_at=self._clock.now(),
+            )
+            return
+        if (
+            current.stage is not ConversationStage.SUBMITTING
+            or draft.stage is not ConversationStage.SUBMITTING
+            or draft.search_submission_update_id != search_update_id
+        ):
+            self._store.dispose_search_outcome(
+                incoming=incoming,
+                received_at=self._clock.now(),
+            )
+            return
+        now = self._clock.now()
+        query_result = self._store.get_completed_search(
+            GetCompletedSearch.request_id(completed_search_id),
+            supported_versions=self._supported_query_versions,
+            received_at=now,
+        )
+        if query_result.status in {
+            CompletedSearchQueryStatus.MISSING,
+            CompletedSearchQueryStatus.INVALID_CONTRACT,
+            CompletedSearchQueryStatus.UNSUPPORTED_VERSION,
+        }:
+            return
+        completed_search = query_result.view
+        result_count = payload.get("result_count")
+        if (
+            completed_search is None
+            or completed_search.completed_search.telegram_user_id != telegram_user_id
+            or completed_search.completed_search.search_update_id != search_update_id
+            or len(completed_search.results) != result_count
+        ):
+            self._store.dispose_search_outcome(
+                incoming=incoming,
+                received_at=now,
+            )
+            return
+        message = _zero_result_message(
+            delivery_id=f"search-result:{completed_search_id}",
+            telegram_user_id=telegram_user_id,
+            locale=current.locale or "en",
+            screen_revision=current.screen_revision + 1,
+        )
+        self._store.accept_search_completion(
+            incoming=incoming,
+            expected_state_revision=current.revision,
+            expected_draft_revision=draft.revision,
+            message=message,
+            received_at=self._clock.now(),
+        )
+
+    def accept_search_failure(self, *, incoming: RawContractEnvelope) -> None:
+        """Restore the confirmed draft and expose an idempotent Retry action."""
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SearchFailed payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        search_update_id = payload.get("search_update_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SearchFailed requires telegram_user_id")
+        if not isinstance(search_update_id, str) or not search_update_id:
+            raise ValueError("SearchFailed requires search_update_id")
+        current = self._store.conversation_state(telegram_user_id)
+        draft = self._store.discovery_draft(telegram_user_id)
+        if current is None or draft is None:
+            self._store.dispose_search_outcome(
+                incoming=incoming,
+                received_at=self._clock.now(),
+            )
+            return
+        if (
+            current.stage is not ConversationStage.SUBMITTING
+            or draft.stage is not ConversationStage.SUBMITTING
+            or draft.search_submission_update_id != search_update_id
+        ):
+            self._store.dispose_search_outcome(
+                incoming=incoming,
+                received_at=self._clock.now(),
+            )
+            return
+        now = self._clock.now()
+        screen_revision = current.screen_revision + 1
+        state = replace(
+            current,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=screen_revision,
+            revision=current.revision + 1,
+        )
+        restored_draft = replace(
+            draft,
+            stage=ConversationStage.POST_CORE,
+            screen_revision=screen_revision,
+            revision=draft.revision + 1,
+            last_activity_at=now,
+            search_submission_update_id=None,
+        )
+        locale = current.locale or "en"
+        copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+        text, retry_label = _SEARCH_FAILURE_COPY[copy_locale]
+        message = TelegramMessage(
+            delivery_id=f"search-failed:{search_update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=text,
+            button_rows=(((retry_label, f"search:retry:{screen_revision}"),),),
+        )
+        self._store.accept_search_failure(
+            incoming=incoming,
+            state=state,
+            draft=restored_draft,
+            message=message,
+            received_at=now,
+        )
+
     def _apply_start(
         self,
         *,
@@ -956,6 +1285,16 @@ class ConversationOnboarding:
                 inactive_before=now - timedelta(days=30),
             )
         draft = self._store.discovery_draft(telegram_user_id)
+        if (
+            current is not None
+            and current.stage is ConversationStage.SUBMITTING
+            and self._store.defer_start_to_pending_search_result(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                recorded_at=now,
+            )
+        ):
+            return
         if current is None:
             current = ConversationState(
                 telegram_user_id=telegram_user_id,
@@ -2657,7 +2996,7 @@ class ConversationOnboarding:
             stale_before=claimed_at - timedelta(minutes=5),
         )
         if claim is None:
-            return False
+            return self._cleanup_old_chat_view()
         message = claim.message
         if claim.mode is TelegramDeliveryMode.SEND:
             try:
@@ -2695,6 +3034,40 @@ class ConversationOnboarding:
             claim_token=claim_token,
             telegram_message_id=telegram_message_id,
             delivered_at=self._clock.now(),
+        )
+        self._cleanup_old_chat_view()
+        return True
+
+    def _cleanup_old_chat_view(self) -> bool:
+        """Attempt one durable cleanup without making it a correctness dependency."""
+        claim_token = uuid4()
+        claimed_at = self._clock.now()
+        cleanup = self._store.claim_old_chat_view_cleanup(
+            claim_token=claim_token,
+            claimed_at=claimed_at,
+            stale_before=claimed_at - timedelta(minutes=5),
+        )
+        if cleanup is None:
+            return False
+        deleted = False
+        try:
+            deleted = self._telegram_delivery.delete_message(
+                telegram_user_id=cleanup.telegram_user_id,
+                telegram_message_id=cleanup.telegram_message_id,
+            )
+        except Exception:
+            deleted = False
+        if not deleted:
+            with suppress(Exception):
+                self._telegram_delivery.remove_inline_actions(
+                    telegram_user_id=cleanup.telegram_user_id,
+                    telegram_message_id=cleanup.telegram_message_id,
+                )
+        self._store.mark_old_chat_view_cleanup_attempted(
+            delivery_id=cleanup.delivery_id,
+            claim_token=cleanup.claim_token,
+            deleted=deleted,
+            attempted_at=self._clock.now(),
         )
         return True
 
@@ -3080,6 +3453,13 @@ def _discovery_message(
             areas=draft.sub_city_areas,
             whole_city=draft.whole_city,
         )
+    if draft.stage is ConversationStage.SUBMITTING:
+        return _submitting_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+        )
     raise RuntimeError(f"unsupported Discovery Draft stage: {draft.stage}")
 
 
@@ -3325,6 +3705,56 @@ def _post_core_message(
     )
 
 
+def _zero_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    text, new_search_label, menu_label = _ZERO_RESULT_COPY[copy_locale]
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(((new_search_label, f"menu:new-search:{screen_revision}"),),),
+        reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _submitting_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=_SUBMITTING_COPY[copy_locale],
+        button_rows=(),
+    )
+
+
+def _required_date_payload(required_date: RequiredDate | None) -> JsonValue:
+    if required_date is None:
+        return None
+    return {
+        "start_local_date": required_date.start_local_date.isoformat(),
+        "end_local_date": required_date.end_local_date.isoformat(),
+        "iana_timezone": required_date.iana_timezone,
+        "timezone_data_version": required_date.timezone_data_version,
+    }
+
+
 def _valid_required_date_proposal(
     proposal: DateInterpretation,
     *,
@@ -3355,4 +3785,499 @@ def _search_area_summary(
     return (
         f"{_location_label(country, locale)} → {_location_label(city, locale)}"
         f" → {scope}"
+    )
+
+
+_RUNTIME_CONTRACTS = {
+    (definition.name, definition.version): definition
+    for definition in SUPPORTED_CONTRACTS
+}
+
+
+class RuntimeProcessingError(RuntimeError):
+    """A runtime transaction rejected an intentionally conflicting outbox ID."""
+
+
+@dataclass(slots=True)
+class RuntimeApplication:
+    """Process one independently restartable runtime responsibility."""
+
+    role: RuntimeRole
+    store: AcceptanceRoleStore
+    clock: Clock
+    telegram_ingestion: TelegramIngestionAdapter | None = None
+    telegram_delivery: TelegramDeliveryAdapter | None = None
+    model: ModelAdapter | None = None
+    location_resolver: LocationResolverAdapter | None = None
+    conversation_language: ConversationLanguageAdapter | None = None
+    date_interpretation: DateInterpretationAdapter | None = None
+    timezone_data: TimezoneDataAdapter | None = None
+    supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
+    search_failures_remaining: int = 0
+
+    def __post_init__(self) -> None:
+        if self.supported_versions:
+            return
+        for definition in SUPPORTED_CONTRACTS:
+            if definition.consumer is self.role and (
+                definition.version == 1
+                or (
+                    definition.name is ContractName.SEARCH_COMPLETED
+                    and definition.version == 2
+                )
+            ):
+                self.supported_versions.setdefault(definition.name, set()).add(
+                    definition.version
+                )
+
+    def supports(self, contract_name: ContractName, version: int) -> None:
+        """Add one explicit consumer contract version."""
+        self.supported_versions.setdefault(contract_name, {1}).add(version)
+
+    def versions_for(self, contract_name: ContractName) -> set[int]:
+        """Return explicit versions supported by this consumer."""
+        return set(self.supported_versions.get(contract_name, set()))
+
+    def record_source_event(
+        self,
+        probe_id: str,
+        *,
+        contract_version: int,
+        payload: JsonValue | None = None,
+    ) -> None:
+        """Commit one Source Event through the ingestion application port."""
+        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
+            raise RuntimeError("only the ingestion runtime can record a Source Event")
+        correlation_id = _runtime_identifier(probe_id, "correlation")
+        source_event_id = self.telegram_ingestion.source_event_id(probe_id)
+        definition = _RUNTIME_CONTRACTS.get(
+            (ContractName.SOURCE_EVENT_RECORDED, contract_version)
+        )
+        if definition is not None and payload is None:
+            envelope: RawContractEnvelope = _runtime_envelope(
+                definition=definition,
+                probe_id=probe_id,
+                version=contract_version,
+                fact=source_event_id,
+                causation_id=correlation_id,
+                correlation_id=correlation_id,
+                recorded_at=self.clock.now(),
+            )
+        else:
+            envelope = RawContractEnvelope(
+                contract_name=ContractName.SOURCE_EVENT_RECORDED,
+                contract_version=contract_version,
+                message_id=_runtime_identifier(
+                    probe_id,
+                    ContractName.SOURCE_EVENT_RECORDED.value,
+                ),
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=probe_id,
+                subject_revision=1,
+                idempotency_key=(
+                    f"{probe_id}:{ContractName.SOURCE_EVENT_RECORDED.value}"
+                ),
+                causation_id=correlation_id,
+                correlation_id=correlation_id,
+                recorded_at=self.clock.now(),
+                payload=payload
+                if payload is not None
+                else {"probe_id": probe_id, "source_event_id": source_event_id},
+            )
+        self.store.commit_initial(probe_id=probe_id, envelope=envelope)
+
+    def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
+        """Discover and process one durable handoff addressed to this role."""
+        incoming = self.store.claim_next(
+            supported_versions=self.supported_versions,
+            claimed_at=self.clock.now(),
+        )
+        if incoming is None:
+            return False
+        supported_incoming = None
+        if incoming.contract_version in self.versions_for(incoming.contract_name):
+            try:
+                supported_incoming = ContractEnvelope.from_raw(incoming)
+            except (TypeError, ValueError):
+                self.store.reject_invalid_contract(
+                    incoming=incoming,
+                    received_at=self.clock.now(),
+                )
+                return True
+        if (
+            incoming.contract_name is ContractName.RUN_SEARCH
+            and supported_incoming is not None
+        ):
+            self._complete_search(supported_incoming)
+            return True
+        if (
+            incoming.contract_name is ContractName.SEARCH_COMPLETED
+            and supported_incoming is not None
+            and incoming.contract_version == 2
+        ):
+            self._conversation_onboarding().accept_search_completion(
+                incoming=supported_incoming
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SEARCH_FAILED
+            and supported_incoming is not None
+        ):
+            self._conversation_onboarding().accept_search_failure(
+                incoming=supported_incoming
+            )
+            return True
+        if incoming.contract_name is ContractName.GET_COMPLETED_SEARCH:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return True
+        outgoing = None
+        if supported_incoming is not None:
+            definition, fact = self._next_handoff(supported_incoming)
+            outgoing = _runtime_envelope(
+                definition=definition,
+                probe_id=_runtime_probe_id(supported_incoming),
+                version=definition.version,
+                fact=fact,
+                subject_id=(
+                    fact
+                    if definition.name is ContractName.SEARCH_COMPLETED
+                    else incoming.subject_id
+                ),
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=self.clock.now(),
+            )
+            if inject_outbox_conflict:
+                outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+        return True
+
+    def fail_next_search(self) -> None:
+        """Inject one controlled Recommendation execution failure."""
+        if self.role is not RuntimeRole.RECOMMENDATION:
+            raise RuntimeError("only Recommendation executes Search")
+        self.search_failures_remaining += 1
+
+    def _complete_search(self, incoming: RawContractEnvelope) -> None:
+        if self.role is not RuntimeRole.RECOMMENDATION:
+            raise RuntimeError("only Recommendation can complete a Search")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("RunSearch payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        search_update_id = payload.get("search_update_id")
+        user_intent = payload.get("user_intent")
+        country_id = payload.get("country_id")
+        city_id = payload.get("city_id")
+        area_ids = payload.get("sub_city_area_ids")
+        whole_city = payload.get("whole_city")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("RunSearch requires telegram_user_id")
+        if not isinstance(search_update_id, str) or not search_update_id:
+            raise ValueError("RunSearch requires search_update_id")
+        if not isinstance(user_intent, str):
+            raise TypeError("RunSearch requires user_intent")
+        if not isinstance(country_id, str) or not country_id:
+            raise ValueError("RunSearch requires country_id")
+        if not isinstance(city_id, str) or not city_id:
+            raise ValueError("RunSearch requires city_id")
+        if not isinstance(area_ids, list) or not all(
+            isinstance(value, str) and value for value in area_ids
+        ):
+            raise TypeError("RunSearch requires sub_city_area_ids")
+        if not isinstance(whole_city, bool):
+            raise TypeError("RunSearch requires whole_city")
+        if self.search_failures_remaining:
+            self.search_failures_remaining -= 1
+            outgoing = ContractEnvelope(
+                contract_name=ContractName.SEARCH_FAILED,
+                contract_version=1,
+                message_id=_runtime_identifier(
+                    str(incoming.message_id), "SearchFailed"
+                ),
+                producer=RuntimeRole.RECOMMENDATION,
+                consumer=RuntimeRole.BOT_ASSISTANT,
+                subject_id=incoming.subject_id,
+                subject_revision=incoming.subject_revision,
+                idempotency_key=f"search-failed:{incoming.message_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=self.clock.now(),
+                payload={
+                    "search_update_id": search_update_id,
+                    "telegram_user_id": telegram_user_id,
+                },
+            )
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=outgoing,
+            )
+            return
+        completed_search_id = f"completed-search:{incoming.message_id}"
+        completed_search = CompletedSearch(
+            completed_search_id=completed_search_id,
+            telegram_user_id=telegram_user_id,
+            search_update_id=search_update_id,
+            user_intent=UserIntent(user_intent),
+            country_id=country_id,
+            city_id=city_id,
+            sub_city_area_ids=tuple(
+                value for value in area_ids if isinstance(value, str)
+            ),
+            whole_city=whole_city,
+            required_date=_runtime_required_date(payload.get("required_date")),
+            completed_at=self.clock.now(),
+        )
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SEARCH_COMPLETED,
+            contract_version=2,
+            message_id=_runtime_identifier(completed_search_id, "SearchCompleted"),
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=completed_search_id,
+            subject_revision=1,
+            idempotency_key=f"search-completed:{completed_search_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=self.clock.now(),
+            payload={
+                "completed_search_id": completed_search_id,
+                "telegram_user_id": telegram_user_id,
+                "search_update_id": search_update_id,
+                "result_count": 0,
+            },
+        )
+        query = GetCompletedSearch.from_search_completed(outgoing)
+        self.store.complete_search(
+            incoming=incoming,
+            completed_search=completed_search,
+            query=query,
+            outgoing=outgoing,
+            received_at=self.clock.now(),
+        )
+
+    def present_next(self) -> bool:
+        """Retry one committed presentation through the idempotent Bot API port."""
+        if self.role is not RuntimeRole.BOT_ASSISTANT:
+            return False
+        if self.telegram_delivery is None:
+            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+        envelope = self.store.claim_presentation(claimed_at=self.clock.now())
+        if envelope is None:
+            return False
+        delivery_id = _runtime_payload_text(envelope, "delivery_id")
+        self.store.record_presentation_attempt(
+            envelope=envelope,
+            delivery_id=delivery_id,
+            attempted_at=self.clock.now(),
+        )
+        self.telegram_delivery.present(delivery_id)
+        self.store.record_presentation_success(
+            message_id=envelope.message_id,
+            presented_at=self.clock.now(),
+        )
+        return True
+
+    def attempt_owner_write(self, *, owner: RuntimeRole, probe_id: str) -> bool:
+        """Attempt one cross-owner write through this role's credential."""
+        message_id = _runtime_identifier(
+            probe_id, f"{self.role.value}:{owner.value}:denied"
+        )
+        attempt = ContractEnvelope(
+            contract_name=ContractName.OWNER_STATE_WRITE,
+            contract_version=1,
+            message_id=message_id,
+            producer=self.role,
+            consumer=owner,
+            subject_id=probe_id,
+            subject_revision=1,
+            idempotency_key=f"{probe_id}:{self.role.value}:{owner.value}:denied",
+            causation_id=message_id,
+            correlation_id=message_id,
+            recorded_at=self.clock.now(),
+            payload={},
+        )
+        return self.store.attempt_owner_write(
+            owner=owner,
+            probe_id=probe_id,
+            attempt=attempt,
+        )
+
+    def _next_handoff(
+        self, incoming: ContractEnvelope
+    ) -> tuple[ContractDefinition, str]:
+        if incoming.contract_name is ContractName.SOURCE_EVENT_RECORDED:
+            source_event_id = _runtime_payload_text(incoming, "source_event_id")
+            return (
+                _RUNTIME_CONTRACTS[(ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION, 1)],
+                f"source-message-revision:{source_event_id}",
+            )
+        if incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION:
+            if self.model is None:
+                raise RuntimeError("classification runtime has no model adapter")
+            revision_id = _runtime_payload_text(incoming, "source_message_revision_id")
+            return (
+                _RUNTIME_CONTRACTS[(ContractName.CLASSIFICATION_PROPOSAL, 1)],
+                self.model.proposal_id(revision_id),
+            )
+        if incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL:
+            if self.location_resolver is None:
+                raise RuntimeError("application runtime has no resolver adapter")
+            proposal_id = _runtime_payload_text(incoming, "proposal_id")
+            return (
+                _RUNTIME_CONTRACTS[(ContractName.OPPORTUNITY_PUBLICATION_CHANGED, 1)],
+                self.location_resolver.opportunity_revision_id(proposal_id),
+            )
+        if incoming.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED:
+            return (
+                _RUNTIME_CONTRACTS[(ContractName.SEARCH_COMPLETED, 1)],
+                f"completed-search:{incoming.subject_id}",
+            )
+        if incoming.contract_name is ContractName.SEARCH_COMPLETED:
+            return (
+                _RUNTIME_CONTRACTS[(ContractName.TELEGRAM_PRESENTATION_REQUESTED, 1)],
+                f"delivery:{incoming.subject_id}",
+            )
+        raise RuntimeError(
+            f"{self.role.value} has no handoff for {incoming.contract_name.value}"
+        )
+
+    def _conversation_onboarding(self) -> ConversationOnboarding:
+        if self.role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant owns Search presentation")
+        if self.telegram_delivery is None:
+            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+        if self.location_resolver is None:
+            raise RuntimeError("Bot Assistant runtime has no resolver adapter")
+        if self.conversation_language is None:
+            raise RuntimeError("Bot Assistant runtime has no language adapter")
+        if self.date_interpretation is None:
+            raise RuntimeError("Bot Assistant runtime has no date interpreter")
+        if self.timezone_data is None:
+            raise RuntimeError("Bot Assistant runtime has no timezone-data adapter")
+        return ConversationOnboarding(
+            store=self.store,
+            telegram_delivery=self.telegram_delivery,
+            conversation_language=self.conversation_language,
+            location_resolver=self.location_resolver,
+            date_interpretation=self.date_interpretation,
+            timezone_data=self.timezone_data,
+            clock=self.clock,
+            supported_query_versions=self.versions_for(
+                ContractName.GET_COMPLETED_SEARCH
+            ),
+        )
+
+
+def _runtime_identifier(probe_id: str, purpose: str) -> UUID:
+    return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
+
+
+def _runtime_required_date(value: JsonValue) -> RequiredDate | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch required_date must be an object")
+    values = (
+        value.get("start_local_date"),
+        value.get("end_local_date"),
+        value.get("iana_timezone"),
+        value.get("timezone_data_version"),
+    )
+    if not all(isinstance(item, str) and item for item in values):
+        raise ValueError("RunSearch required_date is incomplete")
+    start, end, iana_timezone, timezone_data_version = values
+    assert isinstance(start, str)
+    assert isinstance(end, str)
+    assert isinstance(iana_timezone, str)
+    assert isinstance(timezone_data_version, str)
+    return RequiredDate(
+        start_local_date=date.fromisoformat(start),
+        end_local_date=date.fromisoformat(end),
+        iana_timezone=iana_timezone,
+        timezone_data_version=timezone_data_version,
+    )
+
+
+def _runtime_envelope(
+    *,
+    definition: ContractDefinition,
+    probe_id: str,
+    version: int,
+    fact: str,
+    causation_id: UUID,
+    correlation_id: UUID,
+    recorded_at: datetime,
+    subject_id: str | None = None,
+) -> ContractEnvelope:
+    payload: dict[str, JsonValue] = {
+        "probe_id": probe_id,
+        definition.required_fact: fact,
+        **{name: 1 for name in definition.required_integer_facts},
+    }
+    return ContractEnvelope(
+        contract_name=definition.name,
+        contract_version=version,
+        message_id=_runtime_identifier(probe_id, definition.name.value),
+        producer=definition.producer,
+        consumer=definition.consumer,
+        subject_id=subject_id or probe_id,
+        subject_revision=1,
+        idempotency_key=f"{probe_id}:{definition.name.value}",
+        causation_id=causation_id,
+        correlation_id=correlation_id,
+        recorded_at=recorded_at,
+        payload=payload,
+    )
+
+
+def _runtime_payload_text(envelope: RawContractEnvelope, name: str) -> str:
+    if not isinstance(envelope.payload, dict):
+        raise TypeError("supported contract payload must be a JSON object")
+    value = envelope.payload.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"supported contract requires {name}")
+    return value
+
+
+def _runtime_probe_id(envelope: RawContractEnvelope) -> str:
+    if isinstance(envelope.payload, dict):
+        probe_id = envelope.payload.get("probe_id")
+        if isinstance(probe_id, str) and probe_id:
+            return probe_id
+    return envelope.subject_id
+
+
+def _runtime_with_message_id(
+    envelope: ContractEnvelope, message_id: UUID
+) -> ContractEnvelope:
+    return ContractEnvelope(
+        contract_name=envelope.contract_name,
+        contract_version=envelope.contract_version,
+        message_id=message_id,
+        producer=envelope.producer,
+        consumer=envelope.consumer,
+        subject_id=envelope.subject_id,
+        subject_revision=envelope.subject_revision,
+        idempotency_key=envelope.idempotency_key,
+        causation_id=envelope.causation_id,
+        correlation_id=envelope.correlation_id,
+        recorded_at=envelope.recorded_at,
+        payload=envelope.payload,
     )

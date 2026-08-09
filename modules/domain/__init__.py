@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from uuid import UUID
 
 
 class LocaleSource(StrEnum):
@@ -26,6 +27,8 @@ class ConversationStage(StrEnum):
     SEARCH_AREA = "search_area"
     REQUIRED_DATE = "required_date"
     POST_CORE = "post_core"
+    SUBMITTING = "submitting"
+    RESULTS = "results"
 
 
 class GeographicType(StrEnum):
@@ -110,6 +113,7 @@ class DiscoveryDraft:
     sub_city_areas: tuple[AcceptedLocation, ...] = ()
     whole_city: bool = False
     required_date: RequiredDate | None = None
+    search_submission_update_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +275,13 @@ Button = tuple[str, str]
 ButtonRow = tuple[Button, ...]
 
 
+class ReplyKeyboardAction(StrEnum):
+    """Explicit Telegram reply-keyboard instruction for one presentation."""
+
+    REMOVE = "remove"
+    BUTTON = "button"
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramMessage:
     """One application-owned Telegram presentation request."""
@@ -281,6 +292,59 @@ class TelegramMessage:
     screen_revision: int
     text: str
     button_rows: tuple[ButtonRow, ...]
+    reply_button: str | None = None
+    reply_keyboard_action: ReplyKeyboardAction = ReplyKeyboardAction.REMOVE
+
+    def __post_init__(self) -> None:
+        """Require a button label exactly when reply-keyboard markup is requested."""
+        if (self.reply_button is not None) != (
+            self.reply_keyboard_action is ReplyKeyboardAction.BUTTON
+        ):
+            raise ValueError("reply keyboard button action requires one button label")
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSearch:
+    """One immutable successful Search snapshot owned by recommendation."""
+
+    completed_search_id: str
+    telegram_user_id: int
+    search_update_id: str
+    user_intent: UserIntent
+    country_id: str
+    city_id: str
+    sub_city_area_ids: tuple[str, ...]
+    whole_city: bool
+    required_date: RequiredDate | None
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SearchResult:
+    """One immutable ordered Result belonging to a Completed Search."""
+
+    result_id: str
+    completed_search_id: str
+    absolute_position: int
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSearchView:
+    """Immutable response returned by the GetCompletedSearch query."""
+
+    completed_search: CompletedSearch
+    results: tuple[SearchResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveResultContext:
+    """The latest successfully presented Completed Search for one Bot User."""
+
+    telegram_user_id: int
+    completed_search_id: str
+    current_result_id: str | None
+    absolute_position: int | None
+    screen_revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +363,16 @@ class ActiveChatView:
     screen_revision: int
     delivery_id: str
     telegram_message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class OldChatViewCleanup:
+    """One claimed best-effort cleanup for a replaced Telegram view."""
+
+    delivery_id: str
+    telegram_user_id: int
+    telegram_message_id: str
+    claim_token: UUID
 
 
 @dataclass(frozen=True, slots=True)

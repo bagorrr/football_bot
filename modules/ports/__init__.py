@@ -13,12 +13,16 @@ from uuid import UUID
 from modules.contracts import (
     ContractEnvelope,
     ContractName,
+    GetCompletedSearch,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
 )
 from modules.domain import (
     ActiveChatView,
+    ActiveResultContext,
+    CompletedSearch,
+    CompletedSearchView,
     ConversationState,
     DateInterpretationQuery,
     DateInterpretationResolution,
@@ -29,8 +33,10 @@ from modules.domain import (
     LanguageSelection,
     LocationResolution,
     LocationResolutionQuery,
+    OldChatViewCleanup,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
+    SearchResult,
     TelegramDeliveryClaim,
     TelegramMessage,
     UserIntent,
@@ -91,6 +97,22 @@ class TelegramDeliveryAdapter(Protocol):
 
     def reconcile(self, message: TelegramMessage) -> str | None:
         """Return a known accepted identity without sending, or ``None``."""
+        ...
+
+    def remove_inline_actions(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> None:
+        """Remove actions from one already rendered Telegram message."""
+        ...
+
+    def show_typing(self, *, telegram_user_id: int) -> None:
+        """Show Telegram's native typing chat action."""
+        ...
+
+    def delete_message(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> bool:
+        """Best-effort delete one old Telegram message."""
         ...
 
 
@@ -166,6 +188,23 @@ class ConsumeResult(StrEnum):
     REJECTED = "rejected"
 
 
+class CompletedSearchQueryStatus(StrEnum):
+    """Disposition of one public GetCompletedSearch request."""
+
+    ACCEPTED = "accepted"
+    MISSING = "missing"
+    UNSUPPORTED_VERSION = "unsupported_version"
+    INVALID_CONTRACT = "invalid_contract"
+
+
+@dataclass(frozen=True, slots=True)
+class CompletedSearchQueryResult:
+    """Query disposition plus an optional immutable Recommendation snapshot."""
+
+    status: CompletedSearchQueryStatus
+    view: CompletedSearchView | None = None
+
+
 class ConversationStore(Protocol):
     """Bot Assistant-owned persistence boundary for onboarding."""
 
@@ -226,6 +265,72 @@ class ConversationStore(Protocol):
         """Commit one idempotent presentation without changing account state."""
         ...
 
+    def commit_search_submission(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        draft: DiscoveryDraft,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one Search action, submitting draft, and RunSearch command."""
+        ...
+
+    def defer_start_to_pending_search_result(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Record /start without replacing a queued Search result presentation."""
+        ...
+
+    def accept_search_completion(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_state_revision: int,
+        expected_draft_revision: int,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Queue zero-result presentation without activating it prematurely."""
+        ...
+
+    def accept_search_failure(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        state: ConversationState,
+        draft: DiscoveryDraft,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Restore a confirmed draft and queue Retry after technical failure."""
+        ...
+
+    def dispose_search_outcome(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Durably consume a stale Search outcome without changing Bot state."""
+        ...
+
+    def get_completed_search(
+        self,
+        query_request_id: UUID,
+        *,
+        supported_versions: Iterable[int],
+        received_at: datetime,
+    ) -> CompletedSearchQueryResult:
+        """Consume and execute the canonical Completed Search query contract."""
+        ...
+
     def current_conversation_message(
         self, telegram_user_id: int
     ) -> TelegramMessage | None:
@@ -234,6 +339,12 @@ class ConversationStore(Protocol):
 
     def active_conversation_view(self, telegram_user_id: int) -> ActiveChatView | None:
         """Return the latest successfully presented account view."""
+        ...
+
+    def active_result_context(
+        self, telegram_user_id: int
+    ) -> ActiveResultContext | None:
+        """Return the latest successfully presented Completed Search."""
         ...
 
     def claim_conversation_message(
@@ -279,6 +390,27 @@ class ConversationStore(Protocol):
         delivered_at: datetime,
     ) -> None:
         """Record one confirmed Bot API delivery."""
+        ...
+
+    def claim_old_chat_view_cleanup(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> OldChatViewCleanup | None:
+        """Claim one replaced view for best-effort Telegram cleanup."""
+        ...
+
+    def mark_old_chat_view_cleanup_attempted(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        deleted: bool,
+        attempted_at: datetime,
+    ) -> None:
+        """Finish one old-view cleanup attempt regardless of platform outcome."""
         ...
 
 
@@ -346,6 +478,27 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Deduplicate and atomically commit one accepted handoff."""
         ...
 
+    def complete_search(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        completed_search: CompletedSearch,
+        query: GetCompletedSearch,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically persist a zero-result Completed Search and its event."""
+        ...
+
+    def reject_invalid_contract(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Durably reject one supported-version envelope with invalid semantics."""
+        ...
+
     def attempt_owner_write(
         self,
         *,
@@ -381,6 +534,26 @@ class AcceptanceObserver(Protocol):
         """Recover one durable envelope."""
         ...
 
+    def delete_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject one missing canonical query at the privileged test seam."""
+        ...
+
+    def invalidate_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject one invalid supported query at the privileged test seam."""
+        ...
+
+    def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
+        """Restore one corrected canonical query at the privileged test seam."""
+        ...
+
+    def contract_is_accepted(self, message_id: UUID) -> bool:
+        """Report terminal acceptance for one durable contract identity."""
+        ...
+
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free operator alert."""
         ...
@@ -399,6 +572,20 @@ class AcceptanceObserver(Protocol):
         self, telegram_user_id: int
     ) -> tuple[RequiredDateConfirmationEvent, ...]:
         """Observe append-only explicit Required Date confirmations."""
+        ...
+
+    def completed_searches(self, telegram_user_id: int) -> tuple[CompletedSearch, ...]:
+        """Observe immutable Completed Searches through the public testkit."""
+        ...
+
+    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+        """Observe ordered immutable Results through the public testkit."""
+        ...
+
+    def search_completions(
+        self, search_update_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe canonical completion events for one Search command identity."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:

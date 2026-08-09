@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import TypeAlias
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 JsonValue: TypeAlias = (
     bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None
@@ -35,7 +35,10 @@ class ContractName(StrEnum):
     CLASSIFY_SOURCE_MESSAGE_REVISION = "ClassifySourceMessageRevision"
     CLASSIFICATION_PROPOSAL = "ClassificationProposal"
     OPPORTUNITY_PUBLICATION_CHANGED = "OpportunityPublicationChanged"
+    RUN_SEARCH = "RunSearch"
     SEARCH_COMPLETED = "SearchCompleted"
+    SEARCH_FAILED = "SearchFailed"
+    GET_COMPLETED_SEARCH = "GetCompletedSearch"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
 
@@ -44,6 +47,7 @@ class FailureCode(StrEnum):
     """Low-cardinality contract-spine failures."""
 
     UNSUPPORTED_CONTRACT_VERSION = "unsupported_contract_version"
+    INVALID_CONTRACT = "invalid_contract"
     OWNER_WRITE_DENIED = "owner_write_denied"
 
 
@@ -108,7 +112,38 @@ SUPPORTED_CONTRACTS = (
         "opportunity_revision_id",
     ),
     ContractDefinition(
+        ContractName.RUN_SEARCH,
+        1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.RECOMMENDATION,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
         ContractName.SEARCH_COMPLETED,
+        1,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "completed_search_id",
+    ),
+    ContractDefinition(
+        ContractName.SEARCH_COMPLETED,
+        2,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "completed_search_id",
+        ("telegram_user_id", "result_count"),
+    ),
+    ContractDefinition(
+        ContractName.SEARCH_FAILED,
+        1,
+        RuntimeRole.RECOMMENDATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.GET_COMPLETED_SEARCH,
         1,
         RuntimeRole.RECOMMENDATION,
         RuntimeRole.BOT_ASSISTANT,
@@ -224,6 +259,85 @@ class ContractEnvelope(RawContractEnvelope):
             if not isinstance(integer_fact, int) or isinstance(integer_fact, bool):
                 msg = f"supported contract requires integer {field_name}"
                 raise ValueError(msg)
+        if self.contract_name is ContractName.RUN_SEARCH:
+            _validate_run_search(self.payload)
+        elif self.contract_name is ContractName.SEARCH_COMPLETED:
+            _validate_search_completed(
+                self.payload,
+                contract_version=self.contract_version,
+                subject_id=self.subject_id,
+            )
+        elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
+            completed_search_id = _required_text(
+                self.payload,
+                "completed_search_id",
+            )
+            if completed_search_id != self.subject_id:
+                raise ValueError(
+                    "GetCompletedSearch subject must identify its Completed Search"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class GetCompletedSearch(ContractEnvelope):
+    """Public Recommendation query consumed by Bot Assistant."""
+
+    def __post_init__(self) -> None:
+        super(GetCompletedSearch, self).__post_init__()
+        if self.contract_name is not ContractName.GET_COMPLETED_SEARCH:
+            raise ValueError("GetCompletedSearch requires its stable contract name")
+
+    @classmethod
+    def request_id(cls, completed_search_id: str) -> UUID:
+        """Return the stable request identity for one Completed Search."""
+        if not completed_search_id:
+            raise ValueError("GetCompletedSearch requires completed_search_id")
+        return uuid5(
+            NAMESPACE_URL,
+            (
+                "football-bot:"
+                f"{completed_search_id}:"
+                f"{ContractName.GET_COMPLETED_SEARCH.value}"
+            ),
+        )
+
+    @classmethod
+    def from_search_completed(
+        cls,
+        completion: RawContractEnvelope,
+    ) -> GetCompletedSearch:
+        """Derive the stable query request paired with one completion event."""
+        if completion.contract_name is not ContractName.SEARCH_COMPLETED:
+            raise ValueError("GetCompletedSearch requires SearchCompleted causation")
+        if completion.contract_version != 2:
+            raise ValueError("GetCompletedSearch requires canonical SearchCompleted v2")
+        if not isinstance(completion.payload, dict):
+            raise TypeError("SearchCompleted payload must be an object")
+        completed_search_id = completion.payload.get("completed_search_id")
+        if not isinstance(completed_search_id, str) or not completed_search_id:
+            raise ValueError("SearchCompleted requires completed_search_id")
+        return cls(
+            contract_name=ContractName.GET_COMPLETED_SEARCH,
+            contract_version=1,
+            message_id=cls.request_id(completed_search_id),
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=completed_search_id,
+            subject_revision=completion.subject_revision,
+            idempotency_key=f"get-completed-search:{completed_search_id}",
+            causation_id=completion.causation_id,
+            correlation_id=completion.correlation_id,
+            recorded_at=completion.recorded_at,
+            payload={"completed_search_id": completed_search_id},
+        )
+
+    @property
+    def completed_search_id(self) -> str:
+        """Return the validated stable Completed Search identity."""
+        assert isinstance(self.payload, dict)
+        value = self.payload["completed_search_id"]
+        assert isinstance(value, str)
+        return value
 
 
 def _validate_json(value: object) -> None:
@@ -242,3 +356,110 @@ def _validate_json(value: object) -> None:
         return
     msg = "contract payloads may contain only JSON values"
     raise TypeError(msg)
+
+
+_USER_INTENTS = frozenset(
+    {
+        "game_search",
+        "player_search",
+        "tournament_search",
+        "opponent_search",
+        "new_team_search",
+        "transfer_player_search",
+        "coach_search",
+        "coaching_service_offer",
+        "referee_search",
+        "refereeing_service_offer",
+    }
+)
+_DATE_REQUIRED_USER_INTENTS = frozenset(
+    {
+        "game_search",
+        "player_search",
+        "tournament_search",
+        "opponent_search",
+        "referee_search",
+        "refereeing_service_offer",
+    }
+)
+
+
+def _validate_run_search(payload: dict[str, JsonValue]) -> None:
+    """Validate the complete confirmed discovery snapshot on the wire."""
+    _required_text(payload, "display_locale")
+    user_intent = _required_text(payload, "user_intent")
+    if user_intent not in _USER_INTENTS:
+        raise ValueError("RunSearch requires a canonical user_intent")
+    _required_text(payload, "country_id")
+    _required_text(payload, "city_id")
+    area_ids = payload.get("sub_city_area_ids")
+    if not isinstance(area_ids, list) or not all(
+        isinstance(value, str) and value for value in area_ids
+    ):
+        raise ValueError("RunSearch requires string sub_city_area_ids")
+    whole_city = payload.get("whole_city")
+    if not isinstance(whole_city, bool):
+        raise ValueError("RunSearch requires boolean whole_city")
+    if whole_city == bool(area_ids):
+        raise ValueError("RunSearch requires exactly one Search Area mode")
+    required_date = payload.get("required_date")
+    if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
+        _validate_required_date(required_date)
+
+
+def _validate_required_date(value: JsonValue) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("RunSearch requires a Required Date object")
+    start_text = _required_text(value, "start_local_date")
+    end_text = _required_text(value, "end_local_date")
+    _required_text(value, "iana_timezone")
+    _required_text(value, "timezone_data_version")
+    try:
+        start = date.fromisoformat(start_text)
+        end = date.fromisoformat(end_text)
+    except ValueError as error:
+        raise ValueError("RunSearch Required Date must use ISO local dates") from error
+    if start > end:
+        raise ValueError("RunSearch Required Date range must be ordered")
+
+
+def _validate_search_completed(
+    payload: dict[str, JsonValue],
+    *,
+    contract_version: int,
+    subject_id: str,
+) -> None:
+    completed_search_id = _required_text(payload, "completed_search_id")
+    if completed_search_id != subject_id:
+        raise ValueError("SearchCompleted subject must identify its Completed Search")
+    search_fields = ("telegram_user_id", "search_update_id", "result_count")
+    allowed_fields = {"probe_id", "completed_search_id"}
+    if contract_version == 1:
+        if set(payload) - allowed_fields or any(
+            field_name in payload for field_name in search_fields
+        ):
+            raise ValueError("SearchCompleted v1 uses the legacy completion schema")
+        return
+    if contract_version != 2:
+        raise ValueError("SearchCompleted version has no registered semantics")
+    allowed_fields.update(search_fields)
+    if set(payload) - allowed_fields:
+        raise ValueError("SearchCompleted v2 contains unsupported facts")
+    telegram_user_id = payload.get("telegram_user_id")
+    if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+        raise ValueError("SearchCompleted requires telegram_user_id")
+    _required_text(payload, "search_update_id")
+    result_count = payload.get("result_count")
+    if (
+        not isinstance(result_count, int)
+        or isinstance(result_count, bool)
+        or result_count < 0
+    ):
+        raise ValueError("SearchCompleted requires a non-negative result_count")
+
+
+def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"contract requires {field_name}")
+    return value

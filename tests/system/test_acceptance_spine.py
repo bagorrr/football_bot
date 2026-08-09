@@ -160,57 +160,316 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
 def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
     spine: AcceptanceSpine,
 ) -> None:
+    get_completed_search = ContractName("GetCompletedSearch")
     spine.run("contract-compatibility")
+    run_search_payload: dict[str, JsonValue] = {
+        "probe_id": "compatibility-RunSearch",
+        "search_update_id": "compatibility-search-update",
+        "telegram_user_id": 501,
+        "display_locale": "en",
+        "user_intent": "game_search",
+        "country_id": "country:ru",
+        "city_id": "city:ru:moscow",
+        "sub_city_area_ids": [],
+        "whole_city": True,
+        "required_date": {
+            "start_local_date": "2026-08-10",
+            "end_local_date": "2026-08-10",
+            "iana_timezone": "Europe/Moscow",
+            "timezone_data_version": "compatibility-tzdb",
+        },
+    }
+    zero_result_payload: dict[str, JsonValue] = {
+        "probe_id": "compatibility-SearchCompleted",
+        "completed_search_id": "compatibility-SearchCompleted",
+        "search_update_id": "compatibility-search-update",
+        "telegram_user_id": 501,
+        "result_count": 0,
+    }
+    get_completed_search_payload: dict[str, JsonValue] = {
+        "probe_id": "compatibility-GetCompletedSearch",
+        "completed_search_id": "compatibility-GetCompletedSearch",
+    }
+    for contract_name, contract_version, payload in (
+        (ContractName.RUN_SEARCH, 1, run_search_payload),
+        (ContractName.SEARCH_COMPLETED, 2, zero_result_payload),
+        (ContractName.SEARCH_FAILED, 1, None),
+        (
+            get_completed_search,
+            1,
+            get_completed_search_payload,
+        ),
+    ):
+        spine.record_search_event(
+            probe_id=f"compatibility-{contract_name.value}",
+            contract_name=contract_name,
+            contract_version=contract_version,
+            telegram_user_id=501,
+            payload=payload,
+        )
     expected_pairs = (
         (
             ContractName.SOURCE_EVENT_RECORDED,
             RuntimeRole.INGESTION,
             RuntimeRole.APPLICATION,
+            "contract-compatibility",
+            1,
+            "contract-compatibility",
         ),
         (
             ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
             RuntimeRole.APPLICATION,
             RuntimeRole.CLASSIFICATION,
+            "contract-compatibility",
+            1,
+            "contract-compatibility",
         ),
         (
             ContractName.CLASSIFICATION_PROPOSAL,
             RuntimeRole.CLASSIFICATION,
             RuntimeRole.APPLICATION,
+            "contract-compatibility",
+            1,
+            "contract-compatibility",
         ),
         (
             ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
             RuntimeRole.APPLICATION,
             RuntimeRole.RECOMMENDATION,
+            "contract-compatibility",
+            1,
+            "contract-compatibility",
         ),
         (
             ContractName.SEARCH_COMPLETED,
             RuntimeRole.RECOMMENDATION,
             RuntimeRole.BOT_ASSISTANT,
+            "contract-compatibility",
+            1,
+            "completed-search:contract-compatibility",
         ),
         (
             ContractName.TELEGRAM_PRESENTATION_REQUESTED,
             RuntimeRole.BOT_ASSISTANT,
             None,
+            "contract-compatibility",
+            1,
+            "completed-search:contract-compatibility",
+        ),
+        (
+            ContractName.RUN_SEARCH,
+            RuntimeRole.BOT_ASSISTANT,
+            RuntimeRole.RECOMMENDATION,
+            "compatibility-RunSearch",
+            1,
+            "compatibility-RunSearch",
+        ),
+        (
+            ContractName.SEARCH_COMPLETED,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+            "compatibility-SearchCompleted",
+            2,
+            "compatibility-SearchCompleted",
+        ),
+        (
+            ContractName.SEARCH_FAILED,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+            "compatibility-SearchFailed",
+            1,
+            "compatibility-SearchFailed",
+        ),
+        (
+            get_completed_search,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+            "compatibility-GetCompletedSearch",
+            1,
+            "compatibility-GetCompletedSearch",
         ),
     )
 
     correlation_ids = set()
-    for contract_name, producer, consumer in expected_pairs:
+    for (
+        contract_name,
+        producer,
+        consumer,
+        probe_id,
+        contract_version,
+        subject_id,
+    ) in expected_pairs:
         envelope = spine.recoverable_contract(
-            "contract-compatibility",
+            probe_id,
             contract_name=contract_name,
         )
-        assert envelope.contract_version == 1
+        assert envelope.contract_version == contract_version
         assert envelope.producer is producer
         assert envelope.consumer is consumer
-        assert envelope.subject_id == "contract-compatibility"
+        assert envelope.subject_id == subject_id
         assert envelope.subject_revision == 1
         assert envelope.idempotency_key
         assert envelope.causation_id
-        correlation_ids.add(envelope.correlation_id)
+        if probe_id == "contract-compatibility":
+            correlation_ids.add(envelope.correlation_id)
         json.dumps(envelope.payload)
 
     assert len(correlation_ids) == 1
+
+
+def test_search_completed_versions_have_distinct_stable_public_contracts(
+    spine: AcceptanceSpine,
+) -> None:
+    legacy_completed_search_id = "completed-search:legacy-compatibility"
+    canonical_completed_search_id = "completed-search:canonical-compatibility"
+    spine.record_search_event(
+        probe_id=legacy_completed_search_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+        contract_version=1,
+        telegram_user_id=501,
+        include_telegram_user_id=False,
+        payload={"completed_search_id": legacy_completed_search_id},
+    )
+    spine.record_search_event(
+        probe_id=canonical_completed_search_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+        contract_version=2,
+        telegram_user_id=501,
+        payload={
+            "completed_search_id": canonical_completed_search_id,
+            "telegram_user_id": 501,
+            "search_update_id": "canonical-search-update",
+            "result_count": 0,
+        },
+    )
+
+    processed = 0
+    while spine.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT):
+        processed += 1
+    assert processed == 2
+
+    legacy = spine.recoverable_contract(
+        legacy_completed_search_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+    )
+    canonical = spine.recoverable_contract(
+        canonical_completed_search_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+    )
+    assert legacy.contract_version == 1
+    assert legacy.subject_id == legacy_completed_search_id
+    assert legacy.payload == {"completed_search_id": legacy_completed_search_id}
+    assert canonical.contract_version == 2
+    assert canonical.subject_id == canonical_completed_search_id
+    assert canonical.payload == {
+        "completed_search_id": canonical_completed_search_id,
+        "telegram_user_id": 501,
+        "search_update_id": "canonical-search-update",
+        "result_count": 0,
+    }
+    legacy_presentation = spine.recoverable_contract(
+        legacy_completed_search_id,
+        contract_name=ContractName.TELEGRAM_PRESENTATION_REQUESTED,
+    )
+    assert legacy_presentation.causation_id == legacy.message_id
+    assert spine.observe(legacy_completed_search_id).completed is True
+    canonical_snapshot = spine.observe(canonical_completed_search_id)
+    assert canonical_snapshot.rejected_inbox_records == 0
+    assert canonical_snapshot.operator_alerts == ()
+    assert canonical_snapshot.outbox_records == 0
+
+
+@pytest.mark.parametrize(
+    ("probe_id", "contract_version", "payload"),
+    (
+        (
+            "invalid-legacy-subject",
+            1,
+            {
+                "probe_id": "invalid-legacy-subject",
+                "completed_search_id": "completed-search:other-legacy-subject",
+            },
+        ),
+        (
+            "invalid-canonical-shape-in-v1",
+            1,
+            {
+                "probe_id": "invalid-canonical-shape-in-v1",
+                "completed_search_id": "invalid-canonical-shape-in-v1",
+                "telegram_user_id": 501,
+                "search_update_id": "canonical-search-update",
+                "result_count": 0,
+            },
+        ),
+        (
+            "invalid-partial-canonical-v2",
+            2,
+            {
+                "probe_id": "invalid-partial-canonical-v2",
+                "completed_search_id": "invalid-partial-canonical-v2",
+                "telegram_user_id": 501,
+                "result_count": 0,
+            },
+        ),
+        (
+            "invalid-canonical-subject",
+            2,
+            {
+                "probe_id": "invalid-canonical-subject",
+                "completed_search_id": "completed-search:other-canonical-subject",
+                "telegram_user_id": 501,
+                "search_update_id": "canonical-search-update",
+                "result_count": 0,
+            },
+        ),
+        (
+            "invalid-canonical-extra-field",
+            2,
+            {
+                "probe_id": "invalid-canonical-extra-field",
+                "completed_search_id": "invalid-canonical-extra-field",
+                "telegram_user_id": 501,
+                "search_update_id": "canonical-search-update",
+                "result_count": 0,
+                "legacy_route": True,
+            },
+        ),
+    ),
+)
+def test_search_completed_schema_and_subject_mismatches_fail_closed(
+    spine: AcceptanceSpine,
+    probe_id: str,
+    contract_version: int,
+    payload: dict[str, JsonValue],
+) -> None:
+    spine.record_search_event(
+        probe_id=probe_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+        contract_version=contract_version,
+        telegram_user_id=501,
+        include_telegram_user_id=False,
+        payload=payload,
+    )
+
+    assert spine.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    snapshot = spine.observe(probe_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert snapshot.operator_alerts == (
+        OperatorAlert(
+            producer=RuntimeRole.RECOMMENDATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            contract_name=ContractName.SEARCH_COMPLETED,
+            contract_version=contract_version,
+            failure_code=FailureCode.INVALID_CONTRACT,
+        ),
+    )
+    recoverable = spine.recoverable_contract(
+        probe_id,
+        contract_name=ContractName.SEARCH_COMPLETED,
+    )
+    assert recoverable.payload == payload
 
 
 def test_database_rejects_cross_owner_write_and_records_body_free_alert(
@@ -279,7 +538,7 @@ def test_restart_retries_committed_but_unpresented_telegram_delivery(
     spine.run_until_idle("interrupted-before-presentation")
 
     assert telegram_delivery.presentations == [
-        "delivery:interrupted-before-presentation"
+        "delivery:completed-search:interrupted-before-presentation"
     ]
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from modules.application import RuntimeApplication
 from modules.contracts import RuntimeRole
 from modules.ports import (
     Clock,
@@ -15,9 +16,6 @@ from modules.ports import (
 )
 from modules.postgres_adapter import (
     PostgresRoleStore,
-)
-from modules.testkit import (
-    AcceptanceRole,
 )
 
 
@@ -33,9 +31,9 @@ def boot_acceptance_role(
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
-) -> AcceptanceRole:
+) -> RuntimeApplication:
     """Boot exactly one role with its own least-privilege database credential."""
-    return AcceptanceRole(
+    return RuntimeApplication(
         role=role,
         store=PostgresRoleStore(role, database_url),
         clock=clock,

@@ -6,6 +6,7 @@ import json
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -19,6 +20,7 @@ from modules.contracts import (
     ContractEnvelope,
     ContractName,
     FailureCode,
+    GetCompletedSearch,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
@@ -26,6 +28,9 @@ from modules.contracts import (
 from modules.domain import (
     AcceptedLocation,
     ActiveChatView,
+    ActiveResultContext,
+    CompletedSearch,
+    CompletedSearchView,
     ConversationStage,
     ConversationState,
     DiscoveryDraft,
@@ -36,9 +41,12 @@ from modules.domain import (
     GeographySuggestion,
     IntentBranch,
     LocaleSource,
+    OldChatViewCleanup,
+    ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
+    SearchResult,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramMessage,
@@ -46,10 +54,364 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObservation,
+    CompletedSearchQueryResult,
+    CompletedSearchQueryStatus,
     ConsumeResult,
     ConversationAccessDeniedError,
     OutboxConflictError,
 )
+
+_LEGACY_MIGRATION_NAMES = (
+    "0001_acceptance_spine.sql",
+    "0002_durable_role_handoffs.sql",
+    "0003_conversation_language.sql",
+    "0004_discovery_draft.sql",
+    "0005_search_area.sql",
+    "0006_required_date.sql",
+    "0007_zero_result_search.sql",
+)
+
+_MATERIAL_SCHEMA_FINGERPRINTS = (
+    "d90ca567731af934dec2b3417e7a2f4bab8066eeeed3def9c73d4f93bc8355d2",
+    "bafda1b2f143add6a90138b176279410c9968087294bc24e88bbfedde0cfe3a1",
+    "8bbd9a505d1c4a992796e186539bb519361d85f9da96e078a1742219f0d4c084",
+    "0862e2984895c6f0abfb4492ff3b32201ac8af47aa35fc07c9f221a966e3ead5",
+    "0ed51b9232f016c595860a2296129328167051363915f5bda4d552c37dcb2fde",
+    "24e3a984d5f411b22b86486eeb2c95d48ce62bc6348c5a43b432bcb706bac6af",
+    "2b3373bbba4780664716388d50c6e8e4d211ca5e4886a50587ac1041e7751ecc",
+)
+
+_SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
+    # Pre-0003 delivery tables upgraded in place by 0003.
+    "9961714eaf7d3a8489b64541df0ed941618a2efcbcf9d6ad784742d1022d46b4": 2,
+}
+
+_PRE_0003_DELIVERY_RECONCILIATION = """
+ALTER TABLE football_runtime.bot_users
+    ALTER COLUMN stage DROP DEFAULT,
+    ALTER COLUMN screen_revision DROP DEFAULT,
+    ADD CHECK (owner_role = 'bot_assistant'),
+    ADD CHECK (locale_source IN ('explicit', 'telegram_hint')),
+    ADD CHECK (revision > 0),
+    ADD CHECK ((locale IS NULL) = (locale_source IS NULL));
+
+ALTER TABLE football_runtime.bot_message_outbox
+    ALTER COLUMN screen_revision DROP DEFAULT,
+    ADD CHECK (owner_role = 'bot_assistant'),
+    ADD UNIQUE (sequence_id);
+"""
+
+_RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
+
+_MATERIAL_SCHEMA_QUERY = """
+WITH runtime_roles AS (
+    SELECT *
+    FROM pg_roles
+    WHERE rolname = ANY(%s)
+), migration_owner AS (
+    SELECT oid, rolname
+    FROM pg_roles
+    WHERE rolname = current_user
+), material AS (
+    SELECT 'role'::text AS object_kind,
+           role.rolname::text AS object_identity,
+           concat_ws('|', role.rolsuper::text, role.rolinherit::text,
+                     role.rolcreaterole::text, role.rolcreatedb::text,
+                     role.rolreplication::text, role.rolbypassrls::text,
+                     role.rolconnlimit::text) AS object_definition
+    FROM runtime_roles AS role
+
+    UNION ALL
+
+    SELECT 'role_login_mode', 'runtime_roles',
+           CASE WHEN bool_and(role.rolcanlogin)
+                      OR bool_and(NOT role.rolcanlogin)
+                THEN 'uniform'
+                ELSE string_agg(
+                    role.rolname || ':' || role.rolcanlogin::text,
+                    ',' ORDER BY role.rolname
+                ) END
+    FROM runtime_roles AS role
+
+    UNION ALL
+
+    SELECT 'role_membership', member.rolname || '->' || granted_role.rolname,
+           concat_ws('|', membership.admin_option::text,
+                     membership.inherit_option::text,
+                     membership.set_option::text)
+    FROM pg_auth_members AS membership
+    JOIN pg_roles AS member ON member.oid = membership.member
+    JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    WHERE member.oid IN (SELECT oid FROM runtime_roles)
+       OR granted_role.oid IN (SELECT oid FROM runtime_roles)
+
+    UNION ALL
+
+    SELECT 'schema', namespace.nspname,
+           CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                THEN 'authorized_migration_owner'
+                ELSE 'unauthorized:' || owner.rolname END
+    FROM pg_namespace AS namespace
+    JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+
+    UNION ALL
+
+    SELECT 'relation', namespace.nspname || '.' || relation.relname,
+           concat_ws('|', relation.relkind, relation.relpersistence,
+                     relation.relrowsecurity::text,
+                     relation.relforcerowsecurity::text,
+                     relation.relreplident,
+                     CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                          THEN 'authorized_migration_owner'
+                          ELSE 'unauthorized:' || owner.rolname END)
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    JOIN pg_roles AS owner ON owner.oid = relation.relowner
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+
+    UNION ALL
+
+    SELECT 'sequence', namespace.nspname || '.' || relation.relname,
+           concat_ws('|', format_type(sequence.seqtypid, -1),
+                     sequence.seqstart::text, sequence.seqincrement::text,
+                     sequence.seqmax::text, sequence.seqmin::text,
+                     sequence.seqcache::text, sequence.seqcycle::text,
+                     CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                          THEN 'authorized_migration_owner'
+                          ELSE 'unauthorized:' || owner.rolname END,
+                     COALESCE(
+                         ownership.dependency_type || ':' ||
+                         ownership.namespace_name || '.' ||
+                         ownership.relation_name || '.' ||
+                         ownership.column_name,
+                         'unowned'
+                     ))
+    FROM pg_sequence AS sequence
+    JOIN pg_class AS relation ON relation.oid = sequence.seqrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    JOIN pg_roles AS owner ON owner.oid = relation.relowner
+    LEFT JOIN LATERAL (
+        SELECT dependency.deptype::text AS dependency_type,
+               owned_namespace.nspname::text AS namespace_name,
+               owned_relation.relname::text AS relation_name,
+               owned_column.attname::text AS column_name
+        FROM pg_depend AS dependency
+        JOIN pg_class AS owned_relation
+          ON owned_relation.oid = dependency.refobjid
+        JOIN pg_namespace AS owned_namespace
+          ON owned_namespace.oid = owned_relation.relnamespace
+        JOIN pg_attribute AS owned_column
+          ON owned_column.attrelid = dependency.refobjid
+         AND owned_column.attnum = dependency.refobjsubid
+        WHERE dependency.classid = 'pg_class'::regclass
+          AND dependency.objid = relation.oid
+          AND dependency.objsubid = 0
+          AND dependency.refclassid = 'pg_class'::regclass
+          AND dependency.deptype IN ('a', 'i')
+    ) AS ownership ON true
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+
+    UNION ALL
+
+    SELECT 'column',
+           namespace.nspname || '.' || relation.relname || '.' || attribute.attname,
+           concat_ws('|', format_type(attribute.atttypid, attribute.atttypmod),
+                     attribute.attnotnull::text, attribute.attidentity,
+                     attribute.attgenerated,
+                     COALESCE(collation_row.collname, ''),
+                     COALESCE(pg_get_expr(default_value.adbin,
+                                          default_value.adrelid, true), ''))
+    FROM pg_attribute AS attribute
+    JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    LEFT JOIN pg_attrdef AS default_value
+      ON default_value.adrelid = attribute.attrelid
+     AND default_value.adnum = attribute.attnum
+    LEFT JOIN pg_collation AS collation_row
+      ON collation_row.oid = attribute.attcollation
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+
+    UNION ALL
+
+    SELECT 'constraint',
+           namespace.nspname || '.' || relation.relname || '.' ||
+           constraint_row.conname,
+           concat_ws('|', constraint_row.contype,
+                     constraint_row.condeferrable::text,
+                     constraint_row.condeferred::text,
+                     constraint_row.convalidated::text,
+                     pg_get_constraintdef(constraint_row.oid, true))
+    FROM pg_constraint AS constraint_row
+    JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+
+    UNION ALL
+
+    SELECT 'index', namespace.nspname || '.' || index_relation.relname,
+           pg_get_indexdef(index_relation.oid, 0, true)
+    FROM pg_class AS index_relation
+    JOIN pg_namespace AS namespace ON namespace.oid = index_relation.relnamespace
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND index_relation.relkind = 'i'
+
+    UNION ALL
+
+    SELECT 'function', namespace.nspname || '.' || procedure.proname ||
+           '(' || pg_get_function_identity_arguments(procedure.oid) || ')',
+           pg_get_functiondef(procedure.oid) || '|owner:' ||
+           CASE WHEN owner.oid = (SELECT oid FROM migration_owner)
+                THEN 'authorized_migration_owner'
+                ELSE 'unauthorized:' || owner.rolname END
+    FROM pg_proc AS procedure
+    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    JOIN pg_roles AS owner ON owner.oid = procedure.proowner
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+
+    UNION ALL
+
+    SELECT 'policy',
+           namespace.nspname || '.' || relation.relname || '.' || policy.polname,
+           concat_ws('|', policy.polpermissive::text, policy.polcmd,
+                     array_to_string(
+                         ARRAY(
+                             SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                                         ELSE pg_get_userbyid(role_oid) END
+                             FROM unnest(policy.polroles) AS role_oid
+                             ORDER BY 1
+                         ), ','
+                     ),
+                     COALESCE(pg_get_expr(policy.polqual, policy.polrelid, true), ''),
+                     COALESCE(pg_get_expr(policy.polwithcheck,
+                                          policy.polrelid, true), ''))
+    FROM pg_policy AS policy
+    JOIN pg_class AS relation ON relation.oid = policy.polrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+
+    UNION ALL
+
+    SELECT 'trigger',
+           namespace.nspname || '.' || relation.relname || '.' || trigger.tgname,
+           pg_get_triggerdef(trigger.oid, true)
+    FROM pg_trigger AS trigger
+    JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND NOT trigger.tgisinternal
+
+    UNION ALL
+
+    SELECT 'schema_grant', namespace.nspname || ':' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_namespace AS namespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(namespace.nspacl, acldefault('n', namespace.nspowner))
+    ) AS acl
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND acl.grantee <> namespace.nspowner
+
+    UNION ALL
+
+    SELECT 'relation_grant', namespace.nspname || '.' || relation.relname || ':' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_class AS relation
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(
+            relation.relacl,
+            acldefault(
+                CASE WHEN relation.relkind = 'S' THEN 'S'::"char"
+                     ELSE 'r'::"char" END,
+                relation.relowner
+            )
+        )
+    ) AS acl
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+      AND acl.grantee <> relation.relowner
+
+    UNION ALL
+
+    SELECT 'column_grant', namespace.nspname || '.' || relation.relname || '.' ||
+           attribute.attname || ':' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_attribute AS attribute
+    JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+      AND acl.grantee <> relation.relowner
+
+    UNION ALL
+
+    SELECT 'function_grant', namespace.nspname || '.' || procedure.proname ||
+           '(' || pg_get_function_identity_arguments(procedure.oid) || '):' ||
+           CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                ELSE pg_get_userbyid(acl.grantee) END,
+           acl.privilege_type || '|' || acl.is_grantable::text
+    FROM pg_proc AS procedure
+    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    CROSS JOIN LATERAL aclexplode(
+        COALESCE(procedure.proacl, acldefault('f', procedure.proowner))
+    ) AS acl
+    WHERE namespace.nspname IN ('football_runtime', 'football_migrations')
+      AND acl.grantee <> procedure.proowner
+)
+SELECT object_kind, object_identity, object_definition
+FROM material
+ORDER BY object_kind, object_identity, object_definition
+"""
+
+
+def _material_schema_fingerprint(connection: psycopg.Connection[Any]) -> str:
+    """Hash the complete migration-owned runtime schema contract."""
+    rows = connection.execute(
+        _MATERIAL_SCHEMA_QUERY,
+        (list(_RUNTIME_DATABASE_ROLES),),
+    ).fetchall()
+    canonical = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _assert_material_schema(
+    connection: psycopg.Connection[Any],
+    applied_count: int,
+) -> None:
+    if applied_count < 1:
+        return
+    expected = _MATERIAL_SCHEMA_FINGERPRINTS[applied_count - 1]
+    if _material_schema_fingerprint(connection) != expected:
+        raise RuntimeError("Migration history has material schema drift")
+
+
+def _legacy_migration_prefix(
+    connection: psycopg.Connection[Any],
+) -> tuple[int, bool]:
+    fingerprint = _material_schema_fingerprint(connection)
+    try:
+        return _MATERIAL_SCHEMA_FINGERPRINTS.index(fingerprint) + 1, False
+    except ValueError as error:
+        supported_prefix = _SUPPORTED_LEGACY_SCHEMA_PREFIXES.get(fingerprint)
+        if supported_prefix is not None:
+            return supported_prefix, True
+        raise RuntimeError(
+            "Untracked migration state is not a known prefix: material schema drift "
+            f"({fingerprint})"
+        ) from error
 
 
 class PostgresAcceptanceMigrator:
@@ -59,11 +421,110 @@ class PostgresAcceptanceMigrator:
         self._admin_database_url = admin_database_url
 
     def migrate(self) -> None:
-        """Apply repository-owned migrations in lexical order."""
+        """Apply each immutable repository migration exactly once."""
         migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
-        with psycopg.connect(self._admin_database_url, autocommit=True) as connection:
-            for migration_path in sorted(migration_root.glob("*.sql")):
-                connection.execute(migration_path.read_text(encoding="utf-8"))
+        migration_paths = sorted(migration_root.glob("*.sql"))
+        migration_names = tuple(path.name for path in migration_paths)
+        with psycopg.connect(self._admin_database_url) as connection:
+            connection.execute(
+                """
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(
+                        current_database() || ':football_bot:migrations',
+                        0
+                    )
+                )
+                """,
+            )
+            migration_state = connection.execute(
+                """
+                SELECT to_regclass(
+                           'football_migrations.applied_migrations'
+                       ) IS NOT NULL,
+                       to_regnamespace('football_runtime') IS NOT NULL
+                """,
+            ).fetchone()
+            if migration_state is None:
+                raise RuntimeError("Could not inspect migration state")
+            history_existed, runtime_schema_existed = migration_state
+            if history_existed and not runtime_schema_existed:
+                raise RuntimeError("Migration history exists without runtime schema")
+            connection.execute("CREATE SCHEMA IF NOT EXISTS football_migrations")
+            connection.execute("REVOKE ALL ON SCHEMA football_migrations FROM PUBLIC")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS football_migrations.applied_migrations (
+                    migration_name text PRIMARY KEY,
+                    checksum text NOT NULL CHECK (checksum <> ''),
+                    applied_at timestamptz NOT NULL DEFAULT transaction_timestamp()
+                )
+                """,
+            )
+            connection.execute(
+                """
+                REVOKE ALL ON football_migrations.applied_migrations FROM PUBLIC
+                """,
+            )
+            applied_migrations: dict[str, str] = dict(
+                connection.execute(
+                    """
+                    SELECT migration_name, checksum
+                    FROM football_migrations.applied_migrations
+                    """,
+                ).fetchall(),
+            )
+            if history_existed and runtime_schema_existed and not applied_migrations:
+                raise RuntimeError("Migration history is empty for an existing schema")
+            adopted_untracked_schema = False
+            reconcile_pre_0003_delivery = False
+            if not history_existed and runtime_schema_existed:
+                applied_count, reconcile_pre_0003_delivery = _legacy_migration_prefix(
+                    connection
+                )
+                adopted_untracked_schema = True
+                expected_legacy_names = _LEGACY_MIGRATION_NAMES[:applied_count]
+                if migration_names[:applied_count] != expected_legacy_names:
+                    raise RuntimeError("Legacy migration files do not match")
+                for migration_path in migration_paths[:applied_count]:
+                    migration_checksum = sha256(migration_path.read_bytes()).hexdigest()
+                    connection.execute(
+                        """
+                        INSERT INTO football_migrations.applied_migrations (
+                            migration_name, checksum
+                        ) VALUES (%s, %s)
+                        """,
+                        (migration_path.name, migration_checksum),
+                    )
+                    applied_migrations[migration_path.name] = migration_checksum
+            expected_applied_names = set(migration_names[: len(applied_migrations)])
+            if set(applied_migrations) != expected_applied_names:
+                raise RuntimeError("Migration history is not a contiguous prefix")
+            if not adopted_untracked_schema:
+                _assert_material_schema(connection, len(applied_migrations))
+            for migration_path in migration_paths:
+                migration_bytes = migration_path.read_bytes()
+                migration_checksum = sha256(migration_bytes).hexdigest()
+                applied_checksum = applied_migrations.get(migration_path.name)
+                if applied_checksum is not None:
+                    if applied_checksum != migration_checksum:
+                        raise RuntimeError(
+                            f"Applied migration was modified: {migration_path.name}",
+                        )
+                    continue
+                connection.execute(migration_bytes.decode("utf-8"))
+                applied_count = migration_names.index(migration_path.name) + 1
+                if reconcile_pre_0003_delivery and applied_count == 3:
+                    connection.execute(_PRE_0003_DELIVERY_RECONCILIATION)
+                    reconcile_pre_0003_delivery = False
+                _assert_material_schema(connection, applied_count)
+                connection.execute(
+                    """
+                    INSERT INTO football_migrations.applied_migrations (
+                        migration_name, checksum
+                    ) VALUES (%s, %s)
+                    """,
+                    (migration_path.name, migration_checksum),
+                )
 
     def provision_runtime_credentials(
         self,
@@ -89,7 +550,12 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.bot_active_chat_views,
+            TRUNCATE football_runtime.bot_old_chat_views,
+                     football_runtime.bot_search_presentations,
+                     football_runtime.bot_active_result_contexts,
+                     football_runtime.recommendation_results,
+                     football_runtime.recommendation_completed_searches,
+                     football_runtime.bot_active_chat_views,
                      football_runtime.bot_delivery_alerts,
                      football_runtime.bot_message_outbox,
                      football_runtime.bot_required_date_confirmation_events,
@@ -117,14 +583,121 @@ class PostgresAcceptanceObserver:
         ) as connection:
             row = connection.execute(
                 """
-                SELECT * FROM football_runtime.contract_outbox
-                WHERE message_id = %s
+                SELECT contract_outbox.*,
+                       contract_inbox.processing_status AS inbox_status
+                FROM football_runtime.contract_outbox
+                LEFT JOIN football_runtime.contract_inbox
+                  ON contract_inbox.message_id = contract_outbox.message_id
+                 AND contract_inbox.consumer_role = contract_outbox.consumer_role
+                WHERE contract_outbox.message_id = %s
                 """,
                 (message_id,),
             ).fetchone()
         if row is None:
             raise LookupError(message_id)
+        return _row_to_envelope(
+            row,
+            validate_registered=(row["inbox_status"] != "rejected_invalid_contract"),
+        )
+
+    def delete_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Delete one canonical query to inject a missing-read failure."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            deleted = connection.execute(
+                """
+                DELETE FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND contract_name = %s
+                RETURNING *
+                """,
+                (
+                    GetCompletedSearch.request_id(completed_search_id),
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+        if deleted is None:
+            raise LookupError(completed_search_id)
+        return _row_to_envelope(deleted)
+
+    def invalidate_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Corrupt one canonical query to inject supported-contract rejection."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND contract_name = %s
+                FOR UPDATE
+                """,
+                (
+                    GetCompletedSearch.request_id(completed_search_id),
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+            if row is None:
+                raise LookupError(completed_search_id)
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = '{}'::jsonb
+                WHERE message_id = %s
+                  AND contract_name = %s
+                RETURNING message_id
+                """,
+                (
+                    GetCompletedSearch.request_id(completed_search_id),
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+        if changed is None:
+            raise LookupError(completed_search_id)
         return _row_to_envelope(row)
+
+    def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
+        """Restore one corrected canonical query after a controlled fault."""
+        if query.contract_name is not ContractName.GET_COMPLETED_SEARCH:
+            raise ValueError("only GetCompletedSearch can use this test seam")
+        with psycopg.connect(self._admin_database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = %s::jsonb
+                WHERE message_id = %s
+                  AND contract_name = %s
+                RETURNING message_id
+                """,
+                (
+                    json.dumps(query.json_payload()),
+                    query.message_id,
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+            if changed is None:
+                _insert_outbox(connection, query)
+
+    def contract_is_accepted(self, message_id: UUID) -> bool:
+        """Observe terminal contract acceptance without exposing table layout."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT processing_status = 'accepted'
+                FROM football_runtime.contract_inbox
+                WHERE message_id = %s
+                """,
+                (message_id,),
+            ).fetchone()
+        return row is not None and row[0]
 
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free alert by its technical message identity."""
@@ -234,6 +807,69 @@ class PostgresAcceptanceObserver:
             for row in rows
         )
 
+    def completed_searches(self, telegram_user_id: int) -> tuple[CompletedSearch, ...]:
+        """Observe immutable Completed Searches without exposing table layout."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT completed_search_id, telegram_user_id, search_update_id,
+                       user_intent, country_id, city_id, sub_city_area_ids,
+                       whole_city, required_date, completed_at
+                FROM football_runtime.recommendation_completed_searches
+                WHERE telegram_user_id = %s
+                ORDER BY completed_at, completed_search_id
+                """,
+                (telegram_user_id,),
+            ).fetchall()
+        return tuple(_completed_search(row) for row in rows)
+
+    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+        """Observe one Completed Search's immutable ordered Results."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT result_id, completed_search_id, absolute_position
+                FROM football_runtime.recommendation_results
+                WHERE completed_search_id = %s
+                ORDER BY absolute_position
+                """,
+                (completed_search_id,),
+            ).fetchall()
+        return tuple(
+            SearchResult(
+                result_id=row["result_id"],
+                completed_search_id=row["completed_search_id"],
+                absolute_position=row["absolute_position"],
+            )
+            for row in rows
+        )
+
+    def search_completions(
+        self, search_update_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Search completion contracts by stable command identity."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'SearchCompleted'
+                  AND payload ->> 'search_update_id' = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (search_update_id,),
+            ).fetchall()
+        return tuple(_row_to_envelope(row) for row in rows)
+
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
         with psycopg.connect(
@@ -242,10 +878,16 @@ class PostgresAcceptanceObserver:
         ) as connection:
             state_rows = connection.execute(
                 """
-                SELECT owner_role FROM football_runtime.acceptance_state
+                SELECT owner_role
+                FROM football_runtime.acceptance_state
                 WHERE probe_id = %s
+                   OR probe_id IN (
+                       SELECT subject_id
+                       FROM football_runtime.contract_outbox
+                       WHERE payload ->> 'probe_id' = %s
+                   )
                 """,
-                (probe_id,),
+                (probe_id, probe_id),
             ).fetchall()
             counts = connection.execute(
                 """
@@ -266,7 +908,7 @@ class PostgresAcceptanceObserver:
                 SELECT
                     count(*) FILTER (WHERE processing_status = 'accepted') AS accepted,
                     count(*) FILTER (
-                        WHERE processing_status = 'rejected_unsupported_version'
+                        WHERE processing_status <> 'accepted'
                     ) AS rejected
                 FROM football_runtime.contract_inbox AS inbox
                 JOIN football_runtime.contract_outbox AS outbox
@@ -369,7 +1011,9 @@ class PostgresRoleStore:
                   ON inbox.consumer_role = %s
                  AND inbox.message_id = outbox.message_id
                 WHERE outbox.consumer_role = %s
-                  AND inbox.processing_status IS DISTINCT FROM 'accepted'
+                  AND COALESCE(inbox.processing_status, '') NOT IN (
+                      'accepted', 'rejected_invalid_contract'
+                  )
                   AND (
                       outbox.claimed_until IS NULL
                       OR outbox.claimed_until <= %s
@@ -396,7 +1040,7 @@ class PostgresRoleStore:
                     """,
                     (claimed_at + timedelta(seconds=30), row["message_id"]),
                 )
-                return _row_to_envelope(row)
+                return _row_to_envelope(row, validate_registered=False)
         return None
 
     def claim_presentation(
@@ -580,6 +1224,166 @@ class PostgresRoleStore:
         except psycopg.errors.UniqueViolation as error:
             raise OutboxConflictError from error
 
+    def complete_search(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        completed_search: CompletedSearch,
+        query: GetCompletedSearch,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Commit one immutable zero-result Search and SearchCompleted event."""
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is not None and existing[0] == "accepted":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.contract_inbox (
+                        consumer_role, message_id, producer_role, contract_name,
+                        contract_version, processing_status, received_at
+                    ) VALUES (%s, %s, %s, %s, %s, 'accepted', %s)
+                    """,
+                    (
+                        self._role.value,
+                        incoming.message_id,
+                        incoming.producer.value,
+                        incoming.contract_name.value,
+                        incoming.contract_version,
+                        received_at,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.contract_inbox
+                    SET processing_status = 'accepted', received_at = %s
+                    WHERE consumer_role = %s AND message_id = %s
+                    """,
+                    (received_at, self._role.value, incoming.message_id),
+                )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    f"search:{completed_search.telegram_user_id}:"
+                    f"{completed_search.search_update_id}",
+                ),
+            )
+            existing_search = connection.execute(
+                """
+                SELECT completed_search_id
+                FROM football_runtime.recommendation_completed_searches
+                WHERE telegram_user_id = %s AND search_update_id = %s
+                """,
+                (
+                    completed_search.telegram_user_id,
+                    completed_search.search_update_id,
+                ),
+            ).fetchone()
+            if existing_search is not None:
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.recommendation_completed_searches (
+                    completed_search_id, telegram_user_id, search_update_id,
+                    user_intent, country_id, city_id, sub_city_area_ids,
+                    whole_city, required_date, completed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s)
+                """,
+                (
+                    completed_search.completed_search_id,
+                    completed_search.telegram_user_id,
+                    completed_search.search_update_id,
+                    completed_search.user_intent.value,
+                    completed_search.country_id,
+                    completed_search.city_id,
+                    json.dumps(completed_search.sub_city_area_ids),
+                    completed_search.whole_city,
+                    json.dumps(_required_date_json(completed_search.required_date)),
+                    completed_search.completed_at,
+                ),
+            )
+            _insert_outbox(connection, query)
+            _insert_outbox(connection, outgoing)
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.APPLIED
+
+    def reject_invalid_contract(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Reject malformed supported-version work without applying owner state."""
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.contract_inbox (
+                        consumer_role, message_id, producer_role, contract_name,
+                        contract_version, processing_status, received_at
+                    ) VALUES (%s, %s, %s, %s, %s, 'rejected_invalid_contract', %s)
+                    """,
+                    (
+                        self._role.value,
+                        incoming.message_id,
+                        incoming.producer.value,
+                        incoming.contract_name.value,
+                        incoming.contract_version,
+                        received_at,
+                    ),
+                )
+                _insert_alert(
+                    connection,
+                    observer=self._role,
+                    incoming=incoming,
+                    consumer=self._role,
+                    failure_code=FailureCode.INVALID_CONTRACT,
+                    observed_at=received_at,
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.contract_inbox
+                    SET processing_status = 'rejected_invalid_contract',
+                        received_at = %s
+                    WHERE consumer_role = %s AND message_id = %s
+                    """,
+                    (received_at, self._role.value, incoming.message_id),
+                )
+                if existing[0] != "rejected_invalid_contract":
+                    _insert_alert(
+                        connection,
+                        observer=self._role,
+                        incoming=incoming,
+                        consumer=self._role,
+                        failure_code=FailureCode.INVALID_CONTRACT,
+                        observed_at=received_at,
+                    )
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.REJECTED
+
     @contextmanager
     def serialize_conversation_update(
         self, *, update_id: str, telegram_user_id: int
@@ -646,7 +1450,8 @@ class PostgresRoleStore:
                     """
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
                            screen_revision, revision, last_activity_at,
-                           country, city, sub_city_areas, whole_city, required_date
+                           country, city, sub_city_areas, whole_city, required_date,
+                           search_submission_update_id
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
                     """,
@@ -675,6 +1480,7 @@ class PostgresRoleStore:
             ),
             whole_city=row["whole_city"],
             required_date=_optional_required_date(row["required_date"]),
+            search_submission_update_id=row["search_submission_update_id"],
         )
 
     def geography_suggestion(
@@ -942,8 +1748,9 @@ class PostgresRoleStore:
                 """
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
-                    message_text, button_rows, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -952,6 +1759,8 @@ class PostgresRoleStore:
                     message.screen_revision,
                     message.text,
                     json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
                     recorded_at,
                 ),
             )
@@ -1009,8 +1818,9 @@ class PostgresRoleStore:
                 """
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
-                    message_text, button_rows, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -1019,10 +1829,524 @@ class PostgresRoleStore:
                     message.screen_revision,
                     message.text,
                     json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
                     recorded_at,
                 ),
             )
             return True
+
+    def commit_search_submission(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        draft: DiscoveryDraft,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit submitting state and its RunSearch command in one transaction."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, state.telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s,
+                    screen_revision = %s,
+                    revision = %s,
+                    last_bot_user_action_at = %s,
+                    updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    recorded_at,
+                    recorded_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            changed_draft = connection.execute(
+                """
+                UPDATE football_runtime.bot_discovery_drafts
+                SET stage = %s,
+                    screen_revision = %s,
+                    revision = %s,
+                    last_activity_at = %s,
+                    search_submission_update_id = %s,
+                    updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    draft.stage.value,
+                    draft.screen_revision,
+                    draft.revision,
+                    draft.last_activity_at,
+                    draft.search_submission_update_id,
+                    recorded_at,
+                    draft.telegram_user_id,
+                    draft.revision - 1,
+                ),
+            ).fetchone()
+            if changed_draft is None:
+                raise RuntimeError("Discovery Draft changed concurrently")
+            _insert_outbox(connection, command)
+            return True
+
+    def defer_start_to_pending_search_result(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Keep a queued Search result authoritative over a concurrent /start."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                )
+                SELECT %s, %s, %s
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM football_runtime.bot_search_presentations AS presentation
+                    JOIN football_runtime.bot_message_outbox AS outbox
+                      ON outbox.delivery_id = presentation.delivery_id
+                    WHERE presentation.telegram_user_id = %s
+                      AND outbox.delivered_at IS NULL
+                      AND outbox.superseded_at IS NULL
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at, telegram_user_id),
+            ).fetchone()
+            if inserted is not None:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_users
+                    SET last_bot_user_action_at = %s, updated_at = %s
+                    WHERE telegram_user_id = %s
+                    """,
+                    (recorded_at, recorded_at, telegram_user_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_discovery_drafts
+                    SET last_activity_at = %s, updated_at = %s
+                    WHERE telegram_user_id = %s AND stage = 'submitting'
+                    """,
+                    (recorded_at, recorded_at, telegram_user_id),
+                )
+        return inserted is not None
+
+    def accept_search_completion(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_state_revision: int,
+        expected_draft_revision: int,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Queue one zero-result screen and defer activation until delivery."""
+        with psycopg.connect(self._database_url) as connection:
+            payload = incoming.payload
+            if not isinstance(payload, dict):
+                raise TypeError("SearchCompleted payload must be an object")
+            completed_search_id = payload.get("completed_search_id")
+            search_update_id = payload.get("search_update_id")
+            if not isinstance(completed_search_id, str) or not completed_search_id:
+                raise ValueError("SearchCompleted requires completed_search_id")
+            if not isinstance(search_update_id, str) or not search_update_id:
+                raise ValueError("SearchCompleted requires search_update_id")
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (message.telegram_user_id,),
+            )
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is not None and existing[0] == "accepted":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            state = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            draft = connection.execute(
+                """
+                SELECT revision, stage, search_submission_update_id
+                FROM football_runtime.bot_discovery_drafts
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            if state != (expected_state_revision, "submitting") or draft != (
+                expected_draft_revision,
+                "submitting",
+                search_update_id,
+            ):
+                _accept_contract_inbox(
+                    connection,
+                    consumer=self._role,
+                    incoming=incoming,
+                    received_at=received_at,
+                )
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=received_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    received_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_search_presentations (
+                    delivery_id, telegram_user_id, completed_search_id, accepted_at
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    completed_search_id,
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.APPLIED
+
+    def accept_search_failure(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        state: ConversationState,
+        draft: DiscoveryDraft,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Restore one confirmed draft and queue its Retry presentation."""
+        with psycopg.connect(self._database_url) as connection:
+            payload = incoming.payload
+            if not isinstance(payload, dict):
+                raise TypeError("SearchFailed payload must be an object")
+            search_update_id = payload.get("search_update_id")
+            if not isinstance(search_update_id, str) or not search_update_id:
+                raise ValueError("SearchFailed requires search_update_id")
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (message.telegram_user_id,),
+            )
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is not None and existing[0] == "accepted":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            current = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            current_draft = connection.execute(
+                """
+                SELECT revision, stage, search_submission_update_id
+                FROM football_runtime.bot_discovery_drafts
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            if current != (state.revision - 1, "submitting") or current_draft != (
+                draft.revision - 1,
+                "submitting",
+                search_update_id,
+            ):
+                _accept_contract_inbox(
+                    connection,
+                    consumer=self._role,
+                    incoming=incoming,
+                    received_at=received_at,
+                )
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    last_bot_user_action_at = %s, updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    received_at,
+                    received_at,
+                    state.telegram_user_id,
+                    state.revision - 1,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            changed_draft = connection.execute(
+                """
+                UPDATE football_runtime.bot_discovery_drafts
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    last_activity_at = %s, search_submission_update_id = %s,
+                    updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    draft.stage.value,
+                    draft.screen_revision,
+                    draft.revision,
+                    draft.last_activity_at,
+                    draft.search_submission_update_id,
+                    received_at,
+                    draft.telegram_user_id,
+                    draft.revision - 1,
+                ),
+            ).fetchone()
+            if changed_draft is None:
+                raise RuntimeError("Discovery Draft changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=received_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.APPLIED
+
+    def dispose_search_outcome(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Durably consume one stale Search outcome without Bot state mutation."""
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
+            _release_claim(connection, incoming.message_id)
+        return (
+            ConsumeResult.REPLAYED
+            if existing is not None and existing[0] == "accepted"
+            else ConsumeResult.APPLIED
+        )
+
+    def get_completed_search(
+        self,
+        query_request_id: UUID,
+        *,
+        supported_versions: Iterable[int],
+        received_at: datetime,
+    ) -> CompletedSearchQueryResult:
+        """Consume one query contract before reading its immutable snapshot."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant consumes GetCompletedSearch")
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND consumer_role = %s
+                """,
+                (query_request_id, self._role.value),
+            ).fetchone()
+        if row is None:
+            return CompletedSearchQueryResult(CompletedSearchQueryStatus.MISSING)
+        persisted_query = _row_to_envelope(row, validate_registered=False)
+        supported_versions_set = frozenset(supported_versions)
+        supported = persisted_query.contract_version in supported_versions_set
+        if not supported:
+            self.consume(
+                incoming=persisted_query,
+                supported_versions=(),
+                received_at=received_at,
+                outgoing=None,
+            )
+            return CompletedSearchQueryResult(
+                CompletedSearchQueryStatus.UNSUPPORTED_VERSION
+            )
+        try:
+            supported_query = ContractEnvelope.from_raw(persisted_query)
+        except (TypeError, ValueError):
+            self.reject_invalid_contract(
+                incoming=persisted_query,
+                received_at=received_at,
+            )
+            return CompletedSearchQueryResult(
+                CompletedSearchQueryStatus.INVALID_CONTRACT
+            )
+        disposition = self.consume(
+            incoming=persisted_query,
+            supported_versions=supported_versions_set,
+            received_at=received_at,
+            outgoing=None,
+        )
+        if disposition is ConsumeResult.REJECTED:
+            return CompletedSearchQueryResult(
+                CompletedSearchQueryStatus.UNSUPPORTED_VERSION
+            )
+        if supported_query.contract_name is not ContractName.GET_COMPLETED_SEARCH:
+            raise RuntimeError("Completed Search read requires GetCompletedSearch")
+        if not isinstance(supported_query.payload, dict):
+            raise TypeError("GetCompletedSearch payload must be an object")
+        completed_search_id = supported_query.payload.get("completed_search_id")
+        if not isinstance(completed_search_id, str) or not completed_search_id:
+            raise ValueError("GetCompletedSearch requires completed_search_id")
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            search_row = connection.execute(
+                """
+                SELECT completed_search_id, telegram_user_id, search_update_id,
+                       user_intent, country_id, city_id, sub_city_area_ids,
+                       whole_city, required_date, completed_at
+                FROM football_runtime.recommendation_completed_searches
+                WHERE completed_search_id = %s
+                """,
+                (completed_search_id,),
+            ).fetchone()
+            if search_row is None:
+                return CompletedSearchQueryResult(CompletedSearchQueryStatus.ACCEPTED)
+            result_rows = connection.execute(
+                """
+                SELECT result_id, completed_search_id, absolute_position
+                FROM football_runtime.recommendation_results
+                WHERE completed_search_id = %s
+                ORDER BY absolute_position
+                """,
+                (completed_search_id,),
+            ).fetchall()
+        return CompletedSearchQueryResult(
+            CompletedSearchQueryStatus.ACCEPTED,
+            CompletedSearchView(
+                completed_search=_completed_search(search_row),
+                results=tuple(
+                    SearchResult(
+                        result_id=row["result_id"],
+                        completed_search_id=row["completed_search_id"],
+                        absolute_position=row["absolute_position"],
+                    )
+                    for row in result_rows
+                ),
+            ),
+        )
 
     def current_conversation_message(
         self, telegram_user_id: int
@@ -1036,7 +2360,8 @@ class PostgresRoleStore:
                 """
                 SELECT outbox.delivery_id, outbox.telegram_user_id,
                        outbox.display_locale, outbox.screen_revision,
-                       outbox.message_text, outbox.button_rows
+                       outbox.message_text, outbox.button_rows,
+                       outbox.reply_button, outbox.reply_keyboard_action
                 FROM football_runtime.bot_message_outbox AS outbox
                 JOIN football_runtime.bot_users AS account
                   ON account.telegram_user_id = outbox.telegram_user_id
@@ -1072,6 +2397,33 @@ class PostgresRoleStore:
             screen_revision=row["screen_revision"],
             delivery_id=row["delivery_id"],
             telegram_message_id=row["telegram_message_id"],
+        )
+
+    def active_result_context(
+        self, telegram_user_id: int
+    ) -> ActiveResultContext | None:
+        """Read the latest successfully presented Completed Search pointer."""
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT telegram_user_id, completed_search_id, current_result_id,
+                       absolute_position, screen_revision
+                FROM football_runtime.bot_active_result_contexts
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ActiveResultContext(
+            telegram_user_id=row["telegram_user_id"],
+            completed_search_id=row["completed_search_id"],
+            current_result_id=row["current_result_id"],
+            absolute_position=row["absolute_position"],
+            screen_revision=row["screen_revision"],
         )
 
     def claim_conversation_message(
@@ -1135,6 +2487,8 @@ class PostgresRoleStore:
                           bot_message_outbox.screen_revision,
                           bot_message_outbox.message_text,
                           bot_message_outbox.button_rows,
+                          bot_message_outbox.reply_button,
+                          bot_message_outbox.reply_keyboard_action,
                           candidate.delivery_status AS prior_delivery_status
                 """,
                 (stale_before, stale_before, claim_token, claimed_at, claimed_at),
@@ -1237,7 +2591,7 @@ class PostgresRoleStore:
         telegram_message_id: str,
         delivered_at: datetime,
     ) -> None:
-        """Confirm an external delivery without changing conversation state."""
+        """Confirm delivery and activate Search state only after Telegram success."""
         with psycopg.connect(self._database_url) as connection:
             delivered = connection.execute(
                 """
@@ -1264,6 +2618,15 @@ class PostgresRoleStore:
                 (delivered_at, delivery_id),
             )
             if superseded_at is None:
+                previous_view = connection.execute(
+                    """
+                    SELECT delivery_id, telegram_message_id
+                    FROM football_runtime.bot_active_chat_views
+                    WHERE telegram_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
                 connection.execute(
                     """
                     INSERT INTO football_runtime.bot_active_chat_views (
@@ -1284,6 +2647,139 @@ class PostgresRoleStore:
                         delivered_at,
                     ),
                 )
+                if previous_view is not None and previous_view[0] != delivery_id:
+                    connection.execute(
+                        """
+                        INSERT INTO football_runtime.bot_old_chat_views (
+                            delivery_id, telegram_user_id, telegram_message_id,
+                            replacement_delivery_id, classified_at
+                        ) VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (delivery_id) DO NOTHING
+                        """,
+                        (
+                            previous_view[0],
+                            telegram_user_id,
+                            previous_view[1],
+                            delivery_id,
+                            delivered_at,
+                        ),
+                    )
+                search_presentation = connection.execute(
+                    """
+                    SELECT completed_search_id
+                    FROM football_runtime.bot_search_presentations
+                    WHERE delivery_id = %s AND telegram_user_id = %s
+                    """,
+                    (delivery_id, telegram_user_id),
+                ).fetchone()
+                if search_presentation is not None:
+                    completed_search_id = search_presentation[0]
+                    changed = connection.execute(
+                        """
+                        UPDATE football_runtime.bot_users
+                        SET stage = 'results',
+                            screen_revision = %s,
+                            revision = revision + 1,
+                            updated_at = %s
+                        WHERE telegram_user_id = %s
+                          AND stage = 'submitting'
+                        RETURNING revision
+                        """,
+                        (screen_revision, delivered_at, telegram_user_id),
+                    ).fetchone()
+                    if changed is None:
+                        raise RuntimeError(
+                            "Search result presentation lost submitting state"
+                        )
+                    connection.execute(
+                        """
+                        DELETE FROM football_runtime.bot_discovery_drafts
+                        WHERE telegram_user_id = %s AND stage = 'submitting'
+                        """,
+                        (telegram_user_id,),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO football_runtime.bot_active_result_contexts (
+                            telegram_user_id, completed_search_id,
+                            current_result_id, absolute_position,
+                            screen_revision, activated_at
+                        ) VALUES (%s, %s, NULL, NULL, %s, %s)
+                        ON CONFLICT (telegram_user_id) DO UPDATE
+                        SET completed_search_id = EXCLUDED.completed_search_id,
+                            current_result_id = NULL,
+                            absolute_position = NULL,
+                            screen_revision = EXCLUDED.screen_revision,
+                            activated_at = EXCLUDED.activated_at
+                        """,
+                        (
+                            telegram_user_id,
+                            completed_search_id,
+                            screen_revision,
+                            delivered_at,
+                        ),
+                    )
+
+    def claim_old_chat_view_cleanup(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> OldChatViewCleanup | None:
+        """Claim one pending or abandoned old-view cleanup."""
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                WITH candidate AS (
+                    SELECT delivery_id
+                    FROM football_runtime.bot_old_chat_views
+                    WHERE cleanup_status = 'pending'
+                       OR (cleanup_status = 'claimed' AND claimed_at < %s)
+                    ORDER BY classified_at, delivery_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE football_runtime.bot_old_chat_views AS old_view
+                SET cleanup_status = 'claimed', claim_token = %s, claimed_at = %s
+                FROM candidate
+                WHERE old_view.delivery_id = candidate.delivery_id
+                RETURNING old_view.delivery_id, old_view.telegram_user_id,
+                          old_view.telegram_message_id
+                """,
+                (stale_before, claim_token, claimed_at),
+            ).fetchone()
+        if row is None:
+            return None
+        return OldChatViewCleanup(
+            delivery_id=row[0],
+            telegram_user_id=row[1],
+            telegram_message_id=row[2],
+            claim_token=claim_token,
+        )
+
+    def mark_old_chat_view_cleanup_attempted(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        deleted: bool,
+        attempted_at: datetime,
+    ) -> None:
+        """Record the terminal best-effort outcome for one old view."""
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_old_chat_views
+                SET cleanup_status = 'attempted', claim_token = NULL,
+                    claimed_at = NULL, cleanup_attempted_at = %s, deleted = %s
+                WHERE delivery_id = %s AND claim_token = %s
+                RETURNING delivery_id
+                """,
+                (attempted_at, deleted, delivery_id, claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("old-view cleanup claim was lost")
 
     def attempt_owner_write(
         self,
@@ -1355,6 +2851,23 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
             tuple((button[0], button[1]) for button in button_row)
             for button_row in row["button_rows"]
         ),
+        reply_button=row.get("reply_button"),
+        reply_keyboard_action=ReplyKeyboardAction(row["reply_keyboard_action"]),
+    )
+
+
+def _completed_search(row: dict[str, Any]) -> CompletedSearch:
+    return CompletedSearch(
+        completed_search_id=row["completed_search_id"],
+        telegram_user_id=row["telegram_user_id"],
+        search_update_id=row["search_update_id"],
+        user_intent=UserIntent(row["user_intent"]),
+        country_id=row["country_id"],
+        city_id=row["city_id"],
+        sub_city_area_ids=tuple(row["sub_city_area_ids"]),
+        whole_city=row["whole_city"],
+        required_date=_optional_required_date(row["required_date"]),
+        completed_at=row["completed_at"],
     )
 
 
@@ -1462,6 +2975,34 @@ def _insert_outbox(
     )
 
 
+def _accept_contract_inbox(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    *,
+    consumer: RuntimeRole,
+    incoming: RawContractEnvelope,
+    received_at: datetime,
+) -> None:
+    """Persist terminal acceptance for one supported incoming envelope."""
+    connection.execute(
+        """
+        INSERT INTO football_runtime.contract_inbox (
+            consumer_role, message_id, producer_role, contract_name,
+            contract_version, processing_status, received_at
+        ) VALUES (%s, %s, %s, %s, %s, 'accepted', %s)
+        ON CONFLICT (consumer_role, message_id) DO UPDATE
+        SET processing_status = 'accepted', received_at = EXCLUDED.received_at
+        """,
+        (
+            consumer.value,
+            incoming.message_id,
+            incoming.producer.value,
+            incoming.contract_name.value,
+            incoming.contract_version,
+            received_at,
+        ),
+    )
+
+
 def _insert_alert(
     connection: psycopg.Connection[tuple[Any, ...]],
     *,
@@ -1506,7 +3047,9 @@ def _release_claim(
     )
 
 
-def _row_to_envelope(row: dict[str, Any]) -> RawContractEnvelope:
+def _row_to_envelope(
+    row: dict[str, Any], *, validate_registered: bool = True
+) -> RawContractEnvelope:
     consumer = row["consumer_role"]
     envelope = RawContractEnvelope(
         contract_name=ContractName(row["contract_name"]),
@@ -1522,7 +3065,7 @@ def _row_to_envelope(row: dict[str, Any]) -> RawContractEnvelope:
         recorded_at=row["recorded_at"],
         payload=row["payload"],
     )
-    if any(
+    if validate_registered and any(
         definition.name is envelope.contract_name
         and definition.version == envelope.contract_version
         for definition in SUPPORTED_CONTRACTS

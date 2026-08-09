@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from modules.application import ConversationOnboarding
+from modules.application import (
+    ConversationOnboarding,
+    RuntimeApplication,
+    RuntimeProcessingError,
+)
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
     ContractDefinition,
@@ -24,6 +29,8 @@ from modules.contracts import (
 )
 from modules.domain import (
     ActiveChatView,
+    ActiveResultContext,
+    CompletedSearch,
     ConversationStage,
     ConversationState,
     DateInterpretationQuery,
@@ -37,12 +44,13 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    RequiredDate,
     RequiredDateConfirmationEvent,
+    SearchResult,
     TelegramMessage,
 )
 from modules.ports import (
     AcceptanceObserver,
-    AcceptanceRoleStore,
     Clock,
     ConversationAccessDeniedError,
     ConversationLanguageAdapter,
@@ -51,7 +59,6 @@ from modules.ports import (
     LocationResolverAdapter,
     LocationResolverError,
     ModelAdapter,
-    OutboxConflictError,
     ResolvedTimezoneData,
     TelegramDeliveryAdapter,
     TelegramDeliveryOutcomeUnknownError,
@@ -103,6 +110,9 @@ class ControlledTelegramDeliveryAdapter:
 
     presentations: list[str] = field(default_factory=list)
     messages: list[TelegramMessage] = field(default_factory=list)
+    inline_action_removals: list[tuple[int, str]] = field(default_factory=list)
+    typing_actions: list[int] = field(default_factory=list)
+    deletion_attempts: list[tuple[int, str]] = field(default_factory=list)
     failures_remaining: int = 0
     lost_confirmations_remaining: int = 0
     interruptions_after_effect_remaining: int = 0
@@ -158,6 +168,27 @@ class ControlledTelegramDeliveryAdapter:
         if recorded_message != message:
             raise ValueError("delivery ID was reused for a different message")
         return telegram_message_id
+
+    def remove_inline_actions(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> None:
+        """Record one idempotent removal of an existing inline keyboard."""
+        action = (telegram_user_id, telegram_message_id)
+        if action not in self.inline_action_removals:
+            self.inline_action_removals.append(action)
+
+    def show_typing(self, *, telegram_user_id: int) -> None:
+        """Record one native typing action for an accepted Search."""
+        self.typing_actions.append(telegram_user_id)
+
+    def delete_message(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> bool:
+        """Record one idempotent successful old-message deletion."""
+        attempt = (telegram_user_id, telegram_message_id)
+        if attempt not in self.deletion_attempts:
+            self.deletion_attempts.append(attempt)
+        return True
 
 
 class ControlledModelAdapter:
@@ -615,8 +646,7 @@ class OwnershipViolationError(RuntimeError):
         super().__init__("runtime role cannot write another owner's state")
 
 
-class InjectedFailureError(RuntimeError):
-    """A controlled invalid outbox identity rolled back its transaction."""
+InjectedFailureError = RuntimeProcessingError
 
 
 class InjectedInterruptionError(RuntimeError):
@@ -631,204 +661,7 @@ class InjectedTelegramDeliveryInterruptionError(BaseException):
     """A process stopped after Telegram accepted an unconfirmed presentation."""
 
 
-@dataclass(slots=True)
-class AcceptanceRole:
-    """One independently reconnectable runtime responsibility."""
-
-    role: RuntimeRole
-    store: AcceptanceRoleStore
-    clock: Clock
-    telegram_ingestion: TelegramIngestionAdapter | None = None
-    telegram_delivery: TelegramDeliveryAdapter | None = None
-    model: ModelAdapter | None = None
-    location_resolver: LocationResolverAdapter | None = None
-    conversation_language: ConversationLanguageAdapter | None = None
-    date_interpretation: DateInterpretationAdapter | None = None
-    timezone_data: TimezoneDataAdapter | None = None
-    supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.supported_versions:
-            return
-        for definition in SUPPORTED_CONTRACTS:
-            if definition.consumer is self.role and definition.version == 1:
-                self.supported_versions.setdefault(definition.name, set()).add(1)
-
-    def supports(self, contract_name: ContractName, version: int) -> None:
-        """Add one explicit consumer contract version."""
-        self.supported_versions.setdefault(contract_name, {1}).add(version)
-
-    def versions_for(self, contract_name: ContractName) -> set[int]:
-        """Return explicit versions supported by this consumer."""
-        return set(self.supported_versions.get(contract_name, set()))
-
-    def record_source_event(
-        self,
-        probe_id: str,
-        *,
-        contract_version: int,
-        payload: JsonValue | None = None,
-    ) -> None:
-        """Commit one synthetic Source Event through the ingestion role."""
-        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
-            msg = "only the ingestion runtime can record a Source Event"
-            raise RuntimeError(msg)
-        correlation_id = _identifier(probe_id, "correlation")
-        source_event_id = self.telegram_ingestion.source_event_id(probe_id)
-        definition = _CONTRACTS.get(
-            (ContractName.SOURCE_EVENT_RECORDED, contract_version)
-        )
-        if definition is not None and payload is None:
-            envelope: RawContractEnvelope = _envelope(
-                definition=definition,
-                probe_id=probe_id,
-                version=contract_version,
-                fact=source_event_id,
-                causation_id=correlation_id,
-                correlation_id=correlation_id,
-                recorded_at=self.clock.now(),
-            )
-        else:
-            envelope = RawContractEnvelope(
-                contract_name=ContractName.SOURCE_EVENT_RECORDED,
-                contract_version=contract_version,
-                message_id=_identifier(
-                    probe_id,
-                    ContractName.SOURCE_EVENT_RECORDED.value,
-                ),
-                producer=RuntimeRole.INGESTION,
-                consumer=RuntimeRole.APPLICATION,
-                subject_id=probe_id,
-                subject_revision=1,
-                idempotency_key=(
-                    f"{probe_id}:{ContractName.SOURCE_EVENT_RECORDED.value}"
-                ),
-                causation_id=correlation_id,
-                correlation_id=correlation_id,
-                recorded_at=self.clock.now(),
-                payload=payload
-                if payload is not None
-                else {"probe_id": probe_id, "source_event_id": source_event_id},
-            )
-        self.store.commit_initial(probe_id=probe_id, envelope=envelope)
-
-    def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
-        """Discover and process one durable handoff addressed to this role."""
-        incoming = self.store.claim_next(
-            supported_versions=self.supported_versions,
-            claimed_at=self.clock.now(),
-        )
-        if incoming is None:
-            return False
-        outgoing = None
-        if incoming.contract_version in self.versions_for(incoming.contract_name):
-            supported_incoming = ContractEnvelope.from_raw(incoming)
-            definition, fact = self._next_handoff(supported_incoming)
-            outgoing = _envelope(
-                definition=definition,
-                probe_id=incoming.subject_id,
-                version=definition.version,
-                fact=fact,
-                causation_id=incoming.message_id,
-                correlation_id=incoming.correlation_id,
-                recorded_at=self.clock.now(),
-            )
-            if inject_outbox_conflict:
-                outgoing = _with_message_id(outgoing, incoming.message_id)
-        try:
-            self.store.consume(
-                incoming=incoming,
-                supported_versions=self.versions_for(incoming.contract_name),
-                received_at=self.clock.now(),
-                outgoing=outgoing,
-            )
-        except OutboxConflictError as error:
-            raise InjectedFailureError from error
-        return True
-
-    def present_next(self) -> bool:
-        """Retry one committed presentation through the idempotent Bot API port."""
-        if self.role is not RuntimeRole.BOT_ASSISTANT:
-            return False
-        if self.telegram_delivery is None:
-            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
-        envelope = self.store.claim_presentation(claimed_at=self.clock.now())
-        if envelope is None:
-            return False
-        delivery_id = _payload_text(envelope, "delivery_id")
-        self.store.record_presentation_attempt(
-            envelope=envelope,
-            delivery_id=delivery_id,
-            attempted_at=self.clock.now(),
-        )
-        self.telegram_delivery.present(delivery_id)
-        self.store.record_presentation_success(
-            message_id=envelope.message_id,
-            presented_at=self.clock.now(),
-        )
-        return True
-
-    def attempt_owner_write(self, *, owner: RuntimeRole, probe_id: str) -> bool:
-        """Attempt one cross-owner write through this role's credential."""
-        message_id = _identifier(probe_id, f"{self.role.value}:{owner.value}:denied")
-        attempt = ContractEnvelope(
-            contract_name=ContractName.OWNER_STATE_WRITE,
-            contract_version=1,
-            message_id=message_id,
-            producer=self.role,
-            consumer=owner,
-            subject_id=probe_id,
-            subject_revision=1,
-            idempotency_key=f"{probe_id}:{self.role.value}:{owner.value}:denied",
-            causation_id=message_id,
-            correlation_id=message_id,
-            recorded_at=self.clock.now(),
-            payload={},
-        )
-        return self.store.attempt_owner_write(
-            owner=owner,
-            probe_id=probe_id,
-            attempt=attempt,
-        )
-
-    def _next_handoff(
-        self,
-        incoming: ContractEnvelope,
-    ) -> tuple[ContractDefinition, str]:
-        if incoming.contract_name is ContractName.SOURCE_EVENT_RECORDED:
-            source_event_id = _payload_text(incoming, "source_event_id")
-            return (
-                _CONTRACTS[(ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION, 1)],
-                f"source-message-revision:{source_event_id}",
-            )
-        if incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION:
-            if self.model is None:
-                raise RuntimeError("classification runtime has no model adapter")
-            revision_id = _payload_text(incoming, "source_message_revision_id")
-            return (
-                _CONTRACTS[(ContractName.CLASSIFICATION_PROPOSAL, 1)],
-                self.model.proposal_id(revision_id),
-            )
-        if incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL:
-            if self.location_resolver is None:
-                raise RuntimeError("application runtime has no resolver adapter")
-            proposal_id = _payload_text(incoming, "proposal_id")
-            return (
-                _CONTRACTS[(ContractName.OPPORTUNITY_PUBLICATION_CHANGED, 1)],
-                self.location_resolver.opportunity_revision_id(proposal_id),
-            )
-        if incoming.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED:
-            return (
-                _CONTRACTS[(ContractName.SEARCH_COMPLETED, 1)],
-                f"completed-search:{incoming.subject_id}",
-            )
-        if incoming.contract_name is ContractName.SEARCH_COMPLETED:
-            return (
-                _CONTRACTS[(ContractName.TELEGRAM_PRESENTATION_REQUESTED, 1)],
-                f"delivery:{incoming.subject_id}",
-            )
-        msg = f"{self.role.value} has no handoff for {incoming.contract_name.value}"
-        raise RuntimeError(msg)
+AcceptanceRole = RuntimeApplication
 
 
 class AcceptanceSpine:
@@ -912,6 +745,79 @@ class AcceptanceSpine:
             payload=source_payload,
         )
 
+    def record_search_event(
+        self,
+        *,
+        probe_id: str,
+        contract_name: ContractName,
+        contract_version: int,
+        telegram_user_id: int,
+        producer: RuntimeRole | None = None,
+        include_telegram_user_id: bool = True,
+        payload: dict[str, JsonValue] | None = None,
+    ) -> None:
+        """Record one synthetic Recommendation event for contract-boundary tests."""
+        if contract_name not in {
+            ContractName.RUN_SEARCH,
+            ContractName.SEARCH_COMPLETED,
+            ContractName.SEARCH_FAILED,
+            ContractName.GET_COMPLETED_SEARCH,
+        }:
+            raise ValueError("only Search outcome events can use this testkit port")
+        event_producer = producer or (
+            RuntimeRole.BOT_ASSISTANT
+            if contract_name is ContractName.RUN_SEARCH
+            else RuntimeRole.RECOMMENDATION
+        )
+        consumer = (
+            RuntimeRole.RECOMMENDATION
+            if contract_name is ContractName.RUN_SEARCH
+            else RuntimeRole.BOT_ASSISTANT
+        )
+        event_payload: dict[str, JsonValue]
+        if payload is not None:
+            event_payload = dict(payload)
+        else:
+            event_payload = {
+                "probe_id": probe_id,
+                (
+                    "completed_search_id"
+                    if contract_name
+                    in {
+                        ContractName.SEARCH_COMPLETED,
+                        ContractName.GET_COMPLETED_SEARCH,
+                    }
+                    else "search_update_id"
+                ): f"search-fact:{probe_id}",
+                "search_update_id": f"search-update:{probe_id}",
+            }
+        if include_telegram_user_id and "telegram_user_id" not in event_payload:
+            event_payload["telegram_user_id"] = telegram_user_id
+        if (
+            contract_name is ContractName.SEARCH_COMPLETED
+            and contract_version == 2
+            and "result_count" not in event_payload
+        ):
+            event_payload["result_count"] = 0
+        envelope = RawContractEnvelope(
+            contract_name=contract_name,
+            contract_version=contract_version,
+            message_id=_identifier(probe_id, contract_name.value),
+            producer=event_producer,
+            consumer=consumer,
+            subject_id=probe_id,
+            subject_revision=1,
+            idempotency_key=f"{probe_id}:{contract_name.value}",
+            causation_id=_identifier(probe_id, "causation"),
+            correlation_id=_identifier(probe_id, "correlation"),
+            recorded_at=self._roles[event_producer].clock.now(),
+            payload=event_payload,
+        )
+        self._roles[event_producer].store.commit_initial(
+            probe_id=probe_id,
+            envelope=envelope,
+        )
+
     def run_until_idle(
         self,
         probe_id: str,
@@ -963,6 +869,26 @@ class AcceptanceSpine:
         """Recover a rejected or pending envelope without acknowledging it."""
         return self._observer.envelope(_identifier(probe_id, contract_name.value))
 
+    def delete_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject a missing canonical Completed Search query."""
+        return self._observer.delete_completed_search_query(completed_search_id)
+
+    def invalidate_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject an invalid supported Completed Search query."""
+        return self._observer.invalidate_completed_search_query(completed_search_id)
+
+    def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
+        """Restore one corrected canonical Completed Search query."""
+        self._observer.restore_completed_search_query(query)
+
+    def contract_is_accepted(self, message_id: UUID) -> bool:
+        """Observe terminal acceptance for one contract identity."""
+        return self._observer.contract_is_accepted(message_id)
+
     def attempt_owner_write(
         self,
         *,
@@ -1001,25 +927,23 @@ class AcceptanceSpine:
         """Observe append-only explicit Required Date confirmations."""
         return self._observer.required_date_confirmations(telegram_user_id)
 
+    def completed_searches(self, telegram_user_id: int) -> tuple[CompletedSearch, ...]:
+        """Observe immutable Completed Searches through the public seam."""
+        return self._observer.completed_searches(telegram_user_id)
+
+    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+        """Observe one Completed Search's ordered Results through the seam."""
+        return self._observer.results(completed_search_id)
+
+    def search_completions(
+        self, search_update_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe completion contracts for one Search command identity."""
+        return self._observer.search_completions(search_update_id)
+
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
-        if role.telegram_delivery is None:
-            raise RuntimeError("Bot Assistant runtime has no delivery adapter")
-        if role.location_resolver is None:
-            raise RuntimeError("Bot Assistant runtime has no resolver adapter")
-        if role.date_interpretation is None:
-            raise RuntimeError("Bot Assistant runtime has no date interpreter")
-        if role.timezone_data is None:
-            raise RuntimeError("Bot Assistant runtime has no timezone-data adapter")
-        return ConversationOnboarding(
-            store=role.store,
-            telegram_delivery=role.telegram_delivery,
-            conversation_language=_conversation_language(role),
-            location_resolver=role.location_resolver,
-            date_interpretation=role.date_interpretation,
-            timezone_data=role.timezone_data,
-            clock=role.clock,
-        )
+        return _conversation_onboarding_for_role(role)
 
     def start_bot_user(
         self,
@@ -1034,6 +958,55 @@ class AcceptanceSpine:
             telegram_user_id=telegram_user_id,
             telegram_language_hint=telegram_language_hint,
         )
+
+    def submit_search(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Search callback through the external Bot Assistant port."""
+        self._conversation_onboarding().submit_search(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def process_searches_until_idle(self) -> None:
+        """Let recommendation and Bot Assistant finish durable Search work."""
+        while True:
+            progressed = self._roles[RuntimeRole.RECOMMENDATION].process_next()
+            progressed = (
+                self._roles[RuntimeRole.BOT_ASSISTANT].process_next() or progressed
+            )
+            delivered = self._conversation_onboarding().deliver_pending()
+            if not progressed and not delivered:
+                return
+
+    def process_next_search_handoff(self, role: RuntimeRole) -> bool:
+        """Process one durable Search handoff without presenting Telegram output."""
+        if role not in {RuntimeRole.RECOMMENDATION, RuntimeRole.BOT_ASSISTANT}:
+            raise ValueError("Search handoff role must own the Search pipeline")
+        return self._roles[role].process_next()
+
+    @contextmanager
+    def hold_bot_user_transition(self, telegram_user_id: int) -> Iterator[None]:
+        """Hold the real Bot User serialization boundary for concurrency tests."""
+        store = self._roles[RuntimeRole.BOT_ASSISTANT].store
+        with store.serialize_conversation_update(
+            update_id=f"controlled-transition:{telegram_user_id}",
+            telegram_user_id=telegram_user_id,
+        ):
+            yield
+
+    def fail_next_search(self) -> None:
+        """Inject one controlled technical failure in Recommendation."""
+        self._roles[RuntimeRole.RECOMMENDATION].fail_next_search()
 
     def select_fixed_language(
         self,
@@ -1351,6 +1324,15 @@ class AcceptanceSpine:
             raise LookupError(telegram_user_id)
         return view
 
+    def active_result_context(self, telegram_user_id: int) -> ActiveResultContext:
+        """Observe the latest successfully presented Completed Search."""
+        context = self._roles[RuntimeRole.BOT_ASSISTANT].store.active_result_context(
+            telegram_user_id
+        )
+        if context is None:
+            raise LookupError(telegram_user_id)
+        return context
+
     def read_conversation_state_as(
         self,
         *,
@@ -1473,6 +1455,57 @@ def _conversation_language(role: AcceptanceRole) -> ConversationLanguageAdapter:
     if role.conversation_language is None:
         raise RuntimeError("Bot Assistant runtime has no language adapter")
     return role.conversation_language
+
+
+def _conversation_onboarding_for_role(
+    role: AcceptanceRole,
+) -> ConversationOnboarding:
+    if role.role is not RuntimeRole.BOT_ASSISTANT:
+        raise RuntimeError("only Bot Assistant owns Search presentation")
+    if role.telegram_delivery is None:
+        raise RuntimeError("Bot Assistant runtime has no delivery adapter")
+    if role.location_resolver is None:
+        raise RuntimeError("Bot Assistant runtime has no resolver adapter")
+    if role.date_interpretation is None:
+        raise RuntimeError("Bot Assistant runtime has no date interpreter")
+    if role.timezone_data is None:
+        raise RuntimeError("Bot Assistant runtime has no timezone-data adapter")
+    return ConversationOnboarding(
+        store=role.store,
+        telegram_delivery=role.telegram_delivery,
+        conversation_language=_conversation_language(role),
+        location_resolver=role.location_resolver,
+        date_interpretation=role.date_interpretation,
+        timezone_data=role.timezone_data,
+        clock=role.clock,
+        supported_query_versions=role.versions_for(ContractName.GET_COMPLETED_SEARCH),
+    )
+
+
+def _required_date_from_payload(value: JsonValue) -> RequiredDate | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch required_date must be an object")
+    start = value.get("start_local_date")
+    end = value.get("end_local_date")
+    iana_timezone = value.get("iana_timezone")
+    timezone_data_version = value.get("timezone_data_version")
+    if not all(
+        isinstance(item, str) and item
+        for item in (start, end, iana_timezone, timezone_data_version)
+    ):
+        raise ValueError("RunSearch required_date is incomplete")
+    assert isinstance(start, str)
+    assert isinstance(end, str)
+    assert isinstance(iana_timezone, str)
+    assert isinstance(timezone_data_version, str)
+    return RequiredDate(
+        start_local_date=date.fromisoformat(start),
+        end_local_date=date.fromisoformat(end),
+        iana_timezone=iana_timezone,
+        timezone_data_version=timezone_data_version,
+    )
 
 
 def _envelope(
