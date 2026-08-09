@@ -466,6 +466,12 @@ def _assert_final_migration_state(database_url: str) -> None:
     ]
     assert sequence_dependencies == [
         (
+            "bot_callback_outbox_sequence_id_seq",
+            "i",
+            "bot_callback_outbox",
+            "sequence_id",
+        ),
+        (
             "bot_geography_confirmation_events_event_sequence_seq",
             "i",
             "bot_geography_confirmation_events",
@@ -721,7 +727,7 @@ def test_migrate_adopts_untracked_current_schema_without_replaying(
     ]
 
 
-@pytest.mark.parametrize("applied_count", range(1, 8))
+@pytest.mark.parametrize("applied_count", range(1, 9))
 def test_migrate_adopts_each_exact_partial_prefix_and_upgrades_it(
     fresh_database_url: str,
     applied_count: int,

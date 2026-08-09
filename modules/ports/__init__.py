@@ -37,6 +37,7 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
     TelegramMessage,
     UserIntent,
@@ -116,7 +117,7 @@ class TelegramDeliveryAdapter(Protocol):
         ...
 
     def answer_callback(self, *, callback_id: str, text: str) -> None:
-        """Answer one Bot API callback without creating a chat message."""
+        """Idempotently answer one callback-query identity without a chat message."""
         ...
 
 
@@ -273,11 +274,37 @@ class ConversationStore(Protocol):
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         expected_revision: int,
+        text: str,
         recorded_at: datetime,
     ) -> bool:
-        """Record one callback-only effect before it reaches Telegram."""
+        """Commit one callback update and its durable notification outbox."""
+        ...
+
+    def claim_conversation_callback(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramCallbackDeliveryClaim | None:
+        """Claim one pending or abandoned callback notification."""
+        ...
+
+    def release_conversation_callback_claim(self, *, claim_token: UUID) -> None:
+        """Release a callback claim for safe idempotent retry."""
+        ...
+
+    def mark_conversation_callback_delivered(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        delivered_at: datetime,
+    ) -> None:
+        """Record one confirmed callback-query answer."""
         ...
 
     def commit_search_submission(

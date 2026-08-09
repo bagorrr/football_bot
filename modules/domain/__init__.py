@@ -361,6 +361,16 @@ class TelegramDeliveryClaim:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramCallbackDeliveryClaim:
+    """One durable callback notification claim with distinct identities."""
+
+    delivery_id: str
+    callback_id: str
+    text: str
+    claim_token: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveChatView:
     """The latest successfully presented Bot User screen."""
 
@@ -390,3 +400,14 @@ class LanguageSelection:
     direction_labels: tuple[str, str, str, str, str, str, str]
     settings_text: str | None = None
     settings_labels: tuple[str, str, str, str, str, str] | None = None
+    main_menu_text: str | None = None
+    main_menu_labels: tuple[str, str, str, str] | None = None
+    mode_text: str | None = None
+    mode_labels: tuple[str, str, str, str] | None = None
+    settings_language_text: str | None = None
+    settings_language_prompt: str | None = None
+    settings_language_clarification: str | None = None
+    settings_language_labels: tuple[str, str, str] | None = None
+    placeholder_notifications: tuple[str, str, str] | None = None
+    no_results_yet: tuple[str, str, str] | None = None
+    zero_result: tuple[str, str, str] | None = None
