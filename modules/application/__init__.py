@@ -23,7 +23,6 @@ from modules.contracts import (
     RawContractEnvelope,
     RuntimeRole,
     derive_contract_message_id,
-    is_valid_source_chat_address,
 )
 from modules.domain import (
     AcceptedLocation,
@@ -55,6 +54,7 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
     UserIntent,
+    is_valid_source_chat_address,
 )
 from modules.ports import (
     AcceptanceRoleStore,
@@ -1497,6 +1497,7 @@ class ConversationOnboarding:
             recorded_at = self._clock.now()
             locale = current.locale or "en"
             selection = self._language_rendering(locale)
+            registry_generation = self._store.next_source_chat_registration_generation()
             message_id = _runtime_identifier(
                 update_id,
                 ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value,
@@ -1508,7 +1509,7 @@ class ConversationOnboarding:
                 producer=RuntimeRole.BOT_ASSISTANT,
                 consumer=RuntimeRole.APPLICATION,
                 subject_id=f"source-chat-registration:{update_id}",
-                subject_revision=1,
+                subject_revision=registry_generation,
                 idempotency_key=f"source-chat-registration:{update_id}",
                 causation_id=message_id,
                 correlation_id=message_id,
@@ -1516,6 +1517,13 @@ class ConversationOnboarding:
                 payload={
                     "address": normalized_address,
                     "telegram_user_id": telegram_user_id,
+                    "registry_generation": registry_generation,
+                    "registration_request_id": str(
+                        derive_contract_message_id(
+                            message_id,
+                            ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+                        )
+                    ),
                 },
             )
             state = replace(
@@ -4179,6 +4187,10 @@ class ConversationOnboarding:
                 "source-chat-address:",
                 "source-chat-pending:",
             )
+        ) or any(
+            callback.startswith("settings:administration:")
+            for row in message.button_rows
+            for _label, callback in row
         )
         if administration_delivery and not self._is_administrator(
             message.telegram_user_id
@@ -5605,11 +5617,19 @@ class RuntimeApplication:
                     )
                     return True
                 outgoing = None
-                if self.role is RuntimeRole.APPLICATION and incoming.contract_name in {
-                    ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
-                    ContractName.SOURCE_CHAT_ADMISSION_FAILED,
-                }:
-                    outgoing = self._invalid_source_chat_registration_failure(incoming)
+                if self.role is RuntimeRole.APPLICATION:
+                    if (
+                        incoming.contract_name
+                        is ContractName.CHANGE_SOURCE_CHAT_REGISTRY
+                    ):
+                        outgoing = self._invalid_source_chat_command_failure(incoming)
+                    elif incoming.contract_name in {
+                        ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+                        ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+                    }:
+                        outgoing = self._invalid_source_chat_registration_failure(
+                            incoming
+                        )
                 elif (
                     self.role is RuntimeRole.INGESTION
                     and incoming.contract_name
@@ -5753,15 +5773,20 @@ class RuntimeApplication:
             raise TypeError("ChangeSourceChatRegistry payload must be an object")
         address = incoming.payload.get("address")
         telegram_user_id = incoming.payload.get("telegram_user_id")
+        registry_generation = incoming.payload.get("registry_generation")
+        registration_request_id = incoming.payload.get("registration_request_id")
         if not isinstance(address, str) or not address:
             raise ValueError("ChangeSourceChatRegistry requires address")
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("ChangeSourceChatRegistry requires telegram_user_id")
+        if not isinstance(registry_generation, int) or isinstance(
+            registry_generation, bool
+        ):
+            raise TypeError("ChangeSourceChatRegistry requires registry_generation")
+        if not isinstance(registration_request_id, str):
+            raise TypeError("ChangeSourceChatRegistry requires registration_request_id")
         recorded_at = self.clock.now()
-        request_message_id = derive_contract_message_id(
-            incoming.message_id,
-            ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
-        )
+        request_message_id = UUID(registration_request_id)
         outgoing = ContractEnvelope(
             contract_name=ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
             contract_version=1,
@@ -5777,7 +5802,7 @@ class RuntimeApplication:
             payload={
                 "address": address,
                 "telegram_user_id": telegram_user_id,
-                "registry_generation": 1,
+                "registry_generation": registry_generation,
                 "registration_request_id": str(request_message_id),
             },
         )
@@ -5790,7 +5815,7 @@ class RuntimeApplication:
                 registration_request_id=str(request_message_id),
                 origin_subject_id=incoming.subject_id,
                 origin_subject_revision=incoming.subject_revision,
-                registry_generation=1,
+                registry_generation=registry_generation,
                 inject_outbox_conflict=inject_outbox_conflict,
             )
             return
@@ -5882,6 +5907,42 @@ class RuntimeApplication:
                 "registration_request_id": str(context.request_message_id),
                 "telegram_user_id": context.telegram_user_id,
                 "registry_generation": context.registry_generation,
+            },
+        )
+
+    def _invalid_source_chat_command_failure(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> ContractEnvelope | None:
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            return None
+        telegram_user_id = payload.get("telegram_user_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            return None
+        request_message_id = derive_contract_message_id(
+            incoming.message_id,
+            ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+        )
+        return ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+            contract_version=1,
+            message_id=derive_contract_message_id(
+                incoming.message_id,
+                ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=incoming.subject_id,
+            subject_revision=incoming.subject_revision,
+            idempotency_key=f"source-chat-registration-failed:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.message_id,
+            recorded_at=self.clock.now(),
+            payload={
+                "registration_request_id": str(request_message_id),
+                "telegram_user_id": telegram_user_id,
+                "registry_generation": incoming.subject_revision,
             },
         )
 
@@ -6155,8 +6216,6 @@ class RuntimeApplication:
                 "registration_request_id": str(incoming.causation_id),
             },
         )
-        if inject_outbox_conflict:
-            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
         registration_context = (
             self.store.source_chat_registration_context_for_admission(incoming)
         )
@@ -6190,11 +6249,21 @@ class RuntimeApplication:
                 inject_outbox_conflict=inject_outbox_conflict,
             )
             return
+        stale_outgoing = self._invalid_source_chat_registration_failure(incoming)
+        if stale_outgoing is None:
+            raise RuntimeError("Source Chat admission has no registration context")
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+            stale_outgoing = _runtime_with_message_id(
+                stale_outgoing,
+                incoming.message_id,
+            )
         try:
             self.store.register_source_chat(
                 incoming=incoming,
                 entry=entry,
                 outgoing=outgoing,
+                stale_outgoing=stale_outgoing,
                 received_at=registered_at,
             )
         except OutboxConflictError as error:

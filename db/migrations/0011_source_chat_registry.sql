@@ -76,6 +76,42 @@ GRANT SELECT, INSERT
 GRANT UPDATE (address_kind, current_address, enabled, updated_at)
     ON football_runtime.source_chat_registry TO football_application;
 
+CREATE TABLE football_runtime.source_chat_registration_origins (
+    owner_role text NOT NULL DEFAULT 'bot_assistant'
+        CHECK (owner_role = 'bot_assistant'),
+    command_message_id uuid PRIMARY KEY,
+    correlation_id uuid NOT NULL UNIQUE,
+    request_message_id uuid NOT NULL UNIQUE,
+    telegram_user_id bigint NOT NULL CHECK (telegram_user_id > 0),
+    origin_subject_id text NOT NULL CHECK (origin_subject_id <> ''),
+    origin_subject_revision bigint NOT NULL CHECK (origin_subject_revision > 0),
+    registry_generation bigint NOT NULL CHECK (registry_generation > 0),
+    recorded_at timestamptz NOT NULL
+);
+
+ALTER TABLE football_runtime.source_chat_registration_origins ENABLE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.source_chat_registration_origins FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY source_chat_registration_origins_bot_owner
+    ON football_runtime.source_chat_registration_origins
+    USING (
+        football_runtime.current_runtime_role() = 'bot_assistant'
+        AND owner_role = 'bot_assistant'
+    )
+    WITH CHECK (
+        football_runtime.current_runtime_role() = 'bot_assistant'
+        AND owner_role = 'bot_assistant'
+    );
+
+REVOKE ALL ON football_runtime.source_chat_registration_origins FROM
+    football_ingestion,
+    football_application,
+    football_classification,
+    football_recommendation,
+    football_bot_assistant;
+GRANT SELECT, INSERT
+    ON football_runtime.source_chat_registration_origins TO football_bot_assistant;
+
 CREATE TABLE football_runtime.source_chat_admission_requests (
     owner_role text NOT NULL DEFAULT 'application'
         CHECK (owner_role = 'application'),

@@ -352,6 +352,10 @@ class ConversationStore(Protocol):
         """Commit one authorized Bot update and registry command atomically."""
         ...
 
+    def next_source_chat_registration_generation(self) -> int:
+        """Return the next durable one-administrator registration generation."""
+        ...
+
     def accept_source_chat_registration(
         self,
         *,
@@ -561,9 +565,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         incoming: RawContractEnvelope,
         entry: SourceChatRegistryEntry,
         outgoing: ContractEnvelope,
+        stale_outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically accept a command, mutate the registry, and publish its event."""
+        """Atomically accept admission and publish the applicable terminal result."""
         ...
 
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
@@ -715,6 +720,7 @@ class AcceptanceObserver(Protocol):
         *,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
+        new_subject_revision: int | None = None,
     ) -> RawContractEnvelope:
         """Inject one selected Source Chat wire fault at the test seam."""
         ...
@@ -759,6 +765,14 @@ class AcceptanceObserver(Protocol):
         self, search_update_id: str
     ) -> tuple[RawContractEnvelope, ...]:
         """Observe canonical completion events for one Search command identity."""
+        ...
+
+    def source_chat_contracts(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Source Chat outcomes for one external registration origin."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:

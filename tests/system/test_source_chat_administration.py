@@ -32,6 +32,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     FrozenClock,
     InjectedFailureError,
+    InjectedTelegramDeliveryError,
     boot_acceptance_spine,
 )
 
@@ -323,6 +324,286 @@ def test_malformed_public_addresses_return_localized_format_guidance_without_wor
     system.reset()
 
 
+def test_unknown_registry_command_fact_is_rejected_and_recovers_its_originator() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 20, tzinfo=UTC))
+    administrator_id = 46_124
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_612_400,
+    )
+    telethon.allow_public_username(
+        address="@closed_registry_command",
+        identity=identity,
+        transport_boundary="channel-pts:7410",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:closed-registry-command",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:closed-registry-command",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 20, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:closed-registry-command",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:closed-registry-command",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:closed-registry-command",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:closed-registry-command",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:closed-registry-command",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    update_id = "address:closed-registry-command"
+    system.submit_source_chat_address(
+        update_id=update_id,
+        telegram_user_id=administrator_id,
+        address="@closed_registry_command",
+    )
+    command = system.invalidate_source_chat_contract(
+        update_id=update_id,
+        contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        payload_updates={"adapter_fact": "must-not-cross-process"},
+    )
+
+    system.process_source_chat_registrations_until_idle()
+
+    assert system.source_chats() == ()
+    assert system.conversation_state(administrator_id).stage is (
+        ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+    )
+    assert system.operator_alert(command.message_id).failure_code is (
+        FailureCode.INVALID_CONTRACT
+    )
+    assert telethon.resolution_requests == []
+    assert telegram.messages[-1].text.startswith("Could not register this Source Chat")
+    assert not system.process_next_source_chat_change_request()
+    assert not system.process_next_source_chat_bot_result()
+    system.reset()
+
+
+def test_identity_tampered_registry_command_recovers_only_its_durable_originator() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 25, tzinfo=UTC))
+    administrator_id = 46_125
+    substituted_user_id = 46_126
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    for user_id in (administrator_id, substituted_user_id):
+        system.start_bot_user(
+            update_id=f"start:identity-tampered-command:{user_id}",
+            telegram_user_id=user_id,
+            telegram_language_hint="en",
+        )
+        system.select_fixed_language(
+            update_id=f"language:identity-tampered-command:{user_id}",
+            telegram_user_id=user_id,
+            locale="en",
+        )
+    clock.advance_to(datetime(2026, 9, 9, 13, 25, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:identity-tampered-command",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:identity-tampered-command",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:identity-tampered-command",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:identity-tampered-command",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:identity-tampered-command",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    update_id = "address:identity-tampered-command"
+    system.submit_source_chat_address(
+        update_id=update_id,
+        telegram_user_id=administrator_id,
+        address="@identity_tampered_command",
+    )
+    original = system.recoverable_contract(
+        update_id,
+        contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+    )
+    registration_request_id = derive_contract_message_id(
+        original.message_id,
+        ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+    )
+    command = system.invalidate_source_chat_contract(
+        update_id=update_id,
+        contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        payload_updates={
+            "telegram_user_id": substituted_user_id,
+            "registry_generation": 1,
+            "registration_request_id": str(registration_request_id),
+        },
+        causation_id=UUID("00000000-0000-0000-0000-000000000125"),
+        new_correlation_id=UUID("00000000-0000-0000-0000-000000000126"),
+    )
+
+    system.process_source_chat_registrations_until_idle()
+
+    assert system.source_chats() == ()
+    assert system.conversation_state(administrator_id).stage is (
+        ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+    )
+    assert system.conversation_state(substituted_user_id).stage is (
+        ConversationStage.DIRECTION_MENU
+    )
+    assert system.operator_alert(command.message_id).failure_code is (
+        FailureCode.INVALID_CONTRACT
+    )
+    assert telethon.resolution_requests == []
+    assert not system.process_next_source_chat_change_request()
+    assert not system.process_next_source_chat_bot_result()
+    system.reset()
+
+
+def test_malformed_resolved_addresses_are_rejected_before_registry_persistence() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 27, tzinfo=UTC))
+    administrator_id = 46_127
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_612_700,
+    )
+    telethon.allow_public_username(
+        address="@valid_resolved_input",
+        identity=identity,
+        transport_boundary="channel-pts:7420",
+        current_address="@!",
+    )
+    private_input = "https://t.me/+valid-resolved-private"
+    telethon.allow_private_invite(
+        address=private_input,
+        identity=identity,
+        transport_boundary="channel-pts:7421",
+        current_address="https://t.me/+ ",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 27, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:malformed-resolved-address",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+
+    for index, address in enumerate(("@valid_resolved_input", private_input)):
+        system.submit_source_chat_address(
+            update_id=f"address:malformed-resolved-address:{index}",
+            telegram_user_id=administrator_id,
+            address=address,
+        )
+        system.process_source_chat_registrations_until_idle()
+
+        assert system.source_chats() == ()
+        assert system.conversation_state(administrator_id).stage is (
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+        )
+        assert telegram.messages[-1].text.startswith(
+            "Could not register this Source Chat"
+        )
+
+    assert telethon.resolution_requests == ["@valid_resolved_input", private_input]
+    system.reset()
+
+
 def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     telethon = ControlledTelegramIngestionAdapter()
@@ -338,6 +619,12 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
         address="@synthetic_generation_one",
         identity=identity,
         transport_boundary="channel-pts:7401",
+    )
+    second_address = "https://t.me/+synthetic-generation-two"
+    telethon.allow_private_invite(
+        address=second_address,
+        identity=identity,
+        transport_boundary="channel-pts:8402",
     )
     system = boot_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
@@ -395,22 +682,30 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
     initial_generation = system.source_chats()[0]
     assert initial_generation.registry_generation == 1
 
+    clock.advance_to(later_time)
+    system.select_source_chats_action(
+        update_id="add:registry-generation-two",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    second_update_id = "address:registry-generation-two"
+    system.submit_source_chat_address(
+        update_id=second_update_id,
+        telegram_user_id=administrator_id,
+        address=second_address,
+    )
+    system.process_source_chat_registrations_until_idle()
+
     later_generation = SourceChatRegistryEntry(
         identity=identity,
         registry_generation=2,
         address_kind=SourceChatAddressKind.PRIVATE_INVITE,
-        current_address="https://t.me/+synthetic-generation-two",
-        processing_started_at=later_time,
-        transport_boundary="channel-pts:8402",
+        current_address=second_address,
+        processing_started_at=initial_time,
+        transport_boundary="channel-pts:7401",
         enabled=True,
         initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
-        attested_at=later_time,
-    )
-    clock.advance_to(later_time)
-    system.record_source_chat_generation(
-        probe_id="represent:registry-generation-two",
-        telegram_user_id=administrator_id,
-        entry=later_generation,
+        attested_at=initial_time,
     )
 
     assert system.source_chats() == (
@@ -431,10 +726,12 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
         )
         == later_generation
     )
-    changed = system.recoverable_contract(
-        "represent:registry-generation-two",
+    changed_events = system.source_chat_contracts(
+        update_id=second_update_id,
         contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
     )
+    assert len(changed_events) == 1
+    changed = changed_events[0]
     assert changed.subject_revision == 2
     assert changed.payload == {
         "source_chat_key": changed.subject_id,
@@ -442,114 +739,168 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
         "telegram_peer_kind": "channel",
         "telegram_chat_id": 4_610_300,
         "registry_generation": 2,
-        "registration_request_id": str(changed.correlation_id),
+        "registration_request_id": str(
+            derive_contract_message_id(
+                changed.correlation_id,
+                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            )
+        ),
     }
     system.reset()
 
 
-def test_delayed_obsolete_generation_cannot_replace_the_current_generation() -> None:
+def test_delayed_equal_and_lower_generations_are_terminal_noops() -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 35, tzinfo=UTC))
     administrator_id = 46_121
     identity = TelegramPeerIdentity(
         kind=TelegramPeerKind.CHANNEL,
         telegram_id=4_612_100,
     )
+    addresses = (
+        "@generation_order_one",
+        "https://t.me/+generation-order-two",
+        "@generation_order_equal",
+        "https://t.me/+generation-order-lower",
+    )
+    telethon.allow_public_username(
+        address=addresses[0],
+        identity=identity,
+        transport_boundary="channel-pts:7501",
+    )
+    telethon.allow_private_invite(
+        address=addresses[1],
+        identity=identity,
+        transport_boundary="channel-pts:7502",
+    )
+    telethon.allow_public_username(
+        address=addresses[2],
+        identity=identity,
+        transport_boundary="channel-pts:7503",
+    )
+    telethon.allow_private_invite(
+        address=addresses[3],
+        identity=identity,
+        transport_boundary="channel-pts:7504",
+    )
     system = boot_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
-        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
         model=ControlledModelAdapter(),
         location_resolver=ControlledLocationResolverAdapter(),
         telegram_admin_user_id=administrator_id,
     )
     system.reset()
+    system.start_bot_user(
+        update_id="start:generation-order",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:generation-order",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 35, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:generation-order",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:generation-order",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:generation-order",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:generation-order",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:generation-order-one",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:generation-order-one",
+        telegram_user_id=administrator_id,
+        address=addresses[0],
+    )
+    system.process_source_chat_registrations_until_idle()
+    system.select_source_chats_action(
+        update_id="add:generation-order-two",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:generation-order-two",
+        telegram_user_id=administrator_id,
+        address=addresses[1],
+    )
+    system.process_source_chat_registrations_until_idle()
+    current_registry = system.source_chats()
 
-    def generation(
-        number: int,
-        *,
-        address: str,
-        recorded_at: datetime,
-    ) -> SourceChatRegistryEntry:
-        return SourceChatRegistryEntry(
-            identity=identity,
-            registry_generation=number,
-            address_kind=SourceChatAddressKind.PRIVATE_INVITE,
-            current_address=address,
-            processing_started_at=recorded_at,
-            transport_boundary=f"channel-pts:{number}",
-            enabled=True,
-            initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
-            attested_at=recorded_at,
+    for label, address, stale_generation in (
+        ("equal", addresses[2], 2),
+        ("lower", addresses[3], 1),
+    ):
+        system.select_source_chats_action(
+            update_id=f"add:generation-order-{label}",
+            telegram_user_id=administrator_id,
+            action="add",
         )
+        update_id = f"address:generation-order-{label}"
+        system.submit_source_chat_address(
+            update_id=update_id,
+            telegram_user_id=administrator_id,
+            address=address,
+        )
+        system.invalidate_source_chat_contract(
+            update_id=update_id,
+            contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+            payload_updates={"registry_generation": stale_generation},
+            new_subject_revision=stale_generation,
+        )
+        system.process_source_chat_registrations_until_idle()
 
-    first = generation(
-        1,
-        address="https://t.me/+generation-one-original",
-        recorded_at=clock.now(),
-    )
-    second_time = datetime(2026, 8, 9, 13, 36, tzinfo=UTC)
-    second = generation(
-        2,
-        address="https://t.me/+generation-two-current",
-        recorded_at=second_time,
-    )
-    system.record_source_chat_generation(
-        probe_id="generation-order:first",
-        telegram_user_id=administrator_id,
-        entry=first,
-    )
-    clock.advance_to(second_time)
-    system.record_source_chat_generation(
-        probe_id="generation-order:second",
-        telegram_user_id=administrator_id,
-        entry=second,
-    )
+        assert system.source_chats() == current_registry
+        assert (
+            system.source_chat_contracts(
+                update_id=update_id,
+                contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+            )
+            == ()
+        )
+        assert (
+            len(
+                system.source_chat_contracts(
+                    update_id=update_id,
+                    contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+                )
+            )
+            == 1
+        )
+        assert system.conversation_state(administrator_id).stage is (
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+        )
+        assert not system.process_next_source_chat_change_request()
+        assert not system.process_next_source_chat_bot_result()
 
-    obsolete_time = datetime(2026, 8, 9, 13, 37, tzinfo=UTC)
-    obsolete = generation(
-        1,
-        address="https://t.me/+generation-one-delayed",
-        recorded_at=obsolete_time,
-    )
-    clock.advance_to(obsolete_time)
-    system.record_source_chat_generation(
-        probe_id="generation-order:obsolete",
-        telegram_user_id=administrator_id,
-        entry=obsolete,
-    )
-
-    assert system.source_chats() == (replace(first, enabled=False), second)
     assert (
         system.eligible_source_chat_generation(
             identity=identity,
             registry_generation=2,
         )
-        == second
-    )
-    assert (
-        system.recoverable_contract(
-            "generation-order:obsolete",
-            contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
-        ).subject_revision
-        == 1
-    )
-
-    third_time = datetime(2026, 8, 9, 13, 38, tzinfo=UTC)
-    third = generation(
-        3,
-        address="https://t.me/+generation-three-current",
-        recorded_at=third_time,
-    )
-    clock.advance_to(third_time)
-    system.record_source_chat_generation(
-        probe_id="generation-order:third",
-        telegram_user_id=administrator_id,
-        entry=third,
-    )
-    assert system.source_chats() == (
-        replace(first, enabled=False),
-        replace(second, enabled=False),
-        third,
+        == current_registry[-1]
     )
     system.reset()
 
@@ -843,6 +1194,76 @@ def test_queued_success_revalidates_administrator_at_actual_delivery() -> None:
         "Administration"
         not in tuple(button[0] for row in message.button_rows for button in row)
         for message in delivered_after_rotation
+    )
+    rotated_system.reset()
+
+
+def test_queued_settings_revalidates_administrator_at_actual_delivery() -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 47, 45, tzinfo=UTC))
+    former_administrator_id = 46_124
+    current_administrator_id = 46_125
+    submitted_system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=former_administrator_id,
+    )
+    submitted_system.reset()
+    submitted_system.start_bot_user(
+        update_id="start:queued-settings-rotation",
+        telegram_user_id=former_administrator_id,
+        telegram_language_hint="en",
+    )
+    submitted_system.select_fixed_language(
+        update_id="language:queued-settings-rotation",
+        telegram_user_id=former_administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 47, 45, tzinfo=UTC))
+    submitted_system.expire_inactive_discovery_drafts()
+    submitted_system.open_main_menu(
+        update_id="menu:queued-settings-rotation",
+        telegram_user_id=former_administrator_id,
+    )
+    message_count_before_rotation = len(telegram.messages)
+    telegram.fail_next()
+    with pytest.raises(InjectedTelegramDeliveryError):
+        submitted_system.select_main_menu_action(
+            update_id="settings:queued-settings-rotation",
+            telegram_user_id=former_administrator_id,
+            action="settings",
+        )
+
+    rotated_system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=current_administrator_id,
+    )
+    assert rotated_system.deliver_next_bot_message()
+    assert rotated_system.deliver_next_bot_message()
+
+    delivered_after_rotation = telegram.messages[message_count_before_rotation:]
+    assert rotated_system.conversation_state(former_administrator_id).stage is (
+        ConversationStage.SETTINGS
+    )
+    assert [message.text for message in delivered_after_rotation] == ["⚙️ **Settings**"]
+    assert all(
+        callback != f"settings:administration:{message.screen_revision}"
+        for message in delivered_after_rotation
+        for row in message.button_rows
+        for _label, callback in row
+    )
+    assert all(
+        label not in {"Administration", "Source Chats", "Add"}
+        for message in delivered_after_rotation
+        for row in message.button_rows
+        for label, _callback in row
     )
     rotated_system.reset()
 
@@ -2246,6 +2667,17 @@ def test_new_address_for_the_same_identity_changes_only_the_protected_address() 
         SourceChatRegistryEntry(
             identity,
             1,
+            SourceChatAddressKind.PUBLIC_USERNAME,
+            "@synthetic_old_address",
+            initial_time,
+            "channel-pts:9203",
+            False,
+            InitialConsentAttestation.CONFIRMED,
+            initial_time,
+        ),
+        SourceChatRegistryEntry(
+            identity,
+            2,
             SourceChatAddressKind.PRIVATE_INVITE,
             "https://t.me/+synthetic-new-address",
             initial_time,

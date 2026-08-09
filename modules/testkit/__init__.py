@@ -104,7 +104,10 @@ class FrozenClock:
 class ControlledTelegramIngestionAdapter:
     """Synthetic Source Chat input with no live MTProto access."""
 
-    _admissions: dict[str, SourceChatAdmissionResolution] = field(default_factory=dict)
+    _admissions: dict[
+        str,
+        tuple[TelegramPeerIdentity, SourceChatAddressKind, str],
+    ] = field(default_factory=dict)
     _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
     resolution_requests: list[str] = field(default_factory=list)
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
@@ -121,12 +124,13 @@ class ControlledTelegramIngestionAdapter:
         address: str,
         identity: TelegramPeerIdentity,
         transport_boundary: str,
+        current_address: str | None = None,
     ) -> None:
         """Configure one already-accessible public username resolution."""
-        self._admissions[address] = SourceChatAdmissionResolution(
-            identity=identity,
-            address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
-            current_address=address,
+        self._admissions[address] = (
+            identity,
+            SourceChatAddressKind.PUBLIC_USERNAME,
+            current_address or address,
         )
         self._boundaries.setdefault(identity, []).append(transport_boundary)
 
@@ -136,22 +140,28 @@ class ControlledTelegramIngestionAdapter:
         address: str,
         identity: TelegramPeerIdentity,
         transport_boundary: str,
+        current_address: str | None = None,
     ) -> None:
         """Configure one private invite for an account that already has access."""
-        self._admissions[address] = SourceChatAdmissionResolution(
-            identity=identity,
-            address_kind=SourceChatAddressKind.PRIVATE_INVITE,
-            current_address=address,
+        self._admissions[address] = (
+            identity,
+            SourceChatAddressKind.PRIVATE_INVITE,
+            current_address or address,
         )
         self._boundaries.setdefault(identity, []).append(transport_boundary)
 
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         """Return configured admission metadata without join or history operations."""
         self.resolution_requests.append(address)
-        resolution = self._admissions.get(address)
-        if resolution is None:
+        configured = self._admissions.get(address)
+        if configured is None:
             raise SourceChatAdmissionError("controlled Source Chat is inaccessible")
-        return resolution
+        identity, address_kind, current_address = configured
+        return SourceChatAdmissionResolution(
+            identity=identity,
+            address_kind=address_kind,
+            current_address=current_address,
+        )
 
     def capture_source_chat_registration_boundary(
         self, identity: TelegramPeerIdentity
@@ -1064,6 +1074,7 @@ class AcceptanceSpine:
         payload_updates: dict[str, JsonValue],
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
+        new_subject_revision: int | None = None,
     ) -> RawContractEnvelope:
         """Inject one selected Source Chat contract fault by originating update."""
         return self._observer.invalidate_source_chat_contract(
@@ -1072,6 +1083,7 @@ class AcceptanceSpine:
             payload_updates,
             causation_id=causation_id,
             new_correlation_id=new_correlation_id,
+            new_subject_revision=new_subject_revision,
         )
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
@@ -1133,6 +1145,18 @@ class AcceptanceSpine:
     ) -> tuple[RawContractEnvelope, ...]:
         """Observe completion contracts for one Search command identity."""
         return self._observer.search_completions(search_update_id)
+
+    def source_chat_contracts(
+        self,
+        *,
+        update_id: str,
+        contract_name: ContractName,
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Source Chat outcomes for one Bot-originated registration."""
+        return self._observer.source_chat_contracts(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            contract_name,
+        )
 
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
@@ -1329,88 +1353,6 @@ class AcceptanceSpine:
     def deliver_next_bot_message(self) -> bool:
         """Attempt one already-queued Bot presentation at the delivery boundary."""
         return self._conversation_onboarding().deliver_pending()
-
-    def record_source_chat_generation(
-        self,
-        *,
-        probe_id: str,
-        telegram_user_id: int,
-        entry: SourceChatRegistryEntry,
-    ) -> None:
-        """Represent one later Application-owned registry generation."""
-        source_chat_key = str(
-            _identifier(
-                f"{entry.identity.kind.value}:{entry.identity.telegram_id}",
-                "source-chat",
-            )
-        )
-        correlation_id = _identifier(probe_id, "correlation")
-        incoming = RawContractEnvelope(
-            contract_name=ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
-            contract_version=1,
-            message_id=_identifier(
-                probe_id,
-                ContractName.SOURCE_CHAT_ADMISSION_RESOLVED.value,
-            ),
-            producer=RuntimeRole.INGESTION,
-            consumer=RuntimeRole.APPLICATION,
-            subject_id=source_chat_key,
-            subject_revision=entry.registry_generation,
-            idempotency_key=f"{probe_id}:source-chat-admission",
-            causation_id=correlation_id,
-            correlation_id=correlation_id,
-            recorded_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
-            payload={
-                "source_chat_key": source_chat_key,
-                "telegram_user_id": telegram_user_id,
-                "telegram_peer_kind": entry.identity.kind.value,
-                "telegram_chat_id": entry.identity.telegram_id,
-                "address_kind": entry.address_kind.value,
-                "current_address": entry.current_address,
-                "transport_boundary": entry.transport_boundary,
-                "registry_generation": entry.registry_generation,
-            },
-        )
-        self._roles[RuntimeRole.INGESTION].store.commit_initial(
-            probe_id=probe_id,
-            envelope=incoming,
-        )
-        claimed = self._roles[RuntimeRole.APPLICATION].store.claim_next(
-            supported_versions={ContractName.SOURCE_CHAT_ADMISSION_RESOLVED: (1,)},
-            claimed_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
-        )
-        if claimed is None:
-            raise RuntimeError("later Source Chat generation was not claimable")
-        outgoing = ContractEnvelope(
-            contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
-            contract_version=1,
-            message_id=_identifier(
-                probe_id,
-                ContractName.SOURCE_CHAT_GENERATION_CHANGED.value,
-            ),
-            producer=RuntimeRole.APPLICATION,
-            consumer=RuntimeRole.BOT_ASSISTANT,
-            subject_id=source_chat_key,
-            subject_revision=entry.registry_generation,
-            idempotency_key=f"{probe_id}:source-chat-generation",
-            causation_id=incoming.message_id,
-            correlation_id=correlation_id,
-            recorded_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
-            payload={
-                "source_chat_key": source_chat_key,
-                "telegram_user_id": telegram_user_id,
-                "telegram_peer_kind": entry.identity.kind.value,
-                "telegram_chat_id": entry.identity.telegram_id,
-                "registry_generation": entry.registry_generation,
-                "registration_request_id": str(incoming.causation_id),
-            },
-        )
-        self._roles[RuntimeRole.APPLICATION].store.register_source_chat(
-            incoming=claimed,
-            entry=entry,
-            outgoing=outgoing,
-            received_at=self._roles[RuntimeRole.APPLICATION].clock.now(),
-        )
 
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
         """Observe the application-owned Source Chat registry."""

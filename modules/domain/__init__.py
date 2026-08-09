@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -107,6 +108,23 @@ class SourceChatAddressKind(StrEnum):
     PRIVATE_INVITE = "private_invite"
 
 
+def is_valid_source_chat_address(
+    address: str,
+    *,
+    kind: SourceChatAddressKind | None = None,
+) -> bool:
+    """Apply the complete public Source Chat address grammar."""
+    public_username = re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", address) is not None
+    private_invite = (
+        re.fullmatch(r"https://t\.me/\+[A-Za-z0-9_-]{16,64}", address) is not None
+    )
+    if kind is SourceChatAddressKind.PUBLIC_USERNAME:
+        return public_username
+    if kind is SourceChatAddressKind.PRIVATE_INVITE:
+        return private_invite
+    return public_username or private_invite
+
+
 class InitialConsentAttestation(StrEnum):
     """Immutable administrator statement recorded at successful admission."""
 
@@ -133,6 +151,13 @@ class SourceChatAdmissionResolution:
     address_kind: SourceChatAddressKind
     current_address: str
 
+    def __post_init__(self) -> None:
+        if not is_valid_source_chat_address(
+            self.current_address,
+            kind=self.address_kind,
+        ):
+            raise ValueError("resolved Source Chat address is invalid")
+
 
 @dataclass(frozen=True, slots=True)
 class SourceChatRegistryEntry:
@@ -151,6 +176,11 @@ class SourceChatRegistryEntry:
     def __post_init__(self) -> None:
         if self.registry_generation < 1:
             raise ValueError("Source Chat registry generation must be positive")
+        if not is_valid_source_chat_address(
+            self.current_address,
+            kind=self.address_kind,
+        ):
+            raise ValueError("Source Chat registry address is invalid")
 
 
 @dataclass(frozen=True, slots=True)

@@ -95,7 +95,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "c4975655de10c89b60dbfb9a1e1a3af21273486643d8f4b888d6df20500dde8f",
     "a47b752decc202f4cbefd6022f1399ca52242ba0886479ab3d40f38575965c9c",
     "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
-    "49abd5916a4327553bdb3e4ebf0fd1e471d242fd733fad275f8b7b6a5bf4b05a",
+    "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -569,6 +569,7 @@ class PostgresAcceptanceObserver:
         statement = """
             TRUNCATE football_runtime.bot_callback_outbox,
                      football_runtime.source_chat_admission_requests,
+                     football_runtime.source_chat_registration_origins,
                      football_runtime.source_chat_registry,
                      football_runtime.bot_old_chat_views,
                      football_runtime.bot_search_presentations,
@@ -704,6 +705,7 @@ class PostgresAcceptanceObserver:
         *,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
+        new_subject_revision: int | None = None,
     ) -> RawContractEnvelope:
         """Corrupt one selected Source Chat contract at the wire boundary."""
         with psycopg.connect(
@@ -734,7 +736,8 @@ class PostgresAcceptanceObserver:
                 UPDATE football_runtime.contract_outbox
                 SET payload = %s::jsonb,
                     causation_id = COALESCE(%s, causation_id),
-                    correlation_id = COALESCE(%s, correlation_id)
+                    correlation_id = COALESCE(%s, correlation_id),
+                    subject_revision = COALESCE(%s, subject_revision)
                 WHERE message_id = %s
                 RETURNING *
                 """,
@@ -742,6 +745,7 @@ class PostgresAcceptanceObserver:
                     json.dumps(payload),
                     causation_id,
                     new_correlation_id,
+                    new_subject_revision,
                     row["message_id"],
                 ),
             ).fetchone()
@@ -955,6 +959,27 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_row_to_envelope(row) for row in rows)
 
+    def source_chat_contracts(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Source Chat outcomes through their durable correlation."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE correlation_id = %s AND contract_name = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (correlation_id, contract_name.value),
+            ).fetchall()
+        return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
+
     def snapshot(self, probe_id: str) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
         with psycopg.connect(
@@ -1083,6 +1108,7 @@ class PostgresRoleStore:
         incoming: RawContractEnvelope,
         entry: SourceChatRegistryEntry,
         outgoing: ContractEnvelope,
+        stale_outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
         """Atomically accept admission, persist the registry, and publish it."""
@@ -1110,7 +1136,9 @@ class PostgresRoleStore:
                 return ConsumeResult.REPLAYED
             latest_generation = connection.execute(
                 """
-                SELECT registry_generation
+                SELECT registry_generation, processing_started_at,
+                       transport_boundary, initial_consent_attestation,
+                       attested_at
                 FROM football_runtime.source_chat_registry
                 WHERE peer_kind = %s AND telegram_chat_id = %s
                 ORDER BY registry_generation DESC
@@ -1118,11 +1146,31 @@ class PostgresRoleStore:
                 """,
                 (entry.identity.kind.value, entry.identity.telegram_id),
             ).fetchone()
-            is_obsolete = (
+            is_stale = (
                 latest_generation is not None
-                and entry.registry_generation < latest_generation[0]
+                and entry.registry_generation <= latest_generation[0]
             )
-            if entry.enabled and not is_obsolete:
+            processing_started_at = (
+                latest_generation[1]
+                if latest_generation is not None
+                else entry.processing_started_at
+            )
+            transport_boundary = (
+                latest_generation[2]
+                if latest_generation is not None
+                else entry.transport_boundary
+            )
+            initial_consent_attestation = (
+                latest_generation[3]
+                if latest_generation is not None
+                else entry.initial_consent_attestation.value
+            )
+            attested_at = (
+                latest_generation[4]
+                if latest_generation is not None
+                else entry.attested_at
+            )
+            if entry.enabled and not is_stale:
                 connection.execute(
                     """
                     UPDATE football_runtime.source_chat_registry
@@ -1139,7 +1187,7 @@ class PostgresRoleStore:
                         entry.registry_generation,
                     ),
                 )
-            if not is_obsolete:
+            if not is_stale:
                 connection.execute(
                     """
                     INSERT INTO football_runtime.source_chat_registry (
@@ -1162,11 +1210,11 @@ class PostgresRoleStore:
                         entry.registry_generation,
                         entry.address_kind.value,
                         entry.current_address,
-                        entry.processing_started_at,
-                        entry.transport_boundary,
+                        processing_started_at,
+                        transport_boundary,
                         entry.enabled,
-                        entry.initial_consent_attestation.value,
-                        entry.attested_at,
+                        initial_consent_attestation,
+                        attested_at,
                         received_at,
                         received_at,
                     ),
@@ -1178,7 +1226,10 @@ class PostgresRoleStore:
                 received_at=received_at,
             )
             try:
-                _insert_outbox(connection, outgoing)
+                _insert_outbox(
+                    connection,
+                    stale_outgoing if is_stale else outgoing,
+                )
             except psycopg.errors.UniqueViolation as error:
                 raise OutboxConflictError from error
             _release_claim(connection, incoming.message_id)
@@ -1793,43 +1844,45 @@ class PostgresRoleStore:
         with psycopg.connect(self._database_url) as connection:
             row = connection.execute(
                 """
-                SELECT message_id, subject_id, subject_revision,
-                       payload -> 'telegram_user_id'
-                FROM football_runtime.contract_outbox
+                SELECT command_message_id, request_message_id, telegram_user_id,
+                       origin_subject_id, origin_subject_revision,
+                       registry_generation
+                FROM football_runtime.source_chat_registration_origins
                 WHERE correlation_id = %s
-                  AND producer_role = %s
-                  AND contract_name = %s
                 """,
-                (
-                    correlation_id,
-                    RuntimeRole.BOT_ASSISTANT.value,
-                    ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value,
-                ),
+                (correlation_id,),
             ).fetchone()
         if row is None:
             return None
-        command_message_id, subject_id, subject_revision, telegram_user_id = row
+        (
+            command_message_id,
+            request_message_id,
+            telegram_user_id,
+            subject_id,
+            subject_revision,
+            registry_generation,
+        ) = row
         if (
             not isinstance(command_message_id, UUID)
             or command_message_id != correlation_id
+            or not isinstance(request_message_id, UUID)
             or not isinstance(subject_id, str)
             or not subject_id
             or not isinstance(subject_revision, int)
             or isinstance(subject_revision, bool)
             or not isinstance(telegram_user_id, int)
             or isinstance(telegram_user_id, bool)
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
         ):
             raise RuntimeError("Bot registration context is invalid")
         return SourceChatRegistrationContext(
             correlation_id=correlation_id,
-            request_message_id=derive_contract_message_id(
-                command_message_id,
-                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
-            ),
+            request_message_id=request_message_id,
             telegram_user_id=telegram_user_id,
             origin_subject_id=subject_id,
             origin_subject_revision=subject_revision,
-            registry_generation=subject_revision,
+            registry_generation=registry_generation,
         )
 
     def source_chat_registration_origin_for_terminal(
@@ -1842,16 +1895,11 @@ class PostgresRoleStore:
         with psycopg.connect(self._database_url) as connection:
             rows = connection.execute(
                 """
-                SELECT correlation_id, message_id, subject_id, subject_revision,
-                       payload -> 'telegram_user_id'
-                FROM football_runtime.contract_outbox
-                WHERE producer_role = %s
-                  AND contract_name = %s
-                """,
-                (
-                    RuntimeRole.BOT_ASSISTANT.value,
-                    ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value,
-                ),
+                SELECT correlation_id, command_message_id, request_message_id,
+                       telegram_user_id, origin_subject_id,
+                       origin_subject_revision, registry_generation
+                FROM football_runtime.source_chat_registration_origins
+                """
             ).fetchall()
         message_matches: list[SourceChatRegistrationContext] = []
         cause_matches: list[SourceChatRegistrationContext] = []
@@ -1859,26 +1907,27 @@ class PostgresRoleStore:
             (
                 correlation_id,
                 command_message_id,
+                request_message_id,
+                telegram_user_id,
                 subject_id,
                 subject_revision,
-                telegram_user_id,
+                registry_generation,
             ) = row
             if (
                 not isinstance(correlation_id, UUID)
                 or not isinstance(command_message_id, UUID)
                 or command_message_id != correlation_id
+                or not isinstance(request_message_id, UUID)
                 or not isinstance(subject_id, str)
                 or not subject_id
                 or not isinstance(subject_revision, int)
                 or isinstance(subject_revision, bool)
                 or not isinstance(telegram_user_id, int)
                 or isinstance(telegram_user_id, bool)
+                or not isinstance(registry_generation, int)
+                or isinstance(registry_generation, bool)
             ):
                 raise RuntimeError("Bot registration context is invalid")
-            request_message_id = derive_contract_message_id(
-                command_message_id,
-                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
-            )
             resolved_message_id = derive_contract_message_id(
                 request_message_id,
                 ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
@@ -1904,7 +1953,7 @@ class PostgresRoleStore:
                 telegram_user_id=telegram_user_id,
                 origin_subject_id=subject_id,
                 origin_subject_revision=subject_revision,
-                registry_generation=subject_revision,
+                registry_generation=registry_generation,
             )
             expected_messages = tuple(
                 derive_contract_message_id(cause, incoming.contract_name)
@@ -2658,8 +2707,51 @@ class PostgresRoleStore:
                     recorded_at,
                 ),
             )
+            payload = command.payload
+            if not isinstance(payload, dict):
+                raise TypeError("ChangeSourceChatRegistry payload must be an object")
+            registration_request_id = payload.get("registration_request_id")
+            registry_generation = payload.get("registry_generation")
+            if not isinstance(registration_request_id, str) or not isinstance(
+                registry_generation, int
+            ):
+                raise ValueError("Source Chat command origin is incomplete")
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_registration_origins (
+                    command_message_id, correlation_id, request_message_id,
+                    telegram_user_id, origin_subject_id,
+                    origin_subject_revision, registry_generation, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    command.message_id,
+                    command.correlation_id,
+                    UUID(registration_request_id),
+                    state.telegram_user_id,
+                    command.subject_id,
+                    command.subject_revision,
+                    registry_generation,
+                    recorded_at,
+                ),
+            )
             _insert_outbox(connection, command)
             return True
+
+    def next_source_chat_registration_generation(self) -> int:
+        """Allocate the next generation from immutable Bot registration origins."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(registry_generation), 0) + 1
+                FROM football_runtime.source_chat_registration_origins
+                """
+            ).fetchone()
+        if row is None or not isinstance(row[0], int):
+            raise RuntimeError("could not allocate Source Chat registry generation")
+        return row[0]
 
     def accept_source_chat_registration(
         self,

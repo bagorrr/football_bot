@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from typing import TypeAlias
 from uuid import NAMESPACE_URL, UUID, uuid5
+
+from modules.domain import SourceChatAddressKind, is_valid_source_chat_address
 
 JsonValue: TypeAlias = (
     bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None
@@ -354,6 +355,7 @@ class ContractEnvelope(RawContractEnvelope):
                 self.payload,
                 message_id=self.message_id,
                 causation_id=self.causation_id,
+                correlation_id=self.correlation_id,
                 subject_id=self.subject_id,
                 subject_revision=self.subject_revision,
             )
@@ -552,9 +554,34 @@ def _validate_source_chat_contract(
     *,
     message_id: UUID,
     causation_id: UUID,
+    correlation_id: UUID,
     subject_id: str,
     subject_revision: int,
 ) -> None:
+    if contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY:
+        if set(payload) - {
+            "address",
+            "telegram_user_id",
+            "registry_generation",
+            "registration_request_id",
+        }:
+            raise ValueError("ChangeSourceChatRegistry contains unsupported facts")
+        if message_id != causation_id or message_id != correlation_id:
+            raise ValueError(
+                "Source Chat command causation and correlation must match its message"
+            )
+        _validate_source_chat_generation(payload, subject_revision=subject_revision)
+        registration_request_id = _required_uuid_text(
+            payload,
+            "registration_request_id",
+        )
+        if registration_request_id != str(
+            derive_contract_message_id(
+                message_id,
+                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            )
+        ):
+            raise ValueError("Source Chat command request identity is not canonical")
     if contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION and set(payload) - {
         "address",
         "telegram_user_id",
@@ -658,10 +685,16 @@ def _validate_source_chat_contract(
     address_kind = _required_text(payload, "address_kind")
     current_address = _required_text(payload, "current_address")
     if address_kind == "public_username":
-        if not current_address.startswith("@"):
+        if not is_valid_source_chat_address(
+            current_address,
+            kind=SourceChatAddressKind.PUBLIC_USERNAME,
+        ):
             raise ValueError("public Source Chat address must be a username")
     elif address_kind == "private_invite":
-        if not current_address.startswith("https://t.me/+"):
+        if not is_valid_source_chat_address(
+            current_address,
+            kind=SourceChatAddressKind.PRIVATE_INVITE,
+        ):
             raise ValueError("private Source Chat address must be a Telegram invite")
     else:
         raise ValueError("Source Chat contract requires a supported address kind")
@@ -673,14 +706,6 @@ def _validate_source_chat_address(address: str) -> None:
     if is_valid_source_chat_address(address):
         return
     raise ValueError("Source Chat address must be a username or private invite")
-
-
-def is_valid_source_chat_address(address: str) -> bool:
-    """Return whether an administrator-entered Source Chat address is valid."""
-    return (
-        re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", address) is not None
-        or re.fullmatch(r"https://t\.me/\+[A-Za-z0-9_-]{16,64}", address) is not None
-    )
 
 
 def _validate_source_chat_generation(
