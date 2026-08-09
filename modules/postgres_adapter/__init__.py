@@ -39,6 +39,7 @@ from modules.domain import (
     GeographyConfirmationEvent,
     GeographyConfirmationKind,
     GeographySuggestion,
+    InitialConsentAttestation,
     IntentBranch,
     LocaleSource,
     OldChatViewCleanup,
@@ -47,10 +48,14 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    SourceChatAddressKind,
+    SourceChatRegistryEntry,
     TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramMessage,
+    TelegramPeerIdentity,
+    TelegramPeerKind,
     UserIntent,
 )
 from modules.ports import (
@@ -72,6 +77,8 @@ _LEGACY_MIGRATION_NAMES = (
     "0007_zero_result_search.sql",
     "0008_main_menu_settings.sql",
     "0009_callback_notification_outbox.sql",
+    "0010_source_chat_administration.sql",
+    "0011_source_chat_registry.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -84,6 +91,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "2b3373bbba4780664716388d50c6e8e4d211ca5e4886a50587ac1041e7751ecc",
     "c4975655de10c89b60dbfb9a1e1a3af21273486643d8f4b888d6df20500dde8f",
     "a47b752decc202f4cbefd6022f1399ca52242ba0886479ab3d40f38575965c9c",
+    "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
+    "045050089dd36c72c51cda6aa3453d372b933de002e1394c5af9be86c3616ef2",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -556,6 +565,7 @@ class PostgresAcceptanceObserver:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
             TRUNCATE football_runtime.bot_callback_outbox,
+                     football_runtime.source_chat_registry,
                      football_runtime.bot_old_chat_views,
                      football_runtime.bot_search_presentations,
                      football_runtime.bot_active_result_contexts,
@@ -997,6 +1007,106 @@ class PostgresRoleStore:
             ).fetchone()
             if inserted is not None:
                 _insert_outbox(connection, envelope)
+
+    def register_source_chat(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        entry: SourceChatRegistryEntry,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically accept admission, persist the registry, and publish it."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application owns the Source Chat registry")
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is not None and existing[0] == "accepted":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_registry (
+                    peer_kind, telegram_chat_id, address_kind, current_address,
+                    processing_started_at, transport_boundary, enabled,
+                    initial_consent_attestation, attested_at,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (peer_kind, telegram_chat_id) DO UPDATE
+                SET address_kind = EXCLUDED.address_kind,
+                    current_address = EXCLUDED.current_address,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    entry.identity.kind.value,
+                    entry.identity.telegram_id,
+                    entry.address_kind.value,
+                    entry.current_address,
+                    entry.processing_started_at,
+                    entry.transport_boundary,
+                    entry.enabled,
+                    entry.initial_consent_attestation.value,
+                    entry.attested_at,
+                    received_at,
+                    received_at,
+                ),
+            )
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
+            try:
+                _insert_outbox(connection, outgoing)
+            except psycopg.errors.UniqueViolation as error:
+                raise OutboxConflictError from error
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.APPLIED
+
+    def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
+        """Read typed Source Chat admissions through the application owner."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id, address_kind, current_address,
+                       processing_started_at, transport_boundary, enabled,
+                       initial_consent_attestation, attested_at
+                FROM football_runtime.source_chat_registry
+                ORDER BY peer_kind, telegram_chat_id
+                """
+            ).fetchall()
+        return tuple(
+            SourceChatRegistryEntry(
+                identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                address_kind=SourceChatAddressKind(row["address_kind"]),
+                current_address=row["current_address"],
+                processing_started_at=row["processing_started_at"],
+                transport_boundary=row["transport_boundary"],
+                enabled=row["enabled"],
+                initial_consent_attestation=InitialConsentAttestation(
+                    row["initial_consent_attestation"]
+                ),
+                attested_at=row["attested_at"],
+            )
+            for row in rows
+        )
 
     def claim_next(
         self,
@@ -2055,6 +2165,176 @@ class PostgresRoleStore:
                 raise RuntimeError("Discovery Draft changed concurrently")
             _insert_outbox(connection, command)
             return True
+
+    def commit_source_chat_registration_request(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one authorized registration request without changing its screen."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant submits Source Chat registrations")
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, state.telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    last_bot_user_action_at = %s, updated_at = %s
+                WHERE telegram_user_id = %s
+                  AND revision = %s
+                  AND stage = 'source_chat_address_input'
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    recorded_at,
+                    recorded_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    recorded_at,
+                ),
+            )
+            _insert_outbox(connection, command)
+            return True
+
+    def accept_source_chat_registration(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Consume one admission result and queue its authoritative Bot view."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant presents Source Chat registrations")
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (message.telegram_user_id,),
+            )
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is not None and existing[0] == "accepted":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            current = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            _accept_contract_inbox(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            )
+            if current != (expected_revision, "source_chat_registration_pending"):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    received_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=received_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.APPLIED
 
     def defer_start_to_pending_search_result(
         self,

@@ -31,6 +31,10 @@ class ConversationStage(StrEnum):
     RESULTS = "results"
     MAIN_MENU = "main_menu"
     SETTINGS = "settings"
+    ADMINISTRATION = "administration"
+    SOURCE_CHATS = "source_chats"
+    SOURCE_CHAT_ADDRESS_INPUT = "source_chat_address_input"
+    SOURCE_CHAT_REGISTRATION_PENDING = "source_chat_registration_pending"
     MODE = "mode"
     SETTINGS_LANGUAGE_SELECTION = "settings_language_selection"
     SETTINGS_LANGUAGE_INPUT = "settings_language_input"
@@ -87,6 +91,61 @@ class TelegramDeliveryMode(StrEnum):
 
     SEND = "send"
     RECONCILE = "reconcile"
+
+
+class TelegramPeerKind(StrEnum):
+    """Telegram namespace needed to interpret one stable numeric chat ID."""
+
+    CHAT = "chat"
+    CHANNEL = "channel"
+
+
+class SourceChatAddressKind(StrEnum):
+    """Protected current address accepted by Source Chat admission."""
+
+    PUBLIC_USERNAME = "public_username"
+    PRIVATE_INVITE = "private_invite"
+
+
+class InitialConsentAttestation(StrEnum):
+    """Immutable administrator statement recorded at successful admission."""
+
+    CONFIRMED = "confirmed"
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPeerIdentity:
+    """Typed stable Telegram chat identity independent from its address."""
+
+    kind: TelegramPeerKind
+    telegram_id: int
+
+    def __post_init__(self) -> None:
+        if self.telegram_id <= 0:
+            raise ValueError("Telegram chat identity must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatAdmissionResolution:
+    """Accessible stable identity returned without joining or history access."""
+
+    identity: TelegramPeerIdentity
+    address_kind: SourceChatAddressKind
+    current_address: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatRegistryEntry:
+    """Application-owned enabled Source Chat admission state."""
+
+    identity: TelegramPeerIdentity
+    address_kind: SourceChatAddressKind
+    current_address: str
+    processing_started_at: datetime
+    transport_boundary: str
+    enabled: bool
+    initial_consent_attestation: InitialConsentAttestation
+    attested_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

@@ -37,9 +37,12 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    SourceChatAdmissionResolution,
+    SourceChatRegistryEntry,
     TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
     TelegramMessage,
+    TelegramPeerIdentity,
     UserIntent,
 )
 
@@ -79,6 +82,20 @@ class TelegramIngestionAdapter(Protocol):
     def source_event_id(self, probe_id: str) -> str:
         """Return a synthetic Source Event identity."""
         ...
+
+    def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
+        """Resolve one already-accessible chat without joining or reading history."""
+        ...
+
+    def capture_source_chat_registration_boundary(
+        self, identity: TelegramPeerIdentity
+    ) -> str:
+        """Capture the current transport position after successful resolution."""
+        ...
+
+
+class SourceChatAdmissionError(RuntimeError):
+    """Source Chat address was invalid, inaccessible, or technically unresolved."""
 
 
 class TelegramDeliveryAdapter(Protocol):
@@ -320,6 +337,31 @@ class ConversationStore(Protocol):
         """Commit one Search action, submitting draft, and RunSearch command."""
         ...
 
+    def commit_source_chat_registration_request(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one authorized Bot update and registry command atomically."""
+        ...
+
+    def accept_source_chat_registration(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Consume one admission result and queue its Bot presentation atomically."""
+        ...
+
     def defer_start_to_pending_search_result(
         self,
         *,
@@ -471,6 +513,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         envelope: RawContractEnvelope,
     ) -> None:
         """Atomically commit initial owner state and its outbox."""
+        ...
+
+    def register_source_chat(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        entry: SourceChatRegistryEntry,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically accept a command, mutate the registry, and publish its event."""
+        ...
+
+    def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
+        """Read application-owned Source Chats through a stable query."""
         ...
 
     def claim_next(

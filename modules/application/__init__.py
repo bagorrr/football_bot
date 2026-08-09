@@ -35,6 +35,7 @@ from modules.domain import (
     GeographyConfirmation,
     GeographyConfirmationKind,
     GeographySuggestion,
+    InitialConsentAttestation,
     IntentBranch,
     LanguageSelection,
     LocaleSource,
@@ -44,8 +45,12 @@ from modules.domain import (
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
+    SourceChatAddressKind,
+    SourceChatRegistryEntry,
     TelegramDeliveryMode,
     TelegramMessage,
+    TelegramPeerIdentity,
+    TelegramPeerKind,
     UserIntent,
 )
 from modules.ports import (
@@ -60,6 +65,7 @@ from modules.ports import (
     LocationResolverError,
     ModelAdapter,
     OutboxConflictError,
+    SourceChatAdmissionError,
     TelegramDeliveryAdapter,
     TelegramDeliveryPreEffectError,
     TelegramIngestionAdapter,
@@ -821,6 +827,87 @@ _SETTINGS_COPY = {
     ),
 }
 
+_ADMINISTRATION_LABEL = {
+    "en": "Administration",
+    "ru": "Администрирование",
+    "es": "Administración",
+    "fr": "Administration",
+}
+
+_ADMINISTRATION_COPY = {
+    "en": ("⚙️ **Administration**", "Source Chats", "Back", "Menu"),
+    "ru": ("⚙️ **Администрирование**", "Source Chats", "Назад", "Меню"),
+    "es": ("⚙️ **Administración**", "Source Chats", "Atrás", "Menú"),
+    "fr": ("⚙️ **Administration**", "Source Chats", "Retour", "Menu"),
+}
+
+_SOURCE_CHATS_COPY = {
+    "en": ("📡 **Source Chats**", "Add Source Chat", "Back", "Menu"),
+    "ru": ("📡 **Source Chats**", "Добавить Source Chat", "Назад", "Меню"),
+    "es": ("📡 **Source Chats**", "Añadir Source Chat", "Atrás", "Menú"),
+    "fr": ("📡 **Source Chats**", "Ajouter Source Chat", "Retour", "Menu"),
+}
+
+_SOURCE_CHAT_ADDRESS_COPY = {
+    "en": (
+        "Send a public @username or a private invite link for a Source Chat "
+        "the configured account can already access.",
+        "Back",
+        "Menu",
+    ),
+    "ru": (
+        "Отправьте публичный @username или приватную ссылку-приглашение "
+        "Source Chat, к которому у настроенного аккаунта уже есть доступ.",
+        "Назад",
+        "Меню",
+    ),
+    "es": (
+        "Envíe un @username público o una invitación privada de un Source Chat "
+        "al que la cuenta configurada ya tenga acceso.",
+        "Atrás",
+        "Menú",
+    ),
+    "fr": (
+        "Envoyez un @username public ou une invitation privée pour un Source Chat "
+        "déjà accessible au compte configuré.",
+        "Retour",
+        "Menu",
+    ),
+}
+
+_SOURCE_CHAT_REGISTERED_COPY = {
+    "en": "✅ Source Chat registered.\n\nInitial consent confirmed.",
+    "ru": "✅ Source Chat зарегистрирован.\n\nИсходное согласие подтверждено.",
+    "es": "✅ Source Chat registrado.\n\nConsentimiento inicial confirmado.",
+    "fr": "✅ Source Chat enregistré.\n\nConsentement initial confirmé.",
+}
+
+_SOURCE_CHAT_PENDING_COPY = {
+    "en": "Checking Source Chat access…",
+    "ru": "Проверяю доступ к Source Chat…",
+    "es": "Comprobando el acceso al Source Chat…",
+    "fr": "Vérification de l’accès au Source Chat…",
+}
+
+_SOURCE_CHAT_FAILED_COPY = {
+    "en": (
+        "Could not register this Source Chat. Check that the configured account "
+        "already has access and try again."
+    ),
+    "ru": (
+        "Не удалось зарегистрировать Source Chat. Проверьте, что у настроенного "
+        "аккаунта уже есть доступ, и повторите попытку."
+    ),
+    "es": (
+        "No se pudo registrar este Source Chat. Compruebe que la cuenta configurada "
+        "ya tenga acceso e inténtelo de nuevo."
+    ),
+    "fr": (
+        "Impossible d’enregistrer ce Source Chat. Vérifiez que le compte configuré "
+        "y a déjà accès, puis réessayez."
+    ),
+}
+
 _MODE_COPY = {
     "en": ("⚙️ **Mode**", "✅ Search", "Feed", "Back", "Menu"),
     "ru": ("⚙️ **Режим**", "✅ Поиск", "Лента", "Назад", "Меню"),
@@ -1106,6 +1193,7 @@ class ConversationOnboarding:
         date_interpretation: DateInterpretationAdapter,
         timezone_data: TimezoneDataAdapter,
         clock: Clock,
+        telegram_admin_user_id: int | None = None,
         supported_query_versions: Iterable[int] = (1,),
     ) -> None:
         self._store = store
@@ -1115,6 +1203,7 @@ class ConversationOnboarding:
         self._date_interpretation = date_interpretation
         self._timezone_data = timezone_data
         self._clock = clock
+        self._telegram_admin_user_id = telegram_admin_user_id
         self._supported_query_versions = frozenset(supported_query_versions)
 
     def start(
@@ -1235,6 +1324,12 @@ class ConversationOnboarding:
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[1],
                     )
+                elif (
+                    current.stage is ConversationStage.SETTINGS
+                    and action == "administration"
+                    and self._is_administrator(current.telegram_user_id)
+                ):
+                    self._show_administration(update_id=update_id, current=current)
                 elif current.stage is ConversationStage.MODE and action == "feed":
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
@@ -1275,6 +1370,213 @@ class ConversationOnboarding:
         ):
             return
 
+    def select_administration_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+    ) -> None:
+        """Apply one exact-administrator Administration callback."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                if current is None:
+                    return
+                if (
+                    not self._is_administrator(telegram_user_id)
+                    or current.screen_revision != screen_revision
+                    or current.stage is not ConversationStage.ADMINISTRATION
+                ):
+                    self._queue_current_view(update_id=update_id, state=current)
+                elif action == "source-chats":
+                    self._show_source_chats(update_id=update_id, current=current)
+                else:
+                    self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def select_source_chats_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+    ) -> None:
+        """Apply one exact-administrator Source Chats callback."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._store.conversation_state(telegram_user_id)
+                if current is None:
+                    return
+                if (
+                    not self._is_administrator(telegram_user_id)
+                    or current.screen_revision != screen_revision
+                    or current.stage is not ConversationStage.SOURCE_CHATS
+                ):
+                    self._queue_current_view(update_id=update_id, state=current)
+                elif action == "add":
+                    self._show_source_chat_address_input(
+                        update_id=update_id,
+                        current=current,
+                    )
+                else:
+                    self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def submit_source_chat_address(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        address: str,
+        screen_revision: int,
+    ) -> None:
+        """Request admission for one already-accessible Source Chat address."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            if current is None:
+                return
+            if (
+                not self._is_administrator(telegram_user_id)
+                or current.screen_revision != screen_revision
+                or current.stage is not ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            normalized_address = address.strip()
+            if not normalized_address:
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            recorded_at = self._clock.now()
+            message_id = _runtime_identifier(
+                update_id,
+                ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value,
+            )
+            command = ContractEnvelope(
+                contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+                contract_version=1,
+                message_id=message_id,
+                producer=RuntimeRole.BOT_ASSISTANT,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=f"source-chat-registration:{update_id}",
+                subject_revision=1,
+                idempotency_key=f"source-chat-registration:{update_id}",
+                causation_id=message_id,
+                correlation_id=message_id,
+                recorded_at=recorded_at,
+                payload={
+                    "address": normalized_address,
+                    "telegram_user_id": telegram_user_id,
+                },
+            )
+            state = replace(
+                current,
+                stage=ConversationStage.SOURCE_CHAT_REGISTRATION_PENDING,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            self._store.commit_source_chat_registration_request(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                message=_source_chat_pending_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                ),
+                command=command,
+                recorded_at=recorded_at,
+            )
+
+    def accept_source_chat_registration(
+        self,
+        *,
+        incoming: ContractEnvelope,
+    ) -> None:
+        """Present one application-owned successful Source Chat admission."""
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("SourceChatGenerationChanged payload must be an object")
+        telegram_user_id = incoming.payload.get("telegram_user_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SourceChatGenerationChanged requires telegram_user_id")
+        current = self._store.conversation_state(telegram_user_id)
+        if current is None:
+            raise LookupError(telegram_user_id)
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHATS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        message = _source_chats_message(
+            update_id=str(incoming.message_id),
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=state.screen_revision,
+            text=_SOURCE_CHAT_REGISTERED_COPY.get(
+                locale,
+                _SOURCE_CHAT_REGISTERED_COPY["en"],
+            ),
+        )
+        self._store.accept_source_chat_registration(
+            incoming=incoming,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            received_at=self._clock.now(),
+        )
+
+    def accept_source_chat_registration_failure(
+        self,
+        *,
+        incoming: ContractEnvelope,
+    ) -> None:
+        """Return one failed admission to retryable address input."""
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("SourceChatAdmissionFailed payload must be an object")
+        telegram_user_id = incoming.payload.get("telegram_user_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SourceChatAdmissionFailed requires telegram_user_id")
+        current = self._store.conversation_state(telegram_user_id)
+        if current is None:
+            raise LookupError(telegram_user_id)
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        message = _source_chat_address_message(
+            update_id=str(incoming.message_id),
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=state.screen_revision,
+            text=_SOURCE_CHAT_FAILED_COPY.get(locale, _SOURCE_CHAT_FAILED_COPY["en"]),
+        )
+        self._store.accept_source_chat_registration(
+            incoming=incoming,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            received_at=self._clock.now(),
+        )
+
     def _language_rendering(self, locale: str) -> LanguageSelection | None:
         if locale in SUPPORTED_LOCALES:
             return None
@@ -1282,6 +1584,12 @@ class ConversationOnboarding:
         if selection is None or selection.locale != locale:
             raise RuntimeError("saved Conversation Language could not be rendered")
         return selection
+
+    def _is_administrator(self, telegram_user_id: int) -> bool:
+        return (
+            self._telegram_admin_user_id is not None
+            and telegram_user_id == self._telegram_admin_user_id
+        )
 
     def _start_new_search(
         self,
@@ -1326,6 +1634,93 @@ class ConversationOnboarding:
             ),
             recorded_at=now,
             draft=draft,
+        )
+
+    def _show_administration(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.ADMINISTRATION,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_administration_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_source_chats(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHATS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_chats_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_source_chat_address_input(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_chat_address_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+            ),
+            recorded_at=self._clock.now(),
         )
 
     def _show_main_menu(
@@ -1422,6 +1817,7 @@ class ConversationOnboarding:
                 locale=locale,
                 screen_revision=state.screen_revision,
                 selection=selection,
+                is_administrator=self._is_administrator(current.telegram_user_id),
             ),
             recorded_at=self._clock.now(),
         )
@@ -1888,6 +2284,7 @@ class ConversationOnboarding:
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=state.screen_revision,
+                    is_administrator=self._is_administrator(telegram_user_id),
                 ),
                 recorded_at=self._clock.now(),
             )
@@ -3056,6 +3453,12 @@ class ConversationOnboarding:
                     self._queue_current_view(update_id=update_id, state=current)
                 elif current.stage is ConversationStage.SETTINGS:
                     self._show_main_menu(update_id=update_id, current=current)
+                elif current.stage is ConversationStage.ADMINISTRATION:
+                    self._show_settings(update_id=update_id, current=current)
+                elif current.stage is ConversationStage.SOURCE_CHATS:
+                    self._show_administration(update_id=update_id, current=current)
+                elif current.stage is ConversationStage.SOURCE_CHAT_ADDRESS_INPUT:
+                    self._show_source_chats(update_id=update_id, current=current)
                 elif current.stage in {
                     ConversationStage.MODE,
                     ConversationStage.SETTINGS_LANGUAGE_SELECTION,
@@ -3467,6 +3870,7 @@ class ConversationOnboarding:
                     locale=selection.locale,
                     screen_revision=state.screen_revision,
                     selection=selection,
+                    is_administrator=self._is_administrator(current.telegram_user_id),
                 ),
                 recorded_at=self._clock.now(),
             )
@@ -3517,6 +3921,37 @@ class ConversationOnboarding:
         )
 
     def _queue_current_view(self, *, update_id: str, state: ConversationState) -> None:
+        administrator_stages = {
+            ConversationStage.ADMINISTRATION,
+            ConversationStage.SOURCE_CHATS,
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
+            ConversationStage.SOURCE_CHAT_REGISTRATION_PENDING,
+        }
+        if state.stage in administrator_stages and not self._is_administrator(
+            state.telegram_user_id
+        ):
+            locale = state.locale or "en"
+            demoted = replace(
+                state,
+                stage=ConversationStage.SETTINGS,
+                screen_revision=state.screen_revision + 1,
+                revision=state.revision + 1,
+            )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=state.revision,
+                state=demoted,
+                message=_settings_message(
+                    update_id=update_id,
+                    telegram_user_id=state.telegram_user_id,
+                    locale=locale,
+                    screen_revision=demoted.screen_revision,
+                    selection=self._language_rendering(locale),
+                    is_administrator=False,
+                ),
+                recorded_at=self._clock.now(),
+            )
+            return
         if (
             state.stage
             not in {
@@ -3525,6 +3960,10 @@ class ConversationOnboarding:
                 ConversationStage.RESULTS,
                 ConversationStage.MAIN_MENU,
                 ConversationStage.SETTINGS,
+                ConversationStage.ADMINISTRATION,
+                ConversationStage.SOURCE_CHATS,
+                ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
+                ConversationStage.SOURCE_CHAT_REGISTRATION_PENDING,
                 ConversationStage.MODE,
                 ConversationStage.SETTINGS_LANGUAGE_SELECTION,
                 ConversationStage.SETTINGS_LANGUAGE_INPUT,
@@ -4362,6 +4801,7 @@ def _settings_message(
     locale: str,
     screen_revision: int,
     selection: LanguageSelection | None = None,
+    is_administrator: bool = False,
 ) -> TelegramMessage:
     if locale in SUPPORTED_LOCALES:
         text, language, support, mode, premium, back, menu = _SETTINGS_COPY[locale]
@@ -4375,19 +4815,122 @@ def _settings_message(
         language, support, mode, premium, back, menu = selection.settings_labels
     else:
         raise RuntimeError("Conversation Language has no Settings rendering")
+    button_rows = [
+        ((language, f"settings:language:{screen_revision}"),),
+        ((support, "https://telegram.me/myfootball_support_bot"),),
+        ((mode, f"settings:mode:{screen_revision}"),),
+        ((premium, f"settings:premium:{screen_revision}"),),
+    ]
+    if is_administrator:
+        label = _ADMINISTRATION_LABEL.get(locale, "Administration")
+        button_rows.append(((label, f"settings:administration:{screen_revision}"),))
+    button_rows.append(((back, f"settings:back:{screen_revision}"),))
     return TelegramMessage(
         delivery_id=f"settings:{update_id}",
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
         text=text,
+        button_rows=tuple(button_rows),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _administration_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    text, source_chats, back, menu = _ADMINISTRATION_COPY.get(
+        locale, _ADMINISTRATION_COPY["en"]
+    )
+    return TelegramMessage(
+        delivery_id=f"administration:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
         button_rows=(
-            ((language, f"settings:language:{screen_revision}"),),
-            ((support, "https://telegram.me/myfootball_support_bot"),),
-            ((mode, f"settings:mode:{screen_revision}"),),
-            ((premium, f"settings:premium:{screen_revision}"),),
-            ((back, f"settings:back:{screen_revision}"),),
+            ((source_chats, f"administration:source-chats:{screen_revision}"),),
+            ((back, f"administration:back:{screen_revision}"),),
         ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_chats_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    text: str | None = None,
+) -> TelegramMessage:
+    default_text, add, back, menu = _SOURCE_CHATS_COPY.get(
+        locale,
+        _SOURCE_CHATS_COPY["en"],
+    )
+    return TelegramMessage(
+        delivery_id=f"source-chats:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text or default_text,
+        button_rows=(
+            ((add, f"source-chats:add:{screen_revision}"),),
+            ((back, f"source-chats:back:{screen_revision}"),),
+        ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_chat_address_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    text: str | None = None,
+) -> TelegramMessage:
+    default_text, back, menu = _SOURCE_CHAT_ADDRESS_COPY.get(
+        locale,
+        _SOURCE_CHAT_ADDRESS_COPY["en"],
+    )
+    return TelegramMessage(
+        delivery_id=f"source-chat-address:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text or default_text,
+        button_rows=(((back, f"source-chats:back:{screen_revision}"),),),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_chat_pending_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    _default_text, _back, menu = _SOURCE_CHAT_ADDRESS_COPY.get(
+        locale,
+        _SOURCE_CHAT_ADDRESS_COPY["en"],
+    )
+    return TelegramMessage(
+        delivery_id=f"source-chat-pending:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=_SOURCE_CHAT_PENDING_COPY.get(locale, _SOURCE_CHAT_PENDING_COPY["en"]),
+        button_rows=(),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -4655,6 +5198,7 @@ class RuntimeApplication:
     conversation_language: ConversationLanguageAdapter | None = None
     date_interpretation: DateInterpretationAdapter | None = None
     timezone_data: TimezoneDataAdapter | None = None
+    telegram_admin_user_id: int | None = None
     supported_versions: dict[ContractName, set[int]] = field(default_factory=dict)
     search_failures_remaining: int = 0
 
@@ -4771,6 +5315,58 @@ class RuntimeApplication:
                 incoming=supported_incoming
             )
             return True
+        if (
+            incoming.contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY
+            and supported_incoming is not None
+        ):
+            self._request_source_chat_admission(
+                supported_incoming,
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION
+            and supported_incoming is not None
+        ):
+            self._admit_source_chat(
+                supported_incoming,
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
+            and supported_incoming is not None
+        ):
+            self._register_source_chat(
+                supported_incoming,
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_CHAT_ADMISSION_FAILED
+            and supported_incoming is not None
+        ):
+            self._reject_source_chat_registration(
+                supported_incoming,
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_CHAT_REGISTRATION_FAILED
+            and supported_incoming is not None
+        ):
+            self._conversation_onboarding().accept_source_chat_registration_failure(
+                incoming=supported_incoming
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED
+            and supported_incoming is not None
+        ):
+            self._conversation_onboarding().accept_source_chat_registration(
+                incoming=supported_incoming
+            )
+            return True
         if incoming.contract_name is ContractName.GET_COMPLETED_SEARCH:
             self.store.consume(
                 incoming=incoming,
@@ -4814,6 +5410,272 @@ class RuntimeApplication:
         if self.role is not RuntimeRole.RECOMMENDATION:
             raise RuntimeError("only Recommendation executes Search")
         self.search_failures_remaining += 1
+
+    def _request_source_chat_admission(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> None:
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application requests Source Chat admission")
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("ChangeSourceChatRegistry payload must be an object")
+        address = incoming.payload.get("address")
+        telegram_user_id = incoming.payload.get("telegram_user_id")
+        if not isinstance(address, str) or not address:
+            raise ValueError("ChangeSourceChatRegistry requires address")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("ChangeSourceChatRegistry requires telegram_user_id")
+        recorded_at = self.clock.now()
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            contract_version=1,
+            message_id=_runtime_identifier(
+                str(incoming.message_id),
+                ContractName.REQUEST_SOURCE_CHAT_ADMISSION.value,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.INGESTION,
+            subject_id=incoming.subject_id,
+            subject_revision=1,
+            idempotency_key=f"source-chat-admission-request:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+            payload={"address": address, "telegram_user_id": telegram_user_id},
+        )
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=recorded_at,
+                outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def _admit_source_chat(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> None:
+        if self.role is not RuntimeRole.INGESTION:
+            raise RuntimeError("only Ingestion owns Telegram Source Chat admission")
+        if self.telegram_ingestion is None:
+            raise RuntimeError("Ingestion runtime has no Telegram admission adapter")
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("RequestSourceChatAdmission payload must be an object")
+        address = incoming.payload.get("address")
+        telegram_user_id = incoming.payload.get("telegram_user_id")
+        if not isinstance(address, str) or not address:
+            raise ValueError("RequestSourceChatAdmission requires address")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("RequestSourceChatAdmission requires telegram_user_id")
+        recorded_at = self.clock.now()
+        try:
+            resolution = self.telegram_ingestion.resolve_source_chat(address)
+            transport_boundary = (
+                self.telegram_ingestion.capture_source_chat_registration_boundary(
+                    resolution.identity
+                )
+            )
+        except SourceChatAdmissionError:
+            outgoing = ContractEnvelope(
+                contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+                contract_version=1,
+                message_id=_runtime_identifier(
+                    str(incoming.message_id),
+                    ContractName.SOURCE_CHAT_ADMISSION_FAILED.value,
+                ),
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=incoming.subject_id,
+                subject_revision=1,
+                idempotency_key=f"source-chat-admission-failed:{incoming.message_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+                payload={
+                    "registration_request_id": str(incoming.message_id),
+                    "telegram_user_id": telegram_user_id,
+                },
+            )
+        else:
+            source_chat_key = str(
+                _runtime_identifier(
+                    f"{resolution.identity.kind.value}:"
+                    f"{resolution.identity.telegram_id}",
+                    "source-chat",
+                )
+            )
+            outgoing = ContractEnvelope(
+                contract_name=ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+                contract_version=1,
+                message_id=_runtime_identifier(
+                    str(incoming.message_id),
+                    ContractName.SOURCE_CHAT_ADMISSION_RESOLVED.value,
+                ),
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=source_chat_key,
+                subject_revision=1,
+                idempotency_key=f"source-chat-admission:{incoming.message_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+                payload={
+                    "source_chat_key": source_chat_key,
+                    "telegram_user_id": telegram_user_id,
+                    "telegram_peer_kind": resolution.identity.kind.value,
+                    "telegram_chat_id": resolution.identity.telegram_id,
+                    "address_kind": resolution.address_kind.value,
+                    "current_address": resolution.current_address,
+                    "transport_boundary": transport_boundary,
+                },
+            )
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=recorded_at,
+                outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def _reject_source_chat_registration(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> None:
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application rejects Source Chat registration")
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("SourceChatAdmissionFailed payload must be an object")
+        telegram_user_id = incoming.payload.get("telegram_user_id")
+        registration_request_id = incoming.payload.get("registration_request_id")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SourceChatAdmissionFailed requires telegram_user_id")
+        if not isinstance(registration_request_id, str) or not registration_request_id:
+            raise ValueError(
+                "SourceChatAdmissionFailed requires registration_request_id"
+            )
+        recorded_at = self.clock.now()
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+            contract_version=1,
+            message_id=_runtime_identifier(
+                str(incoming.message_id),
+                ContractName.SOURCE_CHAT_REGISTRATION_FAILED.value,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=incoming.subject_id,
+            subject_revision=1,
+            idempotency_key=f"source-chat-registration-failed:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "registration_request_id": registration_request_id,
+                "telegram_user_id": telegram_user_id,
+            },
+        )
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=recorded_at,
+                outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def _register_source_chat(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> None:
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application owns the Source Chat registry")
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("SourceChatAdmissionResolved payload must be an object")
+        telegram_user_id = incoming.payload.get("telegram_user_id")
+        telegram_peer_kind = incoming.payload.get("telegram_peer_kind")
+        telegram_chat_id = incoming.payload.get("telegram_chat_id")
+        address_kind = incoming.payload.get("address_kind")
+        current_address = incoming.payload.get("current_address")
+        transport_boundary = incoming.payload.get("transport_boundary")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_user_id")
+        if not isinstance(telegram_chat_id, int) or isinstance(telegram_chat_id, bool):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_chat_id")
+        if not isinstance(telegram_peer_kind, str):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_peer_kind")
+        if not isinstance(address_kind, str):
+            raise TypeError("SourceChatAdmissionResolved requires address_kind")
+        if not isinstance(current_address, str) or not current_address:
+            raise ValueError("SourceChatAdmissionResolved requires current_address")
+        if not isinstance(transport_boundary, str) or not transport_boundary:
+            raise ValueError("SourceChatAdmissionResolved requires transport_boundary")
+        registered_at = self.clock.now()
+        entry = SourceChatRegistryEntry(
+            identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind(telegram_peer_kind),
+                telegram_id=telegram_chat_id,
+            ),
+            address_kind=SourceChatAddressKind(address_kind),
+            current_address=current_address,
+            processing_started_at=registered_at,
+            transport_boundary=transport_boundary,
+            enabled=True,
+            initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+            attested_at=registered_at,
+        )
+        source_chat_key = incoming.payload.get("source_chat_key")
+        if not isinstance(source_chat_key, str) or not source_chat_key:
+            raise ValueError("SourceChatAdmissionResolved requires source_chat_key")
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+            contract_version=1,
+            message_id=_runtime_identifier(
+                str(incoming.message_id),
+                ContractName.SOURCE_CHAT_GENERATION_CHANGED.value,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=source_chat_key,
+            subject_revision=1,
+            idempotency_key=f"source-chat-generation:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=registered_at,
+            payload={
+                "source_chat_key": source_chat_key,
+                "telegram_user_id": telegram_user_id,
+            },
+        )
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.register_source_chat(
+                incoming=incoming,
+                entry=entry,
+                outgoing=outgoing,
+                received_at=registered_at,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
 
     def _complete_search(self, incoming: RawContractEnvelope) -> None:
         if self.role is not RuntimeRole.RECOMMENDATION:
@@ -5022,6 +5884,7 @@ class RuntimeApplication:
             date_interpretation=self.date_interpretation,
             timezone_data=self.timezone_data,
             clock=self.clock,
+            telegram_admin_user_id=self.telegram_admin_user_id,
             supported_query_versions=self.versions_for(
                 ContractName.GET_COMPLETED_SEARCH
             ),

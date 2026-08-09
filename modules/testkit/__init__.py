@@ -47,7 +47,11 @@ from modules.domain import (
     RequiredDate,
     RequiredDateConfirmationEvent,
     SearchResult,
+    SourceChatAddressKind,
+    SourceChatAdmissionResolution,
+    SourceChatRegistryEntry,
     TelegramMessage,
+    TelegramPeerIdentity,
 )
 from modules.ports import (
     AcceptanceObserver,
@@ -60,6 +64,7 @@ from modules.ports import (
     LocationResolverError,
     ModelAdapter,
     ResolvedTimezoneData,
+    SourceChatAdmissionError,
     TelegramDeliveryAdapter,
     TelegramDeliveryOutcomeUnknownError,
     TelegramDeliveryPreEffectError,
@@ -99,9 +104,66 @@ class FrozenClock:
 class ControlledTelegramIngestionAdapter:
     """Synthetic Source Chat input with no live MTProto access."""
 
+    _admissions: dict[str, SourceChatAdmissionResolution] = field(default_factory=dict)
+    _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
+    resolution_requests: list[str] = field(default_factory=list)
+    boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
+    join_requests: list[str] = field(default_factory=list)
+    history_requests: list[str] = field(default_factory=list)
+
     def source_event_id(self, probe_id: str) -> str:
         """Return a stable synthetic Source Event identity."""
         return f"source-event:{probe_id}"
+
+    def allow_public_username(
+        self,
+        *,
+        address: str,
+        identity: TelegramPeerIdentity,
+        transport_boundary: str,
+    ) -> None:
+        """Configure one already-accessible public username resolution."""
+        self._admissions[address] = SourceChatAdmissionResolution(
+            identity=identity,
+            address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
+            current_address=address,
+        )
+        self._boundaries.setdefault(identity, []).append(transport_boundary)
+
+    def allow_private_invite(
+        self,
+        *,
+        address: str,
+        identity: TelegramPeerIdentity,
+        transport_boundary: str,
+    ) -> None:
+        """Configure one private invite for an account that already has access."""
+        self._admissions[address] = SourceChatAdmissionResolution(
+            identity=identity,
+            address_kind=SourceChatAddressKind.PRIVATE_INVITE,
+            current_address=address,
+        )
+        self._boundaries.setdefault(identity, []).append(transport_boundary)
+
+    def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
+        """Return configured admission metadata without join or history operations."""
+        self.resolution_requests.append(address)
+        resolution = self._admissions.get(address)
+        if resolution is None:
+            raise SourceChatAdmissionError("controlled Source Chat is inaccessible")
+        return resolution
+
+    def capture_source_chat_registration_boundary(
+        self, identity: TelegramPeerIdentity
+    ) -> str:
+        """Capture a separately configured current transport position."""
+        self.boundary_requests.append(identity)
+        boundaries = self._boundaries.get(identity)
+        if not boundaries:
+            raise SourceChatAdmissionError(
+                "controlled transport boundary is unavailable"
+            )
+        return boundaries.pop(0)
 
 
 @dataclass(slots=True)
@@ -1107,6 +1169,102 @@ class AcceptanceSpine:
             ),
         )
 
+    def select_administration_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Administration callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_administration_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_source_chats_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Source Chats callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_source_chats_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_chat_address(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        address: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one public username or private invite through the Bot port."""
+        self._conversation_onboarding().submit_source_chat_address(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            address=address,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def process_source_chat_registrations_until_idle(self) -> None:
+        """Let Ingestion, Application, and Bot Assistant finish admission."""
+        while True:
+            progressed = self._roles[RuntimeRole.INGESTION].process_next()
+            progressed = (
+                self._roles[RuntimeRole.APPLICATION].process_next() or progressed
+            )
+            progressed = (
+                self._roles[RuntimeRole.BOT_ASSISTANT].process_next() or progressed
+            )
+            delivered = self._conversation_onboarding().deliver_pending()
+            if not progressed and not delivered:
+                return
+
+    def process_next_source_chat_registration(
+        self,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> bool:
+        """Process one Application registry commit with an optional atomicity fault."""
+        return self._roles[RuntimeRole.APPLICATION].process_next(
+            inject_outbox_conflict=inject_outbox_conflict,
+        )
+
+    def process_next_source_chat_change_request(self) -> bool:
+        """Let Application request one Telegram-owned admission."""
+        return self._roles[RuntimeRole.APPLICATION].process_next()
+
+    def process_next_source_chat_admission(self) -> bool:
+        """Process one Telegram-owned Source Chat admission handoff."""
+        return self._roles[RuntimeRole.INGESTION].process_next()
+
+    def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
+        """Observe the application-owned Source Chat registry."""
+        return self._roles[RuntimeRole.APPLICATION].store.source_chats()
+
     def process_searches_until_idle(self) -> None:
         """Let recommendation and Bot Assistant finish durable Search work."""
         while True:
@@ -1509,6 +1667,7 @@ def boot_acceptance_spine(
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
+    telegram_admin_user_id: int | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately."""
     from apps.system_acceptance import boot_acceptance_role
@@ -1568,6 +1727,9 @@ def boot_acceptance_spine(
             timezone_data=(
                 installed_timezone_data if role is RuntimeRole.BOT_ASSISTANT else None
             ),
+            telegram_admin_user_id=(
+                telegram_admin_user_id if role is RuntimeRole.BOT_ASSISTANT else None
+            ),
         )
 
     return AcceptanceSpine(
@@ -1608,6 +1770,7 @@ def _conversation_onboarding_for_role(
         date_interpretation=role.date_interpretation,
         timezone_data=role.timezone_data,
         clock=role.clock,
+        telegram_admin_user_id=role.telegram_admin_user_id,
         supported_query_versions=role.versions_for(ContractName.GET_COMPLETED_SEARCH),
     )
 

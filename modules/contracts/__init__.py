@@ -39,6 +39,12 @@ class ContractName(StrEnum):
     SEARCH_COMPLETED = "SearchCompleted"
     SEARCH_FAILED = "SearchFailed"
     GET_COMPLETED_SEARCH = "GetCompletedSearch"
+    CHANGE_SOURCE_CHAT_REGISTRY = "ChangeSourceChatRegistry"
+    REQUEST_SOURCE_CHAT_ADMISSION = "RequestSourceChatAdmission"
+    SOURCE_CHAT_ADMISSION_RESOLVED = "SourceChatAdmissionResolved"
+    SOURCE_CHAT_ADMISSION_FAILED = "SourceChatAdmissionFailed"
+    SOURCE_CHAT_REGISTRATION_FAILED = "SourceChatRegistrationFailed"
+    SOURCE_CHAT_GENERATION_CHANGED = "SourceChatGenerationChanged"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
 
@@ -148,6 +154,54 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.RECOMMENDATION,
         RuntimeRole.BOT_ASSISTANT,
         "completed_search_id",
+    ),
+    ContractDefinition(
+        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.APPLICATION,
+        "address",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.INGESTION,
+        "address",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+        1,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "source_chat_key",
+        ("telegram_user_id", "telegram_chat_id"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+        1,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "registration_request_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "registration_request_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "source_chat_key",
+        ("telegram_user_id",),
     ),
     ContractDefinition(
         ContractName.TELEGRAM_PRESENTATION_REQUESTED,
