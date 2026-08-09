@@ -113,6 +113,7 @@ class ControlledTelegramDeliveryAdapter:
     inline_action_removals: list[tuple[int, str]] = field(default_factory=list)
     typing_actions: list[int] = field(default_factory=list)
     deletion_attempts: list[tuple[int, str]] = field(default_factory=list)
+    callback_notifications: list[tuple[str, str]] = field(default_factory=list)
     failures_remaining: int = 0
     lost_confirmations_remaining: int = 0
     interruptions_after_effect_remaining: int = 0
@@ -189,6 +190,10 @@ class ControlledTelegramDeliveryAdapter:
         if attempt not in self.deletion_attempts:
             self.deletion_attempts.append(attempt)
         return True
+
+    def answer_callback(self, *, callback_id: str, text: str) -> None:
+        """Record one callback notification without creating a message."""
+        self.callback_notifications.append((callback_id, text))
 
 
 class ControlledModelAdapter:
@@ -977,6 +982,58 @@ class AcceptanceSpine:
             ),
         )
 
+    def open_main_menu(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+    ) -> None:
+        """Drive the native Menu text through the Bot Assistant port."""
+        self._conversation_onboarding().open_main_menu(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        )
+
+    def select_main_menu_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Main Menu callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_main_menu_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_settings_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Settings or Mode callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_settings_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
     def process_searches_until_idle(self) -> None:
         """Let recommendation and Bot Assistant finish durable Search work."""
         while True:
@@ -1124,7 +1181,7 @@ class AcceptanceSpine:
             screen_revision=(
                 screen_revision
                 if screen_revision is not None
-                else self.discovery_draft(telegram_user_id).screen_revision
+                else self.conversation_state(telegram_user_id).screen_revision
             ),
         )
 

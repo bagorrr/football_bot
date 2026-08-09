@@ -69,6 +69,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0005_search_area.sql",
     "0006_required_date.sql",
     "0007_zero_result_search.sql",
+    "0008_main_menu_settings.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -79,6 +80,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "0ed51b9232f016c595860a2296129328167051363915f5bda4d552c37dcb2fde",
     "24e3a984d5f411b22b86486eeb2c95d48ce62bc6348c5a43b432bcb706bac6af",
     "2b3373bbba4780664716388d50c6e8e4d211ca5e4886a50587ac1041e7751ecc",
+    "c4975655de10c89b60dbfb9a1e1a3af21273486643d8f4b888d6df20500dde8f",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {

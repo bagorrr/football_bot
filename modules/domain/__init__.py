@@ -29,6 +29,11 @@ class ConversationStage(StrEnum):
     POST_CORE = "post_core"
     SUBMITTING = "submitting"
     RESULTS = "results"
+    MAIN_MENU = "main_menu"
+    SETTINGS = "settings"
+    MODE = "mode"
+    SETTINGS_LANGUAGE_SELECTION = "settings_language_selection"
+    SETTINGS_LANGUAGE_INPUT = "settings_language_input"
 
 
 class GeographicType(StrEnum):

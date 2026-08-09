@@ -115,6 +115,10 @@ class TelegramDeliveryAdapter(Protocol):
         """Best-effort delete one old Telegram message."""
         ...
 
+    def answer_callback(self, *, callback_id: str, text: str) -> None:
+        """Answer one Bot API callback without creating a chat message."""
+        ...
+
 
 class TelegramDeliveryPreEffectError(RuntimeError):
     """The adapter proves that no external Telegram effect occurred."""

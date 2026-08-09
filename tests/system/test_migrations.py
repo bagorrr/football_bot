@@ -721,7 +721,7 @@ def test_migrate_adopts_untracked_current_schema_without_replaying(
     ]
 
 
-@pytest.mark.parametrize("applied_count", range(1, 7))
+@pytest.mark.parametrize("applied_count", range(1, 8))
 def test_migrate_adopts_each_exact_partial_prefix_and_upgrades_it(
     fresh_database_url: str,
     applied_count: int,
