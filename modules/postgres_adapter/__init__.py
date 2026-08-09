@@ -600,6 +600,105 @@ class PostgresAcceptanceObserver:
             validate_registered=(row["inbox_status"] != "rejected_invalid_contract"),
         )
 
+    def delete_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Delete one canonical query to inject a missing-read failure."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            deleted = connection.execute(
+                """
+                DELETE FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND contract_name = %s
+                RETURNING *
+                """,
+                (
+                    GetCompletedSearch.request_id(completed_search_id),
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+        if deleted is None:
+            raise LookupError(completed_search_id)
+        return _row_to_envelope(deleted)
+
+    def invalidate_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Corrupt one canonical query to inject supported-contract rejection."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND contract_name = %s
+                FOR UPDATE
+                """,
+                (
+                    GetCompletedSearch.request_id(completed_search_id),
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+            if row is None:
+                raise LookupError(completed_search_id)
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = '{}'::jsonb
+                WHERE message_id = %s
+                  AND contract_name = %s
+                RETURNING message_id
+                """,
+                (
+                    GetCompletedSearch.request_id(completed_search_id),
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+        if changed is None:
+            raise LookupError(completed_search_id)
+        return _row_to_envelope(row)
+
+    def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
+        """Restore one corrected canonical query after a controlled fault."""
+        if query.contract_name is not ContractName.GET_COMPLETED_SEARCH:
+            raise ValueError("only GetCompletedSearch can use this test seam")
+        with psycopg.connect(self._admin_database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = %s::jsonb
+                WHERE message_id = %s
+                  AND contract_name = %s
+                RETURNING message_id
+                """,
+                (
+                    json.dumps(query.json_payload()),
+                    query.message_id,
+                    ContractName.GET_COMPLETED_SEARCH.value,
+                ),
+            ).fetchone()
+            if changed is None:
+                _insert_outbox(connection, query)
+
+    def contract_is_accepted(self, message_id: UUID) -> bool:
+        """Observe terminal contract acceptance without exposing table layout."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT processing_status = 'accepted'
+                FROM football_runtime.contract_inbox
+                WHERE message_id = %s
+                """,
+                (message_id,),
+            ).fetchone()
+        return row is not None and row[0]
+
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free alert by its technical message identity."""
         with psycopg.connect(

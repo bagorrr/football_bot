@@ -534,6 +534,26 @@ class AcceptanceObserver(Protocol):
         """Recover one durable envelope."""
         ...
 
+    def delete_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject one missing canonical query at the privileged test seam."""
+        ...
+
+    def invalidate_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject one invalid supported query at the privileged test seam."""
+        ...
+
+    def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
+        """Restore one corrected canonical query at the privileged test seam."""
+        ...
+
+    def contract_is_accepted(self, message_id: UUID) -> bool:
+        """Report terminal acceptance for one durable contract identity."""
+        ...
+
     def operator_alert(self, message_id: UUID) -> OperatorAlert:
         """Observe one body-free operator alert."""
         ...

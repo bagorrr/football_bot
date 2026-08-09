@@ -1172,7 +1172,11 @@ class ConversationOnboarding:
             supported_versions=self._supported_query_versions,
             received_at=now,
         )
-        if query_result.status is CompletedSearchQueryStatus.UNSUPPORTED_VERSION:
+        if query_result.status in {
+            CompletedSearchQueryStatus.MISSING,
+            CompletedSearchQueryStatus.INVALID_CONTRACT,
+            CompletedSearchQueryStatus.UNSUPPORTED_VERSION,
+        }:
             return
         completed_search = query_result.view
         result_count = payload.get("result_count")

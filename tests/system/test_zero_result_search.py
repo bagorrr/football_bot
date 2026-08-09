@@ -279,30 +279,131 @@ def test_stale_search_completion_is_consumed_without_presenting_it() -> None:
     system.reset()
 
 
-def test_search_completion_reads_the_canonical_completed_search() -> None:
-    system, _telegram = _boot_search_system()
+def test_missing_completed_search_query_correction_finishes_once() -> None:
+    system, telegram, clock = _boot_search_system_with_clock()
     user_id = 44_018
     _advance_to_complete_draft(system, user_id=user_id)
+    confirmed = system.discovery_draft(user_id)
     system.submit_search(update_id="active-search", telegram_user_id=user_id)
-    system.record_search_event(
-        probe_id="missing-completed-search",
-        contract_name=ContractName.SEARCH_COMPLETED,
-        contract_version=2,
-        telegram_user_id=user_id,
-        payload={
-            "probe_id": "missing-completed-search",
-            "completed_search_id": "missing-completed-search",
-            "search_update_id": "active-search",
-            "telegram_user_id": user_id,
-            "result_count": 0,
-        },
-    )
+    assert system.process_next_search_handoff(RuntimeRole.RECOMMENDATION) is True
+    first_search = system.completed_searches(user_id)[0]
+    query = system.delete_completed_search_query(first_search.completed_search_id)
+    completion = system.search_completions("active-search")[0]
 
     assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
 
+    pending = system.discovery_draft(user_id)
+    assert pending.stage is ConversationStage.SUBMITTING
+    assert pending.user_intent == confirmed.user_intent
+    assert pending.country == confirmed.country
+    assert pending.city == confirmed.city
+    assert pending.sub_city_areas == confirmed.sub_city_areas
+    assert pending.whole_city == confirmed.whole_city
+    assert pending.required_date == confirmed.required_date
+    assert pending.search_submission_update_id == "active-search"
+    assert system.contract_is_accepted(completion.message_id) is False
+    assert system.contract_is_accepted(query.message_id) is False
     assert system.retry_bot_presentations() is False
-    assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
-    assert system.observe("missing-completed-search").accepted_inbox_records == 1
+    with pytest.raises(LookupError):
+        system.operator_alert(query.message_id)
+    with pytest.raises(LookupError):
+        system.active_result_context(user_id)
+    assert not any(
+        message.delivery_id.startswith("search-result:")
+        for message in telegram.messages
+    )
+
+    system.restore_completed_search_query(query)
+    clock.advance_to(datetime(2026, 8, 8, 12, 1, tzinfo=UTC))
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+    assert system.retry_bot_presentations() is True
+
+    assert system.completed_searches(user_id) == (first_search,)
+    assert len(system.search_completions("active-search")) == 1
+    assert system.contract_is_accepted(completion.message_id) is True
+    assert system.contract_is_accepted(query.message_id) is True
+    assert system.has_discovery_draft(user_id) is False
+    assert system.active_result_context(user_id).completed_search_id == (
+        first_search.completed_search_id
+    )
+    assert [
+        message.delivery_id
+        for message in telegram.messages
+        if message.delivery_id.startswith("search-result:")
+    ] == [f"search-result:{first_search.completed_search_id}"]
+    assert telegram.messages[-1].reply_button == "Menu"
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is False
+    assert system.retry_bot_presentations() is False
+    system.reset()
+
+
+def test_invalid_completed_search_query_correction_alerts_and_finishes_once() -> None:
+    system, telegram, clock = _boot_search_system_with_clock()
+    user_id = 44_020
+    _advance_to_complete_draft(system, user_id=user_id)
+    confirmed = system.discovery_draft(user_id)
+    system.submit_search(update_id="invalid-query-search", telegram_user_id=user_id)
+    assert system.process_next_search_handoff(RuntimeRole.RECOMMENDATION) is True
+    first_search = system.completed_searches(user_id)[0]
+    query = system.invalidate_completed_search_query(first_search.completed_search_id)
+    completion = system.search_completions("invalid-query-search")[0]
+
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+
+    pending = system.discovery_draft(user_id)
+    assert pending.stage is ConversationStage.SUBMITTING
+    assert pending.user_intent == confirmed.user_intent
+    assert pending.country == confirmed.country
+    assert pending.city == confirmed.city
+    assert pending.sub_city_areas == confirmed.sub_city_areas
+    assert pending.whole_city == confirmed.whole_city
+    assert pending.required_date == confirmed.required_date
+    assert pending.search_submission_update_id == "invalid-query-search"
+    assert system.contract_is_accepted(completion.message_id) is False
+    invalid_query = system.recoverable_contract(
+        first_search.completed_search_id,
+        contract_name=ContractName.GET_COMPLETED_SEARCH,
+    )
+    assert invalid_query.payload == {}
+    assert system.contract_is_accepted(query.message_id) is False
+    assert system.retry_bot_presentations() is False
+    alert = system.operator_alert(query.message_id)
+    assert alert == OperatorAlert(
+        producer=RuntimeRole.RECOMMENDATION,
+        consumer=RuntimeRole.BOT_ASSISTANT,
+        contract_name=ContractName.GET_COMPLETED_SEARCH,
+        contract_version=1,
+        failure_code=FailureCode.INVALID_CONTRACT,
+    )
+    with pytest.raises(LookupError):
+        system.active_result_context(user_id)
+    assert not any(
+        message.delivery_id.startswith("search-result:")
+        for message in telegram.messages
+    )
+
+    system.restore_completed_search_query(query)
+    clock.advance_to(datetime(2026, 8, 8, 12, 1, tzinfo=UTC))
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
+    assert system.retry_bot_presentations() is True
+
+    assert system.completed_searches(user_id) == (first_search,)
+    assert len(system.search_completions("invalid-query-search")) == 1
+    assert system.contract_is_accepted(completion.message_id) is True
+    assert system.contract_is_accepted(query.message_id) is True
+    assert system.has_discovery_draft(user_id) is False
+    assert system.active_result_context(user_id).completed_search_id == (
+        first_search.completed_search_id
+    )
+    assert [
+        message.delivery_id
+        for message in telegram.messages
+        if message.delivery_id.startswith("search-result:")
+    ] == [f"search-result:{first_search.completed_search_id}"]
+    assert telegram.messages[-1].reply_button == "Menu"
+    assert system.operator_alert(query.message_id) == alert
+    assert system.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is False
+    assert system.retry_bot_presentations() is False
     system.reset()
 
 

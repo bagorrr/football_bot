@@ -869,6 +869,26 @@ class AcceptanceSpine:
         """Recover a rejected or pending envelope without acknowledging it."""
         return self._observer.envelope(_identifier(probe_id, contract_name.value))
 
+    def delete_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject a missing canonical Completed Search query."""
+        return self._observer.delete_completed_search_query(completed_search_id)
+
+    def invalidate_completed_search_query(
+        self, completed_search_id: str
+    ) -> RawContractEnvelope:
+        """Inject an invalid supported Completed Search query."""
+        return self._observer.invalidate_completed_search_query(completed_search_id)
+
+    def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
+        """Restore one corrected canonical Completed Search query."""
+        self._observer.restore_completed_search_query(query)
+
+    def contract_is_accepted(self, message_id: UUID) -> bool:
+        """Observe terminal acceptance for one contract identity."""
+        return self._observer.contract_is_accepted(message_id)
+
     def attempt_owner_write(
         self,
         *,
