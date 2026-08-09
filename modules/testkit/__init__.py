@@ -760,6 +760,26 @@ class ControlledConversationLanguageAdapter:
                 "Neue Suche",
                 "Menü",
             ),
+            administration_label="Verwaltung",
+            administration_text="⚙️ **Verwaltung**",
+            administration_labels=("Quell-Chats", "Zurück", "Menü"),
+            source_chats_text="📡 **Quell-Chats**",
+            source_chats_labels=("Quell-Chat hinzufügen", "Zurück", "Menü"),
+            source_chat_address_text=(
+                "Senden Sie einen öffentlichen @Benutzernamen oder einen privaten "
+                "Einladungslink für einen Quell-Chat, auf den das konfigurierte "
+                "Konto bereits zugreifen kann."
+            ),
+            source_chat_address_labels=("Zurück", "Menü"),
+            source_chat_pending_text="Quell-Chat-Zugriff wird geprüft…",
+            source_chat_registered_text=(
+                "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt."
+            ),
+            source_chat_failed_text=(
+                "Dieser Quell-Chat konnte nicht registriert werden. Prüfen Sie, ob "
+                "das konfigurierte Konto bereits Zugriff hat, und versuchen Sie es "
+                "erneut."
+            ),
         )
 
 

@@ -576,6 +576,128 @@ def test_malformed_source_chat_admission_fails_closed_and_releases_pending_user(
     system.reset()
 
 
+def test_non_static_language_renders_every_source_chat_administration_surface() -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 55, tzinfo=UTC))
+    administrator_id = 46_107
+    telethon.allow_public_username(
+        address="@synthetic_german_source",
+        identity=TelegramPeerIdentity(
+            kind=TelegramPeerKind.CHANNEL,
+            telegram_id=4_610_700,
+        ),
+        transport_boundary="channel-pts:7701",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:german-administration",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.open_language_input(
+        update_id="language-input:german-administration",
+        telegram_user_id=administrator_id,
+    )
+    system.submit_language_text(
+        update_id="language:german-administration",
+        telegram_user_id=administrator_id,
+        text="Deutsch",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 55, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:german-administration",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:german-administration",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    settings = telegram.messages[-1]
+    assert settings.display_locale == "de"
+    assert (
+        "Verwaltung",
+        f"settings:administration:{settings.screen_revision}",
+    ) in tuple(button for row in settings.button_rows for button in row)
+
+    system.select_settings_action(
+        update_id="administration:german-administration",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    administration = telegram.messages[-1]
+    assert administration.display_locale == "de"
+    assert administration.text == "⚙️ **Verwaltung**"
+    assert administration.button_rows[0][0][0] == "Quell-Chats"
+
+    system.select_administration_action(
+        update_id="source-chats:german-administration",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    source_chats = telegram.messages[-1]
+    assert source_chats.display_locale == "de"
+    assert source_chats.text == "📡 **Quell-Chats**"
+    assert source_chats.button_rows[0][0][0] == "Quell-Chat hinzufügen"
+
+    system.select_source_chats_action(
+        update_id="add:german-administration",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    address = telegram.messages[-1]
+    assert address.display_locale == "de"
+    assert address.text.startswith("Senden Sie einen öffentlichen @Benutzernamen")
+
+    message_count_before_registration = len(telegram.messages)
+    system.submit_source_chat_address(
+        update_id="address:german-administration",
+        telegram_user_id=administrator_id,
+        address="@synthetic_german_source",
+    )
+    system.process_source_chat_registrations_until_idle()
+    registration_messages = telegram.messages[message_count_before_registration:]
+    pending = next(
+        message
+        for message in registration_messages
+        if message.text == "Quell-Chat-Zugriff wird geprüft…"
+    )
+    assert pending.display_locale == "de"
+    registered = telegram.messages[-1]
+    assert registered.display_locale == "de"
+    assert registered.text == (
+        "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt."
+    )
+
+    system.select_source_chats_action(
+        update_id="add:german-failure",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:german-failure",
+        telegram_user_id=administrator_id,
+        address="@synthetic_inaccessible_german_source",
+    )
+    system.process_source_chat_registrations_until_idle()
+    failed = telegram.messages[-1]
+    assert failed.display_locale == "de"
+    assert failed.text.startswith("Dieser Quell-Chat konnte nicht registriert werden")
+    assert system.conversation_state(administrator_id).locale == "de"
+    system.reset()
+
+
 def test_private_invite_registration_uses_existing_account_access_without_joining() -> (
     None
 ):

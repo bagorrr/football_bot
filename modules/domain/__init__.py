@@ -475,3 +475,13 @@ class LanguageSelection:
     placeholder_notifications: tuple[str, str, str] | None = None
     no_results_yet: tuple[str, str, str] | None = None
     zero_result: tuple[str, str, str] | None = None
+    administration_label: str | None = None
+    administration_text: str | None = None
+    administration_labels: tuple[str, str, str] | None = None
+    source_chats_text: str | None = None
+    source_chats_labels: tuple[str, str, str] | None = None
+    source_chat_address_text: str | None = None
+    source_chat_address_labels: tuple[str, str] | None = None
+    source_chat_pending_text: str | None = None
+    source_chat_registered_text: str | None = None
+    source_chat_failed_text: str | None = None
