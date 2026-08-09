@@ -771,6 +771,11 @@ class ControlledConversationLanguageAdapter:
                 "Konto bereits zugreifen kann."
             ),
             source_chat_address_labels=("Zurück", "Menü"),
+            source_chat_invalid_address_text=(
+                "Verwenden Sie einen gültigen öffentlichen @Benutzernamen oder "
+                "einen privaten https://t.me/+-Einladungslink und versuchen Sie es "
+                "erneut."
+            ),
             source_chat_pending_text="Quell-Chat-Zugriff wird geprüft…",
             source_chat_registered_text=(
                 "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt."
@@ -1057,12 +1062,16 @@ class AcceptanceSpine:
         update_id: str,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        causation_id: UUID | None = None,
+        new_correlation_id: UUID | None = None,
     ) -> RawContractEnvelope:
         """Inject one selected Source Chat contract fault by originating update."""
         return self._observer.invalidate_source_chat_contract(
             _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
             contract_name,
             payload_updates,
+            causation_id=causation_id,
+            new_correlation_id=new_correlation_id,
         )
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
@@ -1307,6 +1316,20 @@ class AcceptanceSpine:
         """Process one Telegram-owned Source Chat admission handoff."""
         return self._roles[RuntimeRole.INGESTION].process_next()
 
+    def process_next_source_chat_bot_result(self) -> bool:
+        """Process and deliver one Bot-owned Source Chat terminal handoff."""
+        processed = self.queue_next_source_chat_bot_result()
+        self.deliver_next_bot_message()
+        return processed
+
+    def queue_next_source_chat_bot_result(self) -> bool:
+        """Queue one Bot-owned Source Chat terminal without adapter delivery."""
+        return self._roles[RuntimeRole.BOT_ASSISTANT].process_next()
+
+    def deliver_next_bot_message(self) -> bool:
+        """Attempt one already-queued Bot presentation at the delivery boundary."""
+        return self._conversation_onboarding().deliver_pending()
+
     def record_source_chat_generation(
         self,
         *,
@@ -1379,6 +1402,7 @@ class AcceptanceSpine:
                 "telegram_peer_kind": entry.identity.kind.value,
                 "telegram_chat_id": entry.identity.telegram_id,
                 "registry_generation": entry.registry_generation,
+                "registration_request_id": str(incoming.causation_id),
             },
         )
         self._roles[RuntimeRole.APPLICATION].store.register_source_chat(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -47,6 +48,17 @@ class ContractName(StrEnum):
     SOURCE_CHAT_GENERATION_CHANGED = "SourceChatGenerationChanged"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     OWNER_STATE_WRITE = "OwnerStateWrite"
+
+
+def derive_contract_message_id(
+    causation_id: UUID,
+    contract_name: ContractName,
+) -> UUID:
+    """Derive the stable identity of a directly caused contract message."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{causation_id}:{contract_name.value}",
+    )
 
 
 class FailureCode(StrEnum):
@@ -340,6 +352,8 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_source_chat_contract(
                 self.contract_name,
                 self.payload,
+                message_id=self.message_id,
+                causation_id=self.causation_id,
                 subject_id=self.subject_id,
                 subject_revision=self.subject_revision,
             )
@@ -536,6 +550,8 @@ def _validate_source_chat_contract(
     contract_name: ContractName,
     payload: dict[str, JsonValue],
     *,
+    message_id: UUID,
+    causation_id: UUID,
     subject_id: str,
     subject_revision: int,
 ) -> None:
@@ -543,6 +559,7 @@ def _validate_source_chat_contract(
         "address",
         "telegram_user_id",
         "registry_generation",
+        "registration_request_id",
     }:
         raise ValueError("RequestSourceChatAdmission contains unsupported facts")
     if contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED and set(payload) - {
@@ -554,6 +571,7 @@ def _validate_source_chat_contract(
         "current_address",
         "transport_boundary",
         "registry_generation",
+        "registration_request_id",
     }:
         raise ValueError("SourceChatAdmissionResolved contains unsupported facts")
     if contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED and set(payload) - {
@@ -562,6 +580,7 @@ def _validate_source_chat_contract(
         "telegram_peer_kind",
         "telegram_chat_id",
         "registry_generation",
+        "registration_request_id",
     }:
         raise ValueError("SourceChatGenerationChanged contains unsupported facts")
     if contract_name is ContractName.SOURCE_CHAT_ADMISSION_FAILED and set(payload) - {
@@ -573,6 +592,7 @@ def _validate_source_chat_contract(
     ) - {
         "registration_request_id",
         "telegram_user_id",
+        "registry_generation",
     }:
         raise ValueError("SourceChatRegistrationFailed contains unsupported facts")
     if contract_name is not ContractName.SOURCE_CHAT_ADMISSION_FAILED:
@@ -592,11 +612,22 @@ def _validate_source_chat_contract(
         _validate_source_chat_address(_required_text(payload, "address"))
     if contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION:
         _validate_source_chat_generation(payload, subject_revision=subject_revision)
+        if _required_uuid_text(payload, "registration_request_id") != str(message_id):
+            raise ValueError("Source Chat request identity must match its message")
     if contract_name in {
+        ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
         ContractName.SOURCE_CHAT_ADMISSION_FAILED,
         ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
     }:
         _required_uuid_text(payload, "registration_request_id")
+    if contract_name in {
+        ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+        ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+    } and payload["registration_request_id"] != str(causation_id):
+        raise ValueError("Source Chat admission must identify its causing request")
+    if contract_name is ContractName.SOURCE_CHAT_REGISTRATION_FAILED:
+        _validate_source_chat_generation(payload, subject_revision=subject_revision)
     if contract_name not in {
         ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
         ContractName.SOURCE_CHAT_GENERATION_CHANGED,
@@ -646,13 +677,10 @@ def _validate_source_chat_address(address: str) -> None:
 
 def is_valid_source_chat_address(address: str) -> bool:
     """Return whether an administrator-entered Source Chat address is valid."""
-    if (
-        address.startswith("@")
-        and len(address) > 1
-        and not any(character.isspace() for character in address)
-    ):
-        return True
-    return address.startswith("https://t.me/+") and len(address) > len("https://t.me/+")
+    return (
+        re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", address) is not None
+        or re.fullmatch(r"https://t\.me/\+[A-Za-z0-9_-]{16,64}", address) is not None
+    )
 
 
 def _validate_source_chat_generation(

@@ -25,6 +25,7 @@ from modules.contracts import (
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
+    derive_contract_message_id,
 )
 from modules.domain import (
     AcceptedLocation,
@@ -50,6 +51,7 @@ from modules.domain import (
     RequiredDateConfirmationEvent,
     SearchResult,
     SourceChatAddressKind,
+    SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
@@ -93,7 +95,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "c4975655de10c89b60dbfb9a1e1a3af21273486643d8f4b888d6df20500dde8f",
     "a47b752decc202f4cbefd6022f1399ca52242ba0886479ab3d40f38575965c9c",
     "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
-    "c3c69c1c1c21914abaf1dd1c9eaa1781b4a0ace4da92637d83617192a018657e",
+    "49abd5916a4327553bdb3e4ebf0fd1e471d242fd733fad275f8b7b6a5bf4b05a",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -699,6 +701,9 @@ class PostgresAcceptanceObserver:
         correlation_id: UUID,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        *,
+        causation_id: UUID | None = None,
+        new_correlation_id: UUID | None = None,
     ) -> RawContractEnvelope:
         """Corrupt one selected Source Chat contract at the wire boundary."""
         with psycopg.connect(
@@ -720,7 +725,6 @@ class PostgresAcceptanceObserver:
             ).fetchone()
             if row is None:
                 raise LookupError(correlation_id)
-            original = _row_to_envelope(row)
             payload = row["payload"]
             if not isinstance(payload, dict):
                 raise TypeError("Source Chat contract payload must be an object")
@@ -728,15 +732,22 @@ class PostgresAcceptanceObserver:
             changed = connection.execute(
                 """
                 UPDATE football_runtime.contract_outbox
-                SET payload = %s::jsonb
+                SET payload = %s::jsonb,
+                    causation_id = COALESCE(%s, causation_id),
+                    correlation_id = COALESCE(%s, correlation_id)
                 WHERE message_id = %s
-                RETURNING message_id
+                RETURNING *
                 """,
-                (json.dumps(payload), row["message_id"]),
+                (
+                    json.dumps(payload),
+                    causation_id,
+                    new_correlation_id,
+                    row["message_id"],
+                ),
             ).fetchone()
         if changed is None:
             raise LookupError(correlation_id)
-        return original
+        return _row_to_envelope(changed, validate_registered=False)
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical query after a controlled fault."""
@@ -1078,6 +1089,13 @@ class PostgresRoleStore:
         if self._role is not RuntimeRole.APPLICATION:
             raise RuntimeError("only Application owns the Source Chat registry")
         with psycopg.connect(self._database_url) as connection:
+            peer_key = (
+                f"source-chat:{entry.identity.kind.value}:{entry.identity.telegram_id}"
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
             existing = connection.execute(
                 """
                 SELECT processing_status
@@ -1090,7 +1108,21 @@ class PostgresRoleStore:
             if existing is not None and existing[0] == "accepted":
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.REPLAYED
-            if entry.enabled:
+            latest_generation = connection.execute(
+                """
+                SELECT registry_generation
+                FROM football_runtime.source_chat_registry
+                WHERE peer_kind = %s AND telegram_chat_id = %s
+                ORDER BY registry_generation DESC
+                LIMIT 1
+                """,
+                (entry.identity.kind.value, entry.identity.telegram_id),
+            ).fetchone()
+            is_obsolete = (
+                latest_generation is not None
+                and entry.registry_generation < latest_generation[0]
+            )
+            if entry.enabled and not is_obsolete:
                 connection.execute(
                     """
                     UPDATE football_runtime.source_chat_registry
@@ -1107,37 +1139,38 @@ class PostgresRoleStore:
                         entry.registry_generation,
                     ),
                 )
-            connection.execute(
-                """
-                INSERT INTO football_runtime.source_chat_registry (
-                    peer_kind, telegram_chat_id, registry_generation,
-                    address_kind, current_address,
-                    processing_started_at, transport_boundary, enabled,
-                    initial_consent_attestation, attested_at,
-                    created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (
-                    peer_kind, telegram_chat_id, registry_generation
-                ) DO UPDATE
-                SET address_kind = EXCLUDED.address_kind,
-                    current_address = EXCLUDED.current_address,
-                    updated_at = EXCLUDED.updated_at
-                """,
-                (
-                    entry.identity.kind.value,
-                    entry.identity.telegram_id,
-                    entry.registry_generation,
-                    entry.address_kind.value,
-                    entry.current_address,
-                    entry.processing_started_at,
-                    entry.transport_boundary,
-                    entry.enabled,
-                    entry.initial_consent_attestation.value,
-                    entry.attested_at,
-                    received_at,
-                    received_at,
-                ),
-            )
+            if not is_obsolete:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.source_chat_registry (
+                        peer_kind, telegram_chat_id, registry_generation,
+                        address_kind, current_address,
+                        processing_started_at, transport_boundary, enabled,
+                        initial_consent_attestation, attested_at,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (
+                        peer_kind, telegram_chat_id, registry_generation
+                    ) DO UPDATE
+                    SET address_kind = EXCLUDED.address_kind,
+                        current_address = EXCLUDED.current_address,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        entry.identity.kind.value,
+                        entry.identity.telegram_id,
+                        entry.registry_generation,
+                        entry.address_kind.value,
+                        entry.current_address,
+                        entry.processing_started_at,
+                        entry.transport_boundary,
+                        entry.enabled,
+                        entry.initial_consent_attestation.value,
+                        entry.attested_at,
+                        received_at,
+                        received_at,
+                    ),
+                )
             _accept_contract_inbox(
                 connection,
                 consumer=self._role,
@@ -1640,14 +1673,16 @@ class PostgresRoleStore:
     def source_chat_registration_context(
         self,
         correlation_id: UUID,
-    ) -> tuple[int, int] | None:
+    ) -> SourceChatRegistrationContext | None:
         """Read Application's own admission request context by correlation."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         with psycopg.connect(self._database_url) as connection:
             row = connection.execute(
                 """
-                SELECT telegram_user_id, registry_generation
+                SELECT request_message_id, telegram_user_id,
+                       origin_subject_id, origin_subject_revision,
+                       registry_generation
                 FROM football_runtime.source_chat_admission_requests
                 WHERE correlation_id = %s
                 """,
@@ -1655,27 +1690,111 @@ class PostgresRoleStore:
             ).fetchone()
         if row is None:
             return None
-        telegram_user_id, registry_generation = row
+        (
+            request_message_id,
+            telegram_user_id,
+            origin_subject_id,
+            origin_subject_revision,
+            registry_generation,
+        ) = row
         if (
-            not isinstance(telegram_user_id, int)
+            not isinstance(request_message_id, UUID)
+            or not isinstance(telegram_user_id, int)
             or isinstance(telegram_user_id, bool)
+            or not isinstance(origin_subject_id, str)
+            or not origin_subject_id
+            or not isinstance(origin_subject_revision, int)
+            or isinstance(origin_subject_revision, bool)
             or not isinstance(registry_generation, int)
             or isinstance(registry_generation, bool)
         ):
             raise RuntimeError("Application admission context is invalid")
-        return telegram_user_id, registry_generation
+        return SourceChatRegistrationContext(
+            correlation_id=correlation_id,
+            request_message_id=request_message_id,
+            telegram_user_id=telegram_user_id,
+            origin_subject_id=origin_subject_id,
+            origin_subject_revision=origin_subject_revision,
+            registry_generation=registry_generation,
+        )
 
-    def source_chat_registration_originator(
+    def source_chat_registration_context_for_admission(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatRegistrationContext | None:
+        """Read the Application request proven by admission message or cause."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        if incoming.contract_name not in {
+            ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+            ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+        }:
+            return None
+        with psycopg.connect(self._database_url) as connection:
+            rows = connection.execute(
+                """
+                SELECT correlation_id, request_message_id, telegram_user_id,
+                       origin_subject_id, origin_subject_revision,
+                       registry_generation
+                FROM football_runtime.source_chat_admission_requests
+                """
+            ).fetchall()
+        message_matches: list[SourceChatRegistrationContext] = []
+        cause_matches: list[SourceChatRegistrationContext] = []
+        for row in rows:
+            (
+                correlation_id,
+                request_message_id,
+                telegram_user_id,
+                origin_subject_id,
+                origin_subject_revision,
+                registry_generation,
+            ) = row
+            if (
+                not isinstance(correlation_id, UUID)
+                or not isinstance(request_message_id, UUID)
+                or not isinstance(telegram_user_id, int)
+                or isinstance(telegram_user_id, bool)
+                or not isinstance(origin_subject_id, str)
+                or not origin_subject_id
+                or not isinstance(origin_subject_revision, int)
+                or isinstance(origin_subject_revision, bool)
+                or not isinstance(registry_generation, int)
+                or isinstance(registry_generation, bool)
+            ):
+                raise RuntimeError("Application admission context is invalid")
+            context = SourceChatRegistrationContext(
+                correlation_id=correlation_id,
+                request_message_id=request_message_id,
+                telegram_user_id=telegram_user_id,
+                origin_subject_id=origin_subject_id,
+                origin_subject_revision=origin_subject_revision,
+                registry_generation=registry_generation,
+            )
+            if incoming.message_id == derive_contract_message_id(
+                request_message_id,
+                incoming.contract_name,
+            ):
+                message_matches.append(context)
+            if incoming.causation_id == request_message_id:
+                cause_matches.append(context)
+        matches = message_matches or cause_matches
+        if len(matches) > 1:
+            raise RuntimeError("admission maps to multiple registration requests")
+        return matches[0] if matches else None
+
+    def source_chat_registration_origin(
         self,
         correlation_id: UUID,
-    ) -> int | None:
+    ) -> SourceChatRegistrationContext | None:
         """Read Bot Assistant's originating registration command context."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
             raise ConversationAccessDeniedError
         with psycopg.connect(self._database_url) as connection:
             row = connection.execute(
                 """
-                SELECT payload -> 'telegram_user_id'
+                SELECT message_id, subject_id, subject_revision,
+                       payload -> 'telegram_user_id'
                 FROM football_runtime.contract_outbox
                 WHERE correlation_id = %s
                   AND producer_role = %s
@@ -1689,10 +1808,116 @@ class PostgresRoleStore:
             ).fetchone()
         if row is None:
             return None
-        telegram_user_id = row[0]
-        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+        command_message_id, subject_id, subject_revision, telegram_user_id = row
+        if (
+            not isinstance(command_message_id, UUID)
+            or command_message_id != correlation_id
+            or not isinstance(subject_id, str)
+            or not subject_id
+            or not isinstance(subject_revision, int)
+            or isinstance(subject_revision, bool)
+            or not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+        ):
             raise RuntimeError("Bot registration context is invalid")
-        return telegram_user_id
+        return SourceChatRegistrationContext(
+            correlation_id=correlation_id,
+            request_message_id=derive_contract_message_id(
+                command_message_id,
+                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            ),
+            telegram_user_id=telegram_user_id,
+            origin_subject_id=subject_id,
+            origin_subject_revision=subject_revision,
+            registry_generation=subject_revision,
+        )
+
+    def source_chat_registration_origin_for_terminal(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatRegistrationContext | None:
+        """Read the one Bot origin proven by immutable terminal causation."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            rows = connection.execute(
+                """
+                SELECT correlation_id, message_id, subject_id, subject_revision,
+                       payload -> 'telegram_user_id'
+                FROM football_runtime.contract_outbox
+                WHERE producer_role = %s
+                  AND contract_name = %s
+                """,
+                (
+                    RuntimeRole.BOT_ASSISTANT.value,
+                    ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value,
+                ),
+            ).fetchall()
+        message_matches: list[SourceChatRegistrationContext] = []
+        cause_matches: list[SourceChatRegistrationContext] = []
+        for row in rows:
+            (
+                correlation_id,
+                command_message_id,
+                subject_id,
+                subject_revision,
+                telegram_user_id,
+            ) = row
+            if (
+                not isinstance(correlation_id, UUID)
+                or not isinstance(command_message_id, UUID)
+                or command_message_id != correlation_id
+                or not isinstance(subject_id, str)
+                or not subject_id
+                or not isinstance(subject_revision, int)
+                or isinstance(subject_revision, bool)
+                or not isinstance(telegram_user_id, int)
+                or isinstance(telegram_user_id, bool)
+            ):
+                raise RuntimeError("Bot registration context is invalid")
+            request_message_id = derive_contract_message_id(
+                command_message_id,
+                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            )
+            resolved_message_id = derive_contract_message_id(
+                request_message_id,
+                ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+            )
+            admission_failed_message_id = derive_contract_message_id(
+                request_message_id,
+                ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+            )
+            eligible_causes: tuple[UUID, ...]
+            if incoming.contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED:
+                eligible_causes = (resolved_message_id,)
+            elif incoming.contract_name is ContractName.SOURCE_CHAT_REGISTRATION_FAILED:
+                eligible_causes = (
+                    command_message_id,
+                    resolved_message_id,
+                    admission_failed_message_id,
+                )
+            else:
+                continue
+            context = SourceChatRegistrationContext(
+                correlation_id=correlation_id,
+                request_message_id=request_message_id,
+                telegram_user_id=telegram_user_id,
+                origin_subject_id=subject_id,
+                origin_subject_revision=subject_revision,
+                registry_generation=subject_revision,
+            )
+            expected_messages = tuple(
+                derive_contract_message_id(cause, incoming.contract_name)
+                for cause in eligible_causes
+            )
+            if incoming.message_id in expected_messages:
+                message_matches.append(context)
+            if incoming.causation_id in eligible_causes:
+                cause_matches.append(context)
+        matches = message_matches or cause_matches
+        if len(matches) > 1:
+            raise RuntimeError("Bot terminal maps to multiple registration origins")
+        return matches[0] if matches else None
 
     @contextmanager
     def serialize_conversation_update(
@@ -3171,6 +3396,85 @@ class PostgresRoleStore:
                 (claim_token,),
             )
 
+    def replace_unauthorized_administration_delivery(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> None:
+        """Consume one claimed admin view and atomically queue ordinary Settings."""
+        with psycopg.connect(self._database_url) as connection:
+            claimed = connection.execute(
+                """
+                SELECT telegram_user_id
+                FROM football_runtime.bot_message_outbox
+                WHERE delivery_id = %s
+                  AND claim_token = %s
+                  AND delivered_at IS NULL
+                FOR UPDATE
+                """,
+                (delivery_id, claim_token),
+            ).fetchone()
+            if claimed != (state.telegram_user_id,):
+                raise RuntimeError("administration delivery claim was lost")
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    recorded_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=state.telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = NULL, claimed_at = NULL,
+                    delivery_status = 'pending'
+                WHERE delivery_id = %s AND claim_token = %s
+                """,
+                (delivery_id, claim_token),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    recorded_at,
+                ),
+            )
+
     def mark_conversation_message_outcome_unknown(
         self,
         *,
@@ -3622,14 +3926,17 @@ def _insert_outbox(
             """
             INSERT INTO football_runtime.source_chat_admission_requests (
                 correlation_id, request_message_id, telegram_user_id,
+                origin_subject_id, origin_subject_revision,
                 registry_generation, recorded_at
-            ) VALUES (%s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (correlation_id) DO NOTHING
             """,
             (
                 envelope.correlation_id,
                 envelope.message_id,
                 telegram_user_id,
+                envelope.subject_id,
+                envelope.subject_revision,
                 registry_generation,
                 envelope.recorded_at,
             ),

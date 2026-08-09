@@ -154,6 +154,18 @@ class SourceChatRegistryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceChatRegistrationContext:
+    """Application-owned durable origin of one Source Chat admission request."""
+
+    correlation_id: UUID
+    request_message_id: UUID
+    telegram_user_id: int
+    origin_subject_id: str
+    origin_subject_revision: int
+    registry_generation: int
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationState:
     """Durable account-level Conversation Language state."""
 
@@ -482,6 +494,7 @@ class LanguageSelection:
     source_chats_labels: tuple[str, str, str] | None = None
     source_chat_address_text: str | None = None
     source_chat_address_labels: tuple[str, str] | None = None
+    source_chat_invalid_address_text: str | None = None
     source_chat_pending_text: str | None = None
     source_chat_registered_text: str | None = None
     source_chat_failed_text: str | None = None

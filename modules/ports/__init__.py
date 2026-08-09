@@ -39,6 +39,7 @@ from modules.domain import (
     RequiredDateConfirmationEvent,
     SearchResult,
     SourceChatAdmissionResolution,
+    SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
@@ -364,11 +365,18 @@ class ConversationStore(Protocol):
         """Consume one admission result and queue its Bot presentation atomically."""
         ...
 
-    def source_chat_registration_originator(
+    def source_chat_registration_origin(
         self,
         correlation_id: UUID,
-    ) -> int | None:
-        """Recover the Bot-owned originator for one pending registration."""
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the Bot-owned durable origin for one pending registration."""
+        ...
+
+    def source_chat_registration_origin_for_terminal(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the unique durable origin proven by a terminal causation chain."""
         ...
 
     def reject_invalid_contract(
@@ -462,6 +470,19 @@ class ConversationStore(Protocol):
 
     def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
         """Release one pre-effect failure for a later send retry."""
+        ...
+
+    def replace_unauthorized_administration_delivery(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> None:
+        """Consume a claimed admin view and queue ordinary Settings atomically."""
         ...
 
     def mark_conversation_message_outcome_unknown(
@@ -620,8 +641,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
     def source_chat_registration_context(
         self,
         correlation_id: UUID,
-    ) -> tuple[int, int] | None:
+    ) -> SourceChatRegistrationContext | None:
         """Recover the authorized requester and generation for one admission."""
+        ...
+
+    def source_chat_registration_context_for_admission(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the unique durable request proven by admission causation."""
         ...
 
     def attempt_owner_write(
@@ -684,6 +712,9 @@ class AcceptanceObserver(Protocol):
         correlation_id: UUID,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        *,
+        causation_id: UUID | None = None,
+        new_correlation_id: UUID | None = None,
     ) -> RawContractEnvelope:
         """Inject one selected Source Chat wire fault at the test seam."""
         ...

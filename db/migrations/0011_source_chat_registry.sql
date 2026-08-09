@@ -82,6 +82,8 @@ CREATE TABLE football_runtime.source_chat_admission_requests (
     correlation_id uuid PRIMARY KEY,
     request_message_id uuid NOT NULL UNIQUE,
     telegram_user_id bigint NOT NULL CHECK (telegram_user_id > 0),
+    origin_subject_id text NOT NULL CHECK (origin_subject_id <> ''),
+    origin_subject_revision bigint NOT NULL CHECK (origin_subject_revision > 0),
     registry_generation bigint NOT NULL CHECK (registry_generation > 0),
     recorded_at timestamptz NOT NULL
 );
