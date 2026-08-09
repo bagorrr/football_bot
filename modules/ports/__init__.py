@@ -269,6 +269,17 @@ class ConversationStore(Protocol):
         """Commit one idempotent presentation without changing account state."""
         ...
 
+    def commit_conversation_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Record one callback-only effect before it reaches Telegram."""
+        ...
+
     def commit_search_submission(
         self,
         *,

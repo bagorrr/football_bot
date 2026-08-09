@@ -627,6 +627,15 @@ class ControlledConversationLanguageAdapter:
                 "⬅️ Zurück",
                 "Transfers",
             ),
+            settings_text="⚙️ **Einstellungen**",
+            settings_labels=(
+                "Sprache",
+                "Support",
+                "Modus",
+                "Premium",
+                "Zurück",
+                "Menü",
+            ),
         )
 
 

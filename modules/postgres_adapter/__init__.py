@@ -1838,6 +1838,49 @@ class PostgresRoleStore:
             )
             return True
 
+    def commit_conversation_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Record one replay-safe callback effect without changing its screen."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            current = connection.execute(
+                """
+                SELECT revision
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if current is None or current[0] != expected_revision:
+                raise RuntimeError("Conversation state changed concurrently")
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET last_bot_user_action_at = %s
+                WHERE telegram_user_id = %s
+                """,
+                (recorded_at, telegram_user_id),
+            )
+            return True
+
     def commit_search_submission(
         self,
         *,

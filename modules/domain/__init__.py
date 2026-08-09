@@ -388,3 +388,5 @@ class LanguageSelection:
     confirmation: str
     direction_question: str
     direction_labels: tuple[str, str, str, str, str, str, str]
+    settings_text: str | None = None
+    settings_labels: tuple[str, str, str, str, str, str] | None = None

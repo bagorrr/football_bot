@@ -89,6 +89,72 @@ def test_search_results_distinguishes_no_history_from_zero_result() -> None:
     system.reset()
 
 
+def test_menu_rerenders_first_and_returned_language_selection() -> None:
+    system, telegram, _clock = _boot_menu_system()
+    first_user = 45_007
+    system.start_bot_user(
+        update_id="start-first-language-selection",
+        telegram_user_id=first_user,
+        telegram_language_hint="en",
+    )
+
+    system.open_main_menu(
+        update_id="menu-during-first-language-selection",
+        telegram_user_id=first_user,
+    )
+
+    first_state = system.conversation_state(first_user)
+    assert first_state.stage is ConversationStage.LANGUAGE_SELECTION
+    assert telegram.messages[-1].text.startswith(
+        "**Would you like to play football or organize a football match?"
+    )
+    assert all(
+        not callback.startswith("menu:")
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+    )
+
+    system.select_main_menu_action(
+        update_id="new-search-during-first-language-selection",
+        telegram_user_id=first_user,
+        action="new-search",
+    )
+    assert system.conversation_state(first_user).stage is (
+        ConversationStage.LANGUAGE_SELECTION
+    )
+
+    returned_user = 45_008
+    system.start_bot_user(
+        update_id="start-returned-language-selection",
+        telegram_user_id=returned_user,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="select-before-returned-language-selection",
+        telegram_user_id=returned_user,
+        locale="en",
+    )
+    system.go_back(
+        update_id="back-to-language-selection",
+        telegram_user_id=returned_user,
+    )
+    direction_draft = system.discovery_draft(returned_user)
+
+    system.open_main_menu(
+        update_id="menu-during-returned-language-selection",
+        telegram_user_id=returned_user,
+    )
+
+    assert system.conversation_state(returned_user).stage is (
+        ConversationStage.LANGUAGE_SELECTION
+    )
+    assert system.discovery_draft(returned_user) == direction_draft
+    assert telegram.messages[-1].text.startswith(
+        "**Would you like to play football or organize a football match?"
+    )
+    system.reset()
+
+
 def test_new_search_supersedes_only_the_paused_draft() -> None:
     system, telegram, _clock = _boot_menu_system()
     user_id = 45_003
@@ -191,6 +257,32 @@ def test_settings_support_and_placeholders_are_non_mutating() -> None:
     )
     assert len(telegram.messages) == message_count_before_feed
     assert system.conversation_state(user_id) == state_before_feed
+    notifications_after_feed = tuple(telegram.callback_notifications)
+    system.select_settings_action(
+        update_id="feed-placeholder",
+        telegram_user_id=user_id,
+        action="feed",
+    )
+    assert tuple(telegram.callback_notifications) == notifications_after_feed
+    assert system.conversation_state(user_id) == state_before_feed
+
+    system.select_settings_action(
+        update_id="search-mode-placeholder",
+        telegram_user_id=user_id,
+        action="mode-search",
+    )
+    assert telegram.callback_notifications[-1] == (
+        "search-mode-placeholder",
+        "Search mode is active.",
+    )
+    notifications_after_search_mode = tuple(telegram.callback_notifications)
+    system.select_settings_action(
+        update_id="search-mode-placeholder",
+        telegram_user_id=user_id,
+        action="mode-search",
+    )
+    assert tuple(telegram.callback_notifications) == notifications_after_search_mode
+    assert system.conversation_state(user_id) == state_before_feed
 
     system.go_back(update_id="back-to-settings", telegram_user_id=user_id)
     state_before_premium = system.conversation_state(user_id)
@@ -205,6 +297,14 @@ def test_settings_support_and_placeholders_are_non_mutating() -> None:
         "Premium will be available later.",
     )
     assert len(telegram.messages) == message_count_before_premium
+    assert system.conversation_state(user_id) == state_before_premium
+    notifications_after_premium = tuple(telegram.callback_notifications)
+    system.select_settings_action(
+        update_id="premium-placeholder",
+        telegram_user_id=user_id,
+        action="premium",
+    )
+    assert tuple(telegram.callback_notifications) == notifications_after_premium
     assert system.conversation_state(user_id) == state_before_premium
     assert system.completed_searches(user_id) == completed_before
     assert system.active_result_context(user_id) == context_before
@@ -311,9 +411,79 @@ def test_settings_free_text_language_returns_to_settings() -> None:
     state = system.conversation_state(user_id)
     assert state.locale == "de"
     assert state.stage is ConversationStage.SETTINGS
-    assert telegram.messages[-1].display_locale == "de"
+    settings = telegram.messages[-1]
+    assert settings.display_locale == "de"
+    assert settings.text == "⚙️ **Einstellungen**"
+    assert settings.button_rows == (
+        (("Sprache", f"settings:language:{settings.screen_revision}"),),
+        (("Support", "https://telegram.me/myfootball_support_bot"),),
+        (("Modus", f"settings:mode:{settings.screen_revision}"),),
+        (("Premium", f"settings:premium:{settings.screen_revision}"),),
+        (("Zurück", f"settings:back:{settings.screen_revision}"),),
+    )
+    assert settings.reply_button == "Menü"
     assert system.completed_searches(user_id) == completed_before
     assert system.active_result_context(user_id) == context_before
+
+    system.go_back(
+        update_id="back-after-free-language",
+        telegram_user_id=user_id,
+    )
+    system.select_main_menu_action(
+        update_id="reopen-settings-after-free-language",
+        telegram_user_id=user_id,
+        action="settings",
+    )
+    assert telegram.messages[-1].text == "⚙️ **Einstellungen**"
+    system.reset()
+
+
+def test_unmapped_settings_language_retains_back_and_menu_controls() -> None:
+    system, telegram, _clock = _boot_menu_system()
+    user_id = 45_009
+    _complete_zero_result_search(system, user_id=user_id)
+    system.open_main_menu(
+        update_id="menu-before-unmapped-language",
+        telegram_user_id=user_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings-before-unmapped-language",
+        telegram_user_id=user_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="selector-before-unmapped-language",
+        telegram_user_id=user_id,
+        action="language",
+    )
+    system.open_language_input(
+        update_id="open-unmapped-language-input",
+        telegram_user_id=user_id,
+    )
+    confirmed_locale = system.conversation_state(user_id).locale
+
+    system.submit_language_text(
+        update_id="submit-unmapped-settings-language",
+        telegram_user_id=user_id,
+        text="not one unambiguous language",
+    )
+
+    state = system.conversation_state(user_id)
+    clarification = telegram.messages[-1]
+    assert state.stage is ConversationStage.SETTINGS_LANGUAGE_INPUT
+    assert state.locale == confirmed_locale
+    assert "identify one language unambiguously" in clarification.text
+    assert clarification.button_rows == (
+        (("Back", f"settings-language:back:{clarification.screen_revision}"),),
+    )
+    assert clarification.reply_button == "Menu"
+
+    system.go_back(
+        update_id="back-after-unmapped-settings-language",
+        telegram_user_id=user_id,
+    )
+    assert system.conversation_state(user_id).stage is ConversationStage.SETTINGS
+    assert system.conversation_state(user_id).locale == confirmed_locale
     system.reset()
 
 
