@@ -738,6 +738,7 @@ class AcceptanceObserver(Protocol):
         new_subject_id: str | None = None,
         new_idempotency_key: str | None = None,
         new_recorded_at: datetime | None = None,
+        new_contract_version: int | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,

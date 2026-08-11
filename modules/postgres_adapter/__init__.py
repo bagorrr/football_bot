@@ -711,6 +711,7 @@ class PostgresAcceptanceObserver:
         new_subject_id: str | None = None,
         new_idempotency_key: str | None = None,
         new_recorded_at: datetime | None = None,
+        new_contract_version: int | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,
@@ -746,6 +747,7 @@ class PostgresAcceptanceObserver:
                     subject_id = COALESCE(%s, subject_id),
                     idempotency_key = COALESCE(%s, idempotency_key),
                     recorded_at = COALESCE(%s, recorded_at),
+                    contract_version = COALESCE(%s, contract_version),
                     payload = %s::jsonb,
                     causation_id = COALESCE(%s, causation_id),
                     correlation_id = COALESCE(%s, correlation_id),
@@ -758,6 +760,7 @@ class PostgresAcceptanceObserver:
                     new_subject_id,
                     new_idempotency_key,
                     new_recorded_at,
+                    new_contract_version,
                     json.dumps(payload),
                     causation_id,
                     new_correlation_id,
@@ -1613,6 +1616,8 @@ class PostgresRoleStore:
                             failure_code=FailureCode.UNSUPPORTED_CONTRACT_VERSION,
                             observed_at=received_at,
                         )
+                        if outgoing is not None:
+                            _insert_outbox(connection, outgoing)
                     _release_claim(connection, incoming.message_id)
                     return ConsumeResult.REJECTED
                 connection.execute(

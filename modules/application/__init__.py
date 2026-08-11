@@ -5664,6 +5664,27 @@ class RuntimeApplication:
                 )
                 return True
         if (
+            self.role is RuntimeRole.INGESTION
+            and incoming.contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION
+            and supported_incoming is None
+            and incoming.contract_version
+            not in self.versions_for(incoming.contract_name)
+        ):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=(
+                    self._invalid_source_chat_admission_failure(
+                        incoming,
+                        provenance=source_chat_admission_provenance,
+                    )
+                    if source_chat_admission_provenance is not None
+                    else None
+                ),
+            )
+            return True
+        if (
             incoming.contract_name is ContractName.RUN_SEARCH
             and supported_incoming is not None
         ):

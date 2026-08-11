@@ -1603,6 +1603,158 @@ def test_malformed_admission_request_releases_the_correlated_pending_user() -> N
     system.reset()
 
 
+def test_unsupported_admission_request_version_releases_the_durable_origin_once() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 48, 15, tzinfo=UTC))
+    administrator_id = 46_129
+    supported_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_612_900,
+    )
+    telethon.allow_public_username(
+        address="@supported_version_control",
+        identity=supported_identity,
+        transport_boundary="channel-pts:7459",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 48, 15, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:unsupported-admission-version",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+
+    update_id = "address:unsupported-admission-version"
+    system.submit_source_chat_address(
+        update_id=update_id,
+        telegram_user_id=administrator_id,
+        address="@unsupported_admission_version",
+    )
+    assert system.process_next_source_chat_change_request()
+    request = system.invalidate_source_chat_contract(
+        update_id=update_id,
+        contract_name=ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+        payload_updates={},
+        new_contract_version=2,
+    )
+
+    assert system.process_next_source_chat_admission()
+    assert not system.process_next_source_chat_admission()
+    assert system.operator_alert(request.message_id).failure_code is (
+        FailureCode.UNSUPPORTED_CONTRACT_VERSION
+    )
+    assert system.source_chats() == ()
+    assert telethon.resolution_requests == []
+    assert telethon.boundary_requests == []
+
+    admission_failures = system.source_chat_contracts(
+        update_id=update_id,
+        contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+    )
+    assert len(admission_failures) == 1
+    assert admission_failures[0].causation_id == request.message_id
+    assert admission_failures[0].correlation_id == request.correlation_id
+    assert admission_failures[0].payload == {
+        "registration_request_id": str(request.message_id)
+    }
+
+    system.process_source_chat_registrations_until_idle()
+    assert system.conversation_state(administrator_id).stage is (
+        ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+    )
+    assert telegram.messages[-1].telegram_user_id == administrator_id
+    assert telegram.messages[-1].text.startswith("Could not register this Source Chat")
+    terminal_failures = system.source_chat_contracts(
+        update_id=update_id,
+        contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+    )
+    assert len(terminal_failures) == 1
+
+    delivered_count = len(telegram.messages)
+    system.process_source_chat_registrations_until_idle()
+    assert not system.process_next_source_chat_admission()
+    assert len(telegram.messages) == delivered_count
+    assert (
+        system.source_chat_contracts(
+            update_id=update_id,
+            contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+        )
+        == admission_failures
+    )
+    assert (
+        system.source_chat_contracts(
+            update_id=update_id,
+            contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+        )
+        == terminal_failures
+    )
+    assert system.source_chats() == ()
+    assert telethon.resolution_requests == []
+    assert telethon.boundary_requests == []
+
+    supported_update_id = "address:supported-admission-version-control"
+    system.submit_source_chat_address(
+        update_id=supported_update_id,
+        telegram_user_id=administrator_id,
+        address="@supported_version_control",
+    )
+    assert system.process_next_source_chat_change_request()
+    supported_requests = system.source_chat_contracts(
+        update_id=supported_update_id,
+        contract_name=ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+    )
+    assert len(supported_requests) == 1
+    assert supported_requests[0].contract_version == 1
+    system.process_source_chat_registrations_until_idle()
+
+    assert [entry.identity for entry in system.source_chats()] == [supported_identity]
+    assert telethon.resolution_requests == ["@supported_version_control"]
+    assert telethon.boundary_requests == [supported_identity]
+    system.reset()
+
+
 def test_admission_request_rejects_substituted_tuple_and_releases_origin() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     telethon = ControlledTelegramIngestionAdapter()
