@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -31,6 +32,10 @@ class ConversationStage(StrEnum):
     RESULTS = "results"
     MAIN_MENU = "main_menu"
     SETTINGS = "settings"
+    ADMINISTRATION = "administration"
+    SOURCE_CHATS = "source_chats"
+    SOURCE_CHAT_ADDRESS_INPUT = "source_chat_address_input"
+    SOURCE_CHAT_REGISTRATION_PENDING = "source_chat_registration_pending"
     MODE = "mode"
     SETTINGS_LANGUAGE_SELECTION = "settings_language_selection"
     SETTINGS_LANGUAGE_INPUT = "settings_language_input"
@@ -87,6 +92,123 @@ class TelegramDeliveryMode(StrEnum):
 
     SEND = "send"
     RECONCILE = "reconcile"
+
+
+class TelegramPeerKind(StrEnum):
+    """Telegram namespace needed to interpret one stable numeric chat ID."""
+
+    CHAT = "chat"
+    CHANNEL = "channel"
+
+
+class SourceChatAddressKind(StrEnum):
+    """Protected current address accepted by Source Chat admission."""
+
+    PUBLIC_USERNAME = "public_username"
+    PRIVATE_INVITE = "private_invite"
+
+
+def is_valid_source_chat_address(
+    address: str,
+    *,
+    kind: SourceChatAddressKind | None = None,
+) -> bool:
+    """Apply the complete public Source Chat address grammar."""
+    public_username = re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{4,31}", address) is not None
+    private_invite = (
+        re.fullmatch(r"https://t\.me/\+[A-Za-z0-9_-]{16,64}", address) is not None
+    )
+    if kind is SourceChatAddressKind.PUBLIC_USERNAME:
+        return public_username
+    if kind is SourceChatAddressKind.PRIVATE_INVITE:
+        return private_invite
+    return public_username or private_invite
+
+
+class InitialConsentAttestation(StrEnum):
+    """Immutable administrator statement recorded at successful admission."""
+
+    CONFIRMED = "confirmed"
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPeerIdentity:
+    """Typed stable Telegram chat identity independent from its address."""
+
+    kind: TelegramPeerKind
+    telegram_id: int
+
+    def __post_init__(self) -> None:
+        if self.telegram_id <= 0:
+            raise ValueError("Telegram chat identity must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatAdmissionResolution:
+    """Accessible stable identity returned without joining or history access."""
+
+    identity: TelegramPeerIdentity
+    address_kind: SourceChatAddressKind
+    current_address: str
+
+    def __post_init__(self) -> None:
+        if not is_valid_source_chat_address(
+            self.current_address,
+            kind=self.address_kind,
+        ):
+            raise ValueError("resolved Source Chat address is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatRegistryEntry:
+    """Application-owned enabled Source Chat admission state."""
+
+    identity: TelegramPeerIdentity
+    registry_generation: int
+    address_kind: SourceChatAddressKind
+    current_address: str
+    processing_started_at: datetime
+    transport_boundary: str
+    enabled: bool
+    initial_consent_attestation: InitialConsentAttestation
+    attested_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.registry_generation < 1:
+            raise ValueError("Source Chat registry generation must be positive")
+        if not is_valid_source_chat_address(
+            self.current_address,
+            kind=self.address_kind,
+        ):
+            raise ValueError("Source Chat registry address is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatRegistrationContext:
+    """Application-owned durable origin of one Source Chat admission request."""
+
+    correlation_id: UUID
+    request_message_id: UUID
+    telegram_user_id: int
+    origin_subject_id: str
+    origin_subject_revision: int
+    registry_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatAdmissionProvenance:
+    """Immutable Application request facts visible through a narrow proof seam."""
+
+    provenance_id: UUID
+    correlation_id: UUID
+    request_message_id: UUID
+    telegram_user_id: int
+    requested_address: str
+    origin_subject_id: str
+    origin_subject_revision: int
+    registry_generation: int
+    request_idempotency_key: str
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,3 +533,14 @@ class LanguageSelection:
     placeholder_notifications: tuple[str, str, str] | None = None
     no_results_yet: tuple[str, str, str] | None = None
     zero_result: tuple[str, str, str] | None = None
+    administration_label: str | None = None
+    administration_text: str | None = None
+    administration_labels: tuple[str, str, str] | None = None
+    source_chats_text: str | None = None
+    source_chats_labels: tuple[str, str, str] | None = None
+    source_chat_address_text: str | None = None
+    source_chat_address_labels: tuple[str, str] | None = None
+    source_chat_invalid_address_text: str | None = None
+    source_chat_pending_text: str | None = None
+    source_chat_registered_text: str | None = None
+    source_chat_failed_text: str | None = None

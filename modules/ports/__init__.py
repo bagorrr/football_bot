@@ -14,6 +14,7 @@ from modules.contracts import (
     ContractEnvelope,
     ContractName,
     GetCompletedSearch,
+    JsonValue,
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
@@ -37,9 +38,14 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    SourceChatAdmissionProvenance,
+    SourceChatAdmissionResolution,
+    SourceChatRegistrationContext,
+    SourceChatRegistryEntry,
     TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
     TelegramMessage,
+    TelegramPeerIdentity,
     UserIntent,
 )
 
@@ -79,6 +85,20 @@ class TelegramIngestionAdapter(Protocol):
     def source_event_id(self, probe_id: str) -> str:
         """Return a synthetic Source Event identity."""
         ...
+
+    def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
+        """Resolve one already-accessible chat without joining or reading history."""
+        ...
+
+    def capture_source_chat_registration_boundary(
+        self, identity: TelegramPeerIdentity
+    ) -> str:
+        """Capture the current transport position after successful resolution."""
+        ...
+
+
+class SourceChatAdmissionError(RuntimeError):
+    """Source Chat address was invalid, inaccessible, or technically unresolved."""
 
 
 class TelegramDeliveryAdapter(Protocol):
@@ -191,6 +211,14 @@ class ConsumeResult(StrEnum):
     APPLIED = "applied"
     REPLAYED = "replayed"
     REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedContract:
+    """One leased envelope plus transport-owned immutable provenance identity."""
+
+    envelope: RawContractEnvelope
+    source_chat_admission_provenance_id: UUID | None = None
 
 
 class CompletedSearchQueryStatus(StrEnum):
@@ -320,6 +348,60 @@ class ConversationStore(Protocol):
         """Commit one Search action, submitting draft, and RunSearch command."""
         ...
 
+    def commit_source_chat_registration_request(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one authorized Bot update and registry command atomically."""
+        ...
+
+    def next_source_chat_registration_generation(self) -> int:
+        """Return the next durable one-administrator registration generation."""
+        ...
+
+    def accept_source_chat_registration(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        received_at: datetime,
+        invalid_contract: bool = False,
+    ) -> ConsumeResult:
+        """Consume one admission result and queue its Bot presentation atomically."""
+        ...
+
+    def source_chat_registration_origin(
+        self,
+        correlation_id: UUID,
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the Bot-owned durable origin for one pending registration."""
+        ...
+
+    def source_chat_registration_origin_for_terminal(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the unique durable origin proven by a terminal causation chain."""
+        ...
+
+    def reject_invalid_contract(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
+    ) -> ConsumeResult:
+        """Durably reject one supported-version envelope with invalid semantics."""
+        ...
+
     def defer_start_to_pending_search_result(
         self,
         *,
@@ -403,6 +485,19 @@ class ConversationStore(Protocol):
         """Release one pre-effect failure for a later send retry."""
         ...
 
+    def replace_unauthorized_administration_delivery(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> None:
+        """Consume a claimed admin view and queue ordinary Settings atomically."""
+        ...
+
     def mark_conversation_message_outcome_unknown(
         self,
         *,
@@ -473,13 +568,45 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically commit initial owner state and its outbox."""
         ...
 
+    def register_source_chat(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        entry: SourceChatRegistryEntry,
+        outgoing: ContractEnvelope,
+        stale_outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically accept admission and publish the applicable terminal result."""
+        ...
+
+    def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
+        """Read application-owned Source Chats through a stable query."""
+        ...
+
+    def eligible_source_chat_generation(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> SourceChatRegistryEntry | None:
+        """Return only the enabled current generation for an incoming event."""
+        ...
+
     def claim_next(
         self,
         *,
         supported_versions: Mapping[ContractName, Iterable[int]],
         claimed_at: datetime,
-    ) -> RawContractEnvelope | None:
+    ) -> ClaimedContract | None:
         """Claim the next recoverable handoff visible to this role."""
+        ...
+
+    def source_chat_admission_provenance(
+        self,
+        provenance_id: UUID,
+    ) -> SourceChatAdmissionProvenance | None:
+        """Read one Application proof through the Ingestion-only database seam."""
         ...
 
     def claim_presentation(
@@ -532,13 +659,18 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically persist a zero-result Completed Search and its event."""
         ...
 
-    def reject_invalid_contract(
+    def source_chat_registration_context(
         self,
-        *,
+        correlation_id: UUID,
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the authorized requester and generation for one admission."""
+        ...
+
+    def source_chat_registration_context_for_admission(
+        self,
         incoming: RawContractEnvelope,
-        received_at: datetime,
-    ) -> ConsumeResult:
-        """Durably reject one supported-version envelope with invalid semantics."""
+    ) -> SourceChatRegistrationContext | None:
+        """Recover the unique durable request proven by admission causation."""
         ...
 
     def attempt_owner_write(
@@ -588,6 +720,41 @@ class AcceptanceObserver(Protocol):
         """Inject one invalid supported query at the privileged test seam."""
         ...
 
+    def invalidate_source_chat_admission(
+        self,
+        correlation_id: UUID,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject invalid Source Chat facts at the privileged test seam."""
+        ...
+
+    def invalidate_source_chat_contract(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+        *,
+        new_message_id: UUID | None = None,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+        new_recorded_at: datetime | None = None,
+        new_contract_version: int | None = None,
+        causation_id: UUID | None = None,
+        new_correlation_id: UUID | None = None,
+        new_subject_revision: int | None = None,
+    ) -> RawContractEnvelope:
+        """Inject one selected Source Chat wire fault at the test seam."""
+        ...
+
+    def replace_source_chat_contract_payload(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+        payload: JsonValue,
+    ) -> RawContractEnvelope:
+        """Replace one Source Chat payload at the privileged test seam."""
+        ...
+
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical query at the privileged test seam."""
         ...
@@ -628,6 +795,14 @@ class AcceptanceObserver(Protocol):
         self, search_update_id: str
     ) -> tuple[RawContractEnvelope, ...]:
         """Observe canonical completion events for one Search command identity."""
+        ...
+
+    def source_chat_contracts(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Source Chat outcomes for one external registration origin."""
         ...
 
     def snapshot(self, probe_id: str) -> AcceptanceObservation:

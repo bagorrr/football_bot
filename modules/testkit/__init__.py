@@ -47,7 +47,11 @@ from modules.domain import (
     RequiredDate,
     RequiredDateConfirmationEvent,
     SearchResult,
+    SourceChatAddressKind,
+    SourceChatAdmissionResolution,
+    SourceChatRegistryEntry,
     TelegramMessage,
+    TelegramPeerIdentity,
 )
 from modules.ports import (
     AcceptanceObserver,
@@ -60,6 +64,7 @@ from modules.ports import (
     LocationResolverError,
     ModelAdapter,
     ResolvedTimezoneData,
+    SourceChatAdmissionError,
     TelegramDeliveryAdapter,
     TelegramDeliveryOutcomeUnknownError,
     TelegramDeliveryPreEffectError,
@@ -99,9 +104,76 @@ class FrozenClock:
 class ControlledTelegramIngestionAdapter:
     """Synthetic Source Chat input with no live MTProto access."""
 
+    _admissions: dict[
+        str,
+        tuple[TelegramPeerIdentity, SourceChatAddressKind, str],
+    ] = field(default_factory=dict)
+    _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
+    resolution_requests: list[str] = field(default_factory=list)
+    boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
+    join_requests: list[str] = field(default_factory=list)
+    history_requests: list[str] = field(default_factory=list)
+
     def source_event_id(self, probe_id: str) -> str:
         """Return a stable synthetic Source Event identity."""
         return f"source-event:{probe_id}"
+
+    def allow_public_username(
+        self,
+        *,
+        address: str,
+        identity: TelegramPeerIdentity,
+        transport_boundary: str,
+        current_address: str | None = None,
+    ) -> None:
+        """Configure one already-accessible public username resolution."""
+        self._admissions[address] = (
+            identity,
+            SourceChatAddressKind.PUBLIC_USERNAME,
+            current_address or address,
+        )
+        self._boundaries.setdefault(identity, []).append(transport_boundary)
+
+    def allow_private_invite(
+        self,
+        *,
+        address: str,
+        identity: TelegramPeerIdentity,
+        transport_boundary: str,
+        current_address: str | None = None,
+    ) -> None:
+        """Configure one private invite for an account that already has access."""
+        self._admissions[address] = (
+            identity,
+            SourceChatAddressKind.PRIVATE_INVITE,
+            current_address or address,
+        )
+        self._boundaries.setdefault(identity, []).append(transport_boundary)
+
+    def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
+        """Return configured admission metadata without join or history operations."""
+        self.resolution_requests.append(address)
+        configured = self._admissions.get(address)
+        if configured is None:
+            raise SourceChatAdmissionError("controlled Source Chat is inaccessible")
+        identity, address_kind, current_address = configured
+        return SourceChatAdmissionResolution(
+            identity=identity,
+            address_kind=address_kind,
+            current_address=current_address,
+        )
+
+    def capture_source_chat_registration_boundary(
+        self, identity: TelegramPeerIdentity
+    ) -> str:
+        """Capture a separately configured current transport position."""
+        self.boundary_requests.append(identity)
+        boundaries = self._boundaries.get(identity)
+        if not boundaries:
+            raise SourceChatAdmissionError(
+                "controlled transport boundary is unavailable"
+            )
+        return boundaries.pop(0)
 
 
 @dataclass(slots=True)
@@ -698,6 +770,31 @@ class ControlledConversationLanguageAdapter:
                 "Neue Suche",
                 "Menü",
             ),
+            administration_label="Verwaltung",
+            administration_text="⚙️ **Verwaltung**",
+            administration_labels=("Quell-Chats", "Zurück", "Menü"),
+            source_chats_text="📡 **Quell-Chats**",
+            source_chats_labels=("Quell-Chat hinzufügen", "Zurück", "Menü"),
+            source_chat_address_text=(
+                "Senden Sie einen öffentlichen @Benutzernamen oder einen privaten "
+                "Einladungslink für einen Quell-Chat, auf den das konfigurierte "
+                "Konto bereits zugreifen kann."
+            ),
+            source_chat_address_labels=("Zurück", "Menü"),
+            source_chat_invalid_address_text=(
+                "Verwenden Sie einen gültigen öffentlichen @Benutzernamen oder "
+                "einen privaten https://t.me/+-Einladungslink und versuchen Sie es "
+                "erneut."
+            ),
+            source_chat_pending_text="Quell-Chat-Zugriff wird geprüft…",
+            source_chat_registered_text=(
+                "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt."
+            ),
+            source_chat_failed_text=(
+                "Dieser Quell-Chat konnte nicht registriert werden. Prüfen Sie, ob "
+                "das konfigurierte Konto bereits Zugriff hat, und versuchen Sie es "
+                "erneut."
+            ),
         )
 
 
@@ -957,6 +1054,62 @@ class AcceptanceSpine:
         """Inject an invalid supported Completed Search query."""
         return self._observer.invalidate_completed_search_query(completed_search_id)
 
+    def invalidate_source_chat_admission(
+        self,
+        *,
+        update_id: str,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject invalid Source Chat admission facts at the wire boundary."""
+        return self._observer.invalidate_source_chat_admission(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            payload_updates,
+        )
+
+    def invalidate_source_chat_contract(
+        self,
+        *,
+        update_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+        new_message_id: UUID | None = None,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+        new_recorded_at: datetime | None = None,
+        new_contract_version: int | None = None,
+        causation_id: UUID | None = None,
+        new_correlation_id: UUID | None = None,
+        new_subject_revision: int | None = None,
+    ) -> RawContractEnvelope:
+        """Inject one selected Source Chat contract fault by originating update."""
+        return self._observer.invalidate_source_chat_contract(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            contract_name,
+            payload_updates,
+            new_message_id=new_message_id,
+            new_subject_id=new_subject_id,
+            new_idempotency_key=new_idempotency_key,
+            new_recorded_at=new_recorded_at,
+            new_contract_version=new_contract_version,
+            causation_id=causation_id,
+            new_correlation_id=new_correlation_id,
+            new_subject_revision=new_subject_revision,
+        )
+
+    def replace_source_chat_contract_payload(
+        self,
+        *,
+        update_id: str,
+        contract_name: ContractName,
+        payload: JsonValue,
+    ) -> RawContractEnvelope:
+        """Replace one Source Chat payload at the external-contract test seam."""
+        return self._observer.replace_source_chat_contract_payload(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            contract_name,
+            payload,
+        )
+
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical Completed Search query."""
         self._observer.restore_completed_search_query(query)
@@ -1016,6 +1169,18 @@ class AcceptanceSpine:
     ) -> tuple[RawContractEnvelope, ...]:
         """Observe completion contracts for one Search command identity."""
         return self._observer.search_completions(search_update_id)
+
+    def source_chat_contracts(
+        self,
+        *,
+        update_id: str,
+        contract_name: ContractName,
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Source Chat outcomes for one Bot-originated registration."""
+        return self._observer.source_chat_contracts(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            contract_name,
+        )
 
     def _conversation_onboarding(self) -> ConversationOnboarding:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
@@ -1105,6 +1270,130 @@ class AcceptanceSpine:
                 if screen_revision is not None
                 else self.conversation_state(telegram_user_id).screen_revision
             ),
+        )
+
+    def select_administration_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Administration callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_administration_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_source_chats_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Source Chats callback through the Bot Assistant port."""
+        self._conversation_onboarding().select_source_chats_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_chat_address(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        address: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one public username or private invite through the Bot port."""
+        self._conversation_onboarding().submit_source_chat_address(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            address=address,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def process_source_chat_registrations_until_idle(self) -> None:
+        """Let Ingestion, Application, and Bot Assistant finish admission."""
+        while True:
+            progressed = self._roles[RuntimeRole.INGESTION].process_next()
+            progressed = (
+                self._roles[RuntimeRole.APPLICATION].process_next() or progressed
+            )
+            progressed = (
+                self._roles[RuntimeRole.BOT_ASSISTANT].process_next() or progressed
+            )
+            delivered = self._conversation_onboarding().deliver_pending()
+            if not progressed and not delivered:
+                return
+
+    def process_next_source_chat_registration(
+        self,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> bool:
+        """Process one Application registry commit with an optional atomicity fault."""
+        return self._roles[RuntimeRole.APPLICATION].process_next(
+            inject_outbox_conflict=inject_outbox_conflict,
+        )
+
+    def process_next_source_chat_change_request(self) -> bool:
+        """Let Application request one Telegram-owned admission."""
+        return self._roles[RuntimeRole.APPLICATION].process_next()
+
+    def process_next_source_chat_admission(self) -> bool:
+        """Process one Telegram-owned Source Chat admission handoff."""
+        return self._roles[RuntimeRole.INGESTION].process_next()
+
+    def process_next_source_chat_bot_result(self) -> bool:
+        """Process and deliver one Bot-owned Source Chat terminal handoff."""
+        processed = self.queue_next_source_chat_bot_result()
+        self.deliver_next_bot_message()
+        return processed
+
+    def queue_next_source_chat_bot_result(self) -> bool:
+        """Queue one Bot-owned Source Chat terminal without adapter delivery."""
+        return self._roles[RuntimeRole.BOT_ASSISTANT].process_next()
+
+    def deliver_next_bot_message(self) -> bool:
+        """Attempt one already-queued Bot presentation at the delivery boundary."""
+        return self._conversation_onboarding().deliver_pending()
+
+    def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
+        """Observe the application-owned Source Chat registry."""
+        return self._roles[RuntimeRole.APPLICATION].store.source_chats()
+
+    def eligible_source_chat_generation(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> SourceChatRegistryEntry | None:
+        """Observe event eligibility through the Application registry owner."""
+        return self._roles[
+            RuntimeRole.APPLICATION
+        ].store.eligible_source_chat_generation(
+            identity=identity,
+            registry_generation=registry_generation,
         )
 
     def process_searches_until_idle(self) -> None:
@@ -1509,6 +1798,7 @@ def boot_acceptance_spine(
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
+    telegram_admin_user_id: int | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately."""
     from apps.system_acceptance import boot_acceptance_role
@@ -1568,6 +1858,11 @@ def boot_acceptance_spine(
             timezone_data=(
                 installed_timezone_data if role is RuntimeRole.BOT_ASSISTANT else None
             ),
+            telegram_admin_user_id=(
+                telegram_admin_user_id
+                if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
+                else None
+            ),
         )
 
     return AcceptanceSpine(
@@ -1608,6 +1903,7 @@ def _conversation_onboarding_for_role(
         date_interpretation=role.date_interpretation,
         timezone_data=role.timezone_data,
         clock=role.clock,
+        telegram_admin_user_id=role.telegram_admin_user_id,
         supported_query_versions=role.versions_for(ContractName.GET_COMPLETED_SEARCH),
     )
 

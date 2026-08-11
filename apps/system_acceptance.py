@@ -31,6 +31,7 @@ def boot_acceptance_role(
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
+    telegram_admin_user_id: int | None = None,
 ) -> RuntimeApplication:
     """Boot exactly one role with its own least-privilege database credential."""
     return RuntimeApplication(
@@ -44,4 +45,5 @@ def boot_acceptance_role(
         conversation_language=conversation_language,
         date_interpretation=date_interpretation,
         timezone_data=timezone_data,
+        telegram_admin_user_id=telegram_admin_user_id,
     )
