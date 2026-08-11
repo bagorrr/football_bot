@@ -205,7 +205,6 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         RuntimeRole.BOT_ASSISTANT,
         "registration_request_id",
-        ("telegram_user_id",),
     ),
     ContractDefinition(
         ContractName.SOURCE_CHAT_GENERATION_CHANGED,
@@ -622,7 +621,10 @@ def _validate_source_chat_contract(
         "registry_generation",
     }:
         raise ValueError("SourceChatRegistrationFailed contains unsupported facts")
-    if contract_name is not ContractName.SOURCE_CHAT_ADMISSION_FAILED:
+    if contract_name not in {
+        ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+        ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+    }:
         telegram_user_id = payload.get("telegram_user_id")
         if (
             not isinstance(telegram_user_id, int)
@@ -632,6 +634,27 @@ def _validate_source_chat_contract(
             raise ValueError(
                 "Source Chat contract requires a positive telegram_user_id"
             )
+    if contract_name is ContractName.SOURCE_CHAT_REGISTRATION_FAILED:
+        has_telegram_user_id = "telegram_user_id" in payload
+        has_registry_generation = "registry_generation" in payload
+        if has_telegram_user_id != has_registry_generation:
+            raise ValueError(
+                "Source Chat registration failure identity must be complete"
+            )
+        if has_telegram_user_id:
+            telegram_user_id = payload["telegram_user_id"]
+            if (
+                not isinstance(telegram_user_id, int)
+                or isinstance(telegram_user_id, bool)
+                or telegram_user_id < 1
+            ):
+                raise ValueError(
+                    "Source Chat contract requires a positive telegram_user_id"
+                )
+            _validate_source_chat_generation(
+                payload,
+                subject_revision=subject_revision,
+            )
     if contract_name in {
         ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
         ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
@@ -639,6 +662,15 @@ def _validate_source_chat_contract(
         _validate_source_chat_address(_required_text(payload, "address"))
     if contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION:
         _validate_source_chat_generation(payload, subject_revision=subject_revision)
+        if causation_id != correlation_id:
+            raise ValueError(
+                "Source Chat request causation must identify its command correlation"
+            )
+        if message_id != derive_contract_message_id(
+            causation_id,
+            ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+        ):
+            raise ValueError("Source Chat request message identity is not canonical")
         if _required_uuid_text(payload, "registration_request_id") != str(message_id):
             raise ValueError("Source Chat request identity must match its message")
     if contract_name in {
@@ -653,8 +685,6 @@ def _validate_source_chat_contract(
         ContractName.SOURCE_CHAT_ADMISSION_FAILED,
     } and payload["registration_request_id"] != str(causation_id):
         raise ValueError("Source Chat admission must identify its causing request")
-    if contract_name is ContractName.SOURCE_CHAT_REGISTRATION_FAILED:
-        _validate_source_chat_generation(payload, subject_revision=subject_revision)
     if contract_name not in {
         ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
         ContractName.SOURCE_CHAT_GENERATION_CHANGED,

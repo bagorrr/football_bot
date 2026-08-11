@@ -718,11 +718,21 @@ class AcceptanceObserver(Protocol):
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
         *,
+        new_message_id: UUID | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,
     ) -> RawContractEnvelope:
         """Inject one selected Source Chat wire fault at the test seam."""
+        ...
+
+    def replace_source_chat_contract_payload(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+        payload: JsonValue,
+    ) -> RawContractEnvelope:
+        """Replace one Source Chat payload at the privileged test seam."""
         ...
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:

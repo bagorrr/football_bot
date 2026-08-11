@@ -1072,6 +1072,7 @@ class AcceptanceSpine:
         update_id: str,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        new_message_id: UUID | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,
@@ -1081,9 +1082,24 @@ class AcceptanceSpine:
             _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
             contract_name,
             payload_updates,
+            new_message_id=new_message_id,
             causation_id=causation_id,
             new_correlation_id=new_correlation_id,
             new_subject_revision=new_subject_revision,
+        )
+
+    def replace_source_chat_contract_payload(
+        self,
+        *,
+        update_id: str,
+        contract_name: ContractName,
+        payload: JsonValue,
+    ) -> RawContractEnvelope:
+        """Replace one Source Chat payload at the external-contract test seam."""
+        return self._observer.replace_source_chat_contract_payload(
+            _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
+            contract_name,
+            payload,
         )
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:

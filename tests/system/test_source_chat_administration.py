@@ -414,6 +414,123 @@ def test_unknown_registry_command_fact_is_rejected_and_recovers_its_originator()
     system.reset()
 
 
+def test_schema_invalid_registry_commands_release_only_their_durable_originator() -> (
+    None
+):
+    telegram = ControlledTelegramDeliveryAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 22, tzinfo=UTC))
+    administrator_id = 46_128
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=ControlledTelegramIngestionAdapter(),
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:non-object-registry-command",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:non-object-registry-command",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 22, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:non-object-registry-command",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:non-object-registry-command",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:non-object-registry-command",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:non-object-registry-command",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:non-object-registry-command",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    malformed_shapes = ("non-object", "missing", "null", "text", "bool", "float")
+    for index, shape in enumerate(malformed_shapes, start=1):
+        update_id = f"address:invalid-registry-command:{shape}"
+        system.submit_source_chat_address(
+            update_id=update_id,
+            telegram_user_id=administrator_id,
+            address="@invalid_registry_command",
+        )
+        original = system.recoverable_contract(
+            update_id,
+            contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        )
+        if shape == "non-object":
+            replacement: JsonValue = ["malformed"]
+        else:
+            assert isinstance(original.payload, dict)
+            replacement_payload = dict(original.payload)
+            if shape == "missing":
+                replacement_payload.pop("telegram_user_id")
+            elif shape == "null":
+                replacement_payload["telegram_user_id"] = None
+            elif shape == "text":
+                replacement_payload["telegram_user_id"] = str(administrator_id)
+            elif shape == "bool":
+                replacement_payload["telegram_user_id"] = True
+            else:
+                replacement_payload["telegram_user_id"] = float(administrator_id)
+            replacement = replacement_payload
+        command = system.replace_source_chat_contract_payload(
+            update_id=update_id,
+            contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+            payload=replacement,
+        )
+
+        system.process_source_chat_registrations_until_idle()
+
+        assert system.source_chats() == ()
+        assert system.conversation_state(administrator_id).stage is (
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+        )
+        assert system.operator_alert(command.message_id).failure_code is (
+            FailureCode.INVALID_CONTRACT
+        )
+        terminals = system.source_chat_contracts(
+            update_id=update_id,
+            contract_name=ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
+        )
+        assert len(terminals) == 1
+        assert terminals[0].subject_revision == index
+        assert terminals[0].payload == {
+            "registration_request_id": str(
+                derive_contract_message_id(
+                    command.message_id,
+                    ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+                )
+            )
+        }
+        assert telegram.messages[-1].text.startswith(
+            "Could not register this Source Chat"
+        )
+        assert not system.process_next_source_chat_change_request()
+        assert not system.process_next_source_chat_bot_result()
+    system.reset()
+
+
 def test_identity_tampered_registry_command_recovers_only_its_durable_originator() -> (
     None
 ):
@@ -746,6 +863,136 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
             )
         ),
     }
+    system.reset()
+
+
+def test_generation_two_admission_failure_preserves_the_request_revision() -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 33, tzinfo=UTC))
+    administrator_id = 46_129
+    telethon.allow_public_username(
+        address="@generation_failure_seed",
+        identity=TelegramPeerIdentity(
+            kind=TelegramPeerKind.CHANNEL,
+            telegram_id=4_612_900,
+        ),
+        transport_boundary="channel-pts:7429",
+    )
+    telethon.allow_public_username(
+        address="@generation_boundary_failure",
+        identity=TelegramPeerIdentity(
+            kind=TelegramPeerKind.CHANNEL,
+            telegram_id=4_612_901,
+        ),
+        transport_boundary="",
+    )
+    telethon.allow_public_username(
+        address="@generation_resolution_failure",
+        identity=TelegramPeerIdentity(
+            kind=TelegramPeerKind.CHANNEL,
+            telegram_id=4_612_902,
+        ),
+        transport_boundary="channel-pts:7431",
+        current_address="@!",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:generation-two-failure",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:generation-two-failure",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 33, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:generation-two-failure",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:generation-two-failure",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:generation-two-failure",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:generation-two-failure",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add:generation-two-failure-seed",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:generation-two-failure-seed",
+        telegram_user_id=administrator_id,
+        address="@generation_failure_seed",
+    )
+    system.process_source_chat_registrations_until_idle()
+    assert system.source_chats()[0].registry_generation == 1
+
+    failure_cases = (
+        (2, "inaccessible", "@inaccessible_generation_two"),
+        (3, "boundary", "@generation_boundary_failure"),
+        (4, "resolved-address", "@generation_resolution_failure"),
+    )
+    for generation, label, address in failure_cases:
+        system.select_source_chats_action(
+            update_id=f"add:generation-failure:{label}",
+            telegram_user_id=administrator_id,
+            action="add",
+        )
+        failure_update_id = f"address:generation-failure:{label}"
+        system.submit_source_chat_address(
+            update_id=failure_update_id,
+            telegram_user_id=administrator_id,
+            address=address,
+        )
+        assert system.process_next_source_chat_change_request()
+        assert system.process_next_source_chat_admission()
+        failures = system.source_chat_contracts(
+            update_id=failure_update_id,
+            contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+        )
+
+        assert len(failures) == 1
+        assert failures[0].subject_revision == generation
+        assert failures[0].payload == {
+            "registration_request_id": str(
+                derive_contract_message_id(
+                    failures[0].correlation_id,
+                    ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+                )
+            )
+        }
+        assert system.process_next_source_chat_registration()
+        system.process_source_chat_registrations_until_idle()
+        assert system.contract_is_accepted(failures[0].message_id)
+        assert system.conversation_state(administrator_id).stage is (
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+        )
+        with pytest.raises(LookupError):
+            system.operator_alert(failures[0].message_id)
+        assert len(system.source_chats()) == 1
     system.reset()
 
 
@@ -1350,6 +1597,112 @@ def test_malformed_admission_request_releases_the_correlated_pending_user() -> N
             FailureCode.INVALID_CONTRACT
         )
         assert not system.process_next_source_chat_admission()
+        assert telegram.messages[-1].text.startswith(
+            "Could not register this Source Chat"
+        )
+    system.reset()
+
+
+def test_admission_request_rejects_substituted_identity_and_releases_origin() -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 9, 13, 48, 30, tzinfo=UTC))
+    administrator_id = 46_130
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:substituted-request-causation",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:substituted-request-causation",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 9, 9, 13, 48, 30, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:substituted-request-causation",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:substituted-request-causation",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:substituted-request-causation",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:substituted-request-causation",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    substituted_130 = UUID("00000000-0000-0000-0000-000000000130")
+    substituted_131 = UUID("00000000-0000-0000-0000-000000000131")
+    substituted_132 = UUID("00000000-0000-0000-0000-000000000132")
+    substituted_133 = UUID("00000000-0000-0000-0000-000000000133")
+    substituted_134 = UUID("00000000-0000-0000-0000-000000000134")
+    fault_cases: tuple[
+        tuple[str, dict[str, JsonValue], UUID | None, UUID | None, UUID | None],
+        ...,
+    ] = (
+        ("causation", {}, None, substituted_130, None),
+        ("correlation", {}, None, None, substituted_131),
+        ("causation-correlation", {}, None, substituted_132, substituted_132),
+        ("message", {}, substituted_133, None, None),
+        (
+            "request",
+            {"registration_request_id": str(substituted_134)},
+            None,
+            None,
+            None,
+        ),
+    )
+    for label, payload_updates, message_id, causation_id, correlation_id in fault_cases:
+        system.select_source_chats_action(
+            update_id=f"add:substituted-request:{label}",
+            telegram_user_id=administrator_id,
+            action="add",
+        )
+        update_id = f"address:substituted-request:{label}"
+        system.submit_source_chat_address(
+            update_id=update_id,
+            telegram_user_id=administrator_id,
+            address="@substituted_request_identity",
+        )
+        assert system.process_next_source_chat_change_request()
+        request = system.invalidate_source_chat_contract(
+            update_id=update_id,
+            contract_name=ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            payload_updates=payload_updates,
+            new_message_id=message_id,
+            causation_id=causation_id,
+            new_correlation_id=correlation_id,
+        )
+
+        assert system.process_next_source_chat_admission()
+        system.process_source_chat_registrations_until_idle()
+
+        assert system.source_chats() == ()
+        assert telethon.resolution_requests == []
+        assert system.operator_alert(request.message_id).failure_code is (
+            FailureCode.INVALID_CONTRACT
+        )
+        assert system.conversation_state(administrator_id).stage is (
+            ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+        )
         assert telegram.messages[-1].text.startswith(
             "Could not register this Source Chat"
         )

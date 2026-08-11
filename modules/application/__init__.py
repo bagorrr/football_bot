@@ -1626,8 +1626,6 @@ class ConversationOnboarding:
         if not isinstance(incoming.payload, dict):
             raise TypeError("SourceChatAdmissionFailed payload must be an object")
         telegram_user_id = incoming.payload.get("telegram_user_id")
-        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
-            raise TypeError("SourceChatAdmissionFailed requires telegram_user_id")
         registration_request_id = incoming.payload.get("registration_request_id")
         registry_generation = incoming.payload.get("registry_generation")
         origin = self._store.source_chat_registration_origin(incoming.correlation_id)
@@ -1638,14 +1636,21 @@ class ConversationOnboarding:
             origin is None
             or proven_origin != origin
             or not _source_chat_terminal_matches_origin(incoming, origin)
-            or origin.telegram_user_id != telegram_user_id
+            or (
+                telegram_user_id is not None
+                and origin.telegram_user_id != telegram_user_id
+            )
             or registration_request_id != str(origin.request_message_id)
-            or registry_generation != origin.registry_generation
+            or (
+                registry_generation is not None
+                and registry_generation != origin.registry_generation
+            )
             or incoming.subject_id != origin.origin_subject_id
             or incoming.subject_revision != origin.origin_subject_revision
         ):
             self.reject_invalid_source_chat_result(incoming=incoming)
             return
+        telegram_user_id = origin.telegram_user_id
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
             raise LookupError(telegram_user_id)
@@ -5914,12 +5919,6 @@ class RuntimeApplication:
         self,
         incoming: RawContractEnvelope,
     ) -> ContractEnvelope | None:
-        payload = incoming.payload
-        if not isinstance(payload, dict):
-            return None
-        telegram_user_id = payload.get("telegram_user_id")
-        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
-            return None
         request_message_id = derive_contract_message_id(
             incoming.message_id,
             ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
@@ -5941,8 +5940,6 @@ class RuntimeApplication:
             recorded_at=self.clock.now(),
             payload={
                 "registration_request_id": str(request_message_id),
-                "telegram_user_id": telegram_user_id,
-                "registry_generation": incoming.subject_revision,
             },
         )
 
@@ -5950,24 +5947,41 @@ class RuntimeApplication:
         self,
         incoming: RawContractEnvelope,
     ) -> ContractEnvelope:
+        payload_request_id: UUID | None = None
+        if isinstance(incoming.payload, dict):
+            raw_request_id = incoming.payload.get("registration_request_id")
+            if isinstance(raw_request_id, str):
+                with suppress(ValueError):
+                    payload_request_id = UUID(raw_request_id)
+        if payload_request_id == incoming.message_id:
+            request_message_id = incoming.message_id
+        elif incoming.causation_id == incoming.correlation_id:
+            request_message_id = derive_contract_message_id(
+                incoming.causation_id,
+                ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+            )
+        elif payload_request_id is not None:
+            request_message_id = payload_request_id
+        else:
+            request_message_id = incoming.message_id
         recorded_at = self.clock.now()
         return ContractEnvelope(
             contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
             contract_version=1,
             message_id=_runtime_identifier(
-                str(incoming.message_id),
+                str(request_message_id),
                 ContractName.SOURCE_CHAT_ADMISSION_FAILED.value,
             ),
             producer=RuntimeRole.INGESTION,
             consumer=RuntimeRole.APPLICATION,
             subject_id=incoming.subject_id,
             subject_revision=incoming.subject_revision,
-            idempotency_key=f"source-chat-admission-failed:{incoming.message_id}",
-            causation_id=incoming.message_id,
+            idempotency_key=f"source-chat-admission-failed:{request_message_id}",
+            causation_id=request_message_id,
             correlation_id=incoming.correlation_id,
             recorded_at=recorded_at,
             payload={
-                "registration_request_id": str(incoming.message_id),
+                "registration_request_id": str(request_message_id),
             },
         )
 
@@ -6047,7 +6061,7 @@ class RuntimeApplication:
                 producer=RuntimeRole.INGESTION,
                 consumer=RuntimeRole.APPLICATION,
                 subject_id=incoming.subject_id,
-                subject_revision=1,
+                subject_revision=registry_generation,
                 idempotency_key=f"source-chat-admission-failed:{incoming.message_id}",
                 causation_id=incoming.message_id,
                 correlation_id=incoming.correlation_id,

@@ -703,6 +703,7 @@ class PostgresAcceptanceObserver:
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
         *,
+        new_message_id: UUID | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,
@@ -734,7 +735,8 @@ class PostgresAcceptanceObserver:
             changed = connection.execute(
                 """
                 UPDATE football_runtime.contract_outbox
-                SET payload = %s::jsonb,
+                SET message_id = COALESCE(%s, message_id),
+                    payload = %s::jsonb,
                     causation_id = COALESCE(%s, causation_id),
                     correlation_id = COALESCE(%s, correlation_id),
                     subject_revision = COALESCE(%s, subject_revision)
@@ -742,11 +744,41 @@ class PostgresAcceptanceObserver:
                 RETURNING *
                 """,
                 (
+                    new_message_id,
                     json.dumps(payload),
                     causation_id,
                     new_correlation_id,
                     new_subject_revision,
                     row["message_id"],
+                ),
+            ).fetchone()
+        if changed is None:
+            raise LookupError(correlation_id)
+        return _row_to_envelope(changed, validate_registered=False)
+
+    def replace_source_chat_contract_payload(
+        self,
+        correlation_id: UUID,
+        contract_name: ContractName,
+        payload: JsonValue,
+    ) -> RawContractEnvelope:
+        """Replace one Source Chat payload at the wire-boundary test seam."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = %s::jsonb
+                WHERE correlation_id = %s
+                  AND contract_name = %s
+                RETURNING *
+                """,
+                (
+                    json.dumps(payload),
+                    correlation_id,
+                    contract_name.value,
                 ),
             ).fetchone()
         if changed is None:
