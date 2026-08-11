@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg import conninfo, sql
@@ -51,6 +51,7 @@ from modules.domain import (
     RequiredDateConfirmationEvent,
     SearchResult,
     SourceChatAddressKind,
+    SourceChatAdmissionProvenance,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     TelegramCallbackDeliveryClaim,
@@ -63,6 +64,7 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObservation,
+    ClaimedContract,
     CompletedSearchQueryResult,
     CompletedSearchQueryStatus,
     ConsumeResult,
@@ -82,6 +84,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0009_callback_notification_outbox.sql",
     "0010_source_chat_administration.sql",
     "0011_source_chat_registry.sql",
+    "0012_source_chat_admission_provenance.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -96,6 +99,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a47b752decc202f4cbefd6022f1399ca52242ba0886479ab3d40f38575965c9c",
     "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
+    "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -704,6 +708,9 @@ class PostgresAcceptanceObserver:
         payload_updates: dict[str, JsonValue],
         *,
         new_message_id: UUID | None = None,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+        new_recorded_at: datetime | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,
@@ -736,6 +743,9 @@ class PostgresAcceptanceObserver:
                 """
                 UPDATE football_runtime.contract_outbox
                 SET message_id = COALESCE(%s, message_id),
+                    subject_id = COALESCE(%s, subject_id),
+                    idempotency_key = COALESCE(%s, idempotency_key),
+                    recorded_at = COALESCE(%s, recorded_at),
                     payload = %s::jsonb,
                     causation_id = COALESCE(%s, causation_id),
                     correlation_id = COALESCE(%s, correlation_id),
@@ -745,6 +755,9 @@ class PostgresAcceptanceObserver:
                 """,
                 (
                     new_message_id,
+                    new_subject_id,
+                    new_idempotency_key,
+                    new_recorded_at,
                     json.dumps(payload),
                     causation_id,
                     new_correlation_id,
@@ -1360,7 +1373,7 @@ class PostgresRoleStore:
         *,
         supported_versions: Mapping[ContractName, Iterable[int]],
         claimed_at: datetime,
-    ) -> RawContractEnvelope | None:
+    ) -> ClaimedContract | None:
         """Claim durable work addressed to this role using only its credential."""
         with psycopg.connect(
             self._database_url,
@@ -1403,8 +1416,46 @@ class PostgresRoleStore:
                     """,
                     (claimed_at + timedelta(seconds=30), row["message_id"]),
                 )
-                return _row_to_envelope(row, validate_registered=False)
+                return ClaimedContract(
+                    envelope=_row_to_envelope(row, validate_registered=False),
+                    source_chat_admission_provenance_id=row[
+                        "source_chat_admission_provenance_id"
+                    ],
+                )
         return None
+
+    def source_chat_admission_provenance(
+        self,
+        provenance_id: UUID,
+    ) -> SourceChatAdmissionProvenance | None:
+        """Read one Application proof through an Ingestion-only SQL function."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT provenance_id, correlation_id, request_message_id,
+                       telegram_user_id, requested_address, origin_subject_id,
+                       origin_subject_revision, registry_generation,
+                       request_idempotency_key, recorded_at
+                FROM football_runtime.read_source_chat_admission_provenance(%s)
+                """,
+                (provenance_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceChatAdmissionProvenance(
+            provenance_id=row[0],
+            correlation_id=row[1],
+            request_message_id=row[2],
+            telegram_user_id=row[3],
+            requested_address=row[4],
+            origin_subject_id=row[5],
+            origin_subject_revision=row[6],
+            registry_generation=row[7],
+            request_idempotency_key=row[8],
+            recorded_at=row[9],
+        )
 
     def claim_presentation(
         self,
@@ -4030,6 +4081,7 @@ def _insert_outbox(
     connection: psycopg.Connection[tuple[Any, ...]],
     envelope: RawContractEnvelope,
 ) -> None:
+    source_chat_admission_provenance_id: UUID | None = None
     if (
         envelope.producer is RuntimeRole.APPLICATION
         and envelope.contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION
@@ -4039,26 +4091,35 @@ def _insert_outbox(
             raise TypeError("RequestSourceChatAdmission payload must be an object")
         telegram_user_id = payload.get("telegram_user_id")
         registry_generation = payload.get("registry_generation")
+        requested_address = payload.get("address")
         if (
             not isinstance(telegram_user_id, int)
             or isinstance(telegram_user_id, bool)
             or not isinstance(registry_generation, int)
             or isinstance(registry_generation, bool)
+            or not isinstance(requested_address, str)
+            or not requested_address
         ):
             raise ValueError("RequestSourceChatAdmission context is invalid")
+        source_chat_admission_provenance_id = uuid4()
         connection.execute(
             """
             INSERT INTO football_runtime.source_chat_admission_requests (
+                source_chat_admission_provenance_id,
                 correlation_id, request_message_id, telegram_user_id,
+                requested_address, request_idempotency_key,
                 origin_subject_id, origin_subject_revision,
                 registry_generation, recorded_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (correlation_id) DO NOTHING
             """,
             (
+                source_chat_admission_provenance_id,
                 envelope.correlation_id,
                 envelope.message_id,
                 telegram_user_id,
+                requested_address,
+                envelope.idempotency_key,
                 envelope.subject_id,
                 envelope.subject_revision,
                 registry_generation,
@@ -4070,8 +4131,9 @@ def _insert_outbox(
         INSERT INTO football_runtime.contract_outbox (
             message_id, producer_role, consumer_role, contract_name,
             contract_version, subject_id, subject_revision,
-            idempotency_key, causation_id, correlation_id, recorded_at, payload
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            idempotency_key, causation_id, correlation_id, recorded_at, payload,
+            source_chat_admission_provenance_id
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             envelope.message_id,
@@ -4086,6 +4148,7 @@ def _insert_outbox(
             envelope.correlation_id,
             envelope.recorded_at,
             json.dumps(envelope.json_payload()),
+            source_chat_admission_provenance_id,
         ),
     )
 

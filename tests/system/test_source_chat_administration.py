@@ -1603,11 +1603,19 @@ def test_malformed_admission_request_releases_the_correlated_pending_user() -> N
     system.reset()
 
 
-def test_admission_request_rejects_substituted_identity_and_releases_origin() -> None:
+def test_admission_request_rejects_substituted_tuple_and_releases_origin() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     telethon = ControlledTelegramIngestionAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 48, 30, tzinfo=UTC))
     administrator_id = 46_130
+    telethon.allow_public_username(
+        address="@substituted_request_identity",
+        identity=TelegramPeerIdentity(
+            kind=TelegramPeerKind.CHANNEL,
+            telegram_id=4_613_000,
+        ),
+        transport_boundary="channel-pts:7460",
+    )
     system = boot_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
@@ -1654,23 +1662,70 @@ def test_admission_request_rejects_substituted_identity_and_releases_origin() ->
     substituted_132 = UUID("00000000-0000-0000-0000-000000000132")
     substituted_133 = UUID("00000000-0000-0000-0000-000000000133")
     substituted_134 = UUID("00000000-0000-0000-0000-000000000134")
+    substituted_command_135 = UUID("00000000-0000-0000-0000-000000000135")
+    substituted_request_135 = derive_contract_message_id(
+        substituted_command_135,
+        ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
+    )
     fault_cases: tuple[
-        tuple[str, dict[str, JsonValue], UUID | None, UUID | None, UUID | None],
+        tuple[
+            str,
+            dict[str, JsonValue],
+            UUID | None,
+            UUID | None,
+            UUID | None,
+            int | None,
+        ],
         ...,
     ] = (
-        ("causation", {}, None, substituted_130, None),
-        ("correlation", {}, None, None, substituted_131),
-        ("causation-correlation", {}, None, substituted_132, substituted_132),
-        ("message", {}, substituted_133, None, None),
+        ("causation", {}, None, substituted_130, None, None),
+        ("correlation", {}, None, None, substituted_131, None),
+        (
+            "causation-correlation",
+            {},
+            None,
+            substituted_132,
+            substituted_132,
+            None,
+        ),
+        ("message", {}, substituted_133, None, None, None),
         (
             "request",
             {"registration_request_id": str(substituted_134)},
             None,
             None,
             None,
+            None,
+        ),
+        (
+            "identity-tuple",
+            {"registration_request_id": str(substituted_request_135)},
+            substituted_request_135,
+            substituted_command_135,
+            substituted_command_135,
+            None,
+        ),
+        ("generation-tuple", {"registry_generation": 91}, None, None, None, 91),
+        (
+            "metadata-tuple",
+            {
+                "address": "@rewritten_request_identity",
+                "telegram_user_id": administrator_id + 1,
+            },
+            None,
+            None,
+            None,
+            None,
         ),
     )
-    for label, payload_updates, message_id, causation_id, correlation_id in fault_cases:
+    for (
+        label,
+        payload_updates,
+        message_id,
+        causation_id,
+        correlation_id,
+        subject_revision,
+    ) in fault_cases:
         system.select_source_chats_action(
             update_id=f"add:substituted-request:{label}",
             telegram_user_id=administrator_id,
@@ -1688,8 +1743,24 @@ def test_admission_request_rejects_substituted_identity_and_releases_origin() ->
             contract_name=ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
             payload_updates=payload_updates,
             new_message_id=message_id,
+            new_subject_id=(
+                "source-chat-registration:rewritten"
+                if label == "metadata-tuple"
+                else None
+            ),
+            new_idempotency_key=(
+                "source-chat-admission-request:rewritten"
+                if label == "metadata-tuple"
+                else None
+            ),
+            new_recorded_at=(
+                datetime(2026, 9, 9, 13, 49, tzinfo=UTC)
+                if label == "metadata-tuple"
+                else None
+            ),
             causation_id=causation_id,
             new_correlation_id=correlation_id,
+            new_subject_revision=subject_revision,
         )
 
         assert system.process_next_source_chat_admission()
@@ -1697,6 +1768,7 @@ def test_admission_request_rejects_substituted_identity_and_releases_origin() ->
 
         assert system.source_chats() == ()
         assert telethon.resolution_requests == []
+        assert telethon.boundary_requests == []
         assert system.operator_alert(request.message_id).failure_code is (
             FailureCode.INVALID_CONTRACT
         )

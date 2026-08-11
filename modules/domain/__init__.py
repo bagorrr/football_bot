@@ -196,6 +196,22 @@ class SourceChatRegistrationContext:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceChatAdmissionProvenance:
+    """Immutable Application request facts visible through a narrow proof seam."""
+
+    provenance_id: UUID
+    correlation_id: UUID
+    request_message_id: UUID
+    telegram_user_id: int
+    requested_address: str
+    origin_subject_id: str
+    origin_subject_revision: int
+    registry_generation: int
+    request_idempotency_key: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationState:
     """Durable account-level Conversation Language state."""
 

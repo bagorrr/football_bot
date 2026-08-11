@@ -47,6 +47,7 @@ from modules.domain import (
     RequiredDate,
     RequiredDateConfirmation,
     SourceChatAddressKind,
+    SourceChatAdmissionProvenance,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     TelegramDeliveryMode,
@@ -5598,12 +5599,24 @@ class RuntimeApplication:
 
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
-        incoming = self.store.claim_next(
+        claimed = self.store.claim_next(
             supported_versions=self.supported_versions,
             claimed_at=self.clock.now(),
         )
-        if incoming is None:
+        if claimed is None:
             return False
+        incoming = claimed.envelope
+        source_chat_admission_provenance = None
+        if (
+            self.role is RuntimeRole.INGESTION
+            and incoming.contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION
+            and claimed.source_chat_admission_provenance_id is not None
+        ):
+            source_chat_admission_provenance = (
+                self.store.source_chat_admission_provenance(
+                    claimed.source_chat_admission_provenance_id
+                )
+            )
         supported_incoming = None
         if incoming.contract_version in self.versions_for(incoming.contract_name):
             try:
@@ -5640,7 +5653,10 @@ class RuntimeApplication:
                     and incoming.contract_name
                     is ContractName.REQUEST_SOURCE_CHAT_ADMISSION
                 ):
-                    outgoing = self._invalid_source_chat_admission_failure(incoming)
+                    outgoing = self._invalid_source_chat_admission_failure(
+                        incoming,
+                        provenance=source_chat_admission_provenance,
+                    )
                 self.store.reject_invalid_contract(
                     incoming=incoming,
                     received_at=self.clock.now(),
@@ -5683,6 +5699,19 @@ class RuntimeApplication:
             incoming.contract_name is ContractName.REQUEST_SOURCE_CHAT_ADMISSION
             and supported_incoming is not None
         ):
+            if not _source_chat_request_identity_matches_provenance(
+                supported_incoming,
+                source_chat_admission_provenance,
+            ):
+                self.store.reject_invalid_contract(
+                    incoming=incoming,
+                    received_at=self.clock.now(),
+                    outgoing=self._invalid_source_chat_admission_failure(
+                        incoming,
+                        provenance=source_chat_admission_provenance,
+                    ),
+                )
+                return True
             self._admit_source_chat(
                 supported_incoming,
                 inject_outbox_conflict=inject_outbox_conflict,
@@ -5946,7 +5975,30 @@ class RuntimeApplication:
     def _invalid_source_chat_admission_failure(
         self,
         incoming: RawContractEnvelope,
+        *,
+        provenance: SourceChatAdmissionProvenance | None = None,
     ) -> ContractEnvelope:
+        if provenance is not None:
+            request_message_id = provenance.request_message_id
+            return ContractEnvelope(
+                contract_name=ContractName.SOURCE_CHAT_ADMISSION_FAILED,
+                contract_version=1,
+                message_id=_runtime_identifier(
+                    str(request_message_id),
+                    ContractName.SOURCE_CHAT_ADMISSION_FAILED.value,
+                ),
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=provenance.origin_subject_id,
+                subject_revision=provenance.registry_generation,
+                idempotency_key=(f"source-chat-admission-failed:{request_message_id}"),
+                causation_id=request_message_id,
+                correlation_id=provenance.correlation_id,
+                recorded_at=self.clock.now(),
+                payload={
+                    "registration_request_id": str(request_message_id),
+                },
+            )
         payload_request_id: UUID | None = None
         if isinstance(incoming.payload, dict):
             raw_request_id = incoming.payload.get("registration_request_id")
@@ -6499,6 +6551,29 @@ class RuntimeApplication:
 
 def _runtime_identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
+
+
+def _source_chat_request_identity_matches_provenance(
+    incoming: RawContractEnvelope,
+    provenance: SourceChatAdmissionProvenance | None,
+) -> bool:
+    if provenance is None or not isinstance(incoming.payload, dict):
+        return False
+    return (
+        incoming.message_id == provenance.request_message_id
+        and incoming.causation_id == provenance.correlation_id
+        and incoming.correlation_id == provenance.correlation_id
+        and incoming.subject_id == provenance.origin_subject_id
+        and incoming.subject_revision == provenance.origin_subject_revision
+        and incoming.idempotency_key == provenance.request_idempotency_key
+        and incoming.recorded_at == provenance.recorded_at
+        and incoming.payload.get("address") == provenance.requested_address
+        and incoming.payload.get("telegram_user_id") == provenance.telegram_user_id
+        and incoming.payload.get("registry_generation")
+        == provenance.registry_generation
+        and incoming.payload.get("registration_request_id")
+        == str(provenance.request_message_id)
+    )
 
 
 def _source_chat_terminal_matches_origin(

@@ -38,6 +38,7 @@ from modules.domain import (
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
+    SourceChatAdmissionProvenance,
     SourceChatAdmissionResolution,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
@@ -210,6 +211,14 @@ class ConsumeResult(StrEnum):
     APPLIED = "applied"
     REPLAYED = "replayed"
     REJECTED = "rejected"
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedContract:
+    """One leased envelope plus transport-owned immutable provenance identity."""
+
+    envelope: RawContractEnvelope
+    source_chat_admission_provenance_id: UUID | None = None
 
 
 class CompletedSearchQueryStatus(StrEnum):
@@ -589,8 +598,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         supported_versions: Mapping[ContractName, Iterable[int]],
         claimed_at: datetime,
-    ) -> RawContractEnvelope | None:
+    ) -> ClaimedContract | None:
         """Claim the next recoverable handoff visible to this role."""
+        ...
+
+    def source_chat_admission_provenance(
+        self,
+        provenance_id: UUID,
+    ) -> SourceChatAdmissionProvenance | None:
+        """Read one Application proof through the Ingestion-only database seam."""
         ...
 
     def claim_presentation(
@@ -719,6 +735,9 @@ class AcceptanceObserver(Protocol):
         payload_updates: dict[str, JsonValue],
         *,
         new_message_id: UUID | None = None,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+        new_recorded_at: datetime | None = None,
         causation_id: UUID | None = None,
         new_correlation_id: UUID | None = None,
         new_subject_revision: int | None = None,
