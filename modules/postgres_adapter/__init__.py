@@ -52,11 +52,19 @@ from modules.domain import (
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
+    SourceChatIngestionContext,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
+    SourceEventKind,
+    SourceEventRecord,
+    SourceMessage,
+    SourceMessageRevision,
+    TelegramAccountCheckpoint,
     TelegramCallbackDeliveryClaim,
+    TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
+    TelegramDifferenceEvent,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -85,6 +93,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0010_source_chat_administration.sql",
     "0011_source_chat_registry.sql",
     "0012_source_chat_admission_provenance.sql",
+    "0013_source_message_ingestion.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -100,6 +109,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
+    "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -572,6 +582,11 @@ class PostgresAcceptanceObserver:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
             TRUNCATE football_runtime.bot_callback_outbox,
+                     football_runtime.source_message_revisions,
+                     football_runtime.source_messages,
+                     football_runtime.source_event_records,
+                     football_runtime.telegram_channel_difference_checkpoints,
+                     football_runtime.telegram_account_difference_checkpoints,
                      football_runtime.source_chat_admission_requests,
                      football_runtime.source_chat_registration_origins,
                      football_runtime.source_chat_registry,
@@ -624,6 +639,148 @@ class PostgresAcceptanceObserver:
             row,
             validate_registered=(row["inbox_status"] != "rejected_invalid_contract"),
         )
+
+    def source_messages(self) -> tuple[SourceMessage, ...]:
+        """Observe authoritative Source Messages without exposing table layout."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_message_id, peer_kind, telegram_chat_id,
+                       registry_generation, telegram_message_id,
+                       current_revision, event_kind, body, event_time,
+                       recorded_at, tombstoned
+                FROM football_runtime.source_messages
+                ORDER BY source_message_id
+                """
+            ).fetchall()
+        return tuple(
+            SourceMessage(
+                source_message_id=row["source_message_id"],
+                source_chat_identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                telegram_message_id=row["telegram_message_id"],
+                current_revision=row["current_revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+                tombstoned=row["tombstoned"],
+            )
+            for row in rows
+        )
+
+    def source_events(self) -> tuple[SourceEventRecord, ...]:
+        """Observe durable Source Events without exposing physical layout."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_event_id, peer_kind, telegram_chat_id,
+                       registry_generation, telegram_message_id,
+                       source_message_revision, event_kind, body, event_time,
+                       recorded_at
+                FROM football_runtime.source_event_records
+                ORDER BY recorded_at, source_event_id
+                """
+            ).fetchall()
+        return tuple(
+            SourceEventRecord(
+                source_event_id=row["source_event_id"],
+                source_message_id=(
+                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}:"
+                    f"message:{row['telegram_message_id']}"
+                ),
+                source_chat_identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                telegram_message_id=row["telegram_message_id"],
+                revision=row["source_message_revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+            )
+            for row in rows
+        )
+
+    def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
+        """Observe immutable Source Message revision history through testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_message_revision_id, source_message_id,
+                       source_event_id, revision, event_kind, body,
+                       event_time, recorded_at
+                FROM football_runtime.source_message_revisions
+                ORDER BY source_message_id, revision
+                """
+            ).fetchall()
+        return tuple(
+            SourceMessageRevision(
+                source_message_revision_id=row["source_message_revision_id"],
+                source_message_id=row["source_message_id"],
+                source_event_id=row["source_event_id"],
+                revision=row["revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+            )
+            for row in rows
+        )
+
+    def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
+        """Observe ingestion-owned SourceEventRecorded outbox signals."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'SourceEventRecorded'
+                ORDER BY recorded_at, message_id
+                """
+            ).fetchall()
+        return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
+
+    def replace_source_event_contract_version(
+        self,
+        message_id: UUID,
+        version: int,
+    ) -> RawContractEnvelope:
+        """Change one Source Event version at the external contract seam."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET contract_version = %s
+                WHERE message_id = %s
+                  AND contract_name = 'SourceEventRecorded'
+                RETURNING *
+                """,
+                (version, message_id),
+            ).fetchone()
+        if row is None:
+            raise LookupError(message_id)
+        return _row_to_envelope(row, validate_registered=False)
 
     def delete_completed_search_query(
         self, completed_search_id: str
@@ -1369,6 +1526,697 @@ class PostgresRoleStore:
                 row["initial_consent_attestation"]
             ),
             attested_at=row["attested_at"],
+        )
+
+    def source_chat_ingestion_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> SourceChatIngestionContext | None:
+        """Read current Source Chat eligibility through the narrow query seam."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id, registry_generation,
+                       processing_started_at, transport_boundary, channel_pts
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        channel_checkpoint: TelegramChannelCheckpoint | None = None
+        if identity.kind is TelegramPeerKind.CHANNEL:
+            channel_pts = row["channel_pts"]
+            if channel_pts is None:
+                prefix = "channel-pts:"
+                boundary = row["transport_boundary"]
+                if (
+                    not boundary.startswith(prefix)
+                    or not boundary[len(prefix) :].isdigit()
+                ):
+                    raise ValueError("Source Chat channel boundary is invalid")
+                channel_pts = int(boundary[len(prefix) :])
+            channel_checkpoint = TelegramChannelCheckpoint(pts=channel_pts)
+        return SourceChatIngestionContext(
+            identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind(row["peer_kind"]),
+                telegram_id=row["telegram_chat_id"],
+            ),
+            registry_generation=row["registry_generation"],
+            processing_started_at=row["processing_started_at"],
+            checkpoint=channel_checkpoint,
+        )
+
+    def initialize_account_ingestion_checkpoint(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        *,
+        initialized_at: datetime,
+    ) -> None:
+        """Create the explicit owner-visible account difference state."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_account_difference_checkpoints (
+                    pts, qts, seq, checkpoint_date, advanced_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (singleton) DO NOTHING
+                RETURNING singleton
+                """,
+                (
+                    checkpoint.pts,
+                    checkpoint.qts,
+                    checkpoint.seq,
+                    checkpoint.date,
+                    initialized_at,
+                ),
+            ).fetchone()
+            if inserted is None:
+                existing = connection.execute(
+                    """
+                    SELECT pts, qts, seq, checkpoint_date
+                    FROM football_runtime.telegram_account_difference_checkpoints
+                    WHERE singleton
+                    """
+                ).fetchone()
+                if existing != (
+                    checkpoint.pts,
+                    checkpoint.qts,
+                    checkpoint.seq,
+                    checkpoint.date,
+                ):
+                    raise OutboxConflictError
+
+    def account_ingestion_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Read the owner-visible durable account difference state."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT pts, qts, seq, checkpoint_date
+                FROM football_runtime.telegram_account_difference_checkpoints
+                WHERE singleton
+                """
+            ).fetchone()
+        if row is None:
+            raise LookupError("Telegram account checkpoint is not initialized")
+        return TelegramAccountCheckpoint(
+            pts=row["pts"],
+            qts=row["qts"],
+            seq=row["seq"],
+            date=row["checkpoint_date"],
+        )
+
+    def channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramChannelCheckpoint:
+        """Read one eligible Source Chat generation's durable channel pts."""
+        context = self.source_chat_ingestion_context(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
+        if context is None or context.checkpoint is None:
+            raise LookupError(identity)
+        return context.checkpoint
+
+    def discard_account_difference_event(
+        self,
+        *,
+        event: TelegramDifferenceEvent,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance one ineligible account event without retaining content."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if not isinstance(event.from_checkpoint, TelegramAccountCheckpoint):
+            raise TypeError("discard requires an account checkpoint")
+        if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+            raise TypeError("discard requires an account checkpoint")
+        identity = event.source_chat_identity
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            context = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    event.registry_generation,
+                ),
+            ).fetchone()
+            if context is not None:
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            account_checkpoint = connection.execute(
+                """
+                SELECT pts, qts, seq, checkpoint_date
+                FROM football_runtime.telegram_account_difference_checkpoints
+                WHERE singleton
+                FOR UPDATE
+                """
+            ).fetchone()
+            if account_checkpoint is None:
+                raise LookupError("Telegram account checkpoint is not initialized")
+            current_checkpoint = TelegramAccountCheckpoint(
+                pts=account_checkpoint["pts"],
+                qts=account_checkpoint["qts"],
+                seq=account_checkpoint["seq"],
+                date=account_checkpoint["checkpoint_date"],
+            )
+            if current_checkpoint != event.from_checkpoint:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_account_difference_checkpoints
+                SET pts = %s, qts = %s, seq = %s,
+                    checkpoint_date = %s, advanced_at = %s
+                WHERE singleton
+                """,
+                (
+                    event.to_checkpoint.pts,
+                    event.to_checkpoint.qts,
+                    event.to_checkpoint.seq,
+                    event.to_checkpoint.date,
+                    recorded_at,
+                ),
+            )
+        return True
+
+    def commit_source_event(
+        self,
+        *,
+        event: TelegramDifferenceEvent,
+        registry_generation: int,
+        envelope: ContractEnvelope,
+        recorded_at: datetime,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Atomically persist an event, outbox signal, and checkpoint advance."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        identity = event.source_chat_identity
+        account_route = isinstance(event.from_checkpoint, TelegramAccountCheckpoint)
+        channel_route = isinstance(event.from_checkpoint, TelegramChannelCheckpoint)
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        lock_key = (
+            "source-ingestion:account"
+            if account_route
+            else (
+                f"source-ingestion:{identity.kind.value}:{identity.telegram_id}:"
+                f"{registry_generation}"
+            )
+        )
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            context = connection.execute(
+                """
+                SELECT transport_boundary, channel_pts
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if context is None:
+                if not account_route:
+                    raise RuntimeError("Source Chat generation is no longer eligible")
+                if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+                    raise TypeError("account event requires an account checkpoint")
+                account_checkpoint = connection.execute(
+                    """
+                    SELECT pts, qts, seq, checkpoint_date
+                    FROM football_runtime.telegram_account_difference_checkpoints
+                    WHERE singleton
+                    FOR UPDATE
+                    """
+                ).fetchone()
+                if account_checkpoint is None:
+                    raise LookupError("Telegram account checkpoint is not initialized")
+                current_account_checkpoint = TelegramAccountCheckpoint(
+                    pts=account_checkpoint["pts"],
+                    qts=account_checkpoint["qts"],
+                    seq=account_checkpoint["seq"],
+                    date=account_checkpoint["checkpoint_date"],
+                )
+                if current_account_checkpoint != event.from_checkpoint:
+                    return False
+                connection.execute(
+                    """
+                    UPDATE football_runtime.telegram_account_difference_checkpoints
+                    SET pts = %s, qts = %s, seq = %s,
+                        checkpoint_date = %s, advanced_at = %s
+                    WHERE singleton
+                    """,
+                    (
+                        event.to_checkpoint.pts,
+                        event.to_checkpoint.qts,
+                        event.to_checkpoint.seq,
+                        event.to_checkpoint.date,
+                        recorded_at,
+                    ),
+                )
+                return True
+            if account_route:
+                account_checkpoint = connection.execute(
+                    """
+                    SELECT pts, qts, seq, checkpoint_date
+                    FROM football_runtime.telegram_account_difference_checkpoints
+                    WHERE singleton
+                    FOR UPDATE
+                    """
+                ).fetchone()
+                if account_checkpoint is None:
+                    raise LookupError("Telegram account checkpoint is not initialized")
+                current_account_checkpoint = TelegramAccountCheckpoint(
+                    pts=account_checkpoint["pts"],
+                    qts=account_checkpoint["qts"],
+                    seq=account_checkpoint["seq"],
+                    date=account_checkpoint["checkpoint_date"],
+                )
+                if current_account_checkpoint != event.from_checkpoint:
+                    return False
+                account_create_is_after_boundary = False
+                if identity.kind is TelegramPeerKind.CHAT:
+                    prefix = "chat-sequence:"
+                    boundary = context["transport_boundary"]
+                    if (
+                        not boundary.startswith(prefix)
+                        or not boundary[len(prefix) :].isdigit()
+                    ):
+                        raise ValueError("Source Chat account boundary is invalid")
+                    account_create_is_after_boundary = event.from_checkpoint.seq >= int(
+                        boundary[len(prefix) :]
+                    )
+            elif channel_route:
+                channel_pts = context["channel_pts"]
+                if channel_pts is None:
+                    prefix = "channel-pts:"
+                    boundary = context["transport_boundary"]
+                    if (
+                        not boundary.startswith(prefix)
+                        or not boundary[len(prefix) :].isdigit()
+                    ):
+                        raise ValueError("Source Chat channel boundary is invalid")
+                    channel_pts = int(boundary[len(prefix) :])
+                if TelegramChannelCheckpoint(pts=channel_pts) != event.from_checkpoint:
+                    return False
+            else:
+                raise TypeError("Telegram difference checkpoint scope is unsupported")
+            known_transport_identity = event.kind is SourceEventKind.CREATE and (
+                channel_route or account_create_is_after_boundary
+            )
+            if not known_transport_identity:
+                known_transport_identity = (
+                    connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.source_event_records
+                        WHERE peer_kind = %s
+                          AND telegram_chat_id = %s
+                          AND registry_generation = %s
+                          AND telegram_message_id = %s
+                        LIMIT 1
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.telegram_message_id,
+                        ),
+                    ).fetchone()
+                    is not None
+                )
+            if known_transport_identity:
+                inserted = connection.execute(
+                    """
+                    INSERT INTO football_runtime.source_event_records (
+                        source_event_id, message_id, peer_kind, telegram_chat_id,
+                        registry_generation, telegram_message_id,
+                        source_message_revision, event_kind, body, event_time,
+                        recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (source_event_id) DO NOTHING
+                    RETURNING source_event_id
+                    """,
+                    (
+                        event.source_event_id,
+                        envelope.message_id,
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        event.telegram_message_id,
+                        event.revision,
+                        event.kind.value,
+                        event.body,
+                        event.event_time,
+                        recorded_at,
+                    ),
+                ).fetchone()
+                if inserted is not None:
+                    _insert_outbox(connection, envelope)
+                    if inject_database_failure:
+                        raise OutboxConflictError
+                else:
+                    existing = connection.execute(
+                        """
+                        SELECT message_id, peer_kind, telegram_chat_id,
+                               registry_generation, telegram_message_id,
+                               source_message_revision, event_kind, body, event_time
+                        FROM football_runtime.source_event_records
+                        WHERE source_event_id = %s
+                        """,
+                        (event.source_event_id,),
+                    ).fetchone()
+                    expected = {
+                        "message_id": envelope.message_id,
+                        "peer_kind": identity.kind.value,
+                        "telegram_chat_id": identity.telegram_id,
+                        "registry_generation": registry_generation,
+                        "telegram_message_id": event.telegram_message_id,
+                        "source_message_revision": event.revision,
+                        "event_kind": event.kind.value,
+                        "body": event.body,
+                        "event_time": event.event_time,
+                    }
+                    if existing is None or dict(existing) != expected:
+                        raise OutboxConflictError
+            if account_route:
+                if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+                    raise TypeError("account event requires an account checkpoint")
+                connection.execute(
+                    """
+                    UPDATE football_runtime.telegram_account_difference_checkpoints
+                    SET pts = %s, qts = %s, seq = %s,
+                        checkpoint_date = %s, advanced_at = %s
+                    WHERE singleton
+                    """,
+                    (
+                        event.to_checkpoint.pts,
+                        event.to_checkpoint.qts,
+                        event.to_checkpoint.seq,
+                        event.to_checkpoint.date,
+                        recorded_at,
+                    ),
+                )
+            elif channel_route:
+                if not isinstance(event.to_checkpoint, TelegramChannelCheckpoint):
+                    raise TypeError("channel event requires a channel checkpoint")
+                connection.execute(
+                    """
+                    INSERT INTO
+                        football_runtime.telegram_channel_difference_checkpoints (
+                        peer_kind, telegram_chat_id, registry_generation,
+                        channel_pts, advanced_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                    DO UPDATE SET channel_pts = EXCLUDED.channel_pts,
+                                  advanced_at = EXCLUDED.advanced_at
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        event.to_checkpoint.pts,
+                        recorded_at,
+                    ),
+                )
+            else:
+                raise TypeError("Telegram difference checkpoint scope is unsupported")
+        return True
+
+    def accept_source_event(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Create one Application-owned Source Message from a Source Event."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SourceEventRecorded payload must be an object")
+        with psycopg.connect(self._database_url) as connection:
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            if existing is not None and existing[0] == "accepted":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.contract_inbox (
+                    consumer_role, message_id, producer_role, contract_name,
+                    contract_version, processing_status, received_at
+                ) VALUES (%s, %s, %s, %s, %s, 'accepted', %s)
+                ON CONFLICT (consumer_role, message_id) DO UPDATE
+                SET processing_status = 'accepted', received_at = EXCLUDED.received_at
+                """,
+                (
+                    self._role.value,
+                    incoming.message_id,
+                    incoming.producer.value,
+                    incoming.contract_name.value,
+                    incoming.contract_version,
+                    received_at,
+                ),
+            )
+            event_time = datetime.fromisoformat(str(payload["event_time"]))
+            if payload["event_kind"] == SourceEventKind.CREATE.value:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.source_messages (
+                        source_message_id, peer_kind, telegram_chat_id,
+                        registry_generation, telegram_message_id,
+                        current_revision, event_kind, body, event_time,
+                        recorded_at, tombstoned
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false
+                    )
+                    """,
+                    (
+                        incoming.subject_id,
+                        payload["telegram_peer_kind"],
+                        payload["telegram_chat_id"],
+                        payload["registry_generation"],
+                        payload["telegram_message_id"],
+                        incoming.subject_revision,
+                        payload["event_kind"],
+                        payload["body"],
+                        event_time,
+                        incoming.recorded_at,
+                    ),
+                )
+            elif payload["event_kind"] == SourceEventKind.EDIT.value:
+                updated = connection.execute(
+                    """
+                    UPDATE football_runtime.source_messages
+                    SET current_revision = %s, event_kind = %s, body = %s,
+                        event_time = %s, recorded_at = %s, tombstoned = false
+                    WHERE source_message_id = %s
+                      AND current_revision < %s
+                    RETURNING source_message_id
+                    """,
+                    (
+                        incoming.subject_revision,
+                        payload["event_kind"],
+                        payload["body"],
+                        event_time,
+                        incoming.recorded_at,
+                        incoming.subject_id,
+                        incoming.subject_revision,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    source_message_exists = connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.source_messages
+                        WHERE source_message_id = %s
+                        """,
+                        (incoming.subject_id,),
+                    ).fetchone()
+                    if source_message_exists is None:
+                        raise RuntimeError(
+                            "Source Message edit has no earlier revision"
+                        )
+            elif payload["event_kind"] == SourceEventKind.DELETE.value:
+                updated = connection.execute(
+                    """
+                    UPDATE football_runtime.source_messages
+                    SET current_revision = %s, event_kind = %s, body = NULL,
+                        event_time = %s, recorded_at = %s, tombstoned = true
+                    WHERE source_message_id = %s
+                      AND current_revision < %s
+                    RETURNING source_message_id
+                    """,
+                    (
+                        incoming.subject_revision,
+                        payload["event_kind"],
+                        event_time,
+                        incoming.recorded_at,
+                        incoming.subject_id,
+                        incoming.subject_revision,
+                    ),
+                ).fetchone()
+                if updated is None:
+                    source_message_exists = connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.source_messages
+                        WHERE source_message_id = %s
+                        """,
+                        (incoming.subject_id,),
+                    ).fetchone()
+                    if source_message_exists is None:
+                        raise RuntimeError(
+                            "Source Message deletion has no earlier revision"
+                        )
+            else:
+                raise RuntimeError("this Source Event kind is not implemented")
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_message_revisions (
+                    source_message_revision_id, source_message_id,
+                    source_event_id, revision, event_kind, body,
+                    event_time, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    payload["source_message_revision_id"],
+                    incoming.subject_id,
+                    payload["source_event_id"],
+                    incoming.subject_revision,
+                    payload["event_kind"],
+                    payload["body"],
+                    event_time,
+                    incoming.recorded_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def owned_source_events(self) -> tuple[SourceEventRecord, ...]:
+        """Read Source Events through this runtime's database grants and RLS."""
+        try:
+            with psycopg.connect(
+                self._database_url,
+                row_factory=dict_row,
+            ) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT source_event_id, peer_kind, telegram_chat_id,
+                           registry_generation, telegram_message_id,
+                           source_message_revision, event_kind, body,
+                           event_time, recorded_at
+                    FROM football_runtime.source_event_records
+                    ORDER BY recorded_at, source_event_id
+                    """
+                ).fetchall()
+        except psycopg.errors.InsufficientPrivilege as error:
+            raise ConversationAccessDeniedError from error
+        return tuple(
+            SourceEventRecord(
+                source_event_id=row["source_event_id"],
+                source_message_id=(
+                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}:"
+                    f"message:{row['telegram_message_id']}"
+                ),
+                source_chat_identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                telegram_message_id=row["telegram_message_id"],
+                revision=row["source_message_revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+            )
+            for row in rows
+        )
+
+    def owned_source_messages(self) -> tuple[SourceMessage, ...]:
+        """Read Source Messages through this runtime's database grants and RLS."""
+        try:
+            with psycopg.connect(
+                self._database_url,
+                row_factory=dict_row,
+            ) as connection:
+                rows = connection.execute(
+                    """
+                    SELECT source_message_id, peer_kind, telegram_chat_id,
+                           registry_generation, telegram_message_id,
+                           current_revision, event_kind, body, event_time,
+                           recorded_at, tombstoned
+                    FROM football_runtime.source_messages
+                    ORDER BY source_message_id
+                    """
+                ).fetchall()
+        except psycopg.errors.InsufficientPrivilege as error:
+            raise ConversationAccessDeniedError from error
+        return tuple(
+            SourceMessage(
+                source_message_id=row["source_message_id"],
+                source_chat_identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                telegram_message_id=row["telegram_message_id"],
+                current_revision=row["current_revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+                tombstoned=row["tombstoned"],
+            )
+            for row in rows
         )
 
     def claim_next(
@@ -4083,7 +4931,7 @@ def runtime_database_url(
 
 
 def _insert_outbox(
-    connection: psycopg.Connection[tuple[Any, ...]],
+    connection: psycopg.Connection[Any],
     envelope: RawContractEnvelope,
 ) -> None:
     source_chat_admission_provenance_id: UUID | None = None

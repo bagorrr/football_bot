@@ -135,7 +135,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
 
     snapshot = spine.run(
         "unregistered-future-contract",
-        source_contract_version=3,
+        source_contract_version=4,
         source_payload=future_payload,
     )
 
@@ -147,7 +147,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
             producer=RuntimeRole.INGESTION,
             consumer=RuntimeRole.APPLICATION,
             contract_name=ContractName.SOURCE_EVENT_RECORDED,
-            contract_version=3,
+            contract_version=4,
             failure_code=FailureCode.UNSUPPORTED_CONTRACT_VERSION,
         ),
     )
