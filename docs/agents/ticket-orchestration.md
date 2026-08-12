@@ -13,8 +13,10 @@ coordinators. Multiple live frontiers may have separate coordinators only when
 the current native dependency graph permits those frontiers to proceed in
 parallel.
 
-The coordinator that completes a ticket creates the next coordinator. It may
-do so only after all of these facts are durable and verified:
+A coordinator that completes a ticket is a candidate to create coordinators
+for newly permitted frontiers and creates only those for which the election
+below selects it. It may create only after all of these facts are durable and
+verified:
 
 1. the authorized implementation pull request was merged and the merge was
    verified;
@@ -22,23 +24,43 @@ do so only after all of these facts are durable and verified:
    completion record on its canonical GitHub artifact; and
 3. the `quality` run for the exact merge commit on `main` succeeded.
 
-The completing coordinator then recomputes the native dependency graph and
-automatically creates one fresh coordinator for each permitted next frontier.
-Each new coordinator receives a structured handoff naming the specification,
-ticket, dependency state, exact `main`, completed predecessors and artifacts,
+Each completing coordinator then recomputes the native dependency graph. For
+every newly permitted frontier, the elected creator automatically creates one
+fresh coordinator; non-elected coordinators confirm that result. Each new
+coordinator receives a structured handoff naming the specification, ticket,
+dependency state, exact `main`, completed predecessors and artifacts,
 applicable authorization state, required credentials or services, and known
 scope constraints.
+
+Creation authority for a frontier is deterministic. If the frontier has one
+direct blocker, that blocker's coordinator is the creator. At fan-in, compute
+an eligibility timestamp for every direct blocker from the latest of its
+authorized pull request's `merged_at`, its canonical completion record's
+`created_at`, and the `completed_at` of the earliest successful `quality` run
+accepted for its exact merge commit. The creator is the direct blocker with the
+greatest `(eligibility timestamp, ticket number)` tuple. These immutable GitHub
+facts and the ticket-number tie-break make every completing coordinator elect
+the same creator even when several of them reconcile concurrently.
 
 Next-frontier creation uses the supported Codex App task-creation mechanism and
 is part of the completing ticket's authorized lifecycle. It does not start the
 next ticket or transfer that ticket's mutation authority. Before each creation,
-the completing coordinator reconciles active tasks and durable state to avoid a
-duplicate. It must not terminate until every required creation is confirmed or
-a genuine creation failure is reported. On success, the final `Next handoff`
-block identifies the created coordinator and keeps any paste-ready prompt as
-fallback documentation only; the product owner is not asked to relay it. If
-supported creation is unavailable or fails, the coordinator reports the
-failure and provides the exact prompt for manual recovery.
+the elected coordinator reconciles active tasks and durable state under the
+shared frontier-creation idempotency key. Only the elected coordinator may call
+the creation mechanism. Every non-elected completing coordinator must instead
+reconcile and confirm the elected coordinator's active task or durable creation
+record; it must never self-promote or create a fallback coordinator.
+
+The elected coordinator does not terminate until every creation it owns is
+confirmed or a genuine creation failure is durably reported. Absence of a task
+during one reconciliation is not a failure: a genuine failure requires the
+supported mechanism to be unavailable or to return failure, or the elected
+coordinator to be definitively unavailable after task and transition
+reconciliation. Non-elected coordinators confirm that result rather than retry
+creation. On success, the final `Next handoff` block identifies every created
+coordinator and keeps paste-ready prompts as fallback documentation only; the
+product owner is not asked to relay them. On genuine failure, it identifies
+each affected frontier and provides its exact prompt for manual recovery.
 
 A new coordinator initially has read-only readiness authority. It reconciles
 routing, exact `main`, the live frontier, required credentials and services,
@@ -85,9 +107,10 @@ ordinary transitions:
 8. Verify the merge and ticket closure or reconcile them explicitly, publish
    the completion record, and wait for successful `quality` on the exact merge
    commit on `main`.
-9. Recompute the native graph, create and confirm the fresh next-frontier
-   coordinators permitted by it, and report their creation in the final
-   `Next handoff` block.
+9. Recompute the native graph; create and confirm each permitted next-frontier
+   coordinator for which this coordinator is elected, and reconcile and
+   confirm the elected result for every other newly permitted frontier. Report
+   all results in the final `Next handoff` block.
 
 Every implementation, independent-review, and fix task is fresh and uses
 `gpt-5.6-sol` with reasoning effort `high`. Review and fix tasks receive only
@@ -109,6 +132,12 @@ Use this idempotency key for each coordination transition:
 <spec>:<ticket>:<stage>:<base-or-head>
 ```
 
+For next-frontier creation, `<ticket>` is the target frontier ticket,
+`<stage>` is `coordinator-create`, and `<base-or-head>` is the newest direct-
+blocker merge commit in `main` ancestry. Thus every fan-in candidate uses the
+same key; the predecessor coordinator's own ticket and a later unrelated
+`main` commit cannot produce a second creation key.
+
 Before every dispatch or mutation, the coordinator must reconcile:
 
 - the canonical GitHub issue and pull-request state;
@@ -120,6 +149,10 @@ Before every dispatch or mutation, the coordinator must reconcile:
 If the intended transition is already durable or its task is already active,
 the coordinator exits that transition without duplicating it. A callback is a
 wake-up signal, not evidence that the reported transition is still current.
+Creator election decides who may attempt a missing transition; the idempotency
+key and reconciliation detect an already attempted one. Neither is an atomic
+reservation, so the policy does not assume a platform guarantee that the
+supported task-creation mechanism does not provide.
 
 ## Terminal task callbacks
 

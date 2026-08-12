@@ -68,8 +68,10 @@ When work reaches or pauses at a gate, end the final response with:
 - Durable artifacts: <links>
 - Next action: <one action>
 - New thread: <yes or no>
-- Thread transition: <created automatically: ID/title, manual creation required,
-  not required, or creation failed: reason>
+- Thread transition:
+  - <ticket: created automatically — coordinator ID/title>
+  - <ticket: manual creation required, or creation failed — reason>
+  - <repeat one entry per coordinator when there are multiple, or "not required">
 
 Paste into the next thread, or retain as fallback only if it was already
 created automatically:
@@ -201,19 +203,24 @@ End with the Next handoff block from docs/agents/delivery-handoffs.md.
 ## Implementation protocol
 
 A completed ticket coordinator creates a fresh coordinator for each next
-frontier permitted by the recomputed native graph. The handoff names the
+frontier permitted by the recomputed native graph for which it is the elected
+creator, and reconciles the elected result for the rest. The handoff names the
 specification and ticket, exact `main`, dependency state, completed predecessor
 artifacts, authorization applicability, credentials or services, and scope
 constraints.
 
 Creation uses the supported Codex App task-creation mechanism and belongs to
 the completing ticket's authorized lifecycle. It does not start the next
-ticket. Before creation, reconcile active tasks and durable state to prevent a
-duplicate. The completing coordinator must not terminate until every required
-creation is confirmed or a genuine creation failure is reported. A successful
-creation is identified in the final `Next handoff` block, and its paste-ready
-prompt is fallback documentation only. If supported creation is unavailable or
-fails, report that fact and provide the prompt for manual recovery.
+ticket. For each frontier, `ticket-orchestration.md` elects exactly one creator
+from immutable completion facts for its direct blockers. Only that coordinator
+may create; all other completing coordinators reconcile active tasks and the
+shared durable transition, then confirm the elected result rather than create.
+The elected coordinator must not terminate until every creation it owns is
+confirmed or a genuine creation failure is reported. A successful creation is
+listed in the final `Next handoff` block, with one entry per coordinator, and
+its paste-ready prompt is fallback documentation only. If supported creation
+is unavailable or genuinely fails, list each affected frontier and provide its
+prompt for manual recovery; a non-elected coordinator must not self-promote.
 
 The new coordinator performs only read-only readiness checks. It must stop and
 wait for a product-owner start approval that names the ticket or is exactly
@@ -315,16 +322,22 @@ issue before every affected transition.
 
 After merge, verify ticket closure or reconcile it, publish a completion
 record, and wait for successful `quality` on the exact merge commit on `main`.
-Only then recompute the native graph and automatically create a fresh
-coordinator for each permitted next frontier. The old coordinator does not
+Only then recompute the native graph, automatically create each permitted
+next-frontier coordinator for which this coordinator is elected, and confirm
+the elected result for every other frontier. The old coordinator does not
 implement the next ticket itself. It does not finish its own lifecycle until
-each required coordinator creation is confirmed or a real creation failure is
-reported with a manual-recovery prompt.
+each creation for which it is the deterministic elected creator is confirmed,
+and each creation for which it is not elected is reconciled and confirmed, or
+a real creation failure is reported with a manual-recovery prompt. A loser at
+fan-in never creates or self-promotes.
 
 Every dispatch and mutation uses the idempotency key
 `<spec>:<ticket>:<stage>:<base-or-head>` and first reconciles GitHub, the native
 graph, durable transition comments, branches and pull requests, and active
-Codex tasks. One supported, one-shot, idempotent heartbeat may be used only if
+Codex tasks. Next-frontier creation uses the target frontier ticket,
+`coordinator-create`, and the newest direct-blocker merge commit in `main`
+ancestry, so every fan-in candidate reconciles the same transition. One
+supported, one-shot, idempotent heartbeat may be used only if
 the active turn cannot keep waiting and a terminal callback cannot continue;
 it checks durable state, exits when no transition is needed, and is never a
 cron, recurring reminder, repository automation, Git hook, or duplicate task.
