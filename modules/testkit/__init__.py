@@ -55,6 +55,8 @@ from modules.domain import (
     SourceEventRecord,
     SourceMessage,
     SourceMessageRevision,
+    TelegramAccountCheckpoint,
+    TelegramChannelCheckpoint,
     TelegramDifferenceEvent,
     TelegramMessage,
     TelegramPeerIdentity,
@@ -115,16 +117,23 @@ class ControlledTelegramIngestionAdapter:
         tuple[TelegramPeerIdentity, SourceChatAddressKind, str],
     ] = field(default_factory=dict)
     _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
-    _difference_events: dict[
-        tuple[TelegramPeerIdentity, str], TelegramDifferenceEvent
+    _account_difference_events: dict[
+        TelegramAccountCheckpoint, TelegramDifferenceEvent
+    ] = field(default_factory=dict)
+    _channel_difference_events: dict[
+        tuple[TelegramPeerIdentity, TelegramChannelCheckpoint],
+        TelegramDifferenceEvent,
     ] = field(default_factory=dict)
     resolution_requests: list[str] = field(default_factory=list)
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
     join_requests: list[str] = field(default_factory=list)
     history_requests: list[str] = field(default_factory=list)
-    difference_requests: list[tuple[TelegramPeerIdentity, str]] = field(
+    account_difference_requests: list[TelegramAccountCheckpoint] = field(
         default_factory=list
     )
+    channel_difference_requests: list[
+        tuple[TelegramPeerIdentity, TelegramChannelCheckpoint]
+    ] = field(default_factory=list)
     live_callback_completions: list[TelegramPeerIdentity] = field(default_factory=list)
 
     def source_event_id(self, probe_id: str) -> str:
@@ -192,12 +201,13 @@ class ControlledTelegramIngestionAdapter:
             )
         return boundaries.pop(0)
 
-    def add_difference_event(
+    def add_account_difference_event(
         self,
         *,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
         identity: TelegramPeerIdentity,
-        from_checkpoint: str,
-        to_checkpoint: str,
+        registry_generation: int,
         source_event_id: str,
         telegram_message_id: int,
         revision: int,
@@ -205,8 +215,8 @@ class ControlledTelegramIngestionAdapter:
         body: str | None,
         event_time: datetime,
     ) -> None:
-        """Configure one event returned only from its durable checkpoint."""
-        event = TelegramDifferenceEvent(
+        """Configure one account-wide event at its typed durable checkpoint."""
+        self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
             to_checkpoint=to_checkpoint,
@@ -216,17 +226,53 @@ class ControlledTelegramIngestionAdapter:
             kind=kind,
             body=body,
             event_time=event_time,
+            registry_generation=registry_generation,
         )
-        self._difference_events[(identity, from_checkpoint)] = event
 
-    def get_difference_event(
+    def get_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+    ) -> TelegramDifferenceEvent | None:
+        """Return the configured account-wide difference from typed state."""
+        self.account_difference_requests.append(checkpoint)
+        return self._account_difference_events.get(checkpoint)
+
+    def add_channel_difference_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
+        source_event_id: str,
+        telegram_message_id: int,
+        revision: int,
+        kind: SourceEventKind,
+        body: str | None,
+        event_time: datetime,
+    ) -> None:
+        """Configure one channel event at its typed durable pts."""
+        self._channel_difference_events[(identity, from_checkpoint)] = (
+            TelegramDifferenceEvent(
+                source_chat_identity=identity,
+                from_checkpoint=from_checkpoint,
+                to_checkpoint=to_checkpoint,
+                source_event_id=source_event_id,
+                telegram_message_id=telegram_message_id,
+                revision=revision,
+                kind=kind,
+                body=body,
+                event_time=event_time,
+            )
+        )
+
+    def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
-        checkpoint: str,
+        checkpoint: TelegramChannelCheckpoint,
     ) -> TelegramDifferenceEvent | None:
-        """Return the configured recoverable difference from this checkpoint."""
-        self.difference_requests.append((identity, checkpoint))
-        return self._difference_events.get((identity, checkpoint))
+        """Return the configured channel difference from typed pts."""
+        self.channel_difference_requests.append((identity, checkpoint))
+        return self._channel_difference_events.get((identity, checkpoint))
 
 
 @dataclass(slots=True)
@@ -971,18 +1017,55 @@ class AcceptanceSpine:
             payload=source_payload,
         )
 
-    def process_next_telegram_difference(
+    def initialize_account_ingestion_checkpoint(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+    ) -> None:
+        """Initialize explicit account-wide difference state through Ingestion."""
+        ingestion = self._roles[RuntimeRole.INGESTION]
+        ingestion.store.initialize_account_ingestion_checkpoint(
+            checkpoint,
+            initialized_at=ingestion.clock.now(),
+        )
+
+    def process_next_account_telegram_difference(
+        self,
+        *,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Drive one controlled account-wide difference through Ingestion."""
+        return self._roles[RuntimeRole.INGESTION].process_account_telegram_difference(
+            inject_database_failure=inject_database_failure,
+        )
+
+    def account_ingestion_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Observe typed account-wide difference state through Ingestion."""
+        return self._roles[RuntimeRole.INGESTION].store.account_ingestion_checkpoint()
+
+    def process_next_channel_telegram_difference(
         self,
         *,
         identity: TelegramPeerIdentity,
         registry_generation: int,
         inject_database_failure: bool = False,
     ) -> bool:
-        """Drive one controlled difference event through Ingestion."""
-        return self._roles[RuntimeRole.INGESTION].process_telegram_difference(
+        """Drive one controlled channel difference through Ingestion."""
+        return self._roles[RuntimeRole.INGESTION].process_channel_telegram_difference(
             identity=identity,
             registry_generation=registry_generation,
             inject_database_failure=inject_database_failure,
+        )
+
+    def channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramChannelCheckpoint:
+        """Observe a Source Chat generation's typed channel pts."""
+        return self._roles[RuntimeRole.INGESTION].store.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=registry_generation,
         )
 
     def notify_telegram_live_update(self, identity: TelegramPeerIdentity) -> None:
@@ -1001,18 +1084,6 @@ class AcceptanceSpine:
             claimed_at=application.clock.now(),
         )
         return None if claimed is None else claimed.envelope
-
-    def ingestion_checkpoint(
-        self,
-        *,
-        identity: TelegramPeerIdentity,
-        registry_generation: int,
-    ) -> str:
-        """Observe the Ingestion-owned durable difference checkpoint."""
-        return self._roles[RuntimeRole.INGESTION].store.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=registry_generation,
-        )
 
     def source_messages(self) -> tuple[SourceMessage, ...]:
         """Observe authoritative Source Messages through the stable testkit."""
@@ -1060,6 +1131,32 @@ class AcceptanceSpine:
         """Probe Source Message grants and RLS with one runtime credential."""
         try:
             return self._roles[actor].store.owned_source_messages()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+
+    def account_ingestion_checkpoint_as(
+        self,
+        actor: RuntimeRole,
+    ) -> TelegramAccountCheckpoint:
+        """Probe account checkpoint grants and RLS with one runtime credential."""
+        try:
+            return self._roles[actor].store.account_ingestion_checkpoint()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+
+    def channel_ingestion_checkpoint_as(
+        self,
+        actor: RuntimeRole,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramChannelCheckpoint:
+        """Probe channel checkpoint grants and RLS with one runtime credential."""
+        try:
+            return self._roles[actor].store.channel_ingestion_checkpoint(
+                identity=identity,
+                registry_generation=registry_generation,
+            )
         except ConversationAccessDeniedError as error:
             raise OwnershipViolationError(UUID(int=0)) from error
 

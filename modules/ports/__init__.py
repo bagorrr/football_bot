@@ -46,7 +46,9 @@ from modules.domain import (
     SourceEventRecord,
     SourceMessage,
     SourceMessageRevision,
+    TelegramAccountCheckpoint,
     TelegramCallbackDeliveryClaim,
+    TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDifferenceEvent,
     TelegramMessage,
@@ -105,12 +107,19 @@ class TelegramIngestionAdapter(Protocol):
         """Capture the current transport position after successful resolution."""
         ...
 
-    def get_difference_event(
+    def get_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+    ) -> TelegramDifferenceEvent | None:
+        """Return the next account-wide event from durable application state."""
+        ...
+
+    def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
-        checkpoint: str,
+        checkpoint: TelegramChannelCheckpoint,
     ) -> TelegramDifferenceEvent | None:
-        """Return the next recoverable event from the supplied durable cursor."""
+        """Return the next channel event from its typed durable pts."""
         ...
 
 
@@ -619,6 +628,28 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the current eligible generation and durable difference cursor."""
         ...
 
+    def initialize_account_ingestion_checkpoint(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        *,
+        initialized_at: datetime,
+    ) -> None:
+        """Create the explicit Ingestion-owned account difference state."""
+        ...
+
+    def account_ingestion_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Read the durable Ingestion-owned account difference state."""
+        ...
+
+    def channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramChannelCheckpoint:
+        """Read one Source Chat generation's durable channel pts."""
+        ...
+
     def commit_source_event(
         self,
         *,
@@ -638,15 +669,6 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         received_at: datetime,
     ) -> ConsumeResult:
         """Apply one Source Event to Application-owned Source Message state."""
-        ...
-
-    def ingestion_checkpoint(
-        self,
-        *,
-        identity: TelegramPeerIdentity,
-        registry_generation: int,
-    ) -> str:
-        """Read the durable Ingestion-owned checkpoint through its owner port."""
         ...
 
     def owned_source_events(self) -> tuple[SourceEventRecord, ...]:

@@ -14,6 +14,8 @@ from modules.domain import (
     SourceEventRecord,
     SourceMessage,
     SourceMessageRevision,
+    TelegramAccountCheckpoint,
+    TelegramChannelCheckpoint,
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
@@ -39,6 +41,381 @@ class _SteppingClock(FrozenClock):
         if self.step is not None:
             self.instant += self.step
         return instant
+
+
+def test_account_difference_commits_checkpoint_event_and_application_effect() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    event_time = datetime(2026, 9, 12, 9, 1, tzinfo=UTC)
+    account_checkpoint = TelegramAccountCheckpoint(
+        pts=4_600,
+        qts=46,
+        seq=460,
+        date=datetime(2026, 9, 12, 8, 59, tzinfo=UTC),
+    )
+    advanced_checkpoint = TelegramAccountCheckpoint(
+        pts=4_601,
+        qts=47,
+        seq=461,
+        date=event_time,
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    administrator_id = 46_001
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_600_100,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_account_source",
+        identity=identity,
+        transport_boundary="chat-sequence:460",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address="@synthetic_account_source",
+    )
+    system.initialize_account_ingestion_checkpoint(account_checkpoint)
+    telethon.add_account_difference_event(
+        from_checkpoint=account_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:account:1",
+        telegram_message_id=100,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Basic-chat account difference event.",
+        event_time=event_time,
+    )
+    clock.advance_to(event_time)
+
+    system.notify_telegram_live_update(identity)
+    assert telethon.live_callback_completions == [identity]
+    assert system.account_ingestion_checkpoint() == account_checkpoint
+    assert system.source_events() == ()
+
+    with pytest.raises(InjectedFailureError):
+        system.process_next_account_telegram_difference(
+            inject_database_failure=True,
+        )
+    assert system.account_ingestion_checkpoint() == account_checkpoint
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == advanced_checkpoint
+    assert len(system.source_events()) == 1
+    assert len(system.source_event_contracts()) == 1
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 1
+    system.restart(RuntimeRole.INGESTION)
+    assert not system.process_next_account_telegram_difference()
+    assert telethon.account_difference_requests[-1] == advanced_checkpoint
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.redeliver_source_event("source-event:account:1")
+    assert len(system.source_messages()) == 1
+    system.reset()
+
+
+def test_account_difference_discards_pre_boundary_create_without_retaining_body() -> (
+    None
+):
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 15, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_605_100,
+    )
+    before_boundary = TelegramAccountCheckpoint(
+        pts=4_605,
+        qts=60,
+        seq=459,
+        date=datetime(2026, 9, 12, 9, 14, tzinfo=UTC),
+    )
+    at_boundary = TelegramAccountCheckpoint(
+        pts=4_606,
+        qts=61,
+        seq=460,
+        date=datetime(2026, 9, 12, 9, 15, tzinfo=UTC),
+    )
+    telethon.allow_public_username(
+        address="@synthetic_account_boundary",
+        identity=identity,
+        transport_boundary="chat-sequence:460",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_051,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 15, tzinfo=UTC),
+        administrator_id=46_051,
+        address="@synthetic_account_boundary",
+        update_suffix="account-boundary",
+    )
+    system.initialize_account_ingestion_checkpoint(before_boundary)
+    telethon.add_account_difference_event(
+        from_checkpoint=before_boundary,
+        to_checkpoint=at_boundary,
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:account-boundary:1",
+        telegram_message_id=151,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="This pre-boundary body must not be retained.",
+        event_time=at_boundary.date,
+    )
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == at_boundary
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+    assert not system.process_next_source_event()
+    assert system.source_messages() == ()
+    system.reset()
+
+
+def test_account_and_channel_differences_advance_independently() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 30, tzinfo=UTC))
+    account_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_610_100,
+    )
+    channel_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_610_200,
+    )
+    account_start = TelegramAccountCheckpoint(
+        pts=4_610,
+        qts=61,
+        seq=461,
+        date=datetime(2026, 9, 12, 9, 29, tzinfo=UTC),
+    )
+    account_advanced = TelegramAccountCheckpoint(
+        pts=4_611,
+        qts=62,
+        seq=462,
+        date=datetime(2026, 9, 12, 9, 31, tzinfo=UTC),
+    )
+    channel_start = TelegramChannelCheckpoint(pts=8_100)
+    channel_advanced = TelegramChannelCheckpoint(pts=8_101)
+    telethon.allow_public_username(
+        address="@synthetic_interleaved_account",
+        identity=account_identity,
+        transport_boundary="chat-sequence:461",
+    )
+    telethon.allow_public_username(
+        address="@synthetic_interleaved_channel",
+        identity=channel_identity,
+        transport_boundary="channel-pts:8100",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 30, tzinfo=UTC),
+        administrator_id=46_101,
+        address="@synthetic_interleaved_account",
+        update_suffix="interleaved-account",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 30, 30, tzinfo=UTC),
+        administrator_id=46_101,
+        address="@synthetic_interleaved_channel",
+        update_suffix="interleaved-channel",
+        already_in_source_chats=True,
+    )
+    system.initialize_account_ingestion_checkpoint(account_start)
+    telethon.add_account_difference_event(
+        from_checkpoint=account_start,
+        to_checkpoint=account_advanced,
+        identity=account_identity,
+        registry_generation=1,
+        source_event_id="source-event:interleaved:account",
+        telegram_message_id=101,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Account route.",
+        event_time=account_advanced.date,
+    )
+    telethon.add_channel_difference_event(
+        identity=channel_identity,
+        from_checkpoint=channel_start,
+        to_checkpoint=channel_advanced,
+        source_event_id="source-event:interleaved:channel",
+        telegram_message_id=201,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Channel route.",
+        event_time=datetime(2026, 9, 12, 9, 32, tzinfo=UTC),
+    )
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == account_advanced
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=channel_identity,
+            registry_generation=2,
+        )
+        == channel_start
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=channel_identity,
+        registry_generation=2,
+    )
+    assert system.account_ingestion_checkpoint() == account_advanced
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=channel_identity,
+            registry_generation=2,
+        )
+        == channel_advanced
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 2
+    system.reset()
+
+
+def test_cross_route_replay_is_idempotent_and_divergence_fails_closed() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    event_time = datetime(2026, 9, 12, 9, 46, tzinfo=UTC)
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 45, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_620_100,
+    )
+    account_start = TelegramAccountCheckpoint(
+        pts=4_620,
+        qts=62,
+        seq=462,
+        date=datetime(2026, 9, 12, 9, 45, tzinfo=UTC),
+    )
+    account_advanced = TelegramAccountCheckpoint(
+        pts=4_621,
+        qts=63,
+        seq=463,
+        date=event_time,
+    )
+    account_divergent = TelegramAccountCheckpoint(
+        pts=4_622,
+        qts=64,
+        seq=464,
+        date=datetime(2026, 9, 12, 9, 47, tzinfo=UTC),
+    )
+    channel_start = TelegramChannelCheckpoint(pts=8_200)
+    channel_advanced = TelegramChannelCheckpoint(pts=8_201)
+    telethon.allow_public_username(
+        address="@synthetic_cross_route",
+        identity=identity,
+        transport_boundary="channel-pts:8200",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_201,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 45, tzinfo=UTC),
+        administrator_id=46_201,
+        address="@synthetic_cross_route",
+        update_suffix="cross-route",
+    )
+    system.initialize_account_ingestion_checkpoint(account_start)
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=channel_start,
+        to_checkpoint=channel_advanced,
+        source_event_id="source-event:cross-route:1",
+        telegram_message_id=301,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="The same transport event.",
+        event_time=event_time,
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=account_start,
+        to_checkpoint=account_advanced,
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:cross-route:1",
+        telegram_message_id=301,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="The same transport event.",
+        event_time=event_time,
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_account_telegram_difference()
+    assert len(system.source_events()) == 1
+    assert len(system.source_event_contracts()) == 1
+    assert system.process_next_source_event()
+    assert not system.redeliver_source_event("source-event:cross-route:1")
+    assert len(system.source_messages()) == 1
+
+    telethon.add_account_difference_event(
+        from_checkpoint=account_advanced,
+        to_checkpoint=account_divergent,
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:cross-route:1",
+        telegram_message_id=301,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Divergent content under the same stable identity.",
+        event_time=event_time,
+    )
+    with pytest.raises(InjectedFailureError):
+        system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == account_advanced
+    assert len(system.source_events()) == 1
+    assert len(system.source_event_contracts()) == 1
+    system.reset()
 
 
 def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> None:
@@ -74,10 +451,10 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
         administrator_id=administrator_id,
         address="@synthetic_ingestion_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4700",
-        to_checkpoint="channel-pts:4701",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4700),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4701),
         source_event_id="source-event:ordinary:1",
         telegram_message_id=101,
         revision=1,
@@ -88,7 +465,7 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
     clock.advance_to(event_time)
     clock.step = timedelta(seconds=1)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
@@ -96,13 +473,10 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
 
     assert system.source_events()[0].recorded_at == event_time
     assert system.source_event_contracts()[0].recorded_at == event_time
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4701"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4701)
     assert system.source_messages() == (
         SourceMessage(
             source_message_id="source-chat:channel:4700100:message:101",
@@ -153,10 +527,10 @@ def test_transport_proven_post_boundary_event_ignores_earlier_event_time_on_retr
         administrator_id=administrator_id,
         address="@synthetic_boundary",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4800",
-        to_checkpoint="channel-pts:4801",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4800),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4801),
         source_event_id="source-event:transport-boundary:1",
         telegram_message_id=1_101,
         revision=1,
@@ -167,30 +541,28 @@ def test_transport_proven_post_boundary_event_ignores_earlier_event_time_on_retr
     assert len(system.source_chats()) == 1
 
     with pytest.raises(InjectedFailureError):
-        system.process_next_telegram_difference(
+        system.process_next_channel_telegram_difference(
             identity=identity,
             registry_generation=1,
             inject_database_failure=True,
         )
 
-    assert (
-        system.ingestion_checkpoint(identity=identity, registry_generation=1)
-        == "channel-pts:4800"
-    )
-    assert system.process_next_telegram_difference(
+    assert system.channel_ingestion_checkpoint(
+        identity=identity, registry_generation=1
+    ) == TelegramChannelCheckpoint(pts=4800)
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
-    assert not system.process_next_telegram_difference(
+    assert not system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
 
-    assert (
-        system.ingestion_checkpoint(identity=identity, registry_generation=1)
-        == "channel-pts:4801"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity, registry_generation=1
+    ) == TelegramChannelCheckpoint(pts=4801)
     assert len(system.source_events()) == 1
     assert len(system.source_messages()) == 1
     assert len(system.source_message_revisions()) == 1
@@ -229,10 +601,10 @@ def test_pre_boundary_message_edit_advances_without_retaining_content() -> None:
         administrator_id=administrator_id,
         address="@synthetic_old_edit",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4810",
-        to_checkpoint="channel-pts:4811",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4810),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4811),
         source_event_id="source-event:pre-boundary-edit:2",
         telegram_message_id=1_201,
         revision=2,
@@ -242,16 +614,15 @@ def test_pre_boundary_message_edit_advances_without_retaining_content() -> None:
     )
     clock.advance_to(edited_at)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert not system.process_next_source_event()
 
-    assert (
-        system.ingestion_checkpoint(identity=identity, registry_generation=1)
-        == "channel-pts:4811"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity, registry_generation=1
+    ) == TelegramChannelCheckpoint(pts=4811)
     assert system.source_events() == ()
     assert system.source_event_contracts() == ()
     assert system.source_messages() == ()
@@ -291,10 +662,10 @@ def test_irrelevant_event_is_recorded_without_content_pre_screening() -> None:
         administrator_id=administrator_id,
         address="@synthetic_irrelevant_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4710",
-        to_checkpoint="channel-pts:4711",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4710),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4711),
         source_event_id="source-event:irrelevant:1",
         telegram_message_id=202,
         revision=1,
@@ -304,7 +675,7 @@ def test_irrelevant_event_is_recorded_without_content_pre_screening() -> None:
     )
     clock.advance_to(event_time)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
@@ -361,10 +732,10 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
         administrator_id=administrator_id,
         address="@synthetic_edit_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4720",
-        to_checkpoint="channel-pts:4721",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4720),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4721),
         source_event_id="source-event:edit:create",
         telegram_message_id=303,
         revision=1,
@@ -372,10 +743,10 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
         body="Need one player on Friday.",
         event_time=created_at,
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4721",
-        to_checkpoint="channel-pts:4722",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4721),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4722),
         source_event_id="source-event:edit:revision-2",
         telegram_message_id=303,
         revision=2,
@@ -384,14 +755,14 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
         event_time=edited_at,
     )
     clock.advance_to(created_at)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
     clock.advance_to(edited_at)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
@@ -411,13 +782,10 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
             tombstoned=False,
         ),
     )
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4722"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4722)
     system.reset()
 
 
@@ -462,10 +830,10 @@ def test_leased_older_revision_is_preserved_without_regressing_current_state() -
         (2, SourceEventKind.EDIT, "Revision two.", revision_times[1]),
         (3, SourceEventKind.EDIT, "Revision three.", revision_times[2]),
     ):
-        telethon.add_difference_event(
+        telethon.add_channel_difference_event(
             identity=identity,
-            from_checkpoint=f"channel-pts:{4819 + revision}",
-            to_checkpoint=f"channel-pts:{4820 + revision}",
+            from_checkpoint=TelegramChannelCheckpoint(pts=4819 + revision),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4820 + revision),
             source_event_id=f"source-event:leased-edit:{revision}",
             telegram_message_id=1_301,
             revision=revision,
@@ -475,14 +843,14 @@ def test_leased_older_revision_is_preserved_without_regressing_current_state() -
         )
 
     clock.advance_to(revision_times[0])
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
     for event_time in revision_times[1:]:
         clock.advance_to(event_time)
-        assert system.process_next_telegram_difference(
+        assert system.process_next_channel_telegram_difference(
             identity=identity,
             registry_generation=1,
         )
@@ -547,10 +915,10 @@ def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> N
         administrator_id=administrator_id,
         address="@synthetic_delete_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4730",
-        to_checkpoint="channel-pts:4731",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4730),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4731),
         source_event_id="source-event:delete:create",
         telegram_message_id=404,
         revision=1,
@@ -558,10 +926,10 @@ def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> N
         body="Open training tomorrow.",
         event_time=created_at,
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4731",
-        to_checkpoint="channel-pts:4732",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4731),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4732),
         source_event_id="source-event:delete:tombstone",
         telegram_message_id=404,
         revision=2,
@@ -570,14 +938,14 @@ def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> N
         event_time=deleted_at,
     )
     clock.advance_to(created_at)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
     clock.advance_to(deleted_at)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
@@ -635,10 +1003,10 @@ def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> 
         address="@synthetic_duplicate_source",
     )
     for from_checkpoint, to_checkpoint in (
-        ("channel-pts:4740", "channel-pts:4741"),
-        ("channel-pts:4741", "channel-pts:4742"),
+        (TelegramChannelCheckpoint(pts=4740), TelegramChannelCheckpoint(pts=4741)),
+        (TelegramChannelCheckpoint(pts=4741), TelegramChannelCheckpoint(pts=4742)),
     ):
-        telethon.add_difference_event(
+        telethon.add_channel_difference_event(
             identity=identity,
             from_checkpoint=from_checkpoint,
             to_checkpoint=to_checkpoint,
@@ -650,26 +1018,23 @@ def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> 
             event_time=event_time,
         )
     clock.advance_to(event_time)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
     clock.advance_to(duplicate_time)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert not system.process_next_source_event()
 
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4742"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4742)
     assert len(system.source_events()) == 1
     assert len(system.source_messages()) == 1
     assert system.source_message_revisions() == (
@@ -721,10 +1086,10 @@ def test_database_failure_rolls_back_event_outbox_and_checkpoint_for_retry() -> 
         administrator_id=administrator_id,
         address="@synthetic_rollback_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4750",
-        to_checkpoint="channel-pts:4751",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4750),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4751),
         source_event_id="source-event:rollback:1",
         telegram_message_id=606,
         revision=1,
@@ -735,7 +1100,7 @@ def test_database_failure_rolls_back_event_outbox_and_checkpoint_for_retry() -> 
     clock.advance_to(event_time)
 
     with pytest.raises(InjectedFailureError):
-        system.process_next_telegram_difference(
+        system.process_next_channel_telegram_difference(
             identity=identity,
             registry_generation=1,
             inject_database_failure=True,
@@ -743,28 +1108,22 @@ def test_database_failure_rolls_back_event_outbox_and_checkpoint_for_retry() -> 
 
     assert system.source_events() == ()
     assert system.source_event_contracts() == ()
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4750"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4750)
 
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
     assert len(system.source_events()) == 1
     assert len(system.source_event_contracts()) == 1
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4751"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4751)
     system.reset()
 
 
@@ -800,10 +1159,10 @@ def test_application_restart_and_outbox_replay_preserve_one_message_effect() -> 
         administrator_id=administrator_id,
         address="@synthetic_restart_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4760",
-        to_checkpoint="channel-pts:4761",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4760),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4761),
         source_event_id="source-event:restart:1",
         telegram_message_id=707,
         revision=1,
@@ -812,7 +1171,7 @@ def test_application_restart_and_outbox_replay_preserve_one_message_effect() -> 
         event_time=event_time,
     )
     clock.advance_to(event_time)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
@@ -866,10 +1225,10 @@ def test_live_callback_only_wakes_and_restart_recovers_the_difference() -> None:
         administrator_id=administrator_id,
         address="@synthetic_recovery_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4770",
-        to_checkpoint="channel-pts:4771",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4770),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4771),
         source_event_id="source-event:recovery:1",
         telegram_message_id=808,
         revision=1,
@@ -883,28 +1242,31 @@ def test_live_callback_only_wakes_and_restart_recovers_the_difference() -> None:
 
     assert telethon.live_callback_completions == [identity]
     assert system.source_events() == ()
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4770"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4770)
 
     system.restart(RuntimeRole.INGESTION)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
-    assert (
-        system.ingestion_checkpoint(
-            identity=identity,
-            registry_generation=1,
-        )
-        == "channel-pts:4771"
-    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4771)
     assert len(system.source_messages()) == 1
+    system.restart(RuntimeRole.INGESTION)
+    assert not system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.channel_difference_requests[-1] == (
+        identity,
+        TelegramChannelCheckpoint(pts=4771),
+    )
     system.reset()
 
 
@@ -940,10 +1302,10 @@ def test_unsupported_source_event_version_stays_recoverable_and_alerts() -> None
         administrator_id=administrator_id,
         address="@synthetic_version_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4780",
-        to_checkpoint="channel-pts:4781",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4780),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4781),
         source_event_id="source-event:future-version:1",
         telegram_message_id=909,
         revision=1,
@@ -952,7 +1314,7 @@ def test_unsupported_source_event_version_stays_recoverable_and_alerts() -> None
         event_time=event_time,
     )
     clock.advance_to(event_time)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
@@ -1008,10 +1370,10 @@ def test_source_ingestion_and_message_state_enforce_role_and_rls_boundaries() ->
         administrator_id=administrator_id,
         address="@synthetic_role_source",
     )
-    telethon.add_difference_event(
+    telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint="channel-pts:4790",
-        to_checkpoint="channel-pts:4791",
+        from_checkpoint=TelegramChannelCheckpoint(pts=4790),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4791),
         source_event_id="source-event:roles:1",
         telegram_message_id=1_010,
         revision=1,
@@ -1020,16 +1382,33 @@ def test_source_ingestion_and_message_state_enforce_role_and_rls_boundaries() ->
         event_time=event_time,
     )
     clock.advance_to(event_time)
-    assert system.process_next_telegram_difference(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
     assert system.process_next_source_event()
 
+    account_checkpoint = TelegramAccountCheckpoint(
+        pts=4_790,
+        qts=79,
+        seq=479,
+        date=event_time,
+    )
+    system.initialize_account_ingestion_checkpoint(account_checkpoint)
+
     assert system.source_events_as(RuntimeRole.INGESTION) == system.source_events()
     assert (
         system.source_messages_as(RuntimeRole.APPLICATION) == system.source_messages()
     )
+    assert (
+        system.account_ingestion_checkpoint_as(RuntimeRole.INGESTION)
+        == account_checkpoint
+    )
+    assert system.channel_ingestion_checkpoint_as(
+        RuntimeRole.INGESTION,
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4791)
     for actor in (
         RuntimeRole.APPLICATION,
         RuntimeRole.CLASSIFICATION,
@@ -1038,6 +1417,14 @@ def test_source_ingestion_and_message_state_enforce_role_and_rls_boundaries() ->
     ):
         with pytest.raises(OwnershipViolationError):
             system.source_events_as(actor)
+        with pytest.raises(OwnershipViolationError):
+            system.account_ingestion_checkpoint_as(actor)
+        with pytest.raises(OwnershipViolationError):
+            system.channel_ingestion_checkpoint_as(
+                actor,
+                identity=identity,
+                registry_generation=1,
+            )
     for actor in (
         RuntimeRole.INGESTION,
         RuntimeRole.CLASSIFICATION,
@@ -1056,46 +1443,51 @@ def _register_source_chat(
     registered_at: datetime,
     administrator_id: int,
     address: str,
+    update_suffix: str = "source-ingestion",
+    already_in_source_chats: bool = False,
 ) -> None:
     # The helper drives only existing public AcceptanceSpine ports.
-    system.start_bot_user(
-        update_id="start:source-ingestion",
-        telegram_user_id=administrator_id,
-        telegram_language_hint="en",
-    )
-    system.select_fixed_language(
-        update_id="language:source-ingestion",
-        telegram_user_id=administrator_id,
-        locale="en",
-    )
-    clock.advance_to(registered_at)
-    system.expire_inactive_discovery_drafts()
-    system.open_main_menu(
-        update_id="menu:source-ingestion",
-        telegram_user_id=administrator_id,
-    )
-    system.select_main_menu_action(
-        update_id="settings:source-ingestion",
-        telegram_user_id=administrator_id,
-        action="settings",
-    )
-    system.select_settings_action(
-        update_id="administration:source-ingestion",
-        telegram_user_id=administrator_id,
-        action="administration",
-    )
-    system.select_administration_action(
-        update_id="source-chats:source-ingestion",
-        telegram_user_id=administrator_id,
-        action="source-chats",
-    )
+    if not already_in_source_chats:
+        system.start_bot_user(
+            update_id=f"start:{update_suffix}",
+            telegram_user_id=administrator_id,
+            telegram_language_hint="en",
+        )
+        system.select_fixed_language(
+            update_id=f"language:{update_suffix}",
+            telegram_user_id=administrator_id,
+            locale="en",
+        )
+        clock.advance_to(registered_at)
+        system.expire_inactive_discovery_drafts()
+        system.open_main_menu(
+            update_id=f"menu:{update_suffix}",
+            telegram_user_id=administrator_id,
+        )
+        system.select_main_menu_action(
+            update_id=f"settings:{update_suffix}",
+            telegram_user_id=administrator_id,
+            action="settings",
+        )
+        system.select_settings_action(
+            update_id=f"administration:{update_suffix}",
+            telegram_user_id=administrator_id,
+            action="administration",
+        )
+        system.select_administration_action(
+            update_id=f"source-chats:{update_suffix}",
+            telegram_user_id=administrator_id,
+            action="source-chats",
+        )
+    else:
+        clock.advance_to(registered_at)
     system.select_source_chats_action(
-        update_id="add-source-chat:source-ingestion",
+        update_id=f"add-source-chat:{update_suffix}",
         telegram_user_id=administrator_id,
         action="add",
     )
     system.submit_source_chat_address(
-        update_id="address:source-ingestion",
+        update_id=f"address:{update_suffix}",
         telegram_user_id=administrator_id,
         address=address,
     )

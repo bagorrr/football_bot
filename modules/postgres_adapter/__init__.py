@@ -59,7 +59,9 @@ from modules.domain import (
     SourceEventRecord,
     SourceMessage,
     SourceMessageRevision,
+    TelegramAccountCheckpoint,
     TelegramCallbackDeliveryClaim,
+    TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramDifferenceEvent,
@@ -107,7 +109,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "5ece24a5909364b4d4e2f762bc6af104d62cb38302945a0e45dfaa830af77da8",
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
-    "d6cf71d476cafd2e800ee81fda4a64f45cb2cd980a913b371848fb1faede15ce",
+    "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -583,7 +585,8 @@ class PostgresAcceptanceObserver:
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
-                     football_runtime.source_ingestion_checkpoints,
+                     football_runtime.telegram_channel_difference_checkpoints,
+                     football_runtime.telegram_account_difference_checkpoints,
                      football_runtime.source_chat_admission_requests,
                      football_runtime.source_chat_registration_origins,
                      football_runtime.source_chat_registry,
@@ -1538,7 +1541,7 @@ class PostgresRoleStore:
             row = connection.execute(
                 """
                 SELECT peer_kind, telegram_chat_id, registry_generation,
-                       processing_started_at, checkpoint
+                       processing_started_at, transport_boundary, channel_pts
                 FROM football_runtime.read_active_source_chat_ingestion_context(
                     %s, %s, %s
                 )
@@ -1551,6 +1554,19 @@ class PostgresRoleStore:
             ).fetchone()
         if row is None:
             return None
+        channel_checkpoint: TelegramChannelCheckpoint | None = None
+        if identity.kind is TelegramPeerKind.CHANNEL:
+            channel_pts = row["channel_pts"]
+            if channel_pts is None:
+                prefix = "channel-pts:"
+                boundary = row["transport_boundary"]
+                if (
+                    not boundary.startswith(prefix)
+                    or not boundary[len(prefix) :].isdigit()
+                ):
+                    raise ValueError("Source Chat channel boundary is invalid")
+                channel_pts = int(boundary[len(prefix) :])
+            channel_checkpoint = TelegramChannelCheckpoint(pts=channel_pts)
         return SourceChatIngestionContext(
             identity=TelegramPeerIdentity(
                 kind=TelegramPeerKind(row["peer_kind"]),
@@ -1558,8 +1574,86 @@ class PostgresRoleStore:
             ),
             registry_generation=row["registry_generation"],
             processing_started_at=row["processing_started_at"],
-            checkpoint=row["checkpoint"],
+            checkpoint=channel_checkpoint,
         )
+
+    def initialize_account_ingestion_checkpoint(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        *,
+        initialized_at: datetime,
+    ) -> None:
+        """Create the explicit owner-visible account difference state."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_account_difference_checkpoints (
+                    pts, qts, seq, checkpoint_date, advanced_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (singleton) DO NOTHING
+                RETURNING singleton
+                """,
+                (
+                    checkpoint.pts,
+                    checkpoint.qts,
+                    checkpoint.seq,
+                    checkpoint.date,
+                    initialized_at,
+                ),
+            ).fetchone()
+            if inserted is None:
+                existing = connection.execute(
+                    """
+                    SELECT pts, qts, seq, checkpoint_date
+                    FROM football_runtime.telegram_account_difference_checkpoints
+                    WHERE singleton
+                    """
+                ).fetchone()
+                if existing != (
+                    checkpoint.pts,
+                    checkpoint.qts,
+                    checkpoint.seq,
+                    checkpoint.date,
+                ):
+                    raise OutboxConflictError
+
+    def account_ingestion_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Read the owner-visible durable account difference state."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT pts, qts, seq, checkpoint_date
+                FROM football_runtime.telegram_account_difference_checkpoints
+                WHERE singleton
+                """
+            ).fetchone()
+        if row is None:
+            raise LookupError("Telegram account checkpoint is not initialized")
+        return TelegramAccountCheckpoint(
+            pts=row["pts"],
+            qts=row["qts"],
+            seq=row["seq"],
+            date=row["checkpoint_date"],
+        )
+
+    def channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramChannelCheckpoint:
+        """Read one eligible Source Chat generation's durable channel pts."""
+        context = self.source_chat_ingestion_context(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
+        if context is None or context.checkpoint is None:
+            raise LookupError(identity)
+        return context.checkpoint
 
     def commit_source_event(
         self,
@@ -1574,9 +1668,15 @@ class PostgresRoleStore:
         if self._role is not RuntimeRole.INGESTION:
             raise ConversationAccessDeniedError
         identity = event.source_chat_identity
+        account_route = isinstance(event.from_checkpoint, TelegramAccountCheckpoint)
+        channel_route = isinstance(event.from_checkpoint, TelegramChannelCheckpoint)
         lock_key = (
-            f"source-ingestion:{identity.kind.value}:{identity.telegram_id}:"
-            f"{registry_generation}"
+            "source-ingestion:account"
+            if account_route
+            else (
+                f"source-ingestion:{identity.kind.value}:{identity.telegram_id}:"
+                f"{registry_generation}"
+            )
         )
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             connection.execute(
@@ -1585,7 +1685,7 @@ class PostgresRoleStore:
             )
             context = connection.execute(
                 """
-                SELECT checkpoint
+                SELECT transport_boundary, channel_pts
                 FROM football_runtime.read_active_source_chat_ingestion_context(
                     %s, %s, %s
                 )
@@ -1598,9 +1698,55 @@ class PostgresRoleStore:
             ).fetchone()
             if context is None:
                 raise RuntimeError("Source Chat generation is no longer eligible")
-            if context["checkpoint"] != event.from_checkpoint:
-                return False
-            known_transport_identity = event.kind is SourceEventKind.CREATE
+            if account_route:
+                account_checkpoint = connection.execute(
+                    """
+                    SELECT pts, qts, seq, checkpoint_date
+                    FROM football_runtime.telegram_account_difference_checkpoints
+                    WHERE singleton
+                    FOR UPDATE
+                    """
+                ).fetchone()
+                if account_checkpoint is None:
+                    raise LookupError("Telegram account checkpoint is not initialized")
+                current_account_checkpoint = TelegramAccountCheckpoint(
+                    pts=account_checkpoint["pts"],
+                    qts=account_checkpoint["qts"],
+                    seq=account_checkpoint["seq"],
+                    date=account_checkpoint["checkpoint_date"],
+                )
+                if current_account_checkpoint != event.from_checkpoint:
+                    return False
+                account_create_is_after_boundary = False
+                if identity.kind is TelegramPeerKind.CHAT:
+                    prefix = "chat-sequence:"
+                    boundary = context["transport_boundary"]
+                    if (
+                        not boundary.startswith(prefix)
+                        or not boundary[len(prefix) :].isdigit()
+                    ):
+                        raise ValueError("Source Chat account boundary is invalid")
+                    account_create_is_after_boundary = event.from_checkpoint.seq >= int(
+                        boundary[len(prefix) :]
+                    )
+            elif channel_route:
+                channel_pts = context["channel_pts"]
+                if channel_pts is None:
+                    prefix = "channel-pts:"
+                    boundary = context["transport_boundary"]
+                    if (
+                        not boundary.startswith(prefix)
+                        or not boundary[len(prefix) :].isdigit()
+                    ):
+                        raise ValueError("Source Chat channel boundary is invalid")
+                    channel_pts = int(boundary[len(prefix) :])
+                if TelegramChannelCheckpoint(pts=channel_pts) != event.from_checkpoint:
+                    return False
+            else:
+                raise TypeError("Telegram difference checkpoint scope is unsupported")
+            known_transport_identity = event.kind is SourceEventKind.CREATE and (
+                channel_route or account_create_is_after_boundary
+            )
             if not known_transport_identity:
                 known_transport_identity = (
                     connection.execute(
@@ -1676,24 +1822,48 @@ class PostgresRoleStore:
                     }
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError
-            connection.execute(
-                """
-                INSERT INTO football_runtime.source_ingestion_checkpoints (
-                    peer_kind, telegram_chat_id, registry_generation,
-                    checkpoint, advanced_at
-                ) VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
-                DO UPDATE SET checkpoint = EXCLUDED.checkpoint,
-                              advanced_at = EXCLUDED.advanced_at
-                """,
-                (
-                    identity.kind.value,
-                    identity.telegram_id,
-                    registry_generation,
-                    event.to_checkpoint,
-                    recorded_at,
-                ),
-            )
+            if account_route:
+                if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+                    raise TypeError("account event requires an account checkpoint")
+                connection.execute(
+                    """
+                    UPDATE football_runtime.telegram_account_difference_checkpoints
+                    SET pts = %s, qts = %s, seq = %s,
+                        checkpoint_date = %s, advanced_at = %s
+                    WHERE singleton
+                    """,
+                    (
+                        event.to_checkpoint.pts,
+                        event.to_checkpoint.qts,
+                        event.to_checkpoint.seq,
+                        event.to_checkpoint.date,
+                        recorded_at,
+                    ),
+                )
+            elif channel_route:
+                if not isinstance(event.to_checkpoint, TelegramChannelCheckpoint):
+                    raise TypeError("channel event requires a channel checkpoint")
+                connection.execute(
+                    """
+                    INSERT INTO
+                        football_runtime.telegram_channel_difference_checkpoints (
+                        peer_kind, telegram_chat_id, registry_generation,
+                        channel_pts, advanced_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                    DO UPDATE SET channel_pts = EXCLUDED.channel_pts,
+                                  advanced_at = EXCLUDED.advanced_at
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        event.to_checkpoint.pts,
+                        recorded_at,
+                    ),
+                )
+            else:
+                raise TypeError("Telegram difference checkpoint scope is unsupported")
         return True
 
     def accept_source_event(
@@ -1853,21 +2023,6 @@ class PostgresRoleStore:
             )
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
-
-    def ingestion_checkpoint(
-        self,
-        *,
-        identity: TelegramPeerIdentity,
-        registry_generation: int,
-    ) -> str:
-        """Read the owner-visible durable Telegram checkpoint."""
-        context = self.source_chat_ingestion_context(
-            identity=identity,
-            registry_generation=registry_generation,
-        )
-        if context is None:
-            raise LookupError(identity)
-        return context.checkpoint
 
     def owned_source_events(self) -> tuple[SourceEventRecord, ...]:
         """Read Source Events through this runtime's database grants and RLS."""

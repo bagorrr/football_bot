@@ -5603,23 +5603,91 @@ class RuntimeApplication:
             )
         self.store.commit_initial(probe_id=probe_id, envelope=envelope)
 
-    def process_telegram_difference(
+    def process_account_telegram_difference(
+        self,
+        *,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Record one account-wide difference from typed durable state."""
+        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
+            raise RuntimeError("only Ingestion owns the Telegram difference pump")
+        checkpoint = self.store.account_ingestion_checkpoint()
+        event = self.telegram_ingestion.get_account_difference_event(checkpoint)
+        if event is None:
+            return False
+        identity = event.source_chat_identity
+        registry_generation = event.registry_generation
+        if (
+            self.store.source_chat_ingestion_context(
+                identity=identity,
+                registry_generation=registry_generation,
+            )
+            is None
+        ):
+            return False
+        source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
+        message_id = derive_source_event_message_id(event.source_event_id)
+        correlation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{source_chat_key}:generation:{registry_generation}",
+        )
+        recorded_at = self.clock.now()
+        envelope = ContractEnvelope(
+            contract_name=ContractName.SOURCE_EVENT_RECORDED,
+            contract_version=3,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=source_message_id,
+            subject_revision=event.revision,
+            idempotency_key=f"source-event-recorded:{event.source_event_id}",
+            causation_id=message_id,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "source_event_id": event.source_event_id,
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": identity.kind.value,
+                "telegram_chat_id": identity.telegram_id,
+                "registry_generation": registry_generation,
+                "telegram_message_id": event.telegram_message_id,
+                "event_kind": event.kind.value,
+                "source_message_revision_id": (
+                    f"{source_message_id}:revision:{event.revision}"
+                ),
+                "event_time": event.event_time.isoformat(),
+                "body": event.body,
+            },
+        )
+        try:
+            return self.store.commit_source_event(
+                event=event,
+                registry_generation=registry_generation,
+                envelope=envelope,
+                recorded_at=recorded_at,
+                inject_database_failure=inject_database_failure,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def process_channel_telegram_difference(
         self,
         *,
         identity: TelegramPeerIdentity,
         registry_generation: int,
         inject_database_failure: bool = False,
     ) -> bool:
-        """Record one recoverable Telegram difference from the durable cursor."""
+        """Record one channel difference from its typed durable pts."""
         if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
             raise RuntimeError("only Ingestion owns the Telegram difference pump")
         context = self.store.source_chat_ingestion_context(
             identity=identity,
             registry_generation=registry_generation,
         )
-        if context is None:
+        if context is None or context.checkpoint is None:
             return False
-        event = self.telegram_ingestion.get_difference_event(
+        event = self.telegram_ingestion.get_channel_difference_event(
             identity,
             context.checkpoint,
         )

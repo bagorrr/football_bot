@@ -1,10 +1,21 @@
-CREATE TABLE football_runtime.source_ingestion_checkpoints (
+CREATE TABLE football_runtime.telegram_account_difference_checkpoints (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     owner_role text NOT NULL DEFAULT 'ingestion'
         CHECK (owner_role = 'ingestion'),
-    peer_kind text NOT NULL CHECK (peer_kind IN ('chat', 'channel')),
+    pts bigint NOT NULL CHECK (pts >= 0),
+    qts bigint NOT NULL CHECK (qts >= 0),
+    seq bigint NOT NULL CHECK (seq >= 0),
+    checkpoint_date timestamptz NOT NULL,
+    advanced_at timestamptz NOT NULL
+);
+
+CREATE TABLE football_runtime.telegram_channel_difference_checkpoints (
+    owner_role text NOT NULL DEFAULT 'ingestion'
+        CHECK (owner_role = 'ingestion'),
+    peer_kind text NOT NULL CHECK (peer_kind = 'channel'),
     telegram_chat_id bigint NOT NULL CHECK (telegram_chat_id > 0),
     registry_generation bigint NOT NULL CHECK (registry_generation > 0),
-    checkpoint text NOT NULL CHECK (checkpoint <> ''),
+    channel_pts bigint NOT NULL CHECK (channel_pts >= 0),
     advanced_at timestamptz NOT NULL,
     PRIMARY KEY (peer_kind, telegram_chat_id, registry_generation)
 );
@@ -65,8 +76,12 @@ CREATE TABLE football_runtime.source_message_revisions (
     UNIQUE (source_message_id, revision)
 );
 
-ALTER TABLE football_runtime.source_ingestion_checkpoints ENABLE ROW LEVEL SECURITY;
-ALTER TABLE football_runtime.source_ingestion_checkpoints FORCE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.telegram_account_difference_checkpoints
+    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.telegram_account_difference_checkpoints
+    FORCE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.telegram_channel_difference_checkpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE football_runtime.telegram_channel_difference_checkpoints FORCE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.source_event_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.source_event_records FORCE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.source_messages ENABLE ROW LEVEL SECURITY;
@@ -74,8 +89,19 @@ ALTER TABLE football_runtime.source_messages FORCE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.source_message_revisions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE football_runtime.source_message_revisions FORCE ROW LEVEL SECURITY;
 
-CREATE POLICY source_ingestion_checkpoints_owner
-    ON football_runtime.source_ingestion_checkpoints
+CREATE POLICY telegram_account_difference_checkpoints_owner
+    ON football_runtime.telegram_account_difference_checkpoints
+    USING (
+        football_runtime.current_runtime_role() = 'ingestion'
+        AND owner_role = 'ingestion'
+    )
+    WITH CHECK (
+        football_runtime.current_runtime_role() = 'ingestion'
+        AND owner_role = 'ingestion'
+    );
+
+CREATE POLICY telegram_channel_difference_checkpoints_owner
+    ON football_runtime.telegram_channel_difference_checkpoints
     USING (
         football_runtime.current_runtime_role() = 'ingestion'
         AND owner_role = 'ingestion'
@@ -118,7 +144,13 @@ CREATE POLICY source_message_revisions_owner
         AND owner_role = 'application'
     );
 
-REVOKE ALL ON football_runtime.source_ingestion_checkpoints FROM
+REVOKE ALL ON football_runtime.telegram_account_difference_checkpoints FROM
+    football_ingestion,
+    football_application,
+    football_classification,
+    football_recommendation,
+    football_bot_assistant;
+REVOKE ALL ON football_runtime.telegram_channel_difference_checkpoints FROM
     football_ingestion,
     football_application,
     football_classification,
@@ -144,9 +176,15 @@ REVOKE ALL ON football_runtime.source_message_revisions FROM
     football_bot_assistant;
 
 GRANT SELECT, INSERT
-    ON football_runtime.source_ingestion_checkpoints TO football_ingestion;
-GRANT UPDATE (checkpoint, advanced_at)
-    ON football_runtime.source_ingestion_checkpoints TO football_ingestion;
+    ON football_runtime.telegram_account_difference_checkpoints
+    TO football_ingestion;
+GRANT UPDATE (pts, qts, seq, checkpoint_date, advanced_at)
+    ON football_runtime.telegram_account_difference_checkpoints
+    TO football_ingestion;
+GRANT SELECT, INSERT
+    ON football_runtime.telegram_channel_difference_checkpoints TO football_ingestion;
+GRANT UPDATE (channel_pts, advanced_at)
+    ON football_runtime.telegram_channel_difference_checkpoints TO football_ingestion;
 GRANT SELECT, INSERT
     ON football_runtime.source_event_records TO football_ingestion;
 GRANT SELECT, INSERT
@@ -172,7 +210,8 @@ RETURNS TABLE (
     telegram_chat_id bigint,
     registry_generation bigint,
     processing_started_at timestamptz,
-    checkpoint text
+    transport_boundary text,
+    channel_pts bigint
 )
 LANGUAGE sql
 STABLE
@@ -183,9 +222,10 @@ AS $$
            registry.telegram_chat_id,
            registry.registry_generation,
            registry.processing_started_at,
-           COALESCE(checkpoint.checkpoint, registry.transport_boundary)
+           registry.transport_boundary,
+           checkpoint.channel_pts
     FROM football_runtime.source_chat_registry AS registry
-    LEFT JOIN football_runtime.source_ingestion_checkpoints AS checkpoint
+    LEFT JOIN football_runtime.telegram_channel_difference_checkpoints AS checkpoint
       ON checkpoint.peer_kind = registry.peer_kind
      AND checkpoint.telegram_chat_id = registry.telegram_chat_id
      AND checkpoint.registry_generation = registry.registry_generation
