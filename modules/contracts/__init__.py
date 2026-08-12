@@ -62,6 +62,13 @@ def derive_contract_message_id(
     )
 
 
+def derive_source_event_message_id(source_event_id: str) -> UUID:
+    """Return the stable contract identity for one Telegram Source Event."""
+    if not source_event_id:
+        raise ValueError("Source Event identity is required")
+    return uuid5(NAMESPACE_URL, f"football-bot:source-event:{source_event_id}")
+
+
 class FailureCode(StrEnum):
     """Low-cardinality contract-spine failures."""
 
@@ -108,6 +115,14 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         "source_event_id",
         ("registry_generation",),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_EVENT_RECORDED,
+        3,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "source_event_id",
+        ("telegram_chat_id", "registry_generation", "telegram_message_id"),
     ),
     ContractDefinition(
         ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
@@ -326,6 +341,11 @@ class ContractEnvelope(RawContractEnvelope):
                 raise ValueError(msg)
         if self.contract_name is ContractName.RUN_SEARCH:
             _validate_run_search(self.payload)
+        elif (
+            self.contract_name is ContractName.SOURCE_EVENT_RECORDED
+            and self.contract_version == 3
+        ):
+            _validate_source_event_recorded(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
             _validate_search_completed(
                 self.payload,
@@ -545,6 +565,61 @@ def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"contract requires {field_name}")
     return value
+
+
+def _validate_source_event_recorded(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    allowed = {
+        "source_event_id",
+        "source_chat_key",
+        "telegram_peer_kind",
+        "telegram_chat_id",
+        "registry_generation",
+        "telegram_message_id",
+        "event_kind",
+        "source_message_revision_id",
+        "event_time",
+        "body",
+    }
+    if set(payload) != allowed:
+        raise ValueError("SourceEventRecorded contains unsupported or missing facts")
+    source_event_id = _required_text(payload, "source_event_id")
+    if envelope.message_id != derive_source_event_message_id(source_event_id):
+        raise ValueError("SourceEventRecorded message identity is not canonical")
+    if envelope.idempotency_key != f"source-event-recorded:{source_event_id}":
+        raise ValueError("SourceEventRecorded idempotency key is not canonical")
+    peer_kind = _required_text(payload, "telegram_peer_kind")
+    if peer_kind not in {"chat", "channel"}:
+        raise ValueError("SourceEventRecorded peer kind is invalid")
+    telegram_chat_id = payload["telegram_chat_id"]
+    telegram_message_id = payload["telegram_message_id"]
+    registry_generation = payload["registry_generation"]
+    for value in (telegram_chat_id, telegram_message_id, registry_generation):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("SourceEventRecorded numeric identities must be positive")
+    source_chat_key = _required_text(payload, "source_chat_key")
+    if source_chat_key != f"source-chat:{peer_kind}:{telegram_chat_id}":
+        raise ValueError("SourceEventRecorded Source Chat identity is inconsistent")
+    expected_subject = f"{source_chat_key}:message:{telegram_message_id}"
+    if envelope.subject_id != expected_subject:
+        raise ValueError("SourceEventRecorded subject is not its Source Message")
+    if _required_text(payload, "source_message_revision_id") != (
+        f"{expected_subject}:revision:{envelope.subject_revision}"
+    ):
+        raise ValueError("SourceEventRecorded revision identity is inconsistent")
+    event_kind = _required_text(payload, "event_kind")
+    if event_kind not in {"create", "edit", "delete"}:
+        raise ValueError("SourceEventRecorded event kind is invalid")
+    event_time = datetime.fromisoformat(_required_text(payload, "event_time"))
+    if event_time.tzinfo is None:
+        raise ValueError("SourceEventRecorded event time must be timezone-aware")
+    body = payload["body"]
+    if body is not None and not isinstance(body, str):
+        raise TypeError("SourceEventRecorded body must be text or null")
+    if event_kind == "delete" and body is not None:
+        raise ValueError("SourceEventRecorded deletion must be body-free")
 
 
 def _validate_source_chat_contract(

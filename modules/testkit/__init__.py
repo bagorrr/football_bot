@@ -23,6 +23,7 @@ from modules.contracts import (
     JsonValue,
     RawContractEnvelope,
     RuntimeRole,
+    derive_source_event_message_id,
 )
 from modules.contracts import (
     OperatorAlert as OperatorAlert,
@@ -50,6 +51,11 @@ from modules.domain import (
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
     SourceChatRegistryEntry,
+    SourceEventKind,
+    SourceEventRecord,
+    SourceMessage,
+    SourceMessageRevision,
+    TelegramDifferenceEvent,
     TelegramMessage,
     TelegramPeerIdentity,
 )
@@ -109,14 +115,25 @@ class ControlledTelegramIngestionAdapter:
         tuple[TelegramPeerIdentity, SourceChatAddressKind, str],
     ] = field(default_factory=dict)
     _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
+    _difference_events: dict[
+        tuple[TelegramPeerIdentity, str], TelegramDifferenceEvent
+    ] = field(default_factory=dict)
     resolution_requests: list[str] = field(default_factory=list)
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
     join_requests: list[str] = field(default_factory=list)
     history_requests: list[str] = field(default_factory=list)
+    difference_requests: list[tuple[TelegramPeerIdentity, str]] = field(
+        default_factory=list
+    )
+    live_callback_completions: list[TelegramPeerIdentity] = field(default_factory=list)
 
     def source_event_id(self, probe_id: str) -> str:
         """Return a stable synthetic Source Event identity."""
         return f"source-event:{probe_id}"
+
+    def notify_live_update(self, identity: TelegramPeerIdentity) -> None:
+        """Record callback completion without changing any durable cursor."""
+        self.live_callback_completions.append(identity)
 
     def allow_public_username(
         self,
@@ -174,6 +191,42 @@ class ControlledTelegramIngestionAdapter:
                 "controlled transport boundary is unavailable"
             )
         return boundaries.pop(0)
+
+    def add_difference_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        from_checkpoint: str,
+        to_checkpoint: str,
+        source_event_id: str,
+        telegram_message_id: int,
+        revision: int,
+        kind: SourceEventKind,
+        body: str | None,
+        event_time: datetime,
+    ) -> None:
+        """Configure one event returned only from its durable checkpoint."""
+        event = TelegramDifferenceEvent(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=event_time,
+        )
+        self._difference_events[(identity, from_checkpoint)] = event
+
+    def get_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        checkpoint: str,
+    ) -> TelegramDifferenceEvent | None:
+        """Return the configured recoverable difference from this checkpoint."""
+        self.difference_requests.append((identity, checkpoint))
+        return self._difference_events.get((identity, checkpoint))
 
 
 @dataclass(slots=True)
@@ -917,6 +970,89 @@ class AcceptanceSpine:
             contract_version=source_contract_version,
             payload=source_payload,
         )
+
+    def process_next_telegram_difference(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Drive one controlled difference event through Ingestion."""
+        return self._roles[RuntimeRole.INGESTION].process_telegram_difference(
+            identity=identity,
+            registry_generation=registry_generation,
+            inject_database_failure=inject_database_failure,
+        )
+
+    def notify_telegram_live_update(self, identity: TelegramPeerIdentity) -> None:
+        """Drive one live callback that may only wake the difference pump."""
+        self._roles[RuntimeRole.INGESTION].notify_telegram_live_update(identity)
+
+    def process_next_source_event(self) -> bool:
+        """Let Application consume one durable SourceEventRecorded handoff."""
+        return self._roles[RuntimeRole.APPLICATION].process_next()
+
+    def ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> str:
+        """Observe the Ingestion-owned durable difference checkpoint."""
+        return self._roles[RuntimeRole.INGESTION].store.ingestion_checkpoint(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
+
+    def source_messages(self) -> tuple[SourceMessage, ...]:
+        """Observe authoritative Source Messages through the stable testkit."""
+        return self._observer.source_messages()
+
+    def source_events(self) -> tuple[SourceEventRecord, ...]:
+        """Observe durable Source Events through the stable testkit."""
+        return self._observer.source_events()
+
+    def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
+        """Observe immutable Source Message revisions through the testkit."""
+        return self._observer.source_message_revisions()
+
+    def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
+        """Observe durable SourceEventRecorded outbox signals."""
+        return self._observer.source_event_contracts()
+
+    def redeliver_source_event(self, source_event_id: str) -> bool:
+        """Redeliver one durable Source Event at the external contract seam."""
+        envelope = self._observer.envelope(
+            derive_source_event_message_id(source_event_id)
+        )
+        return self._roles[RuntimeRole.APPLICATION].redeliver_source_event(envelope)
+
+    def replace_source_event_contract_version(
+        self,
+        source_event_id: str,
+        *,
+        version: int,
+    ) -> RawContractEnvelope:
+        """Inject an unsupported Source Event version at the contract seam."""
+        return self._observer.replace_source_event_contract_version(
+            derive_source_event_message_id(source_event_id),
+            version,
+        )
+
+    def source_events_as(self, actor: RuntimeRole) -> tuple[SourceEventRecord, ...]:
+        """Probe Source Event grants and RLS with one runtime credential."""
+        try:
+            return self._roles[actor].store.owned_source_events()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+
+    def source_messages_as(self, actor: RuntimeRole) -> tuple[SourceMessage, ...]:
+        """Probe Source Message grants and RLS with one runtime credential."""
+        try:
+            return self._roles[actor].store.owned_source_messages()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
 
     def record_search_event(
         self,

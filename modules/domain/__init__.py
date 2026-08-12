@@ -108,6 +108,14 @@ class SourceChatAddressKind(StrEnum):
     PRIVATE_INVITE = "private_invite"
 
 
+class SourceEventKind(StrEnum):
+    """Account-visible Telegram change represented at the ingestion boundary."""
+
+    CREATE = "create"
+    EDIT = "edit"
+    DELETE = "delete"
+
+
 def is_valid_source_chat_address(
     address: str,
     *,
@@ -181,6 +189,89 @@ class SourceChatRegistryEntry:
             kind=self.address_kind,
         ):
             raise ValueError("Source Chat registry address is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramDifferenceEvent:
+    """One controlled, recoverable event returned from a durable checkpoint."""
+
+    source_chat_identity: TelegramPeerIdentity
+    from_checkpoint: str
+    to_checkpoint: str
+    source_event_id: str
+    telegram_message_id: int
+    revision: int
+    kind: SourceEventKind
+    body: str | None
+    event_time: datetime
+
+    def __post_init__(self) -> None:
+        if not self.from_checkpoint or not self.to_checkpoint:
+            raise ValueError("Telegram difference checkpoints are required")
+        if not self.source_event_id:
+            raise ValueError("Source Event identity is required")
+        if self.telegram_message_id < 1 or self.revision < 1:
+            raise ValueError("Source Message identity and revision must be positive")
+        if self.event_time.tzinfo is None:
+            raise ValueError("Source Event time must be timezone-aware")
+        if self.kind is SourceEventKind.DELETE and self.body is not None:
+            raise ValueError("Deletion transport events must be body-free")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatIngestionContext:
+    """Current Application-owned eligibility facts exposed to Ingestion."""
+
+    identity: TelegramPeerIdentity
+    registry_generation: int
+    processing_started_at: datetime
+    checkpoint: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourceMessage:
+    """Application-owned authoritative current Source Message state."""
+
+    source_message_id: str
+    source_chat_identity: TelegramPeerIdentity
+    registry_generation: int
+    telegram_message_id: int
+    current_revision: int
+    event_kind: SourceEventKind
+    body: str | None
+    event_time: datetime
+    recorded_at: datetime
+    tombstoned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEventRecord:
+    """Ingestion-owned durable copy-permitted event observation."""
+
+    source_event_id: str
+    source_message_id: str
+    source_chat_identity: TelegramPeerIdentity
+    registry_generation: int
+    telegram_message_id: int
+    revision: int
+    event_kind: SourceEventKind
+    body: str | None
+    event_time: datetime
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class SourceMessageRevision:
+    """One immutable Application-owned Source Message revision or tombstone."""
+
+    source_message_revision_id: str
+    source_message_id: str
+    source_event_id: str
+    revision: int
+    event_kind: SourceEventKind
+    body: str | None
+    event_time: datetime
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

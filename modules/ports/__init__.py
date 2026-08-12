@@ -40,10 +40,15 @@ from modules.domain import (
     SearchResult,
     SourceChatAdmissionProvenance,
     SourceChatAdmissionResolution,
+    SourceChatIngestionContext,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
+    SourceEventRecord,
+    SourceMessage,
+    SourceMessageRevision,
     TelegramCallbackDeliveryClaim,
     TelegramDeliveryClaim,
+    TelegramDifferenceEvent,
     TelegramMessage,
     TelegramPeerIdentity,
     UserIntent,
@@ -86,6 +91,10 @@ class TelegramIngestionAdapter(Protocol):
         """Return a synthetic Source Event identity."""
         ...
 
+    def notify_live_update(self, identity: TelegramPeerIdentity) -> None:
+        """Wake the difference pump without acknowledging Telegram state."""
+        ...
+
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         """Resolve one already-accessible chat without joining or reading history."""
         ...
@@ -94,6 +103,14 @@ class TelegramIngestionAdapter(Protocol):
         self, identity: TelegramPeerIdentity
     ) -> str:
         """Capture the current transport position after successful resolution."""
+        ...
+
+    def get_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        checkpoint: str,
+    ) -> TelegramDifferenceEvent | None:
+        """Return the next recoverable event from the supplied durable cursor."""
         ...
 
 
@@ -593,6 +610,53 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Return only the enabled current generation for an incoming event."""
         ...
 
+    def source_chat_ingestion_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> SourceChatIngestionContext | None:
+        """Read the current eligible generation and durable difference cursor."""
+        ...
+
+    def commit_source_event(
+        self,
+        *,
+        event: TelegramDifferenceEvent,
+        registry_generation: int,
+        envelope: ContractEnvelope,
+        recorded_at: datetime,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Atomically record one event, its outbox, and checkpoint advance."""
+        ...
+
+    def accept_source_event(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one Source Event to Application-owned Source Message state."""
+        ...
+
+    def ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> str:
+        """Read the durable Ingestion-owned checkpoint through its owner port."""
+        ...
+
+    def owned_source_events(self) -> tuple[SourceEventRecord, ...]:
+        """Read Ingestion-owned Source Events with the current role credential."""
+        ...
+
+    def owned_source_messages(self) -> tuple[SourceMessage, ...]:
+        """Read Application-owned Source Messages with the current credential."""
+        ...
+
     def claim_next(
         self,
         *,
@@ -706,6 +770,30 @@ class AcceptanceObserver(Protocol):
 
     def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover one durable envelope."""
+        ...
+
+    def source_messages(self) -> tuple[SourceMessage, ...]:
+        """Observe Application-owned Source Messages through the testkit."""
+        ...
+
+    def source_events(self) -> tuple[SourceEventRecord, ...]:
+        """Observe Ingestion-owned Source Events through the testkit."""
+        ...
+
+    def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
+        """Observe immutable Source Message revisions through the testkit."""
+        ...
+
+    def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
+        """Observe SourceEventRecorded outbox signals through the testkit."""
+        ...
+
+    def replace_source_event_contract_version(
+        self,
+        message_id: UUID,
+        version: int,
+    ) -> RawContractEnvelope:
+        """Inject one unsupported Source Event version at the contract seam."""
         ...
 
     def delete_completed_search_query(

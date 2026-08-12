@@ -23,6 +23,7 @@ from modules.contracts import (
     RawContractEnvelope,
     RuntimeRole,
     derive_contract_message_id,
+    derive_source_event_message_id,
 )
 from modules.domain import (
     AcceptedLocation,
@@ -61,6 +62,7 @@ from modules.ports import (
     AcceptanceRoleStore,
     Clock,
     CompletedSearchQueryStatus,
+    ConsumeResult,
     ConversationLanguageAdapter,
     ConversationStore,
     DateInterpretationAdapter,
@@ -5532,6 +5534,10 @@ class RuntimeApplication:
             if definition.consumer is self.role and (
                 definition.version == 1
                 or (
+                    definition.name is ContractName.SOURCE_EVENT_RECORDED
+                    and definition.version == 3
+                )
+                or (
                     definition.name is ContractName.SEARCH_COMPLETED
                     and definition.version == 2
                 )
@@ -5596,6 +5602,99 @@ class RuntimeApplication:
                 else {"probe_id": probe_id, "source_event_id": source_event_id},
             )
         self.store.commit_initial(probe_id=probe_id, envelope=envelope)
+
+    def process_telegram_difference(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Record one recoverable Telegram difference from the durable cursor."""
+        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
+            raise RuntimeError("only Ingestion owns the Telegram difference pump")
+        context = self.store.source_chat_ingestion_context(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
+        if context is None:
+            return False
+        event = self.telegram_ingestion.get_difference_event(
+            identity,
+            context.checkpoint,
+        )
+        if event is None:
+            return False
+        if event.source_chat_identity != identity:
+            raise RuntimeError("Telegram difference returned another Source Chat")
+        if event.event_time <= context.processing_started_at:
+            return False
+        source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
+        message_id = derive_source_event_message_id(event.source_event_id)
+        correlation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{source_chat_key}:generation:{registry_generation}",
+        )
+        recorded_at = self.clock.now()
+        envelope = ContractEnvelope(
+            contract_name=ContractName.SOURCE_EVENT_RECORDED,
+            contract_version=3,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=source_message_id,
+            subject_revision=event.revision,
+            idempotency_key=f"source-event-recorded:{event.source_event_id}",
+            causation_id=message_id,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "source_event_id": event.source_event_id,
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": identity.kind.value,
+                "telegram_chat_id": identity.telegram_id,
+                "registry_generation": registry_generation,
+                "telegram_message_id": event.telegram_message_id,
+                "event_kind": event.kind.value,
+                "source_message_revision_id": (
+                    f"{source_message_id}:revision:{event.revision}"
+                ),
+                "event_time": event.event_time.isoformat(),
+                "body": event.body,
+            },
+        )
+        try:
+            return self.store.commit_source_event(
+                event=event,
+                registry_generation=registry_generation,
+                envelope=envelope,
+                recorded_at=recorded_at,
+                inject_database_failure=inject_database_failure,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def notify_telegram_live_update(self, identity: TelegramPeerIdentity) -> None:
+        """Let a Telethon callback wake Ingestion without committing progress."""
+        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
+            raise RuntimeError("only Ingestion receives Telegram live callbacks")
+        self.telegram_ingestion.notify_live_update(identity)
+
+    def redeliver_source_event(self, incoming: RawContractEnvelope) -> bool:
+        """Consume an at-least-once Source Event delivery after queue replay."""
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application consumes SourceEventRecorded")
+        if incoming.contract_version not in self.versions_for(
+            ContractName.SOURCE_EVENT_RECORDED
+        ):
+            raise ValueError("SourceEventRecorded version is unsupported")
+        envelope = ContractEnvelope.from_raw(incoming)
+        result = self.store.accept_source_event(
+            incoming=envelope,
+            received_at=self.clock.now(),
+        )
+        return result is ConsumeResult.APPLIED
 
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
@@ -5689,6 +5788,16 @@ class RuntimeApplication:
             and supported_incoming is not None
         ):
             self._complete_search(supported_incoming)
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_EVENT_RECORDED
+            and incoming.contract_version == 3
+            and supported_incoming is not None
+        ):
+            self.store.accept_source_event(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
             return True
         if (
             incoming.contract_name is ContractName.SEARCH_COMPLETED
