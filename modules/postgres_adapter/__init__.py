@@ -1600,59 +1600,82 @@ class PostgresRoleStore:
                 raise RuntimeError("Source Chat generation is no longer eligible")
             if context["checkpoint"] != event.from_checkpoint:
                 return False
-            inserted = connection.execute(
-                """
-                INSERT INTO football_runtime.source_event_records (
-                    source_event_id, message_id, peer_kind, telegram_chat_id,
-                    registry_generation, telegram_message_id,
-                    source_message_revision, event_kind, body, event_time,
-                    recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_event_id) DO NOTHING
-                RETURNING source_event_id
-                """,
-                (
-                    event.source_event_id,
-                    envelope.message_id,
-                    identity.kind.value,
-                    identity.telegram_id,
-                    registry_generation,
-                    event.telegram_message_id,
-                    event.revision,
-                    event.kind.value,
-                    event.body,
-                    event.event_time,
-                    recorded_at,
-                ),
-            ).fetchone()
-            if inserted is not None:
-                _insert_outbox(connection, envelope)
-                if inject_database_failure:
-                    raise OutboxConflictError
-            else:
-                existing = connection.execute(
+            known_transport_identity = event.kind is SourceEventKind.CREATE
+            if not known_transport_identity:
+                known_transport_identity = (
+                    connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.source_event_records
+                        WHERE peer_kind = %s
+                          AND telegram_chat_id = %s
+                          AND registry_generation = %s
+                          AND telegram_message_id = %s
+                        LIMIT 1
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.telegram_message_id,
+                        ),
+                    ).fetchone()
+                    is not None
+                )
+            if known_transport_identity:
+                inserted = connection.execute(
                     """
-                    SELECT message_id, peer_kind, telegram_chat_id,
-                           registry_generation, telegram_message_id,
-                           source_message_revision, event_kind, body, event_time
-                    FROM football_runtime.source_event_records
-                    WHERE source_event_id = %s
+                    INSERT INTO football_runtime.source_event_records (
+                        source_event_id, message_id, peer_kind, telegram_chat_id,
+                        registry_generation, telegram_message_id,
+                        source_message_revision, event_kind, body, event_time,
+                        recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (source_event_id) DO NOTHING
+                    RETURNING source_event_id
                     """,
-                    (event.source_event_id,),
+                    (
+                        event.source_event_id,
+                        envelope.message_id,
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        event.telegram_message_id,
+                        event.revision,
+                        event.kind.value,
+                        event.body,
+                        event.event_time,
+                        recorded_at,
+                    ),
                 ).fetchone()
-                expected = {
-                    "message_id": envelope.message_id,
-                    "peer_kind": identity.kind.value,
-                    "telegram_chat_id": identity.telegram_id,
-                    "registry_generation": registry_generation,
-                    "telegram_message_id": event.telegram_message_id,
-                    "source_message_revision": event.revision,
-                    "event_kind": event.kind.value,
-                    "body": event.body,
-                    "event_time": event.event_time,
-                }
-                if existing is None or dict(existing) != expected:
-                    raise OutboxConflictError
+                if inserted is not None:
+                    _insert_outbox(connection, envelope)
+                    if inject_database_failure:
+                        raise OutboxConflictError
+                else:
+                    existing = connection.execute(
+                        """
+                        SELECT message_id, peer_kind, telegram_chat_id,
+                               registry_generation, telegram_message_id,
+                               source_message_revision, event_kind, body, event_time
+                        FROM football_runtime.source_event_records
+                        WHERE source_event_id = %s
+                        """,
+                        (event.source_event_id,),
+                    ).fetchone()
+                    expected = {
+                        "message_id": envelope.message_id,
+                        "peer_kind": identity.kind.value,
+                        "telegram_chat_id": identity.telegram_id,
+                        "registry_generation": registry_generation,
+                        "telegram_message_id": event.telegram_message_id,
+                        "source_message_revision": event.revision,
+                        "event_kind": event.kind.value,
+                        "body": event.body,
+                        "event_time": event.event_time,
+                    }
+                    if existing is None or dict(existing) != expected:
+                        raise OutboxConflictError
             connection.execute(
                 """
                 INSERT INTO football_runtime.source_ingestion_checkpoints (
@@ -1763,7 +1786,18 @@ class PostgresRoleStore:
                     ),
                 ).fetchone()
                 if updated is None:
-                    raise RuntimeError("Source Message edit has no earlier revision")
+                    source_message_exists = connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.source_messages
+                        WHERE source_message_id = %s
+                        """,
+                        (incoming.subject_id,),
+                    ).fetchone()
+                    if source_message_exists is None:
+                        raise RuntimeError(
+                            "Source Message edit has no earlier revision"
+                        )
             elif payload["event_kind"] == SourceEventKind.DELETE.value:
                 updated = connection.execute(
                     """
@@ -1784,9 +1818,18 @@ class PostgresRoleStore:
                     ),
                 ).fetchone()
                 if updated is None:
-                    raise RuntimeError(
-                        "Source Message deletion has no earlier revision"
-                    )
+                    source_message_exists = connection.execute(
+                        """
+                        SELECT 1
+                        FROM football_runtime.source_messages
+                        WHERE source_message_id = %s
+                        """,
+                        (incoming.subject_id,),
+                    ).fetchone()
+                    if source_message_exists is None:
+                        raise RuntimeError(
+                            "Source Message deletion has no earlier revision"
+                        )
             else:
                 raise RuntimeError("this Source Event kind is not implemented")
             connection.execute(

@@ -120,6 +120,145 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
     system.reset()
 
 
+def test_transport_proven_post_boundary_event_ignores_earlier_event_time_on_retry() -> (
+    None
+):
+    telethon = ControlledTelegramIngestionAdapter()
+    processing_started_at = datetime(2026, 9, 12, 10, 30, tzinfo=UTC)
+    clock = FrozenClock(datetime(2026, 8, 12, 10, 30, tzinfo=UTC))
+    administrator_id = 47_011
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_701_100,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_boundary",
+        identity=identity,
+        transport_boundary="channel-pts:4800",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=processing_started_at,
+        administrator_id=administrator_id,
+        address="@synthetic_boundary",
+    )
+    telethon.add_difference_event(
+        identity=identity,
+        from_checkpoint="channel-pts:4800",
+        to_checkpoint="channel-pts:4801",
+        source_event_id="source-event:transport-boundary:1",
+        telegram_message_id=1_101,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Transport cursor proves this event follows registration.",
+        event_time=processing_started_at,
+    )
+    assert len(system.source_chats()) == 1
+
+    with pytest.raises(InjectedFailureError):
+        system.process_next_telegram_difference(
+            identity=identity,
+            registry_generation=1,
+            inject_database_failure=True,
+        )
+
+    assert (
+        system.ingestion_checkpoint(identity=identity, registry_generation=1)
+        == "channel-pts:4800"
+    )
+    assert system.process_next_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert not system.process_next_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+
+    assert (
+        system.ingestion_checkpoint(identity=identity, registry_generation=1)
+        == "channel-pts:4801"
+    )
+    assert len(system.source_events()) == 1
+    assert len(system.source_messages()) == 1
+    assert len(system.source_message_revisions()) == 1
+    system.reset()
+
+
+def test_pre_boundary_message_edit_advances_without_retaining_content() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    processing_started_at = datetime(2026, 9, 12, 10, 45, tzinfo=UTC)
+    edited_at = processing_started_at + timedelta(minutes=5)
+    clock = FrozenClock(datetime(2026, 8, 12, 10, 45, tzinfo=UTC))
+    administrator_id = 47_012
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_701_200,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_old_edit",
+        identity=identity,
+        transport_boundary="channel-pts:4810",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=processing_started_at,
+        administrator_id=administrator_id,
+        address="@synthetic_old_edit",
+    )
+    telethon.add_difference_event(
+        identity=identity,
+        from_checkpoint="channel-pts:4810",
+        to_checkpoint="channel-pts:4811",
+        source_event_id="source-event:pre-boundary-edit:2",
+        telegram_message_id=1_201,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body="This pre-boundary original must not be retained.",
+        event_time=edited_at,
+    )
+    clock.advance_to(edited_at)
+
+    assert system.process_next_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_source_event()
+
+    assert (
+        system.ingestion_checkpoint(identity=identity, registry_generation=1)
+        == "channel-pts:4811"
+    )
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    system.reset()
+
+
 def test_irrelevant_event_is_recorded_without_content_pre_screening() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     registered_at = datetime(2026, 9, 12, 11, 0, tzinfo=UTC)
@@ -279,6 +418,99 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
         )
         == "channel-pts:4722"
     )
+    system.reset()
+
+
+def test_leased_older_revision_is_preserved_without_regressing_current_state() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 12, 30, tzinfo=UTC)
+    revision_times = (
+        registered_at + timedelta(minutes=1),
+        registered_at + timedelta(minutes=2),
+        registered_at + timedelta(minutes=3),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 12, 30, tzinfo=UTC))
+    administrator_id = 47_013
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_701_300,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_leased_edit",
+        identity=identity,
+        transport_boundary="channel-pts:4820",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address="@synthetic_leased_edit",
+    )
+    for revision, kind, body, event_time in (
+        (1, SourceEventKind.CREATE, "Revision one.", revision_times[0]),
+        (2, SourceEventKind.EDIT, "Revision two.", revision_times[1]),
+        (3, SourceEventKind.EDIT, "Revision three.", revision_times[2]),
+    ):
+        telethon.add_difference_event(
+            identity=identity,
+            from_checkpoint=f"channel-pts:{4819 + revision}",
+            to_checkpoint=f"channel-pts:{4820 + revision}",
+            source_event_id=f"source-event:leased-edit:{revision}",
+            telegram_message_id=1_301,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=event_time,
+        )
+
+    clock.advance_to(revision_times[0])
+    assert system.process_next_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    for event_time in revision_times[1:]:
+        clock.advance_to(event_time)
+        assert system.process_next_telegram_difference(
+            identity=identity,
+            registry_generation=1,
+        )
+
+    leased = system.lease_next_source_event()
+    assert leased is not None
+    assert leased.subject_revision == 2
+    assert system.process_next_source_event()
+    assert system.source_messages()[0].current_revision == 3
+    assert [revision.revision for revision in system.source_message_revisions()] == [
+        1,
+        3,
+    ]
+
+    clock.advance_to(revision_times[2] + timedelta(seconds=31))
+    assert system.process_next_source_event()
+
+    assert [revision.revision for revision in system.source_message_revisions()] == [
+        1,
+        2,
+        3,
+    ]
+    current = system.source_messages()[0]
+    assert current.current_revision == 3
+    assert current.body == "Revision three."
+    assert not system.redeliver_source_event("source-event:leased-edit:2")
+    assert not system.redeliver_source_event("source-event:leased-edit:3")
+    assert len(system.source_message_revisions()) == 3
     system.reset()
 
 

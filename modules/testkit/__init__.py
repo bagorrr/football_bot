@@ -993,6 +993,15 @@ class AcceptanceSpine:
         """Let Application consume one durable SourceEventRecorded handoff."""
         return self._roles[RuntimeRole.APPLICATION].process_next()
 
+    def lease_next_source_event(self) -> RawContractEnvelope | None:
+        """Lease one Application handoff without consuming it."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        claimed = application.store.claim_next(
+            supported_versions=application.supported_versions,
+            claimed_at=application.clock.now(),
+        )
+        return None if claimed is None else claimed.envelope
+
     def ingestion_checkpoint(
         self,
         *,
