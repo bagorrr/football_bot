@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import psycopg
 import pytest
 
 from modules.contracts import ContractName, FailureCode, RuntimeRole
@@ -194,6 +197,239 @@ def test_account_difference_discards_pre_boundary_create_without_retaining_body(
     assert system.source_event_contracts() == ()
     assert not system.process_next_source_event()
     assert system.source_messages() == ()
+    system.reset()
+
+
+def test_ineligible_account_event_advances_body_free_and_does_not_wedge_restart() -> (
+    None
+):
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 20, tzinfo=UTC))
+    ineligible_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_606_100,
+    )
+    eligible_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_606_200,
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_606,
+        qts=61,
+        seq=460,
+        date=datetime(2026, 9, 12, 9, 19, tzinfo=UTC),
+    )
+    discarded_checkpoint = TelegramAccountCheckpoint(
+        pts=4_607,
+        qts=62,
+        seq=461,
+        date=datetime(2026, 9, 12, 9, 20, tzinfo=UTC),
+    )
+    eligible_checkpoint = TelegramAccountCheckpoint(
+        pts=4_608,
+        qts=63,
+        seq=462,
+        date=datetime(2026, 9, 12, 9, 21, tzinfo=UTC),
+    )
+    telethon.allow_public_username(
+        address="@synthetic_account_after_discard",
+        identity=eligible_identity,
+        transport_boundary="chat-sequence:461",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_061,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 20, tzinfo=UTC),
+        administrator_id=46_061,
+        address="@synthetic_account_after_discard",
+        update_suffix="account-after-discard",
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    telethon.add_account_difference_event(
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=discarded_checkpoint,
+        identity=ineligible_identity,
+        registry_generation=1,
+        source_event_id="source-event:unregistered-account:1",
+        telegram_message_id=161,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="This unregistered body must never be retained.",
+        event_time=discarded_checkpoint.date,
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=discarded_checkpoint,
+        to_checkpoint=eligible_checkpoint,
+        identity=eligible_identity,
+        registry_generation=1,
+        source_event_id="source-event:eligible-after-discard:1",
+        telegram_message_id=162,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Eligible basic-chat event after an ineligible account update.",
+        event_time=eligible_checkpoint.date,
+    )
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == discarded_checkpoint
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+
+    system.restart(RuntimeRole.INGESTION)
+    assert system.process_next_account_telegram_difference()
+    assert telethon.account_difference_requests[-1] == discarded_checkpoint
+    assert system.account_ingestion_checkpoint() == eligible_checkpoint
+    assert len(system.source_events()) == 1
+    assert len(system.source_event_contracts()) == 1
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 1
+    assert len(system.source_message_revisions()) == 1
+    assert not system.process_next_account_telegram_difference()
+    assert telethon.account_difference_requests[-1] == eligible_checkpoint
+    system.reset()
+
+
+def test_generation_replacement_serializes_before_account_ingestion_commit() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 25, tzinfo=UTC))
+    administrator_id = 46_062
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_606_300,
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_608,
+        qts=63,
+        seq=462,
+        date=datetime(2026, 9, 12, 9, 24, tzinfo=UTC),
+    )
+    advanced_checkpoint = TelegramAccountCheckpoint(
+        pts=4_609,
+        qts=64,
+        seq=463,
+        date=datetime(2026, 9, 12, 9, 25, tzinfo=UTC),
+    )
+    telethon.allow_public_username(
+        address="@synthetic_registry_race_one",
+        identity=identity,
+        transport_boundary="chat-sequence:462",
+    )
+    telethon.allow_public_username(
+        address="@synthetic_registry_race_two",
+        identity=identity,
+        transport_boundary="chat-sequence:900",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 25, tzinfo=UTC),
+        administrator_id=administrator_id,
+        address="@synthetic_registry_race_one",
+        update_suffix="registry-race-one",
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    telethon.add_account_difference_event(
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:registry-race:1",
+        telegram_message_id=163,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="This stale-generation body must not survive the race.",
+        event_time=advanced_checkpoint.date,
+    )
+
+    replacement_update_id = "address:registry-race-two"
+    system.select_source_chats_action(
+        update_id="add-source-chat:registry-race-two",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id=replacement_update_id,
+        telegram_user_id=administrator_id,
+        address="@synthetic_registry_race_two",
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.process_next_source_chat_admission()
+    resolved = system.source_chat_contracts(
+        update_id=replacement_update_id,
+        contract_name=ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+    )
+    assert len(resolved) == 1
+
+    database_url = os.environ["TEST_DATABASE_URL"]
+    peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+    with (
+        psycopg.connect(database_url) as registry_gate,
+        psycopg.connect(database_url) as checkpoint_gate,
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        registry_gate.execute(
+            """
+            SELECT 1
+            FROM football_runtime.source_chat_registry
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = 1
+            FOR UPDATE
+            """,
+            (identity.kind.value, identity.telegram_id),
+        ).fetchone()
+        checkpoint_gate.execute(
+            """
+            SELECT 1
+            FROM football_runtime.telegram_account_difference_checkpoints
+            WHERE singleton
+            FOR UPDATE
+            """
+        ).fetchone()
+
+        replacement = executor.submit(system.process_next_source_chat_registration)
+        _wait_until_advisory_lock_is_held(database_url, peer_key)
+        ingestion = executor.submit(system.process_next_account_telegram_difference)
+        _wait_for_blocked_database_sessions(database_url, minimum=2)
+
+        registry_gate.commit()
+        assert replacement.result(timeout=5)
+        checkpoint_gate.commit()
+        assert ingestion.result(timeout=5)
+
+    assert [entry.registry_generation for entry in system.source_chats()] == [1, 2]
+    assert not system.source_chats()[0].enabled
+    assert system.source_chats()[1].enabled
+    assert system.account_ingestion_checkpoint() == advanced_checkpoint
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    system.restart(RuntimeRole.INGESTION)
+    assert not system.process_next_account_telegram_difference()
+    assert telethon.account_difference_requests[-1] == advanced_checkpoint
     system.reset()
 
 
@@ -1492,3 +1728,41 @@ def _register_source_chat(
         address=address,
     )
     system.process_source_chat_registrations_until_idle()
+
+
+def _wait_until_advisory_lock_is_held(database_url: str, lock_key: str) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            acquired = connection.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            ).fetchone()
+            assert acquired is not None
+            if not acquired[0]:
+                return
+            connection.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+        time.sleep(0.01)
+    raise AssertionError(f"PostgreSQL advisory lock was not held: {lock_key}")
+
+
+def _wait_for_blocked_database_sessions(database_url: str, *, minimum: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with psycopg.connect(database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT count(*)
+                FROM pg_catalog.pg_stat_activity
+                WHERE datname = current_database()
+                  AND wait_event_type = 'Lock'
+                """
+            ).fetchone()
+        assert row is not None
+        if row[0] >= minimum:
+            return
+        time.sleep(0.01)
+    raise AssertionError("PostgreSQL sessions did not reach the forced lock race")

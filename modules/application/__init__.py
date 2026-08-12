@@ -5624,7 +5624,10 @@ class RuntimeApplication:
             )
             is None
         ):
-            return False
+            return self.store.discard_account_difference_event(
+                event=event,
+                recorded_at=self.clock.now(),
+            )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
         source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
         message_id = derive_source_event_message_id(event.source_event_id)

@@ -1655,6 +1655,80 @@ class PostgresRoleStore:
             raise LookupError(identity)
         return context.checkpoint
 
+    def discard_account_difference_event(
+        self,
+        *,
+        event: TelegramDifferenceEvent,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance one ineligible account event without retaining content."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if not isinstance(event.from_checkpoint, TelegramAccountCheckpoint):
+            raise TypeError("discard requires an account checkpoint")
+        if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+            raise TypeError("discard requires an account checkpoint")
+        identity = event.source_chat_identity
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            context = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    event.registry_generation,
+                ),
+            ).fetchone()
+            if context is not None:
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            account_checkpoint = connection.execute(
+                """
+                SELECT pts, qts, seq, checkpoint_date
+                FROM football_runtime.telegram_account_difference_checkpoints
+                WHERE singleton
+                FOR UPDATE
+                """
+            ).fetchone()
+            if account_checkpoint is None:
+                raise LookupError("Telegram account checkpoint is not initialized")
+            current_checkpoint = TelegramAccountCheckpoint(
+                pts=account_checkpoint["pts"],
+                qts=account_checkpoint["qts"],
+                seq=account_checkpoint["seq"],
+                date=account_checkpoint["checkpoint_date"],
+            )
+            if current_checkpoint != event.from_checkpoint:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_account_difference_checkpoints
+                SET pts = %s, qts = %s, seq = %s,
+                    checkpoint_date = %s, advanced_at = %s
+                WHERE singleton
+                """,
+                (
+                    event.to_checkpoint.pts,
+                    event.to_checkpoint.qts,
+                    event.to_checkpoint.seq,
+                    event.to_checkpoint.date,
+                    recorded_at,
+                ),
+            )
+        return True
+
     def commit_source_event(
         self,
         *,
@@ -1670,6 +1744,7 @@ class PostgresRoleStore:
         identity = event.source_chat_identity
         account_route = isinstance(event.from_checkpoint, TelegramAccountCheckpoint)
         channel_route = isinstance(event.from_checkpoint, TelegramChannelCheckpoint)
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
         lock_key = (
             "source-ingestion:account"
             if account_route
@@ -1679,6 +1754,10 @@ class PostgresRoleStore:
             )
         )
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
             connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (lock_key,),
@@ -1697,7 +1776,44 @@ class PostgresRoleStore:
                 ),
             ).fetchone()
             if context is None:
-                raise RuntimeError("Source Chat generation is no longer eligible")
+                if not account_route:
+                    raise RuntimeError("Source Chat generation is no longer eligible")
+                if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+                    raise TypeError("account event requires an account checkpoint")
+                account_checkpoint = connection.execute(
+                    """
+                    SELECT pts, qts, seq, checkpoint_date
+                    FROM football_runtime.telegram_account_difference_checkpoints
+                    WHERE singleton
+                    FOR UPDATE
+                    """
+                ).fetchone()
+                if account_checkpoint is None:
+                    raise LookupError("Telegram account checkpoint is not initialized")
+                current_account_checkpoint = TelegramAccountCheckpoint(
+                    pts=account_checkpoint["pts"],
+                    qts=account_checkpoint["qts"],
+                    seq=account_checkpoint["seq"],
+                    date=account_checkpoint["checkpoint_date"],
+                )
+                if current_account_checkpoint != event.from_checkpoint:
+                    return False
+                connection.execute(
+                    """
+                    UPDATE football_runtime.telegram_account_difference_checkpoints
+                    SET pts = %s, qts = %s, seq = %s,
+                        checkpoint_date = %s, advanced_at = %s
+                    WHERE singleton
+                    """,
+                    (
+                        event.to_checkpoint.pts,
+                        event.to_checkpoint.qts,
+                        event.to_checkpoint.seq,
+                        event.to_checkpoint.date,
+                        recorded_at,
+                    ),
+                )
+                return True
             if account_route:
                 account_checkpoint = connection.execute(
                     """

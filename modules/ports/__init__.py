@@ -650,6 +650,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read one Source Chat generation's durable channel pts."""
         ...
 
+    def discard_account_difference_event(
+        self,
+        *,
+        event: TelegramDifferenceEvent,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance one ineligible account event without retaining content."""
+        ...
+
     def commit_source_event(
         self,
         *,
