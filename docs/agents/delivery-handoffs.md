@@ -10,13 +10,22 @@ Implementation-ticket coordination is governed in detail by
 matching lifecycle gates and handoff shapes; the normative orchestration policy
 wins if a shortened prompt here omits operational detail.
 
+For implementation-ticket transitions, repository policy governs orchestration
+mechanics, the latest applicable durable product-owner amendment on the
+canonical GitHub artifact governs authorization, and live GitHub state governs
+current tickets, dependencies, pull requests, and checks. If those sources
+leave a material conflict unresolved, stop for a product-owner decision.
+
 ## Reminder mechanism
 
 `AGENTS.md` requires every agent working on a delivery stage to read this file
 at the start and again before its final response. At every lifecycle gate, the
 agent must show the next stage and a paste-ready prompt in a `Next handoff`
-block. This makes the reminder appear in the conversation exactly when a new
-thread is required.
+block. When a next-ticket coordinator was created automatically, the block
+identifies it and presents the prompt as fallback documentation only. This
+makes the reminder appear in the conversation exactly when a new thread is
+required without asking the product owner to relay an already completed
+handoff.
 
 A local Git hook is deliberately not the canonical reminder. The important
 events are issue resolution, map completion, specification approval, ticket
@@ -36,8 +45,10 @@ Before telling the user to leave the current thread:
 3. Confirm the working checkout is clean and based on current `main` when the
    next thread will reuse the same workspace.
 4. State whether a fresh thread is required.
-5. Provide a prompt that names the exact map, issue, specification, ticket, or
-   pull request.
+5. State whether that thread was created automatically, requires manual
+   creation, or could not be created.
+6. Provide a prompt that names the exact map, issue, specification, ticket, or
+   pull request. Mark it as fallback-only when the thread already exists.
 
 Once these conditions hold, the user does not need to return to the old thread.
 
@@ -57,8 +68,11 @@ When work reaches or pauses at a gate, end the final response with:
 - Durable artifacts: <links>
 - Next action: <one action>
 - New thread: <yes or no>
+- Thread transition: <created automatically: ID/title, manual creation required,
+  not required, or creation failed: reason>
 
-Paste into the next thread:
+Paste into the next thread, or retain as fallback only if it was already
+created automatically:
 
 <paste-ready prompt, or "Not available until <gate>">
 ```
@@ -192,6 +206,15 @@ specification and ticket, exact `main`, dependency state, completed predecessor
 artifacts, authorization applicability, credentials or services, and scope
 constraints.
 
+Creation uses the supported Codex App task-creation mechanism and belongs to
+the completing ticket's authorized lifecycle. It does not start the next
+ticket. Before creation, reconcile active tasks and durable state to prevent a
+duplicate. The completing coordinator must not terminate until every required
+creation is confirmed or a genuine creation failure is reported. A successful
+creation is identified in the final `Next handoff` block, and its paste-ready
+prompt is fallback documentation only. If supported creation is unavailable or
+fails, report that fact and provide the prompt for manual recovery.
+
 The new coordinator performs only read-only readiness checks. It must stop and
 wait for a product-owner start approval that names the ticket or is exactly
 `Согласен` or `Утверждаю`. Before that approval it may not claim, dispatch,
@@ -285,17 +308,18 @@ standing authorization applies only through a durable amendment that freezes
 its covered existing tickets; it excludes later tickets, material scope or
 dependency changes, process-document pull requests, and deployment.
 
-No standing authorization is active for Specification #38 until a later
-durable GitHub amendment is published after independent review. Its current
-delivery amendment remains authoritative until then. In-flight ticket #42
-continues on its current workflow; the fresh coordinator/readiness boundary
-starts with the next ticket after #42.
+Project-specific authorization status and historical in-flight exceptions are
+not repeated in this document. Resolve them from the latest durable amendments,
+activation records, and supersession records on the canonical specification
+issue before every affected transition.
 
 After merge, verify ticket closure or reconcile it, publish a completion
 record, and wait for successful `quality` on the exact merge commit on `main`.
 Only then recompute the native graph and automatically create a fresh
 coordinator for each permitted next frontier. The old coordinator does not
-implement the next ticket itself.
+implement the next ticket itself. It does not finish its own lifecycle until
+each required coordinator creation is confirmed or a real creation failure is
+reported with a manual-recovery prompt.
 
 Every dispatch and mutation uses the idempotency key
 `<spec>:<ticket>:<stage>:<base-or-head>` and first reconciles GitHub, the native

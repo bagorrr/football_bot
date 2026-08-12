@@ -29,6 +29,17 @@ ticket, dependency state, exact `main`, completed predecessors and artifacts,
 applicable authorization state, required credentials or services, and known
 scope constraints.
 
+Next-frontier creation uses the supported Codex App task-creation mechanism and
+is part of the completing ticket's authorized lifecycle. It does not start the
+next ticket or transfer that ticket's mutation authority. Before each creation,
+the completing coordinator reconciles active tasks and durable state to avoid a
+duplicate. It must not terminate until every required creation is confirmed or
+a genuine creation failure is reported. On success, the final `Next handoff`
+block identifies the created coordinator and keeps any paste-ready prompt as
+fallback documentation only; the product owner is not asked to relay it. If
+supported creation is unavailable or fails, the coordinator reports the
+failure and provides the exact prompt for manual recovery.
+
 A new coordinator initially has read-only readiness authority. It reconciles
 routing, exact `main`, the live frontier, required credentials and services,
 the applicability of any standing authorization, GitHub transition records,
@@ -74,8 +85,9 @@ ordinary transitions:
 8. Verify the merge and ticket closure or reconcile them explicitly, publish
    the completion record, and wait for successful `quality` on the exact merge
    commit on `main`.
-9. Recompute the native graph and create the fresh next-frontier coordinators
-   permitted by it.
+9. Recompute the native graph, create and confirm the fresh next-frontier
+   coordinators permitted by it, and report their creation in the final
+   `Next handoff` block.
 
 Every implementation, independent-review, and fix task is fresh and uses
 `gpt-5.6-sol` with reasoning effort `high`. Review and fix tasks receive only
@@ -171,12 +183,14 @@ later-created tickets, material scope or dependency changes, process-document
 pull requests, release readiness, and deployment. If it does not apply, the
 current exact authorization rule remains in force.
 
-For Specification #38, no standing authorization is active until a later
-durable GitHub amendment is published after independent review. The
-[current delivery amendment](https://github.com/bagorrr/football_bot/issues/38#issuecomment-5153808765)
-remains authoritative until then. Ticket #42 remains on its in-flight workflow;
-this fresh coordinator and readiness boundary begins with the next ticket
-after #42.
+Project-specific authorization status and historical in-flight exceptions are
+not cached in this policy. Resolve them from the latest durable amendments,
+activation records, and supersession records on the canonical specification
+issue before every affected transition. This repository policy governs
+orchestration mechanics, the latest applicable durable product-owner record
+governs authorization, and live GitHub state governs current tickets,
+dependencies, pull requests, and checks. If those sources leave a material
+conflict unresolved, stop and request a product-owner decision.
 
 Release readiness and production deployment are separate lifecycle stages and
 always require explicit product-owner authorization. No start approval or

@@ -27,4 +27,9 @@ create a duplicate coordinator or task.
 
 Do not cross a fresh-thread boundary defined there. When a task reaches or
 stops at a lifecycle gate, end the final response with the required
-`Next handoff` block and a paste-ready prompt for the correct next thread.
+`Next handoff` block and a paste-ready prompt for the correct next thread. If
+an implementation-ticket coordinator has already created the next coordinator
+through the supported Codex App mechanism, identify that created thread and
+label the prompt as fallback documentation rather than asking the product
+owner to relay it. If supported thread creation is unavailable or fails, say
+so explicitly and provide the prompt for manual recovery.
