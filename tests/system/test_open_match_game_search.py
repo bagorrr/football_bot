@@ -899,6 +899,87 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         if opportunity.source_message_revision_id.endswith(":1003:revision:1")
     )
     assert relative_opportunity.publication_state == "active"
+    wrong_date_body = (
+        "20 августа 2026 на Петроградской нужны два игрока. Пишите @wrong_date_contact"
+    )
+    classifier.return_for(
+        body=wrong_date_body,
+        result=ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v1",
+                "disposition": "accepted",
+                "candidates": [
+                    {
+                        "candidate_key": "wrong-normalized-date",
+                        "opportunity_type": "open_match",
+                        "evidence": {
+                            "opportunity": "нужны два игрока",
+                            "event_time": "20 августа 2026",
+                            "location": "на Петроградской",
+                            "open_places": "два игрока",
+                        },
+                        "location": {
+                            "mention": "на Петроградской",
+                            "place_id": "station:ru:spb:petrogradskaya",
+                            "country_id": "country:ru",
+                            "city_id": "city:ru:saint-petersburg",
+                        },
+                        "event_time": {
+                            "start_local_date": "2026-08-02",
+                            "end_local_date": "2026-08-02",
+                            "iana_timezone": "Europe/Moscow",
+                        },
+                        "open_places": 2,
+                        "response_routes": [
+                            {
+                                "kind": "explicit_telegram_username",
+                                "value": "@wrong_date_contact",
+                                "evidence": "@wrong_date_contact",
+                            }
+                        ],
+                    }
+                ],
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="controlled_recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    before_wrong_date = len(system.opportunities())
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        source_event_id="source-event:open-match:wrong-date",
+        telegram_message_id=1004,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=wrong_date_body,
+        event_time=datetime(2026, 8, 18, 17, 31, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    assert len(system.opportunities()) == before_wrong_date
+    wrong_date_user_id = bot_user_id + 7
+    _advance_to_complete_game_search(system, bot_user_id=wrong_date_user_id)
+    system.submit_search(
+        update_id="submit-after-wrong-date",
+        telegram_user_id=wrong_date_user_id,
+    )
+    system.process_searches_until_idle()
+    wrong_date_search = system.completed_searches(wrong_date_user_id)[0]
+    assert all(
+        ":1004:" not in dict(result.card_facts)["opportunity_id"]
+        for result in system.results(wrong_date_search.completed_search_id)
+    )
     system.reset()
 
 

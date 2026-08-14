@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import date
 from pathlib import Path
 
+from modules.application import _event_time_is_supported
 from modules.classifier_contract import classifier_output_is_schema_valid
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
 from modules.testkit import ControlledModelAdapter
@@ -114,4 +116,14 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     assert not classifier_output_is_schema_valid(
         invalid_domain_value,
         body=cases[0]["source"],
+    )
+
+
+def test_offline_corpus_rejects_unrelated_numeric_date_cooccurrence() -> None:
+    """A wrong normalized day cannot borrow another fact's numeric token."""
+    assert not _event_time_is_supported(
+        date(2026, 8, 2),
+        date(2026, 8, 2),
+        None,
+        "20 August 2026 — two players are needed",
     )
