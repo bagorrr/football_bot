@@ -1,3 +1,23 @@
+ALTER TABLE football_runtime.source_event_records
+    ADD COLUMN bounded_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN reply_to_telegram_message_id bigint
+        CHECK (reply_to_telegram_message_id > 0);
+
+ALTER TABLE football_runtime.source_messages
+    ADD COLUMN bounded_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN reply_to_telegram_message_id bigint
+        CHECK (reply_to_telegram_message_id > 0);
+
+ALTER TABLE football_runtime.source_message_revisions
+    ADD COLUMN bounded_metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN registry_generation bigint NOT NULL DEFAULT 1
+        CHECK (registry_generation > 0),
+    ADD COLUMN reply_to_telegram_message_id bigint
+        CHECK (reply_to_telegram_message_id > 0);
+
+GRANT UPDATE (bounded_metadata, reply_to_telegram_message_id)
+    ON football_runtime.source_messages TO football_application;
+
 CREATE TABLE football_runtime.classification_attempts (
     owner_role text NOT NULL DEFAULT 'classification'
         CHECK (owner_role = 'classification'),

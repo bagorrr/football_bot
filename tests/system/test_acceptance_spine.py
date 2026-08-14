@@ -141,7 +141,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
 
     snapshot = spine.run(
         "unregistered-future-contract",
-        source_contract_version=4,
+        source_contract_version=5,
         source_payload=future_payload,
     )
 
@@ -153,7 +153,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
             producer=RuntimeRole.INGESTION,
             consumer=RuntimeRole.APPLICATION,
             contract_name=ContractName.SOURCE_EVENT_RECORDED,
-            contract_version=4,
+            contract_version=5,
             failure_code=FailureCode.UNSUPPORTED_CONTRACT_VERSION,
         ),
     )
@@ -573,6 +573,7 @@ def test_v2_classifier_command_rejects_mismatched_envelope_identity(
             "source_recorded_at": "2026-08-14T12:00:01+00:00",
             "context_bundle_version": "primary-classifier-context-v1",
             "source_chat_reference": "source-chat:channel:501",
+            "source_chat_registry_generation": 1,
             "source_chat_timezone": "Europe/Moscow",
             "source_chat_geography": {"country_id": None, "city_id": None},
             "bounded_metadata": {
@@ -580,6 +581,7 @@ def test_v2_classifier_command_rejects_mismatched_envelope_identity(
                 "attachment_types": [],
             },
             "eligible_reply_context": None,
+            "direct_reply_to_telegram_message_id": None,
         },
     )
 

@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime, timedelta
 from enum import IntEnum
 from hashlib import sha256
 from typing import cast
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -63,7 +64,9 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
     UserIntent,
+    empty_bounded_source_metadata,
     is_valid_source_chat_address,
+    render_response_route,
 )
 from modules.ports import (
     AcceptanceRoleStore,
@@ -4908,6 +4911,7 @@ def _accept_location(
         resolver_version=location.resolver_version,
         glossary_version=location.glossary_version,
         localized_display_names=location.localized_display_names,
+        verified_disjoint_place_ids=location.verified_disjoint_place_ids,
     )
 
 
@@ -4931,6 +4935,7 @@ def _merge_location_candidates(
         or first.country_id != second.country_id
         or first.city_id != second.city_id
         or first.verified_parent_ids != second.verified_parent_ids
+        or first.verified_disjoint_place_ids != second.verified_disjoint_place_ids
         or first.parent_display_names != second.parent_display_names
         or first.iana_timezone != second.iana_timezone
         or first.resolver_version != second.resolver_version
@@ -5027,6 +5032,19 @@ def _valid_location_presentation(
     )
 
 
+def _valid_location_disjointness(
+    candidate: LocationCandidate | AcceptedLocation,
+) -> bool:
+    disjoint_ids = candidate.verified_disjoint_place_ids
+    return (
+        len(disjoint_ids) <= 128
+        and len(disjoint_ids) == len(set(disjoint_ids))
+        and all(disjoint_id for disjoint_id in disjoint_ids)
+        and candidate.place_id not in disjoint_ids
+        and not set(candidate.verified_parent_ids).intersection(disjoint_ids)
+    )
+
+
 def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
     return (
         bool(candidate.place_id)
@@ -5034,6 +5052,7 @@ def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
         and _valid_location_presentation(candidate)
         and bool(candidate.resolver_version)
         and bool(candidate.glossary_version)
+        and _valid_location_disjointness(candidate)
         and candidate.geographic_type is GeographicType.COUNTRY
         and candidate.country_id == candidate.place_id
         and candidate.city_id is None
@@ -5060,6 +5079,7 @@ def _valid_city(
         and _valid_location_presentation(candidate)
         and bool(candidate.resolver_version)
         and bool(candidate.glossary_version)
+        and _valid_location_disjointness(candidate)
         and candidate.geographic_type is GeographicType.CITY
         and candidate.country_id == country.place_id
         and candidate.city_id == candidate.place_id
@@ -5090,6 +5110,7 @@ def _valid_sub_city_areas(
             or not _valid_location_presentation(candidate)
             or not candidate.resolver_version
             or not candidate.glossary_version
+            or not _valid_location_disjointness(candidate)
             or candidate.geographic_type not in _SUB_CITY_TYPES
             or candidate.country_id != country.place_id
             or candidate.city_id != city.place_id
@@ -5847,9 +5868,36 @@ def _open_match_result_message(
             f"{event_end_date.day} {months[event_end_date.month - 1]} "
             f"{event_end_date.year}"
         )
-    when = date_copy + (
-        f", {facts['exact_local_time']}" if "exact_local_time" in facts else ""
-    )
+    day_part_copy = {
+        "en": {
+            "morning": "morning",
+            "daytime": "daytime",
+            "evening": "evening",
+            "night": "night",
+        },
+        "ru": {
+            "morning": "утром",
+            "daytime": "днём",
+            "evening": "вечером",
+            "night": "ночью",
+        },
+        "es": {
+            "morning": "por la mañana",
+            "daytime": "por la tarde",
+            "evening": "por la tarde",
+            "night": "por la noche",
+        },
+        "fr": {
+            "morning": "le matin",
+            "daytime": "l’après-midi",
+            "evening": "le soir",
+            "night": "la nuit",
+        },
+    }[copy_locale]
+    accepted_time = facts.get("exact_local_time")
+    if accepted_time is None and facts.get("day_part") is not None:
+        accepted_time = day_part_copy[facts["day_part"]]
+    when = date_copy + (f", {accepted_time}" if accepted_time is not None else "")
     where = facts[f"city_display_{copy_locale}"]
     if int(facts.get("location_specificity", "0")) > 1:
         where += f", {facts[f'place_display_{copy_locale}']}"
@@ -6079,11 +6127,16 @@ def _open_match_result_message(
         if key not in confirmed_keys and known_values.get(key)
     )
     additional_copy = f"\n{labels[8]}: {additional}\n" if additional else ""
+    route_copy = render_response_route(
+        facts["response_route_kind"],
+        facts["response_route_value"],
+        copy_locale,
+    )
     text = (
         f"{title}\n{when}\n{where}\n{details}\n\n"
         f"{possible_copy}{match_copy}\n{additional_copy}\n"
         f"{labels[3]}: {posted}\n"
-        f"{labels[4]}: {facts['response_route_value']}\n\n"
+        f"{labels[4]}: {route_copy}\n\n"
         f"{labels[7]}"
     )
     menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
@@ -6640,7 +6693,7 @@ class RuntimeApplication:
                 definition.version == 1
                 or (
                     definition.name is ContractName.SOURCE_EVENT_RECORDED
-                    and definition.version == 3
+                    and definition.version in {3, 4}
                 )
                 or (
                     definition.name is ContractName.SEARCH_COMPLETED
@@ -6756,7 +6809,7 @@ class RuntimeApplication:
         recorded_at = self.clock.now()
         envelope = ContractEnvelope(
             contract_name=ContractName.SOURCE_EVENT_RECORDED,
-            contract_version=3,
+            contract_version=4,
             message_id=message_id,
             producer=RuntimeRole.INGESTION,
             consumer=RuntimeRole.APPLICATION,
@@ -6779,6 +6832,8 @@ class RuntimeApplication:
                 ),
                 "event_time": event.event_time.isoformat(),
                 "body": event.body,
+                "bounded_metadata": dict(event.bounded_metadata),
+                "reply_to_telegram_message_id": event.reply_to_telegram_message_id,
             },
         )
         try:
@@ -6826,7 +6881,7 @@ class RuntimeApplication:
         recorded_at = self.clock.now()
         envelope = ContractEnvelope(
             contract_name=ContractName.SOURCE_EVENT_RECORDED,
-            contract_version=3,
+            contract_version=4,
             message_id=message_id,
             producer=RuntimeRole.INGESTION,
             consumer=RuntimeRole.APPLICATION,
@@ -6849,6 +6904,8 @@ class RuntimeApplication:
                 ),
                 "event_time": event.event_time.isoformat(),
                 "body": event.body,
+                "bounded_metadata": dict(event.bounded_metadata),
+                "reply_to_telegram_message_id": event.reply_to_telegram_message_id,
             },
         )
         try:
@@ -6978,7 +7035,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.SOURCE_EVENT_RECORDED
-            and incoming.contract_version == 3
+            and incoming.contract_version in {3, 4}
             and supported_incoming is not None
         ):
             payload = supported_incoming.payload
@@ -6988,12 +7045,14 @@ class RuntimeApplication:
                 and payload.get("event_kind") != "delete"
                 and isinstance(payload.get("body"), str)
             ):
+                identity = TelegramPeerIdentity(
+                    kind=TelegramPeerKind(str(payload["telegram_peer_kind"])),
+                    telegram_id=cast(int, payload["telegram_chat_id"]),
+                )
+                registry_generation = cast(int, payload["registry_generation"])
                 source_chat = self.store.eligible_source_chat_generation(
-                    identity=TelegramPeerIdentity(
-                        kind=TelegramPeerKind(str(payload["telegram_peer_kind"])),
-                        telegram_id=cast(int, payload["telegram_chat_id"]),
-                    ),
-                    registry_generation=cast(int, payload["registry_generation"]),
+                    identity=identity,
+                    registry_generation=registry_generation,
                 )
                 if source_chat is None:
                     self.store.reject_invalid_contract(
@@ -7001,6 +7060,33 @@ class RuntimeApplication:
                         received_at=self.clock.now(),
                     )
                     return True
+                reply_to_message_id = (
+                    cast(int | None, payload["reply_to_telegram_message_id"])
+                    if incoming.contract_version == 4
+                    else None
+                )
+                eligible_reply_context: dict[str, JsonValue] | None = None
+                if reply_to_message_id is not None:
+                    reply_revision = self.store.eligible_reply_revision(
+                        identity=identity,
+                        registry_generation=registry_generation,
+                        telegram_message_id=reply_to_message_id,
+                        current_event_time=datetime.fromisoformat(
+                            str(payload["event_time"])
+                        ),
+                    )
+                    if reply_revision is not None and reply_revision.body is not None:
+                        eligible_reply_context = {
+                            "relationship_kind": "direct_reply",
+                            "source_chat_reference": payload["source_chat_key"],
+                            "registry_generation": registry_generation,
+                            "telegram_message_id": reply_to_message_id,
+                            "source_message_revision_id": (
+                                reply_revision.source_message_revision_id
+                            ),
+                            "body": reply_revision.body,
+                            "source_event_time": reply_revision.event_time.isoformat(),
+                        }
                 classify = ContractEnvelope(
                     contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
                     contract_version=2,
@@ -7029,16 +7115,19 @@ class RuntimeApplication:
                         ),
                         "context_bundle_version": "primary-classifier-context-v1",
                         "source_chat_reference": payload["source_chat_key"],
+                        "source_chat_registry_generation": registry_generation,
                         "source_chat_timezone": source_chat.classifier_timezone,
                         "source_chat_geography": {
                             "country_id": source_chat.classifier_country_id,
                             "city_id": source_chat.classifier_city_id,
                         },
-                        "bounded_metadata": {
-                            "message_language": None,
-                            "attachment_types": [],
-                        },
-                        "eligible_reply_context": None,
+                        "bounded_metadata": (
+                            payload["bounded_metadata"]
+                            if incoming.contract_version == 4
+                            else empty_bounded_source_metadata()
+                        ),
+                        "eligible_reply_context": eligible_reply_context,
+                        "direct_reply_to_telegram_message_id": reply_to_message_id,
                     },
                 )
             self.store.accept_source_event(
@@ -7208,6 +7297,9 @@ class RuntimeApplication:
             source_recorded_at=str(payload["source_recorded_at"]),
             context_bundle_version=str(payload["context_bundle_version"]),
             source_chat_reference=str(payload["source_chat_reference"]),
+            source_chat_registry_generation=cast(
+                int, payload["source_chat_registry_generation"]
+            ),
             source_chat_timezone=(
                 str(payload["source_chat_timezone"])
                 if payload["source_chat_timezone"] is not None
@@ -7219,6 +7311,9 @@ class RuntimeApplication:
             bounded_metadata=cast(dict[str, JsonValue], payload["bounded_metadata"]),
             eligible_reply_context=cast(
                 dict[str, JsonValue] | None, payload["eligible_reply_context"]
+            ),
+            direct_reply_to_telegram_message_id=cast(
+                int | None, payload["direct_reply_to_telegram_message_id"]
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
@@ -7250,10 +7345,16 @@ class RuntimeApplication:
             "source_recorded_at": request.source_recorded_at,
             "context_bundle_version": request.context_bundle_version,
             "source_chat_reference": request.source_chat_reference,
+            "source_chat_registry_generation": (
+                request.source_chat_registry_generation
+            ),
             "source_chat_timezone": request.source_chat_timezone,
             "source_chat_geography": request.source_chat_geography,
             "bounded_metadata": request.bounded_metadata,
             "eligible_reply_context": request.eligible_reply_context,
+            "direct_reply_to_telegram_message_id": (
+                request.direct_reply_to_telegram_message_id
+            ),
             "model": request.requested_model,
             "reasoning_effort": request.requested_reasoning_effort,
             "prompt_version": request.prompt_version,
@@ -7297,10 +7398,16 @@ class RuntimeApplication:
                     "source_recorded_at": payload.get("source_recorded_at"),
                     "context_bundle_version": payload.get("context_bundle_version"),
                     "source_chat_reference": payload.get("source_chat_reference"),
+                    "source_chat_registry_generation": payload.get(
+                        "source_chat_registry_generation"
+                    ),
                     "source_chat_timezone": payload.get("source_chat_timezone"),
                     "source_chat_geography": payload.get("source_chat_geography"),
                     "bounded_metadata": payload.get("bounded_metadata"),
                     "eligible_reply_context": payload.get("eligible_reply_context"),
+                    "direct_reply_to_telegram_message_id": payload.get(
+                        "direct_reply_to_telegram_message_id"
+                    ),
                     "output": result.output,
                     "requested_model": request.requested_model,
                     "effective_model": result.effective_model,
@@ -7396,10 +7503,47 @@ class RuntimeApplication:
                 )
                 == source_chat_reference
                 and entry.enabled
+                and entry.registry_generation == source_revision.registry_generation
             ),
             None,
         )
         if source_chat is None:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=(2,),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
+        reply_revision = None
+        if source_revision.reply_to_telegram_message_id is not None:
+            reply_revision = self.store.eligible_reply_revision(
+                identity=source_chat.identity,
+                registry_generation=source_revision.registry_generation,
+                telegram_message_id=(source_revision.reply_to_telegram_message_id),
+                current_event_time=source_revision.event_time,
+            )
+        authoritative_reply_context: dict[str, JsonValue] | None = None
+        if reply_revision is not None and reply_revision.body is not None:
+            authoritative_reply_context = {
+                "relationship_kind": "direct_reply",
+                "source_chat_reference": source_chat_reference,
+                "registry_generation": source_revision.registry_generation,
+                "telegram_message_id": (source_revision.reply_to_telegram_message_id),
+                "source_message_revision_id": (
+                    reply_revision.source_message_revision_id
+                ),
+                "body": reply_revision.body,
+                "source_event_time": reply_revision.event_time.isoformat(),
+            }
+        if (
+            payload.get("source_chat_registry_generation")
+            != source_revision.registry_generation
+            or payload.get("direct_reply_to_telegram_message_id")
+            != source_revision.reply_to_telegram_message_id
+            or payload.get("eligible_reply_context") != authoritative_reply_context
+            or payload.get("bounded_metadata") != dict(source_revision.bounded_metadata)
+        ):
             self.store.consume(
                 incoming=incoming,
                 supported_versions=(2,),
@@ -7418,6 +7562,12 @@ class RuntimeApplication:
                 "country_id": source_chat.classifier_country_id,
                 "city_id": source_chat.classifier_city_id,
             },
+            "bounded_metadata": dict(source_revision.bounded_metadata),
+            "source_chat_registry_generation": (source_revision.registry_generation),
+            "direct_reply_to_telegram_message_id": (
+                source_revision.reply_to_telegram_message_id
+            ),
+            "eligible_reply_context": authoritative_reply_context,
             "validation_time": self.clock.now().isoformat(),
         }
         accepted = _validated_open_match_proposal(
@@ -8423,10 +8573,16 @@ def _classifier_proposal_has_pinned_provenance(
         "source_recorded_at": payload.get("source_recorded_at"),
         "context_bundle_version": payload.get("context_bundle_version"),
         "source_chat_reference": payload.get("source_chat_reference"),
+        "source_chat_registry_generation": payload.get(
+            "source_chat_registry_generation"
+        ),
         "source_chat_timezone": payload.get("source_chat_timezone"),
         "source_chat_geography": payload.get("source_chat_geography"),
         "bounded_metadata": payload.get("bounded_metadata"),
         "eligible_reply_context": payload.get("eligible_reply_context"),
+        "direct_reply_to_telegram_message_id": payload.get(
+            "direct_reply_to_telegram_message_id"
+        ),
         "model": pinned["requested_model"],
         "reasoning_effort": pinned["requested_reasoning_effort"],
         "prompt_version": pinned["prompt_version"],
@@ -8530,6 +8686,8 @@ def _resolve_source_location_across_supported_locales(
             or accepted.country_id != proposed.country_id
             or accepted.city_id != proposed.city_id
             or accepted.verified_parent_ids != proposed.verified_parent_ids
+            or accepted.verified_disjoint_place_ids
+            != proposed.verified_disjoint_place_ids
             or accepted.iana_timezone != proposed.iana_timezone
             or accepted.resolver_version != proposed.resolver_version
             or accepted.glossary_version != proposed.glossary_version
@@ -8650,36 +8808,16 @@ def _validated_open_match_proposal(
         or not isinstance(location, dict)
         or not isinstance(event_time, dict)
         or not isinstance(routes, list)
-        or not routes
     ):
         return None
-    usable_routes: list[dict[str, str]] = []
-    for proposed_route in routes:
-        if not isinstance(proposed_route, dict):
-            continue
-        kind = proposed_route.get("kind")
-        value = proposed_route.get("value")
-        route_evidence = proposed_route.get("evidence")
-        if (
-            set(proposed_route) == {"kind", "value", "evidence"}
-            and kind == "explicit_telegram_username"
-            and isinstance(value, str)
-            and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value) is not None
-            and isinstance(route_evidence, str)
-            and route_evidence in body
-            and value in route_evidence
-        ):
-            usable_routes.append(
-                {"kind": kind, "value": value, "evidence": route_evidence}
-            )
-    if not usable_routes:
-        return None
-    route = min(
-        usable_routes,
-        key=lambda item: (body.index(str(item["evidence"])), str(item["value"])),
+    route = _select_response_route(
+        body=body,
+        proposed_routes=routes,
+        bounded_metadata=payload_value.get("bounded_metadata"),
     )
+    if route is None:
+        return None
     route_value = route["value"]
-    assert isinstance(route_value, str)
     mention = location.get("mention")
     country_id = location.get("country_id")
     city_id = location.get("city_id")
@@ -8711,6 +8849,7 @@ def _validated_open_match_proposal(
         and place.country_id == country_id
         and place.city_id == city_id
         and country_id in place.verified_parent_ids
+        and _valid_location_disjointness(place)
         and bool(place.resolver_version)
         and bool(place.glossary_version)
         and len(place.verified_parent_ids) == len(place.parent_display_names)
@@ -8769,6 +8908,7 @@ def _validated_open_match_proposal(
     start_date = event_time.get("start_local_date")
     end_date = event_time.get("end_local_date")
     exact_time = event_time.get("exact_local_time")
+    day_part = event_time.get("day_part")
     timezone = event_time.get("iana_timezone")
     try:
         parsed_start = date.fromisoformat(str(start_date))
@@ -8787,6 +8927,8 @@ def _validated_open_match_proposal(
     if (
         parsed_end < parsed_start
         or not isinstance(timezone, str)
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
         or places[0].iana_timezone != timezone
         or source_event_time.tzinfo is None
         or validation_time.tzinfo is None
@@ -8795,6 +8937,7 @@ def _validated_open_match_proposal(
             parsed_end,
             exact_time if isinstance(exact_time, str) else None,
             str(evidence["event_time"]),
+            day_part=day_part if isinstance(day_part, str) else None,
             source_event_time=source_event_time,
             source_timezone=(
                 str(payload_value.get("source_chat_timezone"))
@@ -8823,12 +8966,16 @@ def _validated_open_match_proposal(
         "start_local_date": str(start_date),
         "end_local_date": str(end_date),
         "exact_local_time": exact_time,
+        "day_part": day_part,
         "iana_timezone": timezone,
         "country_id": country_id,
         "city_id": city_id,
         "place_id": place_id,
         "location_geographic_type": places[0].geographic_type.value,
         "location_parent_ids": list(places[0].verified_parent_ids),
+        "location_verified_disjoint_place_ids": list(
+            places[0].verified_disjoint_place_ids
+        ),
         **{
             f"city_display_{locale}": label
             for locale, label in city_display_labels.items()
@@ -8857,6 +9004,92 @@ def _validated_open_match_proposal(
         "evidence": evidence,
         "response_route": {"kind": route["kind"], "value": route_value},
     }
+
+
+def _select_response_route(
+    *,
+    body: str,
+    proposed_routes: list[JsonValue],
+    bounded_metadata: JsonValue,
+) -> dict[str, str] | None:
+    """Select exactly one evidence-backed route by the documented priority."""
+    usable_routes: list[dict[str, str]] = []
+    for proposed_route in proposed_routes:
+        if not isinstance(proposed_route, dict):
+            continue
+        kind = proposed_route.get("kind")
+        value = proposed_route.get("value")
+        route_evidence = proposed_route.get("evidence")
+        if (
+            set(proposed_route) == {"kind", "value", "evidence"}
+            and isinstance(kind, str)
+            and isinstance(value, str)
+            and isinstance(route_evidence, str)
+            and route_evidence in body
+            and value in route_evidence
+            and (
+                (
+                    kind == "explicit_telegram_username"
+                    and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value) is not None
+                )
+                or (
+                    kind == "explicit_phone"
+                    and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", value) is not None
+                    and 7 <= sum(character.isdigit() for character in value) <= 15
+                )
+                or (kind == "explicit_url" and _is_safe_response_url(value))
+            )
+        ):
+            usable_routes.append(
+                {"kind": kind, "value": value, "evidence": route_evidence}
+            )
+    if usable_routes:
+        selected = min(
+            usable_routes,
+            key=lambda item: (
+                body.index(item["evidence"]),
+                item["kind"],
+                item["value"],
+            ),
+        )
+        return {"kind": selected["kind"], "value": selected["value"]}
+    if not isinstance(bounded_metadata, dict):
+        return None
+    fallback_routes = (
+        ("direct_message", bounded_metadata.get("source_author_dm_url")),
+        ("reply_thread", bounded_metadata.get("reply_route_url")),
+        (
+            "source_message",
+            bounded_metadata.get("source_message_url")
+            if bounded_metadata.get("source_message_reply_capable") is True
+            else None,
+        ),
+    )
+    for kind, value in fallback_routes:
+        if isinstance(value, str) and _is_safe_telegram_response_url(value):
+            return {"kind": kind, "value": value}
+    return None
+
+
+def _is_safe_response_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        len(value) <= 2048
+        and parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not any(character.isspace() for character in value)
+    )
+
+
+def _is_safe_telegram_response_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return _is_safe_response_url(value) and (
+        parsed.scheme == "https"
+        and parsed.hostname in {"t.me", "telegram.me"}
+        and parsed.path not in {"", "/"}
+    )
 
 
 def _classification_evidence_references(
@@ -8905,6 +9138,7 @@ def _event_time_is_supported(
     exact_time: str | None,
     evidence: str,
     *,
+    day_part: str | None = None,
     source_event_time: datetime | None = None,
     source_timezone: str | None = None,
 ) -> bool:
@@ -8963,7 +9197,56 @@ def _event_time_is_supported(
             "mañana": 1,
             "demain": 1,
         }
-        if start != end or source_event_time is None or source_timezone is None:
+        weekday_patterns = {
+            0: (
+                r"\bmonday\b",
+                r"\bпонедельник\w*\b",
+                r"\blunes\b",
+                r"\blundi\b",
+            ),
+            1: (
+                r"\btuesday\b",
+                r"\bвторник\w*\b",
+                r"\bmartes\b",
+                r"\bmardi\b",
+            ),
+            2: (
+                r"\bwednesday\b",
+                r"\bсред(?:а|у|ы|е)\b",
+                r"\bmi(?:é|e)rcoles\b",
+                r"\bmercredi\b",
+            ),
+            3: (
+                r"\bthursday\b",
+                r"\bчетверг\w*\b",
+                r"\bjueves\b",
+                r"\bjeudi\b",
+            ),
+            4: (
+                r"\bfriday\b",
+                r"\bпятниц\w*\b",
+                r"\bviernes\b",
+                r"\bvendredi\b",
+            ),
+            5: (
+                r"\bsaturday\b",
+                r"\bсуббот\w*\b",
+                r"\bs(?:á|a)bado\b",
+                r"\bsamedi\b",
+            ),
+            6: (
+                r"\bsunday\b",
+                r"\bвоскресень\w*\b",
+                r"\bdomingo\b",
+                r"\bdimanche\b",
+            ),
+        }
+        if (
+            start != end
+            or source_event_time is None
+            or source_event_time.tzinfo is None
+            or source_timezone is None
+        ):
             return False
         try:
             source_local_date = source_event_time.astimezone(
@@ -8971,18 +9254,71 @@ def _event_time_is_supported(
             ).date()
         except ZoneInfoNotFoundError:
             return False
-        relative_spans = [
-            match.span()
+        relative_candidates = [
+            (match.span(), source_local_date + timedelta(days=offset))
             for token, offset in relative_days.items()
-            if start == source_local_date + timedelta(days=offset)
             for match in re.finditer(rf"(?<!\w){re.escape(token)}(?!\w)", normalized)
         ]
+        relative_candidates.extend(
+            (
+                match.span(),
+                source_local_date
+                + timedelta(
+                    days=(weekday - source_local_date.weekday()) % 7,
+                ),
+            )
+            for weekday, patterns in weekday_patterns.items()
+            for pattern in patterns
+            for match in re.finditer(pattern, normalized)
+        )
+        if not relative_candidates or any(
+            candidate_date != start for _, candidate_date in relative_candidates
+        ):
+            return False
+        relative_spans = [span for span, _ in relative_candidates]
         spans = relative_spans
         end_spans = relative_spans
     if not spans or not end_spans:
         return False
     expression_start = min(span[0] for span in spans)
     expression_end = max(span[1] for span in end_spans)
+    if day_part is not None:
+        day_part_patterns = {
+            "morning": (
+                r"\bmorning\b",
+                r"\bутр\w*\b",
+                r"por la mañana",
+                r"\bmatin\w*\b",
+            ),
+            "daytime": (
+                r"\bdaytime\b",
+                r"\bafternoon\b",
+                r"\bдн(?:е|ё)м\b",
+                r"por la tarde",
+                r"après-midi",
+                r"apres-midi",
+            ),
+            "evening": (
+                r"\bevening\b",
+                r"\bвечер\w*\b",
+                r"por la tarde",
+                r"\bsoir\w*\b",
+            ),
+            "night": (r"\bnight\b", r"\bноч\w*\b", r"por la noche", r"\bnuit\b"),
+        }
+        if day_part not in day_part_patterns:
+            return False
+        day_part_matches = [
+            match
+            for pattern in day_part_patterns[day_part]
+            for match in re.finditer(pattern, normalized)
+        ]
+        if not any(
+            match.start() <= expression_end + 32
+            and match.end() >= expression_start - 32
+            for match in day_part_matches
+        ):
+            return False
     if exact_time is None:
         return True
     time_matches = list(re.finditer(rf"(?<!\d){re.escape(exact_time)}(?!\d)", evidence))

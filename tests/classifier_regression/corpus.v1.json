@@ -71,6 +71,54 @@
       }
     },
     {
+      "case_id": "accepted-relative-weekday",
+      "source": "В субботу в 19:00 на [ЛОКАЦИИ] нужен один защитник. Пишите @sample_contact",
+      "source_event_time": "2026-08-14T20:30:00+00:00",
+      "source_chat_timezone": "Europe/Moscow",
+      "validate_relative_event_time": true,
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "relative-weekday-open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "нужен один защитник",
+            "event_time": "В субботу в 19:00",
+            "location": "на [ЛОКАЦИИ]",
+            "open_places": "один защитник",
+            "positions": "защитник"
+          },
+          "location": {
+            "mention": "на [ЛОКАЦИИ]",
+            "place_id": "station:redacted:relative",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-08-15",
+            "end_local_date": "2026-08-15",
+            "exact_local_time": "19:00",
+            "iana_timezone": "Europe/Moscow"
+          },
+          "open_places": 1,
+          "positions": ["defender"],
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    },
+    {
       "case_id": "excluded-explicit-children-only",
       "source": "Завтра детская игра, есть одно место. Пишите @sample_contact",
       "expected": {

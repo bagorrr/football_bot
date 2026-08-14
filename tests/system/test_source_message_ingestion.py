@@ -1556,20 +1556,20 @@ def test_unsupported_source_event_version_stays_recoverable_and_alerts() -> None
     )
     future = system.replace_source_event_contract_version(
         "source-event:future-version:1",
-        version=4,
+        version=5,
     )
 
     assert system.process_next_source_event()
 
     assert system.source_messages() == ()
     assert system.source_message_revisions() == ()
-    assert future.contract_version == 4
+    assert future.contract_version == 5
     assert system.source_event_contracts()[0].json_payload() == future.json_payload()
     alert = system.operator_alert(future.message_id)
     assert alert.producer is RuntimeRole.INGESTION
     assert alert.consumer is RuntimeRole.APPLICATION
     assert alert.contract_name is ContractName.SOURCE_EVENT_RECORDED
-    assert alert.contract_version == 4
+    assert alert.contract_version == 5
     assert alert.failure_code is FailureCode.UNSUPPORTED_CONTRACT_VERSION
     system.reset()
 

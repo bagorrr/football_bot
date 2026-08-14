@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from typing import TypeAlias, cast
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from modules.classifier_contract import classifier_output_is_schema_valid
@@ -121,6 +122,14 @@ SUPPORTED_CONTRACTS = (
     ContractDefinition(
         ContractName.SOURCE_EVENT_RECORDED,
         3,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "source_event_id",
+        ("telegram_chat_id", "registry_generation", "telegram_message_id"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_EVENT_RECORDED,
+        4,
         RuntimeRole.INGESTION,
         RuntimeRole.APPLICATION,
         "source_event_id",
@@ -374,7 +383,7 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_run_search(self.payload, contract_version=self.contract_version)
         elif (
             self.contract_name is ContractName.SOURCE_EVENT_RECORDED
-            and self.contract_version == 3
+            and self.contract_version in {3, 4}
         ):
             _validate_source_event_recorded(self, self.payload)
         elif (
@@ -726,6 +735,8 @@ def _validate_source_event_recorded(
         "event_time",
         "body",
     }
+    if envelope.contract_version == 4:
+        allowed |= {"bounded_metadata", "reply_to_telegram_message_id"}
     if set(payload) != allowed:
         raise ValueError("SourceEventRecorded contains unsupported or missing facts")
     source_event_id = _required_text(payload, "source_event_id")
@@ -763,6 +774,90 @@ def _validate_source_event_recorded(
         raise TypeError("SourceEventRecorded body must be text or null")
     if event_kind == "delete" and body is not None:
         raise ValueError("SourceEventRecorded deletion must be body-free")
+    if envelope.contract_version == 4:
+        metadata = payload["bounded_metadata"]
+        _validate_bounded_source_metadata(metadata)
+        reply_to_message_id = payload["reply_to_telegram_message_id"]
+        if reply_to_message_id is not None and (
+            not isinstance(reply_to_message_id, int)
+            or isinstance(reply_to_message_id, bool)
+            or reply_to_message_id < 1
+            or reply_to_message_id == telegram_message_id
+        ):
+            raise ValueError("SourceEventRecorded direct-reply identity is invalid")
+
+
+_BOUNDED_METADATA_FIELDS = {
+    "message_language",
+    "attachment_types",
+    "source_author_dm_url",
+    "reply_route_url",
+    "source_message_url",
+    "source_message_reply_capable",
+}
+
+
+def _is_safe_telegram_route(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        len(value) <= 2048
+        and parsed.path not in {"", "/"}
+        and parsed.scheme == "https"
+        and parsed.hostname in {"t.me", "telegram.me"}
+        and parsed.username is None
+        and parsed.password is None
+        and not any(character.isspace() for character in value)
+    )
+
+
+def _is_safe_http_route(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        len(value) <= 2048
+        and parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not any(character.isspace() for character in value)
+    )
+
+
+def _validate_bounded_source_metadata(value: JsonValue) -> None:
+    if not isinstance(value, dict) or set(value) != _BOUNDED_METADATA_FIELDS:
+        raise TypeError("bounded source metadata contains unsupported facts")
+    language = value["message_language"]
+    if language is not None and (
+        not isinstance(language, str) or not language or len(language) > 35
+    ):
+        raise TypeError("message_language must be text or null")
+    attachment_types = value["attachment_types"]
+    if (
+        not isinstance(attachment_types, list)
+        or len(attachment_types) > 8
+        or not all(
+            isinstance(item, str) and item and len(item) <= 64
+            for item in attachment_types
+        )
+        or len(attachment_types) != len(set(attachment_types))
+    ):
+        raise TypeError("attachment_types must be a bounded text list")
+    for field_name in (
+        "source_author_dm_url",
+        "reply_route_url",
+        "source_message_url",
+    ):
+        route = value[field_name]
+        if route is not None and (
+            not isinstance(route, str) or not _is_safe_telegram_route(route)
+        ):
+            raise ValueError(f"{field_name} must be a safe Telegram URL or null")
+    reply_capable = value["source_message_reply_capable"]
+    if not isinstance(reply_capable, bool):
+        raise TypeError("source_message_reply_capable must be boolean")
+    if (value["source_message_url"] is not None) != reply_capable:
+        raise ValueError(
+            "source_message_url must identify exactly one reply-capable post"
+        )
 
 
 def _validate_source_revision_lineage(
@@ -808,10 +903,12 @@ def _validate_classify_source_message_revision(
         "source_recorded_at",
         "context_bundle_version",
         "source_chat_reference",
+        "source_chat_registry_generation",
         "source_chat_timezone",
         "source_chat_geography",
         "bounded_metadata",
         "eligible_reply_context",
+        "direct_reply_to_telegram_message_id",
     }
     if set(payload) != allowed:
         raise ValueError("ClassifySourceMessageRevision has incomplete semantics")
@@ -826,6 +923,25 @@ def _validate_classify_source_message_revision(
     source_chat_reference = _required_text(payload, "source_chat_reference")
     if not envelope.subject_id.startswith(f"{source_chat_reference}:message:"):
         raise ValueError("Source Chat reference does not contain the message subject")
+    source_chat_generation = payload["source_chat_registry_generation"]
+    if (
+        not isinstance(source_chat_generation, int)
+        or isinstance(source_chat_generation, bool)
+        or source_chat_generation < 1
+    ):
+        raise TypeError("source_chat_registry_generation must be positive")
+    try:
+        current_telegram_message_id = int(envelope.subject_id.rsplit(":message:", 1)[1])
+    except ValueError as error:
+        raise ValueError("current Source Message identity is invalid") from error
+    direct_reply_target = payload["direct_reply_to_telegram_message_id"]
+    if direct_reply_target is not None and (
+        not isinstance(direct_reply_target, int)
+        or isinstance(direct_reply_target, bool)
+        or direct_reply_target < 1
+        or direct_reply_target == current_telegram_message_id
+    ):
+        raise ValueError("direct-reply target identity is invalid")
     timezone = payload["source_chat_timezone"]
     if timezone is not None and (not isinstance(timezone, str) or not timezone):
         raise TypeError("source_chat_timezone must be text or null")
@@ -837,10 +953,10 @@ def _validate_classify_source_message_revision(
     ):
         raise TypeError("source_chat_geography values must be text or null")
     metadata = payload["bounded_metadata"]
-    if not isinstance(metadata, dict) or set(metadata) != {
-        "message_language",
-        "attachment_types",
-    }:
+    if not isinstance(metadata, dict) or set(metadata) not in (
+        {"message_language", "attachment_types"},
+        _BOUNDED_METADATA_FIELDS,
+    ):
         raise TypeError("bounded_metadata contains unsupported facts")
     if (
         "message_language" in metadata
@@ -855,17 +971,53 @@ def _validate_classify_source_message_revision(
         or not all(isinstance(value, str) and value for value in attachment_types)
     ):
         raise TypeError("attachment_types must be a bounded text list")
+    if set(metadata) == _BOUNDED_METADATA_FIELDS:
+        _validate_bounded_source_metadata(metadata)
     reply = payload["eligible_reply_context"]
     if reply is not None:
         if not isinstance(reply, dict) or set(reply) != {
+            "relationship_kind",
+            "source_chat_reference",
+            "registry_generation",
+            "telegram_message_id",
             "source_message_revision_id",
             "body",
             "source_event_time",
         }:
             raise TypeError("eligible_reply_context is incomplete")
-        _required_text(reply, "source_message_revision_id")
+        if reply["relationship_kind"] != "direct_reply":
+            raise ValueError("eligible_reply_context relationship is invalid")
+        if reply["source_chat_reference"] != source_chat_reference:
+            raise ValueError("eligible_reply_context crosses Source Chats")
+        if reply["registry_generation"] != source_chat_generation:
+            raise ValueError("eligible_reply_context crosses registry generations")
+        reply_message_id = reply["telegram_message_id"]
+        if (
+            not isinstance(reply_message_id, int)
+            or isinstance(reply_message_id, bool)
+            or reply_message_id != direct_reply_target
+        ):
+            raise ValueError("eligible_reply_context is not the direct reply target")
+        reply_revision_id = _required_text(reply, "source_message_revision_id")
+        if (
+            re.fullmatch(
+                rf"{re.escape(source_chat_reference)}:message:"
+                rf"{reply_message_id}:revision:[1-9][0-9]*",
+                reply_revision_id,
+            )
+            is None
+        ):
+            raise ValueError("eligible_reply_context revision lineage is invalid")
         _required_text(reply, "body")
-        _required_iso_datetime(reply, "source_event_time")
+        reply_event_time = datetime.fromisoformat(
+            _required_iso_datetime(reply, "source_event_time")
+        )
+        source_event_time = datetime.fromisoformat(
+            _required_iso_datetime(payload, "source_event_time")
+        )
+        age = source_event_time - reply_event_time
+        if age < timedelta(0) or age > timedelta(hours=24):
+            raise ValueError("eligible_reply_context is outside the 24-hour bound")
     _validate_direct_causation(envelope, ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION)
     if envelope.idempotency_key != f"classify-source-message:{revision_id}":
         raise ValueError(
@@ -882,10 +1034,12 @@ def _validate_classification_proposal(
         "source_recorded_at",
         "context_bundle_version",
         "source_chat_reference",
+        "source_chat_registry_generation",
         "source_chat_timezone",
         "source_chat_geography",
         "bounded_metadata",
         "eligible_reply_context",
+        "direct_reply_to_telegram_message_id",
     }
     provenance_fields = {
         "output",
@@ -1054,11 +1208,29 @@ def _validate_opportunity_publication_changed(
     route = payload["response_route"]
     if not isinstance(route, dict) or set(route) != {"kind", "value"}:
         raise TypeError("response_route must contain kind and value")
-    if (
-        route["kind"] != "explicit_telegram_username"
-        or not isinstance(route["value"], str)
-        or not route["value"]
-    ):
+    route_kind = route["kind"]
+    route_value = route["value"]
+    valid_route = (
+        isinstance(route_value, str)
+        and bool(route_value)
+        and (
+            (
+                route_kind == "explicit_telegram_username"
+                and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
+            )
+            or (
+                route_kind == "explicit_phone"
+                and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value) is not None
+                and 7 <= sum(character.isdigit() for character in route_value) <= 15
+            )
+            or (route_kind == "explicit_url" and _is_safe_http_route(route_value))
+            or (
+                route_kind in {"direct_message", "reply_thread", "source_message"}
+                and _is_safe_telegram_route(route_value)
+            )
+        )
+    )
+    if not valid_route:
         raise ValueError("response_route is invalid")
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
     if envelope.idempotency_key != f"opportunity-publication:{opportunity_revision_id}":
@@ -1072,12 +1244,14 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         "start_local_date",
         "end_local_date",
         "exact_local_time",
+        "day_part",
         "iana_timezone",
         "country_id",
         "city_id",
         "place_id",
         "location_geographic_type",
         "location_parent_ids",
+        "location_verified_disjoint_place_ids",
         "city_display_en",
         "city_display_ru",
         "city_display_es",
@@ -1132,12 +1306,29 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         or not all(isinstance(value, str) and value for value in parent_ids)
     ):
         raise TypeError("open-match location parents must be a non-empty text list")
+    disjoint_ids = facts["location_verified_disjoint_place_ids"]
+    if (
+        not isinstance(disjoint_ids, list)
+        or len(disjoint_ids) > 128
+        or not all(isinstance(value, str) and value for value in disjoint_ids)
+        or len(disjoint_ids) != len(set(disjoint_ids))
+        or facts["place_id"] in disjoint_ids
+        or bool(set(parent_ids).intersection(disjoint_ids))
+    ):
+        raise TypeError(
+            "open-match location disjoint proof must be a bounded identity list"
+        )
     exact_time = facts["exact_local_time"]
     if exact_time is not None and (
         not isinstance(exact_time, str)
         or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
     ):
         raise ValueError("open-match exact time is invalid")
+    day_part = facts["day_part"]
+    if day_part not in {None, "morning", "daytime", "evening", "night"}:
+        raise ValueError("open-match day part is invalid")
+    if exact_time is not None and day_part is not None:
+        raise ValueError("open-match exact time and day part are mutually exclusive")
     open_places = facts["open_places"]
     if (
         not isinstance(open_places, int)

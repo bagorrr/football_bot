@@ -265,3 +265,56 @@ def test_supported_languages_use_exact_semantic_evidence() -> None:
             "payment": "cuota de 8 €",
         },
     )
+
+
+def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:
+    cases = (
+        (
+            date(2026, 8, 15),
+            "Match on Saturday at 19:00",
+            datetime(2026, 8, 14, 21, 30, tzinfo=ZoneInfo("UTC")),
+            "Europe/Moscow",
+        ),
+        (
+            date(2026, 8, 17),
+            "Матч в понедельник в 19:00",
+            datetime(2026, 8, 16, 12, 0, tzinfo=ZoneInfo("UTC")),
+            "Europe/Moscow",
+        ),
+        (
+            date(2026, 8, 17),
+            "Partido el lunes a las 19:00",
+            datetime(2026, 8, 16, 12, 0, tzinfo=ZoneInfo("UTC")),
+            "Europe/Madrid",
+        ),
+        (
+            date(2026, 8, 17),
+            "Match lundi à 19:00",
+            datetime(2026, 8, 16, 12, 0, tzinfo=ZoneInfo("UTC")),
+            "Europe/Paris",
+        ),
+        (
+            date(2026, 8, 24),
+            "Match on Monday at 19:00",
+            datetime(2026, 8, 18, 12, 0, tzinfo=ZoneInfo("UTC")),
+            "Europe/London",
+        ),
+    )
+    for expected, evidence, source_event_time, timezone in cases:
+        assert _event_time_is_supported(
+            expected,
+            expected,
+            "19:00",
+            evidence,
+            source_event_time=source_event_time,
+            source_timezone=timezone,
+        )
+
+    assert not _event_time_is_supported(
+        date(2026, 8, 16),
+        date(2026, 8, 16),
+        "19:00",
+        "Match on Saturday at 19:00",
+        source_event_time=datetime(2026, 8, 14, 21, 30, tzinfo=ZoneInfo("UTC")),
+        source_timezone="Europe/Moscow",
+    )

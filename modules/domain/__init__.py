@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
@@ -103,13 +103,26 @@ def match_detail(
 
 
 def match_time_detail(
-    requested: tuple[str, ...], accepted_exact_time: str | None
+    requested: tuple[str, ...],
+    accepted_exact_time: str | None,
+    accepted_day_part: str | None = None,
 ) -> MatchState:
-    """Compare an accepted exact local time with exact or day-part criteria."""
+    """Compare mutually exclusive source exact-time/day-part evidence."""
     if not requested:
         return MatchState.CONFIRMED
-    if accepted_exact_time is None:
+    if accepted_exact_time is None and accepted_day_part is None:
         return MatchState.UNKNOWN
+    if accepted_day_part is not None:
+        if any(
+            re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", item) for item in requested
+        ):
+            return MatchState.UNKNOWN
+        return (
+            MatchState.CONFIRMED
+            if accepted_day_part in requested
+            else MatchState.CONFLICT
+        )
+    assert accepted_exact_time is not None
     hour, minute = (int(part) for part in accepted_exact_time.split(":", 1))
     minute_of_day = hour * 60 + minute
     matching_day_parts = {
@@ -149,6 +162,8 @@ def match_search_area(
     """Compare only resolver-verified containment at comparable boundaries."""
     if whole_city:
         return MatchState.CONFIRMED
+    if not selected_area_ids:
+        return MatchState.UNKNOWN
     place_id = facts.get("place_id")
     parent_ids = facts.get("location_parent_ids")
     known_area_ids = {
@@ -169,11 +184,78 @@ def match_search_area(
     ):
         return MatchState.UNKNOWN
     accepted_type = facts.get("location_geographic_type")
-    if not isinstance(accepted_type, str) or accepted_type not in selected_area_types:
+    disjoint_ids_value = facts.get("location_verified_disjoint_place_ids", [])
+    if (
+        not isinstance(disjoint_ids_value, list)
+        or not all(isinstance(value, str) and value for value in disjoint_ids_value)
+        or len(disjoint_ids_value) != len(set(disjoint_ids_value))
+    ):
         return MatchState.UNKNOWN
-    # Same-type siblings are comparable. Their distinct verified identities prove
-    # disjoint containment at their nearest common authoritative parent.
-    return MatchState.CONFLICT
+    disjoint_ids = set(disjoint_ids_value)
+    if disjoint_ids.issuperset(selected_area_ids):
+        return MatchState.CONFLICT
+    if not isinstance(place_id, str) or not isinstance(accepted_type, str):
+        return MatchState.UNKNOWN
+    selected_district_ids = {
+        selected_id
+        for selected_id, selected_type in zip(
+            selected_area_ids, selected_area_types, strict=True
+        )
+        if selected_type == "administrative_district"
+    }
+    if accepted_type != "administrative_district" or not selected_district_ids:
+        return MatchState.UNKNOWN
+    # Distinct administrative districts are comparable authoritative boundaries.
+    # Other selected places are outside only when their verified lineage places
+    # them inside one of those already-proven disjoint selected districts.
+    return (
+        MatchState.CONFLICT
+        if all(
+            (selected_type == "administrative_district" and selected_id != place_id)
+            or bool(selected_district_ids.intersection(selected_parents))
+            for selected_id, selected_type, selected_parents in zip(
+                selected_area_ids,
+                selected_area_types,
+                selected_area_parent_ids,
+                strict=True,
+            )
+        )
+        else MatchState.UNKNOWN
+    )
+
+
+def render_response_route(kind: str, value: str, locale: str) -> str:
+    """Render one already-selected Response Route without exposing alternatives."""
+    if kind in {
+        "explicit_telegram_username",
+        "explicit_phone",
+        "explicit_url",
+    }:
+        return value
+    labels = {
+        "direct_message": {
+            "en": "Message author",
+            "ru": "Написать автору",
+            "es": "Enviar mensaje al autor",
+            "fr": "Contacter l'auteur",
+        },
+        "reply_thread": {
+            "en": "Reply in chat",
+            "ru": "Ответить в чате",
+            "es": "Responder en el chat",
+            "fr": "Répondre dans le chat",
+        },
+        "source_message": {
+            "en": "Open post",
+            "ru": "Открыть публикацию",
+            "es": "Abrir la publicación",
+            "fr": "Ouvrir la publication",
+        },
+    }
+    route_labels = labels.get(kind)
+    if route_labels is None:
+        raise ValueError("Response Route kind is unsupported")
+    return f"[{route_labels.get(locale, route_labels['en'])}]({value})"
 
 
 def game_search_result_sort_key(
@@ -227,6 +309,18 @@ class SourceEventKind(StrEnum):
     CREATE = "create"
     EDIT = "edit"
     DELETE = "delete"
+
+
+def empty_bounded_source_metadata() -> dict[str, Any]:
+    """Return the complete bounded source-metadata shape with no usable route."""
+    return {
+        "message_language": None,
+        "attachment_types": [],
+        "source_author_dm_url": None,
+        "reply_route_url": None,
+        "source_message_url": None,
+        "source_message_reply_capable": False,
+    }
 
 
 def is_valid_source_chat_address(
@@ -348,6 +442,10 @@ class TelegramDifferenceEvent:
     body: str | None
     event_time: datetime
     registry_generation: int = 1
+    bounded_metadata: Mapping[str, Any] = field(
+        default_factory=empty_bounded_source_metadata
+    )
+    reply_to_telegram_message_id: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
@@ -375,6 +473,11 @@ class TelegramDifferenceEvent:
             raise ValueError("Source Event time must be timezone-aware")
         if self.kind is SourceEventKind.DELETE and self.body is not None:
             raise ValueError("Deletion transport events must be body-free")
+        if (
+            self.reply_to_telegram_message_id is not None
+            and self.reply_to_telegram_message_id < 1
+        ):
+            raise ValueError("direct-reply target identity must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +504,10 @@ class SourceMessage:
     event_time: datetime
     recorded_at: datetime
     tombstoned: bool
+    bounded_metadata: Mapping[str, Any] = field(
+        default_factory=empty_bounded_source_metadata
+    )
+    reply_to_telegram_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,6 +524,10 @@ class SourceEventRecord:
     body: str | None
     event_time: datetime
     recorded_at: datetime
+    bounded_metadata: Mapping[str, Any] = field(
+        default_factory=empty_bounded_source_metadata
+    )
+    reply_to_telegram_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +542,11 @@ class SourceMessageRevision:
     body: str | None
     event_time: datetime
     recorded_at: datetime
+    registry_generation: int = 1
+    bounded_metadata: Mapping[str, Any] = field(
+        default_factory=empty_bounded_source_metadata
+    )
+    reply_to_telegram_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,6 +684,7 @@ class LocationCandidate:
     resolver_version: str
     glossary_version: str
     localized_display_names: tuple[tuple[str, str], ...] = ()
+    verified_disjoint_place_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,6 +702,7 @@ class AcceptedLocation:
     resolver_version: str
     glossary_version: str
     localized_display_names: tuple[tuple[str, str], ...] = ()
+    verified_disjoint_place_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,6 +895,7 @@ def evaluate_game_search(
                 str(facts["exact_local_time"])
                 if facts.get("exact_local_time")
                 else None,
+                str(facts["day_part"]) if facts.get("day_part") else None,
             ),
             search_area=match_search_area(
                 whole_city=completed_search.whole_city,
@@ -829,6 +948,8 @@ def evaluate_game_search(
             card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
         if facts.get("exact_local_time"):
             card["exact_local_time"] = str(facts["exact_local_time"])
+        if facts.get("day_part"):
+            card["day_part"] = str(facts["day_part"])
         for key in (
             "team_formats",
             "positions",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date
 from typing import TypeAlias
+from urllib.parse import urlsplit
 
 JsonValue: TypeAlias = (
     bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None
@@ -118,12 +119,18 @@ def classifier_output_is_schema_valid(
                 "exact_local_time",
                 "iana_timezone",
             },
+            {
+                "start_local_date",
+                "end_local_date",
+                "day_part",
+                "iana_timezone",
+            },
         )
         or not isinstance(open_places, int)
         or isinstance(open_places, bool)
         or open_places < 1
         or not isinstance(routes, list)
-        or not routes
+        or len(routes) > 8
     ):
         return False
     try:
@@ -132,6 +139,7 @@ def classifier_output_is_schema_valid(
     except ValueError:
         return False
     exact_time = event_time.get("exact_local_time")
+    day_part = event_time.get("day_part")
     if (
         start > end
         or not isinstance(event_time.get("iana_timezone"), str)
@@ -143,6 +151,8 @@ def classifier_output_is_schema_valid(
                 or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
             )
         )
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
     ):
         return False
     for field_name, allowed in _CANONICAL_LISTS.items():
@@ -164,12 +174,29 @@ def _valid_response_route(value: JsonValue, *, body: str) -> bool:
         return False
     route_value = value.get("value")
     route_evidence = value.get("evidence")
-    return (
-        value.get("kind") == "explicit_telegram_username"
-        and isinstance(route_value, str)
-        and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
-        and isinstance(route_evidence, str)
-        and bool(route_evidence)
-        and route_evidence in body
-        and route_value in route_evidence
-    )
+    if (
+        not isinstance(route_value, str)
+        or not isinstance(route_evidence, str)
+        or not route_evidence
+        or route_evidence not in body
+        or route_value not in route_evidence
+    ):
+        return False
+    if value.get("kind") == "explicit_telegram_username":
+        return re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
+    if value.get("kind") == "explicit_phone":
+        return (
+            re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value) is not None
+            and 7 <= sum(character.isdigit() for character in route_value) <= 15
+        )
+    if value.get("kind") == "explicit_url":
+        parsed = urlsplit(route_value)
+        return (
+            len(route_value) <= 2048
+            and parsed.scheme in {"http", "https"}
+            and bool(parsed.hostname)
+            and parsed.username is None
+            and parsed.password is None
+            and not any(character.isspace() for character in route_value)
+        )
+    return False

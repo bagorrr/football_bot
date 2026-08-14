@@ -50,6 +50,7 @@ def test_application_recomputes_pinned_classifier_manifest() -> None:
         "source_recorded_at": "2026-08-14T12:00:01+00:00",
         "context_bundle_version": "primary-classifier-context-v1",
         "source_chat_reference": "source-chat:redacted",
+        "source_chat_registry_generation": 1,
         "source_chat_timezone": "Europe/Moscow",
         "source_chat_geography": {"country_id": None, "city_id": None},
         "bounded_metadata": {
@@ -57,6 +58,7 @@ def test_application_recomputes_pinned_classifier_manifest() -> None:
             "attachment_types": [],
         },
         "eligible_reply_context": None,
+        "direct_reply_to_telegram_message_id": None,
         "model": "gpt-5.6-sol",
         "reasoning_effort": "high",
         "prompt_version": "open-match-primary-v1",
@@ -72,10 +74,14 @@ def test_application_recomputes_pinned_classifier_manifest() -> None:
         "source_recorded_at": manifest["source_recorded_at"],
         "context_bundle_version": manifest["context_bundle_version"],
         "source_chat_reference": manifest["source_chat_reference"],
+        "source_chat_registry_generation": manifest["source_chat_registry_generation"],
         "source_chat_timezone": manifest["source_chat_timezone"],
         "source_chat_geography": manifest["source_chat_geography"],
         "bounded_metadata": manifest["bounded_metadata"],
         "eligible_reply_context": manifest["eligible_reply_context"],
+        "direct_reply_to_telegram_message_id": manifest[
+            "direct_reply_to_telegram_message_id"
+        ],
         "requested_model": "gpt-5.6-sol",
         "effective_model": "gpt-5.6-sol",
         "requested_reasoning_effort": "high",

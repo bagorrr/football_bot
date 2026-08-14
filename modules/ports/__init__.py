@@ -199,10 +199,12 @@ class ClassifierRequest:
     source_recorded_at: str
     context_bundle_version: str
     source_chat_reference: str
+    source_chat_registry_generation: int
     source_chat_timezone: str | None
     source_chat_geography: dict[str, JsonValue]
     bounded_metadata: dict[str, JsonValue]
     eligible_reply_context: dict[str, JsonValue] | None
+    direct_reply_to_telegram_message_id: int | None
     requested_model: str
     requested_reasoning_effort: str
     prompt_version: str
@@ -784,6 +786,17 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read one Application-owned immutable Source Message revision."""
         ...
 
+    def eligible_reply_revision(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> SourceMessageRevision | None:
+        """Return one retained current direct-reply target within 24 hours."""
+        ...
+
     def claim_next(
         self,
         *,
@@ -1004,6 +1017,15 @@ class AcceptanceObserver(Protocol):
         payload: JsonValue,
     ) -> RawContractEnvelope:
         """Replace one Source Chat payload at the privileged test seam."""
+        ...
+
+    def invalidate_classifier_context(
+        self,
+        source_message_revision_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject one classifier-context wire fault at the test seam."""
         ...
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:

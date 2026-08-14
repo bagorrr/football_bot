@@ -218,6 +218,13 @@ class ControlledTelegramIngestionAdapter:
         kind: SourceEventKind,
         body: str | None,
         event_time: datetime,
+        message_language: str | None = None,
+        attachment_types: tuple[str, ...] = (),
+        source_author_dm_url: str | None = None,
+        reply_route_url: str | None = None,
+        source_message_url: str | None = None,
+        source_message_reply_capable: bool = False,
+        reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
         self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
@@ -231,6 +238,15 @@ class ControlledTelegramIngestionAdapter:
             body=body,
             event_time=event_time,
             registry_generation=registry_generation,
+            bounded_metadata={
+                "message_language": message_language,
+                "attachment_types": list(attachment_types),
+                "source_author_dm_url": source_author_dm_url,
+                "reply_route_url": reply_route_url,
+                "source_message_url": source_message_url,
+                "source_message_reply_capable": source_message_reply_capable,
+            },
+            reply_to_telegram_message_id=reply_to_telegram_message_id,
         )
 
     def get_account_difference_event(
@@ -253,6 +269,13 @@ class ControlledTelegramIngestionAdapter:
         kind: SourceEventKind,
         body: str | None,
         event_time: datetime,
+        message_language: str | None = None,
+        attachment_types: tuple[str, ...] = (),
+        source_author_dm_url: str | None = None,
+        reply_route_url: str | None = None,
+        source_message_url: str | None = None,
+        source_message_reply_capable: bool = False,
+        reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
         self._channel_difference_events[(identity, from_checkpoint)] = (
@@ -266,6 +289,15 @@ class ControlledTelegramIngestionAdapter:
                 kind=kind,
                 body=body,
                 event_time=event_time,
+                bounded_metadata={
+                    "message_language": message_language,
+                    "attachment_types": list(attachment_types),
+                    "source_author_dm_url": source_author_dm_url,
+                    "reply_route_url": reply_route_url,
+                    "source_message_url": source_message_url,
+                    "source_message_reply_capable": source_message_reply_capable,
+                },
+                reply_to_telegram_message_id=reply_to_telegram_message_id,
             )
         )
 
@@ -1451,6 +1483,20 @@ class AcceptanceSpine:
             _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
             contract_name,
             payload,
+        )
+
+    def invalidate_classifier_context(
+        self,
+        *,
+        source_message_revision_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject one classifier-context fault at the external contract seam."""
+        return self._observer.invalidate_classifier_context(
+            source_message_revision_id,
+            contract_name,
+            payload_updates,
         )
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
