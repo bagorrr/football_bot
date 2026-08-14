@@ -76,6 +76,7 @@ class FailureCode(StrEnum):
     UNSUPPORTED_CONTRACT_VERSION = "unsupported_contract_version"
     INVALID_CONTRACT = "invalid_contract"
     OWNER_WRITE_DENIED = "owner_write_denied"
+    INGESTION_STOPPED = "ingestion_stopped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +88,8 @@ class OperatorAlert:
     contract_name: ContractName
     contract_version: int
     failure_code: FailureCode
+    failure_scope: str | None = None
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

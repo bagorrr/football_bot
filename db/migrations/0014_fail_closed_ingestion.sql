@@ -107,3 +107,55 @@ REVOKE ALL ON football_runtime.ingestion_failures FROM
 
 GRANT SELECT, INSERT
     ON football_runtime.ingestion_failures TO football_ingestion;
+
+ALTER TABLE football_runtime.operator_alerts
+    ADD COLUMN failure_scope text,
+    ADD COLUMN failure_reason text;
+
+ALTER TABLE football_runtime.operator_alerts
+    DROP CONSTRAINT operator_alerts_failure_code_check;
+
+ALTER TABLE football_runtime.operator_alerts
+    ADD CONSTRAINT operator_alerts_failure_code_check CHECK (
+        failure_code IN (
+            'unsupported_contract_version',
+            'invalid_contract',
+            'owner_write_denied',
+            'ingestion_stopped'
+        )
+    ),
+    ADD CONSTRAINT operator_alerts_ingestion_stop_check CHECK (
+        (
+            failure_code = 'ingestion_stopped'
+            AND failure_scope IN (
+                'source_stream', 'account_stream', 'ingestion_role'
+            )
+            AND failure_reason IN (
+                'protection_unavailable', 'checkpoint_unavailable',
+                'checkpoint_invalid', 'access_lost', 'difference_too_long',
+                'unrecoverable_gap', 'session_revoked', 'authentication_lost'
+            )
+            AND (
+                (failure_scope = 'source_stream' AND failure_reason IN (
+                    'protection_unavailable', 'checkpoint_unavailable',
+                    'checkpoint_invalid', 'access_lost', 'difference_too_long',
+                    'unrecoverable_gap'
+                ))
+                OR
+                (failure_scope = 'account_stream' AND failure_reason IN (
+                    'checkpoint_unavailable', 'checkpoint_invalid',
+                    'access_lost', 'difference_too_long', 'unrecoverable_gap'
+                ))
+                OR
+                (failure_scope = 'ingestion_role' AND failure_reason IN (
+                    'session_revoked', 'authentication_lost'
+                ))
+            )
+        )
+        OR
+        (
+            failure_code <> 'ingestion_stopped'
+            AND failure_scope IS NULL
+            AND failure_reason IS NULL
+        )
+    );

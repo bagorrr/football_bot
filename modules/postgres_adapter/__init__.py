@@ -116,7 +116,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
-    "72afd32bb34ead03e10852ef3d47a01897b74263994f430063941c681d9f5901",
+    "b8d8201423c0aa17c012eaad73ceb7fd210f55f42d13b8d266e708ca2571e05a",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1117,7 +1117,8 @@ class PostgresAcceptanceObserver:
             row = connection.execute(
                 """
                 SELECT producer_role, consumer_role, contract_name,
-                       contract_version, failure_code
+                       contract_version, failure_code,
+                       failure_scope, failure_reason
                 FROM football_runtime.operator_alerts
                 WHERE message_id = %s
                 """,
@@ -1131,6 +1132,8 @@ class PostgresAcceptanceObserver:
             contract_name=ContractName(row["contract_name"]),
             contract_version=row["contract_version"],
             failure_code=FailureCode(row["failure_code"]),
+            failure_scope=row["failure_scope"],
+            failure_reason=row["failure_reason"],
         )
 
     def unresolved_delivery_alerts(self) -> tuple[str, ...]:
@@ -1351,7 +1354,8 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT alert.producer_role, alert.consumer_role,
                        alert.contract_name, alert.contract_version,
-                       alert.failure_code
+                       alert.failure_code, alert.failure_scope,
+                       alert.failure_reason
                 FROM football_runtime.operator_alerts AS alert
                 JOIN football_runtime.contract_outbox AS outbox
                   ON outbox.message_id = alert.message_id
@@ -1377,6 +1381,8 @@ class PostgresAcceptanceObserver:
                     contract_name=ContractName(row["contract_name"]),
                     contract_version=row["contract_version"],
                     failure_code=FailureCode(row["failure_code"]),
+                    failure_scope=row["failure_scope"],
+                    failure_reason=row["failure_reason"],
                 )
                 for row in alert_rows
             ),
@@ -1518,7 +1524,7 @@ class PostgresRoleStore:
             )
             existing = connection.execute(
                 """
-                SELECT failure_id, failure_reason, recorded_at
+                SELECT failure_id, failure_reason
                 FROM football_runtime.ingestion_failures
                 WHERE scope = 'source_stream'
                   AND peer_kind = %s
@@ -1536,7 +1542,6 @@ class PostgresRoleStore:
                 expected = {
                     "failure_id": failure.ingestion_failure_id,
                     "failure_reason": failure.reason.value,
-                    "recorded_at": failure.recorded_at,
                 }
                 if dict(existing) != expected:
                     raise OutboxConflictError
@@ -1583,7 +1588,7 @@ class PostgresRoleStore:
             )
             existing = connection.execute(
                 """
-                SELECT failure_id, failure_reason, recorded_at
+                SELECT failure_id, failure_reason
                 FROM football_runtime.ingestion_failures
                 WHERE scope = 'account_stream' AND active
                 """
@@ -1592,7 +1597,6 @@ class PostgresRoleStore:
                 expected = {
                     "failure_id": failure.ingestion_failure_id,
                     "failure_reason": failure.reason.value,
-                    "recorded_at": failure.recorded_at,
                 }
                 if dict(existing) != expected:
                     raise OutboxConflictError
@@ -1629,7 +1633,7 @@ class PostgresRoleStore:
             )
             existing = connection.execute(
                 """
-                SELECT failure_id, failure_reason, recorded_at
+                SELECT failure_id, failure_reason
                 FROM football_runtime.ingestion_failures
                 WHERE scope = 'ingestion_role' AND active
                 """
@@ -1638,7 +1642,6 @@ class PostgresRoleStore:
                 expected = {
                     "failure_id": failure.ingestion_failure_id,
                     "failure_reason": failure.reason.value,
-                    "recorded_at": failure.recorded_at,
                 }
                 if dict(existing) != expected:
                     raise OutboxConflictError
@@ -2551,8 +2554,29 @@ class PostgresRoleStore:
                         (incoming.subject_id,),
                     ).fetchone()
                     if source_message_exists is None:
-                        raise RuntimeError(
-                            "Source Message edit has no earlier revision"
+                        connection.execute(
+                            """
+                            INSERT INTO football_runtime.source_messages (
+                                source_message_id, peer_kind, telegram_chat_id,
+                                registry_generation, telegram_message_id,
+                                current_revision, event_kind, body, event_time,
+                                recorded_at, tombstoned
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false
+                            )
+                            """,
+                            (
+                                incoming.subject_id,
+                                payload["telegram_peer_kind"],
+                                payload["telegram_chat_id"],
+                                payload["registry_generation"],
+                                payload["telegram_message_id"],
+                                incoming.subject_revision,
+                                payload["event_kind"],
+                                payload["body"],
+                                event_time,
+                                incoming.recorded_at,
+                            ),
                         )
             elif payload["event_kind"] == SourceEventKind.DELETE.value:
                 updated = connection.execute(
@@ -2583,8 +2607,28 @@ class PostgresRoleStore:
                         (incoming.subject_id,),
                     ).fetchone()
                     if source_message_exists is None:
-                        raise RuntimeError(
-                            "Source Message deletion has no earlier revision"
+                        connection.execute(
+                            """
+                            INSERT INTO football_runtime.source_messages (
+                                source_message_id, peer_kind, telegram_chat_id,
+                                registry_generation, telegram_message_id,
+                                current_revision, event_kind, body, event_time,
+                                recorded_at, tombstoned
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, true
+                            )
+                            """,
+                            (
+                                incoming.subject_id,
+                                payload["telegram_peer_kind"],
+                                payload["telegram_chat_id"],
+                                payload["registry_generation"],
+                                payload["telegram_message_id"],
+                                incoming.subject_revision,
+                                payload["event_kind"],
+                                event_time,
+                                incoming.recorded_at,
+                            ),
                         )
             else:
                 raise RuntimeError("this Source Event kind is not implemented")
@@ -2938,6 +2982,29 @@ class PostgresRoleStore:
                             _insert_outbox(connection, outgoing)
                     _release_claim(connection, incoming.message_id)
                     return ConsumeResult.REJECTED
+                if (
+                    incoming.contract_name is ContractName.SOURCE_STREAM_STOPPED
+                    and existing is None
+                ):
+                    payload = incoming.payload
+                    if not isinstance(payload, dict):
+                        raise TypeError("SourceStreamStopped payload must be an object")
+                    failure_scope = payload.get("scope")
+                    failure_reason = payload.get("failure_reason")
+                    if not isinstance(failure_scope, str) or not isinstance(
+                        failure_reason, str
+                    ):
+                        raise ValueError("SourceStreamStopped failure state is invalid")
+                    _insert_alert(
+                        connection,
+                        observer=self._role,
+                        incoming=incoming,
+                        consumer=self._role,
+                        failure_code=FailureCode.INGESTION_STOPPED,
+                        observed_at=received_at,
+                        failure_scope=failure_scope,
+                        failure_reason=failure_reason,
+                    )
                 connection.execute(
                     """
                     INSERT INTO football_runtime.acceptance_state (
@@ -5552,13 +5619,16 @@ def _insert_alert(
     consumer: RuntimeRole,
     failure_code: FailureCode,
     observed_at: datetime,
+    failure_scope: str | None = None,
+    failure_reason: str | None = None,
 ) -> None:
     connection.execute(
         """
         INSERT INTO football_runtime.operator_alerts (
             observer_role, message_id, producer_role, consumer_role,
-            contract_name, contract_version, failure_code, observed_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            contract_name, contract_version, failure_code, observed_at,
+            failure_scope, failure_reason
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         """,
         (
@@ -5570,6 +5640,8 @@ def _insert_alert(
             incoming.contract_version,
             failure_code.value,
             observed_at,
+            failure_scope,
+            failure_reason,
         ),
     )
 
