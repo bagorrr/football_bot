@@ -730,6 +730,641 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
     system.reset()
 
 
+def test_protected_event_is_body_free_and_future_permitted_event_resumes() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 9, 0, tzinfo=UTC))
+    registered_at = datetime(2026, 9, 14, 9, 0, tzinfo=UTC)
+    administrator_id = 48_001
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_100,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_protected_source",
+        identity=identity,
+        transport_boundary="channel-pts:4800",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address="@synthetic_protected_source",
+        update_suffix="protected-source",
+    )
+    assert len(system.source_chats()) == 1
+    protected_markers = (
+        "protected text",
+        "protected caption",
+        "protected attachment",
+        "protected contact",
+        "protected other body",
+    )
+    telethon.add_protected_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4800),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4801),
+        source_event_id="source-event:protected:1",
+        telegram_message_id=201,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        text=protected_markers[0],
+        caption=protected_markers[1],
+        attachment=protected_markers[2],
+        contact=protected_markers[3],
+        other_body=protected_markers[4],
+        event_time=clock.now(),
+    )
+
+    protected_processed = system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert protected_processed, telethon.channel_difference_requests
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4801)
+    assert system.source_events() == ()
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    skips = system.protected_content_skips()
+    assert len(skips) == 1
+    assert skips[0].source_chat_identity == identity
+    assert skips[0].registry_generation == 1
+    assert skips[0].recorded_at == clock.now()
+    skip_contracts = system.source_event_contracts()
+    assert len(skip_contracts) == 1
+    assert skip_contracts[0].contract_version == 4
+    assert skip_contracts[0].payload == {
+        "ingestion_outcome_id": str(skip_contracts[0].message_id),
+        "outcome": "protected_content_skipped",
+        "source_chat_key": "source-chat:channel:4800100",
+        "telegram_peer_kind": "channel",
+        "telegram_chat_id": 4_800_100,
+        "registry_generation": 1,
+    }
+    serialized_contracts = repr(skip_contracts)
+    assert all(marker not in serialized_contracts for marker in protected_markers)
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+    assert telethon.history_requests == []
+
+    permitted_time = clock.now() + timedelta(minutes=1)
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4801),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4802),
+        source_event_id="source-event:permitted-after-protected:1",
+        telegram_message_id=202,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Future copy-permitted event.",
+        event_time=permitted_time,
+    )
+    clock.advance_to(permitted_time)
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert len(system.protected_content_skips()) == 1
+    assert len(system.source_events()) == 1
+    assert len(system.source_messages()) == 1
+    assert system.source_messages()[0].body == "Future copy-permitted event."
+    assert telethon.history_requests == []
+    system.reset()
+
+
+def test_persistent_protection_failure_stops_only_the_affected_stream() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 10, 0, tzinfo=UTC))
+    registered_at = datetime(2026, 9, 14, 10, 0, tzinfo=UTC)
+    administrator_id = 48_002
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_200,
+    )
+    initial_checkpoint = TelegramChannelCheckpoint(pts=4810)
+    advanced_checkpoint = TelegramChannelCheckpoint(pts=4811)
+    telethon.allow_public_username(
+        address="@synthetic_protection_failure",
+        identity=identity,
+        transport_boundary="channel-pts:4810",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address="@synthetic_protection_failure",
+        update_suffix="protection-failure",
+    )
+    protected_markers = (
+        "unavailable protected text",
+        "unavailable protected caption",
+        "unavailable protected attachment",
+        "unavailable protected contact",
+    )
+    telethon.add_unavailable_protection_channel_difference_event(
+        identity=identity,
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        source_event_id="source-event:protection-unavailable:1",
+        telegram_message_id=211,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        text=protected_markers[0],
+        caption=protected_markers[1],
+        attachment=protected_markers[2],
+        contact=protected_markers[3],
+        event_time=clock.now(),
+        persistent=False,
+    )
+
+    assert not system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=1,
+        )
+        == initial_checkpoint
+    )
+    assert system.ingestion_failures() == ()
+    assert system.source_events() == ()
+    assert system.protected_content_skips() == ()
+    telethon.add_unavailable_protection_channel_difference_event(
+        identity=identity,
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        source_event_id="source-event:protection-unavailable:1",
+        telegram_message_id=211,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        text=protected_markers[0],
+        caption=protected_markers[1],
+        attachment=protected_markers[2],
+        contact=protected_markers[3],
+        event_time=clock.now(),
+        persistent=True,
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=1,
+        )
+        == initial_checkpoint
+    )
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == "source_stream"
+    assert failures[0].reason.value == "protection_unavailable"
+    assert failures[0].source_chat_identity == identity
+    assert failures[0].registry_generation == 1
+    assert failures[0].recorded_at == clock.now()
+    stop_contracts = system.source_stream_stop_contracts()
+    assert len(stop_contracts) == 1
+    assert stop_contracts[0].payload == {
+        "source_stream_failure_id": str(stop_contracts[0].message_id),
+        "scope": "source_stream",
+        "failure_reason": "protection_unavailable",
+        "source_chat_key": "source-chat:channel:4800200",
+        "telegram_peer_kind": "channel",
+        "telegram_chat_id": 4_800_200,
+        "registry_generation": 1,
+    }
+    assert all(marker not in repr(stop_contracts) for marker in protected_markers)
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+
+    request_count = len(telethon.channel_difference_requests)
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        source_event_id="source-event:must-remain-stopped:1",
+        telegram_message_id=212,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="This event must remain behind the stopped checkpoint.",
+        event_time=clock.now(),
+    )
+    assert not system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert len(telethon.channel_difference_requests) == request_count
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=1,
+        )
+        == initial_checkpoint
+    )
+    assert telethon.history_requests == []
+    system.reset()
+
+
+def test_missing_account_checkpoint_stops_only_the_account_stream() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 11, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+    )
+    system.reset()
+    system.delete_account_ingestion_checkpoint()
+
+    assert system.process_next_account_telegram_difference()
+    assert telethon.account_difference_requests == []
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == "account_stream"
+    assert failures[0].reason.value == "checkpoint_unavailable"
+    assert failures[0].source_chat_identity is None
+    assert failures[0].registry_generation is None
+    assert failures[0].recorded_at == clock.now()
+    contracts = system.source_stream_stop_contracts()
+    assert len(contracts) == 1
+    assert contracts[0].payload == {
+        "source_stream_failure_id": str(contracts[0].message_id),
+        "scope": "account_stream",
+        "failure_reason": "checkpoint_unavailable",
+    }
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+
+    assert not system.process_next_account_telegram_difference()
+    assert telethon.account_difference_requests == []
+
+
+def test_corrupt_channel_checkpoint_stops_its_source_stream() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 11, 30, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_250,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_corrupt_checkpoint",
+        identity=identity,
+        transport_boundary="channel-pts:corrupt",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_002,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 11, 30, tzinfo=UTC),
+        administrator_id=48_002,
+        address="@synthetic_corrupt_checkpoint",
+        update_suffix="corrupt-checkpoint",
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.channel_difference_requests == []
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == "source_stream"
+    assert failures[0].reason.value == "checkpoint_invalid"
+    assert failures[0].source_chat_identity == identity
+    assert failures[0].registry_generation == 1
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+    assert system.source_events() == ()
+
+    assert not system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.channel_difference_requests == []
+
+
+def test_access_loss_stops_only_the_affected_source_stream() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 12, 0, tzinfo=UTC))
+    blocked_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_300,
+    )
+    continuing_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_301,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_access_lost",
+        identity=blocked_identity,
+        transport_boundary="channel-pts:4820",
+    )
+    telethon.allow_public_username(
+        address="@synthetic_access_continues",
+        identity=continuing_identity,
+        transport_boundary="channel-pts:4830",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_003,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 12, 0, tzinfo=UTC),
+        administrator_id=48_003,
+        address="@synthetic_access_lost",
+        update_suffix="access-lost",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 12, 1, tzinfo=UTC),
+        administrator_id=48_003,
+        address="@synthetic_access_continues",
+        update_suffix="access-continues",
+        already_in_source_chats=True,
+    )
+    blocked_checkpoint = TelegramChannelCheckpoint(pts=4820)
+    continuing_checkpoint = TelegramChannelCheckpoint(pts=4830)
+    telethon.add_access_loss_channel_difference(
+        identity=blocked_identity,
+        checkpoint=blocked_checkpoint,
+    )
+    telethon.add_channel_difference_event(
+        identity=continuing_identity,
+        from_checkpoint=continuing_checkpoint,
+        to_checkpoint=TelegramChannelCheckpoint(pts=4831),
+        source_event_id="source-event:unrelated-after-access-loss:1",
+        telegram_message_id=301,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Synthetic permitted unrelated event.",
+        event_time=clock.now(),
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=blocked_identity,
+        registry_generation=1,
+    )
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=blocked_identity,
+            registry_generation=1,
+        )
+        == blocked_checkpoint
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=continuing_identity,
+        registry_generation=2,
+    )
+    assert system.channel_ingestion_checkpoint(
+        identity=continuing_identity,
+        registry_generation=2,
+    ) == TelegramChannelCheckpoint(pts=4831)
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == "source_stream"
+    assert failures[0].reason.value == "access_lost"
+    assert failures[0].source_chat_identity == blocked_identity
+    assert failures[0].registry_generation == 1
+    assert system.process_next_source_event()
+    assert system.process_next_source_event()
+    messages = system.source_messages()
+    assert len(messages) == 1
+    assert messages[0].source_chat_identity == continuing_identity
+
+
+def test_unrecoverable_difference_and_gap_stop_their_source_streams() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 13, 0, tzinfo=UTC))
+    difference_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_400,
+    )
+    gap_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_401,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_difference_too_long",
+        identity=difference_identity,
+        transport_boundary="channel-pts:4840",
+    )
+    telethon.allow_public_username(
+        address="@synthetic_unrecoverable_gap",
+        identity=gap_identity,
+        transport_boundary="channel-pts:4850",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_004,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 13, 0, tzinfo=UTC),
+        administrator_id=48_004,
+        address="@synthetic_difference_too_long",
+        update_suffix="difference-too-long",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 13, 1, tzinfo=UTC),
+        administrator_id=48_004,
+        address="@synthetic_unrecoverable_gap",
+        update_suffix="unrecoverable-gap",
+        already_in_source_chats=True,
+    )
+    difference_checkpoint = TelegramChannelCheckpoint(pts=4840)
+    gap_checkpoint = TelegramChannelCheckpoint(pts=4850)
+    telethon.add_difference_too_long_channel_difference(
+        identity=difference_identity,
+        checkpoint=difference_checkpoint,
+    )
+    telethon.add_unrecoverable_gap_channel_difference(
+        identity=gap_identity,
+        checkpoint=gap_checkpoint,
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=difference_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=gap_identity,
+        registry_generation=2,
+    )
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=difference_identity,
+            registry_generation=1,
+        )
+        == difference_checkpoint
+    )
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=gap_identity,
+            registry_generation=2,
+        )
+        == gap_checkpoint
+    )
+    failures = system.ingestion_failures()
+    assert {failure.reason.value for failure in failures} == {
+        "difference_too_long",
+        "unrecoverable_gap",
+    }
+    assert {failure.source_chat_identity for failure in failures} == {
+        difference_identity,
+        gap_identity,
+    }
+    assert system.process_next_source_event()
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+    assert system.source_events() == ()
+
+
+@pytest.mark.parametrize("failure_reason", ["session_revoked", "authentication_lost"])
+def test_session_or_authentication_loss_stops_the_whole_ingestion_role(
+    failure_reason: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 14, 0, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_800_500,
+    )
+    channel_checkpoint = TelegramChannelCheckpoint(pts=4860)
+    account_checkpoint = TelegramAccountCheckpoint(
+        pts=4860,
+        qts=86,
+        seq=486,
+        date=clock.now(),
+    )
+    telethon.allow_public_username(
+        address="@synthetic_ingestion_role_failure",
+        identity=identity,
+        transport_boundary="channel-pts:4860",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_005,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 14, 0, tzinfo=UTC),
+        administrator_id=48_005,
+        address="@synthetic_ingestion_role_failure",
+        update_suffix=f"ingestion-role-{failure_reason}",
+    )
+    system.initialize_account_ingestion_checkpoint(account_checkpoint)
+    telethon.add_ingestion_role_channel_difference_failure(
+        identity=identity,
+        checkpoint=channel_checkpoint,
+        reason=failure_reason,
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=1,
+        )
+        == channel_checkpoint
+    )
+    assert system.account_ingestion_checkpoint() == account_checkpoint
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == "ingestion_role"
+    assert failures[0].reason.value == failure_reason
+    assert failures[0].source_chat_identity is None
+    assert failures[0].registry_generation is None
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+
+    channel_request_count = len(telethon.channel_difference_requests)
+    account_request_count = len(telethon.account_difference_requests)
+    assert not system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_account_telegram_difference()
+    assert len(telethon.channel_difference_requests) == channel_request_count
+    assert len(telethon.account_difference_requests) == account_request_count
+    assert (
+        system.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=1,
+        )
+        == channel_checkpoint
+    )
+    assert system.account_ingestion_checkpoint() == account_checkpoint
+
+
 def test_transport_proven_post_boundary_event_ignores_earlier_event_time_on_retry() -> (
     None
 ):
@@ -1556,20 +2191,20 @@ def test_unsupported_source_event_version_stays_recoverable_and_alerts() -> None
     )
     future = system.replace_source_event_contract_version(
         "source-event:future-version:1",
-        version=4,
+        version=5,
     )
 
     assert system.process_next_source_event()
 
     assert system.source_messages() == ()
     assert system.source_message_revisions() == ()
-    assert future.contract_version == 4
+    assert future.contract_version == 5
     assert system.source_event_contracts()[0].json_payload() == future.json_payload()
     alert = system.operator_alert(future.message_id)
     assert alert.producer is RuntimeRole.INGESTION
     assert alert.consumer is RuntimeRole.APPLICATION
     assert alert.contract_name is ContractName.SOURCE_EVENT_RECORDED
-    assert alert.contract_version == 4
+    assert alert.contract_version == 5
     assert alert.failure_code is FailureCode.UNSUPPORTED_CONTRACT_VERSION
     system.reset()
 

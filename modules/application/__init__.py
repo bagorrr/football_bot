@@ -37,6 +37,9 @@ from modules.domain import (
     GeographyConfirmation,
     GeographyConfirmationKind,
     GeographySuggestion,
+    IngestionFailure,
+    IngestionFailureReason,
+    IngestionFailureScope,
     InitialConsentAttestation,
     IntentBranch,
     LanguageSelection,
@@ -52,9 +55,12 @@ from modules.domain import (
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     TelegramDeliveryMode,
+    TelegramDifferenceEvent,
+    TelegramDifferenceFailure,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
+    TelegramProtectionState,
     UserIntent,
     is_valid_source_chat_address,
 )
@@ -5535,7 +5541,7 @@ class RuntimeApplication:
                 definition.version == 1
                 or (
                     definition.name is ContractName.SOURCE_EVENT_RECORDED
-                    and definition.version == 3
+                    and definition.version in {3, 4}
                 )
                 or (
                     definition.name is ContractName.SEARCH_COMPLETED
@@ -5611,10 +5617,54 @@ class RuntimeApplication:
         """Record one account-wide difference from typed durable state."""
         if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
             raise RuntimeError("only Ingestion owns the Telegram difference pump")
-        checkpoint = self.store.account_ingestion_checkpoint()
+        if self.store.ingestion_role_is_stopped():
+            return False
+        if self.store.account_stream_is_stopped():
+            return False
+        try:
+            checkpoint = self.store.account_ingestion_checkpoint()
+        except LookupError:
+            recorded_at = self.clock.now()
+            message_id = uuid5(
+                NAMESPACE_URL,
+                "football-bot:account-stream-stop:checkpoint_unavailable",
+            )
+            envelope = ContractEnvelope(
+                contract_name=ContractName.SOURCE_STREAM_STOPPED,
+                contract_version=1,
+                message_id=message_id,
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=f"account-stream-failure:{message_id}",
+                subject_revision=1,
+                idempotency_key=f"account-stream-failure:{message_id}",
+                causation_id=message_id,
+                correlation_id=message_id,
+                recorded_at=recorded_at,
+                payload={
+                    "source_stream_failure_id": str(message_id),
+                    "scope": IngestionFailureScope.ACCOUNT_STREAM.value,
+                    "failure_reason": (
+                        IngestionFailureReason.CHECKPOINT_UNAVAILABLE.value
+                    ),
+                },
+            )
+            return self.store.stop_account_stream(
+                failure=IngestionFailure(
+                    ingestion_failure_id=message_id,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                    reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                    source_chat_identity=None,
+                    registry_generation=None,
+                    recorded_at=recorded_at,
+                ),
+                envelope=envelope,
+            )
         event = self.telegram_ingestion.get_account_difference_event(checkpoint)
         if event is None:
             return False
+        if isinstance(event, TelegramDifferenceFailure):
+            raise RuntimeError("account difference failure scope is unsupported")
         identity = event.source_chat_identity
         registry_generation = event.registry_generation
         if (
@@ -5629,6 +5679,23 @@ class RuntimeApplication:
                 recorded_at=self.clock.now(),
             )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        if event.protection_state is TelegramProtectionState.PROTECTED:
+            recorded_at = self.clock.now()
+            try:
+                return self.store.commit_source_event(
+                    event=event,
+                    registry_generation=registry_generation,
+                    envelope=self._protected_content_skip_envelope(
+                        event=event,
+                        registry_generation=registry_generation,
+                        source_chat_key=source_chat_key,
+                        recorded_at=recorded_at,
+                    ),
+                    recorded_at=recorded_at,
+                    inject_database_failure=inject_database_failure,
+                )
+            except OutboxConflictError as error:
+                raise RuntimeProcessingError from error
         source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
         message_id = derive_source_event_message_id(event.source_event_id)
         correlation_id = uuid5(
@@ -5684,10 +5751,24 @@ class RuntimeApplication:
         """Record one channel difference from its typed durable pts."""
         if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
             raise RuntimeError("only Ingestion owns the Telegram difference pump")
-        context = self.store.source_chat_ingestion_context(
+        if self.store.ingestion_role_is_stopped():
+            return False
+        if self.store.source_stream_is_stopped(
             identity=identity,
             registry_generation=registry_generation,
-        )
+        ):
+            return False
+        try:
+            context = self.store.source_chat_ingestion_context(
+                identity=identity,
+                registry_generation=registry_generation,
+            )
+        except ValueError:
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
         if context is None or context.checkpoint is None:
             return False
         event = self.telegram_ingestion.get_channel_difference_event(
@@ -5696,9 +5777,91 @@ class RuntimeApplication:
         )
         if event is None:
             return False
+        if isinstance(event, TelegramDifferenceFailure):
+            if event.source_chat_identity != identity:
+                raise RuntimeError("Telegram difference failed for another Source Chat")
+            if event.checkpoint != context.checkpoint:
+                raise RuntimeError("Telegram difference failed at another checkpoint")
+            if event.reason in {
+                IngestionFailureReason.SESSION_REVOKED,
+                IngestionFailureReason.AUTHENTICATION_LOST,
+            }:
+                return self._stop_ingestion_role(event.reason)
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=event.reason,
+            )
         if event.source_chat_identity != identity:
             raise RuntimeError("Telegram difference returned another Source Chat")
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        if event.protection_state is TelegramProtectionState.UNAVAILABLE:
+            return False
+        if event.protection_state is TelegramProtectionState.PERSISTENTLY_UNAVAILABLE:
+            recorded_at = self.clock.now()
+            message_id = uuid5(
+                NAMESPACE_URL,
+                (
+                    "football-bot:source-stream-stop:"
+                    f"{source_chat_key}:generation:{registry_generation}:"
+                    "protection_unavailable"
+                ),
+            )
+            envelope = ContractEnvelope(
+                contract_name=ContractName.SOURCE_STREAM_STOPPED,
+                contract_version=1,
+                message_id=message_id,
+                producer=RuntimeRole.INGESTION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=f"source-stream-failure:{message_id}",
+                subject_revision=1,
+                idempotency_key=f"source-stream-failure:{message_id}",
+                causation_id=message_id,
+                correlation_id=uuid5(
+                    NAMESPACE_URL,
+                    f"football-bot:{source_chat_key}:generation:{registry_generation}",
+                ),
+                recorded_at=recorded_at,
+                payload={
+                    "source_stream_failure_id": str(message_id),
+                    "scope": IngestionFailureScope.SOURCE_STREAM.value,
+                    "failure_reason": (
+                        IngestionFailureReason.PROTECTION_UNAVAILABLE.value
+                    ),
+                    "source_chat_key": source_chat_key,
+                    "telegram_peer_kind": identity.kind.value,
+                    "telegram_chat_id": identity.telegram_id,
+                    "registry_generation": registry_generation,
+                },
+            )
+            return self.store.stop_source_stream(
+                failure=IngestionFailure(
+                    ingestion_failure_id=message_id,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                    reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+                    source_chat_identity=identity,
+                    registry_generation=registry_generation,
+                    recorded_at=recorded_at,
+                ),
+                envelope=envelope,
+            )
+        if event.protection_state is TelegramProtectionState.PROTECTED:
+            recorded_at = self.clock.now()
+            try:
+                return self.store.commit_source_event(
+                    event=event,
+                    registry_generation=registry_generation,
+                    envelope=self._protected_content_skip_envelope(
+                        event=event,
+                        registry_generation=registry_generation,
+                        source_chat_key=source_chat_key,
+                        recorded_at=recorded_at,
+                    ),
+                    recorded_at=recorded_at,
+                    inject_database_failure=inject_database_failure,
+                )
+            except OutboxConflictError as error:
+                raise RuntimeProcessingError from error
         source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
         message_id = derive_source_event_message_id(event.source_event_id)
         correlation_id = uuid5(
@@ -5749,6 +5912,129 @@ class RuntimeApplication:
         if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
             raise RuntimeError("only Ingestion receives Telegram live callbacks")
         self.telegram_ingestion.notify_live_update(identity)
+
+    def _protected_content_skip_envelope(
+        self,
+        *,
+        event: TelegramDifferenceEvent,
+        registry_generation: int,
+        source_chat_key: str,
+        recorded_at: datetime,
+    ) -> ContractEnvelope:
+        message_id = derive_source_event_message_id(event.source_event_id)
+        return ContractEnvelope(
+            contract_name=ContractName.SOURCE_EVENT_RECORDED,
+            contract_version=4,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=f"protected-content-skip:{message_id}",
+            subject_revision=1,
+            idempotency_key=f"protected-content-skipped:{message_id}",
+            causation_id=message_id,
+            correlation_id=uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{source_chat_key}:generation:{registry_generation}",
+            ),
+            recorded_at=recorded_at,
+            payload={
+                "ingestion_outcome_id": str(message_id),
+                "outcome": "protected_content_skipped",
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": event.source_chat_identity.kind.value,
+                "telegram_chat_id": event.source_chat_identity.telegram_id,
+                "registry_generation": registry_generation,
+            },
+        )
+
+    def _stop_source_stream_for_transport_failure(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        reason: IngestionFailureReason,
+    ) -> bool:
+        source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        recorded_at = self.clock.now()
+        message_id = uuid5(
+            NAMESPACE_URL,
+            (
+                "football-bot:source-stream-stop:"
+                f"{source_chat_key}:generation:{registry_generation}:{reason.value}"
+            ),
+        )
+        envelope = ContractEnvelope(
+            contract_name=ContractName.SOURCE_STREAM_STOPPED,
+            contract_version=1,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=f"source-stream-failure:{message_id}",
+            subject_revision=1,
+            idempotency_key=f"source-stream-failure:{message_id}",
+            causation_id=message_id,
+            correlation_id=uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{source_chat_key}:generation:{registry_generation}",
+            ),
+            recorded_at=recorded_at,
+            payload={
+                "source_stream_failure_id": str(message_id),
+                "scope": IngestionFailureScope.SOURCE_STREAM.value,
+                "failure_reason": reason.value,
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": identity.kind.value,
+                "telegram_chat_id": identity.telegram_id,
+                "registry_generation": registry_generation,
+            },
+        )
+        return self.store.stop_source_stream(
+            failure=IngestionFailure(
+                ingestion_failure_id=message_id,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+                reason=reason,
+                source_chat_identity=identity,
+                registry_generation=registry_generation,
+                recorded_at=recorded_at,
+            ),
+            envelope=envelope,
+        )
+
+    def _stop_ingestion_role(self, reason: IngestionFailureReason) -> bool:
+        recorded_at = self.clock.now()
+        message_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:ingestion-role-stop:{reason.value}",
+        )
+        envelope = ContractEnvelope(
+            contract_name=ContractName.SOURCE_STREAM_STOPPED,
+            contract_version=1,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=f"ingestion-role-failure:{message_id}",
+            subject_revision=1,
+            idempotency_key=f"ingestion-role-failure:{message_id}",
+            causation_id=message_id,
+            correlation_id=message_id,
+            recorded_at=recorded_at,
+            payload={
+                "source_stream_failure_id": str(message_id),
+                "scope": IngestionFailureScope.INGESTION_ROLE.value,
+                "failure_reason": reason.value,
+            },
+        )
+        return self.store.stop_ingestion_role(
+            failure=IngestionFailure(
+                ingestion_failure_id=message_id,
+                scope=IngestionFailureScope.INGESTION_ROLE,
+                reason=reason,
+                source_chat_identity=None,
+                registry_generation=None,
+                recorded_at=recorded_at,
+            ),
+            envelope=envelope,
+        )
 
     def redeliver_source_event(self, incoming: RawContractEnvelope) -> bool:
         """Consume an at-least-once Source Event delivery after queue replay."""
@@ -5860,12 +6146,23 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.SOURCE_EVENT_RECORDED
-            and incoming.contract_version == 3
+            and incoming.contract_version in {3, 4}
             and supported_incoming is not None
         ):
             self.store.accept_source_event(
                 incoming=supported_incoming,
                 received_at=self.clock.now(),
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_STREAM_STOPPED
+            and supported_incoming is not None
+        ):
+            self.store.consume(
+                incoming=supported_incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
             )
             return True
         if (

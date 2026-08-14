@@ -31,10 +31,12 @@ from modules.domain import (
     GeographyConfirmation,
     GeographyConfirmationEvent,
     GeographySuggestion,
+    IngestionFailure,
     LanguageSelection,
     LocationResolution,
     LocationResolutionQuery,
     OldChatViewCleanup,
+    ProtectedContentSkip,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
@@ -51,6 +53,7 @@ from modules.domain import (
     TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDifferenceEvent,
+    TelegramDifferenceFailure,
     TelegramMessage,
     TelegramPeerIdentity,
     UserIntent,
@@ -110,7 +113,7 @@ class TelegramIngestionAdapter(Protocol):
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
-    ) -> TelegramDifferenceEvent | None:
+    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
         """Return the next account-wide event from durable application state."""
         ...
 
@@ -118,7 +121,7 @@ class TelegramIngestionAdapter(Protocol):
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
-    ) -> TelegramDifferenceEvent | None:
+    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
         """Return the next channel event from its typed durable pts."""
         ...
 
@@ -671,6 +674,50 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically record one event, its outbox, and checkpoint advance."""
         ...
 
+    def source_stream_is_stopped(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> bool:
+        """Return whether one Source Chat generation is durably stopped."""
+        ...
+
+    def account_stream_is_stopped(self) -> bool:
+        """Return whether the account-wide difference stream is stopped."""
+        ...
+
+    def ingestion_role_is_stopped(self) -> bool:
+        """Return whether session/auth loss stopped the whole ingestion role."""
+        ...
+
+    def stop_source_stream(
+        self,
+        *,
+        failure: IngestionFailure,
+        envelope: ContractEnvelope,
+    ) -> bool:
+        """Atomically record body-free stream failure state and its outbox."""
+        ...
+
+    def stop_account_stream(
+        self,
+        *,
+        failure: IngestionFailure,
+        envelope: ContractEnvelope,
+    ) -> bool:
+        """Atomically record an account-stream stop and its durable handoff."""
+        ...
+
+    def stop_ingestion_role(
+        self,
+        *,
+        failure: IngestionFailure,
+        envelope: ContractEnvelope,
+    ) -> bool:
+        """Atomically stop every ingestion pump after session/auth loss."""
+        ...
+
     def accept_source_event(
         self,
         *,
@@ -813,6 +860,22 @@ class AcceptanceObserver(Protocol):
 
     def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
         """Observe immutable Source Message revisions through the testkit."""
+        ...
+
+    def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
+        """Observe body-free protected-event outcomes through the testkit."""
+        ...
+
+    def ingestion_failures(self) -> tuple[IngestionFailure, ...]:
+        """Observe operator-visible body-free ingestion failure state."""
+        ...
+
+    def source_stream_stop_contracts(self) -> tuple[RawContractEnvelope, ...]:
+        """Observe body-free SourceStreamStopped handoffs."""
+        ...
+
+    def delete_account_ingestion_checkpoint(self) -> None:
+        """Inject an unrecoverable missing account checkpoint."""
         ...
 
     def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:

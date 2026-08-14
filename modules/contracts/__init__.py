@@ -34,6 +34,7 @@ class ContractName(StrEnum):
     """Contract families exercised by the first cross-process round trip."""
 
     SOURCE_EVENT_RECORDED = "SourceEventRecorded"
+    SOURCE_STREAM_STOPPED = "SourceStreamStopped"
     CLASSIFY_SOURCE_MESSAGE_REVISION = "ClassifySourceMessageRevision"
     CLASSIFICATION_PROPOSAL = "ClassificationProposal"
     OPPORTUNITY_PUBLICATION_CHANGED = "OpportunityPublicationChanged"
@@ -123,6 +124,21 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         "source_event_id",
         ("telegram_chat_id", "registry_generation", "telegram_message_id"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_EVENT_RECORDED,
+        4,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "ingestion_outcome_id",
+        ("telegram_chat_id", "registry_generation"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_STREAM_STOPPED,
+        1,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "source_stream_failure_id",
     ),
     ContractDefinition(
         ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,

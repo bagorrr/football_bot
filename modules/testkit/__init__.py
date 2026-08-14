@@ -39,12 +39,15 @@ from modules.domain import (
     DiscoveryDraft,
     GeographicType,
     GeographyConfirmationEvent,
+    IngestionFailure,
+    IngestionFailureReason,
     LanguageSelection,
     LocaleSource,
     LocationCandidate,
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    ProtectedContentSkip,
     RequiredDate,
     RequiredDateConfirmationEvent,
     SearchResult,
@@ -58,8 +61,10 @@ from modules.domain import (
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
     TelegramDifferenceEvent,
+    TelegramDifferenceFailure,
     TelegramMessage,
     TelegramPeerIdentity,
+    TelegramProtectionState,
 )
 from modules.ports import (
     AcceptanceObserver,
@@ -118,11 +123,11 @@ class ControlledTelegramIngestionAdapter:
     ] = field(default_factory=dict)
     _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
     _account_difference_events: dict[
-        TelegramAccountCheckpoint, TelegramDifferenceEvent
+        TelegramAccountCheckpoint, TelegramDifferenceEvent | TelegramDifferenceFailure
     ] = field(default_factory=dict)
     _channel_difference_events: dict[
         tuple[TelegramPeerIdentity, TelegramChannelCheckpoint],
-        TelegramDifferenceEvent,
+        TelegramDifferenceEvent | TelegramDifferenceFailure,
     ] = field(default_factory=dict)
     resolution_requests: list[str] = field(default_factory=list)
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
@@ -232,7 +237,7 @@ class ControlledTelegramIngestionAdapter:
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
-    ) -> TelegramDifferenceEvent | None:
+    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
         """Return the configured account-wide difference from typed state."""
         self.account_difference_requests.append(checkpoint)
         return self._account_difference_events.get(checkpoint)
@@ -265,11 +270,157 @@ class ControlledTelegramIngestionAdapter:
             )
         )
 
+    def add_access_loss_channel_difference(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        checkpoint: TelegramChannelCheckpoint,
+    ) -> None:
+        """Configure body-free access loss at one channel checkpoint."""
+        self._channel_difference_events[(identity, checkpoint)] = (
+            TelegramDifferenceFailure(
+                source_chat_identity=identity,
+                checkpoint=checkpoint,
+                reason=IngestionFailureReason.ACCESS_LOST,
+            )
+        )
+
+    def add_difference_too_long_channel_difference(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        checkpoint: TelegramChannelCheckpoint,
+    ) -> None:
+        """Configure body-free differenceTooLong at one channel checkpoint."""
+        self._channel_difference_events[(identity, checkpoint)] = (
+            TelegramDifferenceFailure(
+                source_chat_identity=identity,
+                checkpoint=checkpoint,
+                reason=IngestionFailureReason.DIFFERENCE_TOO_LONG,
+            )
+        )
+
+    def add_unrecoverable_gap_channel_difference(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        checkpoint: TelegramChannelCheckpoint,
+    ) -> None:
+        """Configure a body-free unrecoverable channel gap."""
+        self._channel_difference_events[(identity, checkpoint)] = (
+            TelegramDifferenceFailure(
+                source_chat_identity=identity,
+                checkpoint=checkpoint,
+                reason=IngestionFailureReason.UNRECOVERABLE_GAP,
+            )
+        )
+
+    def add_ingestion_role_channel_difference_failure(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        checkpoint: TelegramChannelCheckpoint,
+        reason: str,
+    ) -> None:
+        """Configure body-free session/auth loss surfaced by a channel poll."""
+        parsed_reason = IngestionFailureReason(reason)
+        if parsed_reason not in {
+            IngestionFailureReason.SESSION_REVOKED,
+            IngestionFailureReason.AUTHENTICATION_LOST,
+        }:
+            raise ValueError("ingestion-role failure requires session/auth loss")
+        self._channel_difference_events[(identity, checkpoint)] = (
+            TelegramDifferenceFailure(
+                source_chat_identity=identity,
+                checkpoint=checkpoint,
+                reason=parsed_reason,
+            )
+        )
+
+    def add_protected_channel_difference_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
+        source_event_id: str,
+        telegram_message_id: int,
+        revision: int,
+        kind: SourceEventKind,
+        text: str | None,
+        caption: str | None,
+        attachment: str | None,
+        contact: str | None,
+        other_body: str | None,
+        event_time: datetime,
+    ) -> None:
+        """Configure one protected event without exposing its body to Ingestion."""
+        self._channel_difference_events[(identity, from_checkpoint)] = (
+            TelegramDifferenceEvent(
+                source_chat_identity=identity,
+                from_checkpoint=from_checkpoint,
+                to_checkpoint=to_checkpoint,
+                source_event_id=source_event_id,
+                telegram_message_id=telegram_message_id,
+                revision=revision,
+                kind=kind,
+                body=None,
+                event_time=event_time,
+                protection_state=TelegramProtectionState.PROTECTED,
+                protected_text=text,
+                protected_caption=caption,
+                protected_attachment=attachment,
+                protected_contact=contact,
+                protected_other_body=other_body,
+            )
+        )
+
+    def add_unavailable_protection_channel_difference_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
+        source_event_id: str,
+        telegram_message_id: int,
+        revision: int,
+        kind: SourceEventKind,
+        text: str | None,
+        caption: str | None,
+        attachment: str | None,
+        contact: str | None,
+        event_time: datetime,
+        persistent: bool,
+    ) -> None:
+        """Configure a current protection-state lookup that cannot be established."""
+        self._channel_difference_events[(identity, from_checkpoint)] = (
+            TelegramDifferenceEvent(
+                source_chat_identity=identity,
+                from_checkpoint=from_checkpoint,
+                to_checkpoint=to_checkpoint,
+                source_event_id=source_event_id,
+                telegram_message_id=telegram_message_id,
+                revision=revision,
+                kind=kind,
+                body=None,
+                event_time=event_time,
+                protection_state=(
+                    TelegramProtectionState.PERSISTENTLY_UNAVAILABLE
+                    if persistent
+                    else TelegramProtectionState.UNAVAILABLE
+                ),
+                protected_text=text,
+                protected_caption=caption,
+                protected_attachment=attachment,
+                protected_contact=contact,
+            )
+        )
+
     def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
-    ) -> TelegramDifferenceEvent | None:
+    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
         """Return the configured channel difference from typed pts."""
         self.channel_difference_requests.append((identity, checkpoint))
         return self._channel_difference_events.get((identity, checkpoint))
@@ -1042,6 +1193,10 @@ class AcceptanceSpine:
         """Observe typed account-wide difference state through Ingestion."""
         return self._roles[RuntimeRole.INGESTION].store.account_ingestion_checkpoint()
 
+    def delete_account_ingestion_checkpoint(self) -> None:
+        """Inject an unrecoverable missing account checkpoint."""
+        self._observer.delete_account_ingestion_checkpoint()
+
     def process_next_channel_telegram_difference(
         self,
         *,
@@ -1096,6 +1251,18 @@ class AcceptanceSpine:
     def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
         """Observe immutable Source Message revisions through the testkit."""
         return self._observer.source_message_revisions()
+
+    def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
+        """Observe body-free Protected Content Skips through the testkit."""
+        return self._observer.protected_content_skips()
+
+    def ingestion_failures(self) -> tuple[IngestionFailure, ...]:
+        """Observe body-free ingestion failures through the testkit."""
+        return self._observer.ingestion_failures()
+
+    def source_stream_stop_contracts(self) -> tuple[RawContractEnvelope, ...]:
+        """Observe body-free SourceStreamStopped handoffs."""
+        return self._observer.source_stream_stop_contracts()
 
     def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
         """Observe durable SourceEventRecorded outbox signals."""

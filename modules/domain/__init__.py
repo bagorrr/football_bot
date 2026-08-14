@@ -116,6 +116,36 @@ class SourceEventKind(StrEnum):
     DELETE = "delete"
 
 
+class TelegramProtectionState(StrEnum):
+    """Current copy-permission decision made before retaining an event body."""
+
+    COPY_PERMITTED = "copy_permitted"
+    PROTECTED = "protected"
+    UNAVAILABLE = "unavailable"
+    PERSISTENTLY_UNAVAILABLE = "persistently_unavailable"
+
+
+class IngestionFailureScope(StrEnum):
+    """Durable boundary stopped by one fail-closed ingestion outcome."""
+
+    SOURCE_STREAM = "source_stream"
+    ACCOUNT_STREAM = "account_stream"
+    INGESTION_ROLE = "ingestion_role"
+
+
+class IngestionFailureReason(StrEnum):
+    """Low-cardinality body-free reason for stopping ingestion."""
+
+    PROTECTION_UNAVAILABLE = "protection_unavailable"
+    CHECKPOINT_UNAVAILABLE = "checkpoint_unavailable"
+    CHECKPOINT_INVALID = "checkpoint_invalid"
+    ACCESS_LOST = "access_lost"
+    DIFFERENCE_TOO_LONG = "difference_too_long"
+    UNRECOVERABLE_GAP = "unrecoverable_gap"
+    SESSION_REVOKED = "session_revoked"
+    AUTHENTICATION_LOST = "authentication_lost"
+
+
 def is_valid_source_chat_address(
     address: str,
     *,
@@ -232,6 +262,12 @@ class TelegramDifferenceEvent:
     body: str | None
     event_time: datetime
     registry_generation: int = 1
+    protection_state: TelegramProtectionState = TelegramProtectionState.COPY_PERMITTED
+    protected_text: str | None = None
+    protected_caption: str | None = None
+    protected_attachment: str | None = None
+    protected_contact: str | None = None
+    protected_other_body: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
@@ -259,6 +295,15 @@ class TelegramDifferenceEvent:
             raise ValueError("Source Event time must be timezone-aware")
         if self.kind is SourceEventKind.DELETE and self.body is not None:
             raise ValueError("Deletion transport events must be body-free")
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramDifferenceFailure:
+    """Body-free controlled failure returned at one durable checkpoint."""
+
+    source_chat_identity: TelegramPeerIdentity
+    checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
+    reason: IngestionFailureReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +345,28 @@ class SourceEventRecord:
     event_kind: SourceEventKind
     body: str | None
     event_time: datetime
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedContentSkip:
+    """Ingestion-owned body-free observation of one protected event."""
+
+    protected_content_skip_id: UUID
+    source_chat_identity: TelegramPeerIdentity
+    registry_generation: int
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionFailure:
+    """Operator-visible body-free state for one stopped ingestion boundary."""
+
+    ingestion_failure_id: UUID
+    scope: IngestionFailureScope
+    reason: IngestionFailureReason
+    source_chat_identity: TelegramPeerIdentity | None
+    registry_generation: int | None
     recorded_at: datetime
 
 

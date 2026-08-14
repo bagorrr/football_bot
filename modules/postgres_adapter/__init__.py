@@ -41,10 +41,14 @@ from modules.domain import (
     GeographyConfirmationEvent,
     GeographyConfirmationKind,
     GeographySuggestion,
+    IngestionFailure,
+    IngestionFailureReason,
+    IngestionFailureScope,
     InitialConsentAttestation,
     IntentBranch,
     LocaleSource,
     OldChatViewCleanup,
+    ProtectedContentSkip,
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
@@ -68,6 +72,7 @@ from modules.domain import (
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
+    TelegramProtectionState,
     UserIntent,
 )
 from modules.ports import (
@@ -94,6 +99,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0011_source_chat_registry.sql",
     "0012_source_chat_admission_provenance.sql",
     "0013_source_message_ingestion.sql",
+    "0014_fail_closed_ingestion.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -110,6 +116,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
+    "ce617e72bc56299806d73a7c970d01cf488010547820cc8fe3c39dba183ece57",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -582,6 +589,8 @@ class PostgresAcceptanceObserver:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
             TRUNCATE football_runtime.bot_callback_outbox,
+                     football_runtime.ingestion_failures,
+                     football_runtime.protected_content_skips,
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
@@ -614,6 +623,13 @@ class PostgresAcceptanceObserver:
             autocommit=True,
         ) as connection:
             connection.execute(statement)
+
+    def delete_account_ingestion_checkpoint(self) -> None:
+        """Delete the account checkpoint to inject an unrecoverable failure."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            connection.execute(
+                "DELETE FROM football_runtime.telegram_account_difference_checkpoints"
+            )
 
     def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover an immutable envelope through the administrative testkit."""
@@ -741,6 +757,82 @@ class PostgresAcceptanceObserver:
             )
             for row in rows
         )
+
+    def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
+        """Observe body-free protected-event outcomes through the testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT message_id, peer_kind, telegram_chat_id,
+                       registry_generation, recorded_at
+                FROM football_runtime.protected_content_skips
+                ORDER BY recorded_at, message_id
+                """
+            ).fetchall()
+        return tuple(
+            ProtectedContentSkip(
+                protected_content_skip_id=row["message_id"],
+                source_chat_identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                recorded_at=row["recorded_at"],
+            )
+            for row in rows
+        )
+
+    def ingestion_failures(self) -> tuple[IngestionFailure, ...]:
+        """Observe body-free ingestion failure state through the testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT failure_id, scope, failure_reason, peer_kind,
+                       telegram_chat_id, registry_generation, recorded_at
+                FROM football_runtime.ingestion_failures
+                ORDER BY recorded_at, failure_id
+                """
+            ).fetchall()
+        return tuple(
+            IngestionFailure(
+                ingestion_failure_id=row["failure_id"],
+                scope=IngestionFailureScope(row["scope"]),
+                reason=IngestionFailureReason(row["failure_reason"]),
+                source_chat_identity=(
+                    TelegramPeerIdentity(
+                        kind=TelegramPeerKind(row["peer_kind"]),
+                        telegram_id=row["telegram_chat_id"],
+                    )
+                    if row["peer_kind"] is not None
+                    else None
+                ),
+                registry_generation=row["registry_generation"],
+                recorded_at=row["recorded_at"],
+            )
+            for row in rows
+        )
+
+    def source_stream_stop_contracts(self) -> tuple[RawContractEnvelope, ...]:
+        """Observe body-free SourceStreamStopped outbox signals."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'SourceStreamStopped'
+                ORDER BY recorded_at, message_id
+                """
+            ).fetchall()
+        return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
 
     def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
         """Observe ingestion-owned SourceEventRecorded outbox signals."""
@@ -1307,6 +1399,256 @@ class PostgresRoleStore:
             if inserted is not None:
                 _insert_outbox(connection, envelope)
 
+    def source_stream_is_stopped(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> bool:
+        """Return whether the current Source Chat stream is durably stopped."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            return (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'source_stream'
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                      AND active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                is not None
+            )
+
+    def account_stream_is_stopped(self) -> bool:
+        """Return whether the account-wide difference stream is stopped."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            return (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            )
+
+    def ingestion_role_is_stopped(self) -> bool:
+        """Return whether session/auth loss stopped the ingestion role."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            return (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'ingestion_role' AND active
+                    """
+                ).fetchone()
+                is not None
+            )
+
+    def stop_source_stream(
+        self,
+        *,
+        failure: IngestionFailure,
+        envelope: ContractEnvelope,
+    ) -> bool:
+        """Atomically record a body-free stream stop and its durable handoff."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        identity = failure.source_chat_identity
+        if identity is None or failure.registry_generation is None:
+            raise ValueError("source-stream failure requires Source Chat identity")
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        stream_key = (
+            f"source-ingestion:{identity.kind.value}:{identity.telegram_id}:"
+            f"{failure.registry_generation}"
+        )
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (stream_key,),
+            )
+            existing = connection.execute(
+                """
+                SELECT failure_id, failure_reason, recorded_at
+                FROM football_runtime.ingestion_failures
+                WHERE scope = 'source_stream'
+                  AND peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                  AND active
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    failure.registry_generation,
+                ),
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "failure_id": failure.ingestion_failure_id,
+                    "failure_reason": failure.reason.value,
+                    "recorded_at": failure.recorded_at,
+                }
+                if dict(existing) != expected:
+                    raise OutboxConflictError
+                return False
+            connection.execute(
+                """
+                INSERT INTO football_runtime.ingestion_failures (
+                    failure_id, scope, failure_reason, peer_kind,
+                    telegram_chat_id, registry_generation, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    failure.ingestion_failure_id,
+                    failure.scope.value,
+                    failure.reason.value,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    failure.registry_generation,
+                    failure.recorded_at,
+                ),
+            )
+            _insert_outbox(connection, envelope)
+        return True
+
+    def stop_account_stream(
+        self,
+        *,
+        failure: IngestionFailure,
+        envelope: ContractEnvelope,
+    ) -> bool:
+        """Atomically record a body-free account-stream stop and handoff."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            existing = connection.execute(
+                """
+                SELECT failure_id, failure_reason, recorded_at
+                FROM football_runtime.ingestion_failures
+                WHERE scope = 'account_stream' AND active
+                """
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "failure_id": failure.ingestion_failure_id,
+                    "failure_reason": failure.reason.value,
+                    "recorded_at": failure.recorded_at,
+                }
+                if dict(existing) != expected:
+                    raise OutboxConflictError
+                return False
+            connection.execute(
+                """
+                INSERT INTO football_runtime.ingestion_failures (
+                    failure_id, scope, failure_reason, recorded_at
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    failure.ingestion_failure_id,
+                    failure.scope.value,
+                    failure.reason.value,
+                    failure.recorded_at,
+                ),
+            )
+            _insert_outbox(connection, envelope)
+        return True
+
+    def stop_ingestion_role(
+        self,
+        *,
+        failure: IngestionFailure,
+        envelope: ContractEnvelope,
+    ) -> bool:
+        """Atomically stop all ingestion pumps after session/auth loss."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            existing = connection.execute(
+                """
+                SELECT failure_id, failure_reason, recorded_at
+                FROM football_runtime.ingestion_failures
+                WHERE scope = 'ingestion_role' AND active
+                """
+            ).fetchone()
+            if existing is not None:
+                expected = {
+                    "failure_id": failure.ingestion_failure_id,
+                    "failure_reason": failure.reason.value,
+                    "recorded_at": failure.recorded_at,
+                }
+                if dict(existing) != expected:
+                    raise OutboxConflictError
+                return False
+            connection.execute(
+                """
+                INSERT INTO football_runtime.ingestion_failures (
+                    failure_id, scope, failure_reason, recorded_at
+                ) VALUES (%s, %s, %s, %s)
+                """,
+                (
+                    failure.ingestion_failure_id,
+                    failure.scope.value,
+                    failure.reason.value,
+                    failure.recorded_at,
+                ),
+            )
+            _insert_outbox(connection, envelope)
+        return True
+
+    @staticmethod
+    def _ingestion_role_stopped_in(connection: psycopg.Connection[Any]) -> bool:
+        return (
+            connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.ingestion_failures
+                WHERE scope = 'ingestion_role' AND active
+                """
+            ).fetchone()
+            is not None
+        )
+
     def register_source_chat(
         self,
         *,
@@ -1672,6 +2014,12 @@ class PostgresRoleStore:
         peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (peer_key,),
             )
@@ -1688,6 +2036,26 @@ class PostgresRoleStore:
                     event.registry_generation,
                 ),
             ).fetchone()
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'source_stream'
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                      AND active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        event.registry_generation,
+                    ),
+                ).fetchone()
+                is not None
+            ):
+                return False
             if context is not None:
                 return False
             connection.execute(
@@ -1755,6 +2123,12 @@ class PostgresRoleStore:
         )
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (peer_key,),
             )
@@ -1762,6 +2136,26 @@ class PostgresRoleStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (lock_key,),
             )
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'source_stream'
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                      AND active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                is not None
+            ):
+                return False
             context = connection.execute(
                 """
                 SELECT transport_boundary, channel_pts
@@ -1884,7 +2278,50 @@ class PostgresRoleStore:
                     ).fetchone()
                     is not None
                 )
-            if known_transport_identity:
+            if (
+                known_transport_identity
+                and event.protection_state is TelegramProtectionState.PROTECTED
+            ):
+                inserted = connection.execute(
+                    """
+                    INSERT INTO football_runtime.protected_content_skips (
+                        message_id, peer_kind, telegram_chat_id,
+                        registry_generation, recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (message_id) DO NOTHING
+                    RETURNING message_id
+                    """,
+                    (
+                        envelope.message_id,
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        recorded_at,
+                    ),
+                ).fetchone()
+                if inserted is not None:
+                    _insert_outbox(connection, envelope)
+                    if inject_database_failure:
+                        raise OutboxConflictError
+                else:
+                    existing = connection.execute(
+                        """
+                        SELECT peer_kind, telegram_chat_id,
+                               registry_generation, recorded_at
+                        FROM football_runtime.protected_content_skips
+                        WHERE message_id = %s
+                        """,
+                        (envelope.message_id,),
+                    ).fetchone()
+                    expected_skip = {
+                        "peer_kind": identity.kind.value,
+                        "telegram_chat_id": identity.telegram_id,
+                        "registry_generation": registry_generation,
+                        "recorded_at": recorded_at,
+                    }
+                    if existing is None or dict(existing) != expected_skip:
+                        raise OutboxConflictError
+            elif known_transport_identity:
                 inserted = connection.execute(
                     """
                     INSERT INTO football_runtime.source_event_records (
@@ -2025,6 +2462,9 @@ class PostgresRoleStore:
                     received_at,
                 ),
             )
+            if payload.get("outcome") == "protected_content_skipped":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             event_time = datetime.fromisoformat(str(payload["event_time"]))
             if payload["event_kind"] == SourceEventKind.CREATE.value:
                 connection.execute(
