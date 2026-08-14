@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import TypeAlias, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from modules.classifier_contract import classifier_output_is_schema_valid
 from modules.domain import SourceChatAddressKind, is_valid_source_chat_address
 
 JsonValue: TypeAlias = (
@@ -376,6 +377,21 @@ class ContractEnvelope(RawContractEnvelope):
             and self.contract_version == 3
         ):
             _validate_source_event_recorded(self, self.payload)
+        elif (
+            self.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and self.contract_version == 2
+        ):
+            _validate_classify_source_message_revision(self, self.payload)
+        elif (
+            self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
+            and self.contract_version == 2
+        ):
+            _validate_classification_proposal(self, self.payload)
+        elif (
+            self.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            and self.contract_version == 2
+        ):
+            _validate_opportunity_publication_changed(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
             _validate_search_completed(
                 self.payload,
@@ -747,6 +763,421 @@ def _validate_source_event_recorded(
         raise TypeError("SourceEventRecorded body must be text or null")
     if event_kind == "delete" and body is not None:
         raise ValueError("SourceEventRecorded deletion must be body-free")
+
+
+def _validate_source_revision_lineage(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> str:
+    revision_id = _required_text(payload, "source_message_revision_id")
+    expected_revision_id = f"{envelope.subject_id}:revision:{envelope.subject_revision}"
+    if revision_id != expected_revision_id:
+        raise ValueError("source revision identity does not match its envelope")
+    return revision_id
+
+
+def _required_iso_datetime(payload: dict[str, JsonValue], field_name: str) -> str:
+    value = _required_text(payload, field_name)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"contract requires ISO datetime {field_name}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"contract requires timezone-aware {field_name}")
+    return value
+
+
+def _validate_direct_causation(
+    envelope: RawContractEnvelope,
+    contract_name: ContractName,
+) -> None:
+    if envelope.message_id != derive_contract_message_id(
+        envelope.causation_id, contract_name
+    ):
+        raise ValueError(f"{contract_name.value} message identity is not canonical")
+
+
+def _validate_classify_source_message_revision(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    allowed = {
+        "source_message_revision_id",
+        "body",
+        "source_event_time",
+        "source_recorded_at",
+        "context_bundle_version",
+        "source_chat_reference",
+        "source_chat_timezone",
+        "source_chat_geography",
+        "bounded_metadata",
+        "eligible_reply_context",
+    }
+    if set(payload) != allowed:
+        raise ValueError("ClassifySourceMessageRevision has incomplete semantics")
+    revision_id = _validate_source_revision_lineage(envelope, payload)
+    _required_text(payload, "body")
+    _required_iso_datetime(payload, "source_event_time")
+    _required_iso_datetime(payload, "source_recorded_at")
+    if _required_text(payload, "context_bundle_version") != (
+        "primary-classifier-context-v1"
+    ):
+        raise ValueError("classifier context bundle version is unsupported")
+    source_chat_reference = _required_text(payload, "source_chat_reference")
+    if not envelope.subject_id.startswith(f"{source_chat_reference}:message:"):
+        raise ValueError("Source Chat reference does not contain the message subject")
+    timezone = payload["source_chat_timezone"]
+    if timezone is not None and (not isinstance(timezone, str) or not timezone):
+        raise TypeError("source_chat_timezone must be text or null")
+    geography = payload["source_chat_geography"]
+    if not isinstance(geography, dict) or set(geography) != {"country_id", "city_id"}:
+        raise TypeError("source_chat_geography must contain country_id and city_id")
+    if any(
+        value is not None and not isinstance(value, str) for value in geography.values()
+    ):
+        raise TypeError("source_chat_geography values must be text or null")
+    metadata = payload["bounded_metadata"]
+    if not isinstance(metadata, dict) or set(metadata) != {
+        "message_language",
+        "attachment_types",
+    }:
+        raise TypeError("bounded_metadata contains unsupported facts")
+    if (
+        "message_language" in metadata
+        and metadata["message_language"] is not None
+        and not isinstance(metadata["message_language"], str)
+    ):
+        raise TypeError("message_language must be text or null")
+    attachment_types = metadata.get("attachment_types", [])
+    if (
+        not isinstance(attachment_types, list)
+        or len(attachment_types) > 8
+        or not all(isinstance(value, str) and value for value in attachment_types)
+    ):
+        raise TypeError("attachment_types must be a bounded text list")
+    reply = payload["eligible_reply_context"]
+    if reply is not None:
+        if not isinstance(reply, dict) or set(reply) != {
+            "source_message_revision_id",
+            "body",
+            "source_event_time",
+        }:
+            raise TypeError("eligible_reply_context is incomplete")
+        _required_text(reply, "source_message_revision_id")
+        _required_text(reply, "body")
+        _required_iso_datetime(reply, "source_event_time")
+    _validate_direct_causation(envelope, ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION)
+    if envelope.idempotency_key != f"classify-source-message:{revision_id}":
+        raise ValueError(
+            "ClassifySourceMessageRevision idempotency key is not canonical"
+        )
+
+
+def _validate_classification_proposal(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    context_fields = {
+        "source_event_time",
+        "source_recorded_at",
+        "context_bundle_version",
+        "source_chat_reference",
+        "source_chat_timezone",
+        "source_chat_geography",
+        "bounded_metadata",
+        "eligible_reply_context",
+    }
+    provenance_fields = {
+        "output",
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "pass_number",
+        "attempt_number",
+        "input_manifest_hash",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "classification_status",
+        "classification_command_id",
+    }
+    allowed = (
+        {"proposal_id", "source_message_revision_id", "body"}
+        | context_fields
+        | provenance_fields
+    )
+    if set(payload) != allowed:
+        raise ValueError("ClassificationProposal has incomplete semantics")
+    revision_id = _validate_source_revision_lineage(envelope, payload)
+    if _required_text(payload, "proposal_id") != f"proposal:{revision_id}":
+        raise ValueError("ClassificationProposal proposal identity is not canonical")
+    if _required_text(payload, "classification_command_id") != str(
+        envelope.causation_id
+    ):
+        raise ValueError("ClassificationProposal causation identity is inconsistent")
+    body = _required_text(payload, "body")
+    _required_iso_datetime(payload, "source_event_time")
+    _required_iso_datetime(payload, "source_recorded_at")
+    for field_name in (
+        "context_bundle_version",
+        "source_chat_reference",
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "input_manifest_hash",
+    ):
+        _required_text(payload, field_name)
+    if payload["classification_status"] != "succeeded":
+        raise ValueError("ClassificationProposal status is invalid")
+    if not isinstance(payload["output"], dict):
+        raise TypeError("ClassificationProposal output must be an object")
+    if not classifier_output_is_schema_valid(payload["output"], body=body):
+        raise ValueError("ClassificationProposal output violates its public schema")
+    for field_name in ("pass_number", "attempt_number"):
+        metric = payload[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
+            raise TypeError(f"ClassificationProposal requires positive {field_name}")
+    for field_name in ("duration_ms", "input_tokens", "output_tokens"):
+        metric = payload[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            raise TypeError(
+                f"ClassificationProposal requires non-negative {field_name}"
+            )
+    pinned = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "open-match-primary-v1",
+        "schema_version": "source-message-classification-v1",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+        "context_bundle_version": "primary-classifier-context-v1",
+    }
+    if any(payload[field_name] != value for field_name, value in pinned.items()):
+        raise ValueError("ClassificationProposal provenance version is unsupported")
+    if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
+        raise ValueError("ClassificationProposal manifest hash is invalid")
+    # Reuse the complete bounded context validator without duplicating its shape rules.
+    context_envelope = RawContractEnvelope(
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        message_id=derive_contract_message_id(
+            envelope.causation_id, ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+        ),
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.CLASSIFICATION,
+        subject_id=envelope.subject_id,
+        subject_revision=envelope.subject_revision,
+        idempotency_key=f"classify-source-message:{revision_id}",
+        causation_id=envelope.causation_id,
+        correlation_id=envelope.correlation_id,
+        recorded_at=envelope.recorded_at,
+        payload={
+            "source_message_revision_id": revision_id,
+            "body": payload["body"],
+            **{key: payload[key] for key in context_fields},
+        },
+    )
+    _validate_classify_source_message_revision(
+        context_envelope, cast(dict[str, JsonValue], context_envelope.payload)
+    )
+    _validate_direct_causation(envelope, ContractName.CLASSIFICATION_PROPOSAL)
+    if envelope.idempotency_key != f"classification-proposal:{revision_id}":
+        raise ValueError("ClassificationProposal idempotency key is not canonical")
+
+
+def _validate_opportunity_publication_changed(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    allowed = {
+        "opportunity_id",
+        "opportunity_revision_id",
+        "source_message_revision_id",
+        "publication_state",
+        "opportunity_type",
+        "accepted_facts",
+        "response_route",
+    }
+    if set(payload) != allowed:
+        raise ValueError("OpportunityPublicationChanged has incomplete semantics")
+    opportunity_id = _required_text(payload, "opportunity_id")
+    if opportunity_id != envelope.subject_id:
+        raise ValueError("OpportunityPublicationChanged subject is inconsistent")
+    source_revision_id = _required_text(payload, "source_message_revision_id")
+    if (
+        opportunity_id
+        != f"opportunity:{source_revision_id.rsplit(':revision:', 1)[0]}:open_match"
+    ):
+        raise ValueError(
+            "Opportunity identity is inconsistent with its source revision"
+        )
+    opportunity_revision_id = _required_text(payload, "opportunity_revision_id")
+    if (
+        opportunity_revision_id
+        != f"{opportunity_id}:revision:{envelope.subject_revision}"
+    ):
+        raise ValueError("Opportunity revision identity is inconsistent")
+    if payload["publication_state"] not in {
+        "active",
+        "held_for_review",
+        "suppressed",
+        "expired",
+    }:
+        raise ValueError("Opportunity publication state is invalid")
+    if payload["opportunity_type"] != "open_match":
+        raise ValueError("Opportunity type is invalid")
+    accepted_facts = payload["accepted_facts"]
+    if not isinstance(accepted_facts, dict):
+        raise TypeError("accepted_facts must be an object")
+    _validate_open_match_accepted_facts(accepted_facts)
+    route = payload["response_route"]
+    if not isinstance(route, dict) or set(route) != {"kind", "value"}:
+        raise TypeError("response_route must contain kind and value")
+    if (
+        route["kind"] != "explicit_telegram_username"
+        or not isinstance(route["value"], str)
+        or not route["value"]
+    ):
+        raise ValueError("response_route is invalid")
+    _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
+    if envelope.idempotency_key != f"opportunity-publication:{opportunity_revision_id}":
+        raise ValueError(
+            "OpportunityPublicationChanged idempotency key is not canonical"
+        )
+
+
+def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
+    required = {
+        "start_local_date",
+        "end_local_date",
+        "exact_local_time",
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "open_places",
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "source_posted_at",
+    }
+    if set(facts) != required:
+        raise ValueError("open-match accepted facts are incomplete")
+    try:
+        start = date.fromisoformat(_required_text(facts, "start_local_date"))
+        end = date.fromisoformat(_required_text(facts, "end_local_date"))
+    except ValueError as error:
+        raise ValueError("open-match dates must be ISO local dates") from error
+    if end < start:
+        raise ValueError("open-match date range must be ordered")
+    for field_name in (
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+    ):
+        _required_text(facts, field_name)
+    if _required_text(facts, "location_geographic_type") not in {
+        "country",
+        "city",
+        *SUB_CITY_GEOGRAPHIC_TYPES,
+    }:
+        raise ValueError("open-match geographic type is invalid")
+    parent_ids = facts["location_parent_ids"]
+    if (
+        not isinstance(parent_ids, list)
+        or not parent_ids
+        or not all(isinstance(value, str) and value for value in parent_ids)
+    ):
+        raise TypeError("open-match location parents must be a non-empty text list")
+    exact_time = facts["exact_local_time"]
+    if exact_time is not None and (
+        not isinstance(exact_time, str)
+        or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
+    ):
+        raise ValueError("open-match exact time is invalid")
+    open_places = facts["open_places"]
+    if (
+        not isinstance(open_places, int)
+        or isinstance(open_places, bool)
+        or open_places < 1
+    ):
+        raise TypeError("open-match open_places must be positive")
+    list_allowlists = {
+        "team_formats": {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
+        "positions": {"goalkeeper", "defender", "midfielder", "forward"},
+        "playing_levels": {
+            "novice",
+            "below_average",
+            "average",
+            "above_average",
+            "high",
+            "very_high",
+            "master",
+            "professional",
+        },
+        "venue_settings": {"indoor", "outdoor", "covered_outdoor"},
+        "playing_surfaces": {
+            "natural_grass",
+            "artificial_turf",
+            "hard_surface",
+            "wood_parquet",
+        },
+    }
+    for field_name, allowed in list_allowlists.items():
+        values = facts[field_name]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(cast(list[str], values)))
+            or not all(isinstance(value, str) and value in allowed for value in values)
+        ):
+            raise ValueError(f"open-match {field_name} is invalid")
+    if facts["payment"] not in {None, "free", "paid"}:
+        raise ValueError("open-match payment is invalid")
+    _required_iso_datetime(facts, "source_posted_at")
 
 
 def _validate_source_chat_contract(

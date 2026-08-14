@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
@@ -195,6 +195,14 @@ class ClassifierRequest:
 
     source_message_revision_id: str
     body: str
+    source_event_time: str
+    source_recorded_at: str
+    context_bundle_version: str
+    source_chat_reference: str
+    source_chat_timezone: str | None
+    source_chat_geography: dict[str, JsonValue]
+    bounded_metadata: dict[str, JsonValue]
+    eligible_reply_context: dict[str, JsonValue] | None
     requested_model: str
     requested_reasoning_effort: str
     prompt_version: str
@@ -647,6 +655,18 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read application-owned Source Chats through a stable query."""
         ...
 
+    def configure_source_chat_classifier_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        iana_timezone: str,
+        country_id: str | None,
+        city_id: str | None,
+    ) -> None:
+        """Set bounded Application-owned context for one active generation."""
+        ...
+
     def eligible_source_chat_generation(
         self,
         *,
@@ -823,12 +843,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: RawContractEnvelope,
         completed_search: CompletedSearch,
-        results: tuple[SearchResult, ...],
         query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically persist a zero-result Completed Search and its event."""
+        """Evaluate one snapshot and atomically persist Search, Results and event."""
+        ...
+
+    def set_search_snapshot_hook(self, hook: Callable[[], None]) -> None:
+        """Install one controlled test hook after candidate snapshot selection."""
         ...
 
     def find_search_results(
@@ -910,6 +933,22 @@ class AcceptanceObserver(Protocol):
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
+        ...
+
+    def completed_search_opportunity_revision_inputs(
+        self, completed_search_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Observe the immutable evaluated Opportunity revision input set."""
+        ...
+
+    def inject_concurrent_opportunity_revision(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        open_places: int,
+    ) -> None:
+        """Inject a controlled projection revision for snapshot concurrency tests."""
         ...
 
     def replace_source_event_contract_version(

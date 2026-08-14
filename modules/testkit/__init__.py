@@ -1111,6 +1111,26 @@ class AcceptanceSpine:
         """Observe authoritative Source Messages through the stable testkit."""
         return self._observer.source_messages()
 
+    def configure_source_chat_classifier_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        iana_timezone: str,
+        country_id: str | None,
+        city_id: str | None,
+    ) -> None:
+        """Configure bounded primary-classifier context at the public seam."""
+        self._roles[
+            RuntimeRole.APPLICATION
+        ].store.configure_source_chat_classifier_context(
+            identity=identity,
+            registry_generation=registry_generation,
+            iana_timezone=iana_timezone,
+            country_id=country_id,
+            city_id=city_id,
+        )
+
     def source_events(self) -> tuple[SourceEventRecord, ...]:
         """Observe durable Source Events through the stable testkit."""
         return self._observer.source_events()
@@ -1143,6 +1163,30 @@ class AcceptanceSpine:
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()
+
+    def completed_search_opportunity_revision_inputs(
+        self, completed_search_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Observe the persisted immutable Recommendation revision input set."""
+        return self._observer.completed_search_opportunity_revision_inputs(
+            completed_search_id
+        )
+
+    def inject_projection_change_during_next_search(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        open_places: int,
+    ) -> None:
+        """Change a projection after the next Search has selected its snapshot."""
+        self._roles[RuntimeRole.RECOMMENDATION].store.set_search_snapshot_hook(
+            lambda: self._observer.inject_concurrent_opportunity_revision(
+                opportunity_id=opportunity_id,
+                opportunity_revision_id=opportunity_revision_id,
+                open_places=open_places,
+            )
+        )
 
     def redeliver_source_event(self, source_event_id: str) -> bool:
         """Redeliver one durable Source Event at the external contract seam."""
@@ -1214,24 +1258,38 @@ class AcceptanceSpine:
         include_telegram_user_id: bool = True,
         payload: dict[str, JsonValue] | None = None,
     ) -> None:
-        """Record one synthetic Recommendation event for contract-boundary tests."""
+        """Record one synthetic handoff for public contract-boundary tests."""
         if contract_name not in {
+            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+            ContractName.CLASSIFICATION_PROPOSAL,
+            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
             ContractName.RUN_SEARCH,
             ContractName.SEARCH_COMPLETED,
             ContractName.SEARCH_FAILED,
             ContractName.GET_COMPLETED_SEARCH,
         }:
-            raise ValueError("only Search outcome events can use this testkit port")
+            raise ValueError("contract cannot use this testkit port")
+        definition = _CONTRACTS.get((contract_name, contract_version))
         event_producer = producer or (
-            RuntimeRole.BOT_ASSISTANT
-            if contract_name is ContractName.RUN_SEARCH
-            else RuntimeRole.RECOMMENDATION
+            definition.producer
+            if definition is not None
+            else (
+                RuntimeRole.BOT_ASSISTANT
+                if contract_name is ContractName.RUN_SEARCH
+                else RuntimeRole.RECOMMENDATION
+            )
         )
         consumer = (
-            RuntimeRole.RECOMMENDATION
-            if contract_name is ContractName.RUN_SEARCH
-            else RuntimeRole.BOT_ASSISTANT
+            definition.consumer
+            if definition is not None
+            else (
+                RuntimeRole.RECOMMENDATION
+                if contract_name is ContractName.RUN_SEARCH
+                else RuntimeRole.BOT_ASSISTANT
+            )
         )
+        if consumer is None:
+            raise ValueError("contract has no consumer")
         event_payload: dict[str, JsonValue]
         if payload is not None:
             event_payload = dict(payload)
@@ -1807,6 +1865,10 @@ class AcceptanceSpine:
         """Process one durable Search handoff without presenting Telegram output."""
         if role not in {RuntimeRole.RECOMMENDATION, RuntimeRole.BOT_ASSISTANT}:
             raise ValueError("Search handoff role must own the Search pipeline")
+        return self._roles[role].process_next()
+
+    def process_next_contract_handoff(self, role: RuntimeRole) -> bool:
+        """Process one handoff through its actual runtime consumer."""
         return self._roles[role].process_next()
 
     @contextmanager

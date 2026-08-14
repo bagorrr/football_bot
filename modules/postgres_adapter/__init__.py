@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg import conninfo, sql
@@ -45,10 +47,10 @@ from modules.domain import (
     InitialConsentAttestation,
     IntentBranch,
     LocaleSource,
-    MatchState,
     OldChatViewCleanup,
     Opportunity,
     OpportunityResponseRoute,
+    OpportunityRevisionProjection,
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
@@ -73,8 +75,7 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
     UserIntent,
-    match_detail,
-    match_time_detail,
+    evaluate_game_search,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -117,7 +118,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
-    "4ee1aeec9d5b14cc510b5eaf3fd50c8f26bb99ef13627b4bab302f5d2b0ad9f9",
+    "23807a583b1e434b59e3dd052a485919a0a704eb782d87e56e2bd6bac6e0fcd3",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -805,7 +806,8 @@ class PostgresAcceptanceObserver:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT opportunity_id, source_message_revision_id,
+                SELECT opportunity_id, opportunity_revision_id,
+                       source_message_revision_id,
                        opportunity_type, publication_state, response_route
                 FROM football_runtime.application_opportunities
                 ORDER BY accepted_at, opportunity_id
@@ -814,6 +816,7 @@ class PostgresAcceptanceObserver:
         return tuple(
             Opportunity(
                 opportunity_id=row["opportunity_id"],
+                opportunity_revision_id=row["opportunity_revision_id"],
                 source_message_revision_id=row["source_message_revision_id"],
                 opportunity_type=row["opportunity_type"],
                 publication_state=row["publication_state"],
@@ -824,6 +827,51 @@ class PostgresAcceptanceObserver:
             )
             for row in rows
         )
+
+    def completed_search_opportunity_revision_inputs(
+        self, completed_search_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Observe the immutable full revision input set for one Search."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT opportunity_revision_inputs
+                FROM football_runtime.recommendation_completed_searches
+                WHERE completed_search_id = %s
+                """,
+                (completed_search_id,),
+            ).fetchone()
+        if row is None:
+            return ()
+        return tuple(cast(list[dict[str, JsonValue]], row[0]))
+
+    def inject_concurrent_opportunity_revision(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        open_places: int,
+    ) -> None:
+        """Insert one controlled newer projection revision from another connection."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.recommendation_opportunities (
+                    opportunity_id, opportunity_revision_id, opportunity_type,
+                    publication_state, accepted_facts, response_route, published_at
+                )
+                SELECT opportunity_id, %s, opportunity_type, publication_state,
+                       jsonb_set(accepted_facts, '{open_places}', to_jsonb(%s::int)),
+                       response_route, published_at + interval '1 second'
+                FROM football_runtime.recommendation_opportunities
+                WHERE opportunity_id = %s
+                ORDER BY published_at DESC
+                LIMIT 1
+                """,
+                (opportunity_revision_id, open_places, opportunity_id),
+            )
+            if inserted.rowcount != 1:
+                raise ValueError("Opportunity projection does not exist")
 
     def replace_source_event_contract_version(
         self,
@@ -1346,6 +1394,7 @@ class PostgresRoleStore:
     def __init__(self, role: RuntimeRole, database_url: str) -> None:
         self._role = role
         self._database_url = database_url
+        self._search_snapshot_hook: Callable[[], None] | None = None
 
     @property
     def role(self) -> RuntimeRole:
@@ -1472,8 +1521,13 @@ class PostgresRoleStore:
                         address_kind, current_address,
                         processing_started_at, transport_boundary, enabled,
                         initial_consent_attestation, attested_at,
+                        classifier_timezone, classifier_country_id,
+                        classifier_city_id,
                         created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s
+                    )
                     ON CONFLICT (
                         peer_kind, telegram_chat_id, registry_generation
                     ) DO UPDATE
@@ -1492,6 +1546,9 @@ class PostgresRoleStore:
                         entry.enabled,
                         initial_consent_attestation,
                         attested_at,
+                        entry.classifier_timezone,
+                        entry.classifier_country_id,
+                        entry.classifier_city_id,
                         received_at,
                         received_at,
                     ),
@@ -1525,7 +1582,9 @@ class PostgresRoleStore:
                 SELECT peer_kind, telegram_chat_id, registry_generation,
                        address_kind, current_address,
                        processing_started_at, transport_boundary, enabled,
-                       initial_consent_attestation, attested_at
+                       initial_consent_attestation, attested_at,
+                       classifier_timezone, classifier_country_id,
+                       classifier_city_id
                 FROM football_runtime.source_chat_registry
                 ORDER BY peer_kind, telegram_chat_id, registry_generation
                 """
@@ -1546,9 +1605,48 @@ class PostgresRoleStore:
                     row["initial_consent_attestation"]
                 ),
                 attested_at=row["attested_at"],
+                classifier_timezone=row["classifier_timezone"],
+                classifier_country_id=row["classifier_country_id"],
+                classifier_city_id=row["classifier_city_id"],
             )
             for row in rows
         )
+
+    def configure_source_chat_classifier_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        iana_timezone: str,
+        country_id: str | None,
+        city_id: str | None,
+    ) -> None:
+        """Set bounded classifier context through Application ownership."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        ZoneInfo(iana_timezone)
+        with psycopg.connect(self._database_url) as connection:
+            updated = connection.execute(
+                """
+                UPDATE football_runtime.source_chat_registry
+                SET classifier_timezone = %s,
+                    classifier_country_id = %s,
+                    classifier_city_id = %s,
+                    updated_at = transaction_timestamp()
+                WHERE peer_kind = %s AND telegram_chat_id = %s
+                  AND registry_generation = %s AND enabled
+                """,
+                (
+                    iana_timezone,
+                    country_id,
+                    city_id,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Source Chat generation is not active")
 
     def eligible_source_chat_generation(
         self,
@@ -1568,7 +1666,9 @@ class PostgresRoleStore:
                 SELECT peer_kind, telegram_chat_id, registry_generation,
                        address_kind, current_address,
                        processing_started_at, transport_boundary, enabled,
-                       initial_consent_attestation, attested_at
+                       initial_consent_attestation, attested_at,
+                       classifier_timezone, classifier_country_id,
+                       classifier_city_id
                 FROM football_runtime.source_chat_registry
                 WHERE peer_kind = %s
                   AND telegram_chat_id = %s
@@ -1598,6 +1698,9 @@ class PostgresRoleStore:
                 row["initial_consent_attestation"]
             ),
             attested_at=row["attested_at"],
+            classifier_timezone=row["classifier_timezone"],
+            classifier_country_id=row["classifier_country_id"],
+            classifier_city_id=row["classifier_city_id"],
         )
 
     def source_chat_ingestion_context(
@@ -2609,10 +2712,11 @@ class PostgresRoleStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.application_opportunities (
-                    opportunity_id, source_message_revision_id, opportunity_type,
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
                     publication_state, accepted_facts, evidence, response_route,
                     accepted_at
-                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
                 ON CONFLICT (opportunity_id) DO UPDATE
                 SET source_message_revision_id = EXCLUDED.source_message_revision_id,
                     publication_state = EXCLUDED.publication_state,
@@ -2623,6 +2727,7 @@ class PostgresRoleStore:
                 """,
                 (
                     opportunity["opportunity_id"],
+                    opportunity["opportunity_revision_id"],
                     opportunity["source_message_revision_id"],
                     opportunity["opportunity_type"],
                     opportunity["publication_state"],
@@ -2659,17 +2764,15 @@ class PostgresRoleStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.recommendation_opportunities (
-                    opportunity_id, publication_state, accepted_facts,
-                    response_route, published_at
-                ) VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)
-                ON CONFLICT (opportunity_id) DO UPDATE
-                SET publication_state = EXCLUDED.publication_state,
-                    accepted_facts = EXCLUDED.accepted_facts,
-                    response_route = EXCLUDED.response_route,
-                    published_at = EXCLUDED.published_at
+                    opportunity_id, opportunity_revision_id, opportunity_type,
+                    publication_state, accepted_facts, response_route, published_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                ON CONFLICT (opportunity_revision_id) DO NOTHING
                 """,
                 (
                     payload["opportunity_id"],
+                    payload["opportunity_revision_id"],
+                    payload["opportunity_type"],
                     payload["publication_state"],
                     json.dumps(payload["accepted_facts"]),
                     json.dumps(payload["response_route"]),
@@ -2773,7 +2876,7 @@ class PostgresRoleStore:
         completed_search: CompletedSearch,
         game_search_details: Mapping[str, tuple[str, ...]],
     ) -> tuple[SearchResult, ...]:
-        """Match active accepted facts with deterministic core three-state rules."""
+        """Load accepted projections and delegate deterministic evaluation."""
         if self._role is not RuntimeRole.RECOMMENDATION:
             raise ConversationAccessDeniedError
         if completed_search.user_intent is not UserIntent.GAME_SEARCH:
@@ -2781,153 +2884,43 @@ class PostgresRoleStore:
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             rows = connection.execute(
                 """
-                SELECT opportunity_id, accepted_facts, response_route
+                SELECT DISTINCT ON (opportunity_id)
+                       opportunity_id, opportunity_revision_id, opportunity_type,
+                       publication_state, accepted_facts, response_route
                 FROM football_runtime.recommendation_opportunities
-                WHERE publication_state = 'active'
-                ORDER BY opportunity_id
+                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
                 """
             ).fetchall()
-        matched: list[SearchResult] = []
-        for row in rows:
-            facts = row["accepted_facts"]
-            if (
-                facts.get("country_id") != completed_search.country_id
-                or facts.get("city_id") != completed_search.city_id
-            ):
-                continue
-            start = date.fromisoformat(facts["start_local_date"])
-            end = date.fromisoformat(facts["end_local_date"])
-            required = completed_search.required_date
-            if required is not None and (
-                end < required.start_local_date or start > required.end_local_date
-            ):
-                continue
-            area_state = _match_search_area(
-                whole_city=completed_search.whole_city,
-                selected_area_ids=completed_search.sub_city_area_ids,
-                selected_area_types=completed_search.sub_city_area_geographic_types,
-                selected_area_parent_ids=(
-                    completed_search.sub_city_area_verified_parent_ids
-                ),
-                country_id=completed_search.country_id,
-                city_id=completed_search.city_id,
-                facts=facts,
-            )
-            route = row["response_route"]
-            detail_state_by_key = {
-                key: match_detail(
-                    game_search_details.get(key, ()),
-                    tuple(facts[key]) if facts.get(key) else None,
+        return evaluate_game_search(
+            completed_search,
+            game_search_details,
+            tuple(
+                OpportunityRevisionProjection(
+                    opportunity_id=row["opportunity_id"],
+                    opportunity_revision_id=row["opportunity_revision_id"],
+                    opportunity_type=row["opportunity_type"],
+                    publication_state=row["publication_state"],
+                    accepted_facts=row["accepted_facts"],
+                    response_route=row["response_route"],
                 )
-                for key in (
-                    "team_formats",
-                    "positions",
-                    "playing_levels",
-                    "venue_settings",
-                    "playing_surfaces",
-                )
-            }
-            detail_state_by_key.update(
-                {
-                    "payment": match_detail(
-                        game_search_details.get("payment", ()),
-                        (facts["payment"],) if facts.get("payment") else None,
-                    ),
-                    "times": match_time_detail(
-                        game_search_details.get("times", ()),
-                        facts.get("exact_local_time"),
-                    ),
-                    "search_area": area_state,
-                }
-            )
-            detail_states = tuple(detail_state_by_key.values())
-            if MatchState.CONFLICT in detail_states:
-                continue
-            result_class = (
-                "possible_match"
-                if MatchState.UNKNOWN in detail_states
-                else "confirmed_match"
-            )
-            card: dict[str, str] = {
-                "opportunity_id": row["opportunity_id"],
-                "start_local_date": facts["start_local_date"],
-                "end_local_date": facts["end_local_date"],
-                "sort_local_date": (
-                    max(start, required.start_local_date).isoformat()
-                    if required is not None
-                    else facts["start_local_date"]
-                ),
-                "iana_timezone": facts["iana_timezone"],
-                "open_places": str(facts["open_places"]),
-                "source_posted_at": facts["source_posted_at"],
-                "response_route_kind": route["kind"],
-                "response_route_value": route["value"],
-                "unknown_criterion_count": str(
-                    sum(state is MatchState.UNKNOWN for state in detail_states)
-                ),
-                "location_specificity": str(
-                    _LOCATION_SPECIFICITY.get(
-                        str(facts.get("location_geographic_type")), 0
-                    )
-                ),
-                "match_states": json.dumps(
-                    {
-                        key: state.value
-                        for key, state in detail_state_by_key.items()
-                        if game_search_details.get(key)
-                        or (key == "search_area" and not completed_search.whole_city)
-                    },
-                    sort_keys=True,
-                ),
-            }
-            for locale in ("en", "ru", "es", "fr"):
-                card[f"city_display_{locale}"] = facts[f"city_display_{locale}"]
-                card[f"place_display_{locale}"] = facts[f"place_display_{locale}"]
-            if facts.get("exact_local_time"):
-                card["exact_local_time"] = facts["exact_local_time"]
-            for source_key in (
-                "team_formats",
-                "positions",
-                "playing_levels",
-                "venue_settings",
-                "playing_surfaces",
-            ):
-                if facts.get(source_key):
-                    card[source_key] = json.dumps(facts[source_key])
-            if facts.get("payment"):
-                card["payment"] = facts["payment"]
-            matched.append(
-                SearchResult(
-                    result_id=f"result:{completed_search.completed_search_id}:{row['opportunity_id']}",
-                    completed_search_id=completed_search.completed_search_id,
-                    absolute_position=len(matched) + 1,
-                    result_class=result_class,
-                    card_facts=tuple(sorted(card.items())),
-                )
-            )
-        matched.sort(key=_game_search_result_sort_key)
-        return tuple(
-            SearchResult(
-                result_id=result.result_id,
-                completed_search_id=result.completed_search_id,
-                absolute_position=position,
-                result_class=result.result_class,
-                card_facts=result.card_facts,
-            )
-            for position, result in enumerate(matched, start=1)
+                for row in rows
+            ),
         )
+
+    def set_search_snapshot_hook(self, hook: Callable[[], None]) -> None:
+        """Install one controlled hook after candidate snapshot selection."""
+        self._search_snapshot_hook = hook
 
     def complete_search(
         self,
         *,
         incoming: RawContractEnvelope,
         completed_search: CompletedSearch,
-        results: tuple[SearchResult, ...],
         query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Commit one immutable zero-result Search and SearchCompleted event."""
+        """Evaluate one database snapshot and atomically commit immutable outputs."""
         with psycopg.connect(self._database_url) as connection:
             existing = connection.execute(
                 """
@@ -2988,6 +2981,53 @@ class PostgresRoleStore:
             if existing_search is not None:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
+            opportunity_rows = connection.execute(
+                """
+                SELECT DISTINCT ON (opportunity_id)
+                       opportunity_id, opportunity_revision_id, opportunity_type,
+                       publication_state, accepted_facts, response_route, published_at
+                FROM football_runtime.recommendation_opportunities
+                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                """
+            ).fetchall()
+            if self._search_snapshot_hook is not None:
+                hook, self._search_snapshot_hook = self._search_snapshot_hook, None
+                hook()
+            input_set = [
+                {
+                    "opportunity_id": row[0],
+                    "opportunity_revision_id": row[1],
+                    "opportunity_type": row[2],
+                    "publication_state": row[3],
+                    "accepted_facts": row[4],
+                    "response_route": row[5],
+                    "published_at": row[6].isoformat(),
+                }
+                for row in opportunity_rows
+            ]
+            results = evaluate_game_search(
+                completed_search,
+                dict(completed_search.game_search_details),
+                tuple(
+                    OpportunityRevisionProjection(
+                        opportunity_id=row[0],
+                        opportunity_revision_id=row[1],
+                        opportunity_type=row[2],
+                        publication_state=row[3],
+                        accepted_facts=row[4],
+                        response_route=row[5],
+                    )
+                    for row in opportunity_rows
+                ),
+            )
+            outgoing_payload = outgoing.payload
+            if not isinstance(outgoing_payload, dict):
+                raise TypeError("SearchCompleted payload must be an object")
+            outgoing = replace(
+                outgoing,
+                payload={**outgoing_payload, "result_count": len(results)},
+            )
+            query = GetCompletedSearch.from_search_completed(outgoing)
             connection.execute(
                 """
                 INSERT INTO football_runtime.recommendation_completed_searches (
@@ -2995,10 +3035,10 @@ class PostgresRoleStore:
                     user_intent, country_id, city_id, sub_city_area_ids,
                     sub_city_area_geographic_types,
                     sub_city_area_verified_parent_ids, whole_city, required_date,
-                    game_search_details, completed_at
+                    game_search_details, opportunity_revision_inputs, completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s, %s::jsonb, %s::jsonb, %s
+                    %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s
                 )
                 """,
                 (
@@ -3014,6 +3054,7 @@ class PostgresRoleStore:
                     completed_search.whole_city,
                     json.dumps(_required_date_json(completed_search.required_date)),
                     json.dumps(dict(completed_search.game_search_details)),
+                    json.dumps(input_set),
                     completed_search.completed_at,
                 ),
             )
@@ -5409,72 +5450,6 @@ def _required_date_json(required_date: RequiredDate | None) -> Any:
         "iana_timezone": required_date.iana_timezone,
         "timezone_data_version": required_date.timezone_data_version,
     }
-
-
-_LOCATION_SPECIFICITY = {
-    "country": 0,
-    "city": 1,
-    "administrative_district": 2,
-    "neighborhood": 3,
-    "locality": 4,
-    "station": 5,
-    "transport_hub": 6,
-    "landmark": 7,
-    "address": 8,
-}
-
-
-def _match_search_area(
-    *,
-    whole_city: bool,
-    selected_area_ids: tuple[str, ...],
-    selected_area_types: tuple[str, ...],
-    selected_area_parent_ids: tuple[tuple[str, ...], ...],
-    country_id: str,
-    city_id: str,
-    facts: Mapping[str, Any],
-) -> MatchState:
-    """Match accepted containment without treating broader scope as outside."""
-    if whole_city:
-        return MatchState.CONFIRMED
-    place_id = facts.get("place_id")
-    parent_ids = facts.get("location_parent_ids")
-    known_area_ids = {
-        value
-        for value in (
-            place_id,
-            *(parent_ids if isinstance(parent_ids, list) else ()),
-        )
-        if isinstance(value, str)
-    }
-    if known_area_ids.intersection(selected_area_ids):
-        return MatchState.CONFIRMED
-    if len(selected_area_types) != len(selected_area_ids) or len(
-        selected_area_parent_ids
-    ) != len(selected_area_ids):
-        return MatchState.UNKNOWN
-    if not known_area_ids or known_area_ids.issubset({country_id, city_id}):
-        return MatchState.UNKNOWN
-    if isinstance(place_id, str) and any(
-        place_id in parent_ids for parent_ids in selected_area_parent_ids
-    ):
-        return MatchState.UNKNOWN
-    return MatchState.CONFLICT
-
-
-def _game_search_result_sort_key(
-    result: SearchResult,
-) -> tuple[int, int, str, str, int, str]:
-    """Return the complete deterministic intra-search ordering key."""
-    facts = dict(result.card_facts)
-    return (
-        0 if result.result_class == "confirmed_match" else 1,
-        int(facts.get("unknown_criterion_count", "0")),
-        facts.get("sort_local_date", facts["start_local_date"]),
-        facts.get("exact_local_time", "23:59"),
-        -int(facts.get("location_specificity", "0")),
-        facts["opportunity_id"],
-    )
 
 
 def runtime_database_url(

@@ -9,7 +9,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from modules.contracts import ContractName, FailureCode, JsonValue, RuntimeRole
+from modules.contracts import (
+    SUPPORTED_CONTRACTS,
+    ContractName,
+    FailureCode,
+    JsonValue,
+    RuntimeRole,
+)
 from modules.testkit import (
     AcceptanceSnapshot,
     AcceptanceSpine,
@@ -448,7 +454,7 @@ def test_search_completed_schema_and_subject_mismatches_fail_closed(
         contract_version=contract_version,
         telegram_user_id=501,
         include_telegram_user_id=False,
-        payload=payload,
+        payload={"probe_id": probe_id, **payload},
     )
 
     assert spine.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
@@ -490,6 +496,106 @@ def test_database_rejects_cross_owner_write_and_records_body_free_alert(
         failure_code=FailureCode.OWNER_WRITE_DENIED,
     )
     assert spine.observe("foreign-owner-state").owner_state_roles == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("contract_name", "consumer", "payload"),
+    (
+        (
+            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+            RuntimeRole.CLASSIFICATION,
+            {"source_message_revision_id": "malformed:revision:1"},
+        ),
+        (
+            ContractName.CLASSIFICATION_PROPOSAL,
+            RuntimeRole.APPLICATION,
+            {"proposal_id": "proposal:malformed:revision:1"},
+        ),
+        (
+            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+            RuntimeRole.RECOMMENDATION,
+            {"opportunity_id": "opportunity:malformed"},
+        ),
+    ),
+)
+def test_new_v2_contracts_durably_reject_malformed_replay_without_effect(
+    spine: AcceptanceSpine,
+    contract_name: ContractName,
+    consumer: RuntimeRole,
+    payload: dict[str, JsonValue],
+) -> None:
+    probe_id = f"malformed-{contract_name.value}"
+    spine.record_search_event(
+        probe_id=probe_id,
+        contract_name=contract_name,
+        contract_version=2,
+        telegram_user_id=501,
+        include_telegram_user_id=False,
+        payload={"probe_id": probe_id, **payload},
+    )
+
+    assert spine.process_next_contract_handoff(consumer)
+    assert not spine.process_next_contract_handoff(consumer)
+
+    snapshot = spine.observe(probe_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert snapshot.outbox_records == 1
+    assert snapshot.operator_alerts == (
+        OperatorAlert(
+            producer=next(
+                definition.producer
+                for definition in SUPPORTED_CONTRACTS
+                if definition.name is contract_name and definition.version == 2
+            ),
+            consumer=consumer,
+            contract_name=contract_name,
+            contract_version=2,
+            failure_code=FailureCode.INVALID_CONTRACT,
+        ),
+    )
+
+
+def test_v2_classifier_command_rejects_mismatched_envelope_identity(
+    spine: AcceptanceSpine,
+) -> None:
+    probe_id = "identity-mismatched-classifier-command"
+    spine.record_search_event(
+        probe_id=probe_id,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        telegram_user_id=501,
+        include_telegram_user_id=False,
+        payload={
+            "source_message_revision_id": f"{probe_id}:revision:1",
+            "body": "Tomorrow one place is open",
+            "source_event_time": "2026-08-14T12:00:00+00:00",
+            "source_recorded_at": "2026-08-14T12:00:01+00:00",
+            "context_bundle_version": "primary-classifier-context-v1",
+            "source_chat_reference": "source-chat:channel:501",
+            "source_chat_timezone": "Europe/Moscow",
+            "source_chat_geography": {"country_id": None, "city_id": None},
+            "bounded_metadata": {
+                "message_language": None,
+                "attachment_types": [],
+            },
+            "eligible_reply_context": None,
+        },
+    )
+
+    assert spine.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert not spine.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    envelope = spine.recoverable_contract(
+        probe_id,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+    )
+    assert spine.operator_alert(envelope.message_id) == OperatorAlert(
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.CLASSIFICATION,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        failure_code=FailureCode.INVALID_CONTRACT,
+    )
 
 
 def test_all_roles_resume_safely_after_restart(spine: AcceptanceSpine) -> None:

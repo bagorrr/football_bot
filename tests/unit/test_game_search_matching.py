@@ -1,7 +1,11 @@
 """Deterministic Game Search detail matching."""
 
-from modules.domain import MatchState, match_detail, match_time_detail
-from modules.postgres_adapter import _match_search_area
+from modules.domain import (
+    MatchState,
+    match_detail,
+    match_search_area,
+    match_time_detail,
+)
 
 
 def test_detail_matching_is_confirmed_unknown_or_conflict() -> None:
@@ -45,7 +49,7 @@ def test_broader_locations_are_unknown_without_outside_containment_evidence() ->
     }
     selected = ("station:ru:spb:komendantsky-prospekt",)
     assert (
-        _match_search_area(
+        match_search_area(
             whole_city=False,
             selected_area_ids=selected,
             selected_area_types=("station",),
@@ -59,7 +63,7 @@ def test_broader_locations_are_unknown_without_outside_containment_evidence() ->
         is MatchState.UNKNOWN
     )
     assert (
-        _match_search_area(
+        match_search_area(
             whole_city=False,
             selected_area_ids=selected,
             selected_area_types=("station",),
@@ -73,7 +77,7 @@ def test_broader_locations_are_unknown_without_outside_containment_evidence() ->
         is MatchState.UNKNOWN
     )
     assert (
-        _match_search_area(
+        match_search_area(
             whole_city=False,
             selected_area_ids=selected,
             selected_area_types=("station",),
@@ -87,7 +91,7 @@ def test_broader_locations_are_unknown_without_outside_containment_evidence() ->
         is MatchState.CONFLICT
     )
     assert (
-        _match_search_area(
+        match_search_area(
             whole_city=False,
             selected_area_ids=("district:ru:spb:vyborgsky",),
             selected_area_types=("administrative_district",),
@@ -102,7 +106,7 @@ def test_broader_locations_are_unknown_without_outside_containment_evidence() ->
 
 def test_selected_union_parent_hierarchies_prove_other_district_outside() -> None:
     assert (
-        _match_search_area(
+        match_search_area(
             whole_city=False,
             selected_area_ids=(
                 "district:ru:spb:primorsky",
@@ -132,9 +136,28 @@ def test_selected_union_parent_hierarchies_prove_other_district_outside() -> Non
     )
 
 
+def test_same_parent_cross_type_is_unknown_without_verified_containment() -> None:
+    assert (
+        match_search_area(
+            whole_city=False,
+            selected_area_ids=("district:ru:spb:primorsky",),
+            selected_area_types=("administrative_district",),
+            selected_area_parent_ids=(("city:ru:spb", "country:ru"),),
+            country_id="country:ru",
+            city_id="city:ru:spb",
+            facts={
+                "place_id": "station:ru:spb:petrogradskaya",
+                "location_parent_ids": ["city:ru:spb", "country:ru"],
+                "location_geographic_type": "station",
+            },
+        )
+        is MatchState.UNKNOWN
+    )
+
+
 def test_legacy_area_without_containment_metadata_is_conservatively_unknown() -> None:
     assert (
-        _match_search_area(
+        match_search_area(
             whole_city=False,
             selected_area_ids=("station:ru:spb:komendantsky-prospekt",),
             selected_area_types=(),

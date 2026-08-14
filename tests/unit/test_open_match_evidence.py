@@ -167,6 +167,12 @@ def test_overlapping_substrings_do_not_authorize_normalized_facts() -> None:
         None,
         "20 August 2026",
     )
+    assert not _event_time_is_supported(
+        date(2026, 8, 2),
+        date(2026, 8, 2),
+        None,
+        "On 20 August 2026 we need 2 players",
+    )
     assert not _open_places_are_supported(1, "10 places")
     assert not _open_places_are_supported(1, "one referee")
     assert not _open_places_are_supported(1, "one team registered")
@@ -235,6 +241,14 @@ def test_supported_languages_use_exact_semantic_evidence() -> None:
         date(2026, 9, 25),
         "20:00",
         "25 septembre 2026 à 20:00",
+    )
+    assert _event_time_is_supported(
+        date(2026, 8, 15),
+        date(2026, 8, 15),
+        "19:00",
+        "Матч завтра в 19:00",
+        source_event_time=datetime(2026, 8, 14, 20, 0, tzinfo=ZoneInfo("UTC")),
+        source_timezone="Europe/Moscow",
     )
     assert _open_places_are_supported(2, "hay dos plazas para jugadores")
     assert _optional_values_are_supported(

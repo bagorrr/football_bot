@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import UUID
 
 
@@ -118,6 +121,74 @@ def match_time_detail(
     if accepted_exact_time in requested or matching_day_parts.intersection(requested):
         return MatchState.CONFIRMED
     return MatchState.CONFLICT
+
+
+_LOCATION_SPECIFICITY = {
+    "country": 0,
+    "city": 1,
+    "administrative_district": 2,
+    "neighborhood": 3,
+    "locality": 4,
+    "station": 5,
+    "transport_hub": 6,
+    "landmark": 7,
+    "address": 8,
+}
+
+
+def match_search_area(
+    *,
+    whole_city: bool,
+    selected_area_ids: tuple[str, ...],
+    selected_area_types: tuple[str, ...],
+    selected_area_parent_ids: tuple[tuple[str, ...], ...],
+    country_id: str,
+    city_id: str,
+    facts: Mapping[str, Any],
+) -> MatchState:
+    """Compare only resolver-verified containment at comparable boundaries."""
+    if whole_city:
+        return MatchState.CONFIRMED
+    place_id = facts.get("place_id")
+    parent_ids = facts.get("location_parent_ids")
+    known_area_ids = {
+        value
+        for value in (place_id, *(parent_ids if isinstance(parent_ids, list) else ()))
+        if isinstance(value, str)
+    }
+    if known_area_ids.intersection(selected_area_ids):
+        return MatchState.CONFIRMED
+    if len(selected_area_types) != len(selected_area_ids) or len(
+        selected_area_parent_ids
+    ) != len(selected_area_ids):
+        return MatchState.UNKNOWN
+    if not known_area_ids or known_area_ids.issubset({country_id, city_id}):
+        return MatchState.UNKNOWN
+    if isinstance(place_id, str) and any(
+        place_id in verified_parents for verified_parents in selected_area_parent_ids
+    ):
+        return MatchState.UNKNOWN
+    accepted_type = facts.get("location_geographic_type")
+    if not isinstance(accepted_type, str) or accepted_type not in selected_area_types:
+        return MatchState.UNKNOWN
+    # Same-type siblings are comparable. Their distinct verified identities prove
+    # disjoint containment at their nearest common authoritative parent.
+    return MatchState.CONFLICT
+
+
+def game_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, str, str, int, str]:
+    """Return the complete deterministic intra-search ordering key."""
+    facts = dict(result.card_facts)
+    return (
+        0 if result.result_class == "confirmed_match" else 1,
+        int(facts.get("unknown_criterion_count", "0")),
+        facts.get("sort_local_date", facts["start_local_date"]),
+        facts.get("exact_local_time", "23:59"),
+        -int(facts.get("location_specificity", "0")),
+        facts["opportunity_id"],
+    )
 
 
 class IntentBranch(StrEnum):
@@ -249,6 +320,9 @@ class SourceChatRegistryEntry:
     enabled: bool
     initial_consent_attestation: InitialConsentAttestation
     attested_at: datetime
+    classifier_timezone: str | None = None
+    classifier_country_id: str | None = None
+    classifier_city_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.registry_generation < 1:
@@ -641,6 +715,159 @@ class SearchResult:
 
 
 @dataclass(frozen=True, slots=True)
+class OpportunityRevisionProjection:
+    """One immutable accepted Recommendation input revision."""
+
+    opportunity_id: str
+    opportunity_revision_id: str
+    opportunity_type: str
+    publication_state: str
+    accepted_facts: Mapping[str, Any]
+    response_route: Mapping[str, Any]
+
+
+def evaluate_game_search(
+    completed_search: CompletedSearch,
+    game_search_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Purely classify, snapshot and order one Game Search input set."""
+    if completed_search.user_intent is not UserIntent.GAME_SEARCH:
+        return ()
+    matched: list[SearchResult] = []
+    for opportunity in opportunities:
+        if (
+            opportunity.publication_state != "active"
+            or opportunity.opportunity_type != "open_match"
+        ):
+            continue
+        facts = opportunity.accepted_facts
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+        ):
+            continue
+        start = date.fromisoformat(str(facts["start_local_date"]))
+        end = date.fromisoformat(str(facts["end_local_date"]))
+        required = completed_search.required_date
+        if required is not None and (
+            end < required.start_local_date or start > required.end_local_date
+        ):
+            continue
+        detail_state_by_key = {
+            key: match_detail(
+                game_search_details.get(key, ()),
+                tuple(facts[key]) if facts.get(key) else None,
+            )
+            for key in (
+                "team_formats",
+                "positions",
+                "playing_levels",
+                "venue_settings",
+                "playing_surfaces",
+            )
+        }
+        detail_state_by_key.update(
+            payment=match_detail(
+                game_search_details.get("payment", ()),
+                (str(facts["payment"]),) if facts.get("payment") else None,
+            ),
+            times=match_time_detail(
+                game_search_details.get("times", ()),
+                str(facts["exact_local_time"])
+                if facts.get("exact_local_time")
+                else None,
+            ),
+            search_area=match_search_area(
+                whole_city=completed_search.whole_city,
+                selected_area_ids=completed_search.sub_city_area_ids,
+                selected_area_types=completed_search.sub_city_area_geographic_types,
+                selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+                country_id=completed_search.country_id,
+                city_id=completed_search.city_id,
+                facts=facts,
+            ),
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+        result_class = (
+            "possible_match" if MatchState.UNKNOWN in states else "confirmed_match"
+        )
+        route = opportunity.response_route
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "start_local_date": str(facts["start_local_date"]),
+            "end_local_date": str(facts["end_local_date"]),
+            "sort_local_date": max(start, required.start_local_date).isoformat()
+            if required is not None
+            else str(facts["start_local_date"]),
+            "iana_timezone": str(facts["iana_timezone"]),
+            "open_places": str(facts["open_places"]),
+            "source_posted_at": str(facts["source_posted_at"]),
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if game_search_details.get(key)
+                    or (key == "search_area" and not completed_search.whole_city)
+                },
+                sort_keys=True,
+            ),
+        }
+        for locale in ("en", "ru", "es", "fr"):
+            card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
+            card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("exact_local_time"):
+            card["exact_local_time"] = str(facts["exact_local_time"])
+        for key in (
+            "team_formats",
+            "positions",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+        ):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key])
+        if facts.get("payment"):
+            card["payment"] = str(facts["payment"])
+        matched.append(
+            SearchResult(
+                result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=result_class,
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=game_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
+
+
+def replace_result_position(result: SearchResult, position: int) -> SearchResult:
+    """Return an immutable result with its final ordered position."""
+    return SearchResult(
+        result.result_id,
+        result.completed_search_id,
+        position,
+        result.result_class,
+        result.card_facts,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ClassificationAttempt:
     """One durable primary-classifier execution with complete provenance."""
 
@@ -682,6 +909,7 @@ class Opportunity:
     """Application-authoritative accepted football opportunity."""
 
     opportunity_id: str
+    opportunity_revision_id: str
     source_message_revision_id: str
     opportunity_type: str
     publication_state: str

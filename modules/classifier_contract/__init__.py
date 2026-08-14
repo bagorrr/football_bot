@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from typing import TypeAlias
 
-from modules.contracts import JsonValue
+JsonValue: TypeAlias = (
+    bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None
+)
 
 _DISPOSITIONS = {
     "accepted",

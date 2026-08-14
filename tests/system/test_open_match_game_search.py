@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+from modules.contracts import RuntimeRole
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -216,6 +217,13 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         clock=clock,
         administrator_id=administrator_id,
     )
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
     telegram_ingestion.add_channel_difference_event(
         identity=source_identity,
         from_checkpoint=TelegramChannelCheckpoint(pts=4900),
@@ -237,6 +245,20 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         registry_generation=1,
     )
     system.process_opportunities_until_idle()
+
+    request = classifier.requests[0]
+    assert request.source_event_time == "2026-08-18T09:05:00+00:00"
+    assert request.context_bundle_version == "primary-classifier-context-v1"
+    assert request.source_chat_reference == "source-chat:channel:4900100"
+    assert request.source_chat_timezone == "Europe/Moscow"
+    assert request.source_chat_geography == {
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    assert request.bounded_metadata == {
+        "message_language": None,
+        "attachment_types": [],
+    }
 
     assert {
         query.locale for query in resolver.queries if query.text == "на Петроградской"
@@ -268,6 +290,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     opportunities = system.opportunities()
     assert len(opportunities) == 1
     assert opportunities[0].opportunity_type == "open_match"
+    assert opportunities[0].opportunity_revision_id.endswith(":revision:1")
     assert opportunities[0].publication_state == "active"
     assert opportunities[0].response_route.value == "@open_match_contact"
 
@@ -282,6 +305,16 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert len(completed) == 1
     results = system.results(completed[0].completed_search_id)
     assert len(results) == 1
+    revision_inputs = system.completed_search_opportunity_revision_inputs(
+        completed[0].completed_search_id
+    )
+    assert len(revision_inputs) == 1
+    assert revision_inputs[0]["opportunity_revision_id"] == (
+        opportunities[0].opportunity_revision_id
+    )
+    persisted_facts = revision_inputs[0]["accepted_facts"]
+    assert isinstance(persisted_facts, dict)
+    assert persisted_facts["open_places"] == 1
     assert results[0].result_class == "confirmed_match"
     context = system.active_result_context(bot_user_id)
     assert context.current_result_id == results[0].result_id
@@ -753,6 +786,119 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         json.loads(dict(citywide_result.card_facts)["match_states"])["search_area"]
         == "unknown"
     )
+    concurrent_user_id = bot_user_id + 6
+    _advance_to_complete_game_search(system, bot_user_id=concurrent_user_id)
+    system.inject_projection_change_during_next_search(
+        opportunity_id=opportunities[0].opportunity_id,
+        opportunity_revision_id=(
+            f"{opportunities[0].opportunity_id}:revision:concurrent"
+        ),
+        open_places=99,
+    )
+    system.submit_search(
+        update_id="submit-concurrent-projection-search",
+        telegram_user_id=concurrent_user_id,
+    )
+    system.process_searches_until_idle()
+    concurrent_search = system.completed_searches(concurrent_user_id)[0]
+    concurrent_inputs = system.completed_search_opportunity_revision_inputs(
+        concurrent_search.completed_search_id
+    )
+    original_input = next(
+        item
+        for item in concurrent_inputs
+        if item["opportunity_id"] == opportunities[0].opportunity_id
+    )
+    assert original_input["opportunity_revision_id"] == (
+        opportunities[0].opportunity_revision_id
+    )
+    original_result = next(
+        result
+        for result in system.results(concurrent_search.completed_search_id)
+        if dict(result.card_facts)["opportunity_id"] == opportunities[0].opportunity_id
+    )
+    assert dict(original_result.card_facts)["open_places"] == "1"
+    system.restart(RuntimeRole.RECOMMENDATION)
+    system.process_searches_until_idle()
+    assert (
+        system.completed_search_opportunity_revision_inputs(
+            concurrent_search.completed_search_id
+        )
+        == concurrent_inputs
+    )
+    relative_body = (
+        "Матч завтра на Петроградской, есть одно место. Пишите @relative_match_contact"
+    )
+    classifier.return_for(
+        body=relative_body,
+        result=ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v1",
+                "disposition": "accepted",
+                "candidates": [
+                    {
+                        "candidate_key": "relative-open-place",
+                        "opportunity_type": "open_match",
+                        "evidence": {
+                            "opportunity": "есть одно место",
+                            "event_time": "Матч завтра",
+                            "location": "на Петроградской",
+                            "open_places": "одно место",
+                        },
+                        "location": {
+                            "mention": "на Петроградской",
+                            "place_id": "station:ru:spb:petrogradskaya",
+                            "country_id": "country:ru",
+                            "city_id": "city:ru:saint-petersburg",
+                        },
+                        "event_time": {
+                            "start_local_date": "2026-08-19",
+                            "end_local_date": "2026-08-19",
+                            "iana_timezone": "Europe/Moscow",
+                        },
+                        "open_places": 1,
+                        "response_routes": [
+                            {
+                                "kind": "explicit_telegram_username",
+                                "value": "@relative_match_contact",
+                                "evidence": "@relative_match_contact",
+                            }
+                        ],
+                    }
+                ],
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="controlled_recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4904),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        source_event_id="source-event:open-match:relative",
+        telegram_message_id=1003,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=relative_body,
+        event_time=datetime(2026, 8, 18, 17, 30, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    relative_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id.endswith(":1003:revision:1")
+    )
+    assert relative_opportunity.publication_state == "active"
     system.reset()
 
 

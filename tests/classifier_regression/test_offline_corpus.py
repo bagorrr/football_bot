@@ -49,6 +49,17 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
             ClassifierRequest(
                 source_message_revision_id=f"redacted:{case['case_id']}:revision:1",
                 body=case["source"],
+                source_event_time="2026-08-14T12:00:00+00:00",
+                source_recorded_at="2026-08-14T12:00:01+00:00",
+                context_bundle_version="primary-classifier-context-v1",
+                source_chat_reference="redacted:source-chat",
+                source_chat_timezone="Europe/Moscow",
+                source_chat_geography={"country_id": None, "city_id": None},
+                bounded_metadata={
+                    "message_language": None,
+                    "attachment_types": [],
+                },
+                eligible_reply_context=None,
                 requested_model="gpt-5.6-sol",
                 requested_reasoning_effort="high",
                 prompt_version="open-match-primary-v1",

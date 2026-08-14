@@ -32,10 +32,20 @@ CREATE TABLE football_runtime.classification_attempts (
     recorded_at timestamptz NOT NULL
 );
 
+ALTER TABLE football_runtime.source_chat_registry
+    ADD COLUMN classifier_timezone text,
+    ADD COLUMN classifier_country_id text,
+    ADD COLUMN classifier_city_id text;
+
+GRANT UPDATE (
+    classifier_timezone, classifier_country_id, classifier_city_id, updated_at
+) ON football_runtime.source_chat_registry TO football_application;
+
 CREATE TABLE football_runtime.application_opportunities (
     owner_role text NOT NULL DEFAULT 'application'
         CHECK (owner_role = 'application'),
     opportunity_id text PRIMARY KEY CHECK (opportunity_id <> ''),
+    opportunity_revision_id text NOT NULL UNIQUE CHECK (opportunity_revision_id <> ''),
     source_message_revision_id text NOT NULL CHECK (source_message_revision_id <> ''),
     opportunity_type text NOT NULL CHECK (opportunity_type = 'open_match'),
     publication_state text NOT NULL CHECK (
@@ -51,7 +61,9 @@ CREATE TABLE football_runtime.application_opportunities (
 CREATE TABLE football_runtime.recommendation_opportunities (
     owner_role text NOT NULL DEFAULT 'recommendation'
         CHECK (owner_role = 'recommendation'),
-    opportunity_id text PRIMARY KEY CHECK (opportunity_id <> ''),
+    opportunity_id text NOT NULL CHECK (opportunity_id <> ''),
+    opportunity_revision_id text PRIMARY KEY CHECK (opportunity_revision_id <> ''),
+    opportunity_type text NOT NULL CHECK (opportunity_type = 'open_match'),
     publication_state text NOT NULL CHECK (
         publication_state IN ('active', 'held_for_review', 'suppressed', 'expired')
     ),
@@ -79,7 +91,8 @@ ALTER TABLE football_runtime.bot_discovery_drafts
 ALTER TABLE football_runtime.recommendation_completed_searches
     ADD COLUMN game_search_details jsonb NOT NULL DEFAULT '{}'::jsonb,
     ADD COLUMN sub_city_area_geographic_types jsonb NOT NULL DEFAULT '[]'::jsonb,
-    ADD COLUMN sub_city_area_verified_parent_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
+    ADD COLUMN sub_city_area_verified_parent_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN opportunity_revision_inputs jsonb NOT NULL DEFAULT '[]'::jsonb;
 
 ALTER TABLE football_runtime.bot_search_presentations
     ADD COLUMN current_result_id text,

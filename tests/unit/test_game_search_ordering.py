@@ -1,7 +1,6 @@
 """Deterministic Game Search result ordering."""
 
-from modules.domain import SearchResult
-from modules.postgres_adapter import _game_search_result_sort_key
+from modules.domain import SearchResult, game_search_result_sort_key
 
 
 def _result(
@@ -34,12 +33,12 @@ def test_possible_results_prefer_fewer_unknowns_then_location_specificity() -> N
     )
     assert sorted(
         [specific_with_more_unknowns, broader_with_fewer_unknowns],
-        key=_game_search_result_sort_key,
+        key=game_search_result_sort_key,
     ) == [broader_with_fewer_unknowns, specific_with_more_unknowns]
 
     broad = _result(result_id="result:a", unknown_count=1, location_specificity=1)
     specific = _result(result_id="result:z", unknown_count=1, location_specificity=8)
-    assert sorted([broad, specific], key=_game_search_result_sort_key) == [
+    assert sorted([broad, specific], key=game_search_result_sort_key) == [
         specific,
         broad,
     ]

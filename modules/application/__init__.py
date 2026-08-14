@@ -6988,6 +6988,19 @@ class RuntimeApplication:
                 and payload.get("event_kind") != "delete"
                 and isinstance(payload.get("body"), str)
             ):
+                source_chat = self.store.eligible_source_chat_generation(
+                    identity=TelegramPeerIdentity(
+                        kind=TelegramPeerKind(str(payload["telegram_peer_kind"])),
+                        telegram_id=cast(int, payload["telegram_chat_id"]),
+                    ),
+                    registry_generation=cast(int, payload["registry_generation"]),
+                )
+                if source_chat is None:
+                    self.store.reject_invalid_contract(
+                        incoming=supported_incoming,
+                        received_at=self.clock.now(),
+                    )
+                    return True
                 classify = ContractEnvelope(
                     contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
                     contract_version=2,
@@ -7014,6 +7027,18 @@ class RuntimeApplication:
                         "source_recorded_at": (
                             supported_incoming.recorded_at.isoformat()
                         ),
+                        "context_bundle_version": "primary-classifier-context-v1",
+                        "source_chat_reference": payload["source_chat_key"],
+                        "source_chat_timezone": source_chat.classifier_timezone,
+                        "source_chat_geography": {
+                            "country_id": source_chat.classifier_country_id,
+                            "city_id": source_chat.classifier_city_id,
+                        },
+                        "bounded_metadata": {
+                            "message_language": None,
+                            "attachment_types": [],
+                        },
+                        "eligible_reply_context": None,
                     },
                 )
             self.store.accept_source_event(
@@ -7179,6 +7204,22 @@ class RuntimeApplication:
         request = ClassifierRequest(
             source_message_revision_id=revision_id,
             body=body,
+            source_event_time=str(payload["source_event_time"]),
+            source_recorded_at=str(payload["source_recorded_at"]),
+            context_bundle_version=str(payload["context_bundle_version"]),
+            source_chat_reference=str(payload["source_chat_reference"]),
+            source_chat_timezone=(
+                str(payload["source_chat_timezone"])
+                if payload["source_chat_timezone"] is not None
+                else None
+            ),
+            source_chat_geography=cast(
+                dict[str, JsonValue], payload["source_chat_geography"]
+            ),
+            bounded_metadata=cast(dict[str, JsonValue], payload["bounded_metadata"]),
+            eligible_reply_context=cast(
+                dict[str, JsonValue] | None, payload["eligible_reply_context"]
+            ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
             prompt_version="open-match-primary-v1",
@@ -7205,6 +7246,14 @@ class RuntimeApplication:
         manifest = {
             "source_message_revision_id": revision_id,
             "body": body,
+            "source_event_time": request.source_event_time,
+            "source_recorded_at": request.source_recorded_at,
+            "context_bundle_version": request.context_bundle_version,
+            "source_chat_reference": request.source_chat_reference,
+            "source_chat_timezone": request.source_chat_timezone,
+            "source_chat_geography": request.source_chat_geography,
+            "bounded_metadata": request.bounded_metadata,
+            "eligible_reply_context": request.eligible_reply_context,
             "model": request.requested_model,
             "reasoning_effort": request.requested_reasoning_effort,
             "prompt_version": request.prompt_version,
@@ -7241,10 +7290,17 @@ class RuntimeApplication:
                 recorded_at=self.clock.now(),
                 payload={
                     "proposal_id": proposal_id,
+                    "classification_command_id": str(incoming.message_id),
                     "source_message_revision_id": revision_id,
                     "body": body,
                     "source_event_time": payload.get("source_event_time"),
                     "source_recorded_at": payload.get("source_recorded_at"),
+                    "context_bundle_version": payload.get("context_bundle_version"),
+                    "source_chat_reference": payload.get("source_chat_reference"),
+                    "source_chat_timezone": payload.get("source_chat_timezone"),
+                    "source_chat_geography": payload.get("source_chat_geography"),
+                    "bounded_metadata": payload.get("bounded_metadata"),
+                    "eligible_reply_context": payload.get("eligible_reply_context"),
                     "output": result.output,
                     "requested_model": request.requested_model,
                     "effective_model": result.effective_model,
@@ -7327,11 +7383,41 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
+        source_chat_reference = source_revision.source_message_id.rsplit(
+            ":message:", 1
+        )[0]
+        source_chat = next(
+            (
+                entry
+                for entry in reversed(self.store.source_chats())
+                if (
+                    f"source-chat:{entry.identity.kind.value}:"
+                    f"{entry.identity.telegram_id}"
+                )
+                == source_chat_reference
+                and entry.enabled
+            ),
+            None,
+        )
+        if source_chat is None:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=(2,),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
         authoritative_payload: dict[str, JsonValue] = {
             **payload,
             "body": source_revision.body,
             "source_event_time": source_revision.event_time.isoformat(),
             "source_recorded_at": source_revision.recorded_at.isoformat(),
+            "source_chat_reference": source_chat_reference,
+            "source_chat_timezone": source_chat.classifier_timezone,
+            "source_chat_geography": {
+                "country_id": source_chat.classifier_country_id,
+                "city_id": source_chat.classifier_city_id,
+            },
             "validation_time": self.clock.now().isoformat(),
         }
         accepted = _validated_open_match_proposal(
@@ -7349,6 +7435,10 @@ class RuntimeApplication:
         opportunity_id = accepted["opportunity_id"]
         if not isinstance(opportunity_id, str):
             raise RuntimeError("validated Opportunity identity is missing")
+        opportunity_revision_id = (
+            f"{opportunity_id}:revision:{incoming.subject_revision}"
+        )
+        accepted = {**accepted, "opportunity_revision_id": opportunity_revision_id}
         outgoing = ContractEnvelope(
             contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
             contract_version=2,
@@ -7358,14 +7448,17 @@ class RuntimeApplication:
             producer=RuntimeRole.APPLICATION,
             consumer=RuntimeRole.RECOMMENDATION,
             subject_id=opportunity_id,
-            subject_revision=1,
-            idempotency_key=f"opportunity-publication:{opportunity_id}:1",
+            subject_revision=incoming.subject_revision,
+            idempotency_key=f"opportunity-publication:{opportunity_revision_id}",
             causation_id=incoming.message_id,
             correlation_id=incoming.correlation_id,
             recorded_at=self.clock.now(),
             payload={
                 "opportunity_id": opportunity_id,
+                "opportunity_revision_id": opportunity_revision_id,
+                "source_message_revision_id": revision_id,
                 "publication_state": "active",
+                "opportunity_type": "open_match",
                 "accepted_facts": accepted["accepted_facts"],
                 "response_route": accepted["response_route"],
             },
@@ -8039,10 +8132,6 @@ class RuntimeApplication:
                 for parent_ids in typed_area_parent_ids
             ),
         )
-        results = self.store.find_search_results(
-            completed_search,
-            game_search_details,
-        )
         outgoing = ContractEnvelope(
             contract_name=ContractName.SEARCH_COMPLETED,
             contract_version=2,
@@ -8059,14 +8148,13 @@ class RuntimeApplication:
                 "completed_search_id": completed_search_id,
                 "telegram_user_id": telegram_user_id,
                 "search_update_id": search_update_id,
-                "result_count": len(results),
+                "result_count": 0,
             },
         )
         query = GetCompletedSearch.from_search_completed(outgoing)
         self.store.complete_search(
             incoming=incoming,
             completed_search=completed_search,
-            results=results,
             query=query,
             outgoing=outgoing,
             received_at=self.clock.now(),
@@ -8331,6 +8419,14 @@ def _classifier_proposal_has_pinned_provenance(
     manifest = {
         "source_message_revision_id": revision_id,
         "body": body,
+        "source_event_time": payload.get("source_event_time"),
+        "source_recorded_at": payload.get("source_recorded_at"),
+        "context_bundle_version": payload.get("context_bundle_version"),
+        "source_chat_reference": payload.get("source_chat_reference"),
+        "source_chat_timezone": payload.get("source_chat_timezone"),
+        "source_chat_geography": payload.get("source_chat_geography"),
+        "bounded_metadata": payload.get("bounded_metadata"),
+        "eligible_reply_context": payload.get("eligible_reply_context"),
         "model": pinned["requested_model"],
         "reasoning_effort": pinned["requested_reasoning_effort"],
         "prompt_version": pinned["prompt_version"],
@@ -8699,6 +8795,12 @@ def _validated_open_match_proposal(
             parsed_end,
             exact_time if isinstance(exact_time, str) else None,
             str(evidence["event_time"]),
+            source_event_time=source_event_time,
+            source_timezone=(
+                str(payload_value.get("source_chat_timezone"))
+                if payload_value.get("source_chat_timezone") is not None
+                else None
+            ),
         )
         or mention not in str(evidence["location"])
         or not _open_places_are_supported(
@@ -8802,6 +8904,9 @@ def _event_time_is_supported(
     end: date,
     exact_time: str | None,
     evidence: str,
+    *,
+    source_event_time: datetime | None = None,
+    source_timezone: str | None = None,
 ) -> bool:
     normalized = evidence.casefold()
     month_stems = {
@@ -8819,20 +8924,71 @@ def _event_time_is_supported(
         12: ("december", "декабр", "diciembre", "décembre", "decembre"),
     }
 
-    def supports_date(value: date) -> bool:
-        return value.isoformat() in normalized or (
-            re.search(rf"(?<!\d){value.day}(?!\d)", normalized) is not None
-            and re.search(rf"(?<!\d){value.year}(?!\d)", normalized) is not None
-            and any(stem in normalized for stem in month_stems[value.month])
+    def date_spans(value: date) -> list[tuple[int, int]]:
+        spans = [
+            match.span()
+            for match in re.finditer(
+                rf"(?<!\d){re.escape(value.isoformat())}(?!\d)", normalized
+            )
+        ]
+        stems = "|".join(re.escape(stem) + r"\w*" for stem in month_stems[value.month])
+        patterns = (
+            rf"(?<!\d){value.day}(?!\d)\s+(?:{stems})\s*,?\s*{value.year}(?!\d)",
+            rf"(?:{stems})\s+(?<!\d){value.day}(?!\d)\s*,?\s*{value.year}(?!\d)",
         )
+        for pattern in patterns:
+            spans.extend(match.span() for match in re.finditer(pattern, normalized))
+        return spans
 
-    return (
-        supports_date(start)
-        and (start == end or supports_date(end))
-        and (
-            exact_time is None
-            or re.search(rf"(?<!\d){re.escape(exact_time)}(?!\d)", evidence) is not None
+    spans = date_spans(start)
+    end_spans = spans if start == end else date_spans(end)
+    if start != end and start.month == end.month and start.year == end.year:
+        stems = "|".join(re.escape(stem) + r"\w*" for stem in month_stems[start.month])
+        compact_range = re.search(
+            rf"(?<!\d){start.day}(?!\d)\s*[-–—]\s*"
+            rf"{end.day}(?!\d)\s+(?:{stems})\s*,?\s*{start.year}(?!\d)",
+            normalized,
         )
+        if compact_range is not None:
+            spans = [compact_range.span()]
+            end_spans = spans
+    if not spans or not end_spans:
+        relative_days = {
+            "today": 0,
+            "сегодня": 0,
+            "hoy": 0,
+            "aujourd'hui": 0,
+            "tomorrow": 1,
+            "завтра": 1,
+            "mañana": 1,
+            "demain": 1,
+        }
+        if start != end or source_event_time is None or source_timezone is None:
+            return False
+        try:
+            source_local_date = source_event_time.astimezone(
+                ZoneInfo(source_timezone)
+            ).date()
+        except ZoneInfoNotFoundError:
+            return False
+        relative_spans = [
+            match.span()
+            for token, offset in relative_days.items()
+            if start == source_local_date + timedelta(days=offset)
+            for match in re.finditer(rf"(?<!\w){re.escape(token)}(?!\w)", normalized)
+        ]
+        spans = relative_spans
+        end_spans = relative_spans
+    if not spans or not end_spans:
+        return False
+    expression_start = min(span[0] for span in spans)
+    expression_end = max(span[1] for span in end_spans)
+    if exact_time is None:
+        return True
+    time_matches = list(re.finditer(rf"(?<!\d){re.escape(exact_time)}(?!\d)", evidence))
+    return any(
+        match.start() <= expression_end + 32 and match.end() >= expression_start - 32
+        for match in time_matches
     )
 
 
