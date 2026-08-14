@@ -22,6 +22,7 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
+    ClassificationAttempt,
     CompletedSearch,
     CompletedSearchView,
     ConversationState,
@@ -35,6 +36,7 @@ from modules.domain import (
     LocationResolution,
     LocationResolutionQuery,
     OldChatViewCleanup,
+    Opportunity,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
     SearchResult,
@@ -178,9 +180,43 @@ class TelegramDeliveryOutcomeUnknownError(RuntimeError):
 class ModelAdapter(Protocol):
     """Controlled model boundary for the acceptance spine."""
 
+    def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return one strict, non-authoritative structured proposal."""
+        ...
+
     def proposal_id(self, revision_id: str) -> str:
         """Return one non-authoritative synthetic proposal identity."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifierRequest:
+    """Pinned classifier request with immutable policy provenance."""
+
+    source_message_revision_id: str
+    body: str
+    requested_model: str
+    requested_reasoning_effort: str
+    prompt_version: str
+    schema_version: str
+    glossary_version: str
+    context_policy_version: str
+    routing_policy_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifierAdapterResult:
+    """Provider-neutral classifier response plus effective provenance."""
+
+    output: dict[str, JsonValue]
+    effective_model: str
+    effective_reasoning_effort: str
+    codex_version: str
+    adapter_kind: str
+    adapter_version: str
+    duration_ms: int
+    input_tokens: int
+    output_tokens: int
 
 
 class LocationResolverAdapter(Protocol):
@@ -445,6 +481,7 @@ class ConversationStore(Protocol):
         expected_state_revision: int,
         expected_draft_revision: int,
         message: TelegramMessage,
+        current_result: SearchResult | None,
         received_at: datetime,
     ) -> ConsumeResult:
         """Queue zero-result presentation without activating it prematurely."""
@@ -676,8 +713,41 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Apply one Source Event to Application-owned Source Message state."""
+        ...
+
+    def record_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: ClassifierAdapterResult,
+        outgoing: ContractEnvelope | None,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain provenance and publish only a valid proposal."""
+        ...
+
+    def publish_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity: dict[str, JsonValue],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically accept Application facts and publish one state change."""
+        ...
+
+    def project_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one accepted publication to Recommendation's projection."""
         ...
 
     def owned_source_events(self) -> tuple[SourceEventRecord, ...]:
@@ -686,6 +756,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
 
     def owned_source_messages(self) -> tuple[SourceMessage, ...]:
         """Read Application-owned Source Messages with the current credential."""
+        ...
+
+    def source_message_revision(
+        self, source_message_revision_id: str
+    ) -> SourceMessageRevision | None:
+        """Read one Application-owned immutable Source Message revision."""
         ...
 
     def claim_next(
@@ -747,11 +823,20 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: RawContractEnvelope,
         completed_search: CompletedSearch,
+        results: tuple[SearchResult, ...],
         query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
         """Atomically persist a zero-result Completed Search and its event."""
+        ...
+
+    def find_search_results(
+        self,
+        completed_search: CompletedSearch,
+        game_search_details: Mapping[str, tuple[str, ...]],
+    ) -> tuple[SearchResult, ...]:
+        """Deterministically match active Recommendation projections."""
         ...
 
     def source_chat_registration_context(
@@ -817,6 +902,14 @@ class AcceptanceObserver(Protocol):
 
     def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
         """Observe SourceEventRecorded outbox signals through the testkit."""
+        ...
+
+    def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
+        """Observe durable classifier execution provenance."""
+        ...
+
+    def opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Application-authoritative accepted Opportunities."""
         ...
 
     def replace_source_event_contract_version(

@@ -31,6 +31,7 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
+    ClassificationAttempt,
     CompletedSearch,
     ConversationStage,
     ConversationState,
@@ -45,6 +46,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    Opportunity,
     RequiredDate,
     RequiredDateConfirmationEvent,
     SearchResult,
@@ -63,6 +65,8 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObserver,
+    ClassifierAdapterResult,
+    ClassifierRequest,
     Clock,
     ConversationAccessDeniedError,
     ConversationLanguageAdapter,
@@ -390,8 +394,26 @@ class ControlledTelegramDeliveryAdapter:
             raise InjectedTelegramDeliveryInterruptionError
 
 
+@dataclass(slots=True)
 class ControlledModelAdapter:
     """Deterministic model adapter with no provider access."""
+
+    _results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    requests: list[ClassifierRequest] = field(default_factory=list)
+
+    def return_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
+        """Configure one deterministic structured classifier response."""
+        self._results[body] = result
+
+    def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return only configured offline output and retain policy provenance."""
+        self.requests.append(request)
+        try:
+            return self._results[request.body]
+        except KeyError as error:
+            raise RuntimeError(
+                "controlled classifier result is not configured"
+            ) from error
 
     def proposal_id(self, revision_id: str) -> str:
         """Return a stable non-authoritative proposal identity."""
@@ -1101,6 +1123,27 @@ class AcceptanceSpine:
         """Observe durable SourceEventRecorded outbox signals."""
         return self._observer.source_event_contracts()
 
+    def process_opportunities_until_idle(self) -> None:
+        """Drive Source Message classification, acceptance, and publication."""
+        while any(
+            self._roles[role].process_next()
+            for role in (
+                RuntimeRole.APPLICATION,
+                RuntimeRole.CLASSIFICATION,
+                RuntimeRole.APPLICATION,
+                RuntimeRole.RECOMMENDATION,
+            )
+        ):
+            pass
+
+    def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
+        """Observe durable primary-classifier provenance."""
+        return self._observer.classification_attempts()
+
+    def opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Application-authoritative accepted Opportunities."""
+        return self._observer.opportunities()
+
     def redeliver_source_event(self, source_event_id: str) -> bool:
         """Redeliver one durable Source Event at the external contract seam."""
         envelope = self._observer.envelope(
@@ -1448,6 +1491,7 @@ class AcceptanceSpine:
         update_id: str,
         telegram_user_id: int,
         screen_revision: int | None = None,
+        game_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -1458,6 +1502,116 @@ class AcceptanceSpine:
                 if screen_revision is not None
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
+            game_search_details=game_search_details,
+        )
+
+    def open_game_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive the visible Details callback through Bot Assistant."""
+        self._conversation_onboarding().open_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def open_game_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        detail_key: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Details-hub criterion callback through Bot Assistant."""
+        self._conversation_onboarding().open_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def toggle_game_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        value: str,
+    ) -> None:
+        """Drive one temporary multi-select toggle through Bot Assistant."""
+        self._conversation_onboarding().toggle_game_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_game_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Done for the current Game Search detail submenu."""
+        self._conversation_onboarding().commit_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_game_search_time(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        value: str | None,
+    ) -> None:
+        """Drive one immediate Time choice through Bot Assistant."""
+        self._conversation_onboarding().select_game_search_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_game_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the exact-time prompt callback through Bot Assistant."""
+        self._conversation_onboarding().open_game_search_exact_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_game_search_exact_time_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Drive exact-time text input through Bot Assistant."""
+        self._conversation_onboarding().submit_game_search_exact_time_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_game_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from a submenu or the Details hub."""
+        self._conversation_onboarding().back_from_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
     def open_main_menu(

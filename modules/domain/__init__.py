@@ -78,6 +78,48 @@ class UserIntent(StrEnum):
     REFEREEING_SERVICE_OFFER = "refereeing_service_offer"
 
 
+class MatchState(StrEnum):
+    """Deterministic comparison state for one optional Search detail."""
+
+    CONFIRMED = "confirmed"
+    UNKNOWN = "unknown"
+    CONFLICT = "conflict"
+
+
+def match_detail(
+    requested: tuple[str, ...], accepted: tuple[str, ...] | None
+) -> MatchState:
+    """Compare canonical values without fuzzy or model-based inference."""
+    if not requested:
+        return MatchState.CONFIRMED
+    if not accepted:
+        return MatchState.UNKNOWN
+    if set(requested).intersection(accepted):
+        return MatchState.CONFIRMED
+    return MatchState.CONFLICT
+
+
+def match_time_detail(
+    requested: tuple[str, ...], accepted_exact_time: str | None
+) -> MatchState:
+    """Compare an accepted exact local time with exact or day-part criteria."""
+    if not requested:
+        return MatchState.CONFIRMED
+    if accepted_exact_time is None:
+        return MatchState.UNKNOWN
+    hour, minute = (int(part) for part in accepted_exact_time.split(":", 1))
+    minute_of_day = hour * 60 + minute
+    matching_day_parts = {
+        "morning" if 6 * 60 <= minute_of_day < 12 * 60 else "",
+        "daytime" if 12 * 60 <= minute_of_day < 18 * 60 else "",
+        "evening" if 18 * 60 <= minute_of_day < 22 * 60 else "",
+        "night" if minute_of_day >= 22 * 60 or minute_of_day < 6 * 60 else "",
+    }
+    if accepted_exact_time in requested or matching_day_parts.intersection(requested):
+        return MatchState.CONFIRMED
+    return MatchState.CONFLICT
+
+
 class IntentBranch(StrEnum):
     """A non-terminal onboarding group that can never be a User Intent."""
 
@@ -374,6 +416,10 @@ class DiscoveryDraft:
     sub_city_areas: tuple[AcceptedLocation, ...] = ()
     whole_city: bool = False
     required_date: RequiredDate | None = None
+    game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_game_search_detail: str | None = None
+    game_search_detail_draft: tuple[str, ...] = ()
+    game_search_exact_time_prompt: bool = False
     search_submission_update_id: str | None = None
 
 
@@ -578,6 +624,9 @@ class CompletedSearch:
     whole_city: bool
     required_date: RequiredDate | None
     completed_at: datetime
+    game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    sub_city_area_geographic_types: tuple[str, ...] = ()
+    sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,6 +636,56 @@ class SearchResult:
     result_id: str
     completed_search_id: str
     absolute_position: int
+    result_class: str = "confirmed_match"
+    card_facts: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationAttempt:
+    """One durable primary-classifier execution with complete provenance."""
+
+    attempt_id: str
+    source_message_revision_id: str
+    requested_model: str
+    effective_model: str
+    requested_reasoning_effort: str
+    effective_reasoning_effort: str
+    prompt_version: str
+    schema_version: str
+    glossary_version: str
+    context_policy_version: str
+    routing_policy_version: str
+    codex_version: str
+    adapter_kind: str
+    adapter_version: str
+    pass_number: int
+    attempt_number: int
+    input_manifest_hash: str
+    evidence_references: tuple[str, ...]
+    duration_ms: int
+    input_tokens: int
+    output_tokens: int
+    disposition: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpportunityResponseRoute:
+    """Exactly one Application-selected usable response route."""
+
+    kind: str
+    value: str
+
+
+@dataclass(frozen=True, slots=True)
+class Opportunity:
+    """Application-authoritative accepted football opportunity."""
+
+    opportunity_id: str
+    source_message_revision_id: str
+    opportunity_type: str
+    publication_state: str
+    response_route: OpportunityResponseRoute
 
 
 @dataclass(frozen=True, slots=True)

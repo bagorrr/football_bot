@@ -4,16 +4,21 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from enum import IntEnum
+from hashlib import sha256
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from modules.classifier_contract import classifier_output_is_schema_valid
 from modules.contracts import (
+    SUB_CITY_GEOGRAPHIC_TYPES,
     SUPPORTED_CONTRACTS,
     ContractDefinition,
     ContractEnvelope,
@@ -27,6 +32,7 @@ from modules.contracts import (
 )
 from modules.domain import (
     AcceptedLocation,
+    ClassificationAttempt,
     CompletedSearch,
     ConversationStage,
     ConversationState,
@@ -47,6 +53,7 @@ from modules.domain import (
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
+    SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
     SourceChatRegistrationContext,
@@ -60,6 +67,8 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceRoleStore,
+    ClassifierAdapterResult,
+    ClassifierRequest,
     Clock,
     CompletedSearchQueryStatus,
     ConsumeResult,
@@ -727,6 +736,216 @@ _POST_CORE_COPY = {
         "Détails",
         "Rechercher",
     ),
+}
+
+_GAME_SEARCH_DETAIL_OPTIONS = {
+    "times": ("morning", "daytime", "evening", "night"),
+    "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
+    "positions": ("goalkeeper", "defender", "midfielder", "forward"),
+    "playing_levels": (
+        "novice",
+        "below_average",
+        "average",
+        "above_average",
+        "high",
+        "very_high",
+        "master",
+        "professional",
+    ),
+    "venue_settings": ("indoor", "outdoor", "covered_outdoor"),
+    "playing_surfaces": (
+        "natural_grass",
+        "artificial_turf",
+        "hard_surface",
+        "wood_parquet",
+    ),
+    "payment": ("free", "paid"),
+}
+_GAME_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Time",
+        "Team format",
+        "Positions",
+        "Playing levels",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Время",
+        "Формат команд",
+        "Позиции",
+        "Уровни игры",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Hora",
+        "Formato de equipos",
+        "Posiciones",
+        "Niveles de juego",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Heure",
+        "Format des équipes",
+        "Postes",
+        "Niveaux de jeu",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_GAME_SEARCH_DETAIL_HEADINGS = {
+    "en": (
+        "🕒 What time?",
+        "👥 Select team formats.",
+        "🥅 Which positions?",
+        "⚽ Select playing levels.",
+        "🏟 Select the venue type.",
+        "🌱 Select the playing surface.",
+        "💳 Select the payment type.",
+    ),
+    "ru": (
+        "🕒 В какое время?",
+        "👥 Выберите форматы команд.",
+        "🥅 Какие позиции?",
+        "⚽ Выберите уровни игры.",
+        "🏟 Выберите тип площадки.",
+        "🌱 Выберите покрытие.",
+        "💳 Выберите тип оплаты.",
+    ),
+    "es": (
+        "🕒 ¿A qué hora?",
+        "👥 Selecciona los formatos de equipos.",
+        "🥅 ¿Qué posiciones?",
+        "⚽ Selecciona los niveles de juego.",
+        "🏟 Selecciona el tipo de recinto.",
+        "🌱 Selecciona la superficie de juego.",
+        "💳 Selecciona el tipo de pago.",
+    ),
+    "fr": (
+        "🕒 À quelle heure ?",
+        "👥 Sélectionnez les formats d’équipes.",
+        "🥅 Quels postes ?",
+        "⚽ Sélectionnez les niveaux de jeu.",
+        "🏟 Sélectionnez le type de terrain.",
+        "🌱 Sélectionnez le revêtement.",
+        "💳 Sélectionnez le type de paiement.",
+    ),
+}
+_GAME_SEARCH_VALUE_COPY = {
+    "en": {
+        "morning": "Morning",
+        "daytime": "Daytime",
+        "evening": "Evening",
+        "night": "Night",
+        "goalkeeper": "Goalkeeper",
+        "defender": "Defender",
+        "midfielder": "Midfielder",
+        "forward": "Forward",
+        "novice": "Beginner",
+        "below_average": "Below average",
+        "average": "Average",
+        "above_average": "Above average",
+        "high": "High",
+        "very_high": "Very high",
+        "master": "Master",
+        "professional": "Professional",
+        "indoor": "Indoor",
+        "outdoor": "Outdoor",
+        "covered_outdoor": "Covered outdoor",
+        "natural_grass": "Natural grass",
+        "artificial_turf": "Artificial turf",
+        "hard_surface": "Hard surface",
+        "wood_parquet": "Wood / parquet",
+        "free": "Free",
+        "paid": "Paid",
+    },
+    "ru": {
+        "morning": "Утро",
+        "daytime": "День",
+        "evening": "Вечер",
+        "night": "Ночь",
+        "goalkeeper": "Вратарь",
+        "defender": "Защитник",
+        "midfielder": "Полузащитник",
+        "forward": "Нападающий",
+        "novice": "Новичок",
+        "below_average": "Ниже среднего",
+        "average": "Средний",
+        "above_average": "Выше среднего",
+        "high": "Высокий",
+        "very_high": "Очень высокий",
+        "master": "Мастер",
+        "professional": "Профи",
+        "indoor": "В помещении",
+        "outdoor": "На улице",
+        "covered_outdoor": "На улице под крышей",
+        "natural_grass": "Натуральная трава",
+        "artificial_turf": "Искусственный газон",
+        "hard_surface": "Твёрдое покрытие",
+        "wood_parquet": "Дерево / паркет",
+        "free": "Бесплатно",
+        "paid": "Платно",
+    },
+    "es": {
+        "morning": "Mañana",
+        "daytime": "Día",
+        "evening": "Tarde",
+        "night": "Noche",
+        "goalkeeper": "Portero",
+        "defender": "Defensa",
+        "midfielder": "Centrocampista",
+        "forward": "Delantero",
+        "novice": "Principiante",
+        "below_average": "Por debajo de la media",
+        "average": "Medio",
+        "above_average": "Por encima de la media",
+        "high": "Alto",
+        "very_high": "Muy alto",
+        "master": "Máster",
+        "professional": "Profesional",
+        "indoor": "En interior",
+        "outdoor": "Al aire libre",
+        "covered_outdoor": "Exterior cubierto",
+        "natural_grass": "Césped natural",
+        "artificial_turf": "Césped artificial",
+        "hard_surface": "Superficie dura",
+        "wood_parquet": "Madera / parqué",
+        "free": "Gratis",
+        "paid": "De pago",
+    },
+    "fr": {
+        "morning": "Matin",
+        "daytime": "Journée",
+        "evening": "Soir",
+        "night": "Nuit",
+        "goalkeeper": "Gardien",
+        "defender": "Défenseur",
+        "midfielder": "Milieu",
+        "forward": "Attaquant",
+        "novice": "Débutant",
+        "below_average": "Inférieur à la moyenne",
+        "average": "Moyen",
+        "above_average": "Supérieur à la moyenne",
+        "high": "Élevé",
+        "very_high": "Très élevé",
+        "master": "Maître",
+        "professional": "Professionnel",
+        "indoor": "En salle",
+        "outdoor": "En extérieur",
+        "covered_outdoor": "En extérieur couvert",
+        "natural_grass": "Gazon naturel",
+        "artificial_turf": "Gazon synthétique",
+        "hard_surface": "Surface dure",
+        "wood_parquet": "Bois / parquet",
+        "free": "Gratuit",
+        "paid": "Payant",
+    },
 }
 
 _ZERO_RESULT_COPY = {
@@ -2074,6 +2293,7 @@ class ConversationOnboarding:
         update_id: str,
         telegram_user_id: int,
         screen_revision: int,
+        game_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2126,9 +2346,14 @@ class ConversationOnboarding:
                 NAMESPACE_URL,
                 f"football-bot:run-search:{telegram_user_id}:{update_id}",
             )
+            selected_details = (
+                game_search_details
+                if game_search_details is not None
+                else {key: list(values) for key, values in draft.game_search_details}
+            )
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
-                contract_version=1,
+                contract_version=2,
                 message_id=message_id,
                 producer=RuntimeRole.BOT_ASSISTANT,
                 consumer=RuntimeRole.RECOMMENDATION,
@@ -2148,8 +2373,19 @@ class ConversationOnboarding:
                     "sub_city_area_ids": [
                         area.place_id for area in draft.sub_city_areas
                     ],
+                    "sub_city_area_geographic_types": [
+                        area.geographic_type.value for area in draft.sub_city_areas
+                    ],
+                    "sub_city_area_verified_parent_ids": [
+                        list(area.verified_parent_ids) for area in draft.sub_city_areas
+                    ],
                     "whole_city": draft.whole_city,
                     "required_date": _required_date_payload(draft.required_date),
+                    **(
+                        {"game_search_details": cast(JsonValue, selected_details)}
+                        if selected_details
+                        else {}
+                    ),
                 },
             )
             accepted = self._store.commit_search_submission(
@@ -2168,6 +2404,291 @@ class ConversationOnboarding:
                         telegram_message_id=active_view.telegram_message_id,
                     )
                 self._telegram_delivery.show_typing(telegram_user_id=telegram_user_id)
+
+    def open_game_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Open the durable user-facing Game Search Details hub."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+        )
+
+    def open_game_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one detail submenu with a durable temporary selection."""
+        if detail_key not in _GAME_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Game Search detail key must be canonical")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+        )
+
+    def toggle_game_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one canonical value in the current temporary submenu draft."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+        )
+
+    def commit_game_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit the temporary multi-select and return to the Details hub."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+        )
+
+    def select_game_search_time(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str | None,
+    ) -> None:
+        """Commit one exact time/day part immediately, or clear with Any."""
+        if value is not None and not _canonical_game_search_time(value):
+            raise ValueError("Game Search Time must be canonical")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_time",
+            value=value,
+        )
+
+    def open_game_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the exact-time text prompt from the Time submenu."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="exact_time_prompt",
+        )
+
+    def submit_game_search_exact_time_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and commit one exact local HH:MM criterion."""
+        if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text) is None:
+            raise ValueError("Game Search exact time must be HH:MM")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_exact_time",
+            value=text,
+        )
+
+    def back_from_game_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard submenu edits, or leave the hub while preserving criteria."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+        )
+
+    def _change_game_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        operation: str,
+        detail_key: str | None = None,
+        value: str | None = None,
+    ) -> None:
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.user_intent is not UserIntent.GAME_SEARCH
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            details = dict(draft.game_search_details)
+            editing = draft.editing_game_search_detail
+            temporary = list(draft.game_search_detail_draft)
+            exact_time_prompt = draft.game_search_exact_time_prompt
+            target = "hub"
+            if operation == "open_detail":
+                assert detail_key is not None
+                editing = detail_key
+                temporary = list(details.get(detail_key, ()))
+                exact_time_prompt = False
+                target = "submenu"
+            elif operation == "toggle":
+                if editing is None or editing == "times":
+                    raise RuntimeError("No multi-select Game Search detail is open")
+                if value not in _GAME_SEARCH_DETAIL_OPTIONS[editing]:
+                    raise ValueError("Game Search detail value must be canonical")
+                if value in temporary:
+                    temporary.remove(value)
+                else:
+                    temporary.append(value)
+                target = "submenu"
+            elif operation == "commit":
+                if editing is None or editing == "times":
+                    raise RuntimeError("No multi-select Game Search detail is open")
+                if temporary:
+                    details[editing] = tuple(temporary)
+                else:
+                    details.pop(editing, None)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "select_time":
+                if editing != "times":
+                    raise RuntimeError("Game Search Time detail is not open")
+                if value is None:
+                    details.pop("times", None)
+                else:
+                    details["times"] = (value,)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "submit_exact_time":
+                if editing != "times" or not exact_time_prompt:
+                    raise RuntimeError("Game Search exact-time prompt is not open")
+                if value is None or not _canonical_game_search_time(value):
+                    raise ValueError("Game Search exact time must be canonical")
+                details["times"] = (value,)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "exact_time_prompt":
+                if editing != "times":
+                    raise RuntimeError("Game Search Time detail is not open")
+                exact_time_prompt = True
+                target = "exact_time_prompt"
+            elif operation == "back":
+                if exact_time_prompt and editing == "times":
+                    exact_time_prompt = False
+                    target = "submenu"
+                elif editing is None:
+                    target = "post_core"
+                else:
+                    editing = None
+                    temporary = []
+                    exact_time_prompt = False
+            elif operation == "open_hub":
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            else:
+                raise RuntimeError("Unknown Game Search detail operation")
+            now = self._clock.now()
+            state = replace(
+                current,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                game_search_details=tuple(sorted(details.items())),
+                editing_game_search_detail=editing,
+                game_search_detail_draft=tuple(temporary),
+                game_search_exact_time_prompt=exact_time_prompt,
+            )
+            if target == "submenu":
+                assert editing is not None
+                message = _game_search_detail_submenu_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    detail_key=editing,
+                    temporary=tuple(temporary),
+                )
+            elif target == "exact_time_prompt":
+                message = _game_search_exact_time_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                )
+            elif target == "post_core":
+                if draft.country is None or draft.city is None:
+                    raise RuntimeError("Game Search Details lost its Search Area")
+                message = _post_core_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
+                )
+            else:
+                message = _game_search_details_hub_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    details=details,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                draft=changed_draft,
+                message=message,
+                recorded_at=now,
+            )
+        self.deliver_pending()
 
     def accept_search_completion(self, *, incoming: RawContractEnvelope) -> None:
         """Queue the result screen while preserving the prior authoritative view."""
@@ -2226,18 +2747,31 @@ class ConversationOnboarding:
                 received_at=now,
             )
             return
-        message = _zero_result_message(
-            delivery_id=f"search-result:{completed_search_id}",
-            telegram_user_id=telegram_user_id,
-            locale=current.locale or "en",
-            screen_revision=current.screen_revision + 1,
-            selection=self._language_rendering(current.locale or "en"),
+        current_result = (
+            completed_search.results[0] if completed_search.results else None
         )
+        if current_result is None:
+            message = _zero_result_message(
+                delivery_id=f"search-result:{completed_search_id}",
+                telegram_user_id=telegram_user_id,
+                locale=current.locale or "en",
+                screen_revision=current.screen_revision + 1,
+                selection=self._language_rendering(current.locale or "en"),
+            )
+        else:
+            message = _open_match_result_message(
+                delivery_id=f"search-result:{completed_search_id}",
+                telegram_user_id=telegram_user_id,
+                locale=current.locale or "en",
+                screen_revision=current.screen_revision + 1,
+                result=current_result,
+            )
         self._store.accept_search_completion(
             incoming=incoming,
             expected_state_revision=current.revision,
             expected_draft_revision=draft.revision,
             message=message,
+            current_result=current_result,
             received_at=self._clock.now(),
         )
 
@@ -4966,6 +5500,164 @@ def _post_core_message(
     )
 
 
+def _game_search_details_hub_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    details: dict[str, tuple[str, ...]],
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    introduction, not_set, back_label, search_label = {
+        "en": ("You can choose the following settings:", "not set", "Back", "Search"),
+        "ru": ("Можно выбрать следующие настройки:", "не задано", "Назад", "Поиск"),
+        "es": (
+            "Puedes elegir las siguientes opciones:",
+            "sin definir",
+            "Atrás",
+            "Buscar",
+        ),
+        "fr": (
+            "Vous pouvez choisir les paramètres suivants :",
+            "non défini",
+            "Retour",
+            "Rechercher",
+        ),
+    }[copy_locale]
+    keys = tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+    names = _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+    summaries = tuple(
+        ", ".join(
+            _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+            for value in details.get(key, ())
+        )
+        or not_set
+        for key in keys
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=introduction + "\n\n" + "\n".join(f"- {name}" for name in names),
+        button_rows=(
+            *tuple(
+                (
+                    (
+                        f"{name}: {summary} ▸",
+                        f"details:open:{key}:{screen_revision}",
+                    ),
+                )
+                for key, name, summary in zip(keys, names, summaries, strict=True)
+            ),
+            ((back_label, f"details:back:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _game_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    keys = tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+    heading = _GAME_SEARCH_DETAIL_HEADINGS[copy_locale][keys.index(detail_key)]
+    done_label, any_label, back_label, exact_label = {
+        "en": ("Done", "Any", "⬅️ Back", "Enter exact time"),
+        "ru": ("Готово", "Неважно", "⬅️ Назад", "Указать точное время"),
+        "es": ("Listo", "Cualquiera", "⬅️ Atrás", "Indicar hora exacta"),
+        "fr": ("Valider", "Peu importe", "⬅️ Retour", "Indiquer l’heure exacte"),
+    }[copy_locale]
+
+    def button(value: str) -> tuple[str, str]:
+        return (
+            f"{'✓ ' if value in temporary else ''}"
+            f"{_GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)}",
+            (
+                f"details:time:{value}:{screen_revision}"
+                if detail_key == "times"
+                else f"details:toggle:{value}:{screen_revision}"
+            ),
+        )
+
+    rows: tuple[tuple[tuple[str, str], ...], ...]
+    if detail_key == "times":
+        rows = (
+            ((exact_label, f"details:time:exact:{screen_revision}"),),
+            (button("morning"), button("daytime")),
+            (button("evening"), button("night")),
+            ((any_label, f"details:time:any:{screen_revision}"),),
+        )
+    else:
+        options = _GAME_SEARCH_DETAIL_OPTIONS[detail_key]
+        grouped_options: tuple[tuple[str, ...], ...] = {
+            "team_formats": (options[:3], options[3:6], options[6:]),
+            "positions": (options[:2], options[2:]),
+            "playing_levels": (
+                options[:2],
+                options[2:4],
+                options[4:6],
+                options[6:],
+            ),
+            "venue_settings": tuple((value,) for value in options),
+            "playing_surfaces": tuple((value,) for value in options),
+            "payment": (options,),
+        }[detail_key]
+        rows = tuple(tuple(button(value) for value in row) for row in grouped_options)
+        if detail_key == "team_formats":
+            rows = (
+                *rows[:-1],
+                (*rows[-1], (done_label, f"details:done:{screen_revision}")),
+            )
+        else:
+            rows = (*rows, ((done_label, f"details:done:{screen_revision}"),))
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=heading,
+        button_rows=(*rows, ((back_label, f"details:back:{screen_revision}"),)),
+    )
+
+
+def _game_search_exact_time_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    text, back_label = {
+        "en": ("Enter the exact local time in the selected city.", "⬅️ Back"),
+        "ru": ("Введите точное местное время выбранного города.", "⬅️ Назад"),
+        "es": (
+            "Introduce la hora local exacta de la ciudad seleccionada.",
+            "⬅️ Atrás",
+        ),
+        "fr": (
+            "Indiquez l’heure locale exacte dans la ville sélectionnée.",
+            "⬅️ Retour",
+        ),
+    }[copy_locale]
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(((back_label, f"details:back:{screen_revision}"),),),
+    )
+
+
 def _zero_result_message(
     *,
     delivery_id: str,
@@ -4989,6 +5681,419 @@ def _zero_result_message(
         screen_revision=screen_revision,
         text=text,
         button_rows=(((new_search_label, f"menu:new-search:{screen_revision}"),),),
+        reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _open_match_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+) -> TelegramMessage:
+    """Render one Result Card only from its immutable accepted-fact snapshot."""
+    facts = dict(result.card_facts)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    event_date = date.fromisoformat(facts["start_local_date"])
+    event_end_date = date.fromisoformat(
+        facts.get("end_local_date", facts["start_local_date"])
+    )
+    source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
+        ZoneInfo(facts["iana_timezone"])
+    )
+    months = {
+        "en": (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }[copy_locale]
+    labels = {
+        "en": (
+            "Open Match",
+            "Matches",
+            "Needs clarification",
+            "Posted",
+            "Contact",
+            "at",
+            "date and city",
+            "Questions? Message me. I can explain the card or help refine your search.",
+            "Additional",
+            "No exact match was found.",
+        ),
+        "ru": (
+            "Открытая игра",
+            "Подходит",
+            "Нужно уточнить",
+            "Пост",
+            "Контакт",
+            "в",
+            "дата и город",
+            "💬 Остались вопросы? Напишите, я объясню карточку "
+            "или помогу уточнить поиск.",
+            "Дополнительно",
+            "Точного совпадения не найдено.",
+        ),
+        "es": (
+            "Partido abierto",
+            "Coincide",
+            "Falta confirmar",
+            "Publicado",
+            "Contacto",
+            "a las",
+            "fecha y ciudad",
+            "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha "
+            "o le ayudaré a ajustar la búsqueda.",
+            "Información adicional",
+            "No se encontró una coincidencia exacta.",
+        ),
+        "fr": (
+            "Match ouvert",
+            "Correspond",
+            "À préciser",
+            "Publié",
+            "Contact",
+            "à",
+            "date et ville",
+            "Une question ? Écrivez-moi. Je peux expliquer la fiche "
+            "ou vous aider à affiner votre recherche.",
+            "Informations complémentaires",
+            "Aucune correspondance exacte n’a été trouvée.",
+        ),
+    }[copy_locale]
+    match_states = json.loads(facts.get("match_states", "{}"))
+    confirmed_keys = {
+        key for key, state in match_states.items() if state == "confirmed"
+    }
+    team_formats = json.loads(facts.get("team_formats", "[]"))
+    title = f"⚽ {labels[0]}" + (
+        f" {', '.join(team_formats)}"
+        if team_formats and "team_formats" in confirmed_keys
+        else ""
+    )
+    if event_date == event_end_date:
+        date_copy = f"{event_date.day} {months[event_date.month - 1]} {event_date.year}"
+    elif (
+        event_date.year == event_end_date.year
+        and event_date.month == event_end_date.month
+    ):
+        date_copy = (
+            f"{event_date.day}–{event_end_date.day} "
+            f"{months[event_date.month - 1]} {event_date.year}"
+        )
+    elif event_date.year == event_end_date.year:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]}–"
+            f"{event_end_date.day} {months[event_end_date.month - 1]} "
+            f"{event_date.year}"
+        )
+    else:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]} {event_date.year}–"
+            f"{event_end_date.day} {months[event_end_date.month - 1]} "
+            f"{event_end_date.year}"
+        )
+    when = date_copy + (
+        f", {facts['exact_local_time']}" if "exact_local_time" in facts else ""
+    )
+    where = facts[f"city_display_{copy_locale}"]
+    if int(facts.get("location_specificity", "0")) > 1:
+        where += f", {facts[f'place_display_{copy_locale}']}"
+    open_places = int(facts["open_places"])
+    open_place_copy = {
+        "en": f"{open_places} open place" + ("s" if open_places != 1 else ""),
+        "ru": f"Свободных мест: {open_places}",
+        "es": f"{open_places} plaza"
+        + ("s" if open_places != 1 else "")
+        + " libre"
+        + ("s" if open_places != 1 else ""),
+        "fr": f"{open_places} place"
+        + ("s" if open_places != 1 else "")
+        + " libre"
+        + ("s" if open_places != 1 else ""),
+    }[copy_locale]
+    value_copy = {
+        "en": {
+            "goalkeeper": "Goalkeeper",
+            "defender": "Defender",
+            "midfielder": "Midfielder",
+            "forward": "Forward",
+            "novice": "Beginner",
+            "below_average": "Below average",
+            "average": "Average",
+            "above_average": "Above average",
+            "high": "High",
+            "very_high": "Very high",
+            "master": "Master",
+            "professional": "Professional",
+            "indoor": "Indoor",
+            "outdoor": "Outdoor",
+            "covered_outdoor": "Covered outdoor",
+            "natural_grass": "Natural grass",
+            "artificial_turf": "Artificial turf",
+            "hard_surface": "Hard surface",
+            "wood_parquet": "Wood / parquet",
+            "free": "Free",
+            "paid": "Paid",
+        },
+        "ru": {
+            "goalkeeper": "Вратарь",
+            "defender": "Защитник",
+            "midfielder": "Полузащитник",
+            "forward": "Нападающий",
+            "novice": "Новичок",
+            "below_average": "Ниже среднего",
+            "average": "Средний",
+            "above_average": "Выше среднего",
+            "high": "Высокий",
+            "very_high": "Очень высокий",
+            "master": "Мастер",
+            "professional": "Профессионал",
+            "indoor": "В помещении",
+            "outdoor": "На улице",
+            "covered_outdoor": "Под навесом",
+            "natural_grass": "Натуральный газон",
+            "artificial_turf": "Искусственный газон",
+            "hard_surface": "Твёрдое покрытие",
+            "wood_parquet": "Деревянный паркет",
+            "free": "Бесплатно",
+            "paid": "Платно",
+        },
+        "es": {
+            "goalkeeper": "Portero",
+            "defender": "Defensa",
+            "midfielder": "Centrocampista",
+            "forward": "Delantero",
+            "novice": "Principiante",
+            "below_average": "Por debajo de la media",
+            "average": "Medio",
+            "above_average": "Por encima de la media",
+            "high": "Alto",
+            "very_high": "Muy alto",
+            "master": "Máster",
+            "professional": "Profesional",
+            "indoor": "En interior",
+            "outdoor": "Al aire libre",
+            "covered_outdoor": "Exterior cubierto",
+            "natural_grass": "Césped natural",
+            "artificial_turf": "Césped artificial",
+            "hard_surface": "Superficie dura",
+            "wood_parquet": "Madera / parqué",
+            "free": "Gratis",
+            "paid": "De pago",
+        },
+        "fr": {
+            "goalkeeper": "Gardien",
+            "defender": "Défenseur",
+            "midfielder": "Milieu",
+            "forward": "Attaquant",
+            "novice": "Débutant",
+            "below_average": "Inférieur à la moyenne",
+            "average": "Intermédiaire",
+            "above_average": "Supérieur à la moyenne",
+            "high": "Élevé",
+            "very_high": "Très élevé",
+            "master": "Maître",
+            "professional": "Professionnel",
+            "indoor": "En salle",
+            "outdoor": "En extérieur",
+            "covered_outdoor": "En extérieur couvert",
+            "natural_grass": "Gazon naturel",
+            "artificial_turf": "Gazon synthétique",
+            "hard_surface": "Surface dure",
+            "wood_parquet": "Bois / parquet",
+            "free": "Gratuit",
+            "paid": "Payant",
+        },
+    }[copy_locale]
+    value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
+    detail_names = dict(
+        zip(
+            _GAME_SEARCH_DETAIL_OPTIONS,
+            _GAME_SEARCH_DETAIL_NAMES[copy_locale],
+            strict=True,
+        )
+    )
+    known_values: dict[str, str] = {
+        "team_formats": ", ".join(team_formats),
+    }
+    for key in (
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+    ):
+        values = json.loads(facts.get(key, "[]"))
+        if values:
+            known_values[key] = ", ".join(
+                value_copy.get(value, value.replace("_", " ").capitalize())
+                for value in values
+            )
+    if "payment" in facts:
+        known_values["payment"] = value_copy.get(facts["payment"], facts["payment"])
+    detail_values = [open_place_copy]
+    detail_values.extend(
+        known_values[key]
+        for key in (
+            "positions",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+        )
+        if key in confirmed_keys and key in known_values
+    )
+    details = " · ".join(detail_values)
+    posted = (
+        f"{source_time.day} {months[source_time.month - 1]} {source_time.year} "
+        f"{labels[5]} {source_time:%H:%M}"
+    )
+    criterion_copy = {
+        "en": {
+            "times": "time",
+            "team_formats": "team format",
+            "positions": "position",
+            "playing_levels": "playing level",
+            "venue_settings": "venue setting",
+            "playing_surfaces": "playing surface",
+            "payment": "payment",
+            "search_area": "search area",
+        },
+        "ru": {
+            "times": "время",
+            "team_formats": "формат",
+            "positions": "позиция",
+            "playing_levels": "уровень игры",
+            "venue_settings": "тип площадки",
+            "playing_surfaces": "покрытие",
+            "payment": "оплата",
+            "search_area": "район поиска",
+        },
+        "es": {
+            "times": "hora",
+            "team_formats": "formato",
+            "positions": "posición",
+            "playing_levels": "nivel",
+            "venue_settings": "tipo de campo",
+            "playing_surfaces": "superficie",
+            "payment": "pago",
+            "search_area": "zona de búsqueda",
+        },
+        "fr": {
+            "times": "heure",
+            "team_formats": "format",
+            "positions": "poste",
+            "playing_levels": "niveau",
+            "venue_settings": "type de terrain",
+            "playing_surfaces": "surface",
+            "payment": "paiement",
+            "search_area": "zone de recherche",
+        },
+    }[copy_locale]
+    selected_confirmed = sorted(
+        criterion_copy.get(key, key.replace("_", " "))
+        for key, state in match_states.items()
+        if state == "confirmed" and key != "search_area"
+    )
+    selected_unknown = sorted(
+        criterion_copy.get(key, key.replace("_", " "))
+        for key, state in match_states.items()
+        if state == "unknown"
+    )
+    confirmed_core = (
+        {
+            "en": "date and search area",
+            "ru": "дата и район поиска",
+            "es": "fecha y zona de búsqueda",
+            "fr": "date et zone de recherche",
+        }[copy_locale]
+        if match_states.get("search_area") == "confirmed"
+        else labels[6]
+    )
+    match_lines = [
+        f"{labels[1]}: " + ", ".join((confirmed_core, *selected_confirmed)) + "."
+    ]
+    if selected_unknown:
+        match_lines.append(f"{labels[2]}: {', '.join(selected_unknown)}.")
+    match_copy = "\n".join(match_lines)
+    possible_copy = (
+        f"{labels[9]}\n\n" if result.result_class == "possible_match" else ""
+    )
+    additional = " · ".join(
+        f"{detail_names[key]}: {known_values[key]}"
+        for key in _GAME_SEARCH_DETAIL_OPTIONS
+        if key not in confirmed_keys and known_values.get(key)
+    )
+    additional_copy = f"\n{labels[8]}: {additional}\n" if additional else ""
+    text = (
+        f"{title}\n{when}\n{where}\n{details}\n\n"
+        f"{possible_copy}{match_copy}\n{additional_copy}\n"
+        f"{labels[3]}: {posted}\n"
+        f"{labels[4]}: {facts['response_route_value']}\n\n"
+        f"{labels[7]}"
+    )
+    menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(),
         reply_button=menu_label,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -5541,6 +6646,19 @@ class RuntimeApplication:
                     definition.name is ContractName.SEARCH_COMPLETED
                     and definition.version == 2
                 )
+                or (
+                    definition.name is ContractName.RUN_SEARCH
+                    and definition.version == 2
+                )
+                or (
+                    definition.name
+                    in {
+                        ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+                        ContractName.CLASSIFICATION_PROPOSAL,
+                        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                    }
+                    and definition.version == 2
+                )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
                     definition.version
@@ -5863,7 +6981,67 @@ class RuntimeApplication:
             and incoming.contract_version == 3
             and supported_incoming is not None
         ):
+            payload = supported_incoming.payload
+            classify = None
+            if (
+                isinstance(payload, dict)
+                and payload.get("event_kind") != "delete"
+                and isinstance(payload.get("body"), str)
+            ):
+                classify = ContractEnvelope(
+                    contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+                    contract_version=2,
+                    message_id=derive_contract_message_id(
+                        supported_incoming.message_id,
+                        ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+                    ),
+                    producer=RuntimeRole.APPLICATION,
+                    consumer=RuntimeRole.CLASSIFICATION,
+                    subject_id=supported_incoming.subject_id,
+                    subject_revision=supported_incoming.subject_revision,
+                    idempotency_key=(
+                        f"classify-source-message:{payload['source_message_revision_id']}"
+                    ),
+                    causation_id=supported_incoming.message_id,
+                    correlation_id=supported_incoming.correlation_id,
+                    recorded_at=self.clock.now(),
+                    payload={
+                        "source_message_revision_id": payload[
+                            "source_message_revision_id"
+                        ],
+                        "body": payload["body"],
+                        "source_event_time": payload["event_time"],
+                        "source_recorded_at": (
+                            supported_incoming.recorded_at.isoformat()
+                        ),
+                    },
+                )
             self.store.accept_source_event(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+                outgoing=classify,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and incoming.contract_version == 2
+            and supported_incoming is not None
+        ):
+            self._classify_source_message(supported_incoming)
+            return True
+        if (
+            incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
+            and incoming.contract_version == 2
+            and supported_incoming is not None
+        ):
+            self._accept_classification_proposal(supported_incoming)
+            return True
+        if (
+            incoming.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            and incoming.contract_version == 2
+            and supported_incoming is not None
+        ):
+            self.store.project_opportunity(
                 incoming=supported_incoming,
                 received_at=self.clock.now(),
             )
@@ -5987,6 +7165,217 @@ class RuntimeApplication:
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
         return True
+
+    def _classify_source_message(self, incoming: ContractEnvelope) -> None:
+        if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
+            raise RuntimeError("only Classification executes the primary classifier")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("ClassifySourceMessageRevision payload must be an object")
+        revision_id = payload.get("source_message_revision_id")
+        body = payload.get("body")
+        if not isinstance(revision_id, str) or not isinstance(body, str):
+            raise ValueError("classifier command requires revision identity and body")
+        request = ClassifierRequest(
+            source_message_revision_id=revision_id,
+            body=body,
+            requested_model="gpt-5.6-sol",
+            requested_reasoning_effort="high",
+            prompt_version="open-match-primary-v1",
+            schema_version="source-message-classification-v1",
+            glossary_version="football-opportunity-glossary-v1",
+            context_policy_version="classifier-context-v1",
+            routing_policy_version="classifier-routing-v1",
+        )
+        result = self.model.classify(request)
+        result_disposition = result.output.get("disposition")
+        disposition = (
+            result_disposition
+            if result_disposition
+            in {
+                "accepted",
+                "needs_second_pass",
+                "needs_review",
+                "irrelevant",
+                "unresolved",
+            }
+            else "unresolved"
+        )
+        provenance_complete = _classifier_adapter_result_has_complete_provenance(result)
+        manifest = {
+            "source_message_revision_id": revision_id,
+            "body": body,
+            "model": request.requested_model,
+            "reasoning_effort": request.requested_reasoning_effort,
+            "prompt_version": request.prompt_version,
+            "schema_version": request.schema_version,
+            "glossary_version": request.glossary_version,
+            "context_policy_version": request.context_policy_version,
+            "routing_policy_version": request.routing_policy_version,
+            "pass_number": 1,
+            "attempt_number": 1,
+        }
+        input_manifest_hash = sha256(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        proposal_id = f"proposal:{revision_id}"
+        outgoing = (
+            ContractEnvelope(
+                contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+                contract_version=2,
+                message_id=derive_contract_message_id(
+                    incoming.message_id, ContractName.CLASSIFICATION_PROPOSAL
+                ),
+                producer=RuntimeRole.CLASSIFICATION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=incoming.subject_id,
+                subject_revision=incoming.subject_revision,
+                idempotency_key=f"classification-proposal:{revision_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=self.clock.now(),
+                payload={
+                    "proposal_id": proposal_id,
+                    "source_message_revision_id": revision_id,
+                    "body": body,
+                    "source_event_time": payload.get("source_event_time"),
+                    "source_recorded_at": payload.get("source_recorded_at"),
+                    "output": result.output,
+                    "requested_model": request.requested_model,
+                    "effective_model": result.effective_model,
+                    "requested_reasoning_effort": request.requested_reasoning_effort,
+                    "effective_reasoning_effort": result.effective_reasoning_effort,
+                    "prompt_version": request.prompt_version,
+                    "schema_version": request.schema_version,
+                    "glossary_version": request.glossary_version,
+                    "context_policy_version": request.context_policy_version,
+                    "routing_policy_version": request.routing_policy_version,
+                    "codex_version": result.codex_version,
+                    "adapter_kind": result.adapter_kind,
+                    "adapter_version": result.adapter_version,
+                    "pass_number": 1,
+                    "attempt_number": 1,
+                    "input_manifest_hash": input_manifest_hash,
+                    "duration_ms": result.duration_ms,
+                    "input_tokens": result.input_tokens,
+                    "output_tokens": result.output_tokens,
+                    "classification_status": "succeeded",
+                },
+            )
+            if provenance_complete
+            else None
+        )
+        recorded_result = replace(
+            result,
+            duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
+            input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
+            output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
+        )
+        attempt = ClassificationAttempt(
+            attempt_id=f"classification-attempt:{revision_id}",
+            source_message_revision_id=revision_id,
+            requested_model=request.requested_model,
+            effective_model=result.effective_model,
+            requested_reasoning_effort=request.requested_reasoning_effort,
+            effective_reasoning_effort=result.effective_reasoning_effort,
+            prompt_version=request.prompt_version,
+            schema_version=request.schema_version,
+            glossary_version=request.glossary_version,
+            context_policy_version=request.context_policy_version,
+            routing_policy_version=request.routing_policy_version,
+            codex_version=result.codex_version,
+            adapter_kind=result.adapter_kind,
+            adapter_version=result.adapter_version,
+            pass_number=1,
+            attempt_number=1,
+            input_manifest_hash=input_manifest_hash,
+            evidence_references=_classification_evidence_references(result.output),
+            duration_ms=recorded_result.duration_ms,
+            input_tokens=recorded_result.input_tokens,
+            output_tokens=recorded_result.output_tokens,
+            disposition=disposition,
+            status="succeeded" if provenance_complete else "failed",
+        )
+        self.store.record_classification_attempt(
+            incoming=incoming,
+            attempt=attempt,
+            result=recorded_result,
+            outgoing=outgoing,
+            received_at=self.clock.now(),
+        )
+
+    def _accept_classification_proposal(self, incoming: ContractEnvelope) -> None:
+        if self.role is not RuntimeRole.APPLICATION or self.location_resolver is None:
+            raise RuntimeError("only Application accepts classifier proposals")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("ClassificationProposal payload must be an object")
+        revision_id = payload.get("source_message_revision_id")
+        if not isinstance(revision_id, str):
+            raise ValueError("ClassificationProposal requires revision identity")
+        source_revision = self.store.source_message_revision(revision_id)
+        if source_revision is None or source_revision.body is None:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=(2,),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
+        authoritative_payload: dict[str, JsonValue] = {
+            **payload,
+            "body": source_revision.body,
+            "source_event_time": source_revision.event_time.isoformat(),
+            "source_recorded_at": source_revision.recorded_at.isoformat(),
+            "validation_time": self.clock.now().isoformat(),
+        }
+        accepted = _validated_open_match_proposal(
+            authoritative_payload,
+            resolver=self.location_resolver,
+        )
+        if accepted is None:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=(2,),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
+        opportunity_id = accepted["opportunity_id"]
+        if not isinstance(opportunity_id, str):
+            raise RuntimeError("validated Opportunity identity is missing")
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+            contract_version=2,
+            message_id=derive_contract_message_id(
+                incoming.message_id, ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.RECOMMENDATION,
+            subject_id=opportunity_id,
+            subject_revision=1,
+            idempotency_key=f"opportunity-publication:{opportunity_id}:1",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=self.clock.now(),
+            payload={
+                "opportunity_id": opportunity_id,
+                "publication_state": "active",
+                "accepted_facts": accepted["accepted_facts"],
+                "response_route": accepted["response_route"],
+            },
+        )
+        self.store.publish_opportunity(
+            incoming=incoming,
+            opportunity=accepted,
+            outgoing=outgoing,
+            received_at=self.clock.now(),
+        )
 
     def fail_next_search(self) -> None:
         """Inject one controlled Recommendation execution failure."""
@@ -6546,6 +7935,8 @@ class RuntimeApplication:
         country_id = payload.get("country_id")
         city_id = payload.get("city_id")
         area_ids = payload.get("sub_city_area_ids")
+        area_types = payload.get("sub_city_area_geographic_types", [])
+        area_parent_ids = payload.get("sub_city_area_verified_parent_ids", [])
         whole_city = payload.get("whole_city")
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("RunSearch requires telegram_user_id")
@@ -6561,6 +7952,39 @@ class RuntimeApplication:
             isinstance(value, str) and value for value in area_ids
         ):
             raise TypeError("RunSearch requires sub_city_area_ids")
+        typed_area_ids = cast(list[str], area_ids)
+        if (
+            not isinstance(area_types, list)
+            or (bool(area_types) and len(area_types) != len(area_ids))
+            or (incoming.contract_version >= 2 and len(area_types) != len(area_ids))
+            or not all(value in SUB_CITY_GEOGRAPHIC_TYPES for value in area_types)
+        ):
+            raise TypeError("RunSearch requires aligned sub-city geographic types")
+        if (
+            not isinstance(area_parent_ids, list)
+            or (bool(area_parent_ids) and len(area_parent_ids) != len(area_ids))
+            or (
+                incoming.contract_version >= 2 and len(area_parent_ids) != len(area_ids)
+            )
+            or not all(
+                isinstance(parent_ids, list)
+                and bool(parent_ids)
+                and all(isinstance(value, str) and value for value in parent_ids)
+                for parent_ids in area_parent_ids
+            )
+        ):
+            raise TypeError("RunSearch requires aligned sub-city parent hierarchies")
+        typed_area_parent_ids = cast(list[list[str]], area_parent_ids)
+        if typed_area_parent_ids and any(
+            len(parent_ids) != len(set(parent_ids))
+            or area_id in parent_ids
+            or country_id not in parent_ids
+            or city_id not in parent_ids
+            for area_id, parent_ids in zip(
+                typed_area_ids, typed_area_parent_ids, strict=True
+            )
+        ):
+            raise TypeError("RunSearch requires verified sub-city parent hierarchies")
         if not isinstance(whole_city, bool):
             raise TypeError("RunSearch requires whole_city")
         if self.search_failures_remaining:
@@ -6592,6 +8016,9 @@ class RuntimeApplication:
             )
             return
         completed_search_id = f"completed-search:{incoming.message_id}"
+        game_search_details = _runtime_game_search_details(
+            payload.get("game_search_details")
+        )
         completed_search = CompletedSearch(
             completed_search_id=completed_search_id,
             telegram_user_id=telegram_user_id,
@@ -6599,12 +8026,22 @@ class RuntimeApplication:
             user_intent=UserIntent(user_intent),
             country_id=country_id,
             city_id=city_id,
-            sub_city_area_ids=tuple(
-                value for value in area_ids if isinstance(value, str)
-            ),
+            sub_city_area_ids=tuple(typed_area_ids),
             whole_city=whole_city,
             required_date=_runtime_required_date(payload.get("required_date")),
             completed_at=self.clock.now(),
+            game_search_details=tuple(sorted(game_search_details.items())),
+            sub_city_area_geographic_types=tuple(
+                value for value in area_types if isinstance(value, str)
+            ),
+            sub_city_area_verified_parent_ids=tuple(
+                tuple(value for value in parent_ids if isinstance(value, str))
+                for parent_ids in typed_area_parent_ids
+            ),
+        )
+        results = self.store.find_search_results(
+            completed_search,
+            game_search_details,
         )
         outgoing = ContractEnvelope(
             contract_name=ContractName.SEARCH_COMPLETED,
@@ -6622,13 +8059,14 @@ class RuntimeApplication:
                 "completed_search_id": completed_search_id,
                 "telegram_user_id": telegram_user_id,
                 "search_update_id": search_update_id,
-                "result_count": 0,
+                "result_count": len(results),
             },
         )
         query = GetCompletedSearch.from_search_completed(outgoing)
         self.store.complete_search(
             incoming=incoming,
             completed_search=completed_search,
+            results=results,
             query=query,
             outgoing=outgoing,
             received_at=self.clock.now(),
@@ -6752,6 +8190,37 @@ def _runtime_identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
 
 
+def _nonnegative_metric_or_zero(value: object) -> int:
+    return (
+        value
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        else 0
+    )
+
+
+def _classifier_adapter_result_has_complete_provenance(
+    result: ClassifierAdapterResult,
+) -> bool:
+    """Reject adapter results missing required effective/version/usage metadata."""
+    return all(
+        isinstance(value, str) and bool(value.strip())
+        for value in (
+            result.effective_model,
+            result.effective_reasoning_effort,
+            result.codex_version,
+            result.adapter_kind,
+            result.adapter_version,
+        )
+    ) and all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (
+            result.duration_ms,
+            result.input_tokens,
+            result.output_tokens,
+        )
+    )
+
+
 def _source_chat_request_identity_matches_provenance(
     incoming: RawContractEnvelope,
     provenance: SourceChatAdmissionProvenance | None,
@@ -6803,6 +8272,960 @@ def _source_chat_terminal_matches_origin(
     )
 
 
+def _is_explicit_children_only_game(body: str) -> bool:
+    """Apply the narrow children-only domain exclusion without age inference."""
+    normalized = body.casefold().replace(" ", " ")
+    patterns = (
+        r"\b(?:children['’]?s|childrens|children|kids?['’]?(?:s)?)\s+"
+        r"(?:football\s+)?(?:games?|matches|tournaments?)\b",
+        r"\b(?:games?|matches|tournaments?)\s+(?:only\s+)?for\s+"
+        r"(?:children|kids?)\b",
+        r"\bдетск\w*\s+(?:футбольн\w*\s+)?"
+        r"(?:игр\w*|матч\w*|турнир\w*)\b",
+        r"\b(?:игра|матч|турнир)\s+(?:только\s+)?для\s+детей\b",
+        r"\b(?:partidos?|juegos?|torneos?)\s+(?:de\s+fútbol\s+)?"
+        r"(?:infantiles?|para\s+niños)\b",
+        r"\b(?:matchs?|matches|tournois?)\s+(?:de\s+football\s+)?"
+        r"(?:pour\s+enfants|des\s+enfants)\b",
+    )
+    return any(re.search(pattern, normalized) is not None for pattern in patterns)
+
+
+def _open_match_expiry(
+    start: date,
+    end: date,
+    exact_time: str | None,
+    timezone: ZoneInfo,
+) -> datetime:
+    """Expire one known start exactly; keep a bounded range through its last day."""
+    if exact_time is not None and start == end:
+        return datetime.combine(
+            start,
+            datetime.strptime(exact_time, "%H:%M").time(),
+            tzinfo=timezone,
+        )
+    return datetime.combine(
+        end + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=timezone,
+    )
+
+
+def _classifier_proposal_has_pinned_provenance(
+    payload: dict[str, JsonValue],
+    *,
+    revision_id: str,
+    body: str,
+) -> bool:
+    pinned = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "open-match-primary-v1",
+        "schema_version": "source-message-classification-v1",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+    }
+    manifest = {
+        "source_message_revision_id": revision_id,
+        "body": body,
+        "model": pinned["requested_model"],
+        "reasoning_effort": pinned["requested_reasoning_effort"],
+        "prompt_version": pinned["prompt_version"],
+        "schema_version": pinned["schema_version"],
+        "glossary_version": pinned["glossary_version"],
+        "context_policy_version": pinned["context_policy_version"],
+        "routing_policy_version": pinned["routing_policy_version"],
+        "pass_number": 1,
+        "attempt_number": 1,
+    }
+    expected_manifest_hash = sha256(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        all(payload.get(key) == value for key, value in pinned.items())
+        and all(
+            isinstance(payload.get(key), str) and bool(str(payload[key]).strip())
+            for key in ("codex_version", "adapter_kind", "adapter_version")
+        )
+        and payload.get("pass_number") == 1
+        and payload.get("attempt_number") == 1
+        and payload.get("input_manifest_hash") == expected_manifest_hash
+        and all(
+            isinstance(metric := payload.get(key), int)
+            and not isinstance(metric, bool)
+            and metric >= 0
+            for key in ("duration_ms", "input_tokens", "output_tokens")
+        )
+        and payload.get("classification_status") == "succeeded"
+    )
+
+
+def _resolve_source_location_across_supported_locales(
+    resolver: LocationResolverAdapter,
+    *,
+    mention: str,
+    country_id: str,
+    city_id: str,
+) -> tuple[LocationCandidate, dict[str, str]] | None:
+    """Reconcile one stable place without guessing a Source Message language."""
+    accepted: LocationCandidate | None = None
+    city_display_labels: dict[str, str] = {}
+    for locale in ("en", "es", "fr", "ru"):
+        try:
+            resolution = resolver.resolve(
+                LocationResolutionQuery(
+                    text=mention,
+                    locale=locale,
+                    stage=ConversationStage.SEARCH_AREA,
+                    country_id=country_id,
+                    city_id=city_id,
+                )
+            )
+        except LocationResolverError:
+            return None
+        if not resolution.interpretations:
+            continue
+        if len(resolution.interpretations) != 1:
+            return None
+        interpretation = resolution.interpretations[0]
+        if (
+            interpretation.glossary_version != "location-glossary-v1"
+            or len(interpretation.places) != 1
+            or interpretation.places[0].glossary_version
+            != interpretation.glossary_version
+        ):
+            return None
+        proposed = interpretation.places[0]
+        city_label: str | None
+        if proposed.geographic_type is GeographicType.CITY:
+            city_label = dict(proposed.localized_display_names).get(
+                locale, proposed.display_name
+            )
+        else:
+            city_label = dict(
+                zip(
+                    proposed.verified_parent_ids,
+                    proposed.parent_display_names,
+                    strict=False,
+                )
+            ).get(city_id)
+        if not city_label:
+            return None
+        city_display_labels[locale] = city_label
+        if accepted is None:
+            proposed_localized = dict(proposed.localized_display_names)
+            proposed_localized.setdefault(locale, proposed.display_name)
+            accepted = replace(
+                proposed,
+                localized_display_names=tuple(sorted(proposed_localized.items())),
+            )
+            continue
+        if (
+            accepted.place_id != proposed.place_id
+            or accepted.geographic_type is not proposed.geographic_type
+            or accepted.country_id != proposed.country_id
+            or accepted.city_id != proposed.city_id
+            or accepted.verified_parent_ids != proposed.verified_parent_ids
+            or accepted.iana_timezone != proposed.iana_timezone
+            or accepted.resolver_version != proposed.resolver_version
+            or accepted.glossary_version != proposed.glossary_version
+            or len(accepted.parent_display_names) != len(proposed.parent_display_names)
+            or not all(proposed.parent_display_names)
+        ):
+            return None
+        localized = dict(accepted.localized_display_names)
+        proposed_localized = dict(proposed.localized_display_names)
+        proposed_localized.setdefault(locale, proposed.display_name)
+        if any(
+            existing is not None and existing != label
+            for language, label in proposed_localized.items()
+            if (existing := localized.get(language)) is not None
+        ):
+            return None
+        localized.update(proposed_localized)
+        accepted = replace(
+            accepted,
+            localized_display_names=tuple(sorted(localized.items())),
+        )
+    if accepted is None or not city_display_labels:
+        return None
+    fallback_city_label = city_display_labels.get("en") or next(
+        iter(city_display_labels.values())
+    )
+    for locale in ("en", "es", "fr", "ru"):
+        city_display_labels.setdefault(locale, fallback_city_label)
+    return accepted, city_display_labels
+
+
+def _accepted_city_display_labels(
+    place: LocationCandidate, city_id: str
+) -> dict[str, str] | None:
+    localized = dict(place.localized_display_names)
+    if place.geographic_type is GeographicType.CITY:
+        return {
+            locale: localized.get(locale, place.display_name)
+            for locale in ("en", "ru", "es", "fr")
+        }
+    parent_labels = dict(
+        zip(place.verified_parent_ids, place.parent_display_names, strict=False)
+    )
+    city_label = parent_labels.get(city_id)
+    if not city_label:
+        return None
+    return {locale: city_label for locale in ("en", "ru", "es", "fr")}
+
+
+def _validated_open_match_proposal(
+    payload_value: JsonValue,
+    *,
+    resolver: LocationResolverAdapter,
+) -> dict[str, JsonValue] | None:
+    """Accept only schema-, evidence-, domain-, route-, and location-valid facts."""
+    if not isinstance(payload_value, dict):
+        return None
+    body = payload_value.get("body")
+    revision_id = payload_value.get("source_message_revision_id")
+    output = payload_value.get("output")
+    if (
+        not isinstance(body, str)
+        or not isinstance(revision_id, str)
+        or _is_explicit_children_only_game(body)
+        or not _classifier_proposal_has_pinned_provenance(
+            payload_value,
+            revision_id=revision_id,
+            body=body,
+        )
+        or not isinstance(output, dict)
+        or not classifier_output_is_schema_valid(output, body=body)
+        or output.get("disposition") != "accepted"
+    ):
+        return None
+    candidates = output.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return None
+    required = {
+        "candidate_key",
+        "opportunity_type",
+        "evidence",
+        "location",
+        "event_time",
+        "open_places",
+        "response_routes",
+    }
+    optional = {
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+    if (
+        not required.issubset(candidate)
+        or set(candidate) - required - optional
+        or candidate.get("opportunity_type") != "open_match"
+    ):
+        return None
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    location = candidate.get("location")
+    event_time = candidate.get("event_time")
+    routes = candidate.get("response_routes")
+    if (
+        not isinstance(candidate_key, str)
+        or not isinstance(evidence, dict)
+        or set(evidence)
+        != {"opportunity", "event_time", "location", "open_places"}
+        | (set(candidate) & optional)
+        or not all(
+            isinstance(value, str) and value in body for value in evidence.values()
+        )
+        or not isinstance(location, dict)
+        or not isinstance(event_time, dict)
+        or not isinstance(routes, list)
+        or not routes
+    ):
+        return None
+    usable_routes: list[dict[str, str]] = []
+    for proposed_route in routes:
+        if not isinstance(proposed_route, dict):
+            continue
+        kind = proposed_route.get("kind")
+        value = proposed_route.get("value")
+        route_evidence = proposed_route.get("evidence")
+        if (
+            set(proposed_route) == {"kind", "value", "evidence"}
+            and kind == "explicit_telegram_username"
+            and isinstance(value, str)
+            and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", value) is not None
+            and isinstance(route_evidence, str)
+            and route_evidence in body
+            and value in route_evidence
+        ):
+            usable_routes.append(
+                {"kind": kind, "value": value, "evidence": route_evidence}
+            )
+    if not usable_routes:
+        return None
+    route = min(
+        usable_routes,
+        key=lambda item: (body.index(str(item["evidence"])), str(item["value"])),
+    )
+    route_value = route["value"]
+    assert isinstance(route_value, str)
+    mention = location.get("mention")
+    country_id = location.get("country_id")
+    city_id = location.get("city_id")
+    place_id = location.get("place_id")
+    if (
+        not isinstance(mention, str)
+        or not mention
+        or not isinstance(country_id, str)
+        or not country_id
+        or not isinstance(city_id, str)
+        or not city_id
+        or not isinstance(place_id, str)
+        or not place_id
+    ):
+        return None
+    resolved_location = _resolve_source_location_across_supported_locales(
+        resolver,
+        mention=mention,
+        country_id=country_id,
+        city_id=city_id,
+    )
+    if resolved_location is None:
+        return None
+    resolved_place, city_display_labels = resolved_location
+    places = tuple(
+        place
+        for place in (resolved_place,)
+        if place.place_id == place_id
+        and place.country_id == country_id
+        and place.city_id == city_id
+        and country_id in place.verified_parent_ids
+        and bool(place.resolver_version)
+        and bool(place.glossary_version)
+        and len(place.verified_parent_ids) == len(place.parent_display_names)
+        and all(place.parent_display_names)
+        and (
+            city_id in place.verified_parent_ids
+            or (
+                place.geographic_type is GeographicType.CITY
+                and place.place_id == city_id
+            )
+        )
+    )
+    if len(places) != 1:
+        return None
+    open_places = candidate.get("open_places")
+    team_formats = candidate.get("team_formats")
+    positions = candidate.get("positions")
+    levels = candidate.get("playing_levels")
+    settings = candidate.get("venue_settings")
+    surfaces = candidate.get("playing_surfaces")
+    payment = candidate.get("payment")
+    if (
+        not isinstance(open_places, int)
+        or isinstance(open_places, bool)
+        or open_places < 1
+        or not _optional_canonical_list(
+            team_formats,
+            {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
+        )
+        or not _optional_canonical_list(
+            positions, {"goalkeeper", "defender", "midfielder", "forward"}
+        )
+        or not _optional_canonical_list(
+            levels,
+            {
+                "novice",
+                "below_average",
+                "average",
+                "above_average",
+                "high",
+                "very_high",
+                "master",
+                "professional",
+            },
+        )
+        or not _optional_canonical_list(
+            settings, {"indoor", "outdoor", "covered_outdoor"}
+        )
+        or not _optional_canonical_list(
+            surfaces,
+            {"natural_grass", "artificial_turf", "hard_surface", "wood_parquet"},
+        )
+        or payment not in {None, "free", "paid", "unknown"}
+    ):
+        return None
+    start_date = event_time.get("start_local_date")
+    end_date = event_time.get("end_local_date")
+    exact_time = event_time.get("exact_local_time")
+    timezone = event_time.get("iana_timezone")
+    try:
+        parsed_start = date.fromisoformat(str(start_date))
+        parsed_end = date.fromisoformat(str(end_date))
+        if exact_time is not None:
+            datetime.strptime(str(exact_time), "%H:%M")
+        source_event_time = datetime.fromisoformat(
+            str(payload_value.get("source_event_time"))
+        )
+        validation_time = datetime.fromisoformat(
+            str(payload_value.get("validation_time"))
+        )
+        event_timezone = ZoneInfo(str(timezone))
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    if (
+        parsed_end < parsed_start
+        or not isinstance(timezone, str)
+        or places[0].iana_timezone != timezone
+        or source_event_time.tzinfo is None
+        or validation_time.tzinfo is None
+        or not _event_time_is_supported(
+            parsed_start,
+            parsed_end,
+            exact_time if isinstance(exact_time, str) else None,
+            str(evidence["event_time"]),
+        )
+        or mention not in str(evidence["location"])
+        or not _open_places_are_supported(
+            open_places,
+            f"{evidence['opportunity']}. {evidence['open_places']}",
+        )
+        or not _optional_values_are_supported(candidate, evidence)
+    ):
+        return None
+    expiry = _open_match_expiry(
+        parsed_start,
+        parsed_end,
+        exact_time if isinstance(exact_time, str) else None,
+        event_timezone,
+    )
+    if validation_time.astimezone(event_timezone) >= expiry:
+        return None
+    localized = dict(places[0].localized_display_names)
+    accepted_facts: dict[str, JsonValue] = {
+        "start_local_date": str(start_date),
+        "end_local_date": str(end_date),
+        "exact_local_time": exact_time,
+        "iana_timezone": timezone,
+        "country_id": country_id,
+        "city_id": city_id,
+        "place_id": place_id,
+        "location_geographic_type": places[0].geographic_type.value,
+        "location_parent_ids": list(places[0].verified_parent_ids),
+        **{
+            f"city_display_{locale}": label
+            for locale, label in city_display_labels.items()
+        },
+        **{
+            f"place_display_{locale}": localized.get(locale, places[0].display_name)
+            for locale in ("en", "ru", "es", "fr")
+        },
+        "open_places": open_places,
+        "team_formats": team_formats,
+        "positions": positions,
+        "playing_levels": levels,
+        "venue_settings": settings,
+        "playing_surfaces": surfaces,
+        "payment": None if payment == "unknown" else payment,
+        "source_posted_at": source_event_time.isoformat(),
+    }
+    return {
+        "opportunity_id": (
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:open_match"
+        ),
+        "source_message_revision_id": revision_id,
+        "opportunity_type": "open_match",
+        "publication_state": "active",
+        "accepted_facts": accepted_facts,
+        "evidence": evidence,
+        "response_route": {"kind": route["kind"], "value": route_value},
+    }
+
+
+def _classification_evidence_references(
+    output: dict[str, JsonValue],
+) -> tuple[str, ...]:
+    """Collect content-free evidence hashes for durable provenance."""
+    references: list[str] = []
+    candidates = output.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            evidence = candidate.get("evidence")
+            if isinstance(evidence, dict):
+                references.extend(
+                    value for value in evidence.values() if isinstance(value, str)
+                )
+            routes = candidate.get("response_routes")
+            if isinstance(routes, list):
+                for route in routes:
+                    if not isinstance(route, dict):
+                        continue
+                    route_evidence = route.get("evidence")
+                    if isinstance(route_evidence, str):
+                        references.append(route_evidence)
+    return tuple(
+        dict.fromkeys(
+            f"sha256:{sha256(reference.encode('utf-8')).hexdigest()}"
+            for reference in references
+        )
+    )
+
+
+def _optional_canonical_list(value: JsonValue, allowed: set[str]) -> bool:
+    return value is None or (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, str) and item in allowed for item in value)
+        and len(value) == len(set(value))
+    )
+
+
+def _event_time_is_supported(
+    start: date,
+    end: date,
+    exact_time: str | None,
+    evidence: str,
+) -> bool:
+    normalized = evidence.casefold()
+    month_stems = {
+        1: ("january", "январ", "enero", "janvier"),
+        2: ("february", "феврал", "febrero", "février", "fevrier"),
+        3: ("march", "март", "marzo", "mars"),
+        4: ("april", "апрел", "abril", "avril"),
+        5: ("may", "мая", "mayo", "mai"),
+        6: ("june", "июн", "junio", "juin"),
+        7: ("july", "июл", "julio", "juillet"),
+        8: ("august", "август", "agosto", "août", "aout"),
+        9: ("september", "сентябр", "septiembre", "septembre"),
+        10: ("october", "октябр", "octubre", "octobre"),
+        11: ("november", "ноябр", "noviembre", "novembre"),
+        12: ("december", "декабр", "diciembre", "décembre", "decembre"),
+    }
+
+    def supports_date(value: date) -> bool:
+        return value.isoformat() in normalized or (
+            re.search(rf"(?<!\d){value.day}(?!\d)", normalized) is not None
+            and re.search(rf"(?<!\d){value.year}(?!\d)", normalized) is not None
+            and any(stem in normalized for stem in month_stems[value.month])
+        )
+
+    return (
+        supports_date(start)
+        and (start == end or supports_date(end))
+        and (
+            exact_time is None
+            or re.search(rf"(?<!\d){re.escape(exact_time)}(?!\d)", evidence) is not None
+        )
+    )
+
+
+def _open_places_are_supported(open_places: int, evidence: str) -> bool:
+    evidence_tokens = re.findall(r"[^\W_]+", evidence.casefold())
+    evidence_words = set(evidence_tokens)
+    cardinal_words = {
+        1: {"one", "одно", "один", "одна", "одну", "uno", "una", "un", "une", "1"},
+        2: {"two", "два", "две", "dos", "deux", "2"},
+        3: {"three", "три", "tres", "trois", "3"},
+        4: {"four", "четыре", "четырёх", "четырех", "cuatro", "quatre", "4"},
+        5: {"five", "пять", "cinco", "cinq", "5"},
+    }
+    generic_opening_words = {
+        "place",
+        "places",
+        "spot",
+        "spots",
+        "место",
+        "места",
+        "мест",
+        "plaza",
+        "plazas",
+    }
+    explicit_player_words = {
+        "player",
+        "players",
+        "goalkeeper",
+        "defender",
+        "midfielder",
+        "forward",
+        "игрок",
+        "игрока",
+        "игроков",
+        "вратарь",
+        "защитник",
+        "полузащитник",
+        "нападающий",
+        "jugador",
+        "jugadores",
+        "portero",
+        "defensa",
+        "centrocampista",
+        "delantero",
+        "joueur",
+        "joueurs",
+        "gardien",
+        "défenseur",
+        "milieu",
+        "attaquant",
+    }
+    referee_words = {
+        "referee",
+        "referees",
+        "судья",
+        "судьи",
+        "судейское",
+        "árbitro",
+        "árbitros",
+        "arbitre",
+        "arbitres",
+    }
+    team_words = {
+        "team",
+        "teams",
+        "команда",
+        "команды",
+        "equipo",
+        "equipos",
+        "équipe",
+        "équipes",
+    }
+    has_cardinal = bool(
+        evidence_words.intersection(cardinal_words.get(open_places, {str(open_places)}))
+    )
+    has_explicit_player = bool(evidence_words.intersection(explicit_player_words))
+    has_generic_opening = bool(evidence_words.intersection(generic_opening_words))
+    cardinal_tokens = cardinal_words.get(open_places, {str(open_places)})
+    opening_word = re.compile(
+        r"(?:open|available|need(?:s|ed)?|wanted|seeking|"
+        r"нуж\w*|есть|ищ\w*|треб\w*|свобод\w*|"
+        r"necesit\w*|busc\w*|disponible\w*|libre\w*|hay|"
+        r"cherch\w*|recherch\w*|besoin|reste\w*)"
+    )
+    closed_word = re.compile(
+        r"(?:occupied|filled|closed|taken|"
+        r"занят\w*|закрыт\w*|заполн\w*|"
+        r"ocupad\w*|cerrad\w*|cubiert\w*|"
+        r"occup[ée]\w*|ferm[ée]\w*|pourvu\w*)"
+    )
+    has_supported_counted_opening = False
+    for clause in re.split(r"[.!?;\n]+", evidence.casefold()):
+        clause_tokens = re.findall(r"[^\W_]+", clause)
+        cardinal_indexes = {
+            index
+            for index, token in enumerate(clause_tokens)
+            if token in cardinal_tokens
+        }
+        noun_indexes = {
+            index
+            for index, token in enumerate(clause_tokens)
+            if token in explicit_player_words or token in generic_opening_words
+        }
+        opening_indexes = {
+            index
+            for index, token in enumerate(clause_tokens)
+            if opening_word.fullmatch(token) is not None
+        }
+        closed_indexes = {
+            index
+            for index, token in enumerate(clause_tokens)
+            if closed_word.fullmatch(token) is not None
+        }
+        counted_noun_indexes = {
+            noun_index
+            for noun_index in noun_indexes
+            if any(
+                cardinal_index == noun_index - 1 for cardinal_index in cardinal_indexes
+            )
+            and not any(
+                abs(closed_index - noun_index) <= 2 for closed_index in closed_indexes
+            )
+        }
+        opening_noun_indexes = {
+            noun_index
+            for noun_index in noun_indexes
+            if any(
+                abs(opening_index - noun_index) <= 2
+                for opening_index in opening_indexes
+            )
+        }
+        clause_words = set(clause_tokens)
+        counted_explicit_player = any(
+            clause_tokens[index] in explicit_player_words
+            for index in counted_noun_indexes
+        )
+        counted_generic_opening = any(
+            clause_tokens[index] in generic_opening_words
+            for index in counted_noun_indexes
+        )
+        non_player_context = {
+            "parking",
+            "park",
+            "car",
+            "cars",
+            "spectator",
+            "spectators",
+            "ticket",
+            "tickets",
+            "seat",
+            "seats",
+            "парковка",
+            "парковке",
+            "зритель",
+            "зрителей",
+            "aparcamiento",
+            "estacionamiento",
+            "espectador",
+            "espectadores",
+            "spectateur",
+            "spectateurs",
+        }
+        if (
+            counted_noun_indexes
+            and opening_noun_indexes
+            and (
+                counted_explicit_player
+                or (
+                    bool(clause_words.intersection(explicit_player_words))
+                    and not clause_words.intersection(non_player_context)
+                )
+                or (
+                    open_places == 1
+                    and counted_generic_opening
+                    and len(clause_tokens) <= 3
+                    and not clause_words.intersection(non_player_context)
+                )
+            )
+        ):
+            has_supported_counted_opening = True
+            break
+    return bool(
+        has_cardinal
+        and has_supported_counted_opening
+        and not evidence_words.intersection(referee_words)
+        and (
+            has_explicit_player
+            or (has_generic_opening and not evidence_words.intersection(team_words))
+        )
+    )
+
+
+def _optional_values_are_supported(
+    candidate: dict[str, JsonValue],
+    evidence: dict[str, JsonValue],
+) -> bool:
+    lexicon: dict[str, dict[str, tuple[str, ...]]] = {
+        "positions": {
+            "goalkeeper": (
+                r"\bgoalkeeper\b",
+                r"\bвратар\w*\b",
+                r"\b(?:portero|guardameta)\b",
+                r"\bgardien\w*\b",
+            ),
+            "defender": (
+                r"\bdefender\b",
+                r"\bзащитник\w*\b",
+                r"\bdefensa\b",
+                r"\bd[ée]fenseur\w*\b",
+            ),
+            "midfielder": (
+                r"\bmidfielder\b",
+                r"\bполузащитник\w*\b",
+                r"\bcentrocampista\b",
+                r"\bmilieu\b",
+            ),
+            "forward": (
+                r"\bforward\b",
+                r"\bнападающ\w*\b",
+                r"\bdelantero\w*\b",
+                r"\battaquant\w*\b",
+            ),
+        },
+        "playing_levels": {
+            "novice": (
+                r"\bnovice\b",
+                r"\bнович\w*\b",
+                r"\bprincipiante\b",
+                r"\bd[ée]butant\w*\b",
+            ),
+            "below_average": (
+                r"\bbelow\s+average\b",
+                r"\bниже\s+средн\w*\b",
+                r"\bpor\s+debajo\s+de\s+la\s+media\b",
+                r"\binf[ée]rieur\w*\s+[àa]\s+la\s+moyenne\b",
+            ),
+            "average": (
+                r"(?<!above )(?<!below )\baverage\b",
+                r"(?<!выше )(?<!ниже )\bсредн\w*\b",
+                r"\bmedio\b",
+                r"(?<!encima de la )(?<!debajo de la )\bmedia\b",
+                r"(?<![àa] la )\bmoyen\w*\b",
+            ),
+            "above_average": (
+                r"\babove\s+average\b",
+                r"\bвыше\s+средн\w*\b",
+                r"\bpor\s+encima\s+de\s+la\s+media\b",
+                r"\bsup[ée]rieur\w*\s+[àa]\s+la\s+moyenne\b",
+            ),
+            "high": (
+                r"(?<!very )\bhigh\b",
+                r"(?<!очень )\bвысок\w*\b",
+                r"(?<!muy )\balto\b",
+                r"(?<!très )(?<!tres )\b[ée]lev[ée]\w*\b",
+            ),
+            "very_high": (
+                r"\bvery\s+high\b",
+                r"\bочень\s+высок\w*\b",
+                r"\bmuy\s+alto\b",
+                r"\btr[èe]s\s+[ée]lev[ée]\w*\b",
+            ),
+            "master": (
+                r"\bmaster\b",
+                r"\bмастер\w*\b",
+                r"\bmaestro\b",
+                r"\bma[îi]tre\b",
+            ),
+            "professional": (
+                r"\bprofessional\b",
+                r"\bпрофессион\w*\b",
+                r"\bprofesional\w*\b",
+                r"\bprofessionnel\w*\b",
+            ),
+        },
+        "venue_settings": {
+            "indoor": (
+                r"\bindoor\b",
+                r"\bв\s+помещении\b",
+                r"\bв\s+зале\b",
+                r"\binterior\b",
+                r"\ben\s+salle\b",
+            ),
+            "outdoor": (
+                r"(?<!covered )\boutdoor\b",
+                r"\bна\s+улице\b",
+                r"\bal\s+aire\s+libre\b",
+                r"(?<!couvert )\bext[ée]rieur\b",
+            ),
+            "covered_outdoor": (
+                r"\bcovered\s+outdoor\b",
+                r"\bпод\s+навесом\b",
+                r"\bexterior\s+cubierto\b",
+                r"\bext[ée]rieur\s+couvert\b",
+            ),
+        },
+        "playing_surfaces": {
+            "natural_grass": (
+                r"\bnatural\s+grass\b",
+                r"\bнатуральн\w*\b",
+                r"\bc[ée]sped\s+natural\b",
+                r"\bgazon\s+naturel\b",
+            ),
+            "artificial_turf": (
+                r"\bartificial\s+turf\b",
+                r"\bискусственн\w*\b",
+                r"\bc[ée]sped\s+artificial\b",
+                r"\bgazon\s+(?:synth[ée]tique|artificiel)\b",
+            ),
+            "hard_surface": (
+                r"\bhard\s+surface\b",
+                r"\bтв[её]рд\w*\b",
+                r"\bsuperficie\s+dura\b",
+                r"\bsurface\s+dure\b",
+            ),
+            "wood_parquet": (
+                r"\bwood\s+parquet\b",
+                r"\bпаркет\w*\b",
+                r"\bparqu[ée](?:\s+de\s+madera)?\b",
+                r"\bparquet(?:\s+en\s+bois)?\b",
+            ),
+        },
+    }
+    for field_name in (
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+    ):
+        values = candidate.get(field_name)
+        if values is None:
+            continue
+        field_evidence = evidence.get(field_name)
+        if not isinstance(values, list) or not isinstance(field_evidence, str):
+            return False
+        normalized = field_evidence.casefold()
+        for value in values:
+            if not isinstance(value, str):
+                return False
+            patterns = (
+                (rf"(?<!\w){re.escape(value)}(?!\w)",)
+                if field_name == "team_formats"
+                else lexicon[field_name][value]
+            )
+            if not any(re.search(pattern, normalized) for pattern in patterns):
+                return False
+    payment = candidate.get("payment")
+    if payment is not None:
+        payment_evidence = evidence.get("payment")
+        if not isinstance(payment_evidence, str):
+            return False
+        normalized_payment = payment_evidence.casefold()
+        payment_patterns = {
+            "free": (
+                r"\bfree\b",
+                r"\bбесплат\w*\b",
+                r"\bgratis\b",
+                r"\bgratuit\w*\b",
+            ),
+            "paid": (
+                r"\bpaid\b",
+                r"\bвзнос\w*\b",
+                r"\bруб\w*\b",
+                r"\bde\s+pago\b",
+                r"\bcuota\b",
+                r"\bpayant\w*\b",
+                r"\bpay[ée]\w*\b",
+                r"\bcotisation\b",
+                r"[₽$€]",
+            ),
+            "unknown": (
+                r"\bunknown\b",
+                r"\bне\s+указан\w*\b",
+                r"\bno\s+indicado\b",
+                r"\bnon\s+indiqu[ée]\w*\b",
+            ),
+        }
+        if not isinstance(payment, str) or payment not in payment_patterns:
+            return False
+        if not any(
+            re.search(pattern, normalized_payment)
+            for pattern in payment_patterns[payment]
+        ):
+            return False
+    return True
+
+
+def _canonical_game_search_time(value: str) -> bool:
+    return value in {"morning", "daytime", "evening", "night"} or (
+        re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value) is not None
+    )
+
+
 def _runtime_required_date(value: JsonValue) -> RequiredDate | None:
     if value is None:
         return None
@@ -6827,6 +9250,35 @@ def _runtime_required_date(value: JsonValue) -> RequiredDate | None:
         iana_timezone=iana_timezone,
         timezone_data_version=timezone_data_version,
     )
+
+
+def _runtime_game_search_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical optional detail criteria without semantic inference."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch game_search_details must be an object")
+    allowed = {
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "times",
+    }
+    if set(value) - allowed:
+        raise ValueError("RunSearch game_search_details has unsupported keys")
+    details: dict[str, tuple[str, ...]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise TypeError("RunSearch Game Search details must be string lists")
+        details[key] = tuple(item for item in raw if isinstance(item, str))
+    return details
 
 
 def _runtime_envelope(

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "source-message-classification-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "disposition", "candidates"],
+  "properties": {
+    "schema_version": {"const": "source-message-classification-v1"},
+    "disposition": {"enum": ["accepted", "needs_second_pass", "needs_review", "irrelevant", "unresolved"]},
+    "candidates": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate_key", "opportunity_type", "evidence", "location",
+          "event_time", "open_places", "response_routes"
+        ],
+        "properties": {
+          "candidate_key": {"type": "string", "minLength": 1},
+          "opportunity_type": {"const": "open_match"},
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "opportunity", "event_time", "location", "open_places"
+            ],
+            "properties": {
+              "opportunity": {"type": "string", "minLength": 1},
+              "event_time": {"type": "string", "minLength": 1},
+              "location": {"type": "string", "minLength": 1},
+              "open_places": {"type": "string", "minLength": 1},
+              "team_formats": {"type": "string", "minLength": 1},
+              "positions": {"type": "string", "minLength": 1},
+              "playing_levels": {"type": "string", "minLength": 1},
+              "venue_settings": {"type": "string", "minLength": 1},
+              "playing_surfaces": {"type": "string", "minLength": 1},
+              "payment": {"type": "string", "minLength": 1}
+            }
+          },
+          "location": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["mention", "place_id", "country_id", "city_id"],
+            "properties": {
+              "mention": {"type": "string", "minLength": 1},
+              "place_id": {"type": "string", "minLength": 1},
+              "country_id": {"type": "string", "minLength": 1},
+              "city_id": {"type": "string", "minLength": 1}
+            }
+          },
+          "event_time": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "start_local_date", "end_local_date", "iana_timezone"
+            ],
+            "properties": {
+              "start_local_date": {"type": "string", "format": "date"},
+              "end_local_date": {"type": "string", "format": "date"},
+              "exact_local_time": {"type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]$"},
+              "iana_timezone": {"type": "string", "minLength": 1}
+            }
+          },
+          "open_places": {"type": "integer", "minimum": 1},
+          "team_formats": {"$ref": "#/$defs/team_formats"},
+          "positions": {"$ref": "#/$defs/positions"},
+          "playing_levels": {"$ref": "#/$defs/playing_levels"},
+          "venue_settings": {"$ref": "#/$defs/venue_settings"},
+          "playing_surfaces": {"$ref": "#/$defs/playing_surfaces"},
+          "payment": {"enum": ["free", "paid", "unknown"]},
+          "response_routes": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "value", "evidence"],
+              "properties": {
+                "kind": {"const": "explicit_telegram_username"},
+                "value": {"type": "string", "pattern": "^@[A-Za-z0-9_]{5,32}$"},
+                "evidence": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "team_formats": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"]}},
+    "positions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["goalkeeper", "defender", "midfielder", "forward"]}},
+    "playing_levels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["novice", "below_average", "average", "above_average", "high", "very_high", "master", "professional"]}},
+    "venue_settings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["indoor", "outdoor", "covered_outdoor"]}},
+    "playing_surfaces": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["natural_grass", "artificial_turf", "hard_surface", "wood_parquet"]}}
+  }
+}

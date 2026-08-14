@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
-from typing import TypeAlias
+from typing import TypeAlias, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from modules.domain import SourceChatAddressKind, is_valid_source_chat_address
@@ -132,8 +133,22 @@ SUPPORTED_CONTRACTS = (
         "source_message_revision_id",
     ),
     ContractDefinition(
+        ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        2,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.CLASSIFICATION,
+        "source_message_revision_id",
+    ),
+    ContractDefinition(
         ContractName.CLASSIFICATION_PROPOSAL,
         1,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        2,
         RuntimeRole.CLASSIFICATION,
         RuntimeRole.APPLICATION,
         "proposal_id",
@@ -146,8 +161,23 @@ SUPPORTED_CONTRACTS = (
         "opportunity_revision_id",
     ),
     ContractDefinition(
+        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        2,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.RECOMMENDATION,
+        "opportunity_id",
+    ),
+    ContractDefinition(
         ContractName.RUN_SEARCH,
         1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.RECOMMENDATION,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.RUN_SEARCH,
+        2,
         RuntimeRole.BOT_ASSISTANT,
         RuntimeRole.RECOMMENDATION,
         "search_update_id",
@@ -340,7 +370,7 @@ class ContractEnvelope(RawContractEnvelope):
                 msg = f"supported contract requires integer {field_name}"
                 raise ValueError(msg)
         if self.contract_name is ContractName.RUN_SEARCH:
-            _validate_run_search(self.payload)
+            _validate_run_search(self.payload, contract_version=self.contract_version)
         elif (
             self.contract_name is ContractName.SOURCE_EVENT_RECORDED
             and self.contract_version == 3
@@ -484,21 +514,91 @@ _DATE_REQUIRED_USER_INTENTS = frozenset(
         "refereeing_service_offer",
     }
 )
+_GAME_SEARCH_DETAIL_VALUES = {
+    "team_formats": frozenset({"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"}),
+    "positions": frozenset({"goalkeeper", "defender", "midfielder", "forward"}),
+    "playing_levels": frozenset(
+        {
+            "novice",
+            "below_average",
+            "average",
+            "above_average",
+            "high",
+            "very_high",
+            "master",
+            "professional",
+        }
+    ),
+    "venue_settings": frozenset({"indoor", "outdoor", "covered_outdoor"}),
+    "playing_surfaces": frozenset(
+        {"natural_grass", "artificial_turf", "hard_surface", "wood_parquet"}
+    ),
+    "payment": frozenset({"free", "paid"}),
+}
+
+SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
+    {
+        "administrative_district",
+        "neighborhood",
+        "locality",
+        "station",
+        "transport_hub",
+        "landmark",
+        "address",
+    }
+)
 
 
-def _validate_run_search(payload: dict[str, JsonValue]) -> None:
+def _validate_run_search(
+    payload: dict[str, JsonValue],
+    *,
+    contract_version: int,
+) -> None:
     """Validate the complete confirmed discovery snapshot on the wire."""
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
         raise ValueError("RunSearch requires a canonical user_intent")
-    _required_text(payload, "country_id")
-    _required_text(payload, "city_id")
+    country_id = _required_text(payload, "country_id")
+    city_id = _required_text(payload, "city_id")
     area_ids = payload.get("sub_city_area_ids")
     if not isinstance(area_ids, list) or not all(
         isinstance(value, str) and value for value in area_ids
     ):
         raise ValueError("RunSearch requires string sub_city_area_ids")
+    typed_area_ids = cast(list[str], area_ids)
+    area_types = payload.get("sub_city_area_geographic_types", [])
+    if (
+        not isinstance(area_types, list)
+        or (bool(area_types) and len(area_types) != len(area_ids))
+        or (contract_version >= 2 and len(area_types) != len(area_ids))
+        or not all(value in SUB_CITY_GEOGRAPHIC_TYPES for value in area_types)
+    ):
+        raise ValueError("RunSearch requires aligned sub-city geographic types")
+    area_parent_ids = payload.get("sub_city_area_verified_parent_ids", [])
+    if (
+        not isinstance(area_parent_ids, list)
+        or (bool(area_parent_ids) and len(area_parent_ids) != len(area_ids))
+        or (contract_version >= 2 and len(area_parent_ids) != len(area_ids))
+        or not all(
+            isinstance(parent_ids, list)
+            and bool(parent_ids)
+            and all(isinstance(value, str) and value for value in parent_ids)
+            for parent_ids in area_parent_ids
+        )
+    ):
+        raise ValueError("RunSearch requires aligned sub-city parent hierarchies")
+    typed_area_parent_ids = cast(list[list[str]], area_parent_ids)
+    if typed_area_parent_ids and any(
+        len(parent_ids) != len(set(parent_ids))
+        or area_id in parent_ids
+        or country_id not in parent_ids
+        or city_id not in parent_ids
+        for area_id, parent_ids in zip(
+            typed_area_ids, typed_area_parent_ids, strict=True
+        )
+    ):
+        raise ValueError("RunSearch requires verified sub-city parent hierarchies")
     whole_city = payload.get("whole_city")
     if not isinstance(whole_city, bool):
         raise ValueError("RunSearch requires boolean whole_city")
@@ -507,6 +607,33 @@ def _validate_run_search(payload: dict[str, JsonValue]) -> None:
     required_date = payload.get("required_date")
     if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
         _validate_required_date(required_date)
+    details = payload.get("game_search_details")
+    if details is not None:
+        if user_intent != "game_search" or not isinstance(details, dict):
+            raise ValueError("RunSearch details require Game Search")
+        if set(details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
+            isinstance(values, list)
+            and (key != "times" or len(values) <= 1)
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and (
+                    value in _GAME_SEARCH_DETAIL_VALUES.get(key, ())
+                    or (
+                        key == "times"
+                        and (
+                            value in {"morning", "daytime", "evening", "night"}
+                            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+                            is not None
+                        )
+                    )
+                )
+                for value in values
+            )
+            for key, values in details.items()
+        ):
+            raise ValueError("RunSearch has invalid Game Search details")
 
 
 def _validate_required_date(value: JsonValue) -> None:

@@ -681,7 +681,7 @@ def test_deferred_start_refreshes_draft_activity_when_result_delivery_fails() ->
 @pytest.mark.parametrize(
     ("contract_name", "consumer", "future_version"),
     (
-        (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION, 2),
+        (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION, 3),
         (ContractName.SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT, 3),
         (ContractName.SEARCH_FAILED, RuntimeRole.BOT_ASSISTANT, 2),
         (ContractName.GET_COMPLETED_SEARCH, RuntimeRole.BOT_ASSISTANT, 2),

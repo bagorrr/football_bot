@@ -1,0 +1,100 @@
+{
+  "corpus_version": "open-match-classifier-regression-v1",
+  "redacted": true,
+  "cases": [
+    {
+      "case_id": "accepted-explicit-open-place",
+      "source": "25 сентября 2026 в 20:00 игра 7x7 у метро Спортивная. Нужно одно место, защитник, средний уровень, на улице, искусственный газон, взнос 700 рублей. Пишите @sample_contact",
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "Нужно одно место",
+            "event_time": "25 сентября 2026 в 20:00",
+            "location": "у метро Спортивная",
+            "open_places": "одно место",
+            "team_formats": "7x7",
+            "positions": "защитник",
+            "playing_levels": "средний уровень",
+            "venue_settings": "на улице",
+            "playing_surfaces": "искусственный газон",
+            "payment": "700 рублей"
+          },
+          "location": {
+            "mention": "у метро Спортивная",
+            "place_id": "station:redacted:sportivnaya",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-09-25",
+            "end_local_date": "2026-09-25",
+            "exact_local_time": "20:00",
+            "iana_timezone": "Etc/UTC"
+          },
+          "open_places": 1,
+          "team_formats": ["7x7"],
+          "positions": ["defender"],
+          "playing_levels": ["average"],
+          "venue_settings": ["outdoor"],
+          "playing_surfaces": ["artificial_turf"],
+          "payment": "paid",
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    },
+    {
+      "case_id": "irrelevant-score-only",
+      "source": "Матч завершился со счетом 2:1.",
+      "expected": {
+        "disposition": "irrelevant",
+        "candidate_count": 0
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "irrelevant",
+        "candidates": []
+      }
+    },
+    {
+      "case_id": "excluded-explicit-children-only",
+      "source": "Завтра детская игра, есть одно место. Пишите @sample_contact",
+      "expected": {
+        "disposition": "irrelevant",
+        "candidate_count": 0
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "irrelevant",
+        "candidates": []
+      }
+    },
+    {
+      "case_id": "unresolved-no-event-time",
+      "source": "Когда-нибудь соберемся поиграть, детали позже.",
+      "expected": {
+        "disposition": "unresolved",
+        "candidate_count": 0
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "unresolved",
+        "candidates": []
+      }
+    }
+  ]
+}

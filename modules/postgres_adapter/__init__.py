@@ -31,6 +31,7 @@ from modules.domain import (
     AcceptedLocation,
     ActiveChatView,
     ActiveResultContext,
+    ClassificationAttempt,
     CompletedSearch,
     CompletedSearchView,
     ConversationStage,
@@ -44,7 +45,10 @@ from modules.domain import (
     InitialConsentAttestation,
     IntentBranch,
     LocaleSource,
+    MatchState,
     OldChatViewCleanup,
+    Opportunity,
+    OpportunityResponseRoute,
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
@@ -69,6 +73,8 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
     UserIntent,
+    match_detail,
+    match_time_detail,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -94,6 +100,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0011_source_chat_registry.sql",
     "0012_source_chat_admission_provenance.sql",
     "0013_source_message_ingestion.sql",
+    "0014_open_match_game_search.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -110,6 +117,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
+    "4ee1aeec9d5b14cc510b5eaf3fd50c8f26bb99ef13627b4bab302f5d2b0ad9f9",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -582,6 +590,9 @@ class PostgresAcceptanceObserver:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
             TRUNCATE football_runtime.bot_callback_outbox,
+                     football_runtime.classification_attempts,
+                     football_runtime.application_opportunities,
+                     football_runtime.recommendation_opportunities,
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
@@ -757,6 +768,62 @@ class PostgresAcceptanceObserver:
                 """
             ).fetchall()
         return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
+
+    def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
+        """Observe durable primary-classifier provenance."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT attempt_id, source_message_revision_id, requested_model,
+                       effective_model, requested_reasoning_effort,
+                       effective_reasoning_effort, prompt_version, schema_version,
+                       glossary_version, context_policy_version,
+                       routing_policy_version, codex_version, adapter_kind,
+                       adapter_version, pass_number, attempt_number,
+                       input_manifest_hash, evidence_references, duration_ms,
+                       input_tokens, output_tokens, disposition, status
+                FROM football_runtime.classification_attempts
+                ORDER BY recorded_at, attempt_id
+                """
+            ).fetchall()
+        return tuple(
+            ClassificationAttempt(
+                **{
+                    **row,
+                    "evidence_references": tuple(row["evidence_references"]),
+                }
+            )
+            for row in rows
+        )
+
+    def opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Application-authoritative accepted Opportunities."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT opportunity_id, source_message_revision_id,
+                       opportunity_type, publication_state, response_route
+                FROM football_runtime.application_opportunities
+                ORDER BY accepted_at, opportunity_id
+                """
+            ).fetchall()
+        return tuple(
+            Opportunity(
+                opportunity_id=row["opportunity_id"],
+                source_message_revision_id=row["source_message_revision_id"],
+                opportunity_type=row["opportunity_type"],
+                publication_state=row["publication_state"],
+                response_route=OpportunityResponseRoute(
+                    kind=row["response_route"]["kind"],
+                    value=row["response_route"]["value"],
+                ),
+            )
+            for row in rows
+        )
 
     def replace_source_event_contract_version(
         self,
@@ -1111,7 +1178,9 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT completed_search_id, telegram_user_id, search_update_id,
                        user_intent, country_id, city_id, sub_city_area_ids,
-                       whole_city, required_date, completed_at
+                       sub_city_area_geographic_types,
+                       sub_city_area_verified_parent_ids,
+                       whole_city, required_date, game_search_details, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE telegram_user_id = %s
                 ORDER BY completed_at, completed_search_id
@@ -1128,7 +1197,8 @@ class PostgresAcceptanceObserver:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT result_id, completed_search_id, absolute_position
+                SELECT result_id, completed_search_id, absolute_position,
+                       result_class, card_facts
                 FROM football_runtime.recommendation_results
                 WHERE completed_search_id = %s
                 ORDER BY absolute_position
@@ -1140,6 +1210,8 @@ class PostgresAcceptanceObserver:
                 result_id=row["result_id"],
                 completed_search_id=row["completed_search_id"],
                 absolute_position=row["absolute_position"],
+                result_class=row["result_class"],
+                card_facts=tuple(sorted(row["card_facts"].items())),
             )
             for row in rows
         )
@@ -1987,6 +2059,7 @@ class PostgresRoleStore:
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Create one Application-owned Source Message from a Source Event."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -2137,6 +2210,8 @@ class PostgresRoleStore:
                     incoming.recorded_at,
                 ),
             )
+            if outgoing is not None:
+                _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -2217,6 +2292,48 @@ class PostgresRoleStore:
                 tombstoned=row["tombstoned"],
             )
             for row in rows
+        )
+
+    def source_message_revision(
+        self, source_message_revision_id: str
+    ) -> SourceMessageRevision | None:
+        """Read one immutable revision through Application's owner boundary."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT revision.source_message_revision_id,
+                       revision.source_message_id,
+                       revision.source_event_id,
+                       revision.revision,
+                       revision.event_kind,
+                       revision.body,
+                       revision.event_time,
+                       revision.recorded_at
+                FROM football_runtime.source_message_revisions AS revision
+                JOIN football_runtime.source_messages AS message
+                  ON message.source_message_id = revision.source_message_id
+                 AND message.current_revision = revision.revision
+                 AND NOT message.tombstoned
+                WHERE revision.source_message_revision_id = %s
+                """,
+                (source_message_revision_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceMessageRevision(
+            source_message_revision_id=row["source_message_revision_id"],
+            source_message_id=row["source_message_id"],
+            source_event_id=row["source_event_id"],
+            revision=row["revision"],
+            event_kind=SourceEventKind(row["event_kind"]),
+            body=row["body"],
+            event_time=row["event_time"],
+            recorded_at=row["recorded_at"],
         )
 
     def claim_next(
@@ -2402,6 +2519,166 @@ class PostgresRoleStore:
                 (presented_at, self._role.value, message_id),
             )
 
+    def record_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: Any,
+        outgoing: ContractEnvelope | None,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain provenance and publish only a valid proposal."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.classification_attempts (
+                    attempt_id, source_message_revision_id, requested_model,
+                    effective_model, requested_reasoning_effort,
+                    effective_reasoning_effort, prompt_version, schema_version,
+                    glossary_version, context_policy_version,
+                    routing_policy_version, codex_version, adapter_kind,
+                    adapter_version, pass_number, attempt_number,
+                    input_manifest_hash, evidence_references, duration_ms,
+                    input_tokens, output_tokens, disposition, status, recorded_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
+                ) ON CONFLICT (attempt_id) DO NOTHING
+                """,
+                (
+                    attempt.attempt_id,
+                    attempt.source_message_revision_id,
+                    attempt.requested_model,
+                    attempt.effective_model,
+                    attempt.requested_reasoning_effort,
+                    attempt.effective_reasoning_effort,
+                    attempt.prompt_version,
+                    attempt.schema_version,
+                    attempt.glossary_version,
+                    attempt.context_policy_version,
+                    attempt.routing_policy_version,
+                    result.codex_version,
+                    result.adapter_kind,
+                    result.adapter_version,
+                    attempt.pass_number,
+                    attempt.attempt_number,
+                    attempt.input_manifest_hash,
+                    json.dumps(attempt.evidence_references),
+                    result.duration_ms,
+                    result.input_tokens,
+                    result.output_tokens,
+                    attempt.disposition,
+                    attempt.status,
+                    received_at,
+                ),
+            )
+            if outgoing is not None:
+                _insert_outbox(connection, outgoing)
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def publish_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity: dict[str, JsonValue],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain accepted facts and emit publication state."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence, response_route,
+                    accepted_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                ON CONFLICT (opportunity_id) DO UPDATE
+                SET source_message_revision_id = EXCLUDED.source_message_revision_id,
+                    publication_state = EXCLUDED.publication_state,
+                    accepted_facts = EXCLUDED.accepted_facts,
+                    evidence = EXCLUDED.evidence,
+                    response_route = EXCLUDED.response_route,
+                    accepted_at = EXCLUDED.accepted_at
+                """,
+                (
+                    opportunity["opportunity_id"],
+                    opportunity["source_message_revision_id"],
+                    opportunity["opportunity_type"],
+                    opportunity["publication_state"],
+                    json.dumps(opportunity["accepted_facts"]),
+                    json.dumps(opportunity["evidence"]),
+                    json.dumps(opportunity["response_route"]),
+                    received_at,
+                ),
+            )
+            _insert_outbox(connection, outgoing)
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def project_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one accepted publication to Recommendation's projection."""
+        if self._role is not RuntimeRole.RECOMMENDATION:
+            raise ConversationAccessDeniedError
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("OpportunityPublicationChanged payload must be an object")
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.recommendation_opportunities (
+                    opportunity_id, publication_state, accepted_facts,
+                    response_route, published_at
+                ) VALUES (%s, %s, %s::jsonb, %s::jsonb, %s)
+                ON CONFLICT (opportunity_id) DO UPDATE
+                SET publication_state = EXCLUDED.publication_state,
+                    accepted_facts = EXCLUDED.accepted_facts,
+                    response_route = EXCLUDED.response_route,
+                    published_at = EXCLUDED.published_at
+                """,
+                (
+                    payload["opportunity_id"],
+                    payload["publication_state"],
+                    json.dumps(payload["accepted_facts"]),
+                    json.dumps(payload["response_route"]),
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
     def consume(
         self,
         *,
@@ -2491,11 +2768,161 @@ class PostgresRoleStore:
         except psycopg.errors.UniqueViolation as error:
             raise OutboxConflictError from error
 
+    def find_search_results(
+        self,
+        completed_search: CompletedSearch,
+        game_search_details: Mapping[str, tuple[str, ...]],
+    ) -> tuple[SearchResult, ...]:
+        """Match active accepted facts with deterministic core three-state rules."""
+        if self._role is not RuntimeRole.RECOMMENDATION:
+            raise ConversationAccessDeniedError
+        if completed_search.user_intent is not UserIntent.GAME_SEARCH:
+            return ()
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT opportunity_id, accepted_facts, response_route
+                FROM football_runtime.recommendation_opportunities
+                WHERE publication_state = 'active'
+                ORDER BY opportunity_id
+                """
+            ).fetchall()
+        matched: list[SearchResult] = []
+        for row in rows:
+            facts = row["accepted_facts"]
+            if (
+                facts.get("country_id") != completed_search.country_id
+                or facts.get("city_id") != completed_search.city_id
+            ):
+                continue
+            start = date.fromisoformat(facts["start_local_date"])
+            end = date.fromisoformat(facts["end_local_date"])
+            required = completed_search.required_date
+            if required is not None and (
+                end < required.start_local_date or start > required.end_local_date
+            ):
+                continue
+            area_state = _match_search_area(
+                whole_city=completed_search.whole_city,
+                selected_area_ids=completed_search.sub_city_area_ids,
+                selected_area_types=completed_search.sub_city_area_geographic_types,
+                selected_area_parent_ids=(
+                    completed_search.sub_city_area_verified_parent_ids
+                ),
+                country_id=completed_search.country_id,
+                city_id=completed_search.city_id,
+                facts=facts,
+            )
+            route = row["response_route"]
+            detail_state_by_key = {
+                key: match_detail(
+                    game_search_details.get(key, ()),
+                    tuple(facts[key]) if facts.get(key) else None,
+                )
+                for key in (
+                    "team_formats",
+                    "positions",
+                    "playing_levels",
+                    "venue_settings",
+                    "playing_surfaces",
+                )
+            }
+            detail_state_by_key.update(
+                {
+                    "payment": match_detail(
+                        game_search_details.get("payment", ()),
+                        (facts["payment"],) if facts.get("payment") else None,
+                    ),
+                    "times": match_time_detail(
+                        game_search_details.get("times", ()),
+                        facts.get("exact_local_time"),
+                    ),
+                    "search_area": area_state,
+                }
+            )
+            detail_states = tuple(detail_state_by_key.values())
+            if MatchState.CONFLICT in detail_states:
+                continue
+            result_class = (
+                "possible_match"
+                if MatchState.UNKNOWN in detail_states
+                else "confirmed_match"
+            )
+            card: dict[str, str] = {
+                "opportunity_id": row["opportunity_id"],
+                "start_local_date": facts["start_local_date"],
+                "end_local_date": facts["end_local_date"],
+                "sort_local_date": (
+                    max(start, required.start_local_date).isoformat()
+                    if required is not None
+                    else facts["start_local_date"]
+                ),
+                "iana_timezone": facts["iana_timezone"],
+                "open_places": str(facts["open_places"]),
+                "source_posted_at": facts["source_posted_at"],
+                "response_route_kind": route["kind"],
+                "response_route_value": route["value"],
+                "unknown_criterion_count": str(
+                    sum(state is MatchState.UNKNOWN for state in detail_states)
+                ),
+                "location_specificity": str(
+                    _LOCATION_SPECIFICITY.get(
+                        str(facts.get("location_geographic_type")), 0
+                    )
+                ),
+                "match_states": json.dumps(
+                    {
+                        key: state.value
+                        for key, state in detail_state_by_key.items()
+                        if game_search_details.get(key)
+                        or (key == "search_area" and not completed_search.whole_city)
+                    },
+                    sort_keys=True,
+                ),
+            }
+            for locale in ("en", "ru", "es", "fr"):
+                card[f"city_display_{locale}"] = facts[f"city_display_{locale}"]
+                card[f"place_display_{locale}"] = facts[f"place_display_{locale}"]
+            if facts.get("exact_local_time"):
+                card["exact_local_time"] = facts["exact_local_time"]
+            for source_key in (
+                "team_formats",
+                "positions",
+                "playing_levels",
+                "venue_settings",
+                "playing_surfaces",
+            ):
+                if facts.get(source_key):
+                    card[source_key] = json.dumps(facts[source_key])
+            if facts.get("payment"):
+                card["payment"] = facts["payment"]
+            matched.append(
+                SearchResult(
+                    result_id=f"result:{completed_search.completed_search_id}:{row['opportunity_id']}",
+                    completed_search_id=completed_search.completed_search_id,
+                    absolute_position=len(matched) + 1,
+                    result_class=result_class,
+                    card_facts=tuple(sorted(card.items())),
+                )
+            )
+        matched.sort(key=_game_search_result_sort_key)
+        return tuple(
+            SearchResult(
+                result_id=result.result_id,
+                completed_search_id=result.completed_search_id,
+                absolute_position=position,
+                result_class=result.result_class,
+                card_facts=result.card_facts,
+            )
+            for position, result in enumerate(matched, start=1)
+        )
+
     def complete_search(
         self,
         *,
         incoming: RawContractEnvelope,
         completed_search: CompletedSearch,
+        results: tuple[SearchResult, ...],
         query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
@@ -2566,8 +2993,13 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.recommendation_completed_searches (
                     completed_search_id, telegram_user_id, search_update_id,
                     user_intent, country_id, city_id, sub_city_area_ids,
-                    whole_city, required_date, completed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s)
+                    sub_city_area_geographic_types,
+                    sub_city_area_verified_parent_ids, whole_city, required_date,
+                    game_search_details, completed_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s, %s::jsonb, %s::jsonb, %s
+                )
                 """,
                 (
                     completed_search.completed_search_id,
@@ -2577,11 +3009,30 @@ class PostgresRoleStore:
                     completed_search.country_id,
                     completed_search.city_id,
                     json.dumps(completed_search.sub_city_area_ids),
+                    json.dumps(completed_search.sub_city_area_geographic_types),
+                    json.dumps(completed_search.sub_city_area_verified_parent_ids),
                     completed_search.whole_city,
                     json.dumps(_required_date_json(completed_search.required_date)),
+                    json.dumps(dict(completed_search.game_search_details)),
                     completed_search.completed_at,
                 ),
             )
+            for result in results:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.recommendation_results (
+                        result_id, completed_search_id, absolute_position,
+                        result_class, card_facts
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        result.result_id,
+                        result.completed_search_id,
+                        result.absolute_position,
+                        result.result_class,
+                        json.dumps(dict(result.card_facts)),
+                    ),
+                )
             _insert_outbox(connection, query)
             _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
@@ -2971,6 +3422,8 @@ class PostgresRoleStore:
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
                            screen_revision, revision, last_activity_at,
                            country, city, sub_city_areas, whole_city, required_date,
+                           game_search_details, editing_game_search_detail,
+                           game_search_detail_draft, game_search_exact_time_prompt,
                            search_submission_update_id
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
@@ -3000,6 +3453,13 @@ class PostgresRoleStore:
             ),
             whole_city=row["whole_city"],
             required_date=_optional_required_date(row["required_date"]),
+            game_search_details=tuple(
+                (key, tuple(values))
+                for key, values in sorted(row["game_search_details"].items())
+            ),
+            editing_game_search_detail=row["editing_game_search_detail"],
+            game_search_detail_draft=tuple(row["game_search_detail_draft"]),
+            game_search_exact_time_prompt=row["game_search_exact_time_prompt"],
             search_submission_update_id=row["search_submission_update_id"],
         )
 
@@ -3155,6 +3615,10 @@ class PostgresRoleStore:
                     ),
                     draft.whole_city,
                     json.dumps(_required_date_json(draft.required_date)),
+                    json.dumps(dict(draft.game_search_details)),
+                    draft.editing_game_search_detail,
+                    json.dumps(draft.game_search_detail_draft),
+                    draft.game_search_exact_time_prompt,
                     recorded_at,
                 )
                 if draft.revision == 1:
@@ -3164,10 +3628,13 @@ class PostgresRoleStore:
                             telegram_user_id, stage, intent_branch, user_intent,
                             screen_revision, revision, last_activity_at,
                             country, city, sub_city_areas, whole_city,
-                            required_date, updated_at
+                            required_date, game_search_details,
+                            editing_game_search_detail, game_search_detail_draft,
+                            game_search_exact_time_prompt, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s,
-                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s
+                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb,
+                            %s::jsonb, %s, %s::jsonb, %s, %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -3189,6 +3656,10 @@ class PostgresRoleStore:
                             sub_city_areas = %s::jsonb,
                             whole_city = %s,
                             required_date = %s::jsonb,
+                            game_search_details = %s::jsonb,
+                            editing_game_search_detail = %s,
+                            game_search_detail_draft = %s::jsonb,
+                            game_search_exact_time_prompt = %s,
                             updated_at = %s
                         WHERE telegram_user_id = %s AND revision = %s
                         RETURNING revision
@@ -3871,6 +4342,7 @@ class PostgresRoleStore:
         expected_state_revision: int,
         expected_draft_revision: int,
         message: TelegramMessage,
+        current_result: SearchResult | None,
         received_at: datetime,
     ) -> ConsumeResult:
         """Queue one zero-result screen and defer activation until delivery."""
@@ -3965,13 +4437,18 @@ class PostgresRoleStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.bot_search_presentations (
-                    delivery_id, telegram_user_id, completed_search_id, accepted_at
-                ) VALUES (%s, %s, %s, %s)
+                    delivery_id, telegram_user_id, completed_search_id,
+                    current_result_id, absolute_position, accepted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
                     message.telegram_user_id,
                     completed_search_id,
+                    None if current_result is None else current_result.result_id,
+                    None
+                    if current_result is None
+                    else current_result.absolute_position,
                     received_at,
                 ),
             )
@@ -4221,7 +4698,9 @@ class PostgresRoleStore:
                 """
                 SELECT completed_search_id, telegram_user_id, search_update_id,
                        user_intent, country_id, city_id, sub_city_area_ids,
-                       whole_city, required_date, completed_at
+                       sub_city_area_geographic_types,
+                       sub_city_area_verified_parent_ids,
+                       whole_city, required_date, game_search_details, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
                 """,
@@ -4231,7 +4710,8 @@ class PostgresRoleStore:
                 return CompletedSearchQueryResult(CompletedSearchQueryStatus.ACCEPTED)
             result_rows = connection.execute(
                 """
-                SELECT result_id, completed_search_id, absolute_position
+                SELECT result_id, completed_search_id, absolute_position,
+                       result_class, card_facts
                 FROM football_runtime.recommendation_results
                 WHERE completed_search_id = %s
                 ORDER BY absolute_position
@@ -4247,6 +4727,8 @@ class PostgresRoleStore:
                         result_id=row["result_id"],
                         completed_search_id=row["completed_search_id"],
                         absolute_position=row["absolute_position"],
+                        result_class=row["result_class"],
+                        card_facts=tuple(sorted(row["card_facts"].items())),
                     )
                     for row in result_rows
                 ),
@@ -4650,7 +5132,7 @@ class PostgresRoleStore:
                     )
                 search_presentation = connection.execute(
                     """
-                    SELECT completed_search_id
+                    SELECT completed_search_id, current_result_id, absolute_position
                     FROM football_runtime.bot_search_presentations
                     WHERE delivery_id = %s AND telegram_user_id = %s
                     """,
@@ -4658,6 +5140,8 @@ class PostgresRoleStore:
                 ).fetchone()
                 if search_presentation is not None:
                     completed_search_id = search_presentation[0]
+                    current_result_id = search_presentation[1]
+                    absolute_position = search_presentation[2]
                     changed = connection.execute(
                         """
                         UPDATE football_runtime.bot_users
@@ -4688,17 +5172,19 @@ class PostgresRoleStore:
                             telegram_user_id, completed_search_id,
                             current_result_id, absolute_position,
                             screen_revision, activated_at
-                        ) VALUES (%s, %s, NULL, NULL, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (telegram_user_id) DO UPDATE
                         SET completed_search_id = EXCLUDED.completed_search_id,
-                            current_result_id = NULL,
-                            absolute_position = NULL,
+                            current_result_id = EXCLUDED.current_result_id,
+                            absolute_position = EXCLUDED.absolute_position,
                             screen_revision = EXCLUDED.screen_revision,
                             activated_at = EXCLUDED.activated_at
                         """,
                         (
                             telegram_user_id,
                             completed_search_id,
+                            current_result_id,
+                            absolute_position,
                             screen_revision,
                             delivered_at,
                         ),
@@ -4849,9 +5335,17 @@ def _completed_search(row: dict[str, Any]) -> CompletedSearch:
         country_id=row["country_id"],
         city_id=row["city_id"],
         sub_city_area_ids=tuple(row["sub_city_area_ids"]),
+        sub_city_area_geographic_types=tuple(row["sub_city_area_geographic_types"]),
+        sub_city_area_verified_parent_ids=tuple(
+            tuple(values) for values in row["sub_city_area_verified_parent_ids"]
+        ),
         whole_city=row["whole_city"],
         required_date=_optional_required_date(row["required_date"]),
         completed_at=row["completed_at"],
+        game_search_details=tuple(
+            (key, tuple(values))
+            for key, values in sorted(row["game_search_details"].items())
+        ),
     )
 
 
@@ -4915,6 +5409,72 @@ def _required_date_json(required_date: RequiredDate | None) -> Any:
         "iana_timezone": required_date.iana_timezone,
         "timezone_data_version": required_date.timezone_data_version,
     }
+
+
+_LOCATION_SPECIFICITY = {
+    "country": 0,
+    "city": 1,
+    "administrative_district": 2,
+    "neighborhood": 3,
+    "locality": 4,
+    "station": 5,
+    "transport_hub": 6,
+    "landmark": 7,
+    "address": 8,
+}
+
+
+def _match_search_area(
+    *,
+    whole_city: bool,
+    selected_area_ids: tuple[str, ...],
+    selected_area_types: tuple[str, ...],
+    selected_area_parent_ids: tuple[tuple[str, ...], ...],
+    country_id: str,
+    city_id: str,
+    facts: Mapping[str, Any],
+) -> MatchState:
+    """Match accepted containment without treating broader scope as outside."""
+    if whole_city:
+        return MatchState.CONFIRMED
+    place_id = facts.get("place_id")
+    parent_ids = facts.get("location_parent_ids")
+    known_area_ids = {
+        value
+        for value in (
+            place_id,
+            *(parent_ids if isinstance(parent_ids, list) else ()),
+        )
+        if isinstance(value, str)
+    }
+    if known_area_ids.intersection(selected_area_ids):
+        return MatchState.CONFIRMED
+    if len(selected_area_types) != len(selected_area_ids) or len(
+        selected_area_parent_ids
+    ) != len(selected_area_ids):
+        return MatchState.UNKNOWN
+    if not known_area_ids or known_area_ids.issubset({country_id, city_id}):
+        return MatchState.UNKNOWN
+    if isinstance(place_id, str) and any(
+        place_id in parent_ids for parent_ids in selected_area_parent_ids
+    ):
+        return MatchState.UNKNOWN
+    return MatchState.CONFLICT
+
+
+def _game_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, str, str, int, str]:
+    """Return the complete deterministic intra-search ordering key."""
+    facts = dict(result.card_facts)
+    return (
+        0 if result.result_class == "confirmed_match" else 1,
+        int(facts.get("unknown_criterion_count", "0")),
+        facts.get("sort_local_date", facts["start_local_date"]),
+        facts.get("exact_local_time", "23:59"),
+        -int(facts.get("location_specificity", "0")),
+        facts["opportunity_id"],
+    )
 
 
 def runtime_database_url(
@@ -5032,6 +5592,50 @@ def _accept_contract_inbox(
             received_at,
         ),
     )
+
+
+def _begin_owned_contract(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    *,
+    consumer: RuntimeRole,
+    incoming: RawContractEnvelope,
+    received_at: datetime,
+) -> bool:
+    """Begin an owner-state transition inside its single durable transaction."""
+    existing = connection.execute(
+        """
+        SELECT processing_status
+        FROM football_runtime.contract_inbox
+        WHERE consumer_role = %s AND message_id = %s
+        FOR UPDATE
+        """,
+        (consumer.value, incoming.message_id),
+    ).fetchone()
+    if existing is not None and existing[0] == "accepted":
+        _release_claim(connection, incoming.message_id)
+        return False
+    _accept_contract_inbox(
+        connection,
+        consumer=consumer,
+        incoming=incoming,
+        received_at=received_at,
+    )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.acceptance_state (
+            owner_role, probe_id, contract_name, incoming_message_id, applied_at
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            consumer.value,
+            incoming.subject_id,
+            incoming.contract_name.value,
+            incoming.message_id,
+            received_at,
+        ),
+    )
+    return True
 
 
 def _insert_alert(
