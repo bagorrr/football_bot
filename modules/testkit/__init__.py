@@ -64,6 +64,7 @@ from modules.domain import (
     TelegramDifferenceFailure,
     TelegramMessage,
     TelegramPeerIdentity,
+    TelegramPeerKind,
     TelegramProtectionState,
 )
 from modules.ports import (
@@ -263,6 +264,28 @@ class ControlledTelegramIngestionAdapter:
                 else TelegramProtectionState.UNAVAILABLE
             ),
             protected_text=text,
+        )
+
+    def add_ingestion_role_account_difference_failure(
+        self,
+        *,
+        checkpoint: TelegramAccountCheckpoint,
+        reason: str,
+    ) -> None:
+        """Configure body-free session/auth loss on the account poll."""
+        parsed_reason = IngestionFailureReason(reason)
+        if parsed_reason not in {
+            IngestionFailureReason.SESSION_REVOKED,
+            IngestionFailureReason.AUTHENTICATION_LOST,
+        }:
+            raise ValueError("ingestion-role failure requires session/auth loss")
+        self._account_difference_events[checkpoint] = TelegramDifferenceFailure(
+            source_chat_identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind.CHAT,
+                telegram_id=1,
+            ),
+            checkpoint=checkpoint,
+            reason=parsed_reason,
         )
 
     def get_account_difference_event(

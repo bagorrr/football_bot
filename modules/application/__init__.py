@@ -5664,6 +5664,11 @@ class RuntimeApplication:
         if event is None:
             return False
         if isinstance(event, TelegramDifferenceFailure):
+            if event.reason in {
+                IngestionFailureReason.SESSION_REVOKED,
+                IngestionFailureReason.AUTHENTICATION_LOST,
+            }:
+                return self._stop_ingestion_role(event.reason)
             raise RuntimeError("account difference failure scope is unsupported")
         identity = event.source_chat_identity
         registry_generation = event.registry_generation

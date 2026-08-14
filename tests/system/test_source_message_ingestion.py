@@ -1448,6 +1448,44 @@ def test_session_or_authentication_loss_stops_the_whole_ingestion_role(
     assert system.account_ingestion_checkpoint() == account_checkpoint
 
 
+def test_account_poll_authentication_loss_stops_the_whole_ingestion_role() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 14, 30, tzinfo=UTC))
+    account_checkpoint = TelegramAccountCheckpoint(
+        pts=4870,
+        qts=87,
+        seq=487,
+        date=clock.now(),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+    )
+    system.reset()
+    system.initialize_account_ingestion_checkpoint(account_checkpoint)
+    telethon.add_ingestion_role_account_difference_failure(
+        checkpoint=account_checkpoint,
+        reason="authentication_lost",
+    )
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == account_checkpoint
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == "ingestion_role"
+    assert failures[0].reason.value == "authentication_lost"
+    assert system.process_next_source_event()
+    assert system.source_messages() == ()
+
+    request_count = len(telethon.account_difference_requests)
+    assert not system.process_next_account_telegram_difference()
+    assert len(telethon.account_difference_requests) == request_count
+
+
 def test_transport_proven_post_boundary_event_ignores_earlier_event_time_on_retry() -> (
     None
 ):
