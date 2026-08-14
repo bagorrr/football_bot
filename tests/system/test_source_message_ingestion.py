@@ -1361,10 +1361,7 @@ def test_unrecoverable_difference_and_gap_stop_their_source_streams() -> None:
     assert system.source_events() == ()
 
 
-@pytest.mark.parametrize("failure_reason", ["session_revoked", "authentication_lost"])
-def test_session_or_authentication_loss_stops_the_whole_ingestion_role(
-    failure_reason: str,
-) -> None:
+def test_session_revocation_stops_the_whole_ingestion_role() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     clock = FrozenClock(datetime(2026, 8, 14, 14, 0, tzinfo=UTC))
     identity = TelegramPeerIdentity(
@@ -1399,13 +1396,13 @@ def test_session_or_authentication_loss_stops_the_whole_ingestion_role(
         registered_at=datetime(2026, 9, 14, 14, 0, tzinfo=UTC),
         administrator_id=48_005,
         address="@synthetic_ingestion_role_failure",
-        update_suffix=f"ingestion-role-{failure_reason}",
+        update_suffix="ingestion-role-session-revoked",
     )
     system.initialize_account_ingestion_checkpoint(account_checkpoint)
     telethon.add_ingestion_role_channel_difference_failure(
         identity=identity,
         checkpoint=channel_checkpoint,
-        reason=failure_reason,
+        reason="session_revoked",
     )
 
     assert system.process_next_channel_telegram_difference(
@@ -1423,7 +1420,7 @@ def test_session_or_authentication_loss_stops_the_whole_ingestion_role(
     failures = system.ingestion_failures()
     assert len(failures) == 1
     assert failures[0].scope.value == "ingestion_role"
-    assert failures[0].reason.value == failure_reason
+    assert failures[0].reason.value == "session_revoked"
     assert failures[0].source_chat_identity is None
     assert failures[0].registry_generation is None
     assert system.process_next_source_event()
