@@ -53,9 +53,11 @@ from modules.domain import (
     TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDifferenceEvent,
-    TelegramDifferenceFailure,
+    TelegramDifferenceResult,
     TelegramMessage,
     TelegramPeerIdentity,
+    TelegramProtectedContentEvent,
+    TelegramProtectionUnavailableEvent,
     UserIntent,
 )
 
@@ -113,7 +115,7 @@ class TelegramIngestionAdapter(Protocol):
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
-    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
+    ) -> TelegramDifferenceResult | None:
         """Return the next account-wide event from durable application state."""
         ...
 
@@ -121,7 +123,7 @@ class TelegramIngestionAdapter(Protocol):
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
-    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
+    ) -> TelegramDifferenceResult | None:
         """Return the next channel event from its typed durable pts."""
         ...
 
@@ -656,7 +658,11 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
     def discard_account_difference_event(
         self,
         *,
-        event: TelegramDifferenceEvent,
+        event: (
+            TelegramDifferenceEvent
+            | TelegramProtectedContentEvent
+            | TelegramProtectionUnavailableEvent
+        ),
         recorded_at: datetime,
     ) -> bool:
         """Advance one ineligible account event without retaining content."""
@@ -665,7 +671,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
     def commit_source_event(
         self,
         *,
-        event: TelegramDifferenceEvent,
+        event: TelegramDifferenceEvent | TelegramProtectedContentEvent,
         registry_generation: int,
         envelope: ContractEnvelope,
         recorded_at: datetime,

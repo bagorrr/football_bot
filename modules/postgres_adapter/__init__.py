@@ -72,7 +72,8 @@ from modules.domain import (
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
-    TelegramProtectionState,
+    TelegramProtectedContentEvent,
+    TelegramProtectionUnavailableEvent,
     UserIntent,
 )
 from modules.ports import (
@@ -2064,7 +2065,11 @@ class PostgresRoleStore:
     def discard_account_difference_event(
         self,
         *,
-        event: TelegramDifferenceEvent,
+        event: (
+            TelegramDifferenceEvent
+            | TelegramProtectedContentEvent
+            | TelegramProtectionUnavailableEvent
+        ),
         recorded_at: datetime,
     ) -> bool:
         """Advance one ineligible account event without retaining content."""
@@ -2175,7 +2180,7 @@ class PostgresRoleStore:
     def commit_source_event(
         self,
         *,
-        event: TelegramDifferenceEvent,
+        event: TelegramDifferenceEvent | TelegramProtectedContentEvent,
         registry_generation: int,
         envelope: ContractEnvelope,
         recorded_at: datetime,
@@ -2370,9 +2375,8 @@ class PostgresRoleStore:
                     ).fetchone()
                     is not None
                 )
-            if (
-                known_transport_identity
-                and event.protection_state is TelegramProtectionState.PROTECTED
+            if known_transport_identity and isinstance(
+                event, TelegramProtectedContentEvent
             ):
                 inserted = connection.execute(
                     """
@@ -2414,7 +2418,9 @@ class PostgresRoleStore:
                     }
                     if existing is None or dict(existing) != expected_skip:
                         raise OutboxConflictError
-            elif known_transport_identity:
+            elif known_transport_identity and isinstance(
+                event, TelegramDifferenceEvent
+            ):
                 inserted = connection.execute(
                     """
                     INSERT INTO football_runtime.source_event_records (

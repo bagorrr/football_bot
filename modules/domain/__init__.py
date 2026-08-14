@@ -116,15 +116,6 @@ class SourceEventKind(StrEnum):
     DELETE = "delete"
 
 
-class TelegramProtectionState(StrEnum):
-    """Current copy-permission decision made before retaining an event body."""
-
-    COPY_PERMITTED = "copy_permitted"
-    PROTECTED = "protected"
-    UNAVAILABLE = "unavailable"
-    PERSISTENTLY_UNAVAILABLE = "persistently_unavailable"
-
-
 class IngestionFailureScope(StrEnum):
     """Durable boundary stopped by one fail-closed ingestion outcome."""
 
@@ -248,9 +239,9 @@ class SourceChatRegistryEntry:
             raise ValueError("Source Chat registry address is invalid")
 
 
-@dataclass(frozen=True, slots=True)
-class TelegramDifferenceEvent:
-    """One controlled, recoverable event returned from a durable checkpoint."""
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _TelegramDifferenceProgress:
+    """Body-agnostic progress shared by concrete Telegram difference outcomes."""
 
     source_chat_identity: TelegramPeerIdentity
     from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
@@ -259,15 +250,8 @@ class TelegramDifferenceEvent:
     telegram_message_id: int
     revision: int
     kind: SourceEventKind
-    body: str | None
     event_time: datetime
     registry_generation: int = 1
-    protection_state: TelegramProtectionState = TelegramProtectionState.COPY_PERMITTED
-    protected_text: str | None = None
-    protected_caption: str | None = None
-    protected_attachment: str | None = None
-    protected_contact: str | None = None
-    protected_other_body: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
@@ -293,8 +277,30 @@ class TelegramDifferenceEvent:
             raise ValueError("Source Message identity and revision must be positive")
         if self.event_time.tzinfo is None:
             raise ValueError("Source Event time must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramDifferenceEvent(_TelegramDifferenceProgress):
+    """One copy-permitted event returned from a durable checkpoint."""
+
+    body: str | None
+
+    def __post_init__(self) -> None:
+        _TelegramDifferenceProgress.__post_init__(self)
         if self.kind is SourceEventKind.DELETE and self.body is not None:
             raise ValueError("Deletion transport events must be body-free")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramProtectedContentEvent(_TelegramDifferenceProgress):
+    """Body-free progress for one copy-protected Telegram event."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramProtectionUnavailableEvent(_TelegramDifferenceProgress):
+    """Body-free event whose copy-protection state could not be established."""
+
+    persistent: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +310,14 @@ class TelegramDifferenceFailure:
     source_chat_identity: TelegramPeerIdentity
     checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
     reason: IngestionFailureReason
+
+
+TelegramDifferenceResult = (
+    TelegramDifferenceEvent
+    | TelegramProtectedContentEvent
+    | TelegramProtectionUnavailableEvent
+    | TelegramDifferenceFailure
+)
 
 
 @dataclass(frozen=True, slots=True)

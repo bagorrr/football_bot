@@ -64,10 +64,12 @@ from modules.domain import (
     TelegramChannelCheckpoint,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferenceResult,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
-    TelegramProtectionState,
+    TelegramProtectedContentEvent,
+    TelegramProtectionUnavailableEvent,
 )
 from modules.ports import (
     AcceptanceObserver,
@@ -143,6 +145,17 @@ class _ControlledResultGate:
             self._condition.notify_all()
 
 
+@dataclass(frozen=True, slots=True)
+class _ControlledProtectedBody:
+    """Synthetic raw markers retained only inside the controlled adapter."""
+
+    text: str | None
+    caption: str | None
+    attachment: str | None
+    contact: str | None
+    other_body: str | None
+
+
 @dataclass(slots=True)
 class FrozenClock:
     """Controllable clock for deterministic system acceptance."""
@@ -170,21 +183,25 @@ class ControlledTelegramIngestionAdapter:
     ] = field(default_factory=dict)
     _boundaries: dict[TelegramPeerIdentity, list[str]] = field(default_factory=dict)
     _account_difference_events: dict[
-        TelegramAccountCheckpoint, TelegramDifferenceEvent | TelegramDifferenceFailure
+        TelegramAccountCheckpoint, TelegramDifferenceResult
     ] = field(default_factory=dict)
     _account_difference_sequences: dict[
         TelegramAccountCheckpoint,
-        list[TelegramDifferenceEvent | TelegramDifferenceFailure],
+        list[TelegramDifferenceResult],
     ] = field(default_factory=dict)
     _channel_difference_events: dict[
         tuple[TelegramPeerIdentity, TelegramChannelCheckpoint],
-        TelegramDifferenceEvent | TelegramDifferenceFailure,
+        TelegramDifferenceResult,
     ] = field(default_factory=dict)
     _account_result_gate: _ControlledResultGate = field(
         default_factory=_ControlledResultGate
     )
     _channel_result_gate: _ControlledResultGate = field(
         default_factory=_ControlledResultGate
+    )
+    _protected_bodies: list[_ControlledProtectedBody] = field(
+        default_factory=list,
+        repr=False,
     )
     resolution_requests: list[str] = field(default_factory=list)
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
@@ -304,22 +321,27 @@ class ControlledTelegramIngestionAdapter:
         persistent: bool,
     ) -> None:
         """Configure unavailable copy-protection state on the account route."""
-        self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
-            source_chat_identity=identity,
-            from_checkpoint=from_checkpoint,
-            to_checkpoint=to_checkpoint,
-            source_event_id=source_event_id,
-            telegram_message_id=telegram_message_id,
-            revision=1,
-            kind=SourceEventKind.CREATE,
-            body=None,
-            event_time=event_time,
-            protection_state=(
-                TelegramProtectionState.PERSISTENTLY_UNAVAILABLE
-                if persistent
-                else TelegramProtectionState.UNAVAILABLE
-            ),
-            protected_text=text,
+        self._protected_bodies.append(
+            _ControlledProtectedBody(
+                text=text,
+                caption=None,
+                attachment=None,
+                contact=None,
+                other_body=None,
+            )
+        )
+        self._account_difference_events[from_checkpoint] = (
+            TelegramProtectionUnavailableEvent(
+                source_chat_identity=identity,
+                from_checkpoint=from_checkpoint,
+                to_checkpoint=to_checkpoint,
+                source_event_id=source_event_id,
+                telegram_message_id=telegram_message_id,
+                revision=1,
+                kind=SourceEventKind.CREATE,
+                event_time=event_time,
+                persistent=persistent,
+            )
         )
 
     def add_ingestion_role_account_difference_failure(
@@ -375,7 +397,7 @@ class ControlledTelegramIngestionAdapter:
         self,
         *,
         checkpoint: TelegramAccountCheckpoint,
-        result: TelegramDifferenceEvent | TelegramDifferenceFailure,
+        result: TelegramDifferenceResult,
     ) -> None:
         """Queue one account result for deterministic repeated-checkpoint polling."""
         self._account_difference_sequences.setdefault(checkpoint, []).append(result)
@@ -391,10 +413,10 @@ class ControlledTelegramIngestionAdapter:
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
-    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
+    ) -> TelegramDifferenceResult | None:
         """Return the configured account-wide difference from typed state."""
         sequence = self._account_difference_sequences.get(checkpoint)
-        result: TelegramDifferenceEvent | TelegramDifferenceFailure | None
+        result: TelegramDifferenceResult | None
         if sequence:
             result = sequence.pop(0)
         else:
@@ -516,8 +538,17 @@ class ControlledTelegramIngestionAdapter:
         event_time: datetime,
     ) -> None:
         """Configure one protected event without exposing its body to Ingestion."""
+        self._protected_bodies.append(
+            _ControlledProtectedBody(
+                text=text,
+                caption=caption,
+                attachment=attachment,
+                contact=contact,
+                other_body=other_body,
+            )
+        )
         self._channel_difference_events[(identity, from_checkpoint)] = (
-            TelegramDifferenceEvent(
+            TelegramProtectedContentEvent(
                 source_chat_identity=identity,
                 from_checkpoint=from_checkpoint,
                 to_checkpoint=to_checkpoint,
@@ -525,14 +556,7 @@ class ControlledTelegramIngestionAdapter:
                 telegram_message_id=telegram_message_id,
                 revision=revision,
                 kind=kind,
-                body=None,
                 event_time=event_time,
-                protection_state=TelegramProtectionState.PROTECTED,
-                protected_text=text,
-                protected_caption=caption,
-                protected_attachment=attachment,
-                protected_contact=contact,
-                protected_other_body=other_body,
             )
         )
 
@@ -554,8 +578,17 @@ class ControlledTelegramIngestionAdapter:
         persistent: bool,
     ) -> None:
         """Configure a current protection-state lookup that cannot be established."""
+        self._protected_bodies.append(
+            _ControlledProtectedBody(
+                text=text,
+                caption=caption,
+                attachment=attachment,
+                contact=contact,
+                other_body=None,
+            )
+        )
         self._channel_difference_events[(identity, from_checkpoint)] = (
-            TelegramDifferenceEvent(
+            TelegramProtectionUnavailableEvent(
                 source_chat_identity=identity,
                 from_checkpoint=from_checkpoint,
                 to_checkpoint=to_checkpoint,
@@ -563,17 +596,8 @@ class ControlledTelegramIngestionAdapter:
                 telegram_message_id=telegram_message_id,
                 revision=revision,
                 kind=kind,
-                body=None,
                 event_time=event_time,
-                protection_state=(
-                    TelegramProtectionState.PERSISTENTLY_UNAVAILABLE
-                    if persistent
-                    else TelegramProtectionState.UNAVAILABLE
-                ),
-                protected_text=text,
-                protected_caption=caption,
-                protected_attachment=attachment,
-                protected_contact=contact,
+                persistent=persistent,
             )
         )
 
@@ -593,7 +617,7 @@ class ControlledTelegramIngestionAdapter:
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
-    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
+    ) -> TelegramDifferenceResult | None:
         """Return the configured channel difference from typed pts."""
         self.channel_difference_requests.append((identity, checkpoint))
         result = self._channel_difference_events.get((identity, checkpoint))

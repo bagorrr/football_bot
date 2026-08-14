@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 
 import psycopg
@@ -24,6 +24,8 @@ from modules.domain import (
     TelegramDifferenceFailure,
     TelegramPeerIdentity,
     TelegramPeerKind,
+    TelegramProtectedContentEvent,
+    TelegramProtectionUnavailableEvent,
 )
 from modules.testkit import (
     AcceptanceSpine,
@@ -47,6 +49,33 @@ class _SteppingClock(FrozenClock):
         if self.step is not None:
             self.instant += self.step
         return instant
+
+
+def test_copy_permitted_difference_event_has_no_protected_content_capability() -> None:
+    protected_content_fields = {
+        "protection_state",
+        "protected_text",
+        "protected_caption",
+        "protected_attachment",
+        "protected_contact",
+        "protected_other_body",
+    }
+
+    exposed_fields = {
+        field.name for field in fields(TelegramDifferenceEvent)
+    } & protected_content_fields
+
+    assert exposed_fields == set()
+    assert {field.name for field in fields(TelegramProtectedContentEvent)}.isdisjoint(
+        protected_content_fields
+        | {"body", "text", "caption", "attachment", "contact", "other_body"}
+    )
+    assert {
+        field.name for field in fields(TelegramProtectionUnavailableEvent)
+    }.isdisjoint(
+        protected_content_fields
+        | {"body", "text", "caption", "attachment", "contact", "other_body"}
+    )
 
 
 def test_account_difference_commits_checkpoint_event_and_application_effect() -> None:
@@ -821,6 +850,18 @@ def test_protected_event_is_body_free_and_future_permitted_event_resumes() -> No
     assert all(marker not in serialized_contracts for marker in protected_markers)
     assert system.process_next_source_event()
     assert system.source_messages() == ()
+    public_ingestion_surfaces = (
+        system.source_events(),
+        system.source_messages(),
+        system.source_message_revisions(),
+        system.protected_content_skips(),
+        system.ingestion_failures(),
+        system.source_event_contracts(),
+        system.source_stream_stop_contracts(),
+    )
+    assert all(
+        marker not in repr(public_ingestion_surfaces) for marker in protected_markers
+    )
     assert telethon.history_requests == []
 
     permitted_time = clock.now() + timedelta(minutes=1)

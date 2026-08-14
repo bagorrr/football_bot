@@ -55,12 +55,12 @@ from modules.domain import (
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     TelegramDeliveryMode,
-    TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
-    TelegramProtectionState,
+    TelegramProtectedContentEvent,
+    TelegramProtectionUnavailableEvent,
     UserIntent,
     is_valid_source_chat_address,
 )
@@ -5728,15 +5728,15 @@ class RuntimeApplication:
                 recorded_at=self.clock.now(),
             )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
-        if event.protection_state is TelegramProtectionState.UNAVAILABLE:
-            return False
-        if event.protection_state is TelegramProtectionState.PERSISTENTLY_UNAVAILABLE:
+        if isinstance(event, TelegramProtectionUnavailableEvent):
+            if not event.persistent:
+                return False
             return self._stop_source_stream_for_transport_failure(
                 identity=identity,
                 registry_generation=registry_generation,
                 reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
             )
-        if event.protection_state is TelegramProtectionState.PROTECTED:
+        if isinstance(event, TelegramProtectedContentEvent):
             recorded_at = self.clock.now()
             try:
                 return self.store.commit_source_event(
@@ -5858,9 +5858,9 @@ class RuntimeApplication:
         if event.source_chat_identity != identity:
             raise RuntimeError("Telegram difference returned another Source Chat")
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
-        if event.protection_state is TelegramProtectionState.UNAVAILABLE:
-            return False
-        if event.protection_state is TelegramProtectionState.PERSISTENTLY_UNAVAILABLE:
+        if isinstance(event, TelegramProtectionUnavailableEvent):
+            if not event.persistent:
+                return False
             recorded_at = self.clock.now()
             message_id = uuid5(
                 NAMESPACE_URL,
@@ -5908,7 +5908,7 @@ class RuntimeApplication:
                 ),
                 envelope=envelope,
             )
-        if event.protection_state is TelegramProtectionState.PROTECTED:
+        if isinstance(event, TelegramProtectedContentEvent):
             recorded_at = self.clock.now()
             try:
                 return self.store.commit_source_event(
@@ -5979,7 +5979,7 @@ class RuntimeApplication:
     def _protected_content_skip_envelope(
         self,
         *,
-        event: TelegramDifferenceEvent,
+        event: TelegramProtectedContentEvent,
         registry_generation: int,
         source_chat_key: str,
         recorded_at: datetime,
