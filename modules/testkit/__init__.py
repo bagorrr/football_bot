@@ -234,6 +234,37 @@ class ControlledTelegramIngestionAdapter:
             registry_generation=registry_generation,
         )
 
+    def add_unavailable_protection_account_difference_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+        source_event_id: str,
+        telegram_message_id: int,
+        text: str | None,
+        event_time: datetime,
+        persistent: bool,
+    ) -> None:
+        """Configure unavailable copy-protection state on the account route."""
+        self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=None,
+            event_time=event_time,
+            protection_state=(
+                TelegramProtectionState.PERSISTENTLY_UNAVAILABLE
+                if persistent
+                else TelegramProtectionState.UNAVAILABLE
+            ),
+            protected_text=text,
+        )
+
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,

@@ -994,6 +994,89 @@ def test_persistent_protection_failure_stops_only_the_affected_stream() -> None:
     system.reset()
 
 
+def test_account_route_protection_failure_never_advances_shared_checkpoint() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 10, 30, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_800_210,
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4810,
+        qts=81,
+        seq=481,
+        date=clock.now(),
+    )
+    advanced_checkpoint = TelegramAccountCheckpoint(
+        pts=4811,
+        qts=82,
+        seq=482,
+        date=datetime(2026, 9, 14, 10, 31, tzinfo=UTC),
+    )
+    telethon.allow_public_username(
+        address="@synthetic_account_protection",
+        identity=identity,
+        transport_boundary="chat-sequence:481",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_002,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 10, 30, tzinfo=UTC),
+        administrator_id=48_002,
+        address="@synthetic_account_protection",
+        update_suffix="account-protection-failure",
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    protected_marker = "account route protected body"
+    telethon.add_unavailable_protection_account_difference_event(
+        identity=identity,
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        source_event_id="source-event:account-protection-unavailable:1",
+        telegram_message_id=221,
+        text=protected_marker,
+        event_time=clock.now(),
+        persistent=False,
+    )
+
+    assert not system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
+    assert system.ingestion_failures() == ()
+
+    telethon.add_unavailable_protection_account_difference_event(
+        identity=identity,
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=advanced_checkpoint,
+        source_event_id="source-event:account-protection-unavailable:1",
+        telegram_message_id=221,
+        text=protected_marker,
+        event_time=clock.now(),
+        persistent=True,
+    )
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].source_chat_identity == identity
+    assert failures[0].reason.value == "protection_unavailable"
+    assert protected_marker not in repr(system.source_stream_stop_contracts())
+    assert system.source_events() == ()
+    assert system.protected_content_skips() == ()
+
+    assert not system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
+
+
 def test_missing_account_checkpoint_stops_only_the_account_stream() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     clock = FrozenClock(datetime(2026, 8, 14, 11, 0, tzinfo=UTC))

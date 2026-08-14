@@ -5667,6 +5667,11 @@ class RuntimeApplication:
             raise RuntimeError("account difference failure scope is unsupported")
         identity = event.source_chat_identity
         registry_generation = event.registry_generation
+        if self.store.source_stream_is_stopped(
+            identity=identity,
+            registry_generation=registry_generation,
+        ):
+            return False
         if (
             self.store.source_chat_ingestion_context(
                 identity=identity,
@@ -5679,6 +5684,14 @@ class RuntimeApplication:
                 recorded_at=self.clock.now(),
             )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        if event.protection_state is TelegramProtectionState.UNAVAILABLE:
+            return False
+        if event.protection_state is TelegramProtectionState.PERSISTENTLY_UNAVAILABLE:
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+            )
         if event.protection_state is TelegramProtectionState.PROTECTED:
             recorded_at = self.clock.now()
             try:
