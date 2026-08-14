@@ -72,6 +72,22 @@ def derive_source_event_message_id(source_event_id: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:source-event:{source_event_id}")
 
 
+def derive_run_search_message_id(telegram_user_id: int, search_update_id: str) -> UUID:
+    """Return the canonical identity for one submitted Search command."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:run-search:{telegram_user_id}:{search_update_id}",
+    )
+
+
+def derive_search_completed_message_id(completed_search_id: str) -> UUID:
+    """Return the canonical identity for one Search completion event."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{completed_search_id}:{ContractName.SEARCH_COMPLETED.value}",
+    )
+
+
 class FailureCode(StrEnum):
     """Low-cardinality contract-spine failures."""
 
@@ -380,7 +396,7 @@ class ContractEnvelope(RawContractEnvelope):
                 msg = f"supported contract requires integer {field_name}"
                 raise ValueError(msg)
         if self.contract_name is ContractName.RUN_SEARCH:
-            _validate_run_search(self.payload, contract_version=self.contract_version)
+            _validate_run_search(self, self.payload)
         elif (
             self.contract_name is ContractName.SOURCE_EVENT_RECORDED
             and self.contract_version in {3, 4}
@@ -402,11 +418,7 @@ class ContractEnvelope(RawContractEnvelope):
         ):
             _validate_opportunity_publication_changed(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
-            _validate_search_completed(
-                self.payload,
-                contract_version=self.contract_version,
-                subject_id=self.subject_id,
-            )
+            _validate_search_completed(self, self.payload)
         elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
             completed_search_id = _required_text(
                 self.payload,
@@ -575,11 +587,61 @@ SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
 
 
 def _validate_run_search(
+    envelope: RawContractEnvelope,
     payload: dict[str, JsonValue],
-    *,
-    contract_version: int,
 ) -> None:
     """Validate the complete confirmed discovery snapshot on the wire."""
+    contract_version = envelope.contract_version
+    if contract_version == 2:
+        required_fields = {
+            "search_update_id",
+            "telegram_user_id",
+            "discovery_draft_revision",
+            "display_locale",
+            "user_intent",
+            "country_id",
+            "city_id",
+            "sub_city_area_ids",
+            "sub_city_area_geographic_types",
+            "sub_city_area_verified_parent_ids",
+            "whole_city",
+            "required_date",
+        }
+        allowed_field_sets = (
+            required_fields,
+            required_fields | {"game_search_details"},
+        )
+        if set(payload) not in allowed_field_sets:
+            raise ValueError("RunSearch v2 contains unsupported or missing facts")
+        search_update_id = _required_text(payload, "search_update_id")
+        telegram_user_id = payload["telegram_user_id"]
+        draft_revision = payload["discovery_draft_revision"]
+        if (
+            not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+            or not isinstance(draft_revision, int)
+            or isinstance(draft_revision, bool)
+            or draft_revision < 1
+        ):
+            raise ValueError("RunSearch v2 identities must be positive integers")
+        expected_message_id = derive_run_search_message_id(
+            telegram_user_id, search_update_id
+        )
+        if envelope.message_id != expected_message_id:
+            raise ValueError("RunSearch v2 message identity is not canonical")
+        if envelope.subject_id != f"bot-user:{telegram_user_id}":
+            raise ValueError("RunSearch v2 subject identity is not canonical")
+        if envelope.subject_revision != draft_revision:
+            raise ValueError("RunSearch v2 subject revision is not canonical")
+        if envelope.idempotency_key != (
+            f"run-search:{telegram_user_id}:{search_update_id}"
+        ):
+            raise ValueError("RunSearch v2 idempotency key is not canonical")
+        if (
+            envelope.causation_id != expected_message_id
+            or envelope.correlation_id != expected_message_id
+        ):
+            raise ValueError("RunSearch v2 causation/correlation is not canonical")
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
@@ -678,13 +740,12 @@ def _validate_required_date(value: JsonValue) -> None:
 
 
 def _validate_search_completed(
+    envelope: RawContractEnvelope,
     payload: dict[str, JsonValue],
-    *,
-    contract_version: int,
-    subject_id: str,
 ) -> None:
+    contract_version = envelope.contract_version
     completed_search_id = _required_text(payload, "completed_search_id")
-    if completed_search_id != subject_id:
+    if completed_search_id != envelope.subject_id:
         raise ValueError("SearchCompleted subject must identify its Completed Search")
     search_fields = ("telegram_user_id", "search_update_id", "result_count")
     allowed_fields = {"probe_id", "completed_search_id"}
@@ -696,13 +757,13 @@ def _validate_search_completed(
         return
     if contract_version != 2:
         raise ValueError("SearchCompleted version has no registered semantics")
-    allowed_fields.update(search_fields)
-    if set(payload) - allowed_fields:
-        raise ValueError("SearchCompleted v2 contains unsupported facts")
+    allowed_fields = {"completed_search_id", *search_fields}
+    if set(payload) != allowed_fields:
+        raise ValueError("SearchCompleted v2 contains unsupported or missing facts")
     telegram_user_id = payload.get("telegram_user_id")
     if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
         raise ValueError("SearchCompleted requires telegram_user_id")
-    _required_text(payload, "search_update_id")
+    search_update_id = _required_text(payload, "search_update_id")
     result_count = payload.get("result_count")
     if (
         not isinstance(result_count, int)
@@ -710,6 +771,23 @@ def _validate_search_completed(
         or result_count < 0
     ):
         raise ValueError("SearchCompleted requires a non-negative result_count")
+    run_search_message_id = derive_run_search_message_id(
+        telegram_user_id, search_update_id
+    )
+    expected_completed_search_id = f"completed-search:{run_search_message_id}"
+    if completed_search_id != expected_completed_search_id:
+        raise ValueError("SearchCompleted v2 subject lineage is not canonical")
+    if envelope.message_id != derive_search_completed_message_id(completed_search_id):
+        raise ValueError("SearchCompleted v2 message identity is not canonical")
+    if envelope.subject_revision != 1:
+        raise ValueError("SearchCompleted v2 subject revision is not canonical")
+    if envelope.idempotency_key != f"search-completed:{completed_search_id}":
+        raise ValueError("SearchCompleted v2 idempotency key is not canonical")
+    if (
+        envelope.causation_id != run_search_message_id
+        or envelope.correlation_id != run_search_message_id
+    ):
+        raise ValueError("SearchCompleted v2 causation/correlation is not canonical")
 
 
 def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:

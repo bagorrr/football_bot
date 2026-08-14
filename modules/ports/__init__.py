@@ -196,15 +196,12 @@ class ClassifierRequest:
     source_message_revision_id: str
     body: str
     source_event_time: str
-    source_recorded_at: str
     context_bundle_version: str
     source_chat_reference: str
-    source_chat_registry_generation: int
     source_chat_timezone: str | None
     source_chat_geography: dict[str, JsonValue]
     bounded_metadata: dict[str, JsonValue]
     eligible_reply_context: dict[str, JsonValue] | None
-    direct_reply_to_telegram_message_id: int | None
     requested_model: str
     requested_reasoning_effort: str
     prompt_version: str
@@ -1078,6 +1075,11 @@ class AcceptanceObserver(Protocol):
         """Observe Source Chat outcomes for one external registration origin."""
         ...
 
-    def snapshot(self, probe_id: str) -> AcceptanceObservation:
+    def snapshot(
+        self,
+        probe_id: str,
+        *,
+        message_id: UUID | None = None,
+    ) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical tables."""
         ...

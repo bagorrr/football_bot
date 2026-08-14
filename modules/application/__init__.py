@@ -29,6 +29,8 @@ from modules.contracts import (
     RawContractEnvelope,
     RuntimeRole,
     derive_contract_message_id,
+    derive_run_search_message_id,
+    derive_search_completed_message_id,
     derive_source_event_message_id,
 )
 from modules.domain import (
@@ -2345,10 +2347,7 @@ class ConversationOnboarding:
                 last_activity_at=now,
                 search_submission_update_id=update_id,
             )
-            message_id = uuid5(
-                NAMESPACE_URL,
-                f"football-bot:run-search:{telegram_user_id}:{update_id}",
-            )
+            message_id = derive_run_search_message_id(telegram_user_id, update_id)
             selected_details = (
                 game_search_details
                 if game_search_details is not None
@@ -2369,6 +2368,7 @@ class ConversationOnboarding:
                 payload={
                     "search_update_id": update_id,
                     "telegram_user_id": telegram_user_id,
+                    "discovery_draft_revision": changed_draft.revision,
                     "display_locale": current.locale,
                     "user_intent": draft.user_intent.value,
                     "country_id": draft.country.place_id,
@@ -7291,14 +7291,14 @@ class RuntimeApplication:
         if not isinstance(revision_id, str) or not isinstance(body, str):
             raise ValueError("classifier command requires revision identity and body")
         request = ClassifierRequest(
-            source_message_revision_id=revision_id,
+            source_message_revision_id=_opaque_classifier_reference(
+                revision_id, kind="revision"
+            ),
             body=body,
             source_event_time=str(payload["source_event_time"]),
-            source_recorded_at=str(payload["source_recorded_at"]),
             context_bundle_version=str(payload["context_bundle_version"]),
-            source_chat_reference=str(payload["source_chat_reference"]),
-            source_chat_registry_generation=cast(
-                int, payload["source_chat_registry_generation"]
+            source_chat_reference=_opaque_classifier_reference(
+                str(payload["source_chat_reference"]), kind="source-chat"
             ),
             source_chat_timezone=(
                 str(payload["source_chat_timezone"])
@@ -7308,12 +7308,11 @@ class RuntimeApplication:
             source_chat_geography=cast(
                 dict[str, JsonValue], payload["source_chat_geography"]
             ),
-            bounded_metadata=cast(dict[str, JsonValue], payload["bounded_metadata"]),
-            eligible_reply_context=cast(
-                dict[str, JsonValue] | None, payload["eligible_reply_context"]
+            bounded_metadata=_classifier_bounded_metadata(
+                cast(dict[str, JsonValue], payload["bounded_metadata"])
             ),
-            direct_reply_to_telegram_message_id=cast(
-                int | None, payload["direct_reply_to_telegram_message_id"]
+            eligible_reply_context=_classifier_reply_context(
+                cast(dict[str, JsonValue] | None, payload["eligible_reply_context"])
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
@@ -7339,22 +7338,15 @@ class RuntimeApplication:
         )
         provenance_complete = _classifier_adapter_result_has_complete_provenance(result)
         manifest = {
-            "source_message_revision_id": revision_id,
+            "source_message_revision_id": request.source_message_revision_id,
             "body": body,
             "source_event_time": request.source_event_time,
-            "source_recorded_at": request.source_recorded_at,
             "context_bundle_version": request.context_bundle_version,
             "source_chat_reference": request.source_chat_reference,
-            "source_chat_registry_generation": (
-                request.source_chat_registry_generation
-            ),
             "source_chat_timezone": request.source_chat_timezone,
             "source_chat_geography": request.source_chat_geography,
             "bounded_metadata": request.bounded_metadata,
             "eligible_reply_context": request.eligible_reply_context,
-            "direct_reply_to_telegram_message_id": (
-                request.direct_reply_to_telegram_message_id
-            ),
             "model": request.requested_model,
             "reasoning_effort": request.requested_reasoning_effort,
             "prompt_version": request.prompt_version,
@@ -8258,7 +8250,10 @@ class RuntimeApplication:
                 outgoing=outgoing,
             )
             return
-        completed_search_id = f"completed-search:{incoming.message_id}"
+        run_search_message_id = derive_run_search_message_id(
+            telegram_user_id, search_update_id
+        )
+        completed_search_id = f"completed-search:{run_search_message_id}"
         game_search_details = _runtime_game_search_details(
             payload.get("game_search_details")
         )
@@ -8285,14 +8280,14 @@ class RuntimeApplication:
         outgoing = ContractEnvelope(
             contract_name=ContractName.SEARCH_COMPLETED,
             contract_version=2,
-            message_id=_runtime_identifier(completed_search_id, "SearchCompleted"),
+            message_id=derive_search_completed_message_id(completed_search_id),
             producer=RuntimeRole.RECOMMENDATION,
             consumer=RuntimeRole.BOT_ASSISTANT,
             subject_id=completed_search_id,
             subject_revision=1,
             idempotency_key=f"search-completed:{completed_search_id}",
-            causation_id=incoming.message_id,
-            correlation_id=incoming.correlation_id,
+            causation_id=run_search_message_id,
+            correlation_id=run_search_message_id,
             recorded_at=self.clock.now(),
             payload={
                 "completed_search_id": completed_search_id,
@@ -8426,6 +8421,39 @@ class RuntimeApplication:
 
 def _runtime_identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
+
+
+def _opaque_classifier_reference(value: str, *, kind: str) -> str:
+    """Map an authoritative identity to a stable provider-opaque reference."""
+    opaque_id = uuid5(NAMESPACE_URL, f"football-bot:classifier:{kind}:{value}")
+    return f"classifier-{kind}:{opaque_id}"
+
+
+def _classifier_bounded_metadata(
+    metadata: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Expose only the exhaustive model-facing attachment/language metadata."""
+    return {
+        "message_language": metadata.get("message_language"),
+        "attachment_types": metadata.get("attachment_types", []),
+    }
+
+
+def _classifier_reply_context(
+    context: dict[str, JsonValue] | None,
+) -> dict[str, JsonValue] | None:
+    """Remove Telegram lineage while retaining one permitted direct reply."""
+    if context is None:
+        return None
+    revision_id = cast(str, context["source_message_revision_id"])
+    return {
+        "relationship_kind": "direct_reply",
+        "source_message_revision_reference": _opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
+        "body": context["body"],
+        "source_event_time": context["source_event_time"],
+    }
 
 
 def _nonnegative_metric_or_zero(value: object) -> int:
@@ -8567,21 +8595,22 @@ def _classifier_proposal_has_pinned_provenance(
         "routing_policy_version": "classifier-routing-v1",
     }
     manifest = {
-        "source_message_revision_id": revision_id,
+        "source_message_revision_id": _opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
         "body": body,
         "source_event_time": payload.get("source_event_time"),
-        "source_recorded_at": payload.get("source_recorded_at"),
         "context_bundle_version": payload.get("context_bundle_version"),
-        "source_chat_reference": payload.get("source_chat_reference"),
-        "source_chat_registry_generation": payload.get(
-            "source_chat_registry_generation"
+        "source_chat_reference": _opaque_classifier_reference(
+            str(payload.get("source_chat_reference")), kind="source-chat"
         ),
         "source_chat_timezone": payload.get("source_chat_timezone"),
         "source_chat_geography": payload.get("source_chat_geography"),
-        "bounded_metadata": payload.get("bounded_metadata"),
-        "eligible_reply_context": payload.get("eligible_reply_context"),
-        "direct_reply_to_telegram_message_id": payload.get(
-            "direct_reply_to_telegram_message_id"
+        "bounded_metadata": _classifier_bounded_metadata(
+            cast(dict[str, JsonValue], payload.get("bounded_metadata"))
+        ),
+        "eligible_reply_context": _classifier_reply_context(
+            cast(dict[str, JsonValue] | None, payload.get("eligible_reply_context"))
         ),
         "model": pinned["requested_model"],
         "reasoning_effort": pinned["requested_reasoning_effort"],

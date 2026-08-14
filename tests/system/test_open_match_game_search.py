@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import asdict
 from datetime import UTC, date, datetime
 
 import pytest
@@ -255,7 +256,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     request = classifier.requests[0]
     assert request.source_event_time == "2026-08-18T09:05:00+00:00"
     assert request.context_bundle_version == "primary-classifier-context-v1"
-    assert request.source_chat_reference == "source-chat:channel:4900100"
+    assert request.source_chat_reference.startswith("classifier-source-chat:")
+    assert request.source_message_revision_id.startswith("classifier-revision:")
     assert request.source_chat_timezone == "Europe/Moscow"
     assert request.source_chat_geography == {
         "country_id": "country:ru",
@@ -264,11 +266,13 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert request.bounded_metadata == {
         "message_language": None,
         "attachment_types": [],
-        "source_author_dm_url": None,
-        "reply_route_url": None,
-        "source_message_url": None,
-        "source_message_reply_capable": False,
     }
+    serialized_request = json.dumps(asdict(request), sort_keys=True)
+    assert "4900100" not in serialized_request
+    assert "source-chat:channel" not in serialized_request
+    assert "source_author_dm_url" not in serialized_request
+    assert "reply_route_url" not in serialized_request
+    assert "source_message_url" not in serialized_request
 
     assert {
         query.locale for query in resolver.queries if query.text == "на Петроградской"
@@ -1046,6 +1050,18 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert phone_opportunity.response_route.kind == "explicit_phone"
     assert phone_opportunity.response_route.value == "+7 921 555-01-49"
     assert "unused_source" not in phone_opportunity.response_route.value
+    phone_classifier_request = next(
+        request for request in classifier.requests if request.body == phone_body
+    )
+    serialized_phone_request = json.dumps(
+        asdict(phone_classifier_request), sort_keys=True
+    )
+    assert "unused_source_author_49" not in serialized_phone_request
+    assert "unused_source_chat" not in serialized_phone_request
+    assert set(phone_classifier_request.bounded_metadata) == {
+        "message_language",
+        "attachment_types",
+    }
     url_body = (
         "20 августа 2026 на Петроградской нужен один игрок. "
         "Форма https://example.test/open-match/49"
@@ -1361,17 +1377,24 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         registry_generation=1,
     )
     system.process_opportunities_until_idle()
-    assert classifier.requests[-1].eligible_reply_context == {
+    reply_request = classifier.requests[-1]
+    assert reply_request.eligible_reply_context is not None
+    reply_revision_reference = reply_request.eligible_reply_context[
+        "source_message_revision_reference"
+    ]
+    assert reply_request.eligible_reply_context == {
         "relationship_kind": "direct_reply",
-        "source_chat_reference": "source-chat:channel:4900100",
-        "registry_generation": 1,
-        "telegram_message_id": 1011,
-        "source_message_revision_id": (
-            "source-chat:channel:4900100:message:1011:revision:1"
-        ),
+        "source_message_revision_reference": reply_revision_reference,
         "body": reply_parent_body,
         "source_event_time": "2026-08-18T17:38:00+00:00",
     }
+    assert str(
+        reply_request.eligible_reply_context["source_message_revision_reference"]
+    ).startswith("classifier-revision:")
+    serialized_reply_request = json.dumps(asdict(reply_request), sort_keys=True)
+    assert "4900100" not in serialized_reply_request
+    assert "1011" not in serialized_reply_request
+    assert "telegram_message_id" not in serialized_reply_request
 
     cross_chat_child_body = (
         "20 августа 2026 на Петроградской нужен один игрок. Пишите @cross_chat_context"
@@ -1512,17 +1535,22 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     assert system.process_next_source_event()
     assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    assert classifier.requests[-1].eligible_reply_context == {
+    current_reply_request = classifier.requests[-1]
+    assert current_reply_request.eligible_reply_context is not None
+    current_reply_revision_reference = current_reply_request.eligible_reply_context[
+        "source_message_revision_reference"
+    ]
+    assert current_reply_request.eligible_reply_context == {
         "relationship_kind": "direct_reply",
-        "source_chat_reference": "source-chat:channel:4900100",
-        "registry_generation": 1,
-        "telegram_message_id": 1011,
-        "source_message_revision_id": (
-            "source-chat:channel:4900100:message:1011:revision:2"
-        ),
+        "source_message_revision_reference": current_reply_revision_reference,
         "body": updated_reply_parent_body,
         "source_event_time": "2026-08-18T18:03:00+00:00",
     }
+    assert str(
+        current_reply_request.eligible_reply_context[
+            "source_message_revision_reference"
+        ]
+    ).startswith("classifier-revision:")
     stale_child_revision_id = "source-chat:channel:4900100:message:1014:revision:1"
     system.invalidate_classifier_context(
         source_message_revision_id=stale_child_revision_id,

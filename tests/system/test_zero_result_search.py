@@ -14,6 +14,8 @@ from modules.contracts import (
     JsonValue,
     OperatorAlert,
     RuntimeRole,
+    derive_run_search_message_id,
+    derive_search_completed_message_id,
 )
 from modules.domain import (
     ConversationStage,
@@ -251,6 +253,11 @@ def test_stale_search_failure_is_consumed_without_mutating_active_submission() -
 def test_stale_search_completion_is_consumed_without_presenting_it() -> None:
     system, _telegram = _boot_search_system()
     user_id = 44_015
+    stale_run_message_id = derive_run_search_message_id(user_id, "stale-search")
+    stale_completed_search_id = f"completed-search:{stale_run_message_id}"
+    stale_completion_message_id = derive_search_completed_message_id(
+        stale_completed_search_id
+    )
     _advance_to_complete_draft(system, user_id=user_id)
     system.submit_search(update_id="active-search", telegram_user_id=user_id)
     system.record_search_event(
@@ -258,9 +265,13 @@ def test_stale_search_completion_is_consumed_without_presenting_it() -> None:
         contract_name=ContractName.SEARCH_COMPLETED,
         contract_version=2,
         telegram_user_id=user_id,
+        message_id=stale_completion_message_id,
+        subject_id=stale_completed_search_id,
+        idempotency_key=f"search-completed:{stale_completed_search_id}",
+        causation_id=stale_run_message_id,
+        correlation_id=stale_run_message_id,
         payload={
-            "probe_id": "stale-search-completion",
-            "completed_search_id": "stale-search-completion",
+            "completed_search_id": stale_completed_search_id,
             "search_update_id": "stale-search",
             "telegram_user_id": user_id,
             "result_count": 0,
@@ -271,7 +282,7 @@ def test_stale_search_completion_is_consumed_without_presenting_it() -> None:
 
     assert system.retry_bot_presentations() is False
     assert system.discovery_draft(user_id).stage is ConversationStage.SUBMITTING
-    assert system.observe("stale-search-completion").accepted_inbox_records == 1
+    assert system.contract_is_accepted(stale_completion_message_id) is True
 
     system.process_searches_until_idle()
     assert len(system.completed_searches(user_id)) == 1
@@ -723,7 +734,9 @@ def test_future_search_event_versions_fail_closed(
 def test_unsupported_completed_search_query_does_not_poison_its_completion() -> None:
     system, _telegram = _boot_search_system()
     user_id = 44_019
-    completed_search_id = "completed-search:future-query"
+    run_search_message_id = derive_run_search_message_id(user_id, "active-search")
+    completed_search_id = f"completed-search:{run_search_message_id}"
+    completion_message_id = derive_search_completed_message_id(completed_search_id)
     _advance_to_complete_draft(system, user_id=user_id)
     system.submit_search(update_id="active-search", telegram_user_id=user_id)
     system.record_search_event(
@@ -741,8 +754,12 @@ def test_unsupported_completed_search_query_does_not_poison_its_completion() -> 
         contract_name=ContractName.SEARCH_COMPLETED,
         contract_version=2,
         telegram_user_id=user_id,
+        message_id=completion_message_id,
+        subject_id=completed_search_id,
+        idempotency_key=f"search-completed:{completed_search_id}",
+        causation_id=run_search_message_id,
+        correlation_id=run_search_message_id,
         payload={
-            "probe_id": completed_search_id,
             "completed_search_id": completed_search_id,
             "search_update_id": "active-search",
             "telegram_user_id": user_id,

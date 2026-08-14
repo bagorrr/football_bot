@@ -1289,6 +1289,12 @@ class AcceptanceSpine:
         producer: RuntimeRole | None = None,
         include_telegram_user_id: bool = True,
         payload: dict[str, JsonValue] | None = None,
+        message_id: UUID | None = None,
+        subject_id: str | None = None,
+        subject_revision: int | None = None,
+        idempotency_key: str | None = None,
+        causation_id: UUID | None = None,
+        correlation_id: UUID | None = None,
     ) -> None:
         """Record one synthetic handoff for public contract-boundary tests."""
         if contract_name not in {
@@ -1350,14 +1356,14 @@ class AcceptanceSpine:
         envelope = RawContractEnvelope(
             contract_name=contract_name,
             contract_version=contract_version,
-            message_id=_identifier(probe_id, contract_name.value),
+            message_id=message_id or _identifier(probe_id, contract_name.value),
             producer=event_producer,
             consumer=consumer,
-            subject_id=probe_id,
-            subject_revision=1,
-            idempotency_key=f"{probe_id}:{contract_name.value}",
-            causation_id=_identifier(probe_id, "causation"),
-            correlation_id=_identifier(probe_id, "correlation"),
+            subject_id=subject_id or probe_id,
+            subject_revision=subject_revision or 1,
+            idempotency_key=(idempotency_key or f"{probe_id}:{contract_name.value}"),
+            causation_id=causation_id or _identifier(probe_id, "causation"),
+            correlation_id=correlation_id or _identifier(probe_id, "correlation"),
             recorded_at=self._roles[event_producer].clock.now(),
             payload=event_payload,
         )
@@ -1395,9 +1401,14 @@ class AcceptanceSpine:
             if not progressed:
                 return self.observe(probe_id)
 
-    def observe(self, probe_id: str) -> AcceptanceSnapshot:
+    def observe(
+        self,
+        probe_id: str,
+        *,
+        message_id: UUID | None = None,
+    ) -> AcceptanceSnapshot:
         """Observe business-neutral durable outcomes through the testkit."""
-        values = self._observer.snapshot(probe_id)
+        values = self._observer.snapshot(probe_id, message_id=message_id)
         return AcceptanceSnapshot(
             owner_state_roles=values.roles,
             owner_state_records=values.owner_state_records,
@@ -1416,6 +1427,10 @@ class AcceptanceSpine:
     ) -> RawContractEnvelope:
         """Recover a rejected or pending envelope without acknowledging it."""
         return self._observer.envelope(_identifier(probe_id, contract_name.value))
+
+    def recoverable_contract_message(self, message_id: UUID) -> RawContractEnvelope:
+        """Recover one rejected or pending envelope by its public wire identity."""
+        return self._observer.envelope(message_id)
 
     def delete_completed_search_query(
         self, completed_search_id: str

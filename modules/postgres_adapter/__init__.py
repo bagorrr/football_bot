@@ -1362,7 +1362,12 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
 
-    def snapshot(self, probe_id: str) -> AcceptanceObservation:
+    def snapshot(
+        self,
+        probe_id: str,
+        *,
+        message_id: UUID | None = None,
+    ) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
         with psycopg.connect(
             self._admin_database_url,
@@ -1386,14 +1391,27 @@ class PostgresAcceptanceObserver:
                 SELECT
                     count(*) FILTER (
                         WHERE payload ->> 'probe_id' = %s
+                           OR message_id = %s
+                           OR causation_id = %s
                     ) AS outbox_records,
                     count(*) FILTER (
                         WHERE consumer_role IS NULL
-                          AND payload ->> 'probe_id' = %s
+                          AND (
+                              payload ->> 'probe_id' = %s
+                              OR message_id = %s
+                              OR causation_id = %s
+                          )
                     ) AS completed_records
                 FROM football_runtime.contract_outbox
                 """,
-                (probe_id, probe_id),
+                (
+                    probe_id,
+                    message_id,
+                    message_id,
+                    probe_id,
+                    message_id,
+                    message_id,
+                ),
             ).fetchone()
             inbox_counts = connection.execute(
                 """
@@ -1406,8 +1424,10 @@ class PostgresAcceptanceObserver:
                 JOIN football_runtime.contract_outbox AS outbox
                   ON outbox.message_id = inbox.message_id
                 WHERE outbox.payload ->> 'probe_id' = %s
+                   OR outbox.message_id = %s
+                   OR outbox.causation_id = %s
                 """,
-                (probe_id,),
+                (probe_id, message_id, message_id),
             ).fetchone()
             alert_rows = connection.execute(
                 """
@@ -1418,9 +1438,11 @@ class PostgresAcceptanceObserver:
                 JOIN football_runtime.contract_outbox AS outbox
                   ON outbox.message_id = alert.message_id
                 WHERE outbox.payload ->> 'probe_id' = %s
+                   OR outbox.message_id = %s
+                   OR outbox.causation_id = %s
                 ORDER BY alert.observed_at, alert.consumer_role
                 """,
-                (probe_id,),
+                (probe_id, message_id, message_id),
             ).fetchall()
         if counts is None or inbox_counts is None:
             msg = "PostgreSQL aggregate query returned no row"
