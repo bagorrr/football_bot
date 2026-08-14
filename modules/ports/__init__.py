@@ -899,6 +899,14 @@ class AcceptanceObserver(Protocol):
         """Inject one unsupported Source Event version at the contract seam."""
         ...
 
+    def invalidate_contract_payload(
+        self,
+        message_id: UUID,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject semantic incompatibility into one serialized contract."""
+        ...
+
     def delete_completed_search_query(
         self, completed_search_id: str
     ) -> RawContractEnvelope:

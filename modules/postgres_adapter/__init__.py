@@ -897,6 +897,44 @@ class PostgresAcceptanceObserver:
             raise LookupError(message_id)
         return _row_to_envelope(row, validate_registered=False)
 
+    def invalidate_contract_payload(
+        self,
+        message_id: UUID,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject semantic incompatibility into one serialized contract."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT payload
+                FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                FOR UPDATE
+                """,
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise LookupError(message_id)
+            payload = row["payload"]
+            if not isinstance(payload, dict):
+                raise TypeError("contract payload must be an object")
+            payload.update(payload_updates)
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = %s::jsonb
+                WHERE message_id = %s
+                RETURNING *
+                """,
+                (json.dumps(payload), message_id),
+            ).fetchone()
+        if changed is None:
+            raise LookupError(message_id)
+        return _row_to_envelope(changed, validate_registered=False)
+
     def delete_completed_search_query(
         self, completed_search_id: str
     ) -> RawContractEnvelope:

@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
+from threading import Condition
+from time import monotonic
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -98,6 +100,50 @@ _CONTRACTS = {
 
 
 @dataclass(slots=True)
+class _ControlledResultGate:
+    """Deterministically release controlled-adapter results in call order."""
+
+    _condition: Condition = field(default_factory=Condition)
+    _paused: bool = False
+    _entered: int = 0
+    _released: int = 0
+
+    def pause(self) -> None:
+        with self._condition:
+            self._paused = True
+            self._entered = 0
+            self._released = 0
+
+    def enter(self) -> None:
+        with self._condition:
+            if not self._paused:
+                return
+            ticket = self._entered
+            self._entered += 1
+            self._condition.notify_all()
+            while ticket >= self._released:
+                self._condition.wait()
+
+    def wait_for(self, count: int, *, timeout: float = 5) -> None:
+        if count < 1:
+            raise ValueError("controlled result count must be positive")
+        deadline = monotonic() + timeout
+        with self._condition:
+            while self._entered < count:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise AssertionError("controlled adapter calls did not reach gate")
+                self._condition.wait(remaining)
+
+    def release(self, count: int) -> None:
+        if count < 1:
+            raise ValueError("controlled result count must be positive")
+        with self._condition:
+            self._released += count
+            self._condition.notify_all()
+
+
+@dataclass(slots=True)
 class FrozenClock:
     """Controllable clock for deterministic system acceptance."""
 
@@ -126,10 +172,20 @@ class ControlledTelegramIngestionAdapter:
     _account_difference_events: dict[
         TelegramAccountCheckpoint, TelegramDifferenceEvent | TelegramDifferenceFailure
     ] = field(default_factory=dict)
+    _account_difference_sequences: dict[
+        TelegramAccountCheckpoint,
+        list[TelegramDifferenceEvent | TelegramDifferenceFailure],
+    ] = field(default_factory=dict)
     _channel_difference_events: dict[
         tuple[TelegramPeerIdentity, TelegramChannelCheckpoint],
         TelegramDifferenceEvent | TelegramDifferenceFailure,
     ] = field(default_factory=dict)
+    _account_result_gate: _ControlledResultGate = field(
+        default_factory=_ControlledResultGate
+    )
+    _channel_result_gate: _ControlledResultGate = field(
+        default_factory=_ControlledResultGate
+    )
     resolution_requests: list[str] = field(default_factory=list)
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
     join_requests: list[str] = field(default_factory=list)
@@ -311,13 +367,41 @@ class ControlledTelegramIngestionAdapter:
             reason=parsed_reason,
         )
 
+    def pause_account_difference_results(self) -> None:
+        """Pause account results after callers cross the controlled adapter port."""
+        self._account_result_gate.pause()
+
+    def queue_account_difference_result(
+        self,
+        *,
+        checkpoint: TelegramAccountCheckpoint,
+        result: TelegramDifferenceEvent | TelegramDifferenceFailure,
+    ) -> None:
+        """Queue one account result for deterministic repeated-checkpoint polling."""
+        self._account_difference_sequences.setdefault(checkpoint, []).append(result)
+
+    def wait_for_account_difference_requests(self, count: int) -> None:
+        """Wait until the requested account polls reach the controlled port."""
+        self._account_result_gate.wait_for(count)
+
+    def release_account_difference_results(self, count: int) -> None:
+        """Release paused account results in request order."""
+        self._account_result_gate.release(count)
+
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
     ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
         """Return the configured account-wide difference from typed state."""
+        sequence = self._account_difference_sequences.get(checkpoint)
+        result: TelegramDifferenceEvent | TelegramDifferenceFailure | None
+        if sequence:
+            result = sequence.pop(0)
+        else:
+            result = self._account_difference_events.get(checkpoint)
         self.account_difference_requests.append(checkpoint)
-        return self._account_difference_events.get(checkpoint)
+        self._account_result_gate.enter()
+        return result
 
     def add_channel_difference_event(
         self,
@@ -493,6 +577,18 @@ class ControlledTelegramIngestionAdapter:
             )
         )
 
+    def pause_channel_difference_results(self) -> None:
+        """Pause channel results after callers cross the controlled adapter port."""
+        self._channel_result_gate.pause()
+
+    def wait_for_channel_difference_requests(self, count: int) -> None:
+        """Wait until the requested channel polls reach the controlled port."""
+        self._channel_result_gate.wait_for(count)
+
+    def release_channel_difference_results(self, count: int) -> None:
+        """Release paused channel results in request order."""
+        self._channel_result_gate.release(count)
+
     def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
@@ -500,7 +596,9 @@ class ControlledTelegramIngestionAdapter:
     ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
         """Return the configured channel difference from typed pts."""
         self.channel_difference_requests.append((identity, checkpoint))
-        return self._channel_difference_events.get((identity, checkpoint))
+        result = self._channel_difference_events.get((identity, checkpoint))
+        self._channel_result_gate.enter()
+        return result
 
 
 @dataclass(slots=True)
@@ -1375,6 +1473,15 @@ class AcceptanceSpine:
             derive_source_event_message_id(source_event_id),
             version,
         )
+
+    def invalidate_contract_payload(
+        self,
+        *,
+        message_id: UUID,
+        payload_updates: dict[str, JsonValue],
+    ) -> RawContractEnvelope:
+        """Inject semantic incompatibility at the serialized contract seam."""
+        return self._observer.invalidate_contract_payload(message_id, payload_updates)
 
     def source_events_as(self, actor: RuntimeRole) -> tuple[SourceEventRecord, ...]:
         """Probe Source Event grants and RLS with one runtime credential."""
