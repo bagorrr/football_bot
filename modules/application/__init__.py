@@ -5883,7 +5883,7 @@ def _open_match_result_message(
         },
         "es": {
             "morning": "por la mañana",
-            "daytime": "por la tarde",
+            "daytime": "de día",
             "evening": "por la tarde",
             "night": "por la noche",
         },
@@ -6032,7 +6032,10 @@ def _open_match_result_message(
                 for value in values
             )
     if "payment" in facts:
-        known_values["payment"] = value_copy.get(facts["payment"], facts["payment"])
+        payment_copy = value_copy.get(facts["payment"], facts["payment"])
+        if "payment_amount" in facts and "payment_currency" in facts:
+            payment_copy += f" ({facts['payment_amount']} {facts['payment_currency']})"
+        known_values["payment"] = payment_copy
     detail_values = [open_place_copy]
     detail_values.extend(
         known_values[key]
@@ -8990,6 +8993,11 @@ def _validated_open_match_proposal(
     )
     if validation_time.astimezone(event_timezone) >= expiry:
         return None
+    payment_details = (
+        _stated_payment_amount_and_currency(str(evidence["payment"]))
+        if payment == "paid"
+        else None
+    )
     localized = dict(places[0].localized_display_names)
     accepted_facts: dict[str, JsonValue] = {
         "start_local_date": str(start_date),
@@ -9020,6 +9028,10 @@ def _validated_open_match_proposal(
         "venue_settings": settings,
         "playing_surfaces": surfaces,
         "payment": None if payment == "unknown" else payment,
+        "payment_amount": payment_details[0] if payment_details is not None else None,
+        "payment_currency": (
+            payment_details[1] if payment_details is not None else None
+        ),
         "source_posted_at": source_event_time.isoformat(),
     }
     return {
@@ -9323,7 +9335,8 @@ def _event_time_is_supported(
                 r"\bdaytime\b",
                 r"\bafternoon\b",
                 r"\bдн(?:е|ё)м\b",
-                r"por la tarde",
+                r"\bde día\b",
+                r"\bdurante el día\b",
                 r"après-midi",
                 r"apres-midi",
             ),
@@ -9546,6 +9559,56 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
     )
 
 
+_ISO_CURRENCY_CODES = frozenset(
+    """AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD
+    BND BOB BOV BRL BSD BTN BWP BYN BZD CAD CDF CHE CHF CHW CLF CLP CNY COP
+    COU CRC CUC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL
+    GHS GIP GMD GNF GTQ GYD HKD HNL HRK HTG HUF IDR ILS INR IQD IRR ISK JMD
+    JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD
+    MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MXV MYR MZN NAD NGN NIO NOK
+    NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG
+    SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD
+    TWD TZS UAH UGX USD USN UYI UYU UYW UZS VED VES VND VUV WST XAF XAG XAU
+    XBA XBB XBC XBD XCD XCG XDR XOF XPD XPF XPT XSU XTS XUA XXX YER ZAR ZMW
+    ZWG""".split()  # noqa: SIM905 - compact, auditable ISO 4217 allowlist
+)
+_STATED_CURRENCY_PATTERN = (
+    r"(?:[₽$€£¥₴₸₹₾₺]|(?:" + "|".join(sorted(_ISO_CURRENCY_CODES)) + r")|"
+    r"(?i:rub(?:les?)?|roubles?|руб\w*|rublos?|"
+    r"usd|dollars?|доллар\w*|d[oó]lares?|"
+    r"eur|euros?|евро|"
+    r"gbp|pounds?|фунт\w*|libras?|livres?|"
+    r"chf|francs?|франк\w*|francos?))"
+)
+_STATED_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[\s\u00a0,.]\d{3})+|\d+)(?:[.,]\d{1,2})?"
+
+
+def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None:
+    """Return one adjacent source-stated amount/currency pair without inference."""
+    separators = r"[\s\u00a0]*"
+    amount_then_currency = re.search(
+        rf"(?<![\w.,])(?P<amount>{_STATED_AMOUNT_PATTERN}){separators}"
+        rf"(?P<currency>{_STATED_CURRENCY_PATTERN})(?!\w)",
+        evidence,
+    )
+    if amount_then_currency is not None:
+        return (
+            amount_then_currency.group("amount"),
+            amount_then_currency.group("currency"),
+        )
+    currency_then_amount = re.search(
+        rf"(?<!\w)(?P<currency>{_STATED_CURRENCY_PATTERN}){separators}"
+        rf"(?P<amount>{_STATED_AMOUNT_PATTERN})(?![\w.,])",
+        evidence,
+    )
+    if currency_then_amount is None:
+        return None
+    return (
+        currency_then_amount.group("amount"),
+        currency_then_amount.group("currency"),
+    )
+
+
 def _optional_values_are_supported(
     candidate: dict[str, JsonValue],
     evidence: dict[str, JsonValue],
@@ -9716,13 +9779,11 @@ def _optional_values_are_supported(
             "paid": (
                 r"\bpaid\b",
                 r"\bвзнос\w*\b",
-                r"\bруб\w*\b",
                 r"\bde\s+pago\b",
                 r"\bcuota\b",
                 r"\bpayant\w*\b",
                 r"\bpay[ée]\w*\b",
                 r"\bcotisation\b",
-                r"[₽$€]",
             ),
             "unknown": (
                 r"\bunknown\b",
@@ -9733,9 +9794,15 @@ def _optional_values_are_supported(
         }
         if not isinstance(payment, str) or payment not in payment_patterns:
             return False
-        if not any(
-            re.search(pattern, normalized_payment)
-            for pattern in payment_patterns[payment]
+        if not (
+            any(
+                re.search(pattern, normalized_payment)
+                for pattern in payment_patterns[payment]
+            )
+            or (
+                payment == "paid"
+                and _stated_payment_amount_and_currency(payment_evidence) is not None
+            )
         ):
             return False
     return True

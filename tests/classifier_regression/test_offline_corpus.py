@@ -7,7 +7,11 @@ from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 
-from modules.application import _event_time_is_supported
+from modules.application import (
+    _event_time_is_supported,
+    _optional_values_are_supported,
+    _stated_payment_amount_and_currency,
+)
 from modules.classifier_contract import classifier_output_is_schema_valid
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
 from modules.testkit import ControlledModelAdapter
@@ -86,27 +90,34 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
         if candidates:
             candidate = candidates[0]
             assert isinstance(candidate, dict)
+            evidence = candidate["evidence"]
+            assert isinstance(evidence, dict)
+            assert _optional_values_are_supported(candidate, evidence)
             assert candidate["opportunity_type"] == expected["opportunity_type"]
             assert candidate["open_places"] == expected["open_places"]
             assert candidate["positions"] == expected["positions"]
-            if case.get("validate_relative_event_time") is True:
+            if (
+                case.get("validate_relative_event_time") is True
+                or case.get("validate_event_time") is True
+            ):
                 event_time = candidate["event_time"]
                 assert isinstance(event_time, dict)
-                evidence = candidate["evidence"]
-                assert isinstance(evidence, dict)
                 start_local_date = event_time["start_local_date"]
                 end_local_date = event_time["end_local_date"]
                 exact_local_time = event_time.get("exact_local_time")
+                day_part = event_time.get("day_part")
                 event_time_evidence = evidence["event_time"]
                 assert isinstance(start_local_date, str)
                 assert isinstance(end_local_date, str)
                 assert exact_local_time is None or isinstance(exact_local_time, str)
+                assert day_part is None or isinstance(day_part, str)
                 assert isinstance(event_time_evidence, str)
                 assert _event_time_is_supported(
                     date.fromisoformat(start_local_date),
                     date.fromisoformat(end_local_date),
                     exact_local_time,
                     event_time_evidence,
+                    day_part=day_part,
                     source_event_time=datetime.fromisoformat(source_event_time),
                     source_timezone=source_chat_timezone,
                 )
@@ -150,6 +161,26 @@ def test_offline_corpus_rejects_unrelated_numeric_date_cooccurrence() -> None:
         date(2026, 8, 2),
         None,
         "20 August 2026 — two players are needed",
+    )
+
+
+def test_offline_payment_evidence_covers_four_locales_without_inference() -> None:
+    cases = (
+        ("Fee 500 EUR", ("500", "EUR")),
+        ("Участие 900 рублей", ("900", "рублей")),
+        ("Entrada 20 euros", ("20", "euros")),
+        ("Tarif 500 CHF", ("500", "CHF")),
+    )
+    for evidence, expected_details in cases:
+        assert _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": evidence},
+        )
+        assert _stated_payment_amount_and_currency(evidence) == expected_details
+
+    assert not _optional_values_are_supported(
+        {"payment": "paid"},
+        {"payment": "Fee 500"},
     )
 
 

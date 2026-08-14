@@ -619,6 +619,7 @@ def _validate_run_search(
         if (
             not isinstance(telegram_user_id, int)
             or isinstance(telegram_user_id, bool)
+            or telegram_user_id < 1
             or not isinstance(draft_revision, int)
             or isinstance(draft_revision, bool)
             or draft_revision < 1
@@ -693,7 +694,10 @@ def _validate_run_search(
         raise ValueError("RunSearch requires exactly one Search Area mode")
     required_date = payload.get("required_date")
     if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
-        _validate_required_date(required_date)
+        _validate_required_date(
+            required_date,
+            exact_fields=contract_version >= 2,
+        )
     details = payload.get("game_search_details")
     if details is not None:
         if user_intent != "game_search" or not isinstance(details, dict):
@@ -723,9 +727,18 @@ def _validate_run_search(
             raise ValueError("RunSearch has invalid Game Search details")
 
 
-def _validate_required_date(value: JsonValue) -> None:
+def _validate_required_date(value: JsonValue, *, exact_fields: bool) -> None:
     if not isinstance(value, dict):
         raise ValueError("RunSearch requires a Required Date object")
+    if exact_fields and set(value) != {
+        "start_local_date",
+        "end_local_date",
+        "iana_timezone",
+        "timezone_data_version",
+    }:
+        raise ValueError(
+            "RunSearch Required Date contains unsupported or missing facts"
+        )
     start_text = _required_text(value, "start_local_date")
     end_text = _required_text(value, "end_local_date")
     _required_text(value, "iana_timezone")
@@ -761,7 +774,11 @@ def _validate_search_completed(
     if set(payload) != allowed_fields:
         raise ValueError("SearchCompleted v2 contains unsupported or missing facts")
     telegram_user_id = payload.get("telegram_user_id")
-    if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+    if (
+        not isinstance(telegram_user_id, int)
+        or isinstance(telegram_user_id, bool)
+        or telegram_user_id < 1
+    ):
         raise ValueError("SearchCompleted requires telegram_user_id")
     search_update_id = _required_text(payload, "search_update_id")
     result_count = payload.get("result_count")
@@ -1345,6 +1362,8 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         "venue_settings",
         "playing_surfaces",
         "payment",
+        "payment_amount",
+        "payment_currency",
         "source_posted_at",
     }
     if set(facts) != required:
@@ -1446,6 +1465,19 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
             raise ValueError(f"open-match {field_name} is invalid")
     if facts["payment"] not in {None, "free", "paid"}:
         raise ValueError("open-match payment is invalid")
+    payment_amount = facts["payment_amount"]
+    payment_currency = facts["payment_currency"]
+    if (payment_amount is None) != (payment_currency is None) or (
+        payment_amount is not None
+        and (
+            facts["payment"] != "paid"
+            or not isinstance(payment_amount, str)
+            or not payment_amount
+            or not isinstance(payment_currency, str)
+            or not payment_currency
+        )
+    ):
+        raise ValueError("open-match payment details are invalid")
     _required_iso_datetime(facts, "source_posted_at")
 
 

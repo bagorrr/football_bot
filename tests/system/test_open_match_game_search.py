@@ -342,7 +342,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         "Matches: date and city.\n\n"
         "Additional: Team format: 7x7 · Positions: Goalkeeper, Defender · "
         "Playing levels: Average · Venue type: Outdoor · "
-        "Playing surface: Artificial turf · Payment: Paid\n\n"
+        "Playing surface: Artificial turf · Payment: Paid (900 рублей)\n\n"
         "Posted: 18 August 2026 at 12:05\n"
         "Contact: @open_match_contact\n\n"
         "Questions? Message me. I can explain the card or help refine your search."
@@ -1916,6 +1916,207 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         != disjoint_proof_opportunity.opportunity_id
         for result in area_proof_results
     )
+
+    ordered_time_opportunities = {
+        "exact": opportunities[0],
+        "evening": day_part_opportunity,
+        "unknown": source_message_opportunity,
+    }
+    for offset, day_part in enumerate(("morning", "daytime", "night"), start=1):
+        ordered_body = (
+            f"20 августа 2026 {day_part} на Петроградской нужен один игрок. "
+            f"Пишите @ordering_{day_part}"
+        )
+        classifier.return_for(
+            body=ordered_body,
+            result=_minimal_classifier_result(
+                candidate_key=f"ordering-{day_part}",
+                body=ordered_body,
+                response_routes=[
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": f"@ordering_{day_part}",
+                        "evidence": f"@ordering_{day_part}",
+                    }
+                ],
+                event_time_evidence=f"20 августа 2026 {day_part}",
+                day_part=day_part,
+            ),
+        )
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=4922 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4923 + offset),
+            source_event_id=f"source-event:open-match:ordering-{day_part}",
+            telegram_message_id=1025 + offset,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=ordered_body,
+            event_time=datetime(2026, 8, 18, 21, 32 + offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        ordered_time_opportunities[day_part] = next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.source_message_revision_id.endswith(
+                f":{1025 + offset}:revision:1"
+            )
+        )
+
+    ordering_user_id = bot_user_id + 12
+    _advance_to_complete_game_search(system, bot_user_id=ordering_user_id)
+    ordering_update_id = "submit-mixed-event-time-ordering"
+    ordering_screen_revision = system.discovery_draft(ordering_user_id).screen_revision
+    system.submit_search(
+        update_id=ordering_update_id,
+        telegram_user_id=ordering_user_id,
+        screen_revision=ordering_screen_revision,
+    )
+    system.process_searches_until_idle()
+    ordering_search = system.completed_searches(ordering_user_id)[0]
+    first_snapshot = system.results(ordering_search.completed_search_id)
+    target_labels_by_id = {
+        opportunity.opportunity_id: label
+        for label, opportunity in ordered_time_opportunities.items()
+    }
+    assert [
+        target_labels_by_id[dict(result.card_facts)["opportunity_id"]]
+        for result in first_snapshot
+        if dict(result.card_facts)["opportunity_id"] in target_labels_by_id
+    ] == ["morning", "daytime", "evening", "exact", "night", "unknown"]
+
+    system.submit_search(
+        update_id=ordering_update_id,
+        telegram_user_id=ordering_user_id,
+        screen_revision=ordering_screen_revision,
+    )
+    system.process_searches_until_idle()
+    assert len(system.completed_searches(ordering_user_id)) == 1
+    assert system.results(ordering_search.completed_search_id) == first_snapshot
+
+    spanish_day_part_opportunities = {}
+    for offset, (day_part, spanish_copy, amount, currency) in enumerate(
+        (
+            ("daytime", "de día", "20", "EUR"),
+            ("evening", "por la tarde", "30", "CHF"),
+        ),
+        start=1,
+    ):
+        spanish_body = (
+            f"Partido 20 agosto 2026 {spanish_copy}: на Петроградской нужен один "
+            f"игрок, delantero. Tarifa {amount} {currency}. "
+            f"Escribe a @spanish_{day_part}"
+        )
+        spanish_result = _minimal_classifier_result(
+            candidate_key=f"spanish-{day_part}",
+            body=spanish_body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": f"@spanish_{day_part}",
+                    "evidence": f"@spanish_{day_part}",
+                }
+            ],
+            event_time_evidence=f"20 agosto 2026 {spanish_copy}",
+            day_part=day_part,
+        )
+        candidates = spanish_result.output["candidates"]
+        assert isinstance(candidates, list)
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        evidence["positions"] = "delantero"
+        evidence["payment"] = f"{amount} {currency}"
+        candidate["positions"] = ["forward"]
+        candidate["payment"] = "paid"
+        classifier.return_for(body=spanish_body, result=spanish_result)
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=4925 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4926 + offset),
+            source_event_id=f"source-event:open-match:spanish-{day_part}",
+            telegram_message_id=1028 + offset,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=spanish_body,
+            event_time=datetime(2026, 8, 18, 21, 40 + offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        spanish_day_part_opportunities[day_part] = next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.source_message_revision_id.endswith(
+                f":{1028 + offset}:revision:1"
+            )
+        )
+
+    for offset, (day_part, expected_copy, rejected_copy) in enumerate(
+        (
+            ("daytime", "de día", "por la tarde"),
+            ("evening", "por la tarde", "de día"),
+        ),
+        start=13,
+    ):
+        spanish_user_id = bot_user_id + offset
+        _advance_to_complete_game_search(
+            system,
+            bot_user_id=spanish_user_id,
+            locale="es",
+        )
+        system.submit_search(
+            update_id=f"submit-spanish-{day_part}-search",
+            telegram_user_id=spanish_user_id,
+            game_search_details={
+                "times": [day_part],
+                "positions": ["forward"],
+                "payment": ["paid"],
+            },
+        )
+        system.process_searches_until_idle()
+        spanish_search = system.completed_searches(spanish_user_id)[0]
+        spanish_results = system.results(spanish_search.completed_search_id)
+        expected_opportunity = spanish_day_part_opportunities[day_part]
+        other_opportunity = spanish_day_part_opportunities[
+            "evening" if day_part == "daytime" else "daytime"
+        ]
+        assert dict(spanish_results[0].card_facts)["opportunity_id"] == (
+            expected_opportunity.opportunity_id
+        )
+        assert spanish_results[0].result_class == "confirmed_match"
+        assert all(
+            dict(result.card_facts)["opportunity_id"]
+            != other_opportunity.opportunity_id
+            for result in spanish_results
+        )
+        spanish_card = telegram_delivery.messages[-1].text
+        assert expected_copy in spanish_card
+        assert rejected_copy not in spanish_card
+        expected_amount, expected_currency = (
+            ("20", "EUR") if day_part == "daytime" else ("30", "CHF")
+        )
+        assert f"De pago ({expected_amount} {expected_currency})" in spanish_card
+        revision_inputs = system.completed_search_opportunity_revision_inputs(
+            spanish_search.completed_search_id
+        )
+        accepted_facts = next(
+            revision_input["accepted_facts"]
+            for revision_input in revision_inputs
+            if revision_input["opportunity_revision_id"]
+            == expected_opportunity.opportunity_revision_id
+        )
+        assert isinstance(accepted_facts, dict)
+        assert accepted_facts["payment"] == "paid"
+        assert accepted_facts["payment_amount"] == expected_amount
+        assert accepted_facts["payment_currency"] == expected_currency
     system.reset()
 
 

@@ -143,6 +143,102 @@
         "disposition": "unresolved",
         "candidates": []
       }
+    },
+    {
+      "case_id": "accepted-spanish-daytime",
+      "source": "Partido 20 agosto 2026 de día en [LUGAR], necesitamos un defensa. Tarifa 20 EUR. Escribe a @sample_contact",
+      "validate_event_time": true,
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "spanish-daytime-open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "necesitamos un defensa",
+            "event_time": "20 agosto 2026 de día",
+            "location": "en [LUGAR]",
+            "open_places": "un defensa",
+            "positions": "defensa",
+            "payment": "20 EUR"
+          },
+          "location": {
+            "mention": "en [LUGAR]",
+            "place_id": "station:redacted:spanish-daytime",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-08-20",
+            "end_local_date": "2026-08-20",
+            "day_part": "daytime",
+            "iana_timezone": "Europe/Madrid"
+          },
+          "open_places": 1,
+          "positions": ["defender"],
+          "payment": "paid",
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    },
+    {
+      "case_id": "accepted-spanish-evening",
+      "source": "Partido 20 agosto 2026 por la tarde en [LUGAR], necesitamos un defensa. Tarifa 30 CHF. Escribe a @sample_contact",
+      "validate_event_time": true,
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "spanish-evening-open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "necesitamos un defensa",
+            "event_time": "20 agosto 2026 por la tarde",
+            "location": "en [LUGAR]",
+            "open_places": "un defensa",
+            "positions": "defensa",
+            "payment": "30 CHF"
+          },
+          "location": {
+            "mention": "en [LUGAR]",
+            "place_id": "station:redacted:spanish-evening",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-08-20",
+            "end_local_date": "2026-08-20",
+            "day_part": "evening",
+            "iana_timezone": "Europe/Madrid"
+          },
+          "open_places": 1,
+          "positions": ["defender"],
+          "payment": "paid",
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
     }
   ]
 }

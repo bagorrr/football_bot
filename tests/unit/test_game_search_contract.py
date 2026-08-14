@@ -132,6 +132,7 @@ def test_run_search_v1_replay_accepts_legacy_sub_city_without_types() -> None:
                 "end_local_date": "2026-08-20",
                 "iana_timezone": "Europe/Moscow",
                 "timezone_data_version": "controlled-tzdb-v1",
+                "legacy_replay_fact": "preserved-only-for-v1-replay",
             },
         },
     )

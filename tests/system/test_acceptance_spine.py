@@ -599,6 +599,9 @@ def test_new_v2_contracts_durably_reject_malformed_replay_without_effect(
         )
         for mismatch in (
             "extra_private_fact",
+            "nested_required_date_private_fact",
+            "zero_telegram_user_id",
+            "negative_telegram_user_id",
             "message_id",
             "subject_id",
             "subject_revision",
@@ -606,6 +609,8 @@ def test_new_v2_contracts_durably_reject_malformed_replay_without_effect(
             "causation_id",
             "correlation_id",
         )
+        if mismatch != "nested_required_date_private_fact"
+        or contract_name is ContractName.RUN_SEARCH
     ),
 )
 def test_v2_search_contracts_fail_closed_on_schema_and_lineage_mismatch(
@@ -669,6 +674,33 @@ def test_v2_search_contracts_fail_closed_on_schema_and_lineage_mismatch(
 
     if mismatch == "extra_private_fact":
         payload["private_contact"] = "must-not-cross-runtime-boundary"
+    elif mismatch == "nested_required_date_private_fact":
+        assert contract_name is ContractName.RUN_SEARCH
+        required_date = payload["required_date"]
+        assert isinstance(required_date, dict)
+        required_date["private_fact"] = "must-not-cross-runtime-boundary"
+    elif mismatch in {"zero_telegram_user_id", "negative_telegram_user_id"}:
+        telegram_user_id = 0 if mismatch == "zero_telegram_user_id" else -1
+        payload["telegram_user_id"] = telegram_user_id
+        run_search_message_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:run-search:{telegram_user_id}:{search_update_id}",
+        )
+        if contract_name is ContractName.RUN_SEARCH:
+            message_id = run_search_message_id
+            subject_id = f"bot-user:{telegram_user_id}"
+            idempotency_key = f"run-search:{telegram_user_id}:{search_update_id}"
+        else:
+            completed_search_id = f"completed-search:{run_search_message_id}"
+            payload["completed_search_id"] = completed_search_id
+            message_id = uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{completed_search_id}:SearchCompleted",
+            )
+            subject_id = completed_search_id
+            idempotency_key = f"search-completed:{completed_search_id}"
+        causation_id = run_search_message_id
+        correlation_id = run_search_message_id
     elif mismatch == "message_id":
         message_id = UUID(int=81)
     elif mismatch == "subject_id":

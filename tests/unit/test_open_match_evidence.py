@@ -13,6 +13,7 @@ from modules.application import (
     _open_places_are_supported,
     _optional_values_are_supported,
     _resolve_source_location_across_supported_locales,
+    _stated_payment_amount_and_currency,
 )
 from modules.domain import (
     GeographicType,
@@ -265,6 +266,73 @@ def test_supported_languages_use_exact_semantic_evidence() -> None:
             "payment": "cuota de 8 €",
         },
     )
+
+
+def test_spanish_daytime_and_evening_evidence_remain_distinct() -> None:
+    daytime_evidence = "Partido 20 agosto 2026 de día"
+    evening_evidence = "Partido 20 agosto 2026 por la tarde"
+
+    assert _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 8, 20),
+        None,
+        daytime_evidence,
+        day_part="daytime",
+    )
+    assert not _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 8, 20),
+        None,
+        daytime_evidence,
+        day_part="evening",
+    )
+    assert _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 8, 20),
+        None,
+        evening_evidence,
+        day_part="evening",
+    )
+    assert not _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 8, 20),
+        None,
+        evening_evidence,
+        day_part="daytime",
+    )
+
+
+def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
+    for evidence in (
+        "Fee 500 EUR",
+        "Участие 900 рублей",
+        "Entrada 20 euros",
+        "Tarif 500 CHF",
+        "€ 25",
+    ):
+        assert _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": evidence},
+        )
+
+    for evidence in (
+        "Fee 500",
+        "Currency EUR will be confirmed",
+        "Budget 500 and currency EUR",
+        "€ currency accepted",
+    ):
+        assert not _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": evidence},
+        )
+
+    assert _stated_payment_amount_and_currency("Fee 500 EUR") == ("500", "EUR")
+    assert _stated_payment_amount_and_currency("Tarif 500 CHF") == ("500", "CHF")
+    assert _stated_payment_amount_and_currency("Fee 1 500 EUR") == (
+        "1 500",
+        "EUR",
+    )
+    assert _stated_payment_amount_and_currency("Fee 500 VIP") is None
 
 
 def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:

@@ -263,11 +263,19 @@ def game_search_result_sort_key(
 ) -> tuple[int, int, str, str, int, str]:
     """Return the complete deterministic intra-search ordering key."""
     facts = dict(result.card_facts)
+    canonical_local_time = facts.get("exact_local_time")
+    if canonical_local_time is None:
+        canonical_local_time = {
+            "morning": "06:00",
+            "daytime": "12:00",
+            "evening": "18:00",
+            "night": "22:00",
+        }.get(facts.get("day_part") or "", "23:59")
     return (
         0 if result.result_class == "confirmed_match" else 1,
         int(facts.get("unknown_criterion_count", "0")),
         facts.get("sort_local_date", facts["start_local_date"]),
-        facts.get("exact_local_time", "23:59"),
+        canonical_local_time,
         -int(facts.get("location_specificity", "0")),
         facts["opportunity_id"],
     )
@@ -961,6 +969,9 @@ def evaluate_game_search(
                 card[key] = json.dumps(facts[key])
         if facts.get("payment"):
             card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
