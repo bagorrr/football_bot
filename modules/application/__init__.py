@@ -5669,6 +5669,45 @@ class RuntimeApplication:
                 IngestionFailureReason.AUTHENTICATION_LOST,
             }:
                 return self._stop_ingestion_role(event.reason)
+            if event.reason in {
+                IngestionFailureReason.ACCESS_LOST,
+                IngestionFailureReason.DIFFERENCE_TOO_LONG,
+                IngestionFailureReason.UNRECOVERABLE_GAP,
+            }:
+                recorded_at = self.clock.now()
+                message_id = uuid5(
+                    NAMESPACE_URL,
+                    f"football-bot:account-stream-stop:{event.reason.value}",
+                )
+                envelope = ContractEnvelope(
+                    contract_name=ContractName.SOURCE_STREAM_STOPPED,
+                    contract_version=1,
+                    message_id=message_id,
+                    producer=RuntimeRole.INGESTION,
+                    consumer=RuntimeRole.APPLICATION,
+                    subject_id=f"account-stream-failure:{message_id}",
+                    subject_revision=1,
+                    idempotency_key=f"account-stream-failure:{message_id}",
+                    causation_id=message_id,
+                    correlation_id=message_id,
+                    recorded_at=recorded_at,
+                    payload={
+                        "source_stream_failure_id": str(message_id),
+                        "scope": IngestionFailureScope.ACCOUNT_STREAM.value,
+                        "failure_reason": event.reason.value,
+                    },
+                )
+                return self.store.stop_account_stream(
+                    failure=IngestionFailure(
+                        ingestion_failure_id=message_id,
+                        scope=IngestionFailureScope.ACCOUNT_STREAM,
+                        reason=event.reason,
+                        source_chat_identity=None,
+                        registry_generation=None,
+                        recorded_at=recorded_at,
+                    ),
+                    envelope=envelope,
+                )
             raise RuntimeError("account difference failure scope is unsupported")
         identity = event.source_chat_identity
         registry_generation = event.registry_generation
@@ -5787,8 +5826,14 @@ class RuntimeApplication:
                 registry_generation=registry_generation,
                 reason=IngestionFailureReason.CHECKPOINT_INVALID,
             )
-        if context is None or context.checkpoint is None:
+        if context is None:
             return False
+        if context.checkpoint is None:
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+            )
         event = self.telegram_ingestion.get_channel_difference_event(
             identity,
             context.checkpoint,

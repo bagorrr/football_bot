@@ -288,6 +288,29 @@ class ControlledTelegramIngestionAdapter:
             reason=parsed_reason,
         )
 
+    def add_account_difference_failure(
+        self,
+        *,
+        checkpoint: TelegramAccountCheckpoint,
+        reason: str,
+    ) -> None:
+        """Configure a body-free account-route access or gap failure."""
+        parsed_reason = IngestionFailureReason(reason)
+        if parsed_reason not in {
+            IngestionFailureReason.ACCESS_LOST,
+            IngestionFailureReason.DIFFERENCE_TOO_LONG,
+            IngestionFailureReason.UNRECOVERABLE_GAP,
+        }:
+            raise ValueError("account-stream failure requires access or gap loss")
+        self._account_difference_events[checkpoint] = TelegramDifferenceFailure(
+            source_chat_identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind.CHAT,
+                telegram_id=1,
+            ),
+            checkpoint=checkpoint,
+            reason=parsed_reason,
+        )
+
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
@@ -1250,6 +1273,18 @@ class AcceptanceSpine:
     def delete_account_ingestion_checkpoint(self) -> None:
         """Inject an unrecoverable missing account checkpoint."""
         self._observer.delete_account_ingestion_checkpoint()
+
+    def delete_channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> None:
+        """Inject an unrecoverable missing channel checkpoint."""
+        self._observer.delete_channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
 
     def process_next_channel_telegram_difference(
         self,

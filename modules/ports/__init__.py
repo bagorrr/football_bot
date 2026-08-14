@@ -878,6 +878,15 @@ class AcceptanceObserver(Protocol):
         """Inject an unrecoverable missing account checkpoint."""
         ...
 
+    def delete_channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> None:
+        """Inject an unrecoverable missing channel checkpoint."""
+        ...
+
     def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
         """Observe SourceEventRecorded outbox signals through the testkit."""
         ...

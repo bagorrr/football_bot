@@ -116,7 +116,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
-    "ce617e72bc56299806d73a7c970d01cf488010547820cc8fe3c39dba183ece57",
+    "72afd32bb34ead03e10852ef3d47a01897b74263994f430063941c681d9f5901",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -631,6 +631,28 @@ class PostgresAcceptanceObserver:
                 "DELETE FROM football_runtime.telegram_account_difference_checkpoints"
             )
 
+    def delete_channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> None:
+        """Delete one channel checkpoint to inject an unrecoverable failure."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            connection.execute(
+                """
+                DELETE FROM football_runtime.telegram_channel_difference_checkpoints
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            )
+
     def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover an immutable envelope through the administrative testkit."""
         with psycopg.connect(
@@ -767,7 +789,7 @@ class PostgresAcceptanceObserver:
             rows = connection.execute(
                 """
                 SELECT message_id, peer_kind, telegram_chat_id,
-                       registry_generation, recorded_at
+                       registry_generation, telegram_message_id, recorded_at
                 FROM football_runtime.protected_content_skips
                 ORDER BY recorded_at, message_id
                 """
@@ -780,6 +802,7 @@ class PostgresAcceptanceObserver:
                     telegram_id=row["telegram_chat_id"],
                 ),
                 registry_generation=row["registry_generation"],
+                telegram_message_id=row["telegram_message_id"],
                 recorded_at=row["recorded_at"],
             )
             for row in rows
@@ -1907,8 +1930,8 @@ class PostgresRoleStore:
                     or not boundary[len(prefix) :].isdigit()
                 ):
                     raise ValueError("Source Chat channel boundary is invalid")
-                channel_pts = int(boundary[len(prefix) :])
-            channel_checkpoint = TelegramChannelCheckpoint(pts=channel_pts)
+            else:
+                channel_checkpoint = TelegramChannelCheckpoint(pts=channel_pts)
         return SourceChatIngestionContext(
             identity=TelegramPeerIdentity(
                 kind=TelegramPeerKind(row["peer_kind"]),
@@ -2242,14 +2265,7 @@ class PostgresRoleStore:
             elif channel_route:
                 channel_pts = context["channel_pts"]
                 if channel_pts is None:
-                    prefix = "channel-pts:"
-                    boundary = context["transport_boundary"]
-                    if (
-                        not boundary.startswith(prefix)
-                        or not boundary[len(prefix) :].isdigit()
-                    ):
-                        raise ValueError("Source Chat channel boundary is invalid")
-                    channel_pts = int(boundary[len(prefix) :])
+                    raise LookupError("Telegram channel checkpoint is unavailable")
                 if TelegramChannelCheckpoint(pts=channel_pts) != event.from_checkpoint:
                     return False
             else:
@@ -2261,15 +2277,28 @@ class PostgresRoleStore:
                 known_transport_identity = (
                     connection.execute(
                         """
-                        SELECT 1
-                        FROM football_runtime.source_event_records
-                        WHERE peer_kind = %s
-                          AND telegram_chat_id = %s
-                          AND registry_generation = %s
-                          AND telegram_message_id = %s
+                        SELECT 1 FROM (
+                            SELECT telegram_message_id
+                            FROM football_runtime.source_event_records
+                            WHERE peer_kind = %s
+                              AND telegram_chat_id = %s
+                              AND registry_generation = %s
+                              AND telegram_message_id = %s
+                            UNION ALL
+                            SELECT telegram_message_id
+                            FROM football_runtime.protected_content_skips
+                            WHERE peer_kind = %s
+                              AND telegram_chat_id = %s
+                              AND registry_generation = %s
+                              AND telegram_message_id = %s
+                        ) AS known_message
                         LIMIT 1
                         """,
                         (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.telegram_message_id,
                             identity.kind.value,
                             identity.telegram_id,
                             registry_generation,
@@ -2286,8 +2315,8 @@ class PostgresRoleStore:
                     """
                     INSERT INTO football_runtime.protected_content_skips (
                         message_id, peer_kind, telegram_chat_id,
-                        registry_generation, recorded_at
-                    ) VALUES (%s, %s, %s, %s, %s)
+                        registry_generation, telegram_message_id, recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (message_id) DO NOTHING
                     RETURNING message_id
                     """,
@@ -2296,6 +2325,7 @@ class PostgresRoleStore:
                         identity.kind.value,
                         identity.telegram_id,
                         registry_generation,
+                        event.telegram_message_id,
                         recorded_at,
                     ),
                 ).fetchone()
@@ -2307,7 +2337,7 @@ class PostgresRoleStore:
                     existing = connection.execute(
                         """
                         SELECT peer_kind, telegram_chat_id,
-                               registry_generation, recorded_at
+                               registry_generation, telegram_message_id
                         FROM football_runtime.protected_content_skips
                         WHERE message_id = %s
                         """,
@@ -2317,7 +2347,7 @@ class PostgresRoleStore:
                         "peer_kind": identity.kind.value,
                         "telegram_chat_id": identity.telegram_id,
                         "registry_generation": registry_generation,
-                        "recorded_at": recorded_at,
+                        "telegram_message_id": event.telegram_message_id,
                     }
                     if existing is None or dict(existing) != expected_skip:
                         raise OutboxConflictError
@@ -2925,6 +2955,46 @@ class PostgresRoleStore:
                     ),
                 )
                 if outgoing is not None:
+                    if (
+                        self._role is RuntimeRole.INGESTION
+                        and outgoing.contract_name
+                        is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
+                        and isinstance(outgoing.payload, dict)
+                        and outgoing.payload.get("telegram_peer_kind") == "channel"
+                    ):
+                        boundary = outgoing.payload.get("transport_boundary")
+                        telegram_chat_id = outgoing.payload.get("telegram_chat_id")
+                        registry_generation = outgoing.payload.get(
+                            "registry_generation"
+                        )
+                        if (
+                            isinstance(boundary, str)
+                            and boundary.startswith("channel-pts:")
+                            and boundary.removeprefix("channel-pts:").isdigit()
+                            and isinstance(telegram_chat_id, int)
+                            and not isinstance(telegram_chat_id, bool)
+                            and isinstance(registry_generation, int)
+                            and not isinstance(registry_generation, bool)
+                        ):
+                            connection.execute(
+                                """
+                                INSERT INTO
+                                    football_runtime.
+                                    telegram_channel_difference_checkpoints (
+                                    peer_kind, telegram_chat_id, registry_generation,
+                                    channel_pts, advanced_at
+                                ) VALUES ('channel', %s, %s, %s, %s)
+                                ON CONFLICT (
+                                    peer_kind, telegram_chat_id, registry_generation
+                                ) DO NOTHING
+                                """,
+                                (
+                                    telegram_chat_id,
+                                    registry_generation,
+                                    int(boundary.removeprefix("channel-pts:")),
+                                    received_at,
+                                ),
+                            )
                     _insert_outbox(connection, outgoing)
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED

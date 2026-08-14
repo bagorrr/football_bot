@@ -5,6 +5,7 @@ CREATE TABLE football_runtime.protected_content_skips (
     peer_kind text NOT NULL CHECK (peer_kind IN ('chat', 'channel')),
     telegram_chat_id bigint NOT NULL CHECK (telegram_chat_id > 0),
     registry_generation bigint NOT NULL CHECK (registry_generation > 0),
+    telegram_message_id bigint NOT NULL CHECK (telegram_message_id > 0),
     recorded_at timestamptz NOT NULL,
     FOREIGN KEY (message_id)
         REFERENCES football_runtime.contract_outbox(message_id)

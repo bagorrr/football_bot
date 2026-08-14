@@ -362,6 +362,13 @@ class ContractEnvelope(RawContractEnvelope):
             and self.contract_version == 3
         ):
             _validate_source_event_recorded(self, self.payload)
+        elif (
+            self.contract_name is ContractName.SOURCE_EVENT_RECORDED
+            and self.contract_version == 4
+        ):
+            _validate_protected_content_skip(self, self.payload)
+        elif self.contract_name is ContractName.SOURCE_STREAM_STOPPED:
+            _validate_source_stream_stopped(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
             _validate_search_completed(
                 self.payload,
@@ -636,6 +643,126 @@ def _validate_source_event_recorded(
         raise TypeError("SourceEventRecorded body must be text or null")
     if event_kind == "delete" and body is not None:
         raise ValueError("SourceEventRecorded deletion must be body-free")
+
+
+def _validate_protected_content_skip(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    if set(payload) != {
+        "ingestion_outcome_id",
+        "outcome",
+        "source_chat_key",
+        "telegram_peer_kind",
+        "telegram_chat_id",
+        "registry_generation",
+    }:
+        raise ValueError("SourceEventRecorded v4 contains unsupported or missing facts")
+    if payload.get("outcome") != "protected_content_skipped":
+        raise ValueError("SourceEventRecorded v4 outcome is invalid")
+    peer_kind = _required_text(payload, "telegram_peer_kind")
+    if peer_kind not in {"chat", "channel"}:
+        raise ValueError("SourceEventRecorded v4 peer kind is invalid")
+    telegram_chat_id = payload.get("telegram_chat_id")
+    registry_generation = payload.get("registry_generation")
+    for value in (telegram_chat_id, registry_generation):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("SourceEventRecorded v4 identities must be positive")
+    if payload.get("source_chat_key") != (
+        f"source-chat:{peer_kind}:{telegram_chat_id}"
+    ):
+        raise ValueError("SourceEventRecorded v4 Source Chat identity is inconsistent")
+    message_id = envelope.message_id
+    if (
+        payload["ingestion_outcome_id"] != str(message_id)
+        or envelope.subject_id != f"protected-content-skip:{message_id}"
+        or envelope.subject_revision != 1
+        or envelope.idempotency_key != f"protected-content-skipped:{message_id}"
+        or envelope.causation_id != message_id
+    ):
+        raise ValueError("SourceEventRecorded v4 identity is not canonical")
+    source_chat_key = str(payload["source_chat_key"])
+    expected_correlation_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{source_chat_key}:generation:{registry_generation}",
+    )
+    if envelope.correlation_id != expected_correlation_id:
+        raise ValueError("SourceEventRecorded v4 correlation is not canonical")
+
+
+def _validate_source_stream_stopped(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    scope = payload.get("scope")
+    reasons_by_scope = {
+        "source_stream": {
+            "protection_unavailable",
+            "checkpoint_unavailable",
+            "checkpoint_invalid",
+            "access_lost",
+            "difference_too_long",
+            "unrecoverable_gap",
+        },
+        "account_stream": {
+            "checkpoint_unavailable",
+            "checkpoint_invalid",
+            "access_lost",
+            "difference_too_long",
+            "unrecoverable_gap",
+        },
+        "ingestion_role": {"session_revoked", "authentication_lost"},
+    }
+    if not isinstance(scope, str) or scope not in reasons_by_scope:
+        raise ValueError("SourceStreamStopped scope is invalid")
+    failure_reason = payload.get("failure_reason")
+    if failure_reason not in reasons_by_scope[scope]:
+        raise ValueError("SourceStreamStopped failure reason is invalid for its scope")
+    common_fields = {"source_stream_failure_id", "scope", "failure_reason"}
+    source_fields = {
+        "source_chat_key",
+        "telegram_peer_kind",
+        "telegram_chat_id",
+        "registry_generation",
+    }
+    expected_fields = (
+        common_fields | source_fields if scope == "source_stream" else common_fields
+    )
+    if set(payload) != expected_fields:
+        raise ValueError("SourceStreamStopped contains unsupported or missing facts")
+    message_id = envelope.message_id
+    subject_prefix = {
+        "source_stream": "source-stream-failure",
+        "account_stream": "account-stream-failure",
+        "ingestion_role": "ingestion-role-failure",
+    }[scope]
+    if (
+        payload["source_stream_failure_id"] != str(message_id)
+        or envelope.subject_id != f"{subject_prefix}:{message_id}"
+        or envelope.subject_revision != 1
+        or envelope.idempotency_key != f"{subject_prefix}:{message_id}"
+        or envelope.causation_id != message_id
+    ):
+        raise ValueError("SourceStreamStopped identity is not canonical")
+    expected_correlation_id = message_id
+    if scope == "source_stream":
+        peer_kind = payload.get("telegram_peer_kind")
+        if peer_kind not in {"chat", "channel"}:
+            raise ValueError("SourceStreamStopped peer kind is invalid")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        registry_generation = payload.get("registry_generation")
+        for value in (telegram_chat_id, registry_generation):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError("SourceStreamStopped identities must be positive")
+        source_chat_key = f"source-chat:{peer_kind}:{telegram_chat_id}"
+        if payload.get("source_chat_key") != source_chat_key:
+            raise ValueError("SourceStreamStopped Source Chat identity is inconsistent")
+        expected_correlation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{source_chat_key}:generation:{registry_generation}",
+        )
+    if envelope.correlation_id != expected_correlation_id:
+        raise ValueError("SourceStreamStopped correlation is not canonical")
 
 
 def _validate_source_chat_contract(

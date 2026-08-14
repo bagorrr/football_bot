@@ -355,6 +355,7 @@ class ProtectedContentSkip:
     protected_content_skip_id: UUID
     source_chat_identity: TelegramPeerIdentity
     registry_generation: int
+    telegram_message_id: int
     recorded_at: datetime
 
 
