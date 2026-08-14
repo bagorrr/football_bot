@@ -2088,6 +2088,17 @@ class PostgresRoleStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 ("source-ingestion:account",),
             )
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            ):
+                return False
             account_checkpoint = connection.execute(
                 """
                 SELECT pts, qts, seq, checkpoint_date
@@ -2162,6 +2173,17 @@ class PostgresRoleStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (lock_key,),
             )
+            if account_route and (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            ):
+                return False
             if (
                 connection.execute(
                     """

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import psycopg
@@ -13,12 +13,15 @@ import pytest
 
 from modules.contracts import ContractName, FailureCode, RuntimeRole
 from modules.domain import (
+    IngestionFailureReason,
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
+    TelegramDifferenceEvent,
+    TelegramDifferenceFailure,
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
@@ -44,6 +47,22 @@ class _SteppingClock(FrozenClock):
         if self.step is not None:
             self.instant += self.step
         return instant
+
+
+@dataclass(slots=True)
+class _SequencedAccountDifferenceAdapter(ControlledTelegramIngestionAdapter):
+    account_results: list[TelegramDifferenceEvent | TelegramDifferenceFailure] = field(
+        default_factory=list
+    )
+
+    def get_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+    ) -> TelegramDifferenceEvent | TelegramDifferenceFailure | None:
+        self.account_difference_requests.append(checkpoint)
+        if not self.account_results:
+            return None
+        return self.account_results.pop(0)
 
 
 def test_account_difference_commits_checkpoint_event_and_application_effect() -> None:
@@ -1563,6 +1582,176 @@ def test_concurrent_duplicate_account_stream_stops_keep_the_first_observation() 
     assert len(contracts) == 1
     assert contracts[0].recorded_at == failures[0].recorded_at
     assert clock.instant == sampled_from + timedelta(seconds=2)
+    system.reset()
+
+
+def test_account_stream_stop_wins_before_eligible_event_commit() -> None:
+    telethon = _SequencedAccountDifferenceAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 11, 4, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_800_220,
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4813,
+        qts=83,
+        seq=483,
+        date=datetime(2026, 9, 14, 11, 3, tzinfo=UTC),
+    )
+    advanced_checkpoint = TelegramAccountCheckpoint(
+        pts=4814,
+        qts=84,
+        seq=484,
+        date=datetime(2026, 9, 14, 11, 4, tzinfo=UTC),
+    )
+    telethon.allow_public_username(
+        address="@account_stop_race_eligible",
+        identity=identity,
+        transport_boundary="chat-sequence:483",
+    )
+    telethon.account_results.extend(
+        (
+            TelegramDifferenceFailure(
+                source_chat_identity=identity,
+                checkpoint=initial_checkpoint,
+                reason=IngestionFailureReason.ACCESS_LOST,
+            ),
+            TelegramDifferenceEvent(
+                source_chat_identity=identity,
+                from_checkpoint=initial_checkpoint,
+                to_checkpoint=advanced_checkpoint,
+                source_event_id="source-event:account-stop-race:eligible:1",
+                telegram_message_id=231,
+                revision=1,
+                kind=SourceEventKind.CREATE,
+                body="Eligible event staged before the account stop.",
+                event_time=advanced_checkpoint.date,
+            ),
+        )
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_002,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 14, 11, 4, tzinfo=UTC),
+        administrator_id=48_002,
+        address="@account_stop_race_eligible",
+        update_suffix="account-stop-race-eligible",
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    database_url = os.environ["TEST_DATABASE_URL"]
+
+    with (
+        psycopg.connect(database_url) as gate,
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        gate.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            ("source-ingestion:account",),
+        )
+        stop_attempt = executor.submit(system.process_next_account_telegram_difference)
+        _wait_for_blocked_database_sessions(database_url, minimum=1)
+        event_attempt = executor.submit(system.process_next_account_telegram_difference)
+        _wait_for_blocked_database_sessions(database_url, minimum=2)
+        gate.commit()
+        stop_result = stop_attempt.result(timeout=5)
+        event_result = event_attempt.result(timeout=5)
+
+    assert stop_result
+    assert not event_result
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+    assert len(system.ingestion_failures()) == 1
+    assert len(system.source_stream_stop_contracts()) == 1
+    system.reset()
+
+
+def test_account_stream_stop_wins_before_ineligible_event_discard() -> None:
+    telethon = _SequencedAccountDifferenceAdapter()
+    clock = FrozenClock(datetime(2026, 8, 14, 11, 5, tzinfo=UTC))
+    ineligible_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_800_221,
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4815,
+        qts=85,
+        seq=485,
+        date=datetime(2026, 9, 14, 11, 4, tzinfo=UTC),
+    )
+    advanced_checkpoint = TelegramAccountCheckpoint(
+        pts=4816,
+        qts=86,
+        seq=486,
+        date=datetime(2026, 9, 14, 11, 5, tzinfo=UTC),
+    )
+    telethon.account_results.extend(
+        (
+            TelegramDifferenceFailure(
+                source_chat_identity=ineligible_identity,
+                checkpoint=initial_checkpoint,
+                reason=IngestionFailureReason.ACCESS_LOST,
+            ),
+            TelegramDifferenceEvent(
+                source_chat_identity=ineligible_identity,
+                from_checkpoint=initial_checkpoint,
+                to_checkpoint=advanced_checkpoint,
+                source_event_id="source-event:account-stop-race:ineligible:1",
+                telegram_message_id=232,
+                revision=1,
+                kind=SourceEventKind.CREATE,
+                body="Ineligible event staged before the account stop.",
+                event_time=advanced_checkpoint.date,
+            ),
+        )
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+    )
+    system.reset()
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    database_url = os.environ["TEST_DATABASE_URL"]
+
+    with (
+        psycopg.connect(database_url) as gate,
+        ThreadPoolExecutor(max_workers=2) as executor,
+    ):
+        gate.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            ("source-ingestion:account",),
+        )
+        stop_attempt = executor.submit(system.process_next_account_telegram_difference)
+        _wait_for_blocked_database_sessions(database_url, minimum=1)
+        discard_attempt = executor.submit(
+            system.process_next_account_telegram_difference
+        )
+        _wait_for_blocked_database_sessions(database_url, minimum=2)
+        gate.commit()
+        stop_result = stop_attempt.result(timeout=5)
+        discard_result = discard_attempt.result(timeout=5)
+
+    assert stop_result
+    assert not discard_result
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
+    assert system.source_events() == ()
+    assert system.source_event_contracts() == ()
+    assert len(system.ingestion_failures()) == 1
+    assert len(system.source_stream_stop_contracts()) == 1
     system.reset()
 
 
