@@ -203,6 +203,18 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             )
         ),
     )
+    dates.return_for(
+        text="21 to 23 August",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 21),
+                    end_local_date=date(2026, 8, 23),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
     timezones.add_source(
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
@@ -2133,6 +2145,20 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "francs suisses",
             "fr",
         ),
+        ("dirhams", "at 06:02", None, "06:02", "500", "dirhams", "en"),
+        ("hryvnia", "в 12:02", None, "12:02", "500", "гривен", "ru"),
+        ("soles", "a las 18:02", None, "18:02", "500", "soles", "es"),
+        ("dinars", "à 22:02", None, "22:02", "500", "dinars", "fr"),
+        ("cfa-francs", "à 23:58", None, "23:58", "500", "francs CFA", "fr"),
+        (
+            "mexican-pesos",
+            "a las 18:03",
+            None,
+            "18:03",
+            "500",
+            "pesos mexicanos",
+            "es",
+        ),
     )
     for offset, (
         label,
@@ -2256,8 +2282,158 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         assert len(system.completed_searches(currency_user_id)) == 1
         assert system.results(currency_search.completed_search_id) == currency_snapshot
 
+    range_cases = (
+        (
+            "relative-range-six-players",
+            "Match tomorrow through Sunday at 07:17 на Петроградской. "
+            "Need six players. Contact @relative_range_six",
+            "tomorrow through Sunday at 07:17",
+            "Need six players",
+            "2026-08-21",
+            "2026-08-23",
+            "07:17",
+            datetime(2026, 8, 20, 9, 0, tzinfo=UTC),
+            "21 to 23 August",
+            "en",
+        ),
+        (
+            "spanish-compact-range-six-players",
+            "Partido 20–22 de agosto de 2026 a las 07:18 на Петроградской. "
+            "Necesitamos seis jugadores. Escribe a @compact_range_six",
+            "20–22 de agosto de 2026 a las 07:18",
+            "Necesitamos seis jugadores",
+            "2026-08-20",
+            "2026-08-22",
+            "07:18",
+            datetime(2026, 8, 20, 9, 1, tzinfo=UTC),
+            "20 August",
+            "es",
+        ),
+    )
+    range_opportunities = {}
+    for offset, (
+        label,
+        range_body,
+        range_time_evidence,
+        range_open_places_evidence,
+        range_start,
+        range_end,
+        range_exact_time,
+        range_source_time,
+        _date_text,
+        _locale,
+    ) in enumerate(range_cases, start=1):
+        username = (
+            "@relative_range_six"
+            if label == "relative-range-six-players"
+            else "@compact_range_six"
+        )
+        classifier.return_for(
+            body=range_body,
+            result=_minimal_classifier_result(
+                candidate_key=label,
+                body=range_body,
+                response_routes=[
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": username,
+                        "evidence": username,
+                    }
+                ],
+                event_time_evidence=range_time_evidence,
+                exact_local_time=range_exact_time,
+                start_local_date=range_start,
+                end_local_date=range_end,
+                opportunity_evidence=range_open_places_evidence,
+                open_places_evidence=range_open_places_evidence,
+                open_places=6,
+            ),
+        )
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=4938 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4939 + offset),
+            source_event_id=f"source-event:open-match:{label}",
+            telegram_message_id=1050 + offset,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=range_body,
+            event_time=range_source_time,
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        range_opportunities[label] = next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.source_message_revision_id.endswith(
+                f":{1050 + offset}:revision:1"
+            )
+        )
+
+    for offset, (
+        label,
+        _range_body,
+        _range_time_evidence,
+        _range_open_places_evidence,
+        _range_start,
+        _range_end,
+        range_exact_time,
+        _range_source_time,
+        date_text,
+        locale,
+    ) in enumerate(range_cases, start=40):
+        range_user_id = bot_user_id + offset
+        _advance_to_complete_game_search(
+            system,
+            bot_user_id=range_user_id,
+            locale=locale,
+            date_text=date_text,
+        )
+        range_update_id = f"submit-{label}-search"
+        range_screen_revision = system.discovery_draft(range_user_id).screen_revision
+        system.submit_search(
+            update_id=range_update_id,
+            telegram_user_id=range_user_id,
+            screen_revision=range_screen_revision,
+            game_search_details={"times": [range_exact_time]},
+        )
+        system.process_searches_until_idle()
+        range_search = system.completed_searches(range_user_id)[0]
+        range_snapshot = system.results(range_search.completed_search_id)
+        range_result = next(
+            result
+            for result in range_snapshot
+            if dict(result.card_facts)["opportunity_id"]
+            == range_opportunities[label].opportunity_id
+        )
+        assert range_result.result_class == "confirmed_match"
+        assert "6" in telegram_delivery.messages[-1].text
+        range_inputs = system.completed_search_opportunity_revision_inputs(
+            range_search.completed_search_id
+        )
+        range_accepted_facts = next(
+            revision_input["accepted_facts"]
+            for revision_input in range_inputs
+            if revision_input["opportunity_revision_id"]
+            == range_opportunities[label].opportunity_revision_id
+        )
+        assert isinstance(range_accepted_facts, dict)
+        assert range_accepted_facts["open_places"] == 6
+        system.submit_search(
+            update_id=range_update_id,
+            telegram_user_id=range_user_id,
+            screen_revision=range_screen_revision,
+            game_search_details={"times": [range_exact_time]},
+        )
+        system.process_searches_until_idle()
+        assert len(system.completed_searches(range_user_id)) == 1
+        assert system.results(range_search.completed_search_id) == range_snapshot
+
     exact_end_of_day = currency_opportunities["swiss-francs"]
-    end_of_day_ordering_user_id = bot_user_id + 30
+    end_of_day_ordering_user_id = bot_user_id + 60
     _advance_to_complete_game_search(
         system,
         bot_user_id=end_of_day_ordering_user_id,
@@ -2299,26 +2475,95 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "@invalid_unrelated_range",
             "20 августа 2026. День рождения игрока 10 сентября 2026",
             None,
+            None,
             "2026-08-20",
             "2026-09-10",
+            1,
+            "один игрок",
         ),
         (
             "negated-day-part",
-            "Partido 20 agosto 2026 no por la tarde, на Петроградской нужен один "
-            "игрок. Пишите @invalid_negated_day_part",
-            "20 agosto 2026 no por la tarde",
+            "Partido 20 agosto 2026, no queremos jugar fútbol por la tarde, "
+            "на Петроградской нужен один игрок. Пишите @invalid_negated_day_part",
+            "20 agosto 2026, no queremos jugar fútbol por la tarde",
             "evening",
+            None,
             "2026-08-20",
             "2026-08-20",
+            1,
+            "один игрок",
         ),
         (
             "competing-day-parts",
-            "Partido 20 agosto 2026 de día o por la tarde, на Петроградской нужен "
-            "один игрок. Пишите @invalid_competing_day_parts",
-            "20 agosto 2026 de día o por la tarde",
+            "Partido 20 agosto 2026 de día; el partido será realmente por la tarde, "
+            "на Петроградской нужен один игрок. Пишите @invalid_competing_day_parts",
+            "20 agosto 2026 de día; el partido será realmente por la tarde",
             "daytime",
+            None,
             "2026-08-20",
             "2026-08-20",
+            1,
+            "один игрок",
+        ),
+        (
+            "negated-exact-time",
+            "Match 20 August 2026 not at 19:00 на Петроградской, нужен один игрок. "
+            "Пишите @invalid_negated_exact_time",
+            "20 August 2026 not at 19:00",
+            None,
+            "19:00",
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "один игрок",
+        ),
+        (
+            "score-only-exact-time",
+            "Previous score was 23:59. Match 20 August 2026 на Петроградской, "
+            "нужен один игрок. Пишите @invalid_score_only_exact_time",
+            "Previous score was 23:59. Match 20 August 2026",
+            None,
+            "23:59",
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "один игрок",
+        ),
+        (
+            "english-closed-players",
+            "Match 20 August 2026 на Петроградской. No longer need 2 players. "
+            "Пишите @invalid_english_closed_players",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "No longer need 2 players",
+        ),
+        (
+            "russian-closed-players",
+            "Матч 20 августа 2026 на Петроградской. Больше не нужно два игрока. "
+            "Пишите @invalid_russian_closed_players",
+            "20 августа 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "Больше не нужно два игрока",
+        ),
+        (
+            "spanish-closed-players",
+            "Partido 20 agosto 2026 на Петроградской. Ya no necesitamos dos "
+            "jugadores. Пишите @invalid_spanish_closed_players",
+            "20 agosto 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "Ya no necesitamos dos jugadores",
         ),
     )
     opportunities_before_invalid_evidence = len(system.opportunities())
@@ -2328,8 +2573,11 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         invalid_body,
         event_time_evidence,
         invalid_day_part,
+        invalid_exact_time,
         start_local_date,
         end_local_date,
+        invalid_open_places,
+        invalid_open_places_evidence,
     ) in enumerate(invalid_evidence_cases, start=1):
         invalid_result = _minimal_classifier_result(
             candidate_key=label,
@@ -2343,17 +2591,21 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             ],
             event_time_evidence=event_time_evidence,
             day_part=invalid_day_part,
+            exact_local_time=invalid_exact_time,
             start_local_date=start_local_date,
             end_local_date=end_local_date,
+            opportunity_evidence=invalid_open_places_evidence,
+            open_places_evidence=invalid_open_places_evidence,
+            open_places=invalid_open_places,
         )
         classifier.return_for(body=invalid_body, result=invalid_result)
-        message_id = 1035 + offset
+        message_id = 1060 + offset
         invalid_message_ids.append(message_id)
         source_event_id = f"source-event:open-match:{label}"
         telegram_ingestion.add_channel_difference_event(
             identity=source_identity,
-            from_checkpoint=TelegramChannelCheckpoint(pts=4932 + offset),
-            to_checkpoint=TelegramChannelCheckpoint(pts=4933 + offset),
+            from_checkpoint=TelegramChannelCheckpoint(pts=4940 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4941 + offset),
             source_event_id=source_event_id,
             telegram_message_id=message_id,
             revision=1,
@@ -2371,7 +2623,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         system.process_opportunities_until_idle()
         assert len(system.opportunities()) == opportunities_before_invalid_evidence
 
-    invalid_evidence_user_id = bot_user_id + 31
+    invalid_evidence_user_id = bot_user_id + 61
     _advance_to_complete_game_search(
         system,
         bot_user_id=invalid_evidence_user_id,
@@ -2455,6 +2707,9 @@ def _minimal_classifier_result(
     exact_local_time: str | None = None,
     start_local_date: str = "2026-08-20",
     end_local_date: str | None = None,
+    opportunity_evidence: str = "нужен один игрок",
+    open_places_evidence: str = "один игрок",
+    open_places: int = 1,
 ) -> ClassifierAdapterResult:
     event_time: dict[str, JsonValue] = {
         "start_local_date": start_local_date,
@@ -2473,10 +2728,10 @@ def _minimal_classifier_result(
                 "candidate_key": candidate_key,
                 "opportunity_type": "open_match",
                 "evidence": {
-                    "opportunity": "нужен один игрок",
+                    "opportunity": opportunity_evidence,
                     "event_time": event_time_evidence,
                     "location": "на Петроградской",
-                    "open_places": "один игрок",
+                    "open_places": open_places_evidence,
                 },
                 "location": {
                     "mention": "на Петроградской",
@@ -2485,7 +2740,7 @@ def _minimal_classifier_result(
                     "city_id": "city:ru:saint-petersburg",
                 },
                 "event_time": event_time,
-                "open_places": 1,
+                "open_places": open_places,
                 "response_routes": response_routes,
             }
         ],
@@ -2509,6 +2764,7 @@ def _advance_to_complete_game_search(
     bot_user_id: int,
     locale: str = "en",
     area_text: str = "whole city",
+    date_text: str = "20 August",
 ) -> None:
     system.start_bot_user(
         update_id=f"start:open-match-user:{bot_user_id}",
@@ -2543,5 +2799,5 @@ def _advance_to_complete_game_search(
     system.submit_required_date_text(
         update_id=f"date:open-match-user:{bot_user_id}",
         telegram_user_id=bot_user_id,
-        text="20 August",
+        text=date_text,
     )

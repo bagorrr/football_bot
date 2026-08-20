@@ -328,6 +328,38 @@ def test_temporal_range_endpoints_must_belong_to_one_cited_expression() -> None:
     )
 
 
+def test_relative_and_compact_ranges_preserve_both_related_endpoints() -> None:
+    source_event_time = datetime(2026, 8, 20, 9, 0, tzinfo=ZoneInfo("UTC"))
+    relative_cases = (
+        ("tomorrow through Sunday", "Europe/London"),
+        ("завтра по воскресенье", "Europe/Moscow"),
+        ("mañana hasta domingo", "Europe/Madrid"),
+        ("demain jusqu’à dimanche", "Europe/Paris"),
+    )
+    for evidence, timezone in relative_cases:
+        assert _event_time_is_supported(
+            date(2026, 8, 21),
+            date(2026, 8, 23),
+            None,
+            evidence,
+            source_event_time=source_event_time,
+            source_timezone=timezone,
+        )
+
+    for evidence in (
+        "20–22 August 2026",
+        "20–22 августа 2026",
+        "20–22 de agosto de 2026",
+        "20–22 août 2026",
+    ):
+        assert _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 22),
+            None,
+            evidence,
+        )
+
+
 def test_spanish_day_part_evidence_rejects_negation_and_competing_markers() -> None:
     for day_part in ("daytime", "evening"):
         assert not _event_time_is_supported(
@@ -352,6 +384,63 @@ def test_spanish_day_part_evidence_rejects_negation_and_competing_markers() -> N
         "20 agosto 2026 no por la tarde",
         day_part="evening",
     )
+
+
+def test_temporal_details_require_one_positive_event_expression() -> None:
+    invalid_cases = (
+        (None, "evening", "20 agosto 2026, no queremos jugar fútbol por la tarde"),
+        (
+            None,
+            "daytime",
+            "20 agosto 2026 de día; el partido será realmente por la tarde",
+        ),
+        ("19:00", None, "20 August 2026 not at 19:00"),
+        ("23:59", None, "Previous score was 23:59. Match 20 August 2026"),
+    )
+    for exact_time, day_part, evidence in invalid_cases:
+        assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            exact_time,
+            evidence,
+            day_part=day_part,
+        )
+
+    valid_cases = (
+        ("19:00", None, "Match 20 August 2026 at 19:00"),
+        ("19:00", None, "Матч 20 августа 2026 в 19:00"),
+        (None, "evening", "Partido 20 agosto 2026 por la tarde"),
+        (None, "evening", "Match le 20 août 2026 le soir"),
+    )
+    for exact_time, day_part, evidence in valid_cases:
+        assert _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            exact_time,
+            evidence,
+            day_part=day_part,
+        )
+
+
+def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
+    positive_cases = (
+        (6, "Need six players"),
+        (6, "Нужно шесть игроков"),
+        (6, "Necesitamos seis jugadores"),
+        (6, "Besoin de six joueurs"),
+        (27, "Need 27 players"),
+    )
+    for open_places, evidence in positive_cases:
+        assert _open_places_are_supported(open_places, evidence)
+    assert not _open_places_are_supported(0, "Need 0 players")
+
+    for evidence in (
+        "No longer need 2 players",
+        "Больше не нужно два игрока",
+        "Ya no necesitamos dos jugadores",
+        "Nous n’avons plus besoin de deux joueurs",
+    ):
+        assert not _open_places_are_supported(2, evidence)
 
 
 def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
@@ -401,6 +490,27 @@ def test_explicit_amount_and_currency_establishes_paid_without_inference() -> No
     assert _stated_payment_amount_and_currency("Fee 500") is None
     assert _stated_payment_amount_and_currency("Fee 500 real") is None
     assert _stated_payment_amount_and_currency("Fee 500 VIP") is None
+
+
+def test_named_currencies_preserve_the_complete_source_span() -> None:
+    cases = (
+        ("Fee 500 dirhams", ("500", "dirhams")),
+        ("Участие 500 гривен", ("500", "гривен")),
+        ("Entrada 500 soles", ("500", "soles")),
+        ("Tarif 500 dinars", ("500", "dinars")),
+        ("Tarif 500 francs CFA", ("500", "francs CFA")),
+        ("Entrada 500 pesos mexicanos", ("500", "pesos mexicanos")),
+        ("Fee 500 aEd", ("500", "aEd")),
+    )
+    for evidence, expected in cases:
+        assert _stated_payment_amount_and_currency(evidence) == expected
+        assert _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": evidence},
+        )
+
+    assert _stated_payment_amount_and_currency("Fee 500") is None
+    assert _stated_payment_amount_and_currency("Fee 500 real") is None
 
 
 def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:

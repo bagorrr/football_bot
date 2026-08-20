@@ -1,5 +1,7 @@
 """Deterministic, credential-free classifier regression gate."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual evidence is intentional.
+
 from __future__ import annotations
 
 import json
@@ -9,6 +11,7 @@ from pathlib import Path
 
 from modules.application import (
     _event_time_is_supported,
+    _open_places_are_supported,
     _optional_values_are_supported,
     _stated_payment_amount_and_currency,
 )
@@ -170,6 +173,37 @@ def test_offline_corpus_rejects_unrelated_numeric_date_cooccurrence() -> None:
     )
 
 
+def test_offline_corpus_accepts_related_ranges_in_all_supported_locales() -> None:
+    source_event_time = datetime.fromisoformat("2026-08-20T09:00:00+00:00")
+    for evidence, timezone in (
+        ("tomorrow through Sunday", "Europe/London"),
+        ("завтра по воскресенье", "Europe/Moscow"),
+        ("mañana hasta domingo", "Europe/Madrid"),
+        ("demain jusqu’à dimanche", "Europe/Paris"),
+    ):
+        assert _event_time_is_supported(
+            date(2026, 8, 21),
+            date(2026, 8, 23),
+            None,
+            evidence,
+            source_event_time=source_event_time,
+            source_timezone=timezone,
+        )
+
+    for evidence in (
+        "20–22 August 2026",
+        "20–22 августа 2026",
+        "20–22 de agosto de 2026",
+        "20–22 août 2026",
+    ):
+        assert _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 22),
+            None,
+            evidence,
+        )
+
+
 def test_offline_day_part_evidence_rejects_cross_value_negation_and_ambiguity() -> None:
     for day_part in ("daytime", "evening"):
         assert not _event_time_is_supported(
@@ -188,6 +222,45 @@ def test_offline_day_part_evidence_rejects_cross_value_negation_and_ambiguity() 
         )
 
 
+def test_offline_temporal_details_are_positive_and_event_bound() -> None:
+    for exact_time, day_part, evidence in (
+        (None, "evening", "20 agosto 2026, no queremos jugar fútbol por la tarde"),
+        (
+            None,
+            "daytime",
+            "20 agosto 2026 de día; el partido será realmente por la tarde",
+        ),
+        ("19:00", None, "20 August 2026 not at 19:00"),
+        ("23:59", None, "Previous score was 23:59. Match 20 August 2026"),
+    ):
+        assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            exact_time,
+            evidence,
+            day_part=day_part,
+        )
+
+
+def test_offline_open_player_evidence_is_complete_and_polarity_safe() -> None:
+    for evidence in (
+        "Need six players",
+        "Нужно шесть игроков",
+        "Necesitamos seis jugadores",
+        "Besoin de six joueurs",
+    ):
+        assert _open_places_are_supported(6, evidence)
+    assert _open_places_are_supported(27, "Need 27 players")
+
+    for evidence in (
+        "No longer need 2 players",
+        "Больше не нужно два игрока",
+        "Ya no necesitamos dos jugadores",
+        "Nous n’avons plus besoin de deux joueurs",
+    ):
+        assert not _open_places_are_supported(2, evidence)
+
+
 def test_offline_payment_evidence_covers_four_locales_without_inference() -> None:
     cases = (
         ("Fee 500 EUR", ("500", "EUR")),
@@ -199,6 +272,13 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         ("Fee 500 yen", ("500", "yen")),
         ("Fee 500 cad", ("500", "cad")),
         ("Tarif 500 francs suisses", ("500", "francs suisses")),
+        ("Fee 500 dirhams", ("500", "dirhams")),
+        ("Участие 500 гривен", ("500", "гривен")),
+        ("Entrada 500 soles", ("500", "soles")),
+        ("Tarif 500 dinars", ("500", "dinars")),
+        ("Tarif 500 francs CFA", ("500", "francs CFA")),
+        ("Entrada 500 pesos mexicanos", ("500", "pesos mexicanos")),
+        ("Fee 500 aEd", ("500", "aEd")),
     )
     for evidence, expected_details in cases:
         assert _optional_values_are_supported(

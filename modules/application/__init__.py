@@ -9221,7 +9221,8 @@ def _event_time_is_supported(
         stems = "|".join(re.escape(stem) + r"\w*" for stem in month_stems[start.month])
         compact_range = re.search(
             rf"(?<!\d){start.day}(?!\d)\s*[-–—]\s*"
-            rf"{end.day}(?!\d)\s+(?:{stems})\s*,?\s*{start.year}(?!\d)",
+            rf"{end.day}(?!\d)\s+(?:de\s+)?(?:{stems})"
+            rf"(?:\s+de)?\s*,?\s*{start.year}(?!\d)",
             normalized,
         )
         if compact_range is not None:
@@ -9283,8 +9284,7 @@ def _event_time_is_supported(
             ),
         }
         if (
-            start != end
-            or source_event_time is None
+            source_event_time is None
             or source_event_time.tzinfo is None
             or source_timezone is None
         ):
@@ -9312,13 +9312,22 @@ def _event_time_is_supported(
             for pattern in patterns
             for match in re.finditer(pattern, normalized)
         )
+        expected_relative_dates = {start, end}
         if not relative_candidates or any(
-            candidate_date != start for _, candidate_date in relative_candidates
+            candidate_date not in expected_relative_dates
+            for _, candidate_date in relative_candidates
         ):
             return False
-        relative_spans = [span for span, _ in relative_candidates]
-        spans = relative_spans
-        end_spans = relative_spans
+        spans = [
+            span
+            for span, candidate_date in relative_candidates
+            if candidate_date == start
+        ]
+        end_spans = [
+            span
+            for span, candidate_date in relative_candidates
+            if candidate_date == end
+        ]
     if not spans or not end_spans:
         return False
     if start != end and not any(
@@ -9338,6 +9347,23 @@ def _event_time_is_supported(
         return False
     expression_start = min(span[0] for span in spans)
     expression_end = max(span[1] for span in end_spans)
+    expression_boundary = re.compile(r"[.!?;\n]")
+    prior_boundary = list(expression_boundary.finditer(normalized, 0, expression_start))
+    expression_clause_start = prior_boundary[-1].end() if prior_boundary else 0
+    next_boundary = expression_boundary.search(normalized, expression_end)
+    expression_clause_end = next_boundary.start() if next_boundary else len(normalized)
+
+    def marker_is_negated(match: re.Match[str]) -> bool:
+        marker_prefix = normalized[expression_clause_start : match.start()]
+        return (
+            re.search(
+                r"(?:\bno\b|\bnot\b|\bne\b|\bn['’]|\bpas\b|\bне\b|\bни\b|"
+                r"\bsin\b|\bsans\b)(?:\s+[^.!?;\n]*)?$",
+                marker_prefix,
+            )
+            is not None
+        )
+
     if day_part is not None:
         day_part_patterns = {
             "morning": (
@@ -9365,40 +9391,46 @@ def _event_time_is_supported(
         }
         if day_part not in day_part_patterns:
             return False
-        nearby_matches = {
+        all_matches = {
             candidate: [
                 match
                 for pattern in patterns
                 for match in re.finditer(pattern, normalized)
-                if match.start() <= expression_end + 32
-                and match.end() >= expression_start - 32
             ]
             for candidate, patterns in day_part_patterns.items()
         }
         stated_day_parts = {
-            candidate for candidate, matches in nearby_matches.items() if matches
+            candidate for candidate, matches in all_matches.items() if matches
         }
         if stated_day_parts != {day_part}:
             return False
-        negation = re.compile(
-            r"(?:\bno\b|\bnot\b|\bne\b|\bpas\b|\bне\b|\bни\b|\bsin\b|"
-            r"\bsans\b)(?:\s+\w+){0,2}\s*$"
-        )
-        if any(
-            negation.search(normalized[max(0, match.start() - 32) : match.start()])
-            for match in nearby_matches[day_part]
-        ):
+        if any(marker_is_negated(match) for match in all_matches[day_part]):
             return False
     if exact_time is None:
         return True
-    time_matches = list(re.finditer(rf"(?<!\d){re.escape(exact_time)}(?!\d)", evidence))
-    return any(
-        match.start() <= expression_end + 32 and match.end() >= expression_start - 32
-        for match in time_matches
+    all_clock_matches = list(
+        re.finditer(r"(?<!\d)(?:[01]\d|2[0-3]):[0-5]\d(?!\d)", normalized)
+    )
+    if len(all_clock_matches) != 1:
+        return False
+    time_match = all_clock_matches[0]
+    containing_clause = normalized[expression_clause_start:expression_clause_end]
+    return bool(
+        time_match.group() == exact_time.casefold()
+        and expression_clause_start <= time_match.start() < expression_clause_end
+        and not marker_is_negated(time_match)
+        and re.search(
+            r"\b(?:score|scored|result|previous\s+score|сч[её]т|забил\w*|"
+            r"resultado|marcador|r[ée]sultat)\b",
+            containing_clause,
+        )
+        is None
     )
 
 
 def _open_places_are_supported(open_places: int, evidence: str) -> bool:
+    if open_places <= 0:
+        return False
     evidence_tokens = re.findall(r"[^\W_]+", evidence.casefold())
     evidence_words = set(evidence_tokens)
     cardinal_words = {
@@ -9407,6 +9439,11 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
         3: {"three", "три", "tres", "trois", "3"},
         4: {"four", "четыре", "четырёх", "четырех", "cuatro", "quatre", "4"},
         5: {"five", "пять", "cinco", "cinq", "5"},
+        6: {"six", "шесть", "seis", "6"},
+        7: {"seven", "семь", "siete", "sept", "7"},
+        8: {"eight", "восемь", "ocho", "huit", "8"},
+        9: {"nine", "девять", "nueve", "neuf", "9"},
+        10: {"ten", "десять", "diez", "dix", "10"},
     }
     generic_opening_words = {
         "place",
@@ -9487,6 +9524,18 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
     )
     has_supported_counted_opening = False
     for clause in re.split(r"[.!?;\n]+", evidence.casefold()):
+        normalized_clause = re.sub(r"['’]", " ", clause)
+        if (
+            re.search(
+                r"(?:\bno\s+longer\b|\b(?:do|does|did)\s+not\b|\bnot\s+need\b|"
+                r"\bya\s+no\b|\bno\s+(?:necesit|busc)\w*|\bбольше\s+не\b|"
+                r"\bне\s+(?:нуж|ищ|треб)\w*|\bn\s+\w+\s+plus\s+besoin\b|"
+                r"\bplus\s+besoin\b|\bpas\s+besoin\b)",
+                normalized_clause,
+            )
+            is not None
+        ):
+            continue
         clause_tokens = re.findall(r"[^\W_]+", clause)
         cardinal_indexes = {
             index
@@ -9522,7 +9571,7 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             noun_index
             for noun_index in noun_indexes
             if any(
-                abs(opening_index - noun_index) <= 2
+                abs(opening_index - noun_index) <= 3
                 for opening_index in opening_indexes
             )
         }
@@ -9604,16 +9653,18 @@ _STATED_CURRENCY_PATTERN = (
     r"(?i:(?:[₽$€£¥₴₸₹₾₺]|(?:" + "|".join(sorted(_ISO_CURRENCY_CODES)) + r")|"
     r"canadian[\s\u00a0]+dollars?|dollars?[\s\u00a0]+canadiens?|"
     r"d[oó]lares?[\s\u00a0]+canadienses?|канадск\w*[\s\u00a0]+доллар\w*|"
-    r"swiss[\s\u00a0]+francs?|francs?[\s\u00a0]+suisses?|"
+    r"swiss[\s\u00a0]+francs?|francs?[\s\u00a0]+(?:suisses?|cfa)|"
     r"francos?[\s\u00a0]+suizos?|швейцарск\w*[\s\u00a0]+франк\w*|"
     r"rub(?:les?)?|roubles?|руб\w*|rublos?|"
     r"usd|dollars?|доллар\w*|d[oó]lares?|"
     r"eur|euros?|евро|"
     r"gbp|pounds?|фунт\w*|libras?|livres?|"
     r"chf|francs?|франк\w*|francos?|"
-    r"pesos?|песо|"
+    r"pesos?[\s\u00a0]+mexicanos?|pesos?|песо|"
     r"yuan(?:es|s)?|юан\w*|"
-    r"yens?|(?:и|й)ен\w*))"
+    r"yens?|(?:и|й)ен\w*|"
+    r"dirhams?|дирхам\w*|dinares?|dinars?|динар\w*|"
+    r"soles|грив(?:ен|ны|на|ну)))"
 )
 _STATED_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[\s\u00a0,.]\d{3})+|\d+)(?:[.,]\d{1,2})?"
 
