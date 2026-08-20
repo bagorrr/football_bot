@@ -2918,6 +2918,30 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             2000,
             "Besoin de mille mille joueurs",
         ),
+        (
+            "frag-called-off",
+            "Match 20 August 2026 has been called off на Петроградской. "
+            "Need one player. Contact @invalid_frag_called_off",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "frag-withdrawn",
+            "Матч 20 августа 2026 на Петроградской. Нужно два игрока, но "
+            "заявка была отозвана. Пишите @invalid_frag_withdrawn",
+            "20 августа 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "Нужно два игрока",
+        ),
     )
     opportunities_before_invalid_evidence = len(system.opportunities())
     invalid_message_ids = []
@@ -3058,35 +3082,104 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         assert len(system.opportunities()) == opportunities_before_invalid_evidence
         assert system.opportunity_publication_contracts(invalid_revision_id) == ()
 
-    negated_optional_cases: tuple[tuple[str, str, JsonValue, str], ...] = (
-        ("format", "team_formats", ["7x7"], "We are not playing 7x7"),
-        ("position", "positions", ["defender"], "We do not need a defender"),
+    negated_optional_cases: tuple[tuple[str, str, JsonValue, str, str], ...] = (
+        (
+            "format",
+            "team_formats",
+            ["7x7"],
+            "We are not playing 7x7",
+            "We are not playing 7x7",
+        ),
+        (
+            "position",
+            "positions",
+            ["defender"],
+            "We do not need a defender",
+            "We do not need a defender",
+        ),
         (
             "level",
             "playing_levels",
             ["professional"],
             "The level is not professional",
+            "The level is not professional",
         ),
-        ("setting", "venue_settings", ["indoor"], "The game is not indoor"),
+        (
+            "setting",
+            "venue_settings",
+            ["indoor"],
+            "The game is not indoor",
+            "The game is not indoor",
+        ),
         (
             "surface",
             "playing_surfaces",
             ["artificial_turf"],
             "No artificial turf",
+            "No artificial turf",
         ),
-        ("paid", "payment", "paid", "Participation is not paid"),
-        ("free", "payment", "free", "This is not free"),
+        (
+            "paid",
+            "payment",
+            "paid",
+            "Participation is not paid",
+            "Participation is not paid",
+        ),
+        ("free", "payment", "free", "This is not free", "This is not free"),
+        (
+            "fragformat",
+            "team_formats",
+            ["7x7"],
+            "We are playing 7x7. The 7x7 game was cancelled",
+            "We are playing 7x7",
+        ),
+        (
+            "fragposition",
+            "positions",
+            ["defender"],
+            "Need a defender or a goalkeeper",
+            "Need a defender",
+        ),
+        (
+            "fraglevel",
+            "playing_levels",
+            ["professional"],
+            "Professional level. The level is not professional",
+            "Professional level",
+        ),
+        (
+            "fragsetting",
+            "venue_settings",
+            ["indoor"],
+            "Indoor. It is not indoor",
+            "Indoor",
+        ),
+        (
+            "fragsurface",
+            "playing_surfaces",
+            ["artificial_turf"],
+            "Artificial turf. The field is no longer artificial turf",
+            "Artificial turf",
+        ),
+        (
+            "fragpayment",
+            "payment",
+            "paid",
+            "Participation is paid. Payment was cancelled",
+            "Participation is paid",
+        ),
     )
     optional_checkpoint = invalid_checkpoint + len(lossy_currency_cases)
     for offset, (
         label,
         field_name,
         field_value,
-        optional_evidence,
+        optional_source_expression,
+        optional_evidence_fragment,
     ) in enumerate(negated_optional_cases, start=1):
         invalid_body = (
             "Match 20 August 2026 на Петроградской. Need one player. "
-            f"{optional_evidence}. Contact @invalid_optional_{label}"
+            f"{optional_source_expression}. Contact @invalid_optional_{label}"
         )
         invalid_result = _minimal_classifier_result(
             candidate_key=f"negated-optional-{label}",
@@ -3109,7 +3202,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         evidence = candidate["evidence"]
         assert isinstance(evidence, dict)
         candidate[field_name] = field_value
-        evidence[field_name] = optional_evidence
+        evidence[field_name] = optional_evidence_fragment
         classifier.return_for(body=invalid_body, result=invalid_result)
         message_id = 1100 + offset
         invalid_message_ids.append(message_id)

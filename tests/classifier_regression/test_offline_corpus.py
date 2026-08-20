@@ -431,6 +431,111 @@ def test_offline_optional_game_search_facts_are_affirmative() -> None:
         assert _optional_values_are_supported(candidate, evidence)
 
 
+def test_offline_adversarial_facts_bind_to_complete_authoritative_expressions() -> None:
+    event_date = date(2026, 8, 20)
+    for source_expression in (
+        "Match 20 August 2026 has been called off",
+        "Матч 20 августа 2026 был снят",
+        "Partido 20 agosto 2026 fue retirado",
+        "Match le 20 août 2026 a été retiré",
+    ):
+        assert not _event_time_is_supported(
+            event_date,
+            event_date,
+            None,
+            source_expression,
+        )
+
+    positive_openings = (
+        ("Looking for 1,200 more experienced players", 1200),
+        ("Ищем 1 200 ещё опытных игроков", 1200),
+        ("Buscamos 1.200 jugadores experimentados", 1200),
+        ("Nous recherchons 1 200 joueurs expérimentés", 1200),
+    )
+    for source_expression, open_places in positive_openings:
+        assert _open_places_are_supported(open_places, source_expression)
+
+    for source_expression in (
+        "Need two players, but the request was withdrawn",
+        "Нужно два игрока, но заявка была отозвана",
+        "Necesitamos dos jugadores, pero la solicitud fue retirada",
+        "Besoin de deux joueurs, mais la demande a été retirée",
+    ):
+        assert not _open_places_are_supported(2, source_expression)
+
+    for source_expression in (
+        "Fee covers all 500",
+        "Entry TOP 500",
+        "Payment TRY 500",
+    ):
+        assert _stated_payment_amount_and_currency(source_expression) is None
+
+    for source_expression, expected in (
+        ("Fee 500 euros for every player", ("500", "euros")),
+        ("Взнос 500 рублей для каждого игрока", ("500", "рублей")),
+        ("Entrada 500 euros para cada persona", ("500", "euros")),
+        ("Tarif 500 euros pour chaque personne", ("500", "euros")),
+    ):
+        assert _stated_payment_amount_and_currency(source_expression) == expected
+
+    optional_adversarial: tuple[tuple[dict[str, JsonValue], str, str], ...] = (
+        ({"team_formats": ["7x7"]}, "team_formats", "7x7 was cancelled"),
+        (
+            {"positions": ["defender"]},
+            "positions",
+            "Нужен защитник, но заявка была отозвана",
+        ),
+        (
+            {"positions": ["defender"]},
+            "positions",
+            "Necesitamos defensa o portero",
+        ),
+        (
+            {"playing_levels": ["professional"]},
+            "playing_levels",
+            "Niveau professionnel. Le niveau n’est pas professionnel",
+        ),
+        (
+            {"venue_settings": ["indoor"]},
+            "venue_settings",
+            "Indoor. It is not indoor",
+        ),
+        (
+            {"playing_surfaces": ["artificial_turf"]},
+            "playing_surfaces",
+            "Искусственный газон. Поле больше не с искусственным газоном",
+        ),
+        (
+            {"payment": "paid"},
+            "payment",
+            "Participation is paid. Payment was cancelled",
+        ),
+    )
+    for candidate, field_name, source_expression in optional_adversarial:
+        assert not _optional_values_are_supported(
+            candidate,
+            {field_name: source_expression},
+        )
+
+    assert not _event_time_is_supported(
+        event_date,
+        event_date,
+        None,
+        "20 August 2026",
+        authoritative_body="Match 20 August 2026 has been called off",
+    )
+    assert not _open_places_are_supported(
+        2,
+        "Need two players",
+        authoritative_body="Need two players, but the request was withdrawn",
+    )
+    assert not _optional_values_are_supported(
+        {"positions": ["defender"]},
+        {"positions": "Need a defender"},
+        authoritative_body="Need a defender or a goalkeeper",
+    )
+
+
 def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:
     corpus_path = Path(__file__).with_name("corpus.v1.json")
     corpus = json.loads(corpus_path.read_text(encoding="utf-8"))

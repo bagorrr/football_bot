@@ -8991,13 +8991,19 @@ def _validated_open_match_proposal(
                 if payload_value.get("source_chat_timezone") is not None
                 else None
             ),
+            authoritative_body=body,
         )
         or mention not in str(evidence["location"])
         or not _open_places_are_supported(
             open_places,
             f"{evidence['opportunity']}. {evidence['open_places']}",
+            authoritative_body=body,
         )
-        or not _optional_values_are_supported(candidate, evidence)
+        or not _optional_values_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=body,
+        )
     ):
         return None
     expiry = _open_match_expiry(
@@ -9197,7 +9203,26 @@ def _event_time_is_supported(
     day_part: str | None = None,
     source_event_time: datetime | None = None,
     source_timezone: str | None = None,
+    authoritative_body: str | None = None,
 ) -> bool:
+    if authoritative_body is not None:
+        return _event_time_is_supported(
+            start,
+            end,
+            exact_time,
+            evidence,
+            day_part=day_part,
+            source_event_time=source_event_time,
+            source_timezone=source_timezone,
+        ) and _event_time_is_supported(
+            start,
+            end,
+            exact_time,
+            authoritative_body,
+            day_part=day_part,
+            source_event_time=source_event_time,
+            source_timezone=source_timezone,
+        )
     normalized = evidence.casefold()
     month_stems = {
         1: ("january", "январ", "enero", "janvier"),
@@ -9398,29 +9423,38 @@ def _event_time_is_supported(
         for confirmed_pattern in (
             r"\b(?:is|was|will\s+be|has\s+been|had\s+been)\s+not\s+"
             r"(?:cancelled|canceled|called\s+off)\b",
+            r"\b(?:has|had)\s+not\s+been\s+"
+            r"(?:cancelled|canceled|called\s+off|withdrawn)\b",
             r"\bне\s+(?:(?:был\w*|будет)\s+)?отмен\w*\b",
+            r"\bне\s+(?:(?:был\w*|будет)\s+)?снят\w*\b",
             r"\bотмен\w*\s+не\s+будет\b",
             r"\bno\s+(?:(?:est[áa]|era|fue|ser[áa])\s+|ha\s+sido\s+)?"
-            r"cancelad[oa]s?\b",
+            r"(?:cancelad|retirad)[oa]s?\b",
             r"\bn['’](?:est\s+pas|a\s+pas\s+(?:[ée]t[ée]|ete)|"
             r"avait\s+pas\s+[ée]t[ée]|(?:aura|sera)\s+pas)\s+annul[ée]\w*\b",
+            r"\bn['’](?:est\s+pas|a\s+pas\s+(?:[ée]t[ée]|ete)|"
+            r"avait\s+pas\s+[ée]t[ée]|(?:aura|sera)\s+pas)\s+retir[ée]\w*\b",
         ):
             clause = re.sub(confirmed_pattern, "", clause)
         cancellation_patterns = (
             r"\b(?:is|was|got|gets|will\s+be|has\s+been|had\s+been)\s+"
-            r"(?:cancelled|canceled)\b",
-            r"\b(?:is|was|will\s+be)\s+called\s+off\b",
+            r"(?:cancelled|canceled|called\s+off|withdrawn)\b",
             r"\b(?:is|will|does|did)\s+not\s+"
             r"(?:happen(?:ing)?|take\s+place|go\s+ahead)\b",
             r"\bwon['’]?t\s+(?:happen|take\s+place|go\s+ahead)\b",
             r"\bне\s+(?:состо\w*|будет|произойд\w*)\b",
             r"\bотмен\w*\b",
+            r"\b(?:был\w*\s+)?снят\w*\b",
             r"\b(?:(?:est[áa]|era|fue|ser[áa])\s+|ha\s+sido\s+)?"
             r"cancelad[oa]s?\b",
+            r"\b(?:(?:est[áa]|era|fue|ser[áa])\s+|ha\s+sido\s+)?"
+            r"retirad[oa]s?\b",
             r"\bse\s+cancel\w*\b",
             r"\bno\s+(?:se\s+)?(?:juega|jugar[áa]|celebr\w*|tendr[áa]\s+lugar)\b",
             r"\b(?:est|sera|ser[áa]|[ée]tait|a\s+(?:[ée]t[ée]|ete)|"
             r"avait\s+[ée]t[ée])\s+annul[ée]\w*\b",
+            r"\b(?:est|sera|ser[áa]|[ée]tait|a\s+(?:[ée]t[ée]|ete)|"
+            r"avait\s+[ée]t[ée])\s+retir[ée]\w*\b",
             r"\bn['’]aura\s+pas\s+lieu\b",
             r"\bne\s+se\s+(?:joue|tiendra)\s+pas\b",
         )
@@ -9894,10 +9928,28 @@ def _matching_number_spans(
     return tuple(dict.fromkeys(matches))
 
 
-def _open_places_are_supported(open_places: int, evidence: str) -> bool:
+def _open_places_are_supported(
+    open_places: int,
+    evidence: str,
+    *,
+    authoritative_body: str | None = None,
+) -> bool:
+    if authoritative_body is not None:
+        return _open_places_are_supported(
+            open_places,
+            evidence,
+        ) and _open_places_are_supported(
+            open_places,
+            authoritative_body,
+        )
     if open_places <= 0:
         return False
-    evidence_tokens = re.findall(r"[^\W_]+", evidence.casefold())
+    normalized_evidence = re.sub(
+        r"(?<=\d)[\s\u00a0,.](?=\d{3}(?:\D|$))",
+        "",
+        evidence.casefold(),
+    )
+    evidence_tokens = re.findall(r"[^\W_]+", normalized_evidence)
     evidence_words = set(evidence_tokens)
     generic_opening_words = {
         "place",
@@ -9968,29 +10020,44 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
         r"cherch\w*|recherch\w*|besoin|reste\w*)"
     )
     closed_word = re.compile(
-        r"(?:occupied|filled|closed|taken|"
+        r"(?:occupied|filled|closed|taken|withdrawn|"
         r"занят\w*|закрыт\w*|заполн\w*|"
-        r"ocupad\w*|cerrad\w*|cubiert\w*|"
-        r"occup[ée]\w*|ferm[ée]\w*|pourvu\w*)"
+        r"отозван\w*|снят\w*|"
+        r"ocupad\w*|cerrad\w*|cubiert\w*|retirad\w*|"
+        r"occup[ée]\w*|ferm[ée]\w*|pourvu\w*|retir[ée]\w*)"
     )
-    has_supported_counted_opening = False
-    for clause in re.split(r"[.!?;\n]+", evidence.casefold()):
+    negated_opening = re.compile(
+        r"(?:\bno\s+longer\b|"
+        r"\b(?:(?:do|does|did)\s+not|"
+        r"(?:dont|doesnt|didnt|don\s+t|doesn\s+t|didn\s+t))\s+"
+        r"(?:need|want|seek|look)\b|"
+        r"\bno\s+need(?:ed)?(?:\s+for)?\b|\bnot\s+need(?:ed)?\b|"
+        r"\bya\s+no\b|\bno\s+(?:necesit|busc)\w*|\bбольше\s+не\b|"
+        r"\bне\s+(?:нуж|ищ|треб)\w*|\bn\s+\w+\s+plus\s+besoin\b|"
+        r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+(?:pas|plus)\b|"
+        r"\bne\s+\w+\s+plus\b|\bplus\s+besoin\b|\bpas\s+besoin\b)"
+    )
+    for clause in re.split(r"[.!?;\n]+", normalized_evidence):
         normalized_clause = re.sub(r"['’]", " ", clause)
-        if (
-            re.search(
-                r"(?:\bno\s+longer\b|"
-                r"\b(?:(?:do|does|did)\s+not|"
-                r"(?:dont|doesnt|didnt|don\s+t|doesn\s+t|didn\s+t))\s+"
-                r"(?:need|want|seek)\b|"
-                r"\bno\s+need(?:ed)?(?:\s+for)?\b|\bnot\s+need(?:ed)?\b|"
-                r"\bya\s+no\b|\bno\s+(?:necesit|busc)\w*|\bбольше\s+не\b|"
-                r"\bне\s+(?:нуж|ищ|треб)\w*|\bn\s+\w+\s+plus\s+besoin\b|"
-                r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+(?:pas|plus)\b|"
-                r"\bne\s+\w+\s+plus\b|\bplus\s+besoin\b|\bpas\s+besoin\b)",
-                normalized_clause,
+        clause_tokens = re.findall(r"[^\W_]+", clause)
+        clause_words = set(clause_tokens)
+        has_opening_subject = bool(
+            clause_words.intersection(explicit_player_words | generic_opening_words)
+            or re.search(
+                r"\b(?:request|recruitment|search|заявк\w*|набор\w*|"
+                r"solicitud\w*|b[úu]squeda\w*|demande\w*|recherche\w*)\b",
+                clause,
             )
-            is not None
+        )
+        if has_opening_subject and (
+            negated_opening.search(normalized_clause) is not None
+            or any(closed_word.fullmatch(token) for token in clause_tokens)
         ):
+            return False
+    has_supported_counted_opening = False
+    for clause in re.split(r"[.!?;\n]+", normalized_evidence):
+        normalized_clause = re.sub(r"['’]", " ", clause)
+        if negated_opening.search(normalized_clause) is not None:
             continue
         clause_tokens = re.findall(r"[^\W_]+", clause)
         number_spans = _matching_number_spans(clause_tokens, open_places)
@@ -10003,6 +10070,11 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             index
             for index, token in enumerate(clause_tokens)
             if opening_word.fullmatch(token) is not None
+            or (
+                token in {"look", "looks", "looked", "looking"}
+                and index + 1 < len(clause_tokens)
+                and clause_tokens[index + 1] == "for"
+            )
         }
         closed_indexes = {
             index
@@ -10023,6 +10095,12 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             "tickets",
             "seat",
             "seats",
+            "stand",
+            "stands",
+            "parent",
+            "parents",
+            "bus",
+            "buses",
             "trophy",
             "trophies",
             "award",
@@ -10080,7 +10158,6 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             or (
                 open_places == 1
                 and counted_generic_opening
-                and len(clause_tokens) <= 3
                 and not clause_words.intersection(non_player_context)
             )
         ):
@@ -10129,17 +10206,19 @@ _STATED_CURRENCY_PATTERN = (
 )
 _STATED_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[\s\u00a0,.]\d{3})+|\d+)(?:[.,]\d{1,2})?"
 _STATED_PAYMENT_QUALIFIER_PATTERN = (
-    r"(?i:(?:(?:per|for\s+each|each)\s+(?:player|person|participant)|"
-    r"(?:с|за|на)\s+(?:(?:каждого|одного)\s+)?"
+    r"(?i:(?:(?:per|for\s+(?:each|every)|each|every)\s+"
+    r"(?:player|person|participant)|"
+    r"(?:с|за|на|для)\s+(?:(?:каждого|одного)\s+)?"
     r"(?:игрока|человека|участника)|"
-    r"por\s+(?:cada\s+)?(?:jugador|jugadora|persona|participante)|"
+    r"(?:por|para)\s+(?:cada\s+)?"
+    r"(?:jugador|jugadora|persona|participante)|"
     r"(?:par|pour\s+chaque)\s+"
     r"(?:joueur|joueuse|personne|participant|participante)))"
 )
 
 
 def _has_supported_currency_name_suffix(evidence: str, currency_end: int) -> bool:
-    suffix = evidence[currency_end:]
+    suffix = re.split(r"[.!?;\n]", evidence[currency_end:], maxsplit=1)[0]
     return re.fullmatch(r"[\s\u00a0]*[.,;:!?]?[\s\u00a0]*", suffix) is not None or (
         re.fullmatch(
             rf"[\s\u00a0]+{_STATED_PAYMENT_QUALIFIER_PATTERN}"
@@ -10151,23 +10230,37 @@ def _has_supported_currency_name_suffix(evidence: str, currency_end: int) -> boo
 
 
 def _iso_currency_token_has_payment_context(
-    evidence: str, currency_start: int, currency: str
+    evidence: str,
+    pair_start: int,
+    currency_start: int,
+    currency: str,
+    *,
+    currency_before_amount: bool,
 ) -> bool:
-    if currency == currency.upper():
-        return True
-    prefix = evidence[:currency_start].casefold()
-    return (
-        re.search(
-            r"(?:\bfee\b|\bcost\w*\b|\bprice\b|\bpay(?:ment|able|ing)?\b|"
-            r"\bcharge\b|\bentry\b|\bparticipation\b|\bbudget\b|"
-            r"\bвзнос\w*\b|\bстоим\w*\b|\bцен\w*\b|\bоплат\w*\b|"
-            r"\bучаст\w*\b|\bentrada\b|\btarifa\b|\bprecio\b|"
-            r"\bcuota\b|\bpago\b|\bparticipaci[oó]n\b|\btarif\w*\b|"
-            r"\bprix\b|\bco[uû]t\w*\b|\bcotisation\b|\bfrais\b)",
-            prefix,
-        )
-        is not None
+    payment_context = (
+        r"(?:\bfee\b|\bcost\w*\b|\bprice\b|\bpay(?:ment|able|ing)?\b|"
+        r"\bcharge\b|\bentry\b|\bparticipation\b|\bbudget\b|"
+        r"\bвзнос\w*\b|\bстоим\w*\b|\bцен\w*\b|\bоплат\w*\b|"
+        r"\bучаст\w*\b|\bentrada\b|\btarifa\b|\bprecio\b|"
+        r"\bcuota\b|\bpago\b|\bparticipaci[oó]n\b|\btarif\w*\b|"
+        r"\bprix\b|\bco[uû]t\w*\b|\bcotisation\b|\bfrais\b)"
     )
+    prefix = evidence[:pair_start].casefold()
+    has_payment_context = re.search(payment_context, prefix) is not None
+    ambiguous_iso_words = {"ALL", "CUP", "GEL", "MAD", "PEN", "TOP", "TRY"}
+    if currency.upper() in ambiguous_iso_words:
+        if currency != currency.upper() or not has_payment_context:
+            return False
+        if currency_before_amount:
+            return (
+                re.search(
+                    rf"{payment_context}\s*[:=\-]\s*$",
+                    evidence[:currency_start].casefold(),
+                )
+                is not None
+            )
+        return True
+    return currency == currency.upper() or has_payment_context
 
 
 def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None:
@@ -10187,8 +10280,10 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
             is_iso_token
             and not _iso_currency_token_has_payment_context(
                 evidence,
+                amount_then_currency.start(),
                 amount_then_currency.start("currency"),
                 currency,
+                currency_before_amount=False,
             )
         ):
             return None
@@ -10210,8 +10305,10 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
         currency.upper() in _ISO_CURRENCY_CODES
         and not _iso_currency_token_has_payment_context(
             evidence,
+            currency_then_amount.start(),
             currency_then_amount.start("currency"),
             currency,
+            currency_before_amount=True,
         )
     ):
         return None
@@ -10251,29 +10348,76 @@ def _patterns_have_affirmative_clause_support(
         )
         return negated_before or negated_after
 
+    def is_retracted_after(clause: str, end: int) -> bool:
+        suffix = clause[end:]
+        return (
+            re.search(
+                r"^[\s,]*(?:but\s+)?(?:\w+\s+){0,5}"
+                r"(?:is|are|was|were|has\s+been|have\s+been)\s+"
+                r"(?:cancelled|canceled|withdrawn|closed)\b|"
+                r"^[\s,]*(?:но\s+)?(?:\w+\s+){0,5}"
+                r"(?:(?:был|была|были)\s+)?"
+                r"(?:отмен\w*|отозван\w*|снят\w*|закрыт\w*)\b|"
+                r"^[\s,]*(?:pero\s+)?(?:\w+\s+){0,5}"
+                r"(?:(?:fue|ha\s+sido|est[áa])\s+)?"
+                r"(?:cancelad\w*|retirad\w*|cerrad\w*)\b|"
+                r"^[\s,]*(?:mais\s+)?(?:\w+[\s’']+){0,5}"
+                r"(?:(?:a\s+[ée]t[ée]|est)\s+)?"
+                r"(?:annul[ée]\w*|retir[ée]\w*|ferm[ée]\w*)\b",
+                suffix,
+            )
+            is not None
+        )
+
     clause_start = 0
     clauses: list[str] = []
     for boundary in clause_boundary.finditer(normalized_evidence):
         clauses.append(normalized_evidence[clause_start : boundary.start()])
         clause_start = boundary.end()
     clauses.append(normalized_evidence[clause_start:])
+    supported = False
     for clause in clauses:
         matches = [
             match for pattern in patterns for match in re.finditer(pattern, clause)
         ]
         if not matches:
             continue
-        polarity = [is_negated(clause, match.start(), match.end()) for match in matches]
-        if any(polarity):
-            continue
-        return True
-    return False
+        if any(
+            is_negated(clause, match.start(), match.end())
+            or is_retracted_after(clause, match.end())
+            for match in matches
+        ):
+            return False
+        supported = True
+    return supported
 
 
 def _optional_values_are_supported(
     candidate: dict[str, JsonValue],
     evidence: dict[str, JsonValue],
+    *,
+    authoritative_body: str | None = None,
 ) -> bool:
+    if authoritative_body is not None:
+        authoritative_evidence: dict[str, JsonValue] = {
+            field_name: authoritative_body
+            for field_name in (
+                "team_formats",
+                "positions",
+                "playing_levels",
+                "venue_settings",
+                "playing_surfaces",
+                "payment",
+            )
+            if candidate.get(field_name) is not None
+        }
+        return _optional_values_are_supported(
+            candidate,
+            evidence,
+        ) and _optional_values_are_supported(
+            candidate,
+            authoritative_evidence,
+        )
     lexicon: dict[str, dict[str, tuple[str, ...]]] = {
         "positions": {
             "goalkeeper": (
@@ -10414,6 +10558,24 @@ def _optional_values_are_supported(
         if not isinstance(values, list) or not isinstance(field_evidence, str):
             return False
         normalized = field_evidence.casefold()
+        selected_values = {value for value in values if isinstance(value, str)}
+        if field_name == "team_formats":
+            mentioned_values = {
+                value
+                for value in {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"}
+                if re.search(rf"(?<!\w){re.escape(value)}(?!\w)", normalized)
+            }
+        else:
+            mentioned_values = {
+                value
+                for value, value_patterns in lexicon[field_name].items()
+                if any(re.search(pattern, normalized) for pattern in value_patterns)
+            }
+        if not mentioned_values.issubset(selected_values) or (
+            len(mentioned_values) > 1
+            and re.search(r"\b(?:or|или|o|ou)\b", normalized) is not None
+        ):
+            return False
         for value in values:
             if not isinstance(value, str):
                 return False
@@ -10473,8 +10635,21 @@ def _optional_values_are_supported(
             if payment == "paid"
             else None
         )
+        payment_retracted = (
+            re.search(
+                r"\bpayment\b[^.!?;\n]{0,40}\b"
+                r"(?:cancelled|canceled|withdrawn)\b|"
+                r"\bоплат\w*\b[^.!?;\n]{0,40}\b(?:отмен\w*|отозван\w*)\b|"
+                r"\b(?:pago|pago de participaci[oó]n)\b[^.!?;\n]{0,40}"
+                r"\b(?:cancelad\w*|retirad\w*)\b|"
+                r"\bpaiement\b[^.!?;\n]{0,40}\b(?:annul[ée]\w*|retir[ée]\w*)\b",
+                normalized_payment,
+            )
+            is not None
+        )
         if (
-            competing_supported
+            payment_retracted
+            or competing_supported
             or (direct_mentioned and not direct_supported)
             or not (direct_supported or stated_amount is not None)
         ):
