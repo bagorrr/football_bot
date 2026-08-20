@@ -126,9 +126,14 @@ def classifier_output_is_schema_valid(
                 "iana_timezone",
             },
         )
-        or not isinstance(open_places, int)
-        or isinstance(open_places, bool)
-        or open_places < 1
+        or (
+            open_places is not None
+            and (
+                not isinstance(open_places, int)
+                or isinstance(open_places, bool)
+                or open_places < 1
+            )
+        )
         or not isinstance(routes, list)
         or len(routes) > 8
     ):

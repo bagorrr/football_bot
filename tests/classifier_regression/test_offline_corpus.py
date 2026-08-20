@@ -10,9 +10,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 from modules.application import (
+    _body_establishes_current_open_match,
     _event_time_is_supported,
+    _location_mention_is_authoritative,
     _open_places_are_supported,
     _optional_values_are_supported,
+    _select_response_route,
     _stated_payment_amount_and_currency,
 )
 from modules.classifier_contract import classifier_output_is_schema_valid
@@ -367,6 +370,10 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         ("Взнос 500 рублей за каждого игрока", ("500", "рублей")),
         ("Entrada 500 euros por cada jugador", ("500", "euros")),
         ("Tarif 500 euros pour chaque joueur", ("500", "euros")),
+        ("Fee 500 Australian dollars. Contact @sample", ("500", "Australian dollars")),
+        ("Взнос 500 российских рублей за игрока", ("500", "российских рублей")),
+        ("Entrada 500 pesos argentinos por persona", ("500", "pesos argentinos")),
+        ("Tarif 500 francs belges par joueur", ("500", "francs belges")),
     )
     for evidence, expected_details in cases:
         assert _optional_values_are_supported(
@@ -380,10 +387,6 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         {"payment": "Fee 500"},
     )
     for ambiguous_longer_name in (
-        "Fee 500 dirhams UAE",
-        "Tarif 500 dirhams marocains",
-        "Entrada 500 pesos argentinos",
-        "Tarif 500 francs belges",
         "Fee 500 euros training starts at 19:00",
         "Fee 500 euros per player parking included",
         "We will try 500 players",
@@ -534,6 +537,27 @@ def test_offline_adversarial_facts_bind_to_complete_authoritative_expressions() 
         {"positions": "Need a defender"},
         authoritative_body="Need a defender or a goalkeeper",
     )
+    assert not _optional_values_are_supported(
+        {"positions": ["forward"]},
+        {"positions": "forward"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need one goalkeeper. "
+            "Please forward this message"
+        ),
+    )
+    assert not _optional_values_are_supported(
+        {"payment": "paid"},
+        {"payment": "paid"},
+        authoritative_body=("Football match 20 August 2026. Parking is paid"),
+    )
+    assert not _optional_values_are_supported(
+        {"positions": ["defender"]},
+        {"positions": "Need a defender"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need a defender. "
+            "We later withdrew the opening"
+        ),
+    )
 
 
 def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:
@@ -550,6 +574,46 @@ def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:
     ]
 
     assert classifier_output_is_schema_valid(output, body=source)
+
+
+def test_offline_authority_boundary_rejects_non_authoritative_facts() -> None:
+    for body in (
+        "Practice 20 August 2026 at Central Station. Need two players",
+        "Тренировка 20 августа 2026 у Центральной. Нужны два игрока",
+        "Partido o entrenamiento 20 agosto 2026 en Estación Central",
+        "Match ou entraînement le 20 août 2026 à la Gare Centrale",
+    ):
+        assert not _body_establishes_current_open_match(body)
+
+    for body, mention in (
+        ("Football match not at Central Station", "Central Station"),
+        ("Матч не у Центральной", "Центральной"),
+        ("Partido no en Estación Central", "Estación Central"),
+        ("Match pas à la Gare Centrale", "Gare Centrale"),
+    ):
+        assert not _location_mention_is_authoritative(body, mention)
+
+    fallback: JsonValue = {"reply_route_url": "https://t.me/source_chat/49?comment=1"}
+    for body in (
+        "Venue page @stadium. Reply here",
+        "Страница площадки @stadium. Ответьте здесь",
+        "Página del campo @stadium. Responde aquí",
+        "Page du terrain @stadium. Répondez ici",
+    ):
+        assert _select_response_route(
+            body=body,
+            proposed_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@stadium",
+                    "evidence": "@stadium",
+                }
+            ],
+            bounded_metadata=fallback,
+        ) == {
+            "kind": "reply_thread",
+            "value": "https://t.me/source_chat/49?comment=1",
+        }
 
 
 def test_classifier_contract_accepts_an_evidence_backed_url_route() -> None:
@@ -576,6 +640,21 @@ def test_classifier_contract_leaves_source_metadata_fallback_to_application() ->
     output = deepcopy(corpus["cases"][0]["recorded_output"])
     source = corpus["cases"][0]["source"].replace(" Пишите @sample_contact", "")
     output["candidates"][0]["response_routes"] = []
+
+    assert classifier_output_is_schema_valid(output, body=source)
+
+
+def test_classifier_contract_preserves_unknown_optional_open_place_count() -> None:
+    corpus_path = Path(__file__).with_name("corpus.v1.json")
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    output = deepcopy(corpus["cases"][0]["recorded_output"])
+    source = corpus["cases"][0]["source"].replace(
+        "Нужно одно место, защитник", "Ищем защитника"
+    )
+    candidate = output["candidates"][0]
+    candidate["evidence"]["opportunity"] = "Ищем защитника"
+    candidate["evidence"]["open_places"] = "Ищем защитника"
+    candidate["open_places"] = None
 
     assert classifier_output_is_schema_valid(output, body=source)
 

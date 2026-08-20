@@ -1463,12 +1463,12 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
     if exact_time is not None and day_part is not None:
         raise ValueError("open-match exact time and day part are mutually exclusive")
     open_places = facts["open_places"]
-    if (
+    if open_places is not None and (
         not isinstance(open_places, int)
         or isinstance(open_places, bool)
         or open_places < 1
     ):
-        raise TypeError("open-match open_places must be positive")
+        raise TypeError("open-match open_places must be positive or null")
     list_allowlists = {
         "team_formats": {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
         "positions": {"goalkeeper", "defender", "midfielder", "forward"},

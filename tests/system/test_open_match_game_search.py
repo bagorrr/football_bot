@@ -1105,7 +1105,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         for result in system.results(wrong_date_search.completed_search_id)
     )
     phone_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. Звоните +7 921 555-01-49"
+        "Футбольный матч 20 августа 2026 на Петроградской. "
+        "нужен один игрок. Звоните +7 921 555-01-49"
     )
     classifier.return_for(
         body=phone_body,
@@ -1162,7 +1163,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         "attachment_types",
     }
     url_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. "
+        "Футбольный матч 20 августа 2026 на Петроградской. нужен один игрок. "
         "Форма https://example.test/open-match/49"
     )
     classifier.return_for(
@@ -1202,7 +1203,9 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     assert url_opportunity.response_route.kind == "explicit_url"
     assert url_opportunity.response_route.value == "https://example.test/open-match/49"
-    fallback_body = "20 августа 2026 на Петроградской нужен один игрок."
+    fallback_body = (
+        "Футбольный матч 20 августа 2026 на Петроградской. нужен один игрок."
+    )
     classifier.return_for(
         body=fallback_body,
         result=_minimal_classifier_result(
@@ -1239,12 +1242,19 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert dm_opportunity.response_route.kind == "direct_message"
     assert dm_opportunity.response_route.value == "https://t.me/source_author_49"
     assert "synthetic_open_match_source" not in dm_opportunity.response_route.value
+    venue_reference_body = fallback_body + " Venue page @stadium. Reply here."
     classifier.return_for(
-        body=fallback_body,
+        body=venue_reference_body,
         result=_minimal_classifier_result(
             candidate_key="reply-route",
-            body=fallback_body,
-            response_routes=[],
+            body=venue_reference_body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@stadium",
+                    "evidence": "@stadium",
+                }
+            ],
         ),
     )
     telegram_ingestion.add_channel_difference_event(
@@ -1255,7 +1265,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         telegram_message_id=1008,
         revision=1,
         kind=SourceEventKind.CREATE,
-        body=fallback_body,
+        body=venue_reference_body,
         event_time=datetime(2026, 8, 18, 17, 35, tzinfo=UTC),
         reply_route_url="https://t.me/synthetic_open_match_source/1008?comment=8",
         source_message_url="https://t.me/synthetic_open_match_source/1008",
@@ -1307,7 +1317,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert source_message_opportunity.response_route.kind == "source_message"
     assert source_message_opportunity.response_route.value.endswith("/1009")
     day_part_body = (
-        "20 августа 2026 вечером на Петроградской нужен один игрок. "
+        "Футбольный матч 20 августа 2026 вечером на Петроградской. нужен один игрок. "
         "Пишите @day_part_contact"
     )
     classifier.return_for(
@@ -1442,7 +1452,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     system.process_opportunities_until_idle()
     reply_child_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. "
+        "Футбольный матч 20 августа 2026 на Петроградской. нужен один игрок. "
         "Пишите @reply_context_contact"
     )
     classifier.return_for(
@@ -1496,7 +1506,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert "telegram_message_id" not in serialized_reply_request
 
     cross_chat_child_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. Пишите @cross_chat_context"
+        "Футбольный матч 20 августа 2026 на Петроградской. "
+        "нужен один игрок. Пишите @cross_chat_context"
     )
     classifier.return_for(
         body=cross_chat_child_body,
@@ -1602,7 +1613,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     system.process_opportunities_until_idle()
 
     stale_context_child_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. Пишите @stale_context"
+        "Футбольный матч 20 августа 2026 на Петроградской. "
+        "нужен один игрок. Пишите @stale_context"
     )
     classifier.return_for(
         body=stale_context_child_body,
@@ -1715,7 +1727,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     system.process_opportunities_until_idle()
     old_context_child_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. Пишите @old_context"
+        "Футбольный матч 20 августа 2026 на Петроградской. "
+        "нужен один игрок. Пишите @old_context"
     )
     classifier.return_for(
         body=old_context_child_body,
@@ -1760,7 +1773,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
 
     non_direct_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. Пишите @non_direct_context"
+        "Футбольный матч 20 августа 2026 на Петроградской. "
+        "нужен один игрок. Пишите @non_direct_context"
     )
     classifier.return_for(
         body=non_direct_body,
@@ -1799,7 +1813,10 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         for opportunity in system.opportunities()
     )
 
-    weekday_body = "В среду на Петроградской нужен один игрок. Пишите @weekday_context"
+    weekday_body = (
+        "Футбольный матч. В среду на Петроградской нужен один игрок. "
+        "Пишите @weekday_context"
+    )
     classifier.return_for(
         body=weekday_body,
         result=_minimal_classifier_result(
@@ -1840,7 +1857,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
 
     mismatched_weekday_body = (
-        "В среду на Петроградской нужен один игрок. Пишите @mismatched_weekday"
+        "Футбольный матч. В среду на Петроградской нужен один игрок. "
+        "Пишите @mismatched_weekday"
     )
     classifier.return_for(
         body=mismatched_weekday_body,
@@ -1915,7 +1933,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         ),
     )
     disjoint_proof_body = (
-        "20 августа 2026 на Петроградской нужен один игрок. Пишите @disjoint_area_proof"
+        "Футбольный матч 20 августа 2026 на Петроградской. "
+        "нужен один игрок. Пишите @disjoint_area_proof"
     )
     classifier.return_for(
         body=disjoint_proof_body,
@@ -2031,7 +2050,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     }
     for offset, day_part in enumerate(("morning", "daytime", "night"), start=1):
         ordered_body = (
-            f"20 августа 2026 {day_part} на Петроградской нужен один игрок. "
+            f"Футбольный матч 20 августа 2026 {day_part} на Петроградской. "
+            "нужен один игрок. "
             f"Пишите @ordering_{day_part}"
         )
         classifier.return_for(
@@ -2315,6 +2335,46 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "eUr",
             "en",
         ),
+        (
+            "australian-dollars",
+            "at 06:04",
+            None,
+            "06:04",
+            "500",
+            "Australian dollars",
+            "Australian dollars",
+            "en",
+        ),
+        (
+            "russian-rubles",
+            "в 12:04",
+            None,
+            "12:04",
+            "500",
+            "российских рублей за игрока",
+            "российских рублей",
+            "ru",
+        ),
+        (
+            "argentine-pesos",
+            "a las 18:05",
+            None,
+            "18:05",
+            "500",
+            "pesos argentinos por persona",
+            "pesos argentinos",
+            "es",
+        ),
+        (
+            "belgian-francs",
+            "à 22:04",
+            None,
+            "22:04",
+            "500",
+            "francs belges par joueur",
+            "francs belges",
+            "fr",
+        ),
     )
     for offset, (
         label,
@@ -2327,7 +2387,8 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         _locale,
     ) in enumerate(currency_cases, start=1):
         currency_body = (
-            f"20 августа 2026 {time_copy} на Петроградской нужен один игрок. "
+            f"Футбольный матч 20 августа 2026 {time_copy} на Петроградской. "
+            "нужен один игрок. "
             f"Tarif {amount} {payment_evidence}. "
             f"Пишите @currency_{label.replace('-', '_')}"
         )
@@ -2556,6 +2617,20 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "20 August",
             "es",
         ),
+        (
+            "unknown-count-goalkeeper",
+            "Football match 20 August 2026 at 07:25 на Петроградской. "
+            "Looking for a goalkeeper. Contact @unknown_count_goalkeeper",
+            "20 August 2026 at 07:25",
+            "Looking for a goalkeeper",
+            "2026-08-20",
+            "2026-08-20",
+            "07:25",
+            None,
+            datetime(2026, 8, 20, 9, 8, tzinfo=UTC),
+            "20 August",
+            "en",
+        ),
     )
     range_opportunities = {}
     for offset, (
@@ -2580,6 +2655,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "french-shared-month": "@french_shared_month",
             "month-first-large-opening": "@month_first_large",
             "spanish-not-cancelled-thousand-opening": ("@spanish_thousand_opening"),
+            "unknown-count-goalkeeper": "@unknown_count_goalkeeper",
         }.get(label, "@" + label.replace("-", "_"))
         classifier.return_for(
             body=range_body,
@@ -2620,13 +2696,18 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             registry_generation=1,
         )
         system.process_opportunities_until_idle()
-        range_opportunities[label] = next(
-            opportunity
-            for opportunity in system.opportunities()
-            if opportunity.source_message_revision_id.endswith(
-                f":{1050 + offset}:revision:1"
-            )
+        range_opportunity = next(
+            (
+                opportunity
+                for opportunity in system.opportunities()
+                if opportunity.source_message_revision_id.endswith(
+                    f":{1050 + offset}:revision:1"
+                )
+            ),
+            None,
         )
+        assert range_opportunity is not None, label
+        range_opportunities[label] = range_opportunity
 
     for offset, (
         label,
@@ -2666,7 +2747,11 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             == range_opportunities[label].opportunity_id
         )
         assert range_result.result_class == "confirmed_match"
-        assert str(range_open_places) in telegram_delivery.messages[-1].text
+        if range_open_places is None:
+            assert "open_places" not in dict(range_result.card_facts)
+            assert "None" not in telegram_delivery.messages[-1].text
+        else:
+            assert str(range_open_places) in telegram_delivery.messages[-1].text
         range_inputs = system.completed_search_opportunity_revision_inputs(
             range_search.completed_search_id
         )
@@ -2724,6 +2809,66 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert system.results(end_of_day_search.completed_search_id) == end_of_day_snapshot
 
     invalid_evidence_cases = (
+        (
+            "practice-not-match",
+            "Practice 20 August 2026 на Петроградской. Need one player. "
+            "Contact @invalid_practice_not_match",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "ambiguous",
+            "Match or practice 20 August 2026 на Петроградской. Need one player. "
+            "Contact @invalid_ambiguous",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "negated-location",
+            "Football match 20 August 2026 not at на Петроградской. Need one player. "
+            "Contact @invalid_negated_location",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "separate-cancellation",
+            "Football match 20 August 2026 на Петроградской. Need one player. "
+            "Update: it was cancelled. Contact @invalid_separate_cancellation",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "competing-date",
+            "Football match 20 August 2026 на Петроградской. Maybe 21 August 2026. "
+            "Need one player. Contact @invalid_competing_date",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
         (
             "unrelated-range",
             "Предыдущая игра 20 августа 2026. День рождения игрока 10 сентября "
@@ -3001,7 +3146,9 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             registry_generation=1,
         )
         system.process_opportunities_until_idle()
-        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence, (
+            label
+        )
         invalid_revision_id = next(
             revision.source_message_revision_id
             for revision in system.source_message_revisions()
@@ -3014,10 +3161,6 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         assert system.opportunity_publication_contracts(invalid_revision_id) == ()
 
     lossy_currency_cases = (
-        ("dirhams-uae", "500 dirhams UAE"),
-        ("dirhams-marocains", "500 dirhams marocains"),
-        ("pesos-argentinos", "500 pesos argentinos"),
-        ("francs-belges", "500 francs belges"),
         ("ordinary-try", "We will try 500 players"),
         ("ordinary-top", "The top 500 players qualify"),
         ("ordinary-all", "Need 500 all-round players"),
@@ -3049,7 +3192,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         evidence["payment"] = payment_evidence
         candidate["payment"] = "paid"
         classifier.return_for(body=invalid_body, result=invalid_result)
-        message_id = 1080 + offset
+        message_id = 1090 + offset
         invalid_message_ids.append(message_id)
         source_event_id = f"source-event:open-match:lossy-{label}"
         telegram_ingestion.add_channel_difference_event(
@@ -3167,6 +3310,20 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "paid",
             "Participation is paid. Payment was cancelled",
             "Participation is paid",
+        ),
+        (
+            "homonymforward",
+            "positions",
+            ["forward"],
+            "Please forward this message",
+            "forward",
+        ),
+        (
+            "laterwithdrawal",
+            "positions",
+            ["defender"],
+            "Need a defender. We later withdrew the opening",
+            "Need a defender",
         ),
     )
     optional_checkpoint = invalid_checkpoint + len(lossy_currency_cases)
@@ -3323,7 +3480,7 @@ def _minimal_classifier_result(
     end_local_date: str | None = None,
     opportunity_evidence: str = "нужен один игрок",
     open_places_evidence: str = "один игрок",
-    open_places: int = 1,
+    open_places: int | None = 1,
 ) -> ClassifierAdapterResult:
     event_time: dict[str, JsonValue] = {
         "start_local_date": start_local_date,

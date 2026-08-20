@@ -7,12 +7,15 @@ from zoneinfo import ZoneInfo
 
 from modules.application import (
     _accepted_city_display_labels,
+    _body_establishes_current_open_match,
     _event_time_is_supported,
     _is_explicit_children_only_game,
+    _location_mention_is_authoritative,
     _open_match_expiry,
     _open_places_are_supported,
     _optional_values_are_supported,
     _resolve_source_location_across_supported_locales,
+    _select_response_route,
     _stated_payment_amount_and_currency,
 )
 from modules.contracts import JsonValue
@@ -70,6 +73,91 @@ class _RussianOnlyLocationResolver(_LocalizedLocationResolver):
         if query.locale != "ru":
             return LocationResolution(interpretations=())
         return super().resolve(query)
+
+
+def test_authoritative_body_must_establish_one_current_open_match() -> None:
+    for body in (
+        "Practice 20 August 2026 at Central Station. Need two players",
+        "Training 20 August 2026 at Central Station. Need two players",
+        "Match or practice 20 August 2026 at Central Station. Need two players",
+        "Тренировка 20 августа 2026 у Центральной. Нужны два игрока",
+        "Partido o entrenamiento 20 agosto 2026 en Estación Central. "
+        "Necesitamos dos jugadores",
+        "Match ou entraînement le 20 août 2026 à la Gare Centrale. "
+        "Besoin de deux joueurs",
+    ):
+        assert not _body_establishes_current_open_match(body)
+
+    for body in (
+        "Football match 20 August 2026 at Central Station. Need two players",
+        "Футбольный матч 20 августа 2026 у Центральной. Нужны два игрока",
+        "Partido de fútbol 20 agosto 2026 en Estación Central. "
+        "Necesitamos dos jugadores",
+        "Match de football le 20 août 2026 à la Gare Centrale. Besoin de deux joueurs",
+    ):
+        assert _body_establishes_current_open_match(body)
+
+
+def test_resolved_location_requires_positive_unambiguous_source_geography() -> None:
+    for body, mention in (
+        ("Football match 20 August 2026, not at Central Station", "Central Station"),
+        ("Football match at Central Station or North Station", "Central Station"),
+        ("Матч не у Центральной", "Центральной"),
+        ("Матч у Центральной или Северной", "Центральной"),
+        ("Partido no en Estación Central", "Estación Central"),
+        ("Partido en Estación Central o Estación Norte", "Estación Central"),
+        ("Match pas à la Gare Centrale", "Gare Centrale"),
+        ("Match à la Gare Centrale ou à la Gare du Nord", "Gare Centrale"),
+    ):
+        assert not _location_mention_is_authoritative(body, mention)
+
+    for body, mention in (
+        ("Football match at Central Station", "Central Station"),
+        ("Матч у Центральной", "Центральной"),
+        ("Partido en Estación Central", "Estación Central"),
+        ("Match à la Gare Centrale", "Gare Centrale"),
+    ):
+        assert _location_mention_is_authoritative(body, mention)
+
+
+def test_explicit_route_requires_contact_semantics_before_fallback_priority() -> None:
+    fallback: JsonValue = {
+        "reply_route_url": "https://t.me/source_chat/49?comment=1",
+    }
+    venue_reference = _select_response_route(
+        body="Venue page @stadium; reply here to join",
+        proposed_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@stadium",
+                "evidence": "@stadium",
+            }
+        ],
+        bounded_metadata=fallback,
+    )
+    assert venue_reference == {
+        "kind": "reply_thread",
+        "value": "https://t.me/source_chat/49?comment=1",
+    }
+
+    for body, kind, value in (
+        (
+            "Message @match_contact to join",
+            "explicit_telegram_username",
+            "@match_contact",
+        ),
+        ("Call +44 20 7946 0958 to join", "explicit_phone", "+44 20 7946 0958"),
+        (
+            "Register at https://example.test/open-match/49",
+            "explicit_url",
+            "https://example.test/open-match/49",
+        ),
+    ):
+        assert _select_response_route(
+            body=body,
+            proposed_routes=[{"kind": kind, "value": value, "evidence": value}],
+            bounded_metadata=fallback,
+        ) == {"kind": kind, "value": value}
 
 
 def test_bounded_date_range_expires_after_its_last_local_date() -> None:
@@ -554,6 +642,42 @@ def test_temporal_evidence_rejects_completed_cancellation_and_withdrawal() -> No
         )
 
 
+def test_complete_body_vetoes_separate_temporal_retraction_and_competition() -> None:
+    event_date = date(2026, 8, 20)
+    for body in (
+        "Football match 20 August 2026. Update: it was cancelled",
+        "Футбольный матч 20 августа 2026. Обновление: его отменили",
+        "Partido de fútbol 20 agosto 2026. Actualización: fue cancelado",
+        "Match de football le 20 août 2026. Mise à jour : il a été annulé",
+        "Football match 20 August 2026. We withdrew it",
+        "Football match 20 August 2026 or 21 August 2026",
+        "Матч 20 августа 2026 или 21 августа 2026",
+        "Partido 20 agosto 2026 o 21 agosto 2026",
+        "Match le 20 août 2026 ou le 21 août 2026",
+    ):
+        assert not _event_time_is_supported(
+            event_date,
+            event_date,
+            None,
+            "20 August 2026" if "August" in body else body.split(".", 1)[0],
+            authoritative_body=body,
+        )
+
+    for body in (
+        "Football match 20 August 2026. It was not cancelled",
+        "Футбольный матч 20 августа 2026. Его не отменили",
+        "Partido de fútbol 20 agosto 2026. No fue cancelado",
+        "Match de football le 20 août 2026. Il n’a pas été annulé",
+    ):
+        assert _event_time_is_supported(
+            event_date,
+            event_date,
+            None,
+            body.split(".", 1)[0],
+            authoritative_body=body,
+        )
+
+
 def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
     positive_cases = (
         (6, "Need six players"),
@@ -653,6 +777,25 @@ def test_open_player_evidence_uses_the_complete_current_opening_expression() -> 
         assert not _open_places_are_supported(2, evidence)
 
 
+def test_current_role_opening_allows_unknown_count_and_whole_body_veto() -> None:
+    for body in (
+        "Football match 20 August 2026. Looking for a goalkeeper",
+        "Футбольный матч 20 августа 2026. Ищем вратаря",
+        "Partido de fútbol 20 agosto 2026. Buscamos portero",
+        "Match de football le 20 août 2026. Recherche gardien",
+    ):
+        assert _open_places_are_supported(None, body)
+
+    for body in (
+        "Football match 20 August 2026. Need two players. We have withdrawn it",
+        "Football match 20 August 2026. Need two players. Both slots are filled",
+        "Матч 20 августа 2026. Нужны два игрока. Заявка отозвана",
+        "Partido 20 agosto 2026. Necesitamos dos jugadores. Las plazas están cubiertas",
+        "Match le 20 août 2026. Besoin de deux joueurs. Les places sont pourvues",
+    ):
+        assert not _open_places_are_supported(None, body)
+
+
 def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
     for evidence in (
         "Fee 500 EUR",
@@ -719,6 +862,12 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
         ("Tarif 500 francs suisses par joueur", ("500", "francs suisses")),
         ("Entrada 500 pesos mexicanos por persona", ("500", "pesos mexicanos")),
         ("Взнос 500 рублей с игрока", ("500", "рублей")),
+        ("Fee 500 Australian dollars. Contact @sample", ("500", "Australian dollars")),
+        ("Взнос 500 российских рублей за игрока", ("500", "российских рублей")),
+        ("Entrada 500 pesos argentinos por persona", ("500", "pesos argentinos")),
+        ("Tarif 500 francs belges par joueur", ("500", "francs belges")),
+        ("Fee 500 dirhams UAE. Contact @sample", ("500", "dirhams UAE")),
+        ("Tarif 500 dirhams marocains", ("500", "dirhams marocains")),
     )
     for evidence, expected in cases:
         assert _stated_payment_amount_and_currency(evidence) == expected
@@ -730,10 +879,6 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
     assert _stated_payment_amount_and_currency("Fee 500") is None
     assert _stated_payment_amount_and_currency("Fee 500 real") is None
     for ambiguous_longer_name in (
-        "Fee 500 dirhams UAE",
-        "Tarif 500 dirhams marocains",
-        "Entrada 500 pesos argentinos",
-        "Tarif 500 francs belges",
         "Fee 500 euros training starts at 19:00",
         "Fee 500 euros per player parking included",
     ):
@@ -910,6 +1055,29 @@ def test_semantic_evidence_is_bound_to_the_authoritative_source_body() -> None:
         {"payment": "Participation is paid"},
         authoritative_body="Participation is paid. Payment was cancelled",
     )
+    assert not _optional_values_are_supported(
+        {"positions": ["forward"]},
+        {"positions": "forward"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need one goalkeeper. "
+            "Please forward this message"
+        ),
+    )
+    assert not _optional_values_are_supported(
+        {"payment": "paid"},
+        {"payment": "paid"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need a defender. Parking is paid"
+        ),
+    )
+    assert not _optional_values_are_supported(
+        {"positions": ["defender"]},
+        {"positions": "Need a defender"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need a defender. "
+            "We later withdrew the opening"
+        ),
+    )
 
     assert _event_time_is_supported(
         event_date,
@@ -927,6 +1095,11 @@ def test_semantic_evidence_is_bound_to_the_authoritative_source_body() -> None:
         {"positions": ["defender"]},
         {"positions": "Need a defender"},
         authoritative_body="Need a defender",
+    )
+    assert _optional_values_are_supported(
+        {"payment": "paid"},
+        {"payment": "Participation fee is paid"},
+        authoritative_body=("Football match 20 August 2026. Participation fee is paid"),
     )
 
 

@@ -65,7 +65,7 @@
               "iana_timezone": {"type": "string", "minLength": 1}
             }
           },
-          "open_places": {"type": "integer", "minimum": 1},
+          "open_places": {"type": ["integer", "null"], "minimum": 1},
           "team_formats": {"$ref": "#/$defs/team_formats"},
           "positions": {"$ref": "#/$defs/positions"},
           "playing_levels": {"$ref": "#/$defs/playing_levels"},

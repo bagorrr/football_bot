@@ -933,7 +933,6 @@ def evaluate_game_search(
             if required is not None
             else str(facts["start_local_date"]),
             "iana_timezone": str(facts["iana_timezone"]),
-            "open_places": str(facts["open_places"]),
             "source_posted_at": str(facts["source_posted_at"]),
             "response_route_kind": str(route["kind"]),
             "response_route_value": str(route["value"]),
@@ -953,6 +952,8 @@ def evaluate_game_search(
                 sort_keys=True,
             ),
         }
+        if facts.get("open_places") is not None:
+            card["open_places"] = str(facts["open_places"])
         for locale in ("en", "ru", "es", "fr"):
             card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
             card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])

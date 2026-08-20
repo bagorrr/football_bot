@@ -5902,19 +5902,22 @@ def _open_match_result_message(
     where = facts[f"city_display_{copy_locale}"]
     if int(facts.get("location_specificity", "0")) > 1:
         where += f", {facts[f'place_display_{copy_locale}']}"
-    open_places = int(facts["open_places"])
-    open_place_copy = {
-        "en": f"{open_places} open place" + ("s" if open_places != 1 else ""),
-        "ru": f"Свободных мест: {open_places}",
-        "es": f"{open_places} plaza"
-        + ("s" if open_places != 1 else "")
-        + " libre"
-        + ("s" if open_places != 1 else ""),
-        "fr": f"{open_places} place"
-        + ("s" if open_places != 1 else "")
-        + " libre"
-        + ("s" if open_places != 1 else ""),
-    }[copy_locale]
+    open_places_value = facts.get("open_places")
+    open_place_copy = None
+    if open_places_value is not None:
+        open_places = int(open_places_value)
+        open_place_copy = {
+            "en": f"{open_places} open place" + ("s" if open_places != 1 else ""),
+            "ru": f"Свободных мест: {open_places}",
+            "es": f"{open_places} plaza"
+            + ("s" if open_places != 1 else "")
+            + " libre"
+            + ("s" if open_places != 1 else ""),
+            "fr": f"{open_places} place"
+            + ("s" if open_places != 1 else "")
+            + " libre"
+            + ("s" if open_places != 1 else ""),
+        }[copy_locale]
     value_copy = {
         "en": {
             "goalkeeper": "Goalkeeper",
@@ -6037,7 +6040,7 @@ def _open_match_result_message(
         if "payment_amount" in facts and "payment_currency" in facts:
             payment_copy += f" ({facts['payment_amount']} {facts['payment_currency']})"
         known_values["payment"] = payment_copy
-    detail_values = [open_place_copy]
+    detail_values = [open_place_copy] if open_place_copy is not None else []
     detail_values.extend(
         known_values[key]
         for key in (
@@ -8799,6 +8802,7 @@ def _validated_open_match_proposal(
         not isinstance(body, str)
         or not isinstance(revision_id, str)
         or _is_explicit_children_only_game(body)
+        or not _body_establishes_current_open_match(body)
         or not _classifier_proposal_has_pinned_provenance(
             payload_value,
             revision_id=revision_id,
@@ -8919,9 +8923,14 @@ def _validated_open_match_proposal(
     surfaces = candidate.get("playing_surfaces")
     payment = candidate.get("payment")
     if (
-        not isinstance(open_places, int)
-        or isinstance(open_places, bool)
-        or open_places < 1
+        (
+            open_places is not None
+            and (
+                not isinstance(open_places, int)
+                or isinstance(open_places, bool)
+                or open_places < 1
+            )
+        )
         or not _optional_canonical_list(
             team_formats,
             {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
@@ -8994,6 +9003,7 @@ def _validated_open_match_proposal(
             authoritative_body=body,
         )
         or mention not in str(evidence["location"])
+        or not _location_mention_is_authoritative(body, mention)
         or not _open_places_are_supported(
             open_places,
             f"{evidence['opportunity']}. {evidence['open_places']}",
@@ -9068,6 +9078,78 @@ def _validated_open_match_proposal(
     }
 
 
+def _body_establishes_current_open_match(body: str) -> bool:
+    """Require an unambiguous football-game proposition in authoritative text."""
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    if re.search(
+        r"\b(?:practice|training|scrimmage|тренир\w*|трениров\w*|"
+        r"entrenamient\w*|pr[áa]ctic\w*|entra[îi]nement\w*|s[ée]ance\w*)\b",
+        normalized,
+    ):
+        return False
+    explicit_game = re.search(
+        r"\b(?:football\s+match|football\s+game|match(?:es)?|game|games|"
+        r"матч\w*|игр(?:а|ы|у|е|ой|аем|ают)|"
+        r"partid\w*|encuentro\w*|matchs?|rencontre\w*)\b",
+        normalized,
+    )
+    football_role = re.search(
+        r"\b(?:goalkeeper|defender|midfielder|striker|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
+        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b",
+        normalized,
+    )
+    team_format = re.search(r"(?<!\w)(?:[5-9]|10|11)x(?:[5-9]|10|11)(?!\w)", normalized)
+    return (
+        explicit_game is not None
+        or football_role is not None
+        or team_format is not None
+    )
+
+
+def _location_mention_is_authoritative(body: str, mention: str) -> bool:
+    """Accept resolver-backed geography only from a positive single proposition."""
+    normalized_body = re.sub(r"['’]", " ", body.casefold())
+    normalized_mention = re.sub(r"['’]", " ", mention.casefold())
+    if not normalized_mention:
+        return False
+    occurrences = tuple(re.finditer(re.escape(normalized_mention), normalized_body))
+    if not occurrences:
+        return False
+    for occurrence in occurrences:
+        clause_start = (
+            max(
+                normalized_body.rfind(boundary, 0, occurrence.start())
+                for boundary in ".!?;\n"
+            )
+            + 1
+        )
+        following_boundaries = tuple(
+            position
+            for boundary in ".!?;\n"
+            if (position := normalized_body.find(boundary, occurrence.end())) >= 0
+        )
+        clause_end = min(following_boundaries, default=len(normalized_body))
+        clause = normalized_body[clause_start:clause_end]
+        if re.search(r"\b(?:or|или|o|ou)\b", clause):
+            return False
+        prefix = normalized_body[clause_start : occurrence.start()]
+        if re.search(
+            r"(?:\bnot\s+(?:at|in|near|by)(?:\s+the)?|"
+            r"\bnever\s+(?:at|in|near|by)(?:\s+the)?|"
+            r"\bне\s+(?:у|на|в|возле|около)|\bни\s+(?:у|на|в)|"
+            r"\bno\s+(?:en(?:\s+(?:la|el))?|cerca\s+de|junto\s+a)|"
+            r"\bsin\s+ubicaci[oó]n\s+en|"
+            r"\bpas\s+(?:[àa](?:\s+(?:la|le|l))?|en|pr[èe]s\s+de)|"
+            r"\bsans\s+(?:être\s+)?[àa](?:\s+(?:la|le|l))?)"
+            r"\s*$",
+            prefix,
+        ):
+            return False
+    return True
+
+
 def _select_response_route(
     *,
     body: str,
@@ -9089,6 +9171,7 @@ def _select_response_route(
             and isinstance(route_evidence, str)
             and route_evidence in body
             and value in route_evidence
+            and _route_has_explicit_contact_semantics(body, value)
             and (
                 (
                     kind == "explicit_telegram_username"
@@ -9131,6 +9214,34 @@ def _select_response_route(
         if isinstance(value, str) and _is_safe_telegram_response_url(value):
             return {"kind": kind, "value": value}
     return None
+
+
+def _route_has_explicit_contact_semantics(body: str, value: str) -> bool:
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    value_start = normalized.find(value.casefold())
+    if value_start < 0:
+        return False
+    clause_start = max(
+        normalized.rfind(boundary, 0, value_start) for boundary in ".!?;\n"
+    )
+    clause_start += 1
+    following = tuple(
+        position
+        for boundary in ".!?;\n"
+        if (position := normalized.find(boundary, value_start)) >= 0
+    )
+    clause = normalized[clause_start : min(following, default=len(normalized))]
+    return (
+        re.search(
+            r"\b(?:contact|message|write|text|call|reply|register|apply|form|join|"
+            r"пиш\w*|напис\w*|звон\w*|связ\w*|контакт\w*|регистр\w*|запис\w*|"
+            r"форм\w*|присоедин\w*|escrib\w*|mensaje\w*|llam\w*|contact\w*|"
+            r"registr\w*|inscri\w*|formulari\w*|[ée]cri\w*|message\w*|appel\w*|"
+            r"contact\w*|inscri\w*|formulair\w*)\b",
+            clause,
+        )
+        is not None
+    )
 
 
 def _is_safe_response_url(value: str) -> bool:
@@ -9224,6 +9335,8 @@ def _event_time_is_supported(
             source_timezone=source_timezone,
         )
     normalized = evidence.casefold()
+    if _body_has_terminal_retraction(normalized):
+        return False
     month_stems = {
         1: ("january", "январ", "enero", "janvier"),
         2: ("february", "феврал", "febrero", "février", "fevrier"),
@@ -9238,6 +9351,25 @@ def _event_time_is_supported(
         11: ("november", "ноябр", "noviembre", "novembre"),
         12: ("december", "декабр", "diciembre", "décembre", "decembre"),
     }
+
+    stated_dates: set[date] = set()
+    for month, stems_for_month in month_stems.items():
+        stems = "|".join(re.escape(stem) + r"\w*" for stem in stems_for_month)
+        for pattern in (
+            rf"(?<!\d)(?P<day>[0-3]?\d)(?!\d)\s+(?:de\s+)?(?:{stems})"
+            rf"(?:\s+de)?\s*,?\s*(?P<year>\d{{4}})(?!\d)",
+            rf"(?:{stems})\s+(?<!\d)(?P<day>[0-3]?\d)(?!\d)\s*,?\s*"
+            rf"(?P<year>\d{{4}})(?!\d)",
+        ):
+            for match in re.finditer(pattern, normalized):
+                try:
+                    stated_dates.add(
+                        date(int(match.group("year")), month, int(match.group("day")))
+                    )
+                except ValueError:
+                    return False
+    if stated_dates - {start, end}:
+        return False
 
     def date_spans(value: date) -> list[tuple[int, int]]:
         spans = [
@@ -9537,6 +9669,36 @@ def _event_time_is_supported(
         )
         is None
         for _, _, clause_start, clause_end in positive_expressions
+    )
+
+
+def _body_has_terminal_retraction(body: str) -> bool:
+    """Detect a complete-source retraction while preserving explicit negatives."""
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    affirmative_negations = (
+        r"\b(?:was|is|has\s+been|had\s+been|will\s+be)\s+not\s+"
+        r"(?:cancelled|canceled|called\s+off|withdrawn|closed)\b",
+        r"\b(?:has|had)\s+not\s+been\s+"
+        r"(?:cancelled|canceled|called\s+off|withdrawn|closed)\b",
+        r"\b(?:did|do|does)\s+not\s+(?:cancel|withdraw|close)\b",
+        r"\bне\s+(?:(?:был\w*|будет)\s+)?(?:отмен\w*|отозван\w*|снят\w*)\b",
+        r"\b(?:не\s+)?(?:отмен\w*|отозван\w*|снят\w*)\s+не\s+будет\b",
+        r"\bno\s+(?:(?:fue|est[áa]|ser[áa]|ha\s+sido)\s+)?"
+        r"(?:cancelad\w*|retirad\w*|cerrad\w*)\b",
+        r"\bn\s+(?:(?:est|sera|a|avait)\s+)?(?:pas\s+)?"
+        r"(?:[ée]t[ée]\s+)?(?:annul[ée]\w*|retir[ée]\w*|ferm[ée]\w*)\b",
+    )
+    for pattern in affirmative_negations:
+        normalized = re.sub(pattern, "", normalized)
+    return (
+        re.search(
+            r"\b(?:cancelled|canceled|withdrawn|withdrew|closed|called\s+off|"
+            r"отмен\w*|отозван\w*|отозвал\w*|снят\w*|снял\w*|"
+            r"cancelad\w*|retirad\w*|cerrad\w*|"
+            r"annul[ée]\w*|retir[ée]\w*|ferm[ée]\w*)\b",
+            normalized,
+        )
+        is not None
     )
 
 
@@ -9929,7 +10091,7 @@ def _matching_number_spans(
 
 
 def _open_places_are_supported(
-    open_places: int,
+    open_places: int | None,
     evidence: str,
     *,
     authoritative_body: str | None = None,
@@ -9942,7 +10104,7 @@ def _open_places_are_supported(
             open_places,
             authoritative_body,
         )
-    if open_places <= 0:
+    if open_places is not None and open_places <= 0:
         return False
     normalized_evidence = re.sub(
         r"(?<=\d)[\s\u00a0,.](?=\d{3}(?:\D|$))",
@@ -9989,6 +10151,19 @@ def _open_places_are_supported(
         "milieu",
         "attaquant",
     }
+
+    def is_explicit_player_word(token: str) -> bool:
+        return (
+            token in explicit_player_words
+            or re.fullmatch(
+                r"(?:вратар|защитник|полузащитник|нападающ|игрок)\w*|"
+                r"(?:portero|defensa|centrocampista|delantero|jugador)\w*|"
+                r"(?:gardien|d[ée]fenseur|milieu|attaquant|joueur)\w*",
+                token,
+            )
+            is not None
+        )
+
     referee_words = {
         "referee",
         "referees",
@@ -10010,8 +10185,10 @@ def _open_places_are_supported(
         "équipe",
         "équipes",
     }
-    has_cardinal = bool(_matching_number_spans(evidence_tokens, open_places))
-    has_explicit_player = bool(evidence_words.intersection(explicit_player_words))
+    has_cardinal = open_places is not None and bool(
+        _matching_number_spans(evidence_tokens, open_places)
+    )
+    has_explicit_player = any(is_explicit_player_word(word) for word in evidence_words)
     has_generic_opening = bool(evidence_words.intersection(generic_opening_words))
     opening_word = re.compile(
         r"(?:open|available|need(?:s|ed)?|wanted|seeking|"
@@ -10037,6 +10214,18 @@ def _open_places_are_supported(
         r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+(?:pas|plus)\b|"
         r"\bne\s+\w+\s+plus\b|\bplus\s+besoin\b|\bpas\s+besoin\b)"
     )
+    if _body_has_terminal_retraction(normalized_evidence) or re.search(
+        r"\b(?:both\s+)?(?:slots?|places?|spots?)\b[^.!?;\n]{0,30}\b"
+        r"(?:filled|occupied|closed|taken)\b|"
+        r"\b(?:мест\w*|слот\w*)\b[^.!?;\n]{0,30}\b"
+        r"(?:заполн\w*|занят\w*|закрыт\w*)\b|"
+        r"\b(?:plazas?|puestos?)\b[^.!?;\n]{0,30}\b"
+        r"(?:cubiert\w*|ocupad\w*|cerrad\w*)\b|"
+        r"\bplaces?\b[^.!?;\n]{0,30}\b"
+        r"(?:pourvu\w*|occup[ée]\w*|ferm[ée]\w*)\b",
+        normalized_evidence,
+    ):
+        return False
     for clause in re.split(r"[.!?;\n]+", normalized_evidence):
         normalized_clause = re.sub(r"['’]", " ", clause)
         clause_tokens = re.findall(r"[^\W_]+", clause)
@@ -10055,16 +10244,21 @@ def _open_places_are_supported(
         ):
             return False
     has_supported_counted_opening = False
+    has_supported_uncounted_opening = False
     for clause in re.split(r"[.!?;\n]+", normalized_evidence):
         normalized_clause = re.sub(r"['’]", " ", clause)
         if negated_opening.search(normalized_clause) is not None:
             continue
         clause_tokens = re.findall(r"[^\W_]+", clause)
-        number_spans = _matching_number_spans(clause_tokens, open_places)
+        number_spans = (
+            _matching_number_spans(clause_tokens, open_places)
+            if open_places is not None
+            else ()
+        )
         noun_indexes = {
             index
             for index, token in enumerate(clause_tokens)
-            if token in explicit_player_words or token in generic_opening_words
+            if is_explicit_player_word(token) or token in generic_opening_words
         }
         opening_indexes = {
             index
@@ -10121,6 +10315,20 @@ def _open_places_are_supported(
         forbidden_between = (
             referee_words | team_words | generic_opening_words | non_player_context
         )
+        if (
+            noun_indexes
+            and opening_indexes
+            and any(
+                is_explicit_player_word(clause_tokens[index]) for index in noun_indexes
+            )
+            and not clause_words.intersection(non_player_context | referee_words)
+            and any(
+                opening_index <= noun_index
+                for opening_index in opening_indexes
+                for noun_index in noun_indexes
+            )
+        ):
+            has_supported_uncounted_opening = True
         counted_noun_indexes: set[int] = set()
         for noun_index in noun_indexes:
             for count_start, count_end in number_spans:
@@ -10142,7 +10350,7 @@ def _open_places_are_supported(
                 counted_noun_indexes.add(noun_index)
                 break
         counted_explicit_player = any(
-            clause_tokens[index] in explicit_player_words
+            is_explicit_player_word(clause_tokens[index])
             for index in counted_noun_indexes
         )
         counted_generic_opening = any(
@@ -10163,6 +10371,8 @@ def _open_places_are_supported(
         ):
             has_supported_counted_opening = True
             break
+    if open_places is None:
+        return has_supported_uncounted_opening
     return bool(
         has_cardinal
         and has_supported_counted_opening
@@ -10187,8 +10397,24 @@ _ISO_CURRENCY_CODES = frozenset(
     XBA XBB XBC XBD XCD XCG XDR XOF XPD XPF XPT XSU XTS XUA XXX YER ZAR ZMW
     ZWG""".split()  # noqa: SIM905 - compact, auditable ISO 4217 allowlist
 )
+_CURRENCY_NAME_MODIFIER_PATTERN = (
+    r"(?:(?-i:[A-Z]{2,4})|"
+    r"[a-zà-öø-ÿ]+(?:ian|ean|an|ese|ish|ic|ense|anos?|inos?|eños?|"
+    r"ains?|aises?|ois(?:es)?|iens?|iennes?|ges?|iques?|sses?)|"
+    r"[а-яё]+(?:ских|цких|ийских|ых|их))"
+)
+_CURRENCY_NAME_HEAD_PATTERN = (
+    r"(?:dollars?|d[oó]lares?|доллар\w*|rub(?:les?)?|roubles?|руб\w*|"
+    r"rublos?|euros?|евро|pounds?|фунт\w*|libras?|livres?|"
+    r"francs?|франк\w*|francos?|pesos?|песо|yuan(?:es|s)?|юан\w*|"
+    r"yens?|(?:и|й)ен\w*|dirhams?|дирхам\w*|dinares?|dinars?|динар\w*|"
+    r"soles|грив(?:ен|ны|на|ну))"
+)
 _STATED_CURRENCY_PATTERN = (
     r"(?i:(?:[₽$€£¥₴₸₹₾₺]|(?:" + "|".join(sorted(_ISO_CURRENCY_CODES)) + r")|"
+    rf"(?:{_CURRENCY_NAME_MODIFIER_PATTERN}[\s\u00a0]+)?"
+    rf"{_CURRENCY_NAME_HEAD_PATTERN}"
+    rf"(?:[\s\u00a0]+{_CURRENCY_NAME_MODIFIER_PATTERN})?|"
     r"canadian[\s\u00a0]+dollars?|dollars?[\s\u00a0]+canadiens?|"
     r"d[oó]lares?[\s\u00a0]+canadienses?|канадск\w*[\s\u00a0]+доллар\w*|"
     r"swiss[\s\u00a0]+francs?|francs?[\s\u00a0]+(?:suisses?|cfa)|"
@@ -10397,8 +10623,11 @@ def _optional_values_are_supported(
     evidence: dict[str, JsonValue],
     *,
     authoritative_body: str | None = None,
+    _authoritative: bool = False,
 ) -> bool:
     if authoritative_body is not None:
+        if _body_has_terminal_retraction(authoritative_body):
+            return False
         authoritative_evidence: dict[str, JsonValue] = {
             field_name: authoritative_body
             for field_name in (
@@ -10417,6 +10646,7 @@ def _optional_values_are_supported(
         ) and _optional_values_are_supported(
             candidate,
             authoritative_evidence,
+            _authoritative=True,
         )
     lexicon: dict[str, dict[str, tuple[str, ...]]] = {
         "positions": {
@@ -10586,6 +10816,12 @@ def _optional_values_are_supported(
             )
             if not _patterns_have_affirmative_clause_support(normalized, patterns):
                 return False
+            if _authoritative and not _patterns_have_football_clause_support(
+                normalized,
+                patterns,
+                field_name=field_name,
+            ):
+                return False
     payment = candidate.get("payment")
     if payment is not None:
         payment_evidence = evidence.get("payment")
@@ -10652,9 +10888,90 @@ def _optional_values_are_supported(
             or competing_supported
             or (direct_mentioned and not direct_supported)
             or not (direct_supported or stated_amount is not None)
+            or (
+                _authoritative
+                and not _payment_has_opportunity_semantics(
+                    payment_evidence,
+                    direct_patterns,
+                )
+            )
         ):
             return False
     return True
+
+
+def _payment_has_opportunity_semantics(
+    source_body: str,
+    payment_patterns: tuple[str, ...],
+) -> bool:
+    """Reject paid/free homonyms unrelated to joining the football opportunity."""
+    payment_context = re.compile(
+        r"\b(?:participation|entry|fee|cost|price|payment|pay|registration|"
+        r"player|team|match|game|"
+        r"участ\w*|взнос\w*|стоим\w*|цен\w*|оплат\w*|регистрац\w*|игрок\w*|"
+        r"participaci[oó]n|entrada|tarifa|precio|cuota|pago|inscripci[oó]n|"
+        r"participation|entr[ée]e|tarif\w*|prix|co[uû]t\w*|cotisation|frais|"
+        r"inscription)\b"
+    )
+    unrelated_context = re.compile(
+        r"\b(?:parking|car|ticket|spectator|parking\w*|парков\w*|билет\w*|"
+        r"aparcamiento|estacionamiento|entrada\s+de\s+espectador|"
+        r"stationnement|billet\w*)\b"
+    )
+    for source_clause in re.split(r"[.!?;\n]+", source_body):
+        clause = source_clause.casefold()
+        if not any(re.search(pattern, clause) for pattern in payment_patterns) and (
+            _stated_payment_amount_and_currency(source_clause) is None
+        ):
+            continue
+        if unrelated_context.search(clause):
+            return False
+        if (
+            _stated_payment_amount_and_currency(source_clause) is not None
+            or payment_context.search(clause)
+            or re.search(r"\bthis(?:\s+(?:match|game))?\s+is\s+(?:free|paid)\b", clause)
+        ):
+            return True
+    return False
+
+
+def _patterns_have_football_clause_support(
+    normalized_body: str,
+    patterns: tuple[str, ...],
+    *,
+    field_name: str,
+) -> bool:
+    """Bind an optional fact to a football/opening proposition, not a homonym."""
+    common_context = (
+        r"\b(?:football|match|game|playing|play|team|player|players|"
+        r"need\w*|looking|seeking|wanted|position|"
+        r"футбол\w*|матч\w*|игр\w*|команд\w*|игрок\w*|нуж\w*|ищ\w*|треб\w*|"
+        r"f[úu]tbol|partid\w*|jug\w*|equip\w*|jugador\w*|necesit\w*|busc\w*|"
+        r"match\w*|jou\w*|[ée]quipe\w*|joueur\w*|besoin|cherch\w*)\b"
+    )
+    field_context = {
+        "team_formats": r"\b(?:format|side|a-side|формат\w*|formato|format)\b",
+        "positions": (
+            r"\b(?:goalkeeper|defender|midfielder|striker|position|вратар\w*|"
+            r"защитник\w*|полузащитник\w*|нападающ\w*|portero\w*|defensa|"
+            r"centrocampista\w*|delantero\w*|gardien\w*|d[ée]fenseur\w*|"
+            r"milieu\w*|attaquant\w*)\b"
+        ),
+        "playing_levels": r"\b(?:level|skill|уров\w*|nivel|niveau)\b",
+        "venue_settings": (
+            r"\b(?:venue|field|pitch|court|пол\w*|площад\w*|campo|cancha|terrain)\b"
+        ),
+        "playing_surfaces": (
+            r"\b(?:surface|turf|grass|pitch|field|покрыт\w*|газон\w*|поле|"
+            r"c[ée]sped|superficie|gazon|terrain|parquet)\b"
+        ),
+    }[field_name]
+    for clause in re.split(r"[.!?;\n]+", normalized_body):
+        if not any(re.search(pattern, clause) for pattern in patterns):
+            continue
+        if re.search(common_context, clause) or re.search(field_context, clause):
+            return True
+    return False
 
 
 def _canonical_game_search_time(value: str) -> bool:
