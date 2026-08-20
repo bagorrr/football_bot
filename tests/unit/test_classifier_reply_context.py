@@ -21,7 +21,7 @@ from modules.contracts import (
 def _valid_classify_command() -> RawContractEnvelope:
     source_event_id = "source-event:reply-lineage:child"
     causation_id = derive_source_event_message_id(source_event_id)
-    source_message_id = "source-chat:channel:4900100:message:1012"
+    source_message_id = "source-chat:channel:4900100:generation:3:message:1012"
     revision_id = f"{source_message_id}:revision:1"
     payload: dict[str, JsonValue] = {
         "source_message_revision_id": revision_id,
@@ -46,7 +46,7 @@ def _valid_classify_command() -> RawContractEnvelope:
             "registry_generation": 3,
             "telegram_message_id": 1011,
             "source_message_revision_id": (
-                "source-chat:channel:4900100:message:1011:revision:2"
+                "source-chat:channel:4900100:generation:3:message:1011:revision:2"
             ),
             "body": "Актуальные детали игры",
             "source_event_time": "2026-08-18T17:38:00+00:00",
@@ -75,6 +75,32 @@ def test_classifier_command_accepts_authoritative_direct_reply_lineage() -> None
     ContractEnvelope.from_raw(_valid_classify_command())
 
 
+def test_classifier_command_accepts_direct_reply_older_than_adjacent_window() -> None:
+    valid = _valid_classify_command()
+    payload = deepcopy(valid.payload)
+    assert isinstance(payload, dict)
+    reply = payload["eligible_reply_context"]
+    assert isinstance(reply, dict)
+    reply["source_event_time"] = "2026-08-10T17:59:59+00:00"
+
+    ContractEnvelope.from_raw(
+        RawContractEnvelope(
+            contract_name=valid.contract_name,
+            contract_version=valid.contract_version,
+            message_id=valid.message_id,
+            producer=valid.producer,
+            consumer=valid.consumer,
+            subject_id=valid.subject_id,
+            subject_revision=valid.subject_revision,
+            idempotency_key=valid.idempotency_key,
+            causation_id=valid.causation_id,
+            correlation_id=valid.correlation_id,
+            recorded_at=valid.recorded_at,
+            payload=payload,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "fault",
     (
@@ -82,7 +108,6 @@ def test_classifier_command_accepts_authoritative_direct_reply_lineage() -> None
         "cross_generation",
         "non_direct",
         "wrong_target",
-        "older_than_24_hours",
         "future_parent",
     ),
 )
@@ -102,8 +127,6 @@ def test_classifier_command_deterministically_rejects_ineligible_reply_lineage(
         reply["relationship_kind"] = "adjacent_message"
     elif fault == "wrong_target":
         reply["telegram_message_id"] = 1010
-    elif fault == "older_than_24_hours":
-        reply["source_event_time"] = "2026-08-17T17:59:59+00:00"
     elif fault == "future_parent":
         reply["source_event_time"] = "2026-08-18T18:00:01+00:00"
     else:  # pragma: no cover - exhaustive parametrization guard

@@ -791,7 +791,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         telegram_message_id: int,
         current_event_time: datetime,
     ) -> SourceMessageRevision | None:
-        """Return one retained current direct-reply target within 24 hours."""
+        """Return one retained current direct-reply target after the start boundary."""
         ...
 
     def claim_next(

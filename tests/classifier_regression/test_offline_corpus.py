@@ -195,6 +195,11 @@ def test_offline_corpus_accepts_related_ranges_in_all_supported_locales() -> Non
         "20–22 августа 2026",
         "20–22 de agosto de 2026",
         "20–22 août 2026",
+        "From 20 to 22 August 2026",
+        "С 20 по 22 августа 2026",
+        "Del 20 al 22 de agosto de 2026",
+        "Du 20 au 22 août 2026",
+        "August 20–22, 2026",
     ):
         assert _event_time_is_supported(
             date(2026, 8, 20),
@@ -224,6 +229,8 @@ def test_offline_day_part_evidence_rejects_cross_value_negation_and_ambiguity() 
 
 def test_offline_temporal_details_are_positive_and_event_bound() -> None:
     for exact_time, day_part, evidence in (
+        (None, "evening", "Match 20 August 2026. Training is in the evening"),
+        (None, None, "Match is not on 20 August 2026"),
         (None, "evening", "20 agosto 2026, no queremos jugar fútbol por la tarde"),
         (
             None,
@@ -245,17 +252,21 @@ def test_offline_temporal_details_are_positive_and_event_bound() -> None:
 def test_offline_open_player_evidence_is_complete_and_polarity_safe() -> None:
     for evidence in (
         "Need six players",
+        "Need six more players",
         "Нужно шесть игроков",
         "Necesitamos seis jugadores",
         "Besoin de six joueurs",
     ):
         assert _open_places_are_supported(6, evidence)
     assert _open_places_are_supported(27, "Need 27 players")
+    assert _open_places_are_supported(27, "Need 27 more players")
 
     for evidence in (
+        "We don’t need two players",
         "No longer need 2 players",
         "Больше не нужно два игрока",
         "Ya no necesitamos dos jugadores",
+        "Nous ne cherchons pas deux joueurs",
         "Nous n’avons plus besoin de deux joueurs",
     ):
         assert not _open_places_are_supported(2, evidence)
@@ -291,6 +302,13 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         {"payment": "paid"},
         {"payment": "Fee 500"},
     )
+    for ambiguous_longer_name in (
+        "Fee 500 dirhams UAE",
+        "Tarif 500 dirhams marocains",
+        "Entrada 500 pesos argentinos",
+        "Tarif 500 francs belges",
+    ):
+        assert _stated_payment_amount_and_currency(ambiguous_longer_name) is None
 
 
 def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:

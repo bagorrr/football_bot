@@ -72,6 +72,18 @@ def derive_source_event_message_id(source_event_id: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:source-event:{source_event_id}")
 
 
+def canonical_source_message_id(
+    source_chat_reference: str,
+    registry_generation: int,
+    telegram_message_id: int,
+) -> str:
+    """Return the generation-bound identity of one Telegram Source Message."""
+    return (
+        f"{source_chat_reference}:generation:{registry_generation}:"
+        f"message:{telegram_message_id}"
+    )
+
+
 def derive_run_search_message_id(telegram_user_id: int, search_update_id: str) -> UUID:
     """Return the canonical identity for one submitted Search command."""
     return uuid5(
@@ -845,13 +857,24 @@ def _validate_source_event_recorded(
     telegram_chat_id = payload["telegram_chat_id"]
     telegram_message_id = payload["telegram_message_id"]
     registry_generation = payload["registry_generation"]
-    for value in (telegram_chat_id, telegram_message_id, registry_generation):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError("SourceEventRecorded numeric identities must be positive")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (telegram_chat_id, telegram_message_id, registry_generation)
+    ):
+        raise ValueError("SourceEventRecorded numeric identities must be positive")
+    assert isinstance(telegram_chat_id, int)
+    assert isinstance(telegram_message_id, int)
+    assert isinstance(registry_generation, int)
     source_chat_key = _required_text(payload, "source_chat_key")
     if source_chat_key != f"source-chat:{peer_kind}:{telegram_chat_id}":
         raise ValueError("SourceEventRecorded Source Chat identity is inconsistent")
-    expected_subject = f"{source_chat_key}:message:{telegram_message_id}"
+    expected_subject = (
+        canonical_source_message_id(
+            source_chat_key, registry_generation, telegram_message_id
+        )
+        if envelope.contract_version == 4
+        else f"{source_chat_key}:message:{telegram_message_id}"
+    )
     if envelope.subject_id != expected_subject:
         raise ValueError("SourceEventRecorded subject is not its Source Message")
     if _required_text(payload, "source_message_revision_id") != (
@@ -1016,8 +1039,6 @@ def _validate_classify_source_message_revision(
     ):
         raise ValueError("classifier context bundle version is unsupported")
     source_chat_reference = _required_text(payload, "source_chat_reference")
-    if not envelope.subject_id.startswith(f"{source_chat_reference}:message:"):
-        raise ValueError("Source Chat reference does not contain the message subject")
     source_chat_generation = payload["source_chat_registry_generation"]
     if (
         not isinstance(source_chat_generation, int)
@@ -1027,8 +1048,14 @@ def _validate_classify_source_message_revision(
         raise TypeError("source_chat_registry_generation must be positive")
     try:
         current_telegram_message_id = int(envelope.subject_id.rsplit(":message:", 1)[1])
-    except ValueError as error:
+    except (IndexError, ValueError) as error:
         raise ValueError("current Source Message identity is invalid") from error
+    if envelope.subject_id != canonical_source_message_id(
+        source_chat_reference,
+        source_chat_generation,
+        current_telegram_message_id,
+    ):
+        raise ValueError("Source Message identity is not generation-bound")
     direct_reply_target = payload["direct_reply_to_telegram_message_id"]
     if direct_reply_target is not None and (
         not isinstance(direct_reply_target, int)
@@ -1096,7 +1123,8 @@ def _validate_classify_source_message_revision(
         reply_revision_id = _required_text(reply, "source_message_revision_id")
         if (
             re.fullmatch(
-                rf"{re.escape(source_chat_reference)}:message:"
+                rf"{re.escape(source_chat_reference)}:generation:"
+                rf"{source_chat_generation}:message:"
                 rf"{reply_message_id}:revision:[1-9][0-9]*",
                 reply_revision_id,
             )
@@ -1111,8 +1139,8 @@ def _validate_classify_source_message_revision(
             _required_iso_datetime(payload, "source_event_time")
         )
         age = source_event_time - reply_event_time
-        if age < timedelta(0) or age > timedelta(hours=24):
-            raise ValueError("eligible_reply_context is outside the 24-hour bound")
+        if age < timedelta(0):
+            raise ValueError("eligible_reply_context is newer than its direct reply")
     _validate_direct_causation(envelope, ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION)
     if envelope.idempotency_key != f"classify-source-message:{revision_id}":
         raise ValueError(

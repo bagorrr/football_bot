@@ -1443,7 +1443,9 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     assert system.process_next_source_event()
     attempts_before_cross_chat = system.classification_attempts()
-    cross_chat_revision_id = "source-chat:channel:4900100:message:1013:revision:1"
+    cross_chat_revision_id = (
+        "source-chat:channel:4900100:generation:1:message:1013:revision:1"
+    )
     invalid_command = system.invalidate_classifier_context(
         source_message_revision_id=cross_chat_revision_id,
         contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
@@ -1454,7 +1456,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                 "registry_generation": 1,
                 "telegram_message_id": 1011,
                 "source_message_revision_id": (
-                    "source-chat:channel:4900200:message:1011:revision:1"
+                    "source-chat:channel:4900200:generation:1:message:1011:revision:1"
                 ),
                 "body": reply_parent_body,
                 "source_event_time": "2026-08-18T17:38:00+00:00",
@@ -1563,7 +1565,9 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "source_message_revision_reference"
         ]
     ).startswith("classifier-revision:")
-    stale_child_revision_id = "source-chat:channel:4900100:message:1014:revision:1"
+    stale_child_revision_id = (
+        "source-chat:channel:4900100:generation:1:message:1014:revision:1"
+    )
     system.invalidate_classifier_context(
         source_message_revision_id=stale_child_revision_id,
         contract_name=ContractName.CLASSIFICATION_PROPOSAL,
@@ -1574,7 +1578,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                 "registry_generation": 1,
                 "telegram_message_id": 1011,
                 "source_message_revision_id": (
-                    "source-chat:channel:4900100:message:1011:revision:1"
+                    "source-chat:channel:4900100:generation:1:message:1011:revision:1"
                 ),
                 "body": reply_parent_body,
                 "source_event_time": "2026-08-18T17:38:00+00:00",
@@ -1588,7 +1592,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         for opportunity in system.opportunities()
     )
 
-    old_parent_body = "Контекст старше суток не является подходящим."
+    old_parent_body = "Сохранённый контекст прямого ответа."
     classifier.return_for(
         body=old_parent_body,
         result=ClassifierAdapterResult(
@@ -1657,10 +1661,14 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         registry_generation=1,
     )
     system.process_opportunities_until_idle()
-    assert classifier.requests[-1].eligible_reply_context is None
+    old_reply_context = classifier.requests[-1].eligible_reply_context
+    assert old_reply_context is not None
+    assert old_reply_context["relationship_kind"] == "direct_reply"
+    assert old_reply_context["body"] == old_parent_body
+    assert old_reply_context["source_event_time"] == "2026-08-17T17:59:59+00:00"
     assert any(
         opportunity.source_message_revision_id
-        == "source-chat:channel:4900100:message:1021:revision:1"
+        == "source-chat:channel:4900100:generation:1:message:1021:revision:1"
         for opportunity in system.opportunities()
     )
 
@@ -1700,7 +1708,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert classifier.requests[-1].eligible_reply_context is None
     assert any(
         opportunity.source_message_revision_id
-        == "source-chat:channel:4900100:message:1022:revision:1"
+        == "source-chat:channel:4900100:generation:1:message:1022:revision:1"
         for opportunity in system.opportunities()
     )
 
@@ -1739,7 +1747,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     system.process_opportunities_until_idle()
     assert any(
         opportunity.source_message_revision_id
-        == "source-chat:channel:4900100:message:1023:revision:1"
+        == "source-chat:channel:4900100:generation:1:message:1023:revision:1"
         and opportunity.publication_state == "active"
         for opportunity in system.opportunities()
     )
@@ -1856,7 +1864,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         opportunity
         for opportunity in system.opportunities()
         if opportunity.source_message_revision_id
-        == "source-chat:channel:4900100:message:1025:revision:1"
+        == "source-chat:channel:4900100:generation:1:message:1025:revision:1"
     )
 
     resolver.return_for(
@@ -2292,6 +2300,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "2026-08-21",
             "2026-08-23",
             "07:17",
+            6,
             datetime(2026, 8, 20, 9, 0, tzinfo=UTC),
             "21 to 23 August",
             "en",
@@ -2305,9 +2314,80 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "2026-08-20",
             "2026-08-22",
             "07:18",
+            6,
             datetime(2026, 8, 20, 9, 1, tzinfo=UTC),
             "20 August",
             "es",
+        ),
+        (
+            "english-shared-month-more-players",
+            "Match From 20 to 22 August 2026 at 07:19 на Петроградской. "
+            "Need six more players. Contact @english_shared_month",
+            "From 20 to 22 August 2026 at 07:19",
+            "Need six more players",
+            "2026-08-20",
+            "2026-08-22",
+            "07:19",
+            6,
+            datetime(2026, 8, 20, 9, 2, tzinfo=UTC),
+            "20 August",
+            "en",
+        ),
+        (
+            "russian-shared-month",
+            "Матч с 20 по 22 августа 2026 в 07:20 на Петроградской. "
+            "Нужно шесть игроков. Пишите @russian_shared_month",
+            "с 20 по 22 августа 2026 в 07:20",
+            "Нужно шесть игроков",
+            "2026-08-20",
+            "2026-08-22",
+            "07:20",
+            6,
+            datetime(2026, 8, 20, 9, 3, tzinfo=UTC),
+            "20 August",
+            "ru",
+        ),
+        (
+            "spanish-shared-month",
+            "Partido del 20 al 22 de agosto de 2026 a las 07:21 на Петроградской. "
+            "Necesitamos seis jugadores. Escribe a @spanish_shared_month",
+            "del 20 al 22 de agosto de 2026 a las 07:21",
+            "Necesitamos seis jugadores",
+            "2026-08-20",
+            "2026-08-22",
+            "07:21",
+            6,
+            datetime(2026, 8, 20, 9, 4, tzinfo=UTC),
+            "20 August",
+            "es",
+        ),
+        (
+            "french-shared-month",
+            "Match du 20 au 22 août 2026 à 07:22 на Петроградской. "
+            "Besoin de six joueurs. Contact @french_shared_month",
+            "du 20 au 22 août 2026 à 07:22",
+            "Besoin de six joueurs",
+            "2026-08-20",
+            "2026-08-22",
+            "07:22",
+            6,
+            datetime(2026, 8, 20, 9, 5, tzinfo=UTC),
+            "20 August",
+            "fr",
+        ),
+        (
+            "month-first-large-opening",
+            "Match August 20–22, 2026 at 07:23 на Петроградской. "
+            "Need 27 more players. Contact @month_first_large",
+            "August 20–22, 2026 at 07:23",
+            "Need 27 more players",
+            "2026-08-20",
+            "2026-08-22",
+            "07:23",
+            27,
+            datetime(2026, 8, 20, 9, 6, tzinfo=UTC),
+            "20 August",
+            "en",
         ),
     )
     range_opportunities = {}
@@ -2319,15 +2399,20 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         range_start,
         range_end,
         range_exact_time,
+        range_open_places,
         range_source_time,
         _date_text,
         _locale,
     ) in enumerate(range_cases, start=1):
-        username = (
-            "@relative_range_six"
-            if label == "relative-range-six-players"
-            else "@compact_range_six"
-        )
+        username = {
+            "relative-range-six-players": "@relative_range_six",
+            "spanish-compact-range-six-players": "@compact_range_six",
+            "english-shared-month-more-players": "@english_shared_month",
+            "russian-shared-month": "@russian_shared_month",
+            "spanish-shared-month": "@spanish_shared_month",
+            "french-shared-month": "@french_shared_month",
+            "month-first-large-opening": "@month_first_large",
+        }.get(label, "@" + label.replace("-", "_"))
         classifier.return_for(
             body=range_body,
             result=_minimal_classifier_result(
@@ -2346,7 +2431,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                 end_local_date=range_end,
                 opportunity_evidence=range_open_places_evidence,
                 open_places_evidence=range_open_places_evidence,
-                open_places=6,
+                open_places=range_open_places,
             ),
         )
         telegram_ingestion.add_channel_difference_event(
@@ -2381,6 +2466,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         _range_start,
         _range_end,
         range_exact_time,
+        range_open_places,
         _range_source_time,
         date_text,
         locale,
@@ -2410,7 +2496,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             == range_opportunities[label].opportunity_id
         )
         assert range_result.result_class == "confirmed_match"
-        assert "6" in telegram_delivery.messages[-1].text
+        assert str(range_open_places) in telegram_delivery.messages[-1].text
         range_inputs = system.completed_search_opportunity_revision_inputs(
             range_search.completed_search_id
         )
@@ -2421,7 +2507,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             == range_opportunities[label].opportunity_revision_id
         )
         assert isinstance(range_accepted_facts, dict)
-        assert range_accepted_facts["open_places"] == 6
+        assert range_accepted_facts["open_places"] == range_open_places
         system.submit_search(
             update_id=range_update_id,
             telegram_user_id=range_user_id,
@@ -2530,6 +2616,30 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "один игрок",
         ),
         (
+            "unrelated-evening",
+            "Match 20 August 2026. Training is in the evening. "
+            "на Петроградской нужен один игрок. Пишите @invalid_unrelated_evening",
+            "Match 20 August 2026. Training is in the evening",
+            "evening",
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "один игрок",
+        ),
+        (
+            "negated-date",
+            "Match is not on 20 August 2026 на Петроградской, нужен один игрок. "
+            "Пишите @invalid_negated_date",
+            "Match is not on 20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "один игрок",
+        ),
+        (
             "english-closed-players",
             "Match 20 August 2026 на Петроградской. No longer need 2 players. "
             "Пишите @invalid_english_closed_players",
@@ -2565,9 +2675,35 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             2,
             "Ya no necesitamos dos jugadores",
         ),
+        (
+            "english-contracted-negation",
+            "Match 20 August 2026 на Петроградской. We don’t need two players. "
+            "Пишите @invalid_english_contracted_negation",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "We don’t need two players",
+        ),
+        (
+            "french-negated-search",
+            "Match 20 août 2026 на Петроградской. "
+            "Nous ne cherchons pas deux joueurs. "
+            "Пишите @invalid_french_negated_search",
+            "20 août 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "Nous ne cherchons pas deux joueurs",
+        ),
     )
     opportunities_before_invalid_evidence = len(system.opportunities())
     invalid_message_ids = []
+    range_checkpoint = 4939 + len(range_cases)
     for offset, (
         label,
         invalid_body,
@@ -2579,6 +2715,67 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         invalid_open_places,
         invalid_open_places_evidence,
     ) in enumerate(invalid_evidence_cases, start=1):
+        if label in {"english-contracted-negation", "french-negated-search"}:
+            invalid_result = _irrelevant_classifier_result()
+        else:
+            invalid_result = _minimal_classifier_result(
+                candidate_key=label,
+                body=invalid_body,
+                response_routes=[
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": f"@invalid_{label.replace('-', '_')}",
+                        "evidence": f"@invalid_{label.replace('-', '_')}",
+                    }
+                ],
+                event_time_evidence=event_time_evidence,
+                day_part=invalid_day_part,
+                exact_local_time=invalid_exact_time,
+                start_local_date=start_local_date,
+                end_local_date=end_local_date,
+                opportunity_evidence=invalid_open_places_evidence,
+                open_places_evidence=invalid_open_places_evidence,
+                open_places=invalid_open_places,
+            )
+        classifier.return_for(body=invalid_body, result=invalid_result)
+        message_id = 1060 + offset
+        invalid_message_ids.append(message_id)
+        source_event_id = f"source-event:open-match:{label}"
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(
+                pts=range_checkpoint + offset - 1
+            ),
+            to_checkpoint=TelegramChannelCheckpoint(pts=range_checkpoint + offset),
+            source_event_id=source_event_id,
+            telegram_message_id=message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=invalid_body,
+            event_time=datetime(2026, 8, 18, 23, offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        assert not system.redeliver_source_event(source_event_id)
+        system.process_opportunities_until_idle()
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+
+    lossy_currency_cases = (
+        ("dirhams-uae", "500 dirhams UAE"),
+        ("dirhams-marocains", "500 dirhams marocains"),
+        ("pesos-argentinos", "500 pesos argentinos"),
+        ("francs-belges", "500 francs belges"),
+    )
+    invalid_checkpoint = range_checkpoint + len(invalid_evidence_cases)
+    for offset, (label, payment_evidence) in enumerate(lossy_currency_cases, start=1):
+        invalid_body = (
+            "Match 20 August 2026 на Петроградской, нужен один игрок. "
+            f"Tarif {payment_evidence}. Пишите @invalid_{label.replace('-', '_')}"
+        )
         invalid_result = _minimal_classifier_result(
             candidate_key=label,
             body=invalid_body,
@@ -2589,29 +2786,32 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                     "evidence": f"@invalid_{label.replace('-', '_')}",
                 }
             ],
-            event_time_evidence=event_time_evidence,
-            day_part=invalid_day_part,
-            exact_local_time=invalid_exact_time,
-            start_local_date=start_local_date,
-            end_local_date=end_local_date,
-            opportunity_evidence=invalid_open_places_evidence,
-            open_places_evidence=invalid_open_places_evidence,
-            open_places=invalid_open_places,
+            event_time_evidence="20 August 2026",
         )
+        candidates = invalid_result.output["candidates"]
+        assert isinstance(candidates, list)
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        evidence["payment"] = payment_evidence
+        candidate["payment"] = "paid"
         classifier.return_for(body=invalid_body, result=invalid_result)
-        message_id = 1060 + offset
+        message_id = 1080 + offset
         invalid_message_ids.append(message_id)
-        source_event_id = f"source-event:open-match:{label}"
+        source_event_id = f"source-event:open-match:lossy-{label}"
         telegram_ingestion.add_channel_difference_event(
             identity=source_identity,
-            from_checkpoint=TelegramChannelCheckpoint(pts=4940 + offset),
-            to_checkpoint=TelegramChannelCheckpoint(pts=4941 + offset),
+            from_checkpoint=TelegramChannelCheckpoint(
+                pts=invalid_checkpoint + offset - 1
+            ),
+            to_checkpoint=TelegramChannelCheckpoint(pts=invalid_checkpoint + offset),
             source_event_id=source_event_id,
             telegram_message_id=message_id,
             revision=1,
             kind=SourceEventKind.CREATE,
             body=invalid_body,
-            event_time=datetime(2026, 8, 18, 23, offset, tzinfo=UTC),
+            event_time=datetime(2026, 8, 19, 0, offset, tzinfo=UTC),
         )
         assert system.process_next_channel_telegram_difference(
             identity=source_identity,
@@ -2747,6 +2947,24 @@ def _minimal_classifier_result(
     }
     return ClassifierAdapterResult(
         output=output,
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="controlled_recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
+
+
+def _irrelevant_classifier_result() -> ClassifierAdapterResult:
+    return ClassifierAdapterResult(
+        output={
+            "schema_version": "source-message-classification-v1",
+            "disposition": "irrelevant",
+            "candidates": [],
+        },
         effective_model="gpt-5.6-sol",
         effective_reasoning_effort="high",
         codex_version="controlled-offline",

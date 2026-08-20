@@ -28,6 +28,7 @@ from modules.contracts import (
     JsonValue,
     RawContractEnvelope,
     RuntimeRole,
+    canonical_source_message_id,
     derive_contract_message_id,
     derive_run_search_message_id,
     derive_search_completed_message_id,
@@ -6803,7 +6804,9 @@ class RuntimeApplication:
                 recorded_at=self.clock.now(),
             )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
-        source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
+        source_message_id = canonical_source_message_id(
+            source_chat_key, registry_generation, event.telegram_message_id
+        )
         message_id = derive_source_event_message_id(event.source_event_id)
         correlation_id = uuid5(
             NAMESPACE_URL,
@@ -6875,7 +6878,9 @@ class RuntimeApplication:
         if event.source_chat_identity != identity:
             raise RuntimeError("Telegram difference returned another Source Chat")
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
-        source_message_id = f"{source_chat_key}:message:{event.telegram_message_id}"
+        source_message_id = canonical_source_message_id(
+            source_chat_key, registry_generation, event.telegram_message_id
+        )
         message_id = derive_source_event_message_id(event.source_event_id)
         correlation_id = uuid5(
             NAMESPACE_URL,
@@ -7485,9 +7490,19 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
-        source_chat_reference = source_revision.source_message_id.rsplit(
-            ":message:", 1
-        )[0]
+        generation_suffix = f":generation:{source_revision.registry_generation}"
+        source_message_scope = source_revision.source_message_id.rsplit(":message:", 1)[
+            0
+        ]
+        if not source_message_scope.endswith(generation_suffix):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=(2,),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
+        source_chat_reference = source_message_scope.removesuffix(generation_suffix)
         source_chat = next(
             (
                 entry
@@ -9220,9 +9235,13 @@ def _event_time_is_supported(
     if start != end and start.month == end.month and start.year == end.year:
         stems = "|".join(re.escape(stem) + r"\w*" for stem in month_stems[start.month])
         compact_range = re.search(
-            rf"(?<!\d){start.day}(?!\d)\s*[-–—]\s*"
-            rf"{end.day}(?!\d)\s+(?:de\s+)?(?:{stems})"
-            rf"(?:\s+de)?\s*,?\s*{start.year}(?!\d)",
+            rf"(?:"
+            rf"(?<!\d)(?:(?:from|с|del|du)\s+)?{start.day}(?!\d)\s*"
+            rf"(?:[-–—]|to|по|al|au)\s*{end.day}(?!\d)\s+"
+            rf"(?:de\s+)?(?:{stems})(?:\s+de)?\s*,?\s*{start.year}(?!\d)"
+            rf"|(?:{stems})\s+(?<!\d){start.day}(?!\d)\s*[-–—]\s*"
+            rf"{end.day}(?!\d)\s*,?\s*{start.year}(?!\d)"
+            rf")",
             normalized,
         )
         if compact_range is not None:
@@ -9330,8 +9349,12 @@ def _event_time_is_supported(
         ]
     if not spans or not end_spans:
         return False
-    if start != end and not any(
-        start_span == end_span
+    expression_pairs = [
+        (start_span, end_span)
+        for start_span in spans
+        for end_span in end_spans
+        if start == end
+        or start_span == end_span
         or (
             start_span[1] <= end_span[0]
             and re.fullmatch(
@@ -9341,20 +9364,26 @@ def _event_time_is_supported(
             )
             is not None
         )
-        for start_span in spans
-        for end_span in end_spans
-    ):
+    ]
+    if not expression_pairs:
         return False
-    expression_start = min(span[0] for span in spans)
-    expression_end = max(span[1] for span in end_spans)
     expression_boundary = re.compile(r"[.!?;\n]")
-    prior_boundary = list(expression_boundary.finditer(normalized, 0, expression_start))
-    expression_clause_start = prior_boundary[-1].end() if prior_boundary else 0
-    next_boundary = expression_boundary.search(normalized, expression_end)
-    expression_clause_end = next_boundary.start() if next_boundary else len(normalized)
 
-    def marker_is_negated(match: re.Match[str]) -> bool:
-        marker_prefix = normalized[expression_clause_start : match.start()]
+    def clause_bounds(
+        start_span: tuple[int, int], end_span: tuple[int, int]
+    ) -> tuple[int, int]:
+        expression_start = min(start_span[0], end_span[0])
+        expression_end = max(start_span[1], end_span[1])
+        prior_boundary = list(
+            expression_boundary.finditer(normalized, 0, expression_start)
+        )
+        clause_start = prior_boundary[-1].end() if prior_boundary else 0
+        next_boundary = expression_boundary.search(normalized, expression_end)
+        clause_end = next_boundary.start() if next_boundary else len(normalized)
+        return clause_start, clause_end
+
+    def marker_is_negated(position: int, clause_start: int) -> bool:
+        marker_prefix = normalized[clause_start:position]
         return (
             re.search(
                 r"(?:\bno\b|\bnot\b|\bne\b|\bn['’]|\bpas\b|\bне\b|\bни\b|"
@@ -9363,6 +9392,17 @@ def _event_time_is_supported(
             )
             is not None
         )
+
+    positive_expressions = [
+        (start_span, end_span, *clause_bounds(start_span, end_span))
+        for start_span, end_span in expression_pairs
+        if not marker_is_negated(
+            min(start_span[0], end_span[0]),
+            clause_bounds(start_span, end_span)[0],
+        )
+    ]
+    if not positive_expressions:
+        return False
 
     if day_part is not None:
         day_part_patterns = {
@@ -9404,7 +9444,12 @@ def _event_time_is_supported(
         }
         if stated_day_parts != {day_part}:
             return False
-        if any(marker_is_negated(match) for match in all_matches[day_part]):
+        if not any(
+            clause_start <= match.start() < clause_end
+            and not marker_is_negated(match.start(), clause_start)
+            for _, _, clause_start, clause_end in positive_expressions
+            for match in all_matches[day_part]
+        ):
             return False
     if exact_time is None:
         return True
@@ -9414,17 +9459,16 @@ def _event_time_is_supported(
     if len(all_clock_matches) != 1:
         return False
     time_match = all_clock_matches[0]
-    containing_clause = normalized[expression_clause_start:expression_clause_end]
-    return bool(
-        time_match.group() == exact_time.casefold()
-        and expression_clause_start <= time_match.start() < expression_clause_end
-        and not marker_is_negated(time_match)
+    return time_match.group() == exact_time.casefold() and any(
+        clause_start <= time_match.start() < clause_end
+        and not marker_is_negated(time_match.start(), clause_start)
         and re.search(
             r"\b(?:score|scored|result|previous\s+score|сч[её]т|забил\w*|"
             r"resultado|marcador|r[ée]sultat)\b",
-            containing_clause,
+            normalized[clause_start:clause_end],
         )
         is None
+        for _, _, clause_start, clause_end in positive_expressions
     )
 
 
@@ -9527,9 +9571,13 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
         normalized_clause = re.sub(r"['’]", " ", clause)
         if (
             re.search(
-                r"(?:\bno\s+longer\b|\b(?:do|does|did)\s+not\b|\bnot\s+need\b|"
+                r"(?:\bno\s+longer\b|"
+                r"\b(?:(?:do|does|did)\s+not|(?:don|doesn|didn)\s+t)\s+"
+                r"(?:need|want|seek)\b|"
+                r"\bnot\s+need\b|"
                 r"\bya\s+no\b|\bno\s+(?:necesit|busc)\w*|\bбольше\s+не\b|"
                 r"\bне\s+(?:нуж|ищ|треб)\w*|\bn\s+\w+\s+plus\s+besoin\b|"
+                r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+pas\b|"
                 r"\bplus\s+besoin\b|\bpas\s+besoin\b)",
                 normalized_clause,
             )
@@ -9561,7 +9609,12 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             noun_index
             for noun_index in noun_indexes
             if any(
-                cardinal_index == noun_index - 1 for cardinal_index in cardinal_indexes
+                cardinal_index == noun_index - 1
+                or (
+                    cardinal_index == noun_index - 2
+                    and clause_tokens[noun_index - 1] in {"more", "additional", "extra"}
+                )
+                for cardinal_index in cardinal_indexes
             )
             and not any(
                 abs(closed_index - noun_index) <= 2 for closed_index in closed_indexes
@@ -9678,9 +9731,20 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
         evidence,
     )
     if amount_then_currency is not None:
+        currency = amount_then_currency.group("currency")
+        is_iso_token = currency.upper() in _ISO_CURRENCY_CODES
+        has_unmatched_name_continuation = (
+            re.match(
+                r"^[\s\u00a0]+[^\W\d_]+",
+                evidence[amount_then_currency.end("currency") :],
+            )
+            is not None
+        )
+        if not is_iso_token and has_unmatched_name_continuation:
+            return None
         return (
             amount_then_currency.group("amount"),
-            amount_then_currency.group("currency"),
+            currency,
         )
     currency_then_amount = re.search(
         rf"(?<!\w)(?P<currency>{_STATED_CURRENCY_PATTERN}){separators}"

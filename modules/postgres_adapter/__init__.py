@@ -27,6 +27,7 @@ from modules.contracts import (
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
+    canonical_source_message_id,
     derive_contract_message_id,
 )
 from modules.domain import (
@@ -711,9 +712,10 @@ class PostgresAcceptanceObserver:
         return tuple(
             SourceEventRecord(
                 source_event_id=row["source_event_id"],
-                source_message_id=(
-                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}:"
-                    f"message:{row['telegram_message_id']}"
+                source_message_id=canonical_source_message_id(
+                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}",
+                    row["registry_generation"],
+                    row["telegram_message_id"],
                 ),
                 source_chat_identity=TelegramPeerIdentity(
                     kind=TelegramPeerKind(row["peer_kind"]),
@@ -2454,9 +2456,10 @@ class PostgresRoleStore:
         return tuple(
             SourceEventRecord(
                 source_event_id=row["source_event_id"],
-                source_message_id=(
-                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}:"
-                    f"message:{row['telegram_message_id']}"
+                source_message_id=canonical_source_message_id(
+                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}",
+                    row["registry_generation"],
+                    row["telegram_message_id"],
                 ),
                 source_chat_identity=TelegramPeerIdentity(
                     kind=TelegramPeerKind(row["peer_kind"]),
@@ -2573,7 +2576,7 @@ class PostgresRoleStore:
         telegram_message_id: int,
         current_event_time: datetime,
     ) -> SourceMessageRevision | None:
-        """Read one current same-generation direct-reply target within 24 hours."""
+        """Read one current same-generation direct-reply target after its boundary."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         with psycopg.connect(
@@ -2610,7 +2613,6 @@ class PostgresRoleStore:
                   AND NOT message.tombstoned
                   AND revision.body IS NOT NULL
                   AND revision.event_time <= %s
-                  AND revision.event_time >= %s
                 """,
                 (
                     identity.kind.value,
@@ -2618,7 +2620,6 @@ class PostgresRoleStore:
                     registry_generation,
                     telegram_message_id,
                     current_event_time,
-                    current_event_time - timedelta(hours=24),
                 ),
             ).fetchone()
         if row is None:

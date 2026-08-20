@@ -359,6 +359,20 @@ def test_relative_and_compact_ranges_preserve_both_related_endpoints() -> None:
             evidence,
         )
 
+    for evidence in (
+        "From 20 to 22 August 2026",
+        "С 20 по 22 августа 2026",
+        "Del 20 al 22 de agosto de 2026",
+        "Du 20 au 22 août 2026",
+        "August 20–22, 2026",
+    ):
+        assert _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 22),
+            None,
+            evidence,
+        )
+
 
 def test_spanish_day_part_evidence_rejects_negation_and_competing_markers() -> None:
     for day_part in ("daytime", "evening"):
@@ -388,6 +402,12 @@ def test_spanish_day_part_evidence_rejects_negation_and_competing_markers() -> N
 
 def test_temporal_details_require_one_positive_event_expression() -> None:
     invalid_cases = (
+        (
+            None,
+            "evening",
+            "Match 20 August 2026. Training is in the evening",
+        ),
+        (None, None, "Match is not on 20 August 2026"),
         (None, "evening", "20 agosto 2026, no queremos jugar fútbol por la tarde"),
         (
             None,
@@ -425,19 +445,23 @@ def test_temporal_details_require_one_positive_event_expression() -> None:
 def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
     positive_cases = (
         (6, "Need six players"),
+        (6, "Need six more players"),
         (6, "Нужно шесть игроков"),
         (6, "Necesitamos seis jugadores"),
         (6, "Besoin de six joueurs"),
         (27, "Need 27 players"),
+        (27, "Need 27 more players"),
     )
     for open_places, evidence in positive_cases:
         assert _open_places_are_supported(open_places, evidence)
     assert not _open_places_are_supported(0, "Need 0 players")
 
     for evidence in (
+        "We don’t need two players",
         "No longer need 2 players",
         "Больше не нужно два игрока",
         "Ya no necesitamos dos jugadores",
+        "Nous ne cherchons pas deux joueurs",
         "Nous n’avons plus besoin de deux joueurs",
     ):
         assert not _open_places_are_supported(2, evidence)
@@ -483,6 +507,10 @@ def test_explicit_amount_and_currency_establishes_paid_without_inference() -> No
     )
     assert _stated_payment_amount_and_currency("Fee 500 yen") == ("500", "yen")
     assert _stated_payment_amount_and_currency("Fee 500 cad") == ("500", "cad")
+    assert _stated_payment_amount_and_currency("Fee 500 eUr per player") == (
+        "500",
+        "eUr",
+    )
     assert _stated_payment_amount_and_currency("Tarif 500 francs suisses") == (
         "500",
         "francs suisses",
@@ -511,6 +539,13 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
 
     assert _stated_payment_amount_and_currency("Fee 500") is None
     assert _stated_payment_amount_and_currency("Fee 500 real") is None
+    for ambiguous_longer_name in (
+        "Fee 500 dirhams UAE",
+        "Tarif 500 dirhams marocains",
+        "Entrada 500 pesos argentinos",
+        "Tarif 500 francs belges",
+    ):
+        assert _stated_payment_amount_and_currency(ambiguous_longer_name) is None
 
 
 def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:
