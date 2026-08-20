@@ -162,6 +162,30 @@ def test_offline_corpus_rejects_unrelated_numeric_date_cooccurrence() -> None:
         None,
         "20 August 2026 — two players are needed",
     )
+    assert not _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 9, 10),
+        None,
+        "Previous game 20 August 2026. Player birthday 10 September 2026.",
+    )
+
+
+def test_offline_day_part_evidence_rejects_cross_value_negation_and_ambiguity() -> None:
+    for day_part in ("daytime", "evening"):
+        assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            None,
+            "20 agosto 2026 no por la tarde, de día",
+            day_part=day_part,
+        )
+        assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            None,
+            "20 agosto 2026 de día o por la tarde",
+            day_part=day_part,
+        )
 
 
 def test_offline_payment_evidence_covers_four_locales_without_inference() -> None:
@@ -170,6 +194,11 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         ("Участие 900 рублей", ("900", "рублей")),
         ("Entrada 20 euros", ("20", "euros")),
         ("Tarif 500 CHF", ("500", "CHF")),
+        ("Entrada 500 pesos", ("500", "pesos")),
+        ("Участие 500 юаней", ("500", "юаней")),
+        ("Fee 500 yen", ("500", "yen")),
+        ("Fee 500 cad", ("500", "cad")),
+        ("Tarif 500 francs suisses", ("500", "francs suisses")),
     )
     for evidence, expected_details in cases:
         assert _optional_values_are_supported(

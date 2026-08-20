@@ -9321,6 +9321,21 @@ def _event_time_is_supported(
         end_spans = relative_spans
     if not spans or not end_spans:
         return False
+    if start != end and not any(
+        start_span == end_span
+        or (
+            start_span[1] <= end_span[0]
+            and re.fullmatch(
+                r"\s*(?:[-–—]|to|through|until|till|по|до|al|a|hasta|au|à|"
+                r"jusqu(?:['’](?:au|à))?)\s*",
+                normalized[start_span[1] : end_span[0]],
+            )
+            is not None
+        )
+        for start_span in spans
+        for end_span in end_spans
+    ):
+        return False
     expression_start = min(span[0] for span in spans)
     expression_end = max(span[1] for span in end_spans)
     if day_part is not None:
@@ -9350,15 +9365,28 @@ def _event_time_is_supported(
         }
         if day_part not in day_part_patterns:
             return False
-        day_part_matches = [
-            match
-            for pattern in day_part_patterns[day_part]
-            for match in re.finditer(pattern, normalized)
-        ]
-        if not any(
-            match.start() <= expression_end + 32
-            and match.end() >= expression_start - 32
-            for match in day_part_matches
+        nearby_matches = {
+            candidate: [
+                match
+                for pattern in patterns
+                for match in re.finditer(pattern, normalized)
+                if match.start() <= expression_end + 32
+                and match.end() >= expression_start - 32
+            ]
+            for candidate, patterns in day_part_patterns.items()
+        }
+        stated_day_parts = {
+            candidate for candidate, matches in nearby_matches.items() if matches
+        }
+        if stated_day_parts != {day_part}:
+            return False
+        negation = re.compile(
+            r"(?:\bno\b|\bnot\b|\bne\b|\bpas\b|\bне\b|\bни\b|\bsin\b|"
+            r"\bsans\b)(?:\s+\w+){0,2}\s*$"
+        )
+        if any(
+            negation.search(normalized[max(0, match.start() - 32) : match.start()])
+            for match in nearby_matches[day_part]
         ):
             return False
     if exact_time is None:
@@ -9573,12 +9601,19 @@ _ISO_CURRENCY_CODES = frozenset(
     ZWG""".split()  # noqa: SIM905 - compact, auditable ISO 4217 allowlist
 )
 _STATED_CURRENCY_PATTERN = (
-    r"(?:[₽$€£¥₴₸₹₾₺]|(?:" + "|".join(sorted(_ISO_CURRENCY_CODES)) + r")|"
-    r"(?i:rub(?:les?)?|roubles?|руб\w*|rublos?|"
+    r"(?i:(?:[₽$€£¥₴₸₹₾₺]|(?:" + "|".join(sorted(_ISO_CURRENCY_CODES)) + r")|"
+    r"canadian[\s\u00a0]+dollars?|dollars?[\s\u00a0]+canadiens?|"
+    r"d[oó]lares?[\s\u00a0]+canadienses?|канадск\w*[\s\u00a0]+доллар\w*|"
+    r"swiss[\s\u00a0]+francs?|francs?[\s\u00a0]+suisses?|"
+    r"francos?[\s\u00a0]+suizos?|швейцарск\w*[\s\u00a0]+франк\w*|"
+    r"rub(?:les?)?|roubles?|руб\w*|rublos?|"
     r"usd|dollars?|доллар\w*|d[oó]lares?|"
     r"eur|euros?|евро|"
     r"gbp|pounds?|фунт\w*|libras?|livres?|"
-    r"chf|francs?|франк\w*|francos?))"
+    r"chf|francs?|франк\w*|francos?|"
+    r"pesos?|песо|"
+    r"yuan(?:es|s)?|юан\w*|"
+    r"yens?|(?:и|й)ен\w*))"
 )
 _STATED_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[\s\u00a0,.]\d{3})+|\d+)(?:[.,]\d{1,2})?"
 

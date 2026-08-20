@@ -260,10 +260,11 @@ def render_response_route(kind: str, value: str, locale: str) -> str:
 
 def game_search_result_sort_key(
     result: SearchResult,
-) -> tuple[int, int, str, str, int, str]:
+) -> tuple[int, int, str, int, str, int, str]:
     """Return the complete deterministic intra-search ordering key."""
     facts = dict(result.card_facts)
     canonical_local_time = facts.get("exact_local_time")
+    time_is_unknown = canonical_local_time is None and not facts.get("day_part")
     if canonical_local_time is None:
         canonical_local_time = {
             "morning": "06:00",
@@ -275,6 +276,7 @@ def game_search_result_sort_key(
         0 if result.result_class == "confirmed_match" else 1,
         int(facts.get("unknown_criterion_count", "0")),
         facts.get("sort_local_date", facts["start_local_date"]),
+        1 if time_is_unknown else 0,
         canonical_local_time,
         -int(facts.get("location_specificity", "0")),
         facts["opportunity_id"],

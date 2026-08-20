@@ -302,6 +302,58 @@ def test_spanish_daytime_and_evening_evidence_remain_distinct() -> None:
     )
 
 
+def test_temporal_range_endpoints_must_belong_to_one_cited_expression() -> None:
+    start = date(2026, 8, 20)
+    end = date(2026, 9, 10)
+
+    for evidence in (
+        "From 20 August 2026 to 10 September 2026",
+        "С 20 августа 2026 по 10 сентября 2026",
+        "Del 20 agosto 2026 al 10 septiembre 2026",
+        "Du 20 août 2026 au 10 septembre 2026",
+    ):
+        assert _event_time_is_supported(start, end, None, evidence)
+
+    assert _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 8, 22),
+        None,
+        "20–22 августа 2026",
+    )
+    assert not _event_time_is_supported(
+        start,
+        end,
+        None,
+        "Previous game 20 August 2026. Player birthday 10 September 2026.",
+    )
+
+
+def test_spanish_day_part_evidence_rejects_negation_and_competing_markers() -> None:
+    for day_part in ("daytime", "evening"):
+        assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            None,
+            "20 agosto 2026 no por la tarde, de día",
+            day_part=day_part,
+        )
+        assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            None,
+            "20 agosto 2026 de día o por la tarde",
+            day_part=day_part,
+        )
+
+    assert not _event_time_is_supported(
+        date(2026, 8, 20),
+        date(2026, 8, 20),
+        None,
+        "20 agosto 2026 no por la tarde",
+        day_part="evening",
+    )
+
+
 def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
     for evidence in (
         "Fee 500 EUR",
@@ -332,6 +384,22 @@ def test_explicit_amount_and_currency_establishes_paid_without_inference() -> No
         "1 500",
         "EUR",
     )
+    assert _stated_payment_amount_and_currency("Entrada 500 pesos") == (
+        "500",
+        "pesos",
+    )
+    assert _stated_payment_amount_and_currency("Участие 500 юаней") == (
+        "500",
+        "юаней",
+    )
+    assert _stated_payment_amount_and_currency("Fee 500 yen") == ("500", "yen")
+    assert _stated_payment_amount_and_currency("Fee 500 cad") == ("500", "cad")
+    assert _stated_payment_amount_and_currency("Tarif 500 francs suisses") == (
+        "500",
+        "francs suisses",
+    )
+    assert _stated_payment_amount_and_currency("Fee 500") is None
+    assert _stated_payment_amount_and_currency("Fee 500 real") is None
     assert _stated_payment_amount_and_currency("Fee 500 VIP") is None
 
 

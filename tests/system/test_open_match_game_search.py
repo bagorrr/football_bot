@@ -2117,6 +2117,281 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         assert accepted_facts["payment"] == "paid"
         assert accepted_facts["payment_amount"] == expected_amount
         assert accepted_facts["payment_currency"] == expected_currency
+
+    currency_opportunities = {}
+    currency_cases = (
+        ("pesos", "a las 06:01", None, "06:01", "500", "pesos", "es"),
+        ("yuan", "в 12:01", None, "12:01", "500", "юаней", "ru"),
+        ("yen", "at 18:01", None, "18:01", "500", "yen", "en"),
+        ("cad", "at 22:01", None, "22:01", "500", "cad", "en"),
+        (
+            "swiss-francs",
+            "à 23:59",
+            None,
+            "23:59",
+            "500",
+            "francs suisses",
+            "fr",
+        ),
+    )
+    for offset, (
+        label,
+        time_copy,
+        currency_day_part,
+        currency_exact_time,
+        amount,
+        currency,
+        _locale,
+    ) in enumerate(currency_cases, start=1):
+        currency_body = (
+            f"20 августа 2026 {time_copy} на Петроградской нужен один игрок. "
+            f"Tarif {amount} {currency}. Пишите @currency_{label.replace('-', '_')}"
+        )
+        currency_result = _minimal_classifier_result(
+            candidate_key=f"currency-{label}",
+            body=currency_body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": f"@currency_{label.replace('-', '_')}",
+                    "evidence": f"@currency_{label.replace('-', '_')}",
+                }
+            ],
+            event_time_evidence=f"20 августа 2026 {time_copy}",
+            day_part=currency_day_part,
+            exact_local_time=currency_exact_time,
+        )
+        candidates = currency_result.output["candidates"]
+        assert isinstance(candidates, list)
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        evidence["payment"] = f"{amount} {currency}"
+        candidate["payment"] = "paid"
+        classifier.return_for(body=currency_body, result=currency_result)
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=4927 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4928 + offset),
+            source_event_id=f"source-event:open-match:currency-{label}",
+            telegram_message_id=1030 + offset,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=currency_body,
+            event_time=datetime(2026, 8, 18, 22, offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        currency_opportunities[label] = next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.source_message_revision_id.endswith(
+                f":{1030 + offset}:revision:1"
+            )
+        )
+
+    for offset, (
+        label,
+        _time_copy,
+        currency_day_part,
+        currency_exact_time,
+        amount,
+        currency,
+        locale,
+    ) in enumerate(currency_cases, start=20):
+        currency_user_id = bot_user_id + offset
+        _advance_to_complete_game_search(
+            system,
+            bot_user_id=currency_user_id,
+            locale=locale,
+        )
+        currency_update_id = f"submit-currency-{label}-search"
+        currency_screen_revision = system.discovery_draft(
+            currency_user_id
+        ).screen_revision
+        system.submit_search(
+            update_id=currency_update_id,
+            telegram_user_id=currency_user_id,
+            screen_revision=currency_screen_revision,
+            game_search_details={
+                "times": [currency_day_part or currency_exact_time],
+                "payment": ["paid"],
+            },
+        )
+        system.process_searches_until_idle()
+        currency_search = system.completed_searches(currency_user_id)[0]
+        currency_snapshot = system.results(currency_search.completed_search_id)
+        expected_opportunity = currency_opportunities[label]
+        assert dict(currency_snapshot[0].card_facts)["opportunity_id"] == (
+            expected_opportunity.opportunity_id
+        )
+        assert currency_snapshot[0].result_class == "confirmed_match"
+        assert f"{amount} {currency}" in telegram_delivery.messages[-1].text
+        revision_inputs = system.completed_search_opportunity_revision_inputs(
+            currency_search.completed_search_id
+        )
+        accepted_facts = next(
+            revision_input["accepted_facts"]
+            for revision_input in revision_inputs
+            if revision_input["opportunity_revision_id"]
+            == expected_opportunity.opportunity_revision_id
+        )
+        assert isinstance(accepted_facts, dict)
+        assert accepted_facts["payment_amount"] == amount
+        assert accepted_facts["payment_currency"] == currency
+        system.submit_search(
+            update_id=currency_update_id,
+            telegram_user_id=currency_user_id,
+            screen_revision=currency_screen_revision,
+            game_search_details={
+                "times": [currency_day_part or currency_exact_time],
+                "payment": ["paid"],
+            },
+        )
+        system.process_searches_until_idle()
+        assert len(system.completed_searches(currency_user_id)) == 1
+        assert system.results(currency_search.completed_search_id) == currency_snapshot
+
+    exact_end_of_day = currency_opportunities["swiss-francs"]
+    end_of_day_ordering_user_id = bot_user_id + 30
+    _advance_to_complete_game_search(
+        system,
+        bot_user_id=end_of_day_ordering_user_id,
+    )
+    end_of_day_update_id = "submit-exact-end-of-day-ordering"
+    end_of_day_screen_revision = system.discovery_draft(
+        end_of_day_ordering_user_id
+    ).screen_revision
+    system.submit_search(
+        update_id=end_of_day_update_id,
+        telegram_user_id=end_of_day_ordering_user_id,
+        screen_revision=end_of_day_screen_revision,
+    )
+    system.process_searches_until_idle()
+    end_of_day_search = system.completed_searches(end_of_day_ordering_user_id)[0]
+    end_of_day_snapshot = system.results(end_of_day_search.completed_search_id)
+    target_order = {
+        exact_end_of_day.opportunity_id: "exact-23:59",
+        source_message_opportunity.opportunity_id: "unknown",
+    }
+    assert [
+        target_order[dict(result.card_facts)["opportunity_id"]]
+        for result in end_of_day_snapshot
+        if dict(result.card_facts)["opportunity_id"] in target_order
+    ] == ["exact-23:59", "unknown"]
+    system.submit_search(
+        update_id=end_of_day_update_id,
+        telegram_user_id=end_of_day_ordering_user_id,
+        screen_revision=end_of_day_screen_revision,
+    )
+    system.process_searches_until_idle()
+    assert system.results(end_of_day_search.completed_search_id) == end_of_day_snapshot
+
+    invalid_evidence_cases = (
+        (
+            "unrelated-range",
+            "Предыдущая игра 20 августа 2026. День рождения игрока 10 сентября "
+            "2026. на Петроградской нужен один игрок. Пишите "
+            "@invalid_unrelated_range",
+            "20 августа 2026. День рождения игрока 10 сентября 2026",
+            None,
+            "2026-08-20",
+            "2026-09-10",
+        ),
+        (
+            "negated-day-part",
+            "Partido 20 agosto 2026 no por la tarde, на Петроградской нужен один "
+            "игрок. Пишите @invalid_negated_day_part",
+            "20 agosto 2026 no por la tarde",
+            "evening",
+            "2026-08-20",
+            "2026-08-20",
+        ),
+        (
+            "competing-day-parts",
+            "Partido 20 agosto 2026 de día o por la tarde, на Петроградской нужен "
+            "один игрок. Пишите @invalid_competing_day_parts",
+            "20 agosto 2026 de día o por la tarde",
+            "daytime",
+            "2026-08-20",
+            "2026-08-20",
+        ),
+    )
+    opportunities_before_invalid_evidence = len(system.opportunities())
+    invalid_message_ids = []
+    for offset, (
+        label,
+        invalid_body,
+        event_time_evidence,
+        invalid_day_part,
+        start_local_date,
+        end_local_date,
+    ) in enumerate(invalid_evidence_cases, start=1):
+        invalid_result = _minimal_classifier_result(
+            candidate_key=label,
+            body=invalid_body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": f"@invalid_{label.replace('-', '_')}",
+                    "evidence": f"@invalid_{label.replace('-', '_')}",
+                }
+            ],
+            event_time_evidence=event_time_evidence,
+            day_part=invalid_day_part,
+            start_local_date=start_local_date,
+            end_local_date=end_local_date,
+        )
+        classifier.return_for(body=invalid_body, result=invalid_result)
+        message_id = 1035 + offset
+        invalid_message_ids.append(message_id)
+        source_event_id = f"source-event:open-match:{label}"
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=4932 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4933 + offset),
+            source_event_id=source_event_id,
+            telegram_message_id=message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=invalid_body,
+            event_time=datetime(2026, 8, 18, 23, offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        assert not system.redeliver_source_event(source_event_id)
+        system.process_opportunities_until_idle()
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+
+    invalid_evidence_user_id = bot_user_id + 31
+    _advance_to_complete_game_search(
+        system,
+        bot_user_id=invalid_evidence_user_id,
+    )
+    system.submit_search(
+        update_id="submit-after-invalid-evidence",
+        telegram_user_id=invalid_evidence_user_id,
+    )
+    system.process_searches_until_idle()
+    invalid_evidence_search = system.completed_searches(invalid_evidence_user_id)[0]
+    invalid_revision_inputs = system.completed_search_opportunity_revision_inputs(
+        invalid_evidence_search.completed_search_id
+    )
+    assert all(
+        not any(
+            f":{message_id}:" in str(revision_input)
+            for message_id in invalid_message_ids
+        )
+        for revision_input in invalid_revision_inputs
+    )
     system.reset()
 
 
@@ -2177,15 +2452,19 @@ def _minimal_classifier_result(
     response_routes: list[JsonValue],
     event_time_evidence: str = "20 августа 2026",
     day_part: str | None = None,
+    exact_local_time: str | None = None,
     start_local_date: str = "2026-08-20",
+    end_local_date: str | None = None,
 ) -> ClassifierAdapterResult:
     event_time: dict[str, JsonValue] = {
         "start_local_date": start_local_date,
-        "end_local_date": start_local_date,
+        "end_local_date": end_local_date or start_local_date,
         "iana_timezone": "Europe/Moscow",
     }
     if day_part is not None:
         event_time["day_part"] = day_part
+    if exact_local_time is not None:
+        event_time["exact_local_time"] = exact_local_time
     output: dict[str, JsonValue] = {
         "schema_version": "source-message-classification-v1",
         "disposition": "accepted",
