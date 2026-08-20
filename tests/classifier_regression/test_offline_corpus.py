@@ -239,8 +239,32 @@ def test_offline_temporal_details_are_positive_and_event_bound() -> None:
         ),
         ("19:00", None, "20 August 2026 not at 19:00"),
         ("23:59", None, "Previous score was 23:59. Match 20 August 2026"),
+        (None, None, "Match 20 August 2026 is not happening"),
+        ("19:00", None, "Match 20 August 2026 at 19:00 is cancelled"),
+        (None, "evening", "Match 20 August 2026 in the evening is cancelled"),
+        (None, None, "Матч 20 августа 2026 не состоится"),
+        (None, None, "Partido 20 agosto 2026 está cancelado"),
+        (None, None, "Match le 20 août 2026 est annulé"),
     ):
         assert not _event_time_is_supported(
+            date(2026, 8, 20),
+            date(2026, 8, 20),
+            exact_time,
+            evidence,
+            day_part=day_part,
+        )
+
+    for exact_time, day_part, evidence in (
+        (None, None, "Match 20 August 2026 is happening"),
+        (None, None, "Match 20 August 2026 is not cancelled"),
+        ("19:00", None, "Матч 20 августа 2026 в 19:00 подтверждён"),
+        (None, None, "Матч 20 августа 2026 не отменён"),
+        (None, "evening", "Partido 20 agosto 2026 por la tarde confirmado"),
+        (None, None, "Partido 20 agosto 2026 no está cancelado"),
+        (None, "evening", "Match le 20 août 2026 le soir confirmé"),
+        (None, None, "Match le 20 août 2026 n’est pas annulé"),
+    ):
+        assert _event_time_is_supported(
             date(2026, 8, 20),
             date(2026, 8, 20),
             exact_time,
@@ -260,16 +284,38 @@ def test_offline_open_player_evidence_is_complete_and_polarity_safe() -> None:
         assert _open_places_are_supported(6, evidence)
     assert _open_places_are_supported(27, "Need 27 players")
     assert _open_places_are_supported(27, "Need 27 more players")
+    assert _open_places_are_supported(11, "Need eleven players")
+    assert _open_places_are_supported(27, "Need twenty seven players")
+    assert _open_places_are_supported(27, "Need 27 more experienced players")
+    assert _open_places_are_supported(27, "Нужно двадцать семь ещё опытных игроков")
+    assert _open_places_are_supported(
+        27, "Necesitamos veinte y siete jugadores experimentados"
+    )
+    assert _open_places_are_supported(27, "Besoin de vingt-sept joueurs expérimentés")
+    for evidence in (
+        "Need one hundred twenty seven experienced players",
+        "Нужно сто двадцать семь опытных игроков",
+        "Necesitamos ciento veintisiete jugadores",
+        "Besoin de cent vingt-sept joueurs",
+    ):
+        assert _open_places_are_supported(127, evidence)
+    assert _open_places_are_supported(80, "Besoin de quatre-vingts joueurs")
+    assert _open_places_are_supported(1000, "Necesitamos mil jugadores")
 
     for evidence in (
         "We don’t need two players",
+        "We dont need two players",
         "No longer need 2 players",
         "Больше не нужно два игрока",
         "Ya no necesitamos dos jugadores",
         "Nous ne cherchons pas deux joueurs",
+        "Nous ne cherchons plus deux joueurs",
         "Nous n’avons plus besoin de deux joueurs",
     ):
         assert not _open_places_are_supported(2, evidence)
+    assert not _open_places_are_supported(1, "Need zero players")
+    assert not _open_places_are_supported(2, "Need one one players")
+    assert not _open_places_are_supported(31, "Need twenty eleven players")
 
 
 def test_offline_payment_evidence_covers_four_locales_without_inference() -> None:
@@ -290,6 +336,10 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         ("Tarif 500 francs CFA", ("500", "francs CFA")),
         ("Entrada 500 pesos mexicanos", ("500", "pesos mexicanos")),
         ("Fee 500 aEd", ("500", "aEd")),
+        ("Fee 500 euros per player", ("500", "euros")),
+        ("Tarif 500 francs suisses par joueur", ("500", "francs suisses")),
+        ("Entrada 500 pesos mexicanos por persona", ("500", "pesos mexicanos")),
+        ("Взнос 500 рублей с игрока", ("500", "рублей")),
     )
     for evidence, expected_details in cases:
         assert _optional_values_are_supported(
@@ -307,6 +357,8 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         "Tarif 500 dirhams marocains",
         "Entrada 500 pesos argentinos",
         "Tarif 500 francs belges",
+        "Fee 500 euros training starts at 19:00",
+        "Fee 500 euros per player parking included",
     ):
         assert _stated_payment_amount_and_currency(ambiguous_longer_name) is None
 

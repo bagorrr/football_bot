@@ -1092,6 +1092,9 @@ class PostgresAcceptanceObserver:
         source_message_revision_id: str,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        *,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
     ) -> RawContractEnvelope:
         """Inject one classifier-context wire fault at the test seam."""
         if contract_name not in {
@@ -1122,11 +1125,18 @@ class PostgresAcceptanceObserver:
             changed = connection.execute(
                 """
                 UPDATE football_runtime.contract_outbox
-                SET payload = %s::jsonb
+                SET payload = %s::jsonb,
+                    subject_id = COALESCE(%s, subject_id),
+                    idempotency_key = COALESCE(%s, idempotency_key)
                 WHERE message_id = %s
                 RETURNING *
                 """,
-                (json.dumps(payload), row["message_id"]),
+                (
+                    json.dumps(payload),
+                    new_subject_id,
+                    new_idempotency_key,
+                    row["message_id"],
+                ),
             ).fetchone()
         if changed is None:
             raise LookupError(source_message_revision_id)

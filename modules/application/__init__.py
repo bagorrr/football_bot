@@ -9393,6 +9393,34 @@ def _event_time_is_supported(
             is not None
         )
 
+    def clause_cancels_event(clause_start: int, clause_end: int) -> bool:
+        clause = normalized[clause_start:clause_end]
+        for confirmed_pattern in (
+            r"\b(?:is|was|will\s+be|has\s+been)\s+not\s+"
+            r"(?:cancelled|canceled|called\s+off)\b",
+            r"\bне\s+(?:(?:был\w*|будет)\s+)?отмен\w*\b",
+            r"\bотмен\w*\s+не\s+будет\b",
+            r"\bno\s+(?:est[áa]|ser[áa])\s+cancelad[oa]s?\b",
+            r"\bn['’]est\s+pas\s+annul[ée]\w*\b",
+        ):
+            clause = re.sub(confirmed_pattern, "", clause)
+        cancellation_patterns = (
+            r"\b(?:is|was|will\s+be|has\s+been)\s+(?:cancelled|canceled)\b",
+            r"\b(?:is|was|will\s+be)\s+called\s+off\b",
+            r"\b(?:is|will|does|did)\s+not\s+"
+            r"(?:happen(?:ing)?|take\s+place|go\s+ahead)\b",
+            r"\bwon['’]?t\s+(?:happen|take\s+place|go\s+ahead)\b",
+            r"\bне\s+(?:состо\w*|будет|произойд\w*)\b",
+            r"\bотмен\w*\b",
+            r"\b(?:est[áa]\s+)?cancelad[oa]s?\b",
+            r"\bse\s+cancel\w*\b",
+            r"\bno\s+(?:se\s+)?(?:juega|jugar[áa]|celebr\w*|tendr[áa]\s+lugar)\b",
+            r"\b(?:est|sera)\s+annul[ée]\w*\b",
+            r"\bn['’]aura\s+pas\s+lieu\b",
+            r"\bne\s+se\s+(?:joue|tiendra)\s+pas\b",
+        )
+        return any(re.search(pattern, clause) for pattern in cancellation_patterns)
+
     positive_expressions = [
         (start_span, end_span, *clause_bounds(start_span, end_span))
         for start_span, end_span in expression_pairs
@@ -9400,6 +9428,7 @@ def _event_time_is_supported(
             min(start_span[0], end_span[0]),
             clause_bounds(start_span, end_span)[0],
         )
+        and not clause_cancels_event(*clause_bounds(start_span, end_span))
     ]
     if not positive_expressions:
         return False
@@ -9472,23 +9501,395 @@ def _event_time_is_supported(
     )
 
 
+def _additive_number_phrase_value(
+    tokens: tuple[str, ...],
+    *,
+    values: dict[str, int],
+    conjunctions: frozenset[str],
+    hundred_tokens: frozenset[str],
+    thousand_tokens: frozenset[str],
+    implicit_thousand: bool,
+) -> int | None:
+    if not tokens:
+        return None
+    cleaned: list[str] = []
+    for index, token in enumerate(tokens):
+        if token in conjunctions:
+            if (
+                index == 0
+                or index == len(tokens) - 1
+                or tokens[index - 1] in conjunctions
+                or tokens[index + 1] in conjunctions
+            ):
+                return None
+            continue
+        if (
+            token not in values
+            and token not in hundred_tokens
+            and token not in thousand_tokens
+        ):
+            return None
+        cleaned.append(token)
+
+    def under_one_hundred(parts: list[str]) -> int | None:
+        if len(parts) == 1:
+            value = values.get(parts[0])
+            return value if value is not None and 0 <= value < 100 else None
+        if len(parts) == 2:
+            tens = values.get(parts[0])
+            unit = values.get(parts[1])
+            if (
+                tens is not None
+                and 20 <= tens <= 90
+                and tens % 10 == 0
+                and unit is not None
+                and 1 <= unit <= 9
+            ):
+                return tens + unit
+        return None
+
+    def under_one_thousand(parts: list[str]) -> int | None:
+        if not parts or any(token in thousand_tokens for token in parts):
+            return None
+        hundred_indexes = [
+            index for index, token in enumerate(parts) if token in hundred_tokens
+        ]
+        if hundred_indexes:
+            if hundred_indexes != [1]:
+                return None
+            multiplier = values.get(parts[0])
+            if multiplier is None or not 1 <= multiplier <= 9:
+                return None
+            remainder = under_one_hundred(parts[2:]) if parts[2:] else 0
+            return None if remainder is None else multiplier * 100 + remainder
+        first = values.get(parts[0])
+        if first is not None and 100 <= first <= 900 and first % 100 == 0:
+            remainder = under_one_hundred(parts[1:]) if parts[1:] else 0
+            return None if remainder is None else first + remainder
+        return under_one_hundred(parts)
+
+    scale_indexes = [
+        index for index, token in enumerate(cleaned) if token in thousand_tokens
+    ]
+    if not scale_indexes:
+        return under_one_thousand(cleaned)
+    if len(scale_indexes) != 1:
+        return None
+    scale_index = scale_indexes[0]
+    prefix = cleaned[:scale_index]
+    suffix = cleaned[scale_index + 1 :]
+    multiplier = (
+        under_one_thousand(prefix) if prefix else (1 if implicit_thousand else None)
+    )
+    remainder = under_one_thousand(suffix) if suffix else 0
+    if multiplier is None or remainder is None:
+        return None
+    return multiplier * 1000 + remainder
+
+
+def _french_number_phrase_value(tokens: tuple[str, ...]) -> int | None:
+    filtered = tuple(
+        "vingt" if token == "vingts" else token for token in tokens if token != "et"
+    )
+    if not filtered:
+        return None
+    units = {
+        "zéro": 0,
+        "zero": 0,
+        "un": 1,
+        "une": 1,
+        "deux": 2,
+        "trois": 3,
+        "quatre": 4,
+        "cinq": 5,
+        "six": 6,
+        "sept": 7,
+        "huit": 8,
+        "neuf": 9,
+        "dix": 10,
+        "onze": 11,
+        "douze": 12,
+        "treize": 13,
+        "quatorze": 14,
+        "quinze": 15,
+        "seize": 16,
+    }
+
+    def under_one_hundred(parts: tuple[str, ...]) -> int | None:
+        if len(parts) == 1:
+            return units.get(
+                parts[0],
+                {
+                    "vingt": 20,
+                    "trente": 30,
+                    "quarante": 40,
+                    "cinquante": 50,
+                    "soixante": 60,
+                }.get(parts[0]),
+            )
+        if (
+            len(parts) == 2
+            and parts[0] == "dix"
+            and parts[1]
+            in {
+                "sept",
+                "huit",
+                "neuf",
+            }
+        ):
+            return 10 + units[parts[1]]
+        if len(parts) >= 2 and parts[:2] == ("quatre", "vingt"):
+            remainder = under_one_hundred(parts[2:]) if parts[2:] else 0
+            return None if remainder is None or remainder > 19 else 80 + remainder
+        tens = {"vingt": 20, "trente": 30, "quarante": 40, "cinquante": 50}
+        if parts[0] in tens and len(parts) == 2 and parts[1] in units:
+            return tens[parts[0]] + units[parts[1]]
+        if parts[0] == "soixante":
+            remainder = under_one_hundred(parts[1:])
+            return None if remainder is None or remainder > 19 else 60 + remainder
+        return None
+
+    if "mille" in filtered:
+        scale_index = filtered.index("mille")
+        prefix = filtered[:scale_index]
+        suffix = filtered[scale_index + 1 :]
+        multiplier = _french_number_phrase_value(prefix) if prefix else 1
+        remainder = _french_number_phrase_value(suffix) if suffix else 0
+        if multiplier is None or remainder is None:
+            return None
+        return multiplier * 1000 + remainder
+    for hundred_token in ("cent", "cents"):
+        if hundred_token in filtered:
+            scale_index = filtered.index(hundred_token)
+            prefix = filtered[:scale_index]
+            suffix = filtered[scale_index + 1 :]
+            multiplier = under_one_hundred(prefix) if prefix else 1
+            remainder = under_one_hundred(suffix) if suffix else 0
+            if multiplier is None or remainder is None or multiplier > 9:
+                return None
+            return multiplier * 100 + remainder
+    return under_one_hundred(filtered)
+
+
+def _number_phrase_value(tokens: tuple[str, ...]) -> int | None:
+    english = {
+        "zero": 0,
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "thirteen": 13,
+        "fourteen": 14,
+        "fifteen": 15,
+        "sixteen": 16,
+        "seventeen": 17,
+        "eighteen": 18,
+        "nineteen": 19,
+        "twenty": 20,
+        "thirty": 30,
+        "forty": 40,
+        "fifty": 50,
+        "sixty": 60,
+        "seventy": 70,
+        "eighty": 80,
+        "ninety": 90,
+    }
+    russian = {
+        "ноль": 0,
+        "один": 1,
+        "одна": 1,
+        "одно": 1,
+        "одну": 1,
+        "два": 2,
+        "две": 2,
+        "три": 3,
+        "четыре": 4,
+        "четырёх": 4,
+        "четырех": 4,
+        "пять": 5,
+        "шесть": 6,
+        "семь": 7,
+        "восемь": 8,
+        "девять": 9,
+        "десять": 10,
+        "одиннадцать": 11,
+        "двенадцать": 12,
+        "тринадцать": 13,
+        "четырнадцать": 14,
+        "пятнадцать": 15,
+        "шестнадцать": 16,
+        "семнадцать": 17,
+        "восемнадцать": 18,
+        "девятнадцать": 19,
+        "двадцать": 20,
+        "тридцать": 30,
+        "сорок": 40,
+        "пятьдесят": 50,
+        "шестьдесят": 60,
+        "семьдесят": 70,
+        "восемьдесят": 80,
+        "девяносто": 90,
+        "сто": 100,
+        "двести": 200,
+        "триста": 300,
+        "четыреста": 400,
+        "пятьсот": 500,
+        "шестьсот": 600,
+        "семьсот": 700,
+        "восемьсот": 800,
+        "девятьсот": 900,
+    }
+    spanish = {
+        "cero": 0,
+        "un": 1,
+        "uno": 1,
+        "una": 1,
+        "dos": 2,
+        "tres": 3,
+        "cuatro": 4,
+        "cinco": 5,
+        "seis": 6,
+        "siete": 7,
+        "ocho": 8,
+        "nueve": 9,
+        "diez": 10,
+        "once": 11,
+        "doce": 12,
+        "trece": 13,
+        "catorce": 14,
+        "quince": 15,
+        "dieciséis": 16,
+        "dieciseis": 16,
+        "diecisiete": 17,
+        "dieciocho": 18,
+        "diecinueve": 19,
+        "veinte": 20,
+        "veintiuno": 21,
+        "veintiún": 21,
+        "veintiun": 21,
+        "veintidós": 22,
+        "veintidos": 22,
+        "veintitrés": 23,
+        "veintitres": 23,
+        "veinticuatro": 24,
+        "veinticinco": 25,
+        "veintiséis": 26,
+        "veintiseis": 26,
+        "veintisiete": 27,
+        "veintiocho": 28,
+        "veintinueve": 29,
+        "treinta": 30,
+        "cuarenta": 40,
+        "cincuenta": 50,
+        "sesenta": 60,
+        "setenta": 70,
+        "ochenta": 80,
+        "noventa": 90,
+        "cien": 100,
+        "ciento": 100,
+        "doscientos": 200,
+        "trescientos": 300,
+        "cuatrocientos": 400,
+        "quinientos": 500,
+        "seiscientos": 600,
+        "setecientos": 700,
+        "ochocientos": 800,
+        "novecientos": 900,
+    }
+    for values, conjunctions, hundred_tokens, thousand_tokens, implicit in (
+        (
+            english,
+            frozenset({"and"}),
+            frozenset({"hundred"}),
+            frozenset({"thousand"}),
+            False,
+        ),
+        (
+            russian,
+            frozenset(),
+            frozenset(),
+            frozenset({"тысяча", "тысячи", "тысяч"}),
+            True,
+        ),
+        (spanish, frozenset({"y"}), frozenset(), frozenset({"mil"}), True),
+    ):
+        value = _additive_number_phrase_value(
+            tokens,
+            values=values,
+            conjunctions=conjunctions,
+            hundred_tokens=hundred_tokens,
+            thousand_tokens=thousand_tokens,
+            implicit_thousand=implicit,
+        )
+        if value is not None:
+            return value
+    return _french_number_phrase_value(tokens)
+
+
+def _is_number_phrase_token(token: str) -> bool:
+    return (
+        token.isdigit()
+        or token
+        in {
+            "and",
+            "hundred",
+            "thousand",
+            "тысяча",
+            "тысячи",
+            "тысяч",
+            "y",
+            "mil",
+            "et",
+            "cent",
+            "cents",
+            "mille",
+            "vingts",
+        }
+        or _number_phrase_value((token,)) is not None
+    )
+
+
+def _matching_number_spans(
+    tokens: list[str], expected: int
+) -> tuple[tuple[int, int], ...]:
+    matches: list[tuple[int, int]] = []
+    for start in range(len(tokens)):
+        if not _is_number_phrase_token(tokens[start]) or (
+            start > 0 and _is_number_phrase_token(tokens[start - 1])
+        ):
+            continue
+        if (
+            tokens[start].isdigit()
+            and int(tokens[start]) == expected
+            and (
+                start + 1 == len(tokens)
+                or not _is_number_phrase_token(tokens[start + 1])
+            )
+        ):
+            matches.append((start, start + 1))
+        for end in range(start + 1, len(tokens) + 1):
+            if not _is_number_phrase_token(tokens[end - 1]):
+                break
+            if end < len(tokens) and _is_number_phrase_token(tokens[end]):
+                continue
+            if _number_phrase_value(tuple(tokens[start:end])) == expected:
+                matches.append((start, end))
+    return tuple(dict.fromkeys(matches))
+
+
 def _open_places_are_supported(open_places: int, evidence: str) -> bool:
     if open_places <= 0:
         return False
     evidence_tokens = re.findall(r"[^\W_]+", evidence.casefold())
     evidence_words = set(evidence_tokens)
-    cardinal_words = {
-        1: {"one", "одно", "один", "одна", "одну", "uno", "una", "un", "une", "1"},
-        2: {"two", "два", "две", "dos", "deux", "2"},
-        3: {"three", "три", "tres", "trois", "3"},
-        4: {"four", "четыре", "четырёх", "четырех", "cuatro", "quatre", "4"},
-        5: {"five", "пять", "cinco", "cinq", "5"},
-        6: {"six", "шесть", "seis", "6"},
-        7: {"seven", "семь", "siete", "sept", "7"},
-        8: {"eight", "восемь", "ocho", "huit", "8"},
-        9: {"nine", "девять", "nueve", "neuf", "9"},
-        10: {"ten", "десять", "diez", "dix", "10"},
-    }
     generic_opening_words = {
         "place",
         "places",
@@ -9548,12 +9949,9 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
         "équipe",
         "équipes",
     }
-    has_cardinal = bool(
-        evidence_words.intersection(cardinal_words.get(open_places, {str(open_places)}))
-    )
+    has_cardinal = bool(_matching_number_spans(evidence_tokens, open_places))
     has_explicit_player = bool(evidence_words.intersection(explicit_player_words))
     has_generic_opening = bool(evidence_words.intersection(generic_opening_words))
-    cardinal_tokens = cardinal_words.get(open_places, {str(open_places)})
     opening_word = re.compile(
         r"(?:open|available|need(?:s|ed)?|wanted|seeking|"
         r"нуж\w*|есть|ищ\w*|треб\w*|свобод\w*|"
@@ -9572,12 +9970,13 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
         if (
             re.search(
                 r"(?:\bno\s+longer\b|"
-                r"\b(?:(?:do|does|did)\s+not|(?:don|doesn|didn)\s+t)\s+"
+                r"\b(?:(?:do|does|did)\s+not|"
+                r"(?:dont|doesnt|didnt|don\s+t|doesn\s+t|didn\s+t))\s+"
                 r"(?:need|want|seek)\b|"
                 r"\bnot\s+need\b|"
                 r"\bya\s+no\b|\bno\s+(?:necesit|busc)\w*|\bбольше\s+не\b|"
                 r"\bне\s+(?:нуж|ищ|треб)\w*|\bn\s+\w+\s+plus\s+besoin\b|"
-                r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+pas\b|"
+                r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+(?:pas|plus)\b|"
                 r"\bplus\s+besoin\b|\bpas\s+besoin\b)",
                 normalized_clause,
             )
@@ -9585,11 +9984,7 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
         ):
             continue
         clause_tokens = re.findall(r"[^\W_]+", clause)
-        cardinal_indexes = {
-            index
-            for index, token in enumerate(clause_tokens)
-            if token in cardinal_tokens
-        }
+        number_spans = _matching_number_spans(clause_tokens, open_places)
         noun_indexes = {
             index
             for index, token in enumerate(clause_tokens)
@@ -9605,38 +10000,7 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             for index, token in enumerate(clause_tokens)
             if closed_word.fullmatch(token) is not None
         }
-        counted_noun_indexes = {
-            noun_index
-            for noun_index in noun_indexes
-            if any(
-                cardinal_index == noun_index - 1
-                or (
-                    cardinal_index == noun_index - 2
-                    and clause_tokens[noun_index - 1] in {"more", "additional", "extra"}
-                )
-                for cardinal_index in cardinal_indexes
-            )
-            and not any(
-                abs(closed_index - noun_index) <= 2 for closed_index in closed_indexes
-            )
-        }
-        opening_noun_indexes = {
-            noun_index
-            for noun_index in noun_indexes
-            if any(
-                abs(opening_index - noun_index) <= 3
-                for opening_index in opening_indexes
-            )
-        }
         clause_words = set(clause_tokens)
-        counted_explicit_player = any(
-            clause_tokens[index] in explicit_player_words
-            for index in counted_noun_indexes
-        )
-        counted_generic_opening = any(
-            clause_tokens[index] in generic_opening_words
-            for index in counted_noun_indexes
-        )
         non_player_context = {
             "parking",
             "park",
@@ -9648,6 +10012,12 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             "tickets",
             "seat",
             "seats",
+            "trophy",
+            "trophies",
+            "award",
+            "awards",
+            "goal",
+            "goals",
             "парковка",
             "парковке",
             "зритель",
@@ -9659,21 +10029,48 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             "spectateur",
             "spectateurs",
         }
-        if (
-            counted_noun_indexes
-            and opening_noun_indexes
-            and (
-                counted_explicit_player
-                or (
-                    bool(clause_words.intersection(explicit_player_words))
-                    and not clause_words.intersection(non_player_context)
-                )
-                or (
-                    open_places == 1
-                    and counted_generic_opening
-                    and len(clause_tokens) <= 3
-                    and not clause_words.intersection(non_player_context)
-                )
+        forbidden_between = (
+            referee_words | team_words | generic_opening_words | non_player_context
+        )
+        counted_noun_indexes: set[int] = set()
+        for noun_index in noun_indexes:
+            for count_start, count_end in number_spans:
+                if count_end > noun_index:
+                    continue
+                intervening = set(clause_tokens[count_end:noun_index])
+                if intervening.intersection(forbidden_between):
+                    continue
+                if any(
+                    abs(closed_index - noun_index) <= 2
+                    for closed_index in closed_indexes
+                ):
+                    continue
+                if not any(
+                    opening_index <= count_start or 0 < opening_index - noun_index <= 2
+                    for opening_index in opening_indexes
+                ):
+                    continue
+                counted_noun_indexes.add(noun_index)
+                break
+        counted_explicit_player = any(
+            clause_tokens[index] in explicit_player_words
+            for index in counted_noun_indexes
+        )
+        counted_generic_opening = any(
+            clause_tokens[index] in generic_opening_words
+            for index in counted_noun_indexes
+        )
+        if counted_noun_indexes and (
+            counted_explicit_player
+            or (
+                bool(clause_words.intersection(explicit_player_words))
+                and not clause_words.intersection(non_player_context)
+            )
+            or (
+                open_places == 1
+                and counted_generic_opening
+                and len(clause_tokens) <= 3
+                and not clause_words.intersection(non_player_context)
             )
         ):
             has_supported_counted_opening = True
@@ -9720,6 +10117,26 @@ _STATED_CURRENCY_PATTERN = (
     r"soles|грив(?:ен|ны|на|ну)))"
 )
 _STATED_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[\s\u00a0,.]\d{3})+|\d+)(?:[.,]\d{1,2})?"
+_STATED_PAYMENT_QUALIFIER_PATTERN = (
+    r"(?i:(?:per\s+(?:player|person|participant)|"
+    r"(?:с|за|на)\s+(?:игрока|человека|участника)|"
+    r"por\s+(?:jugador|jugadora|persona|participante)|"
+    r"par\s+(?:joueur|joueuse|personne|participant|participante)))"
+)
+
+
+def _has_supported_currency_name_suffix(evidence: str, currency_end: int) -> bool:
+    suffix = evidence[currency_end:]
+    if re.match(r"^[\s\u00a0]+[^\W\d_]+", suffix) is None:
+        return True
+    return (
+        re.fullmatch(
+            rf"[\s\u00a0]+{_STATED_PAYMENT_QUALIFIER_PATTERN}"
+            rf"[\s\u00a0]*[.,;:!?]?[\s\u00a0]*",
+            suffix,
+        )
+        is not None
+    )
 
 
 def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None:
@@ -9733,14 +10150,9 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
     if amount_then_currency is not None:
         currency = amount_then_currency.group("currency")
         is_iso_token = currency.upper() in _ISO_CURRENCY_CODES
-        has_unmatched_name_continuation = (
-            re.match(
-                r"^[\s\u00a0]+[^\W\d_]+",
-                evidence[amount_then_currency.end("currency") :],
-            )
-            is not None
-        )
-        if not is_iso_token and has_unmatched_name_continuation:
+        if not is_iso_token and not _has_supported_currency_name_suffix(
+            evidence, amount_then_currency.end("currency")
+        ):
             return None
         return (
             amount_then_currency.group("amount"),

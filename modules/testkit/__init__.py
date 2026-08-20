@@ -1506,12 +1506,16 @@ class AcceptanceSpine:
         source_message_revision_id: str,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
     ) -> RawContractEnvelope:
         """Inject one classifier-context fault at the external contract seam."""
         return self._observer.invalidate_classifier_context(
             source_message_revision_id,
             contract_name,
             payload_updates,
+            new_subject_id=new_subject_id,
+            new_idempotency_key=new_idempotency_key,
         )
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:

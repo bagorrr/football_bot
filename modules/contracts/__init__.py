@@ -1039,6 +1039,14 @@ def _validate_classify_source_message_revision(
     ):
         raise ValueError("classifier context bundle version is unsupported")
     source_chat_reference = _required_text(payload, "source_chat_reference")
+    if (
+        re.fullmatch(
+            r"source-chat:(?:chat|channel):[1-9][0-9]*",
+            source_chat_reference,
+        )
+        is None
+    ):
+        raise ValueError("classifier context requires a typed Source Chat reference")
     source_chat_generation = payload["source_chat_registry_generation"]
     if (
         not isinstance(source_chat_generation, int)

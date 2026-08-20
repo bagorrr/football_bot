@@ -15,6 +15,187 @@ ALTER TABLE football_runtime.source_message_revisions
     ADD COLUMN reply_to_telegram_message_id bigint
         CHECK (reply_to_telegram_message_id > 0);
 
+UPDATE football_runtime.source_event_records
+SET bounded_metadata = '{
+    "message_language": null,
+    "attachment_types": [],
+    "source_author_dm_url": null,
+    "reply_route_url": null,
+    "source_message_url": null,
+    "source_message_reply_capable": false
+}'::jsonb;
+
+UPDATE football_runtime.source_messages
+SET bounded_metadata = '{
+    "message_language": null,
+    "attachment_types": [],
+    "source_author_dm_url": null,
+    "reply_route_url": null,
+    "source_message_url": null,
+    "source_message_reply_capable": false
+}'::jsonb;
+
+UPDATE football_runtime.source_message_revisions
+SET bounded_metadata = '{
+    "message_language": null,
+    "attachment_types": [],
+    "source_author_dm_url": null,
+    "reply_route_url": null,
+    "source_message_url": null,
+    "source_message_reply_capable": false
+}'::jsonb;
+
+CREATE TEMPORARY TABLE source_message_identity_0014
+ON COMMIT DROP
+AS
+SELECT source_message_id AS legacy_source_message_id,
+       format(
+           'source-chat:%s:%s:generation:%s:message:%s',
+           peer_kind,
+           telegram_chat_id,
+           registry_generation,
+           telegram_message_id
+       ) AS canonical_source_message_id,
+       registry_generation
+FROM football_runtime.source_messages;
+
+CREATE UNIQUE INDEX source_message_identity_0014_legacy
+    ON source_message_identity_0014 (legacy_source_message_id);
+
+CREATE TEMPORARY TABLE source_message_revision_identity_0014
+ON COMMIT DROP
+AS
+SELECT revision.source_message_revision_id AS legacy_source_message_revision_id,
+       message.legacy_source_message_id,
+       message.canonical_source_message_id,
+       format(
+           '%s:revision:%s',
+           message.canonical_source_message_id,
+           revision.revision
+       ) AS canonical_source_message_revision_id,
+       message.registry_generation,
+       revision.source_event_id,
+       revision.bounded_metadata,
+       revision.reply_to_telegram_message_id
+FROM football_runtime.source_message_revisions AS revision
+JOIN source_message_identity_0014 AS message
+  ON message.legacy_source_message_id = revision.source_message_id;
+
+CREATE UNIQUE INDEX source_message_revision_identity_0014_legacy
+    ON source_message_revision_identity_0014 (
+        legacy_source_message_revision_id
+    );
+
+ALTER TABLE football_runtime.source_message_revisions
+    DROP CONSTRAINT source_message_revisions_source_message_id_fkey;
+
+UPDATE football_runtime.source_messages AS message
+SET source_message_id = identity.canonical_source_message_id
+FROM source_message_identity_0014 AS identity
+WHERE message.source_message_id = identity.legacy_source_message_id
+  AND identity.legacy_source_message_id <> identity.canonical_source_message_id;
+
+UPDATE football_runtime.source_message_revisions AS revision
+SET source_message_revision_id = identity.canonical_source_message_revision_id,
+    source_message_id = identity.canonical_source_message_id,
+    registry_generation = identity.registry_generation
+FROM source_message_revision_identity_0014 AS identity
+WHERE revision.source_message_revision_id = (
+    identity.legacy_source_message_revision_id
+);
+
+ALTER TABLE football_runtime.source_message_revisions
+    ADD CONSTRAINT source_message_revisions_source_message_id_fkey
+        FOREIGN KEY (source_message_id)
+        REFERENCES football_runtime.source_messages(source_message_id);
+
+UPDATE football_runtime.contract_outbox AS event
+SET contract_version = 4,
+    subject_id = identity.canonical_source_message_id,
+    payload = event.payload || jsonb_build_object(
+        'source_message_revision_id',
+        identity.canonical_source_message_revision_id,
+        'bounded_metadata',
+        identity.bounded_metadata,
+        'reply_to_telegram_message_id',
+        identity.reply_to_telegram_message_id
+    )
+FROM source_message_revision_identity_0014 AS identity
+WHERE event.contract_name = 'SourceEventRecorded'
+  AND event.subject_id = identity.legacy_source_message_id
+  AND event.payload ->> 'source_message_revision_id' = (
+      identity.legacy_source_message_revision_id
+  );
+
+UPDATE football_runtime.contract_inbox AS inbox
+SET contract_version = 4
+FROM football_runtime.contract_outbox AS event
+WHERE inbox.message_id = event.message_id
+  AND inbox.consumer_role = 'application'
+  AND event.contract_name = 'SourceEventRecorded'
+  AND event.contract_version = 4;
+
+UPDATE football_runtime.contract_outbox AS command
+SET subject_id = identity.canonical_source_message_id,
+    idempotency_key = format(
+        'classify-source-message:%s',
+        identity.canonical_source_message_revision_id
+    ),
+    payload = jsonb_set(
+        command.payload,
+        '{source_message_revision_id}',
+        to_jsonb(identity.canonical_source_message_revision_id)
+    )
+FROM source_message_revision_identity_0014 AS identity
+WHERE command.contract_name = 'ClassifySourceMessageRevision'
+  AND command.subject_id = identity.legacy_source_message_id
+  AND command.payload ->> 'source_message_revision_id' = (
+      identity.legacy_source_message_revision_id
+  );
+
+UPDATE football_runtime.contract_outbox AS proposal
+SET subject_id = identity.canonical_source_message_id,
+    idempotency_key = format(
+        'classification-proposal:%s',
+        identity.canonical_source_message_revision_id
+    ),
+    payload = jsonb_set(
+        jsonb_set(
+            proposal.payload,
+            '{source_message_revision_id}',
+            to_jsonb(identity.canonical_source_message_revision_id)
+        ),
+        '{proposal_id}',
+        to_jsonb(
+            format(
+                'proposal:%s',
+                identity.canonical_source_message_revision_id
+            )
+        )
+    )
+FROM source_message_revision_identity_0014 AS identity
+WHERE proposal.contract_name = 'ClassificationProposal'
+  AND proposal.subject_id = identity.legacy_source_message_id
+  AND proposal.payload ->> 'source_message_revision_id' = (
+      identity.legacy_source_message_revision_id
+  );
+
+UPDATE football_runtime.contract_outbox AS classifier_contract
+SET payload = jsonb_set(
+    classifier_contract.payload,
+    '{eligible_reply_context,source_message_revision_id}',
+    to_jsonb(identity.canonical_source_message_revision_id),
+    false
+)
+FROM source_message_revision_identity_0014 AS identity
+WHERE classifier_contract.contract_name IN (
+        'ClassifySourceMessageRevision',
+        'ClassificationProposal'
+    )
+  AND classifier_contract.payload #>> (
+      '{eligible_reply_context,source_message_revision_id}'::text[]
+  ) = identity.legacy_source_message_revision_id;
+
 GRANT UPDATE (bounded_metadata, reply_to_telegram_message_id)
     ON football_runtime.source_messages TO football_application;
 

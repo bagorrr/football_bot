@@ -45,6 +45,93 @@ from modules.testkit import (
 )
 
 
+def test_untyped_classifier_peer_fails_closed_before_model_and_replay() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_110
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_100,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4900",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+    assert system.channel_ingestion_checkpoint(
+        identity=source_identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=4900)
+    body = "20 августа 2026 нужен один игрок"
+    source_event_id = "source-event:open-match:untyped-classifier-peer"
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4900),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4901),
+        source_event_id=source_event_id,
+        telegram_message_id=1110,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    canonical_revision_id = (
+        "source-chat:channel:4900100:generation:1:message:1110:revision:1"
+    )
+    malformed_message_id = "not-a-typed-peer:generation:1:message:1110"
+    malformed_revision_id = f"{malformed_message_id}:revision:1"
+    invalid_command = system.invalidate_classifier_context(
+        source_message_revision_id=canonical_revision_id,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        payload_updates={
+            "source_chat_reference": "not-a-typed-peer",
+            "source_message_revision_id": malformed_revision_id,
+        },
+        new_subject_id=malformed_message_id,
+        new_idempotency_key=f"classify-source-message:{malformed_revision_id}",
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert classifier.requests == []
+    assert system.classification_attempts() == ()
+    assert system.opportunities() == ()
+    assert not system.contract_is_accepted(invalid_command.message_id)
+    assert system.operator_alert(invalid_command.message_id) == OperatorAlert(
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.CLASSIFICATION,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        failure_code=FailureCode.INVALID_CONTRACT,
+    )
+    assert not system.redeliver_source_event(source_event_id)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert classifier.requests == []
+    system.reset()
+
+
 def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> None:
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     telegram_delivery = ControlledTelegramDeliveryAdapter()

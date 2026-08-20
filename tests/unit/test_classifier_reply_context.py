@@ -101,6 +101,40 @@ def test_classifier_command_accepts_direct_reply_older_than_adjacent_window() ->
     )
 
 
+def test_classifier_command_rejects_self_consistent_untyped_source_chat() -> None:
+    valid = _valid_classify_command()
+    payload = deepcopy(valid.payload)
+    assert isinstance(payload, dict)
+    source_message_id = "not-a-typed-peer:generation:3:message:1012"
+    revision_id = f"{source_message_id}:revision:1"
+    payload["source_chat_reference"] = "not-a-typed-peer"
+    payload["source_message_revision_id"] = revision_id
+    reply = payload["eligible_reply_context"]
+    assert isinstance(reply, dict)
+    reply["source_chat_reference"] = "not-a-typed-peer"
+    reply["source_message_revision_id"] = (
+        "not-a-typed-peer:generation:3:message:1011:revision:2"
+    )
+    invalid = RawContractEnvelope(
+        contract_name=valid.contract_name,
+        contract_version=valid.contract_version,
+        message_id=valid.message_id,
+        producer=valid.producer,
+        consumer=valid.consumer,
+        subject_id=source_message_id,
+        subject_revision=valid.subject_revision,
+        idempotency_key=f"classify-source-message:{revision_id}",
+        causation_id=valid.causation_id,
+        correlation_id=valid.correlation_id,
+        recorded_at=valid.recorded_at,
+        payload=payload,
+    )
+
+    for _ in range(2):
+        with pytest.raises(ValueError, match="typed Source Chat"):
+            ContractEnvelope.from_raw(invalid)
+
+
 @pytest.mark.parametrize(
     "fault",
     (

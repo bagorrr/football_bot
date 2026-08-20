@@ -1021,6 +1021,9 @@ class AcceptanceObserver(Protocol):
         source_message_revision_id: str,
         contract_name: ContractName,
         payload_updates: dict[str, JsonValue],
+        *,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
     ) -> RawContractEnvelope:
         """Inject one classifier-context wire fault at the test seam."""
         ...
