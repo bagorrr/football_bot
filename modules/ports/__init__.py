@@ -945,6 +945,12 @@ class AcceptanceObserver(Protocol):
         """Observe Application-authoritative accepted Opportunities."""
         ...
 
+    def opportunity_publication_contracts(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe publication outbox effects for one Source Message revision."""
+        ...
+
     def completed_search_opportunity_revision_inputs(
         self, completed_search_id: str
     ) -> tuple[dict[str, JsonValue], ...]:

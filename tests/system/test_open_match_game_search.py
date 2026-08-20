@@ -2227,10 +2227,10 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
 
     currency_opportunities = {}
     currency_cases = (
-        ("pesos", "a las 06:01", None, "06:01", "500", "pesos", "es"),
-        ("yuan", "в 12:01", None, "12:01", "500", "юаней", "ru"),
-        ("yen", "at 18:01", None, "18:01", "500", "yen", "en"),
-        ("cad", "at 22:01", None, "22:01", "500", "cad", "en"),
+        ("pesos", "a las 06:01", None, "06:01", "500", "pesos", "pesos", "es"),
+        ("yuan", "в 12:01", None, "12:01", "500", "юаней", "юаней", "ru"),
+        ("yen", "at 18:01", None, "18:01", "500", "yen", "yen", "en"),
+        ("cad", "at 22:01", None, "22:01", "500", "cad", "cad", "en"),
         (
             "swiss-francs",
             "à 23:59",
@@ -2238,13 +2238,23 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "23:59",
             "500",
             "francs suisses",
+            "francs suisses",
             "fr",
         ),
-        ("dirhams", "at 06:02", None, "06:02", "500", "dirhams", "en"),
-        ("hryvnia", "в 12:02", None, "12:02", "500", "гривен", "ru"),
-        ("soles", "a las 18:02", None, "18:02", "500", "soles", "es"),
-        ("dinars", "à 22:02", None, "22:02", "500", "dinars", "fr"),
-        ("cfa-francs", "à 23:58", None, "23:58", "500", "francs CFA", "fr"),
+        ("dirhams", "at 06:02", None, "06:02", "500", "dirhams", "dirhams", "en"),
+        ("hryvnia", "в 12:02", None, "12:02", "500", "гривен", "гривен", "ru"),
+        ("soles", "a las 18:02", None, "18:02", "500", "soles", "soles", "es"),
+        ("dinars", "à 22:02", None, "22:02", "500", "dinars", "dinars", "fr"),
+        (
+            "cfa-francs",
+            "à 23:58",
+            None,
+            "23:58",
+            "500",
+            "francs CFA",
+            "francs CFA",
+            "fr",
+        ),
         (
             "mexican-pesos",
             "a las 18:03",
@@ -2252,7 +2262,58 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "18:03",
             "500",
             "pesos mexicanos",
+            "pesos mexicanos",
             "es",
+        ),
+        (
+            "each-player",
+            "at 06:03",
+            None,
+            "06:03",
+            "500",
+            "euros each player",
+            "euros",
+            "en",
+        ),
+        (
+            "each-russian-player",
+            "в 12:03",
+            None,
+            "12:03",
+            "500",
+            "рублей за каждого игрока",
+            "рублей",
+            "ru",
+        ),
+        (
+            "each-spanish-player",
+            "a las 18:04",
+            None,
+            "18:04",
+            "500",
+            "euros por cada jugador",
+            "euros",
+            "es",
+        ),
+        (
+            "each-french-player",
+            "à 22:03",
+            None,
+            "22:03",
+            "500",
+            "euros pour chaque joueur",
+            "euros",
+            "fr",
+        ),
+        (
+            "mixed-case-iso",
+            "at 23:57",
+            None,
+            "23:57",
+            "500",
+            "eUr for each player",
+            "eUr",
+            "en",
         ),
     )
     for offset, (
@@ -2261,12 +2322,14 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         currency_day_part,
         currency_exact_time,
         amount,
-        currency,
+        payment_evidence,
+        _currency,
         _locale,
     ) in enumerate(currency_cases, start=1):
         currency_body = (
             f"20 августа 2026 {time_copy} на Петроградской нужен один игрок. "
-            f"Tarif {amount} {currency}. Пишите @currency_{label.replace('-', '_')}"
+            f"Tarif {amount} {payment_evidence}. "
+            f"Пишите @currency_{label.replace('-', '_')}"
         )
         currency_result = _minimal_classifier_result(
             candidate_key=f"currency-{label}",
@@ -2288,7 +2351,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         assert isinstance(candidate, dict)
         evidence = candidate["evidence"]
         assert isinstance(evidence, dict)
-        evidence["payment"] = f"{amount} {currency}"
+        evidence["payment"] = f"Tarif {amount} {payment_evidence}"
         candidate["payment"] = "paid"
         classifier.return_for(body=currency_body, result=currency_result)
         telegram_ingestion.add_channel_difference_event(
@@ -2321,6 +2384,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         currency_day_part,
         currency_exact_time,
         amount,
+        _payment_evidence,
         currency,
         locale,
     ) in enumerate(currency_cases, start=20):
@@ -2377,6 +2441,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         assert len(system.completed_searches(currency_user_id)) == 1
         assert system.results(currency_search.completed_search_id) == currency_snapshot
 
+    range_base_checkpoint = 4928 + len(currency_cases)
     range_cases = (
         (
             "relative-range-six-players",
@@ -2476,6 +2541,21 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "20 August",
             "en",
         ),
+        (
+            "spanish-not-cancelled-thousand-opening",
+            "Partido 20 agosto 2026 a las 07:24 no fue cancelado "
+            "на Петроградской. Necesitamos mil doscientos jugadores "
+            "experimentados. Escribe a @spanish_thousand_opening",
+            "20 agosto 2026 a las 07:24 no fue cancelado",
+            "Necesitamos mil doscientos jugadores experimentados",
+            "2026-08-20",
+            "2026-08-20",
+            "07:24",
+            1200,
+            datetime(2026, 8, 20, 9, 7, tzinfo=UTC),
+            "20 August",
+            "es",
+        ),
     )
     range_opportunities = {}
     for offset, (
@@ -2499,6 +2579,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "spanish-shared-month": "@spanish_shared_month",
             "french-shared-month": "@french_shared_month",
             "month-first-large-opening": "@month_first_large",
+            "spanish-not-cancelled-thousand-opening": ("@spanish_thousand_opening"),
         }.get(label, "@" + label.replace("-", "_"))
         classifier.return_for(
             body=range_body,
@@ -2523,8 +2604,10 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         )
         telegram_ingestion.add_channel_difference_event(
             identity=source_identity,
-            from_checkpoint=TelegramChannelCheckpoint(pts=4938 + offset),
-            to_checkpoint=TelegramChannelCheckpoint(pts=4939 + offset),
+            from_checkpoint=TelegramChannelCheckpoint(
+                pts=range_base_checkpoint + offset - 1
+            ),
+            to_checkpoint=TelegramChannelCheckpoint(pts=range_base_checkpoint + offset),
             source_event_id=f"source-event:open-match:{label}",
             telegram_message_id=1050 + offset,
             revision=1,
@@ -2787,10 +2870,58 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             2,
             "Nous ne cherchons pas deux joueurs",
         ),
+        (
+            "english-got-cancelled",
+            "Match 20 August 2026 at 19:00 got cancelled на Петроградской. "
+            "Need one player. Contact @invalid_english_got_cancelled",
+            "20 August 2026 at 19:00 got cancelled",
+            None,
+            "19:00",
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "french-past-cancelled",
+            "Match le 20 août 2026 le soir a été annulé на Петроградской. "
+            "Besoin d’un joueur. Contact @invalid_french_past_cancelled",
+            "20 août 2026 le soir a été annulé",
+            "evening",
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Besoin d’un joueur",
+        ),
+        (
+            "filled-player-opening",
+            "Match 20 August 2026 на Петроградской. Need two players, but both "
+            "places are already filled. Contact @invalid_filled_player_opening",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2,
+            "Need two players, but both places are already filled",
+        ),
+        (
+            "malformed-french-count",
+            "Match le 20 août 2026 на Петроградской. Besoin de mille mille "
+            "joueurs. Contact @invalid_malformed_french_count",
+            "20 août 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            2000,
+            "Besoin de mille mille joueurs",
+        ),
     )
     opportunities_before_invalid_evidence = len(system.opportunities())
     invalid_message_ids = []
-    range_checkpoint = 4939 + len(range_cases)
+    range_checkpoint = range_base_checkpoint + len(range_cases)
     for offset, (
         label,
         invalid_body,
@@ -2847,15 +2978,25 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         )
         system.process_opportunities_until_idle()
         assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        invalid_revision_id = next(
+            revision.source_message_revision_id
+            for revision in system.source_message_revisions()
+            if revision.source_event_id == source_event_id
+        )
+        assert system.opportunity_publication_contracts(invalid_revision_id) == ()
         assert not system.redeliver_source_event(source_event_id)
         system.process_opportunities_until_idle()
         assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        assert system.opportunity_publication_contracts(invalid_revision_id) == ()
 
     lossy_currency_cases = (
         ("dirhams-uae", "500 dirhams UAE"),
         ("dirhams-marocains", "500 dirhams marocains"),
         ("pesos-argentinos", "500 pesos argentinos"),
         ("francs-belges", "500 francs belges"),
+        ("ordinary-try", "We will try 500 players"),
+        ("ordinary-top", "The top 500 players qualify"),
+        ("ordinary-all", "Need 500 all-round players"),
     )
     invalid_checkpoint = range_checkpoint + len(invalid_evidence_cases)
     for offset, (label, payment_evidence) in enumerate(lossy_currency_cases, start=1):
@@ -2906,9 +3047,102 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         )
         system.process_opportunities_until_idle()
         assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        invalid_revision_id = next(
+            revision.source_message_revision_id
+            for revision in system.source_message_revisions()
+            if revision.source_event_id == source_event_id
+        )
+        assert system.opportunity_publication_contracts(invalid_revision_id) == ()
         assert not system.redeliver_source_event(source_event_id)
         system.process_opportunities_until_idle()
         assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        assert system.opportunity_publication_contracts(invalid_revision_id) == ()
+
+    negated_optional_cases: tuple[tuple[str, str, JsonValue, str], ...] = (
+        ("format", "team_formats", ["7x7"], "We are not playing 7x7"),
+        ("position", "positions", ["defender"], "We do not need a defender"),
+        (
+            "level",
+            "playing_levels",
+            ["professional"],
+            "The level is not professional",
+        ),
+        ("setting", "venue_settings", ["indoor"], "The game is not indoor"),
+        (
+            "surface",
+            "playing_surfaces",
+            ["artificial_turf"],
+            "No artificial turf",
+        ),
+        ("paid", "payment", "paid", "Participation is not paid"),
+        ("free", "payment", "free", "This is not free"),
+    )
+    optional_checkpoint = invalid_checkpoint + len(lossy_currency_cases)
+    for offset, (
+        label,
+        field_name,
+        field_value,
+        optional_evidence,
+    ) in enumerate(negated_optional_cases, start=1):
+        invalid_body = (
+            "Match 20 August 2026 на Петроградской. Need one player. "
+            f"{optional_evidence}. Contact @invalid_optional_{label}"
+        )
+        invalid_result = _minimal_classifier_result(
+            candidate_key=f"negated-optional-{label}",
+            body=invalid_body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": f"@invalid_optional_{label}",
+                    "evidence": f"@invalid_optional_{label}",
+                }
+            ],
+            event_time_evidence="20 August 2026",
+            opportunity_evidence="Need one player",
+            open_places_evidence="Need one player",
+        )
+        candidates = invalid_result.output["candidates"]
+        assert isinstance(candidates, list)
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        candidate[field_name] = field_value
+        evidence[field_name] = optional_evidence
+        classifier.return_for(body=invalid_body, result=invalid_result)
+        message_id = 1100 + offset
+        invalid_message_ids.append(message_id)
+        source_event_id = f"source-event:open-match:negated-optional-{label}"
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(
+                pts=optional_checkpoint + offset - 1
+            ),
+            to_checkpoint=TelegramChannelCheckpoint(pts=optional_checkpoint + offset),
+            source_event_id=source_event_id,
+            telegram_message_id=message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=invalid_body,
+            event_time=datetime(2026, 8, 19, 1, offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        invalid_revision_id = next(
+            revision.source_message_revision_id
+            for revision in system.source_message_revisions()
+            if revision.source_event_id == source_event_id
+        )
+        assert system.opportunity_publication_contracts(invalid_revision_id) == ()
+        assert not system.redeliver_source_event(source_event_id)
+        system.process_opportunities_until_idle()
+        assert len(system.opportunities()) == opportunities_before_invalid_evidence
+        assert system.opportunity_publication_contracts(invalid_revision_id) == ()
 
     invalid_evidence_user_id = bot_user_id + 61
     _advance_to_complete_game_search(

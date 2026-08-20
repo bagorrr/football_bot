@@ -1353,6 +1353,26 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_row_to_envelope(row) for row in rows)
 
+    def opportunity_publication_contracts(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe publication outbox effects for one Source Message revision."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'OpportunityPublicationChanged'
+                  AND payload ->> 'source_message_revision_id' = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (source_message_revision_id,),
+            ).fetchall()
+        return tuple(_row_to_envelope(row) for row in rows)
+
     def source_chat_contracts(
         self,
         correlation_id: UUID,

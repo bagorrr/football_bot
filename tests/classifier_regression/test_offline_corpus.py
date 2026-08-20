@@ -16,6 +16,7 @@ from modules.application import (
     _stated_payment_amount_and_currency,
 )
 from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.contracts import JsonValue
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
 from modules.testkit import ControlledModelAdapter
 
@@ -245,6 +246,10 @@ def test_offline_temporal_details_are_positive_and_event_bound() -> None:
         (None, None, "Матч 20 августа 2026 не состоится"),
         (None, None, "Partido 20 agosto 2026 está cancelado"),
         (None, None, "Match le 20 août 2026 est annulé"),
+        (None, None, "Match 20 August 2026 got cancelled"),
+        ("19:00", None, "Матч 20 августа 2026 в 19:00 был отменён"),
+        (None, "evening", "Partido 20 agosto 2026 por la tarde fue cancelado"),
+        (None, None, "Match le 20 août 2026 a été annulé"),
     ):
         assert not _event_time_is_supported(
             date(2026, 8, 20),
@@ -263,6 +268,10 @@ def test_offline_temporal_details_are_positive_and_event_bound() -> None:
         (None, None, "Partido 20 agosto 2026 no está cancelado"),
         (None, "evening", "Match le 20 août 2026 le soir confirmé"),
         (None, None, "Match le 20 août 2026 n’est pas annulé"),
+        (None, None, "Match 20 August 2026 was not cancelled"),
+        ("19:00", None, "Матч 20 августа 2026 в 19:00 не был отменён"),
+        (None, "evening", "Partido 20 agosto 2026 por la tarde no fue cancelado"),
+        (None, None, "Match le 20 août 2026 n’a pas été annulé"),
     ):
         assert _event_time_is_supported(
             date(2026, 8, 20),
@@ -311,11 +320,25 @@ def test_offline_open_player_evidence_is_complete_and_polarity_safe() -> None:
         "Nous ne cherchons pas deux joueurs",
         "Nous ne cherchons plus deux joueurs",
         "Nous n’avons plus besoin de deux joueurs",
+        "Need two players, but both places are already filled",
+        "No need for two players",
+        "Two players not needed",
+        "Нужно два игрока, но оба места уже заняты",
+        "Necesitamos dos jugadores, pero las plazas ya están cubiertas",
+        "Besoin de deux joueurs, mais les places sont déjà pourvues",
     ):
         assert not _open_places_are_supported(2, evidence)
     assert not _open_places_are_supported(1, "Need zero players")
     assert not _open_places_are_supported(2, "Need one one players")
     assert not _open_places_are_supported(31, "Need twenty eleven players")
+    assert not _open_places_are_supported(2000, "Besoin de mille mille joueurs")
+    for evidence in (
+        "Need one thousand two hundred experienced players",
+        "Нужно тысяча двести опытных игроков",
+        "Necesitamos mil doscientos jugadores experimentados",
+        "Besoin de mille deux cents joueurs expérimentés",
+    ):
+        assert _open_places_are_supported(1200, evidence)
 
 
 def test_offline_payment_evidence_covers_four_locales_without_inference() -> None:
@@ -340,6 +363,10 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         ("Tarif 500 francs suisses par joueur", ("500", "francs suisses")),
         ("Entrada 500 pesos mexicanos por persona", ("500", "pesos mexicanos")),
         ("Взнос 500 рублей с игрока", ("500", "рублей")),
+        ("Fee 500 euros each player", ("500", "euros")),
+        ("Взнос 500 рублей за каждого игрока", ("500", "рублей")),
+        ("Entrada 500 euros por cada jugador", ("500", "euros")),
+        ("Tarif 500 euros pour chaque joueur", ("500", "euros")),
     )
     for evidence, expected_details in cases:
         assert _optional_values_are_supported(
@@ -359,8 +386,49 @@ def test_offline_payment_evidence_covers_four_locales_without_inference() -> Non
         "Tarif 500 francs belges",
         "Fee 500 euros training starts at 19:00",
         "Fee 500 euros per player parking included",
+        "We will try 500 players",
+        "The top 500 players qualify",
+        "Need 500 all-round players",
     ):
         assert _stated_payment_amount_and_currency(ambiguous_longer_name) is None
+
+
+def test_offline_optional_game_search_facts_are_affirmative() -> None:
+    negated_cases: tuple[tuple[dict[str, JsonValue], dict[str, JsonValue]], ...] = (
+        ({"team_formats": ["7x7"]}, {"team_formats": "Мы не играем 7x7"}),
+        ({"positions": ["defender"]}, {"positions": "No necesitamos defensa"}),
+        (
+            {"playing_levels": ["professional"]},
+            {"playing_levels": "Niveau pas professionnel"},
+        ),
+        ({"venue_settings": ["indoor"]}, {"venue_settings": "Not indoor"}),
+        (
+            {"playing_surfaces": ["artificial_turf"]},
+            {"playing_surfaces": "Без искусственного газона"},
+        ),
+        ({"payment": "paid"}, {"payment": "La participación no es de pago"}),
+        ({"payment": "free"}, {"payment": "Ce n’est pas gratuit"}),
+    )
+    for candidate, evidence in negated_cases:
+        assert not _optional_values_are_supported(candidate, evidence)
+
+    affirmative_cases: tuple[tuple[dict[str, JsonValue], dict[str, JsonValue]], ...] = (
+        ({"team_formats": ["7x7"]}, {"team_formats": "Играем 7x7"}),
+        ({"positions": ["defender"]}, {"positions": "Necesitamos defensa"}),
+        (
+            {"playing_levels": ["professional"]},
+            {"playing_levels": "Niveau professionnel"},
+        ),
+        ({"venue_settings": ["indoor"]}, {"venue_settings": "Indoor"}),
+        (
+            {"playing_surfaces": ["artificial_turf"]},
+            {"playing_surfaces": "Искусственный газон"},
+        ),
+        ({"payment": "paid"}, {"payment": "La participación es de pago"}),
+        ({"payment": "free"}, {"payment": "C’est gratuit"}),
+    )
+    for candidate, evidence in affirmative_cases:
+        assert _optional_values_are_supported(candidate, evidence)
 
 
 def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:

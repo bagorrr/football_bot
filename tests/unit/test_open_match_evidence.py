@@ -15,6 +15,7 @@ from modules.application import (
     _resolve_source_location_across_supported_locales,
     _stated_payment_amount_and_currency,
 )
+from modules.contracts import JsonValue
 from modules.domain import (
     GeographicType,
     LocationCandidate,
@@ -481,6 +482,47 @@ def test_temporal_evidence_rejects_trailing_event_cancellation() -> None:
         )
 
 
+def test_temporal_evidence_binds_full_clause_cancellation_polarity() -> None:
+    event_date = date(2026, 8, 20)
+    cancelled_cases = (
+        (None, None, "Match 20 August 2026 got cancelled"),
+        ("19:00", None, "Match 20 August 2026 at 19:00 got cancelled"),
+        (None, "evening", "Match 20 August 2026 in the evening got cancelled"),
+        (None, None, "Матч 20 августа 2026 был отменён"),
+        ("19:00", None, "Матч 20 августа 2026 в 19:00 был отменён"),
+        (None, "evening", "Матч 20 августа 2026 вечером был отменён"),
+        (None, None, "Partido 20 agosto 2026 fue cancelado"),
+        ("19:00", None, "Partido 20 agosto 2026 a las 19:00 fue cancelado"),
+        (None, "evening", "Partido 20 agosto 2026 por la tarde fue cancelado"),
+        (None, None, "Match le 20 août 2026 a été annulé"),
+        ("19:00", None, "Match le 20 août 2026 à 19:00 a été annulé"),
+        (None, "evening", "Match le 20 août 2026 le soir a été annulé"),
+    )
+    for exact_time, day_part, evidence in cancelled_cases:
+        assert not _event_time_is_supported(
+            event_date,
+            event_date,
+            exact_time,
+            evidence,
+            day_part=day_part,
+        )
+
+    affirmed_cases = (
+        (None, None, "Match 20 August 2026 was not cancelled"),
+        ("19:00", None, "Матч 20 августа 2026 в 19:00 не был отменён"),
+        (None, "evening", "Partido 20 agosto 2026 por la tarde no fue cancelado"),
+        (None, None, "Match le 20 août 2026 n’a pas été annulé"),
+    )
+    for exact_time, day_part, evidence in affirmed_cases:
+        assert _event_time_is_supported(
+            event_date,
+            event_date,
+            exact_time,
+            evidence,
+            day_part=day_part,
+        )
+
+
 def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
     positive_cases = (
         (6, "Need six players"),
@@ -521,6 +563,35 @@ def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> N
     assert not _open_places_are_supported(1, "Need zero players")
     assert not _open_places_are_supported(2, "Need one one players")
     assert not _open_places_are_supported(31, "Need twenty eleven players")
+
+
+def test_open_player_evidence_requires_one_current_non_competing_opening() -> None:
+    closed_cases = (
+        ("Need two players, but both places are already filled", 2),
+        ("No need for two players", 2),
+        ("Two players not needed", 2),
+        ("Нужно два игрока, но оба места уже заняты", 2),
+        ("Не нужно два игрока", 2),
+        ("Два игрока больше не нужны", 2),
+        ("Necesitamos dos jugadores, pero las plazas ya están cubiertas", 2),
+        ("No necesitamos dos jugadores", 2),
+        ("Dos jugadores ya no son necesarios", 2),
+        ("Besoin de deux joueurs, mais les places sont déjà pourvues", 2),
+        ("Pas besoin de deux joueurs", 2),
+        ("Deux joueurs ne sont plus nécessaires", 2),
+        ("Besoin de mille mille joueurs", 2000),
+    )
+    for evidence, open_places in closed_cases:
+        assert not _open_places_are_supported(open_places, evidence)
+
+    positive_cases = (
+        ("Need one thousand two hundred experienced players", 1200),
+        ("Нужно тысяча двести опытных игроков", 1200),
+        ("Necesitamos mil doscientos jugadores experimentados", 1200),
+        ("Besoin de mille deux cents joueurs expérimentés", 1200),
+    )
+    for evidence, open_places in positive_cases:
+        assert _open_places_are_supported(open_places, evidence)
 
 
 def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
@@ -608,6 +679,71 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
         "Fee 500 euros per player parking included",
     ):
         assert _stated_payment_amount_and_currency(ambiguous_longer_name) is None
+
+
+def test_currency_evidence_disambiguates_iso_prose_and_ordinary_qualifiers() -> None:
+    for ordinary_prose in (
+        "We will try 500 players",
+        "The top 500 players qualify",
+        "Need 500 all-round players",
+    ):
+        assert _stated_payment_amount_and_currency(ordinary_prose) is None
+        assert not _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": ordinary_prose},
+        )
+
+    qualified_payments = (
+        ("Fee 500 euros each player", ("500", "euros")),
+        ("Взнос 500 рублей за каждого игрока", ("500", "рублей")),
+        ("Entrada 500 euros por cada jugador", ("500", "euros")),
+        ("Tarif 500 euros pour chaque joueur", ("500", "euros")),
+        ("Fee 500 eUr for each player", ("500", "eUr")),
+    )
+    for evidence, expected in qualified_payments:
+        assert _stated_payment_amount_and_currency(evidence) == expected
+        assert _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": evidence},
+        )
+
+
+def test_optional_game_search_facts_require_affirmative_evidence() -> None:
+    negated_cases: tuple[tuple[dict[str, JsonValue], dict[str, JsonValue]], ...] = (
+        ({"team_formats": ["7x7"]}, {"team_formats": "We are not playing 7x7"}),
+        ({"positions": ["defender"]}, {"positions": "We do not need a defender"}),
+        (
+            {"playing_levels": ["professional"]},
+            {"playing_levels": "The level is not professional"},
+        ),
+        ({"venue_settings": ["indoor"]}, {"venue_settings": "The game is not indoor"}),
+        (
+            {"playing_surfaces": ["artificial_turf"]},
+            {"playing_surfaces": "No artificial turf"},
+        ),
+        ({"payment": "paid"}, {"payment": "Participation is not paid"}),
+        ({"payment": "free"}, {"payment": "This is not free"}),
+    )
+    for candidate, evidence in negated_cases:
+        assert not _optional_values_are_supported(candidate, evidence)
+
+    affirmative_cases: tuple[tuple[dict[str, JsonValue], dict[str, JsonValue]], ...] = (
+        ({"team_formats": ["7x7"]}, {"team_formats": "We are playing 7x7"}),
+        ({"positions": ["defender"]}, {"positions": "We need a defender"}),
+        (
+            {"playing_levels": ["professional"]},
+            {"playing_levels": "Professional level"},
+        ),
+        ({"venue_settings": ["indoor"]}, {"venue_settings": "The game is indoor"}),
+        (
+            {"playing_surfaces": ["artificial_turf"]},
+            {"playing_surfaces": "Artificial turf"},
+        ),
+        ({"payment": "paid"}, {"payment": "Participation is paid"}),
+        ({"payment": "free"}, {"payment": "This is free"}),
+    )
+    for candidate, evidence in affirmative_cases:
+        assert _optional_values_are_supported(candidate, evidence)
 
 
 def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:

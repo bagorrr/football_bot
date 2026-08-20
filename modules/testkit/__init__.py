@@ -1196,6 +1196,14 @@ class AcceptanceSpine:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()
 
+    def opportunity_publication_contracts(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe publication outbox effects for one Source Message revision."""
+        return self._observer.opportunity_publication_contracts(
+            source_message_revision_id
+        )
+
     def completed_search_opportunity_revision_inputs(
         self, completed_search_id: str
     ) -> tuple[dict[str, JsonValue], ...]:

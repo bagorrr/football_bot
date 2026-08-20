@@ -9396,26 +9396,31 @@ def _event_time_is_supported(
     def clause_cancels_event(clause_start: int, clause_end: int) -> bool:
         clause = normalized[clause_start:clause_end]
         for confirmed_pattern in (
-            r"\b(?:is|was|will\s+be|has\s+been)\s+not\s+"
+            r"\b(?:is|was|will\s+be|has\s+been|had\s+been)\s+not\s+"
             r"(?:cancelled|canceled|called\s+off)\b",
             r"\bне\s+(?:(?:был\w*|будет)\s+)?отмен\w*\b",
             r"\bотмен\w*\s+не\s+будет\b",
-            r"\bno\s+(?:est[áa]|ser[áa])\s+cancelad[oa]s?\b",
-            r"\bn['’]est\s+pas\s+annul[ée]\w*\b",
+            r"\bno\s+(?:(?:est[áa]|era|fue|ser[áa])\s+|ha\s+sido\s+)?"
+            r"cancelad[oa]s?\b",
+            r"\bn['’](?:est\s+pas|a\s+pas\s+(?:[ée]t[ée]|ete)|"
+            r"avait\s+pas\s+[ée]t[ée]|(?:aura|sera)\s+pas)\s+annul[ée]\w*\b",
         ):
             clause = re.sub(confirmed_pattern, "", clause)
         cancellation_patterns = (
-            r"\b(?:is|was|will\s+be|has\s+been)\s+(?:cancelled|canceled)\b",
+            r"\b(?:is|was|got|gets|will\s+be|has\s+been|had\s+been)\s+"
+            r"(?:cancelled|canceled)\b",
             r"\b(?:is|was|will\s+be)\s+called\s+off\b",
             r"\b(?:is|will|does|did)\s+not\s+"
             r"(?:happen(?:ing)?|take\s+place|go\s+ahead)\b",
             r"\bwon['’]?t\s+(?:happen|take\s+place|go\s+ahead)\b",
             r"\bне\s+(?:состо\w*|будет|произойд\w*)\b",
             r"\bотмен\w*\b",
-            r"\b(?:est[áa]\s+)?cancelad[oa]s?\b",
+            r"\b(?:(?:est[áa]|era|fue|ser[áa])\s+|ha\s+sido\s+)?"
+            r"cancelad[oa]s?\b",
             r"\bse\s+cancel\w*\b",
             r"\bno\s+(?:se\s+)?(?:juega|jugar[áa]|celebr\w*|tendr[áa]\s+lugar)\b",
-            r"\b(?:est|sera)\s+annul[ée]\w*\b",
+            r"\b(?:est|sera|ser[áa]|[ée]tait|a\s+(?:[ée]t[ée]|ete)|"
+            r"avait\s+[ée]t[ée])\s+annul[ée]\w*\b",
             r"\bn['’]aura\s+pas\s+lieu\b",
             r"\bne\s+se\s+(?:joue|tiendra)\s+pas\b",
         )
@@ -9591,7 +9596,11 @@ def _french_number_phrase_value(tokens: tuple[str, ...]) -> int | None:
     filtered = tuple(
         "vingt" if token == "vingts" else token for token in tokens if token != "et"
     )
-    if not filtered:
+    if (
+        not filtered
+        or filtered.count("mille") > 1
+        or sum(filtered.count(token) for token in ("cent", "cents")) > 1
+    ):
         return None
     units = {
         "zéro": 0,
@@ -9973,11 +9982,11 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
                 r"\b(?:(?:do|does|did)\s+not|"
                 r"(?:dont|doesnt|didnt|don\s+t|doesn\s+t|didn\s+t))\s+"
                 r"(?:need|want|seek)\b|"
-                r"\bnot\s+need\b|"
+                r"\bno\s+need(?:ed)?(?:\s+for)?\b|\bnot\s+need(?:ed)?\b|"
                 r"\bya\s+no\b|\bno\s+(?:necesit|busc)\w*|\bбольше\s+не\b|"
                 r"\bне\s+(?:нуж|ищ|треб)\w*|\bn\s+\w+\s+plus\s+besoin\b|"
                 r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+(?:pas|plus)\b|"
-                r"\bplus\s+besoin\b|\bpas\s+besoin\b)",
+                r"\bne\s+\w+\s+plus\b|\bplus\s+besoin\b|\bpas\s+besoin\b)",
                 normalized_clause,
             )
             is not None
@@ -10000,6 +10009,8 @@ def _open_places_are_supported(open_places: int, evidence: str) -> bool:
             for index, token in enumerate(clause_tokens)
             if closed_word.fullmatch(token) is not None
         }
+        if closed_indexes:
+            continue
         clause_words = set(clause_tokens)
         non_player_context = {
             "parking",
@@ -10118,22 +10129,42 @@ _STATED_CURRENCY_PATTERN = (
 )
 _STATED_AMOUNT_PATTERN = r"(?:\d{1,3}(?:[\s\u00a0,.]\d{3})+|\d+)(?:[.,]\d{1,2})?"
 _STATED_PAYMENT_QUALIFIER_PATTERN = (
-    r"(?i:(?:per\s+(?:player|person|participant)|"
-    r"(?:с|за|на)\s+(?:игрока|человека|участника)|"
-    r"por\s+(?:jugador|jugadora|persona|participante)|"
-    r"par\s+(?:joueur|joueuse|personne|participant|participante)))"
+    r"(?i:(?:(?:per|for\s+each|each)\s+(?:player|person|participant)|"
+    r"(?:с|за|на)\s+(?:(?:каждого|одного)\s+)?"
+    r"(?:игрока|человека|участника)|"
+    r"por\s+(?:cada\s+)?(?:jugador|jugadora|persona|participante)|"
+    r"(?:par|pour\s+chaque)\s+"
+    r"(?:joueur|joueuse|personne|participant|participante)))"
 )
 
 
 def _has_supported_currency_name_suffix(evidence: str, currency_end: int) -> bool:
     suffix = evidence[currency_end:]
-    if re.match(r"^[\s\u00a0]+[^\W\d_]+", suffix) is None:
-        return True
-    return (
+    return re.fullmatch(r"[\s\u00a0]*[.,;:!?]?[\s\u00a0]*", suffix) is not None or (
         re.fullmatch(
             rf"[\s\u00a0]+{_STATED_PAYMENT_QUALIFIER_PATTERN}"
             rf"[\s\u00a0]*[.,;:!?]?[\s\u00a0]*",
             suffix,
+        )
+        is not None
+    )
+
+
+def _iso_currency_token_has_payment_context(
+    evidence: str, currency_start: int, currency: str
+) -> bool:
+    if currency == currency.upper():
+        return True
+    prefix = evidence[:currency_start].casefold()
+    return (
+        re.search(
+            r"(?:\bfee\b|\bcost\w*\b|\bprice\b|\bpay(?:ment|able|ing)?\b|"
+            r"\bcharge\b|\bentry\b|\bparticipation\b|\bbudget\b|"
+            r"\bвзнос\w*\b|\bстоим\w*\b|\bцен\w*\b|\bоплат\w*\b|"
+            r"\bучаст\w*\b|\bentrada\b|\btarifa\b|\bprecio\b|"
+            r"\bcuota\b|\bpago\b|\bparticipaci[oó]n\b|\btarif\w*\b|"
+            r"\bprix\b|\bco[uû]t\w*\b|\bcotisation\b|\bfrais\b)",
+            prefix,
         )
         is not None
     )
@@ -10150,8 +10181,15 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
     if amount_then_currency is not None:
         currency = amount_then_currency.group("currency")
         is_iso_token = currency.upper() in _ISO_CURRENCY_CODES
-        if not is_iso_token and not _has_supported_currency_name_suffix(
+        if not _has_supported_currency_name_suffix(
             evidence, amount_then_currency.end("currency")
+        ) or (
+            is_iso_token
+            and not _iso_currency_token_has_payment_context(
+                evidence,
+                amount_then_currency.start("currency"),
+                currency,
+            )
         ):
             return None
         return (
@@ -10165,10 +10203,71 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
     )
     if currency_then_amount is None:
         return None
+    currency = currency_then_amount.group("currency")
+    if not _has_supported_currency_name_suffix(
+        evidence, currency_then_amount.end("amount")
+    ) or (
+        currency.upper() in _ISO_CURRENCY_CODES
+        and not _iso_currency_token_has_payment_context(
+            evidence,
+            currency_then_amount.start("currency"),
+            currency,
+        )
+    ):
+        return None
     return (
         currency_then_amount.group("amount"),
-        currency_then_amount.group("currency"),
+        currency,
     )
+
+
+def _patterns_have_affirmative_clause_support(
+    normalized_evidence: str, patterns: tuple[str, ...]
+) -> bool:
+    clause_boundary = re.compile(r"[.!?;\n]")
+
+    def is_negated(clause: str, start: int, end: int) -> bool:
+        prefix = clause[:start]
+        suffix = clause[end:]
+        negated_before = (
+            re.search(
+                r"(?:\bno\b|\bnot\b|\bnever\b|\bwithout\b|"
+                r"\b(?:do|does|did|is|are|was|were|will)\s+n['’]?t\b|"
+                r"\bне\b|\bни\b|\bбез\b|\bno\b|\bsin\b|"
+                r"\bne\b|\bn['’]|\bpas\b|\bsans\b)"
+                r"(?:\s+[^\s,.!?;:]+){0,5}\s*$",
+                prefix,
+            )
+            is not None
+        )
+        negated_after = (
+            re.match(
+                r"^\s*(?:(?:is|are|was|were|will\s+be|est|sera|"
+                r"ser[áa]|будет|оказал\w*)\s+)?"
+                r"(?:not|no\s+longer|не|no|pas|plus)\b",
+                suffix,
+            )
+            is not None
+        )
+        return negated_before or negated_after
+
+    clause_start = 0
+    clauses: list[str] = []
+    for boundary in clause_boundary.finditer(normalized_evidence):
+        clauses.append(normalized_evidence[clause_start : boundary.start()])
+        clause_start = boundary.end()
+    clauses.append(normalized_evidence[clause_start:])
+    for clause in clauses:
+        matches = [
+            match for pattern in patterns for match in re.finditer(pattern, clause)
+        ]
+        if not matches:
+            continue
+        polarity = [is_negated(clause, match.start(), match.end()) for match in matches]
+        if any(polarity):
+            continue
+        return True
+    return False
 
 
 def _optional_values_are_supported(
@@ -10323,7 +10422,7 @@ def _optional_values_are_supported(
                 if field_name == "team_formats"
                 else lexicon[field_name][value]
             )
-            if not any(re.search(pattern, normalized) for pattern in patterns):
+            if not _patterns_have_affirmative_clause_support(normalized, patterns):
                 return False
     payment = candidate.get("payment")
     if payment is not None:
@@ -10356,15 +10455,28 @@ def _optional_values_are_supported(
         }
         if not isinstance(payment, str) or payment not in payment_patterns:
             return False
-        if not (
-            any(
-                re.search(pattern, normalized_payment)
-                for pattern in payment_patterns[payment]
+        direct_patterns = payment_patterns[payment]
+        direct_mentioned = any(
+            re.search(pattern, normalized_payment) for pattern in direct_patterns
+        )
+        direct_supported = _patterns_have_affirmative_clause_support(
+            normalized_payment, direct_patterns
+        )
+        competing_status = "paid" if payment == "free" else "free"
+        competing_supported = payment in {"free", "paid"} and (
+            _patterns_have_affirmative_clause_support(
+                normalized_payment, payment_patterns[competing_status]
             )
-            or (
-                payment == "paid"
-                and _stated_payment_amount_and_currency(payment_evidence) is not None
-            )
+        )
+        stated_amount = (
+            _stated_payment_amount_and_currency(payment_evidence)
+            if payment == "paid"
+            else None
+        )
+        if (
+            competing_supported
+            or (direct_mentioned and not direct_supported)
+            or not (direct_supported or stated_amount is not None)
         ):
             return False
     return True
