@@ -112,6 +112,14 @@ class CanonicalPropositionGraph:
             )
         )
 
+    def has_exact_support_spans(self) -> bool:
+        """Require each support edge to repeat its target node's exact span."""
+
+        if not self.has_complete_support_topology():
+            return False
+        node_spans = {node.node_id: node.span for node in self.nodes}
+        return all(edge.span == node_spans[edge.target] for edge in self.edges)
+
 
 def canonical_proposition_graph_from_wire(
     value: object,

@@ -98,6 +98,7 @@ from modules.ports import (
     TimezoneDataError,
 )
 from modules.proposition_graph import (
+    CanonicalPropositionGraph,
     PropositionState,
     canonical_proposition_graph_from_wire,
 )
@@ -8823,7 +8824,9 @@ def _proposition_evidence_is_authoritative(
         graph is None
         or not graph.is_current_positive()
         or not graph.has_complete_support_topology()
-        or not _source_player_participation_is_current(body)
+        or not graph.has_exact_support_spans()
+        or not _proposition_graph_has_closed_target_set(graph, evidence, routes)
+        or not _source_open_match_semantics_are_authoritative(body)
     ):
         return False
     contract = cast(dict[str, JsonValue], value)
@@ -8894,30 +8897,118 @@ def _proposition_evidence_is_authoritative(
     return supported_targets == set(expected_support_spans)
 
 
+_MANDATORY_OPEN_MATCH_FACTS = frozenset(
+    {"opportunity", "event_time", "location", "open_places"}
+)
+_OPTIONAL_OPEN_MATCH_FACTS = frozenset(
+    {
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+)
+
+
+def _proposition_graph_has_closed_target_set(
+    graph: CanonicalPropositionGraph,
+    evidence: dict[str, JsonValue],
+    routes: list[JsonValue],
+) -> bool:
+    """Bind v1 nodes to the closed Application target set.
+
+    Fact names are the existing v1 target types. Mandatory facts must always
+    be present; optional facts are admitted only when the candidate carries
+    their own evidence node. This keeps the classifier as the primary
+    interpreter while preventing an untyped positive node from authorizing a
+    different fact or a source span belonging to another fact.
+    """
+    fact_ids = {node.node_id for node in graph.facts}
+    evidence_ids = set(evidence)
+    if (
+        not _MANDATORY_OPEN_MATCH_FACTS.issubset(evidence_ids)
+        or not evidence_ids.issubset(
+            _MANDATORY_OPEN_MATCH_FACTS | _OPTIONAL_OPEN_MATCH_FACTS
+        )
+        or fact_ids != evidence_ids
+    ):
+        return False
+    route_ids = {
+        f"route:{kind}:{value}"
+        for route in routes
+        if isinstance(route, dict)
+        and isinstance(kind := route.get("kind"), str)
+        and isinstance(value := route.get("value"), str)
+    }
+    return graph.root.node_id == "root" and graph.node_ids == {
+        "root",
+        *fact_ids,
+        *route_ids,
+    }
+
+
 def _source_player_participation_is_current(body: str) -> bool:
     """Reject a positive graph when the source negates player participation."""
-    normalized = re.sub(r"['’]", " ", body.casefold())
+    normalized = body.casefold()
+    for contraction, expansion in (
+        ("isn't", "is not"),
+        ("aren't", "are not"),
+        ("wasn't", "was not"),
+        ("weren't", "were not"),
+        ("isn’t", "is not"),
+        ("aren’t", "are not"),
+        ("wasn’t", "was not"),
+        ("weren’t", "were not"),
+    ):
+        normalized = normalized.replace(contraction, expansion)
+    normalized = re.sub(r"['’]", " ", normalized)
     negated_player_proposition_patterns = (
         r"\b(?:match|game)\b[^.!?;\n]{0,80}"
         r"\b(?:is|are|was|were)\s+not\s+(?:intended|meant)\s+for\s+"
         r"(?:individual\s+)?players?\b",
         r"\bnot\s+(?:intended|meant)\s+for\s+(?:individual\s+)?players?\b",
+        r"\b(?:match|game)\b[^.!?;\n]{0,80}"
+        r"\b(?:is|are|was|were)\s+not\s+(?:for\s+)?"
+        r"(?:individual\s+)?players?\b",
+        r"\bnot\s+(?:for\s+)?(?:individual\s+)?players?\b",
         r"\b(?:матч\w*|игр\w*)\b[^.!?;\n]{0,80}"
         r"\bне\s+предназначен\w*\s+для\s+(?:отдельн\w*\s+)?игрок\w*\b",
         r"\bне\s+предназначен\w*\s+для\s+(?:отдельн\w*\s+)?игрок\w*\b",
+        r"\b(?:матч\w*|игр\w*)\b[^.!?;\n]{0,80}"
+        r"\bне\s+для\s+(?:отдельн\w*\s+)?игрок\w*\b",
+        r"\bне\s+для\s+(?:отдельн\w*\s+)?игрок\w*\b",
         r"\bpartid\w*\b[^.!?;\n]{0,80}"
         r"\bno\s+est[áa]\s+destinad\w*\s+a\s+"
         r"(?:jugador\w*\s+individual\w*|jugador\w*)\b",
         r"\bno\s+est[áa]\s+destinad\w*\s+a\s+"
         r"(?:jugador\w*\s+individual\w*|jugador\w*)\b",
+        r"\b(?:partid\w*|encuentro\w*)\b[^.!?;\n]{0,80}"
+        r"\bno\s+(?:es\s+)?para\s+(?:jugador\w*\s+individual\w*|jugador\w*)\b",
+        r"\bno\s+(?:es\s+)?para\s+(?:jugador\w*\s+individual\w*|jugador\w*)\b",
         r"\bmatch\w*\b[^.!?;\n]{0,80}"
         r"\bn\s+est\s+pas\s+destin\w*\s+(?:aux|a\s+des)\s+joueur\w*\b",
         r"\bn\s+est\s+pas\s+destin\w*\s+(?:aux|a\s+des)\s+joueur\w*\b",
+        r"\b(?:match\w*|rencontre\w*)\b[^.!?;\n]{0,80}"
+        r"\bn\s+est\s+pas\s+pour\s+(?:les?\s+)?joueur\w*\b",
+        r"\bn\s+est\s+pas\s+pour\s+(?:les?\s+)?joueur\w*\b",
     )
     return not any(
         re.search(pattern, normalized) is not None
         for pattern in negated_player_proposition_patterns
     )
+
+
+def _source_open_match_semantics_are_authoritative(body: str) -> bool:
+    """Apply the bounded rejection-only semantic gate to the graph root.
+
+    The classifier remains the primary semantic interpreter. This Application
+    gate only admits a graph whose target-specific root can be independently
+    established as one current positive Open Match; unknown or contradictory
+    source meaning remains unpublished.
+    """
+    return _body_establishes_current_open_match(body)
 
 
 def _validated_open_match_proposal(

@@ -239,97 +239,117 @@ def test_semantically_negated_open_match_has_no_postgres_publication_effect() ->
         }
         return result
 
-    negative_body = (
-        "Football match is not intended for individual players. "
-        "20 August 2026 in whole city. Need one player. "
-        "Contact @s1_negative"
+    semantic_cases = (
+        (
+            "s1_en_isnt_intended",
+            "Football match isn't intended for individual players.",
+            False,
+        ),
+        (
+            "s1_en_teams_only",
+            "Football match is intended for teams only, not individual players.",
+            False,
+        ),
+        (
+            "s1_en_not_for",
+            "Football match is not for individual players.",
+            False,
+        ),
+        ("s1_ru_not_for", "Матч не для отдельных игроков.", False),
+        (
+            "s1_es_not_for",
+            "El partido no es para jugadores individuales.",
+            False,
+        ),
+        (
+            "s1_fr_not_for",
+            "Le match n’est pas pour les joueurs individuels.",
+            False,
+        ),
+        (
+            "s1_en_positive",
+            "Football match for individual players.",
+            True,
+        ),
+        ("s1_ru_positive", "Матч для отдельных игроков.", True),
+        (
+            "s1_es_positive",
+            "El partido es para jugadores individuales.",
+            True,
+        ),
+        (
+            "s1_fr_positive",
+            "Le match est pour les joueurs individuels.",
+            True,
+        ),
+        (
+            "s1_en_contrast_positive",
+            "Football match is not for teams, but for individual players.",
+            True,
+        ),
     )
-    valid_body = (
-        "Football match for individual players. 20 August 2026 in whole city. "
-        "Need one player. Contact @s1_valid"
-    )
-    classifier.return_for(
-        body=negative_body,
-        result=result_for(negative_body, "@s1_negative"),
-    )
-    classifier.return_for(
-        body=valid_body,
-        result=result_for(valid_body, "@s1_valid"),
-    )
+    expected_active_count = 0
+    for case_index, (case_key, opening, expected_active) in enumerate(semantic_cases):
+        contact = f"@{case_key}"
+        body = (
+            f"{opening} 20 August 2026 in whole city. Need one player. "
+            f"Contact {contact}"
+        )
+        classifier.return_for(body=body, result=result_for(body, contact))
+        source_event_id = f"source-event:open-match:{case_key}"
+        from_checkpoint = TelegramChannelCheckpoint(pts=4920 + case_index)
+        to_checkpoint = TelegramChannelCheckpoint(pts=4921 + case_index)
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=1120 + case_index,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=body,
+            event_time=datetime(2026, 8, 18, 9, 6 + case_index, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        revision_id = next(
+            revision.source_message_revision_id
+            for revision in system.source_message_revisions()
+            if revision.source_event_id == source_event_id
+        )
+        attempts = system.classification_attempts()
+        assert attempts[-1].status == "succeeded"
+        assert attempts[-1].disposition == "accepted"
+        assert len(attempts) == case_index + 1
+        assert len(classifier.requests) == case_index + 1
+        if not expected_active:
+            assert system.opportunities() == ()
+            assert system.opportunity_publication_contracts(revision_id) == ()
+            assert not system.redeliver_source_event(source_event_id)
+            system.process_opportunities_until_idle()
+            assert system.classification_attempts() == attempts
+            assert system.opportunities() == ()
+            assert system.opportunity_publication_contracts(revision_id) == ()
+            continue
 
-    negative_source_event_id = "source-event:open-match:s1-negative"
-    telegram_ingestion.add_channel_difference_event(
-        identity=source_identity,
-        from_checkpoint=TelegramChannelCheckpoint(pts=4920),
-        to_checkpoint=TelegramChannelCheckpoint(pts=4921),
-        source_event_id=negative_source_event_id,
-        telegram_message_id=1120,
-        revision=1,
-        kind=SourceEventKind.CREATE,
-        body=negative_body,
-        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
-    )
-    assert system.process_next_channel_telegram_difference(
-        identity=source_identity,
-        registry_generation=1,
-    )
-    system.process_opportunities_until_idle()
-    negative_revision_id = next(
-        revision.source_message_revision_id
-        for revision in system.source_message_revisions()
-        if revision.source_event_id == negative_source_event_id
-    )
-    assert system.classification_attempts()[-1].status == "succeeded"
-    assert system.classification_attempts()[-1].disposition == "accepted"
-    assert system.opportunities() == ()
-    assert system.opportunity_publication_contracts(negative_revision_id) == ()
-    negative_attempts = system.classification_attempts()
-    assert not system.redeliver_source_event(negative_source_event_id)
-    system.process_opportunities_until_idle()
-    assert system.classification_attempts() == negative_attempts
-    assert system.opportunities() == ()
-    assert system.opportunity_publication_contracts(negative_revision_id) == ()
-
-    valid_source_event_id = "source-event:open-match:s1-valid"
-    telegram_ingestion.add_channel_difference_event(
-        identity=source_identity,
-        from_checkpoint=TelegramChannelCheckpoint(pts=4921),
-        to_checkpoint=TelegramChannelCheckpoint(pts=4922),
-        source_event_id=valid_source_event_id,
-        telegram_message_id=1121,
-        revision=1,
-        kind=SourceEventKind.CREATE,
-        body=valid_body,
-        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
-    )
-    assert system.process_next_channel_telegram_difference(
-        identity=source_identity,
-        registry_generation=1,
-    )
-    system.process_opportunities_until_idle()
-    valid_revision_id = next(
-        revision.source_message_revision_id
-        for revision in system.source_message_revisions()
-        if revision.source_event_id == valid_source_event_id
-    )
-    valid_opportunities = system.opportunities()
-    assert len(system.classification_attempts()) == 2, (
-        len(classifier.requests),
-        len(system.source_events()),
-        len(system.source_event_contracts()),
-    )
-    assert len(valid_opportunities) == 1
-    assert valid_opportunities[0].publication_state == "active"
-    valid_publication_contracts = system.opportunity_publication_contracts(
-        valid_revision_id
-    )
-    assert len(valid_publication_contracts) == 1
-    assert not system.redeliver_source_event(valid_source_event_id)
-    system.process_opportunities_until_idle()
-    assert system.opportunities() == valid_opportunities
-    assert system.opportunity_publication_contracts(valid_revision_id) == (
-        valid_publication_contracts
-    )
+        expected_active_count += 1
+        active_opportunities = system.opportunities()
+        assert len(active_opportunities) == expected_active_count
+        assert all(
+            opportunity.publication_state == "active"
+            for opportunity in active_opportunities
+        )
+        publication_contracts = system.opportunity_publication_contracts(revision_id)
+        assert len(publication_contracts) == 1
+        assert not system.redeliver_source_event(source_event_id)
+        system.process_opportunities_until_idle()
+        assert system.opportunities() == active_opportunities
+        assert system.opportunity_publication_contracts(revision_id) == (
+            publication_contracts
+        )
     system.reset()
 
 

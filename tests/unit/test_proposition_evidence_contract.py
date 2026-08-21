@@ -235,6 +235,99 @@ def test_structured_evidence_requires_support_for_every_current_node() -> None:
     )
 
 
+def test_application_requires_support_span_to_match_its_target_node() -> None:
+    body = (
+        "Football match tomorrow at Central Station: one goalkeeper. "
+        "Contact @match_contact; Contact @match_contact"
+    )
+    evidence = {
+        "opportunity": "Football match tomorrow",
+        "event_time": "tomorrow",
+        "location": "at Central Station",
+        "open_places": "one goalkeeper",
+    }
+    routes = [
+        {
+            "kind": "explicit_telegram_username",
+            "value": "@match_contact",
+            "evidence": "Contact @match_contact",
+        }
+    ]
+    valid = _contract(body, evidence=evidence, routes=routes)
+    assert _authoritative(
+        valid,
+        body=body,
+        candidate_key="open-place",
+        evidence=evidence,
+        routes=routes,
+    )
+
+    moved_support = deepcopy(valid)
+    relations = moved_support["relations"]
+    assert isinstance(relations, list)
+    route_support = relations[-1]
+    assert isinstance(route_support, dict)
+    second_start = body.rfind("Contact @match_contact")
+    route_support["span"] = {
+        "start": second_start,
+        "end": second_start + len("Contact @match_contact"),
+        "text": "Contact @match_contact",
+    }
+    assert not _authoritative(
+        moved_support,
+        body=body,
+        candidate_key="open-place",
+        evidence=evidence,
+        routes=routes,
+    )
+
+
+def test_application_binds_optional_and_payment_facts_to_current_typed_nodes() -> None:
+    body = (
+        "Football match tomorrow at Central Station: Need one goalkeeper, 7x7, "
+        "outdoor, participation fee 900 rubles. Contact @match_contact"
+    )
+    evidence = {
+        "opportunity": "Football match tomorrow",
+        "event_time": "tomorrow",
+        "location": "at Central Station",
+        "open_places": "Need one goalkeeper",
+        "team_formats": "7x7",
+        "positions": "Need one goalkeeper",
+        "venue_settings": "outdoor",
+        "payment": "participation fee 900 rubles",
+    }
+    routes = [
+        {
+            "kind": "explicit_telegram_username",
+            "value": "@match_contact",
+            "evidence": "Contact @match_contact",
+        }
+    ]
+    valid = _contract(body, evidence=evidence, routes=routes)
+    assert _authoritative(
+        valid,
+        body=body,
+        candidate_key="open-place",
+        evidence=evidence,
+        routes=routes,
+    )
+
+    withdrawn_payment = deepcopy(valid)
+    facts = withdrawn_payment["facts"]
+    assert isinstance(facts, dict)
+    payment = facts["payment"]
+    assert isinstance(payment, dict)
+    payment["currentness"] = "withdrawn"
+    assert not _authoritative(
+        withdrawn_payment,
+        body=body,
+        candidate_key="open-place",
+        evidence=evidence,
+        routes=routes,
+    )
+
+
 def test_application_rejects_negative_stale_or_competing_propositions() -> None:
     body = (
         "Football match tomorrow at Central Station: one goalkeeper. "
@@ -397,4 +490,196 @@ def test_application_rejects_negated_player_participation_in_all_locales() -> No
             candidate_key="open-place",
             evidence=evidence,
             routes=routes,
+        )
+
+
+def test_application_rejects_equivalent_negated_player_meanings_in_all_locales() -> (
+    None
+):
+    cases = (
+        (
+            "Football match isn't intended for individual players. "
+            "20 August 2026 at Central Station. Need one player. "
+            "Contact @match_contact",
+            "Football match isn't intended for individual players",
+            "20 August 2026",
+            "at Central Station",
+            "Need one player",
+            "Contact @match_contact",
+            False,
+        ),
+        (
+            "Football match is intended for teams only, not individual players. "
+            "20 August 2026 at Central Station. Need one player. "
+            "Contact @match_contact",
+            "Football match is intended for teams only, not individual players",
+            "20 August 2026",
+            "at Central Station",
+            "Need one player",
+            "Contact @match_contact",
+            False,
+        ),
+        (
+            "Football match is not for individual players. "
+            "20 August 2026 at Central Station. Need one player. "
+            "Contact @match_contact",
+            "Football match is not for individual players",
+            "20 August 2026",
+            "at Central Station",
+            "Need one player",
+            "Contact @match_contact",
+            False,
+        ),
+        (
+            "Матч не для отдельных игроков. 20 августа 2026 у Центральной. "
+            "Нужен один игрок. Контакт @match_contact",
+            "Матч не для отдельных игроков",
+            "20 августа 2026",
+            "у Центральной",
+            "Нужен один игрок",
+            "Контакт @match_contact",
+            False,
+        ),
+        (
+            "El partido no es para jugadores individuales. "
+            "20 agosto 2026 en Estación Central. Necesitamos un jugador. "
+            "Contacto @match_contact",
+            "El partido no es para jugadores individuales",
+            "20 agosto 2026",
+            "en Estación Central",
+            "Necesitamos un jugador",
+            "Contacto @match_contact",
+            False,
+        ),
+        (
+            "Le match n’est pas pour les joueurs individuels. "
+            "20 août 2026 à la Gare Centrale. Besoin d’un joueur. "
+            "Contact @match_contact",
+            "Le match n’est pas pour les joueurs individuels",
+            "20 août 2026",
+            "à la Gare Centrale",
+            "Besoin d’un joueur",
+            "Contact @match_contact",
+            False,
+        ),
+        (
+            "Football match is intended for individual players. "
+            "20 August 2026 at Central Station. Need one player. "
+            "Contact @match_contact",
+            "Football match is intended for individual players",
+            "20 August 2026",
+            "at Central Station",
+            "Need one player",
+            "Contact @match_contact",
+            True,
+        ),
+        (
+            "Матч для отдельных игроков. 20 августа 2026 у Центральной. "
+            "Нужен один игрок. Контакт @match_contact",
+            "Матч для отдельных игроков",
+            "20 августа 2026",
+            "у Центральной",
+            "Нужен один игрок",
+            "Контакт @match_contact",
+            True,
+        ),
+        (
+            "El partido es para jugadores individuales. "
+            "20 agosto 2026 en Estación Central. Necesitamos un jugador. "
+            "Contacto @match_contact",
+            "El partido es para jugadores individuales",
+            "20 agosto 2026",
+            "en Estación Central",
+            "Necesitamos un jugador",
+            "Contacto @match_contact",
+            True,
+        ),
+        (
+            "Le match est pour les joueurs individuels. "
+            "20 août 2026 à la Gare Centrale. Besoin d’un joueur. "
+            "Contact @match_contact",
+            "Le match est pour les joueurs individuels",
+            "20 août 2026",
+            "à la Gare Centrale",
+            "Besoin d’un joueur",
+            "Contact @match_contact",
+            True,
+        ),
+        (
+            "Football match is not for teams, but for individual players. "
+            "20 August 2026 at Central Station. Need one player. "
+            "Contact @match_contact",
+            "Football match is not for teams, but for individual players",
+            "20 August 2026",
+            "at Central Station",
+            "Need one player",
+            "Contact @match_contact",
+            True,
+        ),
+        (
+            "Матч не для команд, а для отдельных игроков. "
+            "20 августа 2026 у Центральной. Нужен один игрок. "
+            "Контакт @match_contact",
+            "Матч не для команд, а для отдельных игроков",
+            "20 августа 2026",
+            "у Центральной",
+            "Нужен один игрок",
+            "Контакт @match_contact",
+            True,
+        ),
+        (
+            "El partido no es para equipos, sino para jugadores individuales. "
+            "20 agosto 2026 en Estación Central. Necesitamos un jugador. "
+            "Contacto @match_contact",
+            "El partido no es para equipos, sino para jugadores individuales",
+            "20 agosto 2026",
+            "en Estación Central",
+            "Necesitamos un jugador",
+            "Contacto @match_contact",
+            True,
+        ),
+        (
+            "Le match n’est pas pour les équipes, mais pour les joueurs individuels. "
+            "20 août 2026 à la Gare Centrale. Besoin d’un joueur. "
+            "Contact @match_contact",
+            "Le match n’est pas pour les équipes, mais pour les joueurs individuels",
+            "20 août 2026",
+            "à la Gare Centrale",
+            "Besoin d’un joueur",
+            "Contact @match_contact",
+            True,
+        ),
+    )
+    for (
+        body,
+        opportunity,
+        event_time,
+        location,
+        open_places,
+        route_evidence,
+        expected,
+    ) in cases:
+        evidence = {
+            "opportunity": opportunity,
+            "event_time": event_time,
+            "location": location,
+            "open_places": open_places,
+        }
+        routes = [
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@match_contact",
+                "evidence": route_evidence,
+            }
+        ]
+        contract = _contract(body, evidence=evidence, routes=routes)
+        assert (
+            _authoritative(
+                contract,
+                body=body,
+                candidate_key="open-place",
+                evidence=evidence,
+                routes=routes,
+            )
+            is expected
         )
