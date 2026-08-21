@@ -22,6 +22,7 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
+from modules.ports import ClassifierAdapterResult
 from modules.testkit import (
     AcceptanceSpine,
     ControlledLocationResolverAdapter,
@@ -547,6 +548,130 @@ def test_account_and_channel_differences_advance_independently() -> None:
     system.reset()
 
 
+def test_reregistered_generation_has_distinct_classification_identity_and_replay() -> (
+    None
+):
+    telethon = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 45, tzinfo=UTC))
+    administrator_id = 46_201
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_620_200,
+    )
+    first_address = "@synthetic_generation_collision"
+    second_address = "https://t.me/+synthetic-generation-collision"
+    telethon.allow_public_username(
+        address=first_address,
+        identity=identity,
+        transport_boundary="channel-pts:8200",
+    )
+    telethon.allow_private_invite(
+        address=second_address,
+        identity=identity,
+        transport_boundary="channel-pts:9200",
+    )
+    for body in ("Generation one body.", "Generation two body."):
+        classifier.return_for(
+            body=body,
+            result=ClassifierAdapterResult(
+                output={
+                    "schema_version": "source-message-classification-v1",
+                    "disposition": "irrelevant",
+                    "candidates": [],
+                },
+                effective_model="gpt-5.6-sol",
+                effective_reasoning_effort="high",
+                codex_version="controlled-offline",
+                adapter_kind="controlled_recording",
+                adapter_version="classifier-recording-v1",
+                duration_ms=1,
+                input_tokens=3,
+                output_tokens=2,
+            ),
+        )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 9, 45, tzinfo=UTC),
+        administrator_id=administrator_id,
+        address=first_address,
+        update_suffix="classification-generation-one",
+    )
+    first_event_id = "source-event:classification-generation:one"
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=8200),
+        to_checkpoint=TelegramChannelCheckpoint(pts=8201),
+        source_event_id=first_event_id,
+        telegram_message_id=909,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Generation one body.",
+        event_time=datetime(2026, 9, 12, 9, 46, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 10, 12, 9, 45, tzinfo=UTC),
+        administrator_id=administrator_id,
+        address=second_address,
+        update_suffix="classification-generation-two",
+        already_in_source_chats=True,
+    )
+    second_event_id = "source-event:classification-generation:two"
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=8200),
+        to_checkpoint=TelegramChannelCheckpoint(pts=8201),
+        source_event_id=second_event_id,
+        telegram_message_id=909,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Generation two body.",
+        event_time=datetime(2026, 10, 12, 9, 46, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=2,
+    )
+    system.process_opportunities_until_idle()
+
+    expected_revision_ids = {
+        "source-chat:channel:4620200:generation:1:message:909:revision:1",
+        "source-chat:channel:4620200:generation:2:message:909:revision:1",
+    }
+    assert {
+        revision.source_message_revision_id
+        for revision in system.source_message_revisions()
+    } == expected_revision_ids
+    assert {
+        attempt.source_message_revision_id
+        for attempt in system.classification_attempts()
+    } == expected_revision_ids
+    assert not system.redeliver_source_event(first_event_id)
+    assert not system.redeliver_source_event(second_event_id)
+    system.process_opportunities_until_idle()
+    assert len(system.classification_attempts()) == 2
+    system.reset()
+
+
 def test_cross_route_replay_is_idempotent_and_divergence_fails_closed() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     event_time = datetime(2026, 9, 12, 9, 46, tzinfo=UTC)
@@ -715,7 +840,7 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
     ) == TelegramChannelCheckpoint(pts=4701)
     assert system.source_messages() == (
         SourceMessage(
-            source_message_id="source-chat:channel:4700100:message:101",
+            source_message_id="source-chat:channel:4700100:generation:1:message:101",
             source_chat_identity=identity,
             registry_generation=1,
             telegram_message_id=101,
@@ -920,7 +1045,7 @@ def test_irrelevant_event_is_recorded_without_content_pre_screening() -> None:
     assert system.source_events() == (
         SourceEventRecord(
             source_event_id="source-event:irrelevant:1",
-            source_message_id="source-chat:channel:4700200:message:202",
+            source_message_id="source-chat:channel:4700200:generation:1:message:202",
             source_chat_identity=identity,
             registry_generation=1,
             telegram_message_id=202,
@@ -1006,7 +1131,7 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
 
     assert system.source_messages() == (
         SourceMessage(
-            source_message_id="source-chat:channel:4700300:message:303",
+            source_message_id="source-chat:channel:4700300:generation:1:message:303",
             source_chat_identity=identity,
             registry_generation=1,
             telegram_message_id=303,
@@ -1189,7 +1314,7 @@ def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> N
 
     assert system.source_messages() == (
         SourceMessage(
-            source_message_id="source-chat:channel:4700400:message:404",
+            source_message_id="source-chat:channel:4700400:generation:1:message:404",
             source_chat_identity=identity,
             registry_generation=1,
             telegram_message_id=404,
@@ -1276,9 +1401,9 @@ def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> 
     assert system.source_message_revisions() == (
         SourceMessageRevision(
             source_message_revision_id=(
-                "source-chat:channel:4700500:message:505:revision:1"
+                "source-chat:channel:4700500:generation:1:message:505:revision:1"
             ),
-            source_message_id="source-chat:channel:4700500:message:505",
+            source_message_id="source-chat:channel:4700500:generation:1:message:505",
             source_event_id="source-event:duplicate:1",
             revision=1,
             event_kind=SourceEventKind.CREATE,
@@ -1421,7 +1546,9 @@ def test_application_restart_and_outbox_replay_preserve_one_message_effect() -> 
     assert len(system.source_messages()) == 1
     assert len(system.source_message_revisions()) == 1
     contract = system.source_event_contracts()[0]
-    assert contract.subject_id == "source-chat:channel:4700700:message:707"
+    assert contract.subject_id == (
+        "source-chat:channel:4700700:generation:1:message:707"
+    )
     assert contract.subject_revision == 1
     assert contract.idempotency_key == "source-event-recorded:source-event:restart:1"
     assert contract.causation_id == contract.message_id
@@ -1556,20 +1683,20 @@ def test_unsupported_source_event_version_stays_recoverable_and_alerts() -> None
     )
     future = system.replace_source_event_contract_version(
         "source-event:future-version:1",
-        version=4,
+        version=5,
     )
 
     assert system.process_next_source_event()
 
     assert system.source_messages() == ()
     assert system.source_message_revisions() == ()
-    assert future.contract_version == 4
+    assert future.contract_version == 5
     assert system.source_event_contracts()[0].json_payload() == future.json_payload()
     alert = system.operator_alert(future.message_id)
     assert alert.producer is RuntimeRole.INGESTION
     assert alert.consumer is RuntimeRole.APPLICATION
     assert alert.contract_name is ContractName.SOURCE_EVENT_RECORDED
-    assert alert.contract_version == 4
+    assert alert.contract_version == 5
     assert alert.failure_code is FailureCode.UNSUPPORTED_CONTRACT_VERSION
     system.reset()
 

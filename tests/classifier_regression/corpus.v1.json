@@ -1,0 +1,244 @@
+{
+  "corpus_version": "open-match-classifier-regression-v1",
+  "redacted": true,
+  "cases": [
+    {
+      "case_id": "accepted-explicit-open-place",
+      "source": "25 сентября 2026 в 20:00 игра 7x7 у метро Спортивная. Нужно одно место, защитник, средний уровень, на улице, искусственный газон, взнос 700 рублей. Пишите @sample_contact",
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "Нужно одно место",
+            "event_time": "25 сентября 2026 в 20:00",
+            "location": "у метро Спортивная",
+            "open_places": "одно место",
+            "team_formats": "7x7",
+            "positions": "защитник",
+            "playing_levels": "средний уровень",
+            "venue_settings": "на улице",
+            "playing_surfaces": "искусственный газон",
+            "payment": "700 рублей"
+          },
+          "location": {
+            "mention": "у метро Спортивная",
+            "place_id": "station:redacted:sportivnaya",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-09-25",
+            "end_local_date": "2026-09-25",
+            "exact_local_time": "20:00",
+            "iana_timezone": "Etc/UTC"
+          },
+          "open_places": 1,
+          "team_formats": ["7x7"],
+          "positions": ["defender"],
+          "playing_levels": ["average"],
+          "venue_settings": ["outdoor"],
+          "playing_surfaces": ["artificial_turf"],
+          "payment": "paid",
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    },
+    {
+      "case_id": "irrelevant-score-only",
+      "source": "Матч завершился со счетом 2:1.",
+      "expected": {
+        "disposition": "irrelevant",
+        "candidate_count": 0
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "irrelevant",
+        "candidates": []
+      }
+    },
+    {
+      "case_id": "accepted-relative-weekday",
+      "source": "В субботу в 19:00 на [ЛОКАЦИИ] нужен один защитник. Пишите @sample_contact",
+      "source_event_time": "2026-08-14T20:30:00+00:00",
+      "source_chat_timezone": "Europe/Moscow",
+      "validate_relative_event_time": true,
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "relative-weekday-open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "нужен один защитник",
+            "event_time": "В субботу в 19:00",
+            "location": "на [ЛОКАЦИИ]",
+            "open_places": "один защитник",
+            "positions": "защитник"
+          },
+          "location": {
+            "mention": "на [ЛОКАЦИИ]",
+            "place_id": "station:redacted:relative",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-08-15",
+            "end_local_date": "2026-08-15",
+            "exact_local_time": "19:00",
+            "iana_timezone": "Europe/Moscow"
+          },
+          "open_places": 1,
+          "positions": ["defender"],
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    },
+    {
+      "case_id": "excluded-explicit-children-only",
+      "source": "Завтра детская игра, есть одно место. Пишите @sample_contact",
+      "expected": {
+        "disposition": "irrelevant",
+        "candidate_count": 0
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "irrelevant",
+        "candidates": []
+      }
+    },
+    {
+      "case_id": "unresolved-no-event-time",
+      "source": "Когда-нибудь соберемся поиграть, детали позже.",
+      "expected": {
+        "disposition": "unresolved",
+        "candidate_count": 0
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "unresolved",
+        "candidates": []
+      }
+    },
+    {
+      "case_id": "accepted-spanish-daytime",
+      "source": "Partido 20 agosto 2026 de día en [LUGAR], necesitamos un defensa. Tarifa 20 EUR. Escribe a @sample_contact",
+      "validate_event_time": true,
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "spanish-daytime-open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "necesitamos un defensa",
+            "event_time": "20 agosto 2026 de día",
+            "location": "en [LUGAR]",
+            "open_places": "un defensa",
+            "positions": "defensa",
+            "payment": "20 EUR"
+          },
+          "location": {
+            "mention": "en [LUGAR]",
+            "place_id": "station:redacted:spanish-daytime",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-08-20",
+            "end_local_date": "2026-08-20",
+            "day_part": "daytime",
+            "iana_timezone": "Europe/Madrid"
+          },
+          "open_places": 1,
+          "positions": ["defender"],
+          "payment": "paid",
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    },
+    {
+      "case_id": "accepted-spanish-evening",
+      "source": "Partido 20 agosto 2026 por la tarde en [LUGAR], necesitamos un defensa. Tarifa 30 CHF. Escribe a @sample_contact",
+      "validate_event_time": true,
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "open_match",
+        "open_places": 1,
+        "positions": ["defender"]
+      },
+      "recorded_output": {
+        "schema_version": "source-message-classification-v1",
+        "disposition": "accepted",
+        "candidates": [{
+          "candidate_key": "spanish-evening-open-place",
+          "opportunity_type": "open_match",
+          "evidence": {
+            "opportunity": "necesitamos un defensa",
+            "event_time": "20 agosto 2026 por la tarde",
+            "location": "en [LUGAR]",
+            "open_places": "un defensa",
+            "positions": "defensa",
+            "payment": "30 CHF"
+          },
+          "location": {
+            "mention": "en [LUGAR]",
+            "place_id": "station:redacted:spanish-evening",
+            "country_id": "country:redacted",
+            "city_id": "city:redacted"
+          },
+          "event_time": {
+            "start_local_date": "2026-08-20",
+            "end_local_date": "2026-08-20",
+            "day_part": "evening",
+            "iana_timezone": "Europe/Madrid"
+          },
+          "open_places": 1,
+          "positions": ["defender"],
+          "payment": "paid",
+          "response_routes": [{
+            "kind": "explicit_telegram_username",
+            "value": "@sample_contact",
+            "evidence": "@sample_contact"
+          }]
+        }]
+      }
+    }
+  ]
+}

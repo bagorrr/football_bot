@@ -6,10 +6,17 @@ import json
 import os
 from dataclasses import replace
 from datetime import UTC, datetime
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
-from modules.contracts import ContractName, FailureCode, JsonValue, RuntimeRole
+from modules.contracts import (
+    SUPPORTED_CONTRACTS,
+    ContractName,
+    FailureCode,
+    JsonValue,
+    RuntimeRole,
+)
 from modules.testkit import (
     AcceptanceSnapshot,
     AcceptanceSpine,
@@ -135,7 +142,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
 
     snapshot = spine.run(
         "unregistered-future-contract",
-        source_contract_version=4,
+        source_contract_version=5,
         source_payload=future_payload,
     )
 
@@ -147,7 +154,7 @@ def test_unregistered_future_version_is_retained_rejected_and_alerted(
             producer=RuntimeRole.INGESTION,
             consumer=RuntimeRole.APPLICATION,
             contract_name=ContractName.SOURCE_EVENT_RECORDED,
-            contract_version=4,
+            contract_version=5,
             failure_code=FailureCode.UNSUPPORTED_CONTRACT_VERSION,
         ),
     )
@@ -179,9 +186,19 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
             "timezone_data_version": "compatibility-tzdb",
         },
     }
+    compatibility_run_search_id = uuid5(
+        NAMESPACE_URL,
+        "football-bot:run-search:501:compatibility-search-update",
+    )
+    compatibility_completed_search_id = (
+        f"completed-search:{compatibility_run_search_id}"
+    )
+    compatibility_completion_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{compatibility_completed_search_id}:SearchCompleted",
+    )
     zero_result_payload: dict[str, JsonValue] = {
-        "probe_id": "compatibility-SearchCompleted",
-        "completed_search_id": "compatibility-SearchCompleted",
+        "completed_search_id": compatibility_completed_search_id,
         "search_update_id": "compatibility-search-update",
         "telegram_user_id": 501,
         "result_count": 0,
@@ -200,13 +217,30 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
             get_completed_search_payload,
         ),
     ):
-        spine.record_search_event(
-            probe_id=f"compatibility-{contract_name.value}",
-            contract_name=contract_name,
-            contract_version=contract_version,
-            telegram_user_id=501,
-            payload=payload,
-        )
+        if contract_name is ContractName.SEARCH_COMPLETED:
+            spine.record_search_event(
+                probe_id=f"compatibility-{contract_name.value}",
+                contract_name=contract_name,
+                contract_version=contract_version,
+                telegram_user_id=501,
+                payload=payload,
+                message_id=compatibility_completion_id,
+                subject_id=compatibility_completed_search_id,
+                subject_revision=1,
+                idempotency_key=(
+                    f"search-completed:{compatibility_completed_search_id}"
+                ),
+                causation_id=compatibility_run_search_id,
+                correlation_id=compatibility_run_search_id,
+            )
+        else:
+            spine.record_search_event(
+                probe_id=f"compatibility-{contract_name.value}",
+                contract_name=contract_name,
+                contract_version=contract_version,
+                telegram_user_id=501,
+                payload=payload,
+            )
     expected_pairs = (
         (
             ContractName.SOURCE_EVENT_RECORDED,
@@ -270,7 +304,7 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
             RuntimeRole.BOT_ASSISTANT,
             "compatibility-SearchCompleted",
             2,
-            "compatibility-SearchCompleted",
+            compatibility_completed_search_id,
         ),
         (
             ContractName.SEARCH_FAILED,
@@ -299,9 +333,14 @@ def test_every_supported_pair_has_adapter_neutral_versioned_metadata(
         contract_version,
         subject_id,
     ) in expected_pairs:
-        envelope = spine.recoverable_contract(
-            probe_id,
-            contract_name=contract_name,
+        envelope = (
+            spine.recoverable_contract_message(compatibility_completion_id)
+            if contract_name is ContractName.SEARCH_COMPLETED
+            and probe_id == "compatibility-SearchCompleted"
+            else spine.recoverable_contract(
+                probe_id,
+                contract_name=contract_name,
+            )
         )
         assert envelope.contract_version == contract_version
         assert envelope.producer is producer
@@ -448,7 +487,7 @@ def test_search_completed_schema_and_subject_mismatches_fail_closed(
         contract_version=contract_version,
         telegram_user_id=501,
         include_telegram_user_id=False,
-        payload=payload,
+        payload={"probe_id": probe_id, **payload},
     )
 
     assert spine.process_next_search_handoff(RuntimeRole.BOT_ASSISTANT) is True
@@ -490,6 +529,273 @@ def test_database_rejects_cross_owner_write_and_records_body_free_alert(
         failure_code=FailureCode.OWNER_WRITE_DENIED,
     )
     assert spine.observe("foreign-owner-state").owner_state_roles == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("contract_name", "consumer", "payload"),
+    (
+        (
+            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+            RuntimeRole.CLASSIFICATION,
+            {"source_message_revision_id": "malformed:revision:1"},
+        ),
+        (
+            ContractName.CLASSIFICATION_PROPOSAL,
+            RuntimeRole.APPLICATION,
+            {"proposal_id": "proposal:malformed:revision:1"},
+        ),
+        (
+            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+            RuntimeRole.RECOMMENDATION,
+            {"opportunity_id": "opportunity:malformed"},
+        ),
+    ),
+)
+def test_new_v2_contracts_durably_reject_malformed_replay_without_effect(
+    spine: AcceptanceSpine,
+    contract_name: ContractName,
+    consumer: RuntimeRole,
+    payload: dict[str, JsonValue],
+) -> None:
+    probe_id = f"malformed-{contract_name.value}"
+    spine.record_search_event(
+        probe_id=probe_id,
+        contract_name=contract_name,
+        contract_version=2,
+        telegram_user_id=501,
+        include_telegram_user_id=False,
+        payload={"probe_id": probe_id, **payload},
+    )
+
+    assert spine.process_next_contract_handoff(consumer)
+    assert not spine.process_next_contract_handoff(consumer)
+
+    snapshot = spine.observe(probe_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert snapshot.outbox_records == 1
+    assert snapshot.operator_alerts == (
+        OperatorAlert(
+            producer=next(
+                definition.producer
+                for definition in SUPPORTED_CONTRACTS
+                if definition.name is contract_name and definition.version == 2
+            ),
+            consumer=consumer,
+            contract_name=contract_name,
+            contract_version=2,
+            failure_code=FailureCode.INVALID_CONTRACT,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("contract_name", "consumer", "mismatch"),
+    tuple(
+        (contract_name, consumer, mismatch)
+        for contract_name, consumer in (
+            (ContractName.RUN_SEARCH, RuntimeRole.RECOMMENDATION),
+            (ContractName.SEARCH_COMPLETED, RuntimeRole.BOT_ASSISTANT),
+        )
+        for mismatch in (
+            "extra_private_fact",
+            "nested_required_date_private_fact",
+            "zero_telegram_user_id",
+            "negative_telegram_user_id",
+            "message_id",
+            "subject_id",
+            "subject_revision",
+            "idempotency_key",
+            "causation_id",
+            "correlation_id",
+        )
+        if mismatch != "nested_required_date_private_fact"
+        or contract_name is ContractName.RUN_SEARCH
+    ),
+)
+def test_v2_search_contracts_fail_closed_on_schema_and_lineage_mismatch(
+    spine: AcceptanceSpine,
+    telegram_delivery: ControlledTelegramDeliveryAdapter,
+    contract_name: ContractName,
+    consumer: RuntimeRole,
+    mismatch: str,
+) -> None:
+    telegram_user_id = 501
+    search_update_id = f"lineage:{contract_name.value}:{mismatch}"
+    run_search_message_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:run-search:{telegram_user_id}:{search_update_id}",
+    )
+    completed_search_id = f"completed-search:{run_search_message_id}"
+    if contract_name is ContractName.RUN_SEARCH:
+        producer = RuntimeRole.BOT_ASSISTANT
+        message_id = run_search_message_id
+        subject_id = f"bot-user:{telegram_user_id}"
+        subject_revision = 7
+        idempotency_key = f"run-search:{telegram_user_id}:{search_update_id}"
+        causation_id = run_search_message_id
+        correlation_id = run_search_message_id
+        payload: dict[str, JsonValue] = {
+            "search_update_id": search_update_id,
+            "telegram_user_id": telegram_user_id,
+            "discovery_draft_revision": subject_revision,
+            "display_locale": "en",
+            "user_intent": "game_search",
+            "country_id": "country:ru",
+            "city_id": "city:ru:moscow",
+            "sub_city_area_ids": [],
+            "sub_city_area_geographic_types": [],
+            "sub_city_area_verified_parent_ids": [],
+            "whole_city": True,
+            "required_date": {
+                "start_local_date": "2026-08-10",
+                "end_local_date": "2026-08-10",
+                "iana_timezone": "Europe/Moscow",
+                "timezone_data_version": "controlled-tzdb-v1",
+            },
+        }
+    else:
+        producer = RuntimeRole.RECOMMENDATION
+        message_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{completed_search_id}:SearchCompleted",
+        )
+        subject_id = completed_search_id
+        subject_revision = 1
+        idempotency_key = f"search-completed:{completed_search_id}"
+        causation_id = run_search_message_id
+        correlation_id = run_search_message_id
+        payload = {
+            "completed_search_id": completed_search_id,
+            "telegram_user_id": telegram_user_id,
+            "search_update_id": search_update_id,
+            "result_count": 0,
+        }
+
+    if mismatch == "extra_private_fact":
+        payload["private_contact"] = "must-not-cross-runtime-boundary"
+    elif mismatch == "nested_required_date_private_fact":
+        assert contract_name is ContractName.RUN_SEARCH
+        required_date = payload["required_date"]
+        assert isinstance(required_date, dict)
+        required_date["private_fact"] = "must-not-cross-runtime-boundary"
+    elif mismatch in {"zero_telegram_user_id", "negative_telegram_user_id"}:
+        telegram_user_id = 0 if mismatch == "zero_telegram_user_id" else -1
+        payload["telegram_user_id"] = telegram_user_id
+        run_search_message_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:run-search:{telegram_user_id}:{search_update_id}",
+        )
+        if contract_name is ContractName.RUN_SEARCH:
+            message_id = run_search_message_id
+            subject_id = f"bot-user:{telegram_user_id}"
+            idempotency_key = f"run-search:{telegram_user_id}:{search_update_id}"
+        else:
+            completed_search_id = f"completed-search:{run_search_message_id}"
+            payload["completed_search_id"] = completed_search_id
+            message_id = uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{completed_search_id}:SearchCompleted",
+            )
+            subject_id = completed_search_id
+            idempotency_key = f"search-completed:{completed_search_id}"
+        causation_id = run_search_message_id
+        correlation_id = run_search_message_id
+    elif mismatch == "message_id":
+        message_id = UUID(int=81)
+    elif mismatch == "subject_id":
+        subject_id = "unrelated-subject"
+    elif mismatch == "subject_revision":
+        subject_revision += 98
+    elif mismatch == "idempotency_key":
+        idempotency_key = "arbitrary-idempotency"
+    elif mismatch == "causation_id":
+        causation_id = UUID(int=82)
+    elif mismatch == "correlation_id":
+        correlation_id = UUID(int=83)
+
+    probe_id = f"invalid-v2:{contract_name.value}:{mismatch}"
+    spine.record_search_event(
+        probe_id=probe_id,
+        contract_name=contract_name,
+        contract_version=2,
+        telegram_user_id=telegram_user_id,
+        producer=producer,
+        include_telegram_user_id=False,
+        payload=payload,
+        message_id=message_id,
+        subject_id=subject_id,
+        subject_revision=subject_revision,
+        idempotency_key=idempotency_key,
+        causation_id=causation_id,
+        correlation_id=correlation_id,
+    )
+
+    assert spine.process_next_contract_handoff(consumer)
+    assert not spine.process_next_contract_handoff(consumer)
+
+    snapshot = spine.observe(probe_id, message_id=message_id)
+    assert snapshot.owner_state_roles == frozenset({producer})
+    assert snapshot.owner_state_records == 1
+    assert snapshot.outbox_records == 1
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert not spine.contract_is_accepted(message_id)
+    assert spine.completed_searches(telegram_user_id) == ()
+    assert telegram_delivery.messages == []
+    assert spine.operator_alert(message_id) == (
+        OperatorAlert(
+            producer=producer,
+            consumer=consumer,
+            contract_name=contract_name,
+            contract_version=2,
+            failure_code=FailureCode.INVALID_CONTRACT,
+        )
+    )
+
+
+def test_v2_classifier_command_rejects_mismatched_envelope_identity(
+    spine: AcceptanceSpine,
+) -> None:
+    probe_id = "identity-mismatched-classifier-command"
+    spine.record_search_event(
+        probe_id=probe_id,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        telegram_user_id=501,
+        include_telegram_user_id=False,
+        payload={
+            "source_message_revision_id": f"{probe_id}:revision:1",
+            "body": "Tomorrow one place is open",
+            "source_event_time": "2026-08-14T12:00:00+00:00",
+            "source_recorded_at": "2026-08-14T12:00:01+00:00",
+            "context_bundle_version": "primary-classifier-context-v1",
+            "source_chat_reference": "source-chat:channel:501",
+            "source_chat_registry_generation": 1,
+            "source_chat_timezone": "Europe/Moscow",
+            "source_chat_geography": {"country_id": None, "city_id": None},
+            "bounded_metadata": {
+                "message_language": None,
+                "attachment_types": [],
+            },
+            "eligible_reply_context": None,
+            "direct_reply_to_telegram_message_id": None,
+        },
+    )
+
+    assert spine.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert not spine.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    envelope = spine.recoverable_contract(
+        probe_id,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+    )
+    assert spine.operator_alert(envelope.message_id) == OperatorAlert(
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.CLASSIFICATION,
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        failure_code=FailureCode.INVALID_CONTRACT,
+    )
 
 
 def test_all_roles_resume_safely_after_restart(spine: AcceptanceSpine) -> None:

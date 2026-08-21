@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import StrEnum
-from typing import TypeAlias
+from typing import TypeAlias, cast
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from modules.classifier_contract import (
+    classifier_output_is_schema_valid,
+    semantic_proof_is_schema_valid,
+)
 from modules.domain import SourceChatAddressKind, is_valid_source_chat_address
 
 JsonValue: TypeAlias = (
@@ -69,6 +75,34 @@ def derive_source_event_message_id(source_event_id: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:source-event:{source_event_id}")
 
 
+def canonical_source_message_id(
+    source_chat_reference: str,
+    registry_generation: int,
+    telegram_message_id: int,
+) -> str:
+    """Return the generation-bound identity of one Telegram Source Message."""
+    return (
+        f"{source_chat_reference}:generation:{registry_generation}:"
+        f"message:{telegram_message_id}"
+    )
+
+
+def derive_run_search_message_id(telegram_user_id: int, search_update_id: str) -> UUID:
+    """Return the canonical identity for one submitted Search command."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:run-search:{telegram_user_id}:{search_update_id}",
+    )
+
+
+def derive_search_completed_message_id(completed_search_id: str) -> UUID:
+    """Return the canonical identity for one Search completion event."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{completed_search_id}:{ContractName.SEARCH_COMPLETED.value}",
+    )
+
+
 class FailureCode(StrEnum):
     """Low-cardinality contract-spine failures."""
 
@@ -125,8 +159,23 @@ SUPPORTED_CONTRACTS = (
         ("telegram_chat_id", "registry_generation", "telegram_message_id"),
     ),
     ContractDefinition(
+        ContractName.SOURCE_EVENT_RECORDED,
+        4,
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        "source_event_id",
+        ("telegram_chat_id", "registry_generation", "telegram_message_id"),
+    ),
+    ContractDefinition(
         ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
         1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.CLASSIFICATION,
+        "source_message_revision_id",
+    ),
+    ContractDefinition(
+        ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        2,
         RuntimeRole.APPLICATION,
         RuntimeRole.CLASSIFICATION,
         "source_message_revision_id",
@@ -139,6 +188,20 @@ SUPPORTED_CONTRACTS = (
         "proposal_id",
     ),
     ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        2,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        3,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
         1,
         RuntimeRole.APPLICATION,
@@ -146,8 +209,23 @@ SUPPORTED_CONTRACTS = (
         "opportunity_revision_id",
     ),
     ContractDefinition(
+        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        2,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.RECOMMENDATION,
+        "opportunity_id",
+    ),
+    ContractDefinition(
         ContractName.RUN_SEARCH,
         1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.RECOMMENDATION,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
+        ContractName.RUN_SEARCH,
+        2,
         RuntimeRole.BOT_ASSISTANT,
         RuntimeRole.RECOMMENDATION,
         "search_update_id",
@@ -340,18 +418,29 @@ class ContractEnvelope(RawContractEnvelope):
                 msg = f"supported contract requires integer {field_name}"
                 raise ValueError(msg)
         if self.contract_name is ContractName.RUN_SEARCH:
-            _validate_run_search(self.payload)
+            _validate_run_search(self, self.payload)
         elif (
             self.contract_name is ContractName.SOURCE_EVENT_RECORDED
-            and self.contract_version == 3
+            and self.contract_version in {3, 4}
         ):
             _validate_source_event_recorded(self, self.payload)
+        elif (
+            self.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and self.contract_version == 2
+        ):
+            _validate_classify_source_message_revision(self, self.payload)
+        elif (
+            self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
+            and self.contract_version in {2, 3}
+        ):
+            _validate_classification_proposal(self, self.payload)
+        elif (
+            self.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            and self.contract_version == 2
+        ):
+            _validate_opportunity_publication_changed(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
-            _validate_search_completed(
-                self.payload,
-                contract_version=self.contract_version,
-                subject_id=self.subject_id,
-            )
+            _validate_search_completed(self, self.payload)
         elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
             completed_search_id = _required_text(
                 self.payload,
@@ -484,21 +573,142 @@ _DATE_REQUIRED_USER_INTENTS = frozenset(
         "refereeing_service_offer",
     }
 )
+_GAME_SEARCH_DETAIL_VALUES = {
+    "team_formats": frozenset({"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"}),
+    "positions": frozenset({"goalkeeper", "defender", "midfielder", "forward"}),
+    "playing_levels": frozenset(
+        {
+            "novice",
+            "below_average",
+            "average",
+            "above_average",
+            "high",
+            "very_high",
+            "master",
+            "professional",
+        }
+    ),
+    "venue_settings": frozenset({"indoor", "outdoor", "covered_outdoor"}),
+    "playing_surfaces": frozenset(
+        {"natural_grass", "artificial_turf", "hard_surface", "wood_parquet"}
+    ),
+    "payment": frozenset({"free", "paid"}),
+}
+
+SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
+    {
+        "administrative_district",
+        "neighborhood",
+        "locality",
+        "station",
+        "transport_hub",
+        "landmark",
+        "address",
+    }
+)
 
 
-def _validate_run_search(payload: dict[str, JsonValue]) -> None:
+def _validate_run_search(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
     """Validate the complete confirmed discovery snapshot on the wire."""
+    contract_version = envelope.contract_version
+    if contract_version == 2:
+        required_fields = {
+            "search_update_id",
+            "telegram_user_id",
+            "discovery_draft_revision",
+            "display_locale",
+            "user_intent",
+            "country_id",
+            "city_id",
+            "sub_city_area_ids",
+            "sub_city_area_geographic_types",
+            "sub_city_area_verified_parent_ids",
+            "whole_city",
+            "required_date",
+        }
+        allowed_field_sets = (
+            required_fields,
+            required_fields | {"game_search_details"},
+        )
+        if set(payload) not in allowed_field_sets:
+            raise ValueError("RunSearch v2 contains unsupported or missing facts")
+        search_update_id = _required_text(payload, "search_update_id")
+        telegram_user_id = payload["telegram_user_id"]
+        draft_revision = payload["discovery_draft_revision"]
+        if (
+            not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+            or telegram_user_id < 1
+            or not isinstance(draft_revision, int)
+            or isinstance(draft_revision, bool)
+            or draft_revision < 1
+        ):
+            raise ValueError("RunSearch v2 identities must be positive integers")
+        expected_message_id = derive_run_search_message_id(
+            telegram_user_id, search_update_id
+        )
+        if envelope.message_id != expected_message_id:
+            raise ValueError("RunSearch v2 message identity is not canonical")
+        if envelope.subject_id != f"bot-user:{telegram_user_id}":
+            raise ValueError("RunSearch v2 subject identity is not canonical")
+        if envelope.subject_revision != draft_revision:
+            raise ValueError("RunSearch v2 subject revision is not canonical")
+        if envelope.idempotency_key != (
+            f"run-search:{telegram_user_id}:{search_update_id}"
+        ):
+            raise ValueError("RunSearch v2 idempotency key is not canonical")
+        if (
+            envelope.causation_id != expected_message_id
+            or envelope.correlation_id != expected_message_id
+        ):
+            raise ValueError("RunSearch v2 causation/correlation is not canonical")
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
         raise ValueError("RunSearch requires a canonical user_intent")
-    _required_text(payload, "country_id")
-    _required_text(payload, "city_id")
+    country_id = _required_text(payload, "country_id")
+    city_id = _required_text(payload, "city_id")
     area_ids = payload.get("sub_city_area_ids")
     if not isinstance(area_ids, list) or not all(
         isinstance(value, str) and value for value in area_ids
     ):
         raise ValueError("RunSearch requires string sub_city_area_ids")
+    typed_area_ids = cast(list[str], area_ids)
+    area_types = payload.get("sub_city_area_geographic_types", [])
+    if (
+        not isinstance(area_types, list)
+        or (bool(area_types) and len(area_types) != len(area_ids))
+        or (contract_version >= 2 and len(area_types) != len(area_ids))
+        or not all(value in SUB_CITY_GEOGRAPHIC_TYPES for value in area_types)
+    ):
+        raise ValueError("RunSearch requires aligned sub-city geographic types")
+    area_parent_ids = payload.get("sub_city_area_verified_parent_ids", [])
+    if (
+        not isinstance(area_parent_ids, list)
+        or (bool(area_parent_ids) and len(area_parent_ids) != len(area_ids))
+        or (contract_version >= 2 and len(area_parent_ids) != len(area_ids))
+        or not all(
+            isinstance(parent_ids, list)
+            and bool(parent_ids)
+            and all(isinstance(value, str) and value for value in parent_ids)
+            for parent_ids in area_parent_ids
+        )
+    ):
+        raise ValueError("RunSearch requires aligned sub-city parent hierarchies")
+    typed_area_parent_ids = cast(list[list[str]], area_parent_ids)
+    if typed_area_parent_ids and any(
+        len(parent_ids) != len(set(parent_ids))
+        or area_id in parent_ids
+        or country_id not in parent_ids
+        or city_id not in parent_ids
+        for area_id, parent_ids in zip(
+            typed_area_ids, typed_area_parent_ids, strict=True
+        )
+    ):
+        raise ValueError("RunSearch requires verified sub-city parent hierarchies")
     whole_city = payload.get("whole_city")
     if not isinstance(whole_city, bool):
         raise ValueError("RunSearch requires boolean whole_city")
@@ -506,12 +716,51 @@ def _validate_run_search(payload: dict[str, JsonValue]) -> None:
         raise ValueError("RunSearch requires exactly one Search Area mode")
     required_date = payload.get("required_date")
     if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
-        _validate_required_date(required_date)
+        _validate_required_date(
+            required_date,
+            exact_fields=contract_version >= 2,
+        )
+    details = payload.get("game_search_details")
+    if details is not None:
+        if user_intent != "game_search" or not isinstance(details, dict):
+            raise ValueError("RunSearch details require Game Search")
+        if set(details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
+            isinstance(values, list)
+            and (key != "times" or len(values) <= 1)
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and (
+                    value in _GAME_SEARCH_DETAIL_VALUES.get(key, ())
+                    or (
+                        key == "times"
+                        and (
+                            value in {"morning", "daytime", "evening", "night"}
+                            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+                            is not None
+                        )
+                    )
+                )
+                for value in values
+            )
+            for key, values in details.items()
+        ):
+            raise ValueError("RunSearch has invalid Game Search details")
 
 
-def _validate_required_date(value: JsonValue) -> None:
+def _validate_required_date(value: JsonValue, *, exact_fields: bool) -> None:
     if not isinstance(value, dict):
         raise ValueError("RunSearch requires a Required Date object")
+    if exact_fields and set(value) != {
+        "start_local_date",
+        "end_local_date",
+        "iana_timezone",
+        "timezone_data_version",
+    }:
+        raise ValueError(
+            "RunSearch Required Date contains unsupported or missing facts"
+        )
     start_text = _required_text(value, "start_local_date")
     end_text = _required_text(value, "end_local_date")
     _required_text(value, "iana_timezone")
@@ -526,13 +775,12 @@ def _validate_required_date(value: JsonValue) -> None:
 
 
 def _validate_search_completed(
+    envelope: RawContractEnvelope,
     payload: dict[str, JsonValue],
-    *,
-    contract_version: int,
-    subject_id: str,
 ) -> None:
+    contract_version = envelope.contract_version
     completed_search_id = _required_text(payload, "completed_search_id")
-    if completed_search_id != subject_id:
+    if completed_search_id != envelope.subject_id:
         raise ValueError("SearchCompleted subject must identify its Completed Search")
     search_fields = ("telegram_user_id", "search_update_id", "result_count")
     allowed_fields = {"probe_id", "completed_search_id"}
@@ -544,13 +792,17 @@ def _validate_search_completed(
         return
     if contract_version != 2:
         raise ValueError("SearchCompleted version has no registered semantics")
-    allowed_fields.update(search_fields)
-    if set(payload) - allowed_fields:
-        raise ValueError("SearchCompleted v2 contains unsupported facts")
+    allowed_fields = {"completed_search_id", *search_fields}
+    if set(payload) != allowed_fields:
+        raise ValueError("SearchCompleted v2 contains unsupported or missing facts")
     telegram_user_id = payload.get("telegram_user_id")
-    if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+    if (
+        not isinstance(telegram_user_id, int)
+        or isinstance(telegram_user_id, bool)
+        or telegram_user_id < 1
+    ):
         raise ValueError("SearchCompleted requires telegram_user_id")
-    _required_text(payload, "search_update_id")
+    search_update_id = _required_text(payload, "search_update_id")
     result_count = payload.get("result_count")
     if (
         not isinstance(result_count, int)
@@ -558,6 +810,23 @@ def _validate_search_completed(
         or result_count < 0
     ):
         raise ValueError("SearchCompleted requires a non-negative result_count")
+    run_search_message_id = derive_run_search_message_id(
+        telegram_user_id, search_update_id
+    )
+    expected_completed_search_id = f"completed-search:{run_search_message_id}"
+    if completed_search_id != expected_completed_search_id:
+        raise ValueError("SearchCompleted v2 subject lineage is not canonical")
+    if envelope.message_id != derive_search_completed_message_id(completed_search_id):
+        raise ValueError("SearchCompleted v2 message identity is not canonical")
+    if envelope.subject_revision != 1:
+        raise ValueError("SearchCompleted v2 subject revision is not canonical")
+    if envelope.idempotency_key != f"search-completed:{completed_search_id}":
+        raise ValueError("SearchCompleted v2 idempotency key is not canonical")
+    if (
+        envelope.causation_id != run_search_message_id
+        or envelope.correlation_id != run_search_message_id
+    ):
+        raise ValueError("SearchCompleted v2 causation/correlation is not canonical")
 
 
 def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:
@@ -583,6 +852,8 @@ def _validate_source_event_recorded(
         "event_time",
         "body",
     }
+    if envelope.contract_version == 4:
+        allowed |= {"bounded_metadata", "reply_to_telegram_message_id"}
     if set(payload) != allowed:
         raise ValueError("SourceEventRecorded contains unsupported or missing facts")
     source_event_id = _required_text(payload, "source_event_id")
@@ -596,13 +867,24 @@ def _validate_source_event_recorded(
     telegram_chat_id = payload["telegram_chat_id"]
     telegram_message_id = payload["telegram_message_id"]
     registry_generation = payload["registry_generation"]
-    for value in (telegram_chat_id, telegram_message_id, registry_generation):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError("SourceEventRecorded numeric identities must be positive")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value > 0
+        for value in (telegram_chat_id, telegram_message_id, registry_generation)
+    ):
+        raise ValueError("SourceEventRecorded numeric identities must be positive")
+    assert isinstance(telegram_chat_id, int)
+    assert isinstance(telegram_message_id, int)
+    assert isinstance(registry_generation, int)
     source_chat_key = _required_text(payload, "source_chat_key")
     if source_chat_key != f"source-chat:{peer_kind}:{telegram_chat_id}":
         raise ValueError("SourceEventRecorded Source Chat identity is inconsistent")
-    expected_subject = f"{source_chat_key}:message:{telegram_message_id}"
+    expected_subject = (
+        canonical_source_message_id(
+            source_chat_key, registry_generation, telegram_message_id
+        )
+        if envelope.contract_version == 4
+        else f"{source_chat_key}:message:{telegram_message_id}"
+    )
     if envelope.subject_id != expected_subject:
         raise ValueError("SourceEventRecorded subject is not its Source Message")
     if _required_text(payload, "source_message_revision_id") != (
@@ -620,6 +902,740 @@ def _validate_source_event_recorded(
         raise TypeError("SourceEventRecorded body must be text or null")
     if event_kind == "delete" and body is not None:
         raise ValueError("SourceEventRecorded deletion must be body-free")
+    if envelope.contract_version == 4:
+        metadata = payload["bounded_metadata"]
+        _validate_bounded_source_metadata(metadata)
+        reply_to_message_id = payload["reply_to_telegram_message_id"]
+        if reply_to_message_id is not None and (
+            not isinstance(reply_to_message_id, int)
+            or isinstance(reply_to_message_id, bool)
+            or reply_to_message_id < 1
+            or reply_to_message_id == telegram_message_id
+        ):
+            raise ValueError("SourceEventRecorded direct-reply identity is invalid")
+
+
+_BOUNDED_METADATA_FIELDS = {
+    "message_language",
+    "attachment_types",
+    "source_author_dm_url",
+    "reply_route_url",
+    "source_message_url",
+    "source_message_reply_capable",
+}
+
+
+def _is_safe_telegram_route(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        len(value) <= 2048
+        and parsed.path not in {"", "/"}
+        and parsed.scheme == "https"
+        and parsed.hostname in {"t.me", "telegram.me"}
+        and parsed.username is None
+        and parsed.password is None
+        and not any(character.isspace() for character in value)
+    )
+
+
+def _is_safe_http_route(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (
+        len(value) <= 2048
+        and parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not any(character.isspace() for character in value)
+    )
+
+
+def _validate_bounded_source_metadata(value: JsonValue) -> None:
+    if not isinstance(value, dict) or set(value) != _BOUNDED_METADATA_FIELDS:
+        raise TypeError("bounded source metadata contains unsupported facts")
+    language = value["message_language"]
+    if language is not None and (
+        not isinstance(language, str) or not language or len(language) > 35
+    ):
+        raise TypeError("message_language must be text or null")
+    attachment_types = value["attachment_types"]
+    if (
+        not isinstance(attachment_types, list)
+        or len(attachment_types) > 8
+        or not all(
+            isinstance(item, str) and item and len(item) <= 64
+            for item in attachment_types
+        )
+        or len(attachment_types) != len(set(attachment_types))
+    ):
+        raise TypeError("attachment_types must be a bounded text list")
+    for field_name in (
+        "source_author_dm_url",
+        "reply_route_url",
+        "source_message_url",
+    ):
+        route = value[field_name]
+        if route is not None and (
+            not isinstance(route, str) or not _is_safe_telegram_route(route)
+        ):
+            raise ValueError(f"{field_name} must be a safe Telegram URL or null")
+    reply_capable = value["source_message_reply_capable"]
+    if not isinstance(reply_capable, bool):
+        raise TypeError("source_message_reply_capable must be boolean")
+    if (value["source_message_url"] is not None) != reply_capable:
+        raise ValueError(
+            "source_message_url must identify exactly one reply-capable post"
+        )
+
+
+def _validate_source_revision_lineage(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> str:
+    revision_id = _required_text(payload, "source_message_revision_id")
+    expected_revision_id = f"{envelope.subject_id}:revision:{envelope.subject_revision}"
+    if revision_id != expected_revision_id:
+        raise ValueError("source revision identity does not match its envelope")
+    return revision_id
+
+
+def _required_iso_datetime(payload: dict[str, JsonValue], field_name: str) -> str:
+    value = _required_text(payload, field_name)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"contract requires ISO datetime {field_name}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"contract requires timezone-aware {field_name}")
+    return value
+
+
+def _validate_direct_causation(
+    envelope: RawContractEnvelope,
+    contract_name: ContractName,
+) -> None:
+    if envelope.message_id != derive_contract_message_id(
+        envelope.causation_id, contract_name
+    ):
+        raise ValueError(f"{contract_name.value} message identity is not canonical")
+
+
+def _validate_classify_source_message_revision(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    allowed = {
+        "source_message_revision_id",
+        "body",
+        "source_event_time",
+        "source_recorded_at",
+        "context_bundle_version",
+        "source_chat_reference",
+        "source_chat_registry_generation",
+        "source_chat_timezone",
+        "source_chat_geography",
+        "bounded_metadata",
+        "eligible_reply_context",
+        "direct_reply_to_telegram_message_id",
+    }
+    if set(payload) != allowed:
+        raise ValueError("ClassifySourceMessageRevision has incomplete semantics")
+    revision_id = _validate_source_revision_lineage(envelope, payload)
+    _required_text(payload, "body")
+    _required_iso_datetime(payload, "source_event_time")
+    _required_iso_datetime(payload, "source_recorded_at")
+    if _required_text(payload, "context_bundle_version") != (
+        "primary-classifier-context-v1"
+    ):
+        raise ValueError("classifier context bundle version is unsupported")
+    source_chat_reference = _required_text(payload, "source_chat_reference")
+    if (
+        re.fullmatch(
+            r"source-chat:(?:chat|channel):[1-9][0-9]*",
+            source_chat_reference,
+        )
+        is None
+    ):
+        raise ValueError("classifier context requires a typed Source Chat reference")
+    source_chat_generation = payload["source_chat_registry_generation"]
+    if (
+        not isinstance(source_chat_generation, int)
+        or isinstance(source_chat_generation, bool)
+        or source_chat_generation < 1
+    ):
+        raise TypeError("source_chat_registry_generation must be positive")
+    try:
+        current_telegram_message_id = int(envelope.subject_id.rsplit(":message:", 1)[1])
+    except (IndexError, ValueError) as error:
+        raise ValueError("current Source Message identity is invalid") from error
+    if envelope.subject_id != canonical_source_message_id(
+        source_chat_reference,
+        source_chat_generation,
+        current_telegram_message_id,
+    ):
+        raise ValueError("Source Message identity is not generation-bound")
+    direct_reply_target = payload["direct_reply_to_telegram_message_id"]
+    if direct_reply_target is not None and (
+        not isinstance(direct_reply_target, int)
+        or isinstance(direct_reply_target, bool)
+        or direct_reply_target < 1
+        or direct_reply_target == current_telegram_message_id
+    ):
+        raise ValueError("direct-reply target identity is invalid")
+    timezone = payload["source_chat_timezone"]
+    if timezone is not None and (not isinstance(timezone, str) or not timezone):
+        raise TypeError("source_chat_timezone must be text or null")
+    geography = payload["source_chat_geography"]
+    if not isinstance(geography, dict) or set(geography) != {"country_id", "city_id"}:
+        raise TypeError("source_chat_geography must contain country_id and city_id")
+    if any(
+        value is not None and not isinstance(value, str) for value in geography.values()
+    ):
+        raise TypeError("source_chat_geography values must be text or null")
+    metadata = payload["bounded_metadata"]
+    if not isinstance(metadata, dict) or set(metadata) not in (
+        {"message_language", "attachment_types"},
+        _BOUNDED_METADATA_FIELDS,
+    ):
+        raise TypeError("bounded_metadata contains unsupported facts")
+    if (
+        "message_language" in metadata
+        and metadata["message_language"] is not None
+        and not isinstance(metadata["message_language"], str)
+    ):
+        raise TypeError("message_language must be text or null")
+    attachment_types = metadata.get("attachment_types", [])
+    if (
+        not isinstance(attachment_types, list)
+        or len(attachment_types) > 8
+        or not all(isinstance(value, str) and value for value in attachment_types)
+    ):
+        raise TypeError("attachment_types must be a bounded text list")
+    if set(metadata) == _BOUNDED_METADATA_FIELDS:
+        _validate_bounded_source_metadata(metadata)
+    reply = payload["eligible_reply_context"]
+    if reply is not None:
+        if not isinstance(reply, dict) or set(reply) != {
+            "relationship_kind",
+            "source_chat_reference",
+            "registry_generation",
+            "telegram_message_id",
+            "source_message_revision_id",
+            "body",
+            "source_event_time",
+        }:
+            raise TypeError("eligible_reply_context is incomplete")
+        if reply["relationship_kind"] != "direct_reply":
+            raise ValueError("eligible_reply_context relationship is invalid")
+        if reply["source_chat_reference"] != source_chat_reference:
+            raise ValueError("eligible_reply_context crosses Source Chats")
+        if reply["registry_generation"] != source_chat_generation:
+            raise ValueError("eligible_reply_context crosses registry generations")
+        reply_message_id = reply["telegram_message_id"]
+        if (
+            not isinstance(reply_message_id, int)
+            or isinstance(reply_message_id, bool)
+            or reply_message_id != direct_reply_target
+        ):
+            raise ValueError("eligible_reply_context is not the direct reply target")
+        reply_revision_id = _required_text(reply, "source_message_revision_id")
+        if (
+            re.fullmatch(
+                rf"{re.escape(source_chat_reference)}:generation:"
+                rf"{source_chat_generation}:message:"
+                rf"{reply_message_id}:revision:[1-9][0-9]*",
+                reply_revision_id,
+            )
+            is None
+        ):
+            raise ValueError("eligible_reply_context revision lineage is invalid")
+        _required_text(reply, "body")
+        reply_event_time = datetime.fromisoformat(
+            _required_iso_datetime(reply, "source_event_time")
+        )
+        source_event_time = datetime.fromisoformat(
+            _required_iso_datetime(payload, "source_event_time")
+        )
+        age = source_event_time - reply_event_time
+        if age < timedelta(0):
+            raise ValueError("eligible_reply_context is newer than its direct reply")
+    _validate_direct_causation(envelope, ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION)
+    if envelope.idempotency_key != f"classify-source-message:{revision_id}":
+        raise ValueError(
+            "ClassifySourceMessageRevision idempotency key is not canonical"
+        )
+
+
+def _validate_classification_proposal(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    context_fields = {
+        "source_event_time",
+        "source_recorded_at",
+        "context_bundle_version",
+        "source_chat_reference",
+        "source_chat_registry_generation",
+        "source_chat_timezone",
+        "source_chat_geography",
+        "bounded_metadata",
+        "eligible_reply_context",
+        "direct_reply_to_telegram_message_id",
+    }
+    provenance_fields = {
+        "output",
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "pass_number",
+        "attempt_number",
+        "input_manifest_hash",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "classification_status",
+        "classification_command_id",
+    }
+    semantic_fields = {
+        "semantic_proof",
+        "semantic_proof_execution",
+    }
+    allowed = (
+        {"proposal_id", "source_message_revision_id", "body"}
+        | context_fields
+        | provenance_fields
+        | (semantic_fields if envelope.contract_version == 3 else set())
+    )
+    if set(payload) != allowed:
+        raise ValueError("ClassificationProposal has incomplete semantics")
+    revision_id = _validate_source_revision_lineage(envelope, payload)
+    if _required_text(payload, "proposal_id") != f"proposal:{revision_id}":
+        raise ValueError("ClassificationProposal proposal identity is not canonical")
+    if _required_text(payload, "classification_command_id") != str(
+        envelope.causation_id
+    ):
+        raise ValueError("ClassificationProposal causation identity is inconsistent")
+    body = _required_text(payload, "body")
+    _required_iso_datetime(payload, "source_event_time")
+    _required_iso_datetime(payload, "source_recorded_at")
+    for field_name in (
+        "context_bundle_version",
+        "source_chat_reference",
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "input_manifest_hash",
+    ):
+        _required_text(payload, field_name)
+    if payload["classification_status"] != "succeeded":
+        raise ValueError("ClassificationProposal status is invalid")
+    if not isinstance(payload["output"], dict):
+        raise TypeError("ClassificationProposal output must be an object")
+    if not classifier_output_is_schema_valid(payload["output"], body=body):
+        raise ValueError("ClassificationProposal output violates its public schema")
+    if envelope.contract_version == 3:
+        if payload["output"].get("disposition") != "accepted":
+            raise ValueError("ClassificationProposal v3 requires an accepted output")
+        candidates = payload["output"].get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            raise ValueError("ClassificationProposal v3 requires one candidate")
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise TypeError("ClassificationProposal v3 candidate must be an object")
+        candidate_key = candidate.get("candidate_key")
+        evidence = candidate.get("evidence")
+        routes = candidate.get("response_routes")
+        proof = payload.get("semantic_proof")
+        if (
+            not isinstance(candidate_key, str)
+            or not isinstance(evidence, dict)
+            or not isinstance(routes, list)
+            or not isinstance(proof, dict)
+        ):
+            raise ValueError("ClassificationProposal v3 semantic proof is incomplete")
+        proof_reference = proof.get("source_message_revision_reference")
+        if not isinstance(proof_reference, str) or not proof_reference:
+            raise ValueError("ClassificationProposal v3 proof reference is invalid")
+        if not semantic_proof_is_schema_valid(
+            proof,
+            body=body,
+            source_message_revision_reference=proof_reference,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+        ):
+            raise ValueError("ClassificationProposal v3 semantic proof is invalid")
+        _validate_semantic_proof_execution(payload["semantic_proof_execution"])
+    for field_name in ("pass_number", "attempt_number"):
+        metric = payload[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
+            raise TypeError(f"ClassificationProposal requires positive {field_name}")
+    for field_name in ("duration_ms", "input_tokens", "output_tokens"):
+        metric = payload[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            raise TypeError(
+                f"ClassificationProposal requires non-negative {field_name}"
+            )
+    pinned = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "open-match-primary-v1",
+        "schema_version": "source-message-classification-v1",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+        "context_bundle_version": "primary-classifier-context-v1",
+    }
+    if any(payload[field_name] != value for field_name, value in pinned.items()):
+        raise ValueError("ClassificationProposal provenance version is unsupported")
+    if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
+        raise ValueError("ClassificationProposal manifest hash is invalid")
+    # Reuse the complete bounded context validator without duplicating its shape rules.
+    context_envelope = RawContractEnvelope(
+        contract_name=ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+        contract_version=2,
+        message_id=derive_contract_message_id(
+            envelope.causation_id, ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+        ),
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.CLASSIFICATION,
+        subject_id=envelope.subject_id,
+        subject_revision=envelope.subject_revision,
+        idempotency_key=f"classify-source-message:{revision_id}",
+        causation_id=envelope.causation_id,
+        correlation_id=envelope.correlation_id,
+        recorded_at=envelope.recorded_at,
+        payload={
+            "source_message_revision_id": revision_id,
+            "body": payload["body"],
+            **{key: payload[key] for key in context_fields},
+        },
+    )
+    _validate_classify_source_message_revision(
+        context_envelope, cast(dict[str, JsonValue], context_envelope.payload)
+    )
+    _validate_direct_causation(envelope, ContractName.CLASSIFICATION_PROPOSAL)
+    if envelope.idempotency_key != f"classification-proposal:{revision_id}":
+        raise ValueError("ClassificationProposal idempotency key is not canonical")
+
+
+def _validate_semantic_proof_execution(value: JsonValue) -> None:
+    """Validate the pinned bounded semantic-proof pass provenance."""
+    fields = {
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "pass_number",
+        "attempt_number",
+        "input_manifest_hash",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "status",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("semantic-proof execution metadata is incomplete")
+    for field_name in (
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "input_manifest_hash",
+    ):
+        _required_text(value, field_name)
+    if value["status"] != "succeeded":
+        raise ValueError("semantic-proof execution status is invalid")
+    for field_name in ("pass_number", "attempt_number"):
+        metric = value[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
+            raise TypeError(f"semantic-proof execution requires positive {field_name}")
+    for field_name in ("duration_ms", "input_tokens", "output_tokens"):
+        metric = value[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            raise TypeError(
+                f"semantic-proof execution requires non-negative {field_name}"
+            )
+    pinned = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "open-match-semantic-proof-v1",
+        "schema_version": "source-semantic-proof-v1",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "semantic-proof-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+        "context_bundle_version": "semantic-proof-context-v1",
+    }
+    if any(value[field_name] != expected for field_name, expected in pinned.items()):
+        raise ValueError("semantic-proof execution provenance is not pinned")
+    if re.fullmatch(r"[0-9a-f]{64}", str(value["input_manifest_hash"])) is None:
+        raise ValueError("semantic-proof execution manifest hash is invalid")
+
+
+def _validate_opportunity_publication_changed(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    allowed = {
+        "opportunity_id",
+        "opportunity_revision_id",
+        "source_message_revision_id",
+        "publication_state",
+        "opportunity_type",
+        "accepted_facts",
+        "response_route",
+    }
+    if set(payload) != allowed:
+        raise ValueError("OpportunityPublicationChanged has incomplete semantics")
+    opportunity_id = _required_text(payload, "opportunity_id")
+    if opportunity_id != envelope.subject_id:
+        raise ValueError("OpportunityPublicationChanged subject is inconsistent")
+    source_revision_id = _required_text(payload, "source_message_revision_id")
+    if (
+        opportunity_id
+        != f"opportunity:{source_revision_id.rsplit(':revision:', 1)[0]}:open_match"
+    ):
+        raise ValueError(
+            "Opportunity identity is inconsistent with its source revision"
+        )
+    opportunity_revision_id = _required_text(payload, "opportunity_revision_id")
+    if (
+        opportunity_revision_id
+        != f"{opportunity_id}:revision:{envelope.subject_revision}"
+    ):
+        raise ValueError("Opportunity revision identity is inconsistent")
+    if payload["publication_state"] not in {
+        "active",
+        "held_for_review",
+        "suppressed",
+        "expired",
+    }:
+        raise ValueError("Opportunity publication state is invalid")
+    if payload["opportunity_type"] != "open_match":
+        raise ValueError("Opportunity type is invalid")
+    accepted_facts = payload["accepted_facts"]
+    if not isinstance(accepted_facts, dict):
+        raise TypeError("accepted_facts must be an object")
+    _validate_open_match_accepted_facts(accepted_facts)
+    route = payload["response_route"]
+    if not isinstance(route, dict) or set(route) != {"kind", "value"}:
+        raise TypeError("response_route must contain kind and value")
+    route_kind = route["kind"]
+    route_value = route["value"]
+    valid_route = (
+        isinstance(route_value, str)
+        and bool(route_value)
+        and (
+            (
+                route_kind == "explicit_telegram_username"
+                and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
+            )
+            or (
+                route_kind == "explicit_phone"
+                and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value) is not None
+                and 7 <= sum(character.isdigit() for character in route_value) <= 15
+            )
+            or (route_kind == "explicit_url" and _is_safe_http_route(route_value))
+            or (
+                route_kind in {"direct_message", "reply_thread", "source_message"}
+                and _is_safe_telegram_route(route_value)
+            )
+        )
+    )
+    if not valid_route:
+        raise ValueError("response_route is invalid")
+    _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
+    if envelope.idempotency_key != f"opportunity-publication:{opportunity_revision_id}":
+        raise ValueError(
+            "OpportunityPublicationChanged idempotency key is not canonical"
+        )
+
+
+def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
+    required = {
+        "start_local_date",
+        "end_local_date",
+        "exact_local_time",
+        "day_part",
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "location_verified_disjoint_place_ids",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "open_places",
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "payment_amount",
+        "payment_currency",
+        "source_posted_at",
+    }
+    if set(facts) != required:
+        raise ValueError("open-match accepted facts are incomplete")
+    try:
+        start = date.fromisoformat(_required_text(facts, "start_local_date"))
+        end = date.fromisoformat(_required_text(facts, "end_local_date"))
+    except ValueError as error:
+        raise ValueError("open-match dates must be ISO local dates") from error
+    if end < start:
+        raise ValueError("open-match date range must be ordered")
+    for field_name in (
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+    ):
+        _required_text(facts, field_name)
+    if _required_text(facts, "location_geographic_type") not in {
+        "country",
+        "city",
+        *SUB_CITY_GEOGRAPHIC_TYPES,
+    }:
+        raise ValueError("open-match geographic type is invalid")
+    parent_ids = facts["location_parent_ids"]
+    if (
+        not isinstance(parent_ids, list)
+        or not parent_ids
+        or not all(isinstance(value, str) and value for value in parent_ids)
+    ):
+        raise TypeError("open-match location parents must be a non-empty text list")
+    disjoint_ids = facts["location_verified_disjoint_place_ids"]
+    if (
+        not isinstance(disjoint_ids, list)
+        or len(disjoint_ids) > 128
+        or not all(isinstance(value, str) and value for value in disjoint_ids)
+        or len(disjoint_ids) != len(set(disjoint_ids))
+        or facts["place_id"] in disjoint_ids
+        or bool(set(parent_ids).intersection(disjoint_ids))
+    ):
+        raise TypeError(
+            "open-match location disjoint proof must be a bounded identity list"
+        )
+    exact_time = facts["exact_local_time"]
+    if exact_time is not None and (
+        not isinstance(exact_time, str)
+        or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
+    ):
+        raise ValueError("open-match exact time is invalid")
+    day_part = facts["day_part"]
+    if day_part not in {None, "morning", "daytime", "evening", "night"}:
+        raise ValueError("open-match day part is invalid")
+    if exact_time is not None and day_part is not None:
+        raise ValueError("open-match exact time and day part are mutually exclusive")
+    open_places = facts["open_places"]
+    if open_places is not None and (
+        not isinstance(open_places, int)
+        or isinstance(open_places, bool)
+        or open_places < 1
+    ):
+        raise TypeError("open-match open_places must be positive or null")
+    list_allowlists = {
+        "team_formats": {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
+        "positions": {"goalkeeper", "defender", "midfielder", "forward"},
+        "playing_levels": {
+            "novice",
+            "below_average",
+            "average",
+            "above_average",
+            "high",
+            "very_high",
+            "master",
+            "professional",
+        },
+        "venue_settings": {"indoor", "outdoor", "covered_outdoor"},
+        "playing_surfaces": {
+            "natural_grass",
+            "artificial_turf",
+            "hard_surface",
+            "wood_parquet",
+        },
+    }
+    for field_name, allowed in list_allowlists.items():
+        values = facts[field_name]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(cast(list[str], values)))
+            or not all(isinstance(value, str) and value in allowed for value in values)
+        ):
+            raise ValueError(f"open-match {field_name} is invalid")
+    if facts["payment"] not in {None, "free", "paid"}:
+        raise ValueError("open-match payment is invalid")
+    payment_amount = facts["payment_amount"]
+    payment_currency = facts["payment_currency"]
+    if (payment_amount is None) != (payment_currency is None) or (
+        payment_amount is not None
+        and (
+            facts["payment"] != "paid"
+            or not isinstance(payment_amount, str)
+            or not payment_amount
+            or not isinstance(payment_currency, str)
+            or not payment_currency
+        )
+    ):
+        raise ValueError("open-match payment details are invalid")
+    _required_iso_datetime(facts, "source_posted_at")
 
 
 def _validate_source_chat_contract(
