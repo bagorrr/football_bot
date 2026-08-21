@@ -130,6 +130,31 @@ def test_location_evidence_tracks_current_replacement_across_the_revision() -> N
     assert not _location_mention_is_authoritative(revised, "Central Station")
     assert _location_mention_is_authoritative(revised, "North Station")
 
+    for body, old_mention, current_mention in (
+        (
+            "Football match at Central Station. The venue is now North Station",
+            "Central Station",
+            "North Station",
+        ),
+        (
+            "Матч у Центральной. Место теперь Северная",
+            "Центральной",
+            "Северная",
+        ),
+        (
+            "Partido en Estación Central. El lugar ahora es Estación Norte",
+            "Estación Central",
+            "Estación Norte",
+        ),
+        (
+            "Match à la Gare Centrale. Le lieu est maintenant Gare du Nord",
+            "Gare Centrale",
+            "Gare du Nord",
+        ),
+    ):
+        assert not _location_mention_is_authoritative(body, old_mention)
+        assert _location_mention_is_authoritative(body, current_mention)
+
 
 def test_explicit_route_requires_contact_semantics_before_fallback_priority() -> None:
     fallback: JsonValue = {
@@ -739,6 +764,30 @@ def test_complete_body_temporal_retraction_must_refer_to_the_same_event() -> Non
             authoritative_body=body,
         )
 
+    withdrawn_next_sentence = (
+        (
+            "Football match 20 August 2026. It will not go ahead",
+            "20 August 2026",
+        ),
+        ("Футбольный матч 20 августа 2026. Он не состоится", "20 августа 2026"),
+        (
+            "Partido de fútbol 20 agosto 2026. No se jugará",
+            "20 agosto 2026",
+        ),
+        (
+            "Match de football le 20 août 2026. Il n'aura pas lieu",
+            "20 août 2026",
+        ),
+    )
+    for body, evidence in withdrawn_next_sentence:
+        assert not _event_time_is_supported(
+            event_date,
+            event_date,
+            None,
+            evidence,
+            authoritative_body=body,
+        )
+
 
 def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
     positive_cases = (
@@ -875,6 +924,16 @@ def test_current_individual_opening_is_proven_across_the_complete_body() -> None
     ):
         assert not _open_places_are_supported(None, body)
 
+    for body in (
+        "Football match 20 August 2026. Need a goalkeeper. All roles have been filled",
+        "Футбольный матч 20 августа 2026. Нужен вратарь. Все роли уже заполнены",
+        "Partido de fútbol 20 agosto 2026. Necesitamos un portero. "
+        "Todos los puestos están cubiertos",
+        "Match de football le 20 août 2026. Besoin d'un gardien. "
+        "Tous les rôles sont pourvus",
+    ):
+        assert not _open_places_are_supported(None, body)
+
 
 def test_open_match_proposition_requires_positive_unambiguous_football_meaning() -> (
     None
@@ -894,6 +953,20 @@ def test_open_match_proposition_requires_positive_unambiguous_football_meaning()
         "Match de football demain",
     ):
         assert _body_establishes_current_open_match(body)
+
+    for body in (
+        "Football match is not a real game. 20 August 2026 at Central Station. "
+        "Need one player",
+        "Футбольный матч — не настоящая игра. 20 августа 2026 у Центральной. "
+        "Нужен один игрок",
+        "El partido de fútbol no es un partido real. 20 agosto 2026 en "
+        "Estación Central. "
+        "Necesitamos un jugador",
+        "Le match de football n'est pas un vrai match. 20 août 2026 à la "
+        "Gare Centrale. "
+        "Besoin d'un joueur",
+    ):
+        assert not _body_establishes_current_open_match(body)
 
 
 def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
@@ -972,6 +1045,10 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
         ("Fee 500 Norwegian kroner", ("500", "Norwegian kroner")),
         ("Fee 500 Polish zloty", ("500", "Polish zloty")),
         ("Fee 500 Thai baht", ("500", "Thai baht")),
+        ("Fee 500 Indian rupees", ("500", "Indian rupees")),
+        ("Fee 500 Brazilian reais", ("500", "Brazilian reais")),
+        ("Fee 500 Iranian rials", ("500", "Iranian rials")),
+        ("Fee 500 South African rand", ("500", "South African rand")),
     )
     for evidence, expected in cases:
         assert _stated_payment_amount_and_currency(evidence) == expected
@@ -1275,6 +1352,22 @@ def test_optional_facts_reject_forward_payment_homonyms_and_filled_roles() -> No
             role_evidence_value,
             authoritative_body=body,
         )
+
+    assert not _optional_values_are_supported(
+        {"positions": ["defender"]},
+        {"positions": "Defender is a legal role in the game"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need one player. "
+            "Defender is a legal role in the game"
+        ),
+    )
+    assert not _optional_values_are_supported(
+        {"positions": ["defender"]},
+        {"positions": "Need a defender"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need a defender. All roles have been filled"
+        ),
+    )
 
 
 def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:

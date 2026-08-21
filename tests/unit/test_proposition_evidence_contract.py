@@ -41,6 +41,7 @@ def _contract(
         "root": {
             "proposition_id": candidate_key,
             "domain": "football_match",
+            "meaning": "open_match",
             "polarity": "positive",
             "currentness": "current",
             "span": {"start": 0, "end": len(body), "text": body},
@@ -65,7 +66,32 @@ def _contract(
             }
             for route in routes
         ],
-        "relations": [],
+        "relations": [
+            {
+                "kind": "supports",
+                "direction": "outgoing",
+                "target": "root",
+                "span": {"start": 0, "end": len(body), "text": body},
+            },
+            *[
+                {
+                    "kind": "supports",
+                    "direction": "outgoing",
+                    "target": fact_name,
+                    "span": _span(body, fact_evidence),
+                }
+                for fact_name, fact_evidence in evidence.items()
+            ],
+            *[
+                {
+                    "kind": "supports",
+                    "direction": "outgoing",
+                    "target": f"route:{route['kind']}:{route['value']}",
+                    "span": _span(body, route["evidence"]),
+                }
+                for route in routes
+            ],
+        ],
     }
 
 
@@ -168,6 +194,35 @@ def test_structured_evidence_rejects_unknown_fact_and_route_bindings() -> None:
 
     assert not _schema_valid(
         malformed,
+        body=body,
+        candidate_key="open-place",
+        evidence=evidence,
+        routes=routes,
+    )
+
+
+def test_structured_evidence_requires_support_for_every_current_node() -> None:
+    body = (
+        "Football match tomorrow at Central Station: one goalkeeper. "
+        "Contact @match_contact"
+    )
+    evidence = {
+        "opportunity": "Football match tomorrow",
+        "event_time": "tomorrow",
+        "location": "at Central Station",
+        "open_places": "one goalkeeper",
+    }
+    routes = [
+        {
+            "kind": "explicit_telegram_username",
+            "value": "@match_contact",
+            "evidence": "Contact @match_contact",
+        }
+    ]
+    incomplete = _contract(body, evidence=evidence, routes=routes)
+    incomplete["relations"] = []
+    assert not _schema_valid(
+        incomplete,
         body=body,
         candidate_key="open-place",
         evidence=evidence,

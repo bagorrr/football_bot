@@ -231,6 +231,7 @@ def proposition_evidence_is_schema_valid(
     if not isinstance(root, dict) or set(root) != {
         "proposition_id",
         "domain",
+        "meaning",
         "polarity",
         "currentness",
         "span",
@@ -239,6 +240,7 @@ def proposition_evidence_is_schema_valid(
     if (
         root.get("proposition_id") != candidate_key
         or root.get("domain") not in _PROPOSITION_DOMAINS
+        or root.get("meaning") != "open_match"
         or root.get("polarity") not in _PROPOSITION_POLARITIES
         or root.get("currentness") not in _PROPOSITION_CURRENTNESS
         or not _valid_source_span(root.get("span"), body, expected_text=body)
@@ -319,7 +321,7 @@ def proposition_evidence_is_schema_valid(
     if sorted(structured_route_keys) != sorted(expected_route_keys):
         return False
     relations = value.get("relations")
-    if not isinstance(relations, list) or len(relations) > 32:
+    if not isinstance(relations, list) or not relations or len(relations) > 32:
         return False
     valid_targets = {"root", *facts}
     valid_targets.update(

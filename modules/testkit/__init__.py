@@ -502,12 +502,40 @@ def _ensure_test_proposition_evidence(
         start = body.index(text)
         return {"start": start, "end": start + len(text), "text": text}
 
+    relations: list[JsonValue] = [
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "target": "root",
+            "span": {"start": 0, "end": len(body), "text": body},
+        }
+    ]
+    for fact_name, fact_evidence in evidence.items():
+        if isinstance(fact_evidence, str):
+            relations.append(
+                {
+                    "kind": "supports",
+                    "direction": "outgoing",
+                    "target": fact_name,
+                    "span": span(fact_evidence),
+                }
+            )
+    for kind, value, route_evidence in route_values:
+        relations.append(
+            {
+                "kind": "supports",
+                "direction": "outgoing",
+                "target": f"route:{kind}:{value}",
+                "span": span(route_evidence),
+            }
+        )
     candidate["proposition_evidence"] = {
         "contract_version": "source-proposition-evidence-v1",
         "coverage": "complete_source_revision",
         "root": {
             "proposition_id": candidate_key,
             "domain": "football_match",
+            "meaning": "open_match",
             "polarity": "positive",
             "currentness": "current",
             "span": {"start": 0, "end": len(body), "text": body},
@@ -533,7 +561,7 @@ def _ensure_test_proposition_evidence(
             }
             for kind, value, route_evidence in route_values
         ],
-        "relations": [],
+        "relations": relations,
     }
     return enriched
 

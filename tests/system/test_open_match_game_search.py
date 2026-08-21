@@ -2375,6 +2375,46 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "francs belges",
             "fr",
         ),
+        (
+            "indian-rupees",
+            "at 06:05",
+            None,
+            "06:05",
+            "500",
+            "Indian rupees",
+            "Indian rupees",
+            "en",
+        ),
+        (
+            "brazilian-reais",
+            "в 12:05",
+            None,
+            "12:05",
+            "500",
+            "Brazilian reais",
+            "Brazilian reais",
+            "ru",
+        ),
+        (
+            "iranian-rials",
+            "a las 18:06",
+            None,
+            "18:06",
+            "500",
+            "Iranian rials",
+            "Iranian rials",
+            "es",
+        ),
+        (
+            "south-african-rand",
+            "à 22:05",
+            None,
+            "22:05",
+            "500",
+            "South African rand",
+            "South African rand",
+            "fr",
+        ),
     )
     for offset, (
         label,
@@ -2685,7 +2725,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             ),
             to_checkpoint=TelegramChannelCheckpoint(pts=range_base_checkpoint + offset),
             source_event_id=f"source-event:open-match:{label}",
-            telegram_message_id=1050 + offset,
+            telegram_message_id=1200 + offset,
             revision=1,
             kind=SourceEventKind.CREATE,
             body=range_body,
@@ -2701,7 +2741,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                 opportunity
                 for opportunity in system.opportunities()
                 if opportunity.source_message_revision_id.endswith(
-                    f":{1050 + offset}:revision:1"
+                    f":{1200 + offset}:revision:1"
                 )
             ),
             None,
@@ -2721,7 +2761,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         _range_source_time,
         date_text,
         locale,
-    ) in enumerate(range_cases, start=40):
+    ) in enumerate(range_cases, start=50):
         range_user_id = bot_user_id + offset
         _advance_to_complete_game_search(
             system,
@@ -2832,6 +2872,54 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "2026-08-20",
             1,
             "Need one player",
+        ),
+        (
+            "negated-match-meaning",
+            "Football match is not a real game. 20 August 2026 на Петроградской. "
+            "Need one player. Contact @invalid_negated_match_meaning",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "superseded-location",
+            "Football match 20 August 2026 на Петроградской. The venue is now "
+            "North Station. Need one player. Contact @invalid_superseded_location",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "same-event-withdrawal",
+            "Football match 20 August 2026 на Петроградской. Need one player. "
+            "It will not go ahead. Contact @invalid_same_event_withdrawal",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            1,
+            "Need one player",
+        ),
+        (
+            "filled-individual",
+            "Football match 20 August 2026 на Петроградской. Need a goalkeeper. "
+            "All roles have been filled. Contact @invalid_filled_individual",
+            "20 August 2026",
+            None,
+            None,
+            "2026-08-20",
+            "2026-08-20",
+            None,
+            "Need a goalkeeper",
         ),
         (
             "negated-location",
@@ -3125,7 +3213,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                 open_places=invalid_open_places,
             )
         classifier.return_for(body=invalid_body, result=invalid_result)
-        message_id = 1060 + offset
+        message_id = 1300 + offset
         invalid_message_ids.append(message_id)
         source_event_id = f"source-event:open-match:{label}"
         telegram_ingestion.add_channel_difference_event(
@@ -3192,7 +3280,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         evidence["payment"] = payment_evidence
         candidate["payment"] = "paid"
         classifier.return_for(body=invalid_body, result=invalid_result)
-        message_id = 1090 + offset
+        message_id = 1400 + offset
         invalid_message_ids.append(message_id)
         source_event_id = f"source-event:open-match:lossy-{label}"
         telegram_ingestion.add_channel_difference_event(
@@ -3325,6 +3413,20 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
             "Need a defender. We later withdrew the opening",
             "Need a defender",
         ),
+        (
+            "legalrole",
+            "positions",
+            ["defender"],
+            "Defender is a legal role in the game",
+            "Defender is a legal role in the game",
+        ),
+        (
+            "filledrole",
+            "positions",
+            ["defender"],
+            "Need a defender. All roles have been filled",
+            "Need a defender",
+        ),
     )
     optional_checkpoint = invalid_checkpoint + len(lossy_currency_cases)
     for offset, (
@@ -3361,7 +3463,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         candidate[field_name] = field_value
         evidence[field_name] = optional_evidence_fragment
         classifier.return_for(body=invalid_body, result=invalid_result)
-        message_id = 1100 + offset
+        message_id = 1500 + offset
         invalid_message_ids.append(message_id)
         source_event_id = f"source-event:open-match:negated-optional-{label}"
         telegram_ingestion.add_channel_difference_event(
