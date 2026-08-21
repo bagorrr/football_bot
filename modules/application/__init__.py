@@ -46,6 +46,7 @@ from modules.domain import (
     DateInterpretation,
     DateInterpretationQuery,
     DiscoveryDraft,
+    ExplicitAmountCurrencySpan,
     GeographicType,
     GeographyConfirmation,
     GeographyConfirmationKind,
@@ -95,6 +96,10 @@ from modules.ports import (
     TelegramIngestionAdapter,
     TimezoneDataAdapter,
     TimezoneDataError,
+)
+from modules.proposition_graph import (
+    PropositionState,
+    canonical_proposition_graph_from_wire,
 )
 
 SUPPORTED_LOCALES = frozenset({"en", "es", "fr", "ru"})
@@ -8807,6 +8812,20 @@ def _proposition_evidence_is_authoritative(
         routes=routes,
     ):
         return False
+    graph = canonical_proposition_graph_from_wire(
+        value,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    )
+    if (
+        graph is None
+        or not graph.is_current_positive()
+        or not graph.has_complete_support_topology()
+        or not _source_player_participation_is_current(body)
+    ):
+        return False
     contract = cast(dict[str, JsonValue], value)
     root = contract.get("root")
     facts = contract.get("facts")
@@ -8873,6 +8892,32 @@ def _proposition_evidence_is_authoritative(
             return False
         supported_targets.add(target)
     return supported_targets == set(expected_support_spans)
+
+
+def _source_player_participation_is_current(body: str) -> bool:
+    """Reject a positive graph when the source negates player participation."""
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    negated_player_proposition_patterns = (
+        r"\b(?:match|game)\b[^.!?;\n]{0,80}"
+        r"\b(?:is|are|was|were)\s+not\s+(?:intended|meant)\s+for\s+"
+        r"(?:individual\s+)?players?\b",
+        r"\bnot\s+(?:intended|meant)\s+for\s+(?:individual\s+)?players?\b",
+        r"\b(?:матч\w*|игр\w*)\b[^.!?;\n]{0,80}"
+        r"\bне\s+предназначен\w*\s+для\s+(?:отдельн\w*\s+)?игрок\w*\b",
+        r"\bне\s+предназначен\w*\s+для\s+(?:отдельн\w*\s+)?игрок\w*\b",
+        r"\bpartid\w*\b[^.!?;\n]{0,80}"
+        r"\bno\s+est[áa]\s+destinad\w*\s+a\s+"
+        r"(?:jugador\w*\s+individual\w*|jugador\w*)\b",
+        r"\bno\s+est[áa]\s+destinad\w*\s+a\s+"
+        r"(?:jugador\w*\s+individual\w*|jugador\w*)\b",
+        r"\bmatch\w*\b[^.!?;\n]{0,80}"
+        r"\bn\s+est\s+pas\s+destin\w*\s+(?:aux|a\s+des)\s+joueur\w*\b",
+        r"\bn\s+est\s+pas\s+destin\w*\s+(?:aux|a\s+des)\s+joueur\w*\b",
+    )
+    return not any(
+        re.search(pattern, normalized) is not None
+        for pattern in negated_player_proposition_patterns
+    )
 
 
 def _validated_open_match_proposal(
@@ -9182,6 +9227,8 @@ def _validated_open_match_proposal(
 def _body_establishes_current_open_match(body: str) -> bool:
     """Require one positive, unambiguous football-match proposition."""
     normalized = re.sub(r"['’]", " ", body.casefold())
+    if not _source_player_participation_is_current(body):
+        return False
     if re.search(
         r"\b(?:football\s+)?(?:match|game)\b[^.!?;\n]{0,60}"
         r"\b(?:is|are|was|were)\s+not\s+(?:a\s+)?"
@@ -9321,6 +9368,26 @@ def _location_mention_is_authoritative(body: str, mention: str) -> bool:
     replacement_positions = tuple(
         match.start() for match in replacement.finditer(normalized_body)
     )
+    directional_replacement = re.compile(
+        r"\b(?:switched|changed|moved)\s+from\b[^.!?;\n]*?\bto\b|"
+        r"\bсмен\w*\s+с\b[^.!?;\n]*?\bна\b|"
+        r"\bcambi\w*\s+de\b[^.!?;\n]*?\ba\b|"
+        r"\b(?:est\s+)?pass[ée]\w*\s+de\b[^.!?;\n]*?\b(?:à|a)\b"
+    )
+    directional_replacement_edges = tuple(
+        directional_replacement.finditer(normalized_body)
+    )
+
+    def directional_location_state(position: int) -> PropositionState | None:
+        """Interpret a directional replacement as typed old/current states."""
+        state: PropositionState | None = None
+        for edge in directional_replacement_edges:
+            if edge.start() <= position < edge.end():
+                return PropositionState.SUPERSEDED
+            if position >= edge.end():
+                state = PropositionState.CURRENT_POSITIVE
+        return state
+
     current_location_marker = re.compile(
         r"\b(?:the\s+)?(?:venue|location|place)\s+(?:is\s+)?"
         r"(?:now|currently|moved\s+to|has\s+moved\s+to)\b|"
@@ -9338,6 +9405,10 @@ def _location_mention_is_authoritative(body: str, mention: str) -> bool:
     positive_occurrences: list[re.Match[str]] = []
     negative_positions: list[int] = []
     for occurrence in occurrences:
+        directional_state = directional_location_state(occurrence.start())
+        if directional_state is PropositionState.SUPERSEDED:
+            negative_positions.append(occurrence.start())
+            continue
         clause_start = (
             max(
                 normalized_body.rfind(boundary, 0, occurrence.start())
@@ -10049,7 +10120,7 @@ def _body_has_terminal_retraction(body: str) -> bool:
         r"(?:will\s+not|won\s+t)\s+(?:go\s+ahead|happen|take\s+place)\b|"
         r"\b(?:он|матч\w*|игр\w*)\s+не\s+состо\w*\b|"
         r"\bno\s+se\s+(?:jugar\w*|celebrar\w*|tendr\w*\s+lugar)\b|"
-        r"\bil\s+n\s+aura\s+pas\s+lieu\b|"
+        r"\b(?:il|le\s+match|ce\s+match|match)\s+n\s+aura\s+pas\s+lieu\b|"
         r"\bne\s+se\s+(?:jouera|tiendra)\s+pas\b"
     )
     unrelated_subject = re.compile(
@@ -10475,6 +10546,8 @@ def _open_places_are_supported(
         )
     if open_places is not None and open_places <= 0:
         return False
+    if _source_player_opening_state(evidence) is not PropositionState.CURRENT_POSITIVE:
+        return False
     normalized_evidence = re.sub(
         r"(?<=\d)[\s\u00a0,.](?=\d{3}(?:\D|$))",
         "",
@@ -10783,6 +10856,34 @@ def _open_places_are_supported(
     )
 
 
+def _source_player_opening_state(body: str) -> PropositionState:
+    """Classify the bounded current/closed state of a player opening."""
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    if _body_has_terminal_retraction(normalized):
+        return PropositionState.WITHDRAWN
+    closure_patterns = (
+        r"\bvacanc(?:y|ies)\b[^.!?;\n]{0,40}"
+        r"\b(?:filled|occupied|closed|taken)\b",
+        r"\b(?:goalkeeper|defender|midfielder|forward)\b[^.!?;\n]{0,40}"
+        r"\b(?:has\s+been|was|is)\s+(?:recruited|hired|filled|taken)\b",
+        r"\bваканси\w*\b[^.!?;\n]{0,40}"
+        r"\b(?:заполн\w*|занят\w*|закрыт\w*|укомплектован\w*)\b",
+        r"\b(?:вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*)"
+        r"[^.!?;\n]{0,40}\b(?:набран\w*|нанят\w*|укомплектован\w*)\b",
+        r"\bvacante\w*\b[^.!?;\n]{0,40}"
+        r"\b(?:cubiert\w*|ocupad\w*|cerrad\w*|llen\w*)\b",
+        r"\b(?:portero\w*|defensa\w*|centrocampista\w*|delantero\w*)"
+        r"[^.!?;\n]{0,40}\b(?:reclutad\w*|contratad\w*|cubiert\w*)\b",
+        r"\b(?:vacance\w*|poste\w*|r[oô]le\w*)\b[^.!?;\n]{0,40}"
+        r"\b(?:pourvu\w*|occup[ée]\w*|ferm[ée]\w*|combl[ée]\w*)\b",
+        r"\b(?:gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)"
+        r"[^.!?;\n]{0,40}\b(?:recrut[ée]\w*|engag[ée]\w*|pourvu\w*)\b",
+    )
+    if any(re.search(pattern, normalized) is not None for pattern in closure_patterns):
+        return PropositionState.WITHDRAWN
+    return PropositionState.CURRENT_POSITIVE
+
+
 _ISO_CURRENCY_CODES = frozenset(
     """AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD
     BND BOB BOV BRL BSD BTN BWP BYN BZD CAD CDF CHE CHF CHW CLF CLP CNY COP
@@ -10848,7 +10949,9 @@ def _has_supported_currency_name_suffix(evidence: str, currency_end: int) -> boo
     )
 
 
-def _currency_phrase_is_explicit(currency: str) -> bool:
+def _currency_phrase_is_explicit(
+    currency: str, *, allow_single_token: bool = False
+) -> bool:
     """Recognize a source currency phrase without a country-head allowlist."""
     normalized = currency.casefold().strip()
     if any(symbol in normalized for symbol in "₽$€£¥₴₸₹₾₺"):
@@ -10856,7 +10959,9 @@ def _currency_phrase_is_explicit(currency: str) -> bool:
     tokens = re.findall(r"[^\W\d_]+", normalized)
     if not tokens or any(token in _CURRENCY_COLLISION_WORDS for token in tokens):
         return False
-    if len(tokens) == 1 and tokens[0].upper() in _ISO_CURRENCY_CODES:
+    if len(tokens) == 1 and (
+        tokens[0].upper() in _ISO_CURRENCY_CODES or allow_single_token
+    ):
         return True
     if any(
         re.search(
@@ -10881,14 +10986,7 @@ def _iso_currency_token_has_payment_context(
     *,
     currency_before_amount: bool,
 ) -> bool:
-    payment_context = (
-        r"(?:\bfee\b|\bcost\w*\b|\bprice\b|\bpay(?:ment|able|ing)?\b|"
-        r"\bcharge\b|\bentry\b|\bparticipation\b|\bbudget\b|"
-        r"\bвзнос\w*\b|\bстоим\w*\b|\bцен\w*\b|\bоплат\w*\b|"
-        r"\bучаст\w*\b|\bentrada\b|\btarifa\b|\bprecio\b|"
-        r"\bcuota\b|\bpago\b|\bparticipaci[oó]n\b|\btarif\w*\b|"
-        r"\bprix\b|\bco[uû]t\w*\b|\bcotisation\b|\bfrais\b)"
-    )
+    payment_context = _PAYMENT_CONTEXT_PATTERN
     prefix = evidence[:pair_start].casefold()
     has_payment_context = re.search(payment_context, prefix) is not None
     ambiguous_iso_words = {"ALL", "CUP", "GEL", "MAD", "PEN", "TOP", "TRY"}
@@ -10907,8 +11005,30 @@ def _iso_currency_token_has_payment_context(
     return currency == currency.upper() or has_payment_context
 
 
-def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None:
-    """Return one adjacent source-stated amount/currency pair without inference."""
+_PAYMENT_CONTEXT_PATTERN = (
+    r"(?:\bfee\b|\bcost\w*\b|\bprice\b|\bpay(?:ment|able|ing)?\b|"
+    r"\bcharge\b|\bentry\b|\bparticipation\b|\bbudget\b|"
+    r"\bвзнос\w*\b|\bстоим\w*\b|\bцен\w*\b|\bоплат\w*\b|"
+    r"\bучаст\w*\b|\bentrada\b|\btarifa\b|\bprecio\b|"
+    r"\bcuota\b|\bpago\b|\bparticipaci[oó]n\b|\btarif\w*\b|"
+    r"\bprix\b|\bco[uû]t\w*\b|\bcotisation\b|\bfrais\b)"
+)
+
+
+def _payment_context_before_amount(evidence: str, amount_start: int) -> bool:
+    return (
+        re.search(
+            _PAYMENT_CONTEXT_PATTERN,
+            evidence[:amount_start].casefold(),
+        )
+        is not None
+    )
+
+
+def _explicit_amount_currency_span(
+    evidence: str,
+) -> ExplicitAmountCurrencySpan | None:
+    """Parse one exact adjacent amount/currency source span."""
     separators = r"[\s\u00a0]*"
     currency_boundary = (
         rf"(?=[\s\u00a0]*(?:[.,;:!?]|$|{_STATED_PAYMENT_QUALIFIER_PATTERN}))"
@@ -10922,7 +11042,13 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
         currency = amount_then_currency.group("currency")
         is_iso_token = currency.upper() in _ISO_CURRENCY_CODES
         if (
-            not _currency_phrase_is_explicit(currency)
+            not _currency_phrase_is_explicit(
+                currency,
+                allow_single_token=_payment_context_before_amount(
+                    evidence,
+                    amount_then_currency.start("amount"),
+                ),
+            )
             or not _has_supported_currency_name_suffix(
                 evidence, amount_then_currency.end("currency")
             )
@@ -10938,9 +11064,16 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
             )
         ):
             continue
-        return (
-            amount_then_currency.group("amount"),
-            currency,
+        return ExplicitAmountCurrencySpan(
+            source_text=amount_then_currency.group(0),
+            amount=amount_then_currency.group("amount"),
+            currency=currency,
+            start=amount_then_currency.start(),
+            end=amount_then_currency.end(),
+            amount_start=amount_then_currency.start("amount"),
+            amount_end=amount_then_currency.end("amount"),
+            currency_start=amount_then_currency.start("currency"),
+            currency_end=amount_then_currency.end("currency"),
         )
     currency_then_amount_pattern = (
         rf"(?<!\w)(?P<currency>{_STATED_CURRENCY_PATTERN}){separators}"
@@ -10949,7 +11082,14 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
     for currency_then_amount in re.finditer(currency_then_amount_pattern, evidence):
         currency = currency_then_amount.group("currency")
         if (
-            not _currency_phrase_is_explicit(currency)
+            not _currency_phrase_is_explicit(
+                currency,
+                # A bare word before the amount is not an explicit currency
+                # span: otherwise payment context makes "Fee 500" parse as
+                # currency="Fee". Single-token natural-language currencies
+                # are supported only in the amount-then-currency form.
+                allow_single_token=False,
+            )
             or not _has_supported_currency_name_suffix(
                 evidence, currency_then_amount.end("amount")
             )
@@ -10965,11 +11105,24 @@ def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None
             )
         ):
             continue
-        return (
-            currency_then_amount.group("amount"),
-            currency,
+        return ExplicitAmountCurrencySpan(
+            source_text=currency_then_amount.group(0),
+            amount=currency_then_amount.group("amount"),
+            currency=currency,
+            start=currency_then_amount.start(),
+            end=currency_then_amount.end(),
+            amount_start=currency_then_amount.start("amount"),
+            amount_end=currency_then_amount.end("amount"),
+            currency_start=currency_then_amount.start("currency"),
+            currency_end=currency_then_amount.end("currency"),
         )
     return None
+
+
+def _stated_payment_amount_and_currency(evidence: str) -> tuple[str, str] | None:
+    """Return one adjacent source-stated amount/currency pair without inference."""
+    span = _explicit_amount_currency_span(evidence)
+    return None if span is None else (span.amount, span.currency)
 
 
 def _patterns_have_affirmative_clause_support(
@@ -11247,6 +11400,12 @@ def _optional_values_are_supported(
                 if field_name == "team_formats"
                 else lexicon[field_name][value]
             )
+            if (
+                field_name == "positions"
+                and _source_position_state(value, normalized)
+                is not PropositionState.CURRENT_POSITIVE
+            ):
+                return False
             if not _patterns_have_affirmative_clause_support(normalized, patterns):
                 return False
             if _authoritative and not _patterns_have_football_clause_support(
@@ -11333,6 +11492,24 @@ def _optional_values_are_supported(
         ):
             return False
     return True
+
+
+def _source_position_state(value: str, body: str) -> PropositionState:
+    """Keep role values tied to player participation, not verb homonyms."""
+    if value != "forward":
+        return PropositionState.CURRENT_POSITIVE
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    forwarding_message = re.compile(
+        r"\bforward(?:ed|ing)?\b[^.!?;\n]{0,40}"
+        r"\b(?:this\s+)?(?:message|email|text|post)\b|"
+        r"\b(?:message|email|text|post)\b[^.!?;\n]{0,40}"
+        r"\bforward(?:ed|ing)?\b"
+    )
+    return (
+        PropositionState.UNKNOWN
+        if forwarding_message.search(normalized) is not None
+        else PropositionState.CURRENT_POSITIVE
+    )
 
 
 def _payment_has_opportunity_semantics(

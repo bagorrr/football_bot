@@ -1,11 +1,16 @@
 """Versioned proposition/evidence contract at the classifier boundary."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual evidence is intentional.
+
 from __future__ import annotations
 
 from copy import deepcopy
 from typing import cast
 
-from modules.application import _proposition_evidence_is_authoritative
+from modules.application import (
+    _body_establishes_current_open_match,
+    _proposition_evidence_is_authoritative,
+)
 from modules.classifier_contract import proposition_evidence_is_schema_valid
 from modules.contracts import JsonValue
 
@@ -297,3 +302,99 @@ def test_application_rejects_negative_stale_or_competing_propositions() -> None:
         evidence=evidence,
         routes=routes,
     )
+
+
+def test_application_rejects_all_positive_graph_for_negated_player_participation() -> (
+    None
+):
+    body = (
+        "Football match is not intended for individual players. "
+        "20 August 2026 at Central Station. Need one player. "
+        "Contact @match_contact"
+    )
+    evidence = {
+        "opportunity": "Football match is not intended for individual players",
+        "event_time": "20 August 2026",
+        "location": "at Central Station",
+        "open_places": "Need one player",
+    }
+    routes = [
+        {
+            "kind": "explicit_telegram_username",
+            "value": "@match_contact",
+            "evidence": "Contact @match_contact",
+        }
+    ]
+
+    # The fixture deliberately supplies positive/current nodes and support edges.
+    # Application acceptance must still be bound to the source meaning.
+    assert not _authoritative(
+        _contract(body, evidence=evidence, routes=routes),
+        body=body,
+        candidate_key="open-place",
+        evidence=evidence,
+        routes=routes,
+    )
+
+
+def test_application_rejects_negated_player_participation_in_all_locales() -> None:
+    cases = (
+        (
+            "Football match is not intended for individual players. "
+            "20 August 2026 at Central Station. Need one player. "
+            "Contact @match_contact",
+            "Football match is not intended for individual players",
+            "20 August 2026",
+            "at Central Station",
+            "Need one player",
+        ),
+        (
+            "Футбольный матч не предназначен для отдельных игроков. "
+            "20 августа 2026 у Центральной. Нужен один игрок. "
+            "Контакт @match_contact",
+            "Футбольный матч не предназначен для отдельных игроков",
+            "20 августа 2026",
+            "у Центральной",
+            "Нужен один игрок",
+        ),
+        (
+            "El partido de fútbol no está destinado a jugadores individuales. "
+            "20 agosto 2026 en Estación Central. Necesitamos un jugador. "
+            "Contacto @match_contact",
+            "El partido de fútbol no está destinado a jugadores individuales",
+            "20 agosto 2026",
+            "en Estación Central",
+            "Necesitamos un jugador",
+        ),
+        (
+            "Le match de football n'est pas destiné aux joueurs individuels. "
+            "20 août 2026 à la Gare Centrale. Besoin d'un joueur. "
+            "Contact @match_contact",
+            "Le match de football n'est pas destiné aux joueurs individuels",
+            "20 août 2026",
+            "à la Gare Centrale",
+            "Besoin d'un joueur",
+        ),
+    )
+    for body, opportunity, event_time, location, open_places in cases:
+        assert not _body_establishes_current_open_match(body)
+        evidence = {
+            "opportunity": opportunity,
+            "event_time": event_time,
+            "location": location,
+            "open_places": open_places,
+        }
+        routes = [
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@match_contact",
+                "evidence": "@match_contact",
+            }
+        ]
+        assert not _authoritative(
+            _contract(body, evidence=evidence, routes=routes),
+            body=body,
+            candidate_key="open-place",
+            evidence=evidence,
+            routes=routes,
+        )

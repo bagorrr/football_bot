@@ -89,6 +89,27 @@ class MatchState(StrEnum):
     CONFLICT = "conflict"
 
 
+@dataclass(frozen=True, slots=True)
+class ExplicitAmountCurrencySpan:
+    """One adjacent source-stated amount/currency span.
+
+    The payment parser returns this typed value before Application persists the
+    exact amount and currency strings. The surrounding payment context, exact
+    adjacency, and source span are part of the contract; currency names are not
+    inferred from a finite suffix list.
+    """
+
+    source_text: str
+    amount: str
+    currency: str
+    start: int
+    end: int
+    amount_start: int
+    amount_end: int
+    currency_start: int
+    currency_end: int
+
+
 def match_detail(
     requested: tuple[str, ...], accepted: tuple[str, ...] | None
 ) -> MatchState:

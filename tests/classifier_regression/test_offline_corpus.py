@@ -587,6 +587,22 @@ def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:
 
 def test_offline_authority_boundary_rejects_non_authoritative_facts() -> None:
     for body in (
+        "Football match is not intended for individual players. "
+        "20 August 2026 at Central Station. Need one player. "
+        "Contact @match_contact",
+        "Футбольный матч не предназначен для отдельных игроков. "
+        "20 августа 2026 у Центральной. Нужен один игрок. "
+        "Контакт @match_contact",
+        "El partido de fútbol no está destinado a jugadores individuales. "
+        "20 agosto 2026 en Estación Central. Necesitamos un jugador. "
+        "Contacto @match_contact",
+        "Le match de football n'est pas destiné aux joueurs individuels. "
+        "20 août 2026 à la Gare Centrale. Besoin d'un joueur. "
+        "Contact @match_contact",
+    ):
+        assert not _body_establishes_current_open_match(body)
+
+    for body in (
         "Practice 20 August 2026 at Central Station. Need two players",
         "Тренировка 20 августа 2026 у Центральной. Нужны два игрока",
         "Partido o entrenamiento 20 agosto 2026 en Estación Central",

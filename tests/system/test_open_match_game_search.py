@@ -132,6 +132,207 @@ def test_untyped_classifier_peer_fails_closed_before_model_and_replay() -> None:
     system.reset()
 
 
+def test_semantically_negated_open_match_has_no_postgres_publication_effect() -> None:
+    """Model-positive evidence cannot publish a source-negated opening."""
+    telegram_ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_120
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_120,
+    )
+    telegram_ingestion.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4920",
+    )
+    timezones.add_source(version="controlled-tzdb-v1", timezones=("Europe/Moscow",))
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="in whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                                ("ru", "Санкт-Петербург"),
+                            ),
+                        ),
+                    ),
+                    whole_city=True,
+                ),
+            ),
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    def result_for(body: str, contact: str) -> ClassifierAdapterResult:
+        result = _minimal_classifier_result(
+            candidate_key=contact.removeprefix("@").replace("_", "-"),
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": contact,
+                    "evidence": contact,
+                }
+            ],
+            event_time_evidence="20 August 2026",
+            opportunity_evidence="Need one player",
+            open_places_evidence="Need one player",
+        )
+        candidates = result.output["candidates"]
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        candidate_evidence = candidate.get("evidence")
+        assert isinstance(candidate_evidence, dict)
+        candidate["evidence"] = {
+            **candidate_evidence,
+            "location": "in whole city",
+        }
+        candidate["location"] = {
+            "mention": "in whole city",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        }
+        return result
+
+    negative_body = (
+        "Football match is not intended for individual players. "
+        "20 August 2026 in whole city. Need one player. "
+        "Contact @s1_negative"
+    )
+    valid_body = (
+        "Football match for individual players. 20 August 2026 in whole city. "
+        "Need one player. Contact @s1_valid"
+    )
+    classifier.return_for(
+        body=negative_body,
+        result=result_for(negative_body, "@s1_negative"),
+    )
+    classifier.return_for(
+        body=valid_body,
+        result=result_for(valid_body, "@s1_valid"),
+    )
+
+    negative_source_event_id = "source-event:open-match:s1-negative"
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4920),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4921),
+        source_event_id=negative_source_event_id,
+        telegram_message_id=1120,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=negative_body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    negative_revision_id = next(
+        revision.source_message_revision_id
+        for revision in system.source_message_revisions()
+        if revision.source_event_id == negative_source_event_id
+    )
+    assert system.classification_attempts()[-1].status == "succeeded"
+    assert system.classification_attempts()[-1].disposition == "accepted"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(negative_revision_id) == ()
+    negative_attempts = system.classification_attempts()
+    assert not system.redeliver_source_event(negative_source_event_id)
+    system.process_opportunities_until_idle()
+    assert system.classification_attempts() == negative_attempts
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(negative_revision_id) == ()
+
+    valid_source_event_id = "source-event:open-match:s1-valid"
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4921),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4922),
+        source_event_id=valid_source_event_id,
+        telegram_message_id=1121,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=valid_body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    valid_revision_id = next(
+        revision.source_message_revision_id
+        for revision in system.source_message_revisions()
+        if revision.source_event_id == valid_source_event_id
+    )
+    valid_opportunities = system.opportunities()
+    assert len(system.classification_attempts()) == 2, (
+        len(classifier.requests),
+        len(system.source_events()),
+        len(system.source_event_contracts()),
+    )
+    assert len(valid_opportunities) == 1
+    assert valid_opportunities[0].publication_state == "active"
+    valid_publication_contracts = system.opportunity_publication_contracts(
+        valid_revision_id
+    )
+    assert len(valid_publication_contracts) == 1
+    assert not system.redeliver_source_event(valid_source_event_id)
+    system.process_opportunities_until_idle()
+    assert system.opportunities() == valid_opportunities
+    assert system.opportunity_publication_contracts(valid_revision_id) == (
+        valid_publication_contracts
+    )
+    system.reset()
+
+
 def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> None:
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     telegram_delivery = ControlledTelegramDeliveryAdapter()

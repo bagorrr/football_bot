@@ -156,6 +156,34 @@ def test_location_evidence_tracks_current_replacement_across_the_revision() -> N
         assert _location_mention_is_authoritative(body, current_mention)
 
 
+def test_location_evidence_tracks_switched_from_to_current_edges() -> None:
+    cases = (
+        (
+            "The venue switched from Central Station to North Station",
+            "Central Station",
+            "North Station",
+        ),
+        (
+            "Место сменилось с Центральной на Северную",
+            "Центральной",
+            "Северную",
+        ),
+        (
+            "El lugar cambió de Estación Central a Estación Norte",
+            "Estación Central",
+            "Estación Norte",
+        ),
+        (
+            "Le lieu est passé de la Gare Centrale à la Gare du Nord",
+            "Gare Centrale",
+            "Gare du Nord",
+        ),
+    )
+    for body, old_mention, current_mention in cases:
+        assert not _location_mention_is_authoritative(body, old_mention)
+        assert _location_mention_is_authoritative(body, current_mention)
+
+
 def test_explicit_route_requires_contact_semantics_before_fallback_priority() -> None:
     fallback: JsonValue = {
         "reply_route_url": "https://t.me/source_chat/49?comment=1",
@@ -789,6 +817,21 @@ def test_complete_body_temporal_retraction_must_refer_to_the_same_event() -> Non
         )
 
 
+def test_french_same_event_withdrawal_rejects_the_opening() -> None:
+    event_date = date(2026, 8, 20)
+    body = (
+        "Match de football le 20 août 2026 à la Gare Centrale. "
+        "Besoin d'un joueur. Le match n'aura pas lieu."
+    )
+    assert not _event_time_is_supported(
+        event_date,
+        event_date,
+        None,
+        "20 août 2026",
+        authoritative_body=body,
+    )
+
+
 def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
     positive_cases = (
         (6, "Need six players"),
@@ -922,6 +965,26 @@ def test_current_individual_opening_is_proven_across_the_complete_body() -> None
         "Buscamos un portero. Ya encontramos uno",
         "Nous cherchons un gardien. On en a trouvé un",
     ):
+        assert not _open_places_are_supported(None, body)
+
+
+def test_current_individual_opening_rejects_vacancy_and_recruitment_closure() -> None:
+    closed_cases = (
+        "Football match 20 August 2026. Need a goalkeeper. The vacancy has been filled",
+        "Football match 20 August 2026. Need a goalkeeper. "
+        "The goalkeeper has been recruited",
+        "Футбольный матч 20 августа 2026. Нужен вратарь. Вакансия заполнена",
+        "Футбольный матч 20 августа 2026. Нужен вратарь. Вратарь набран",
+        "Partido de fútbol 20 agosto 2026. Necesitamos un portero. "
+        "La vacante ha sido cubierta",
+        "Partido de fútbol 20 agosto 2026. Necesitamos un portero. "
+        "El portero ha sido reclutado",
+        "Match de football le 20 août 2026. Besoin d'un gardien. "
+        "La vacance a été pourvue",
+        "Match de football le 20 août 2026. Besoin d'un gardien. "
+        "Le gardien a été recruté",
+    )
+    for body in closed_cases:
         assert not _open_places_are_supported(None, body)
 
     for body in (
@@ -1064,6 +1127,16 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
         "Fee 500 euros per player parking included",
     ):
         assert _stated_payment_amount_and_currency(ambiguous_longer_name) is None
+
+
+def test_explicit_single_token_currency_spans_preserve_amount_and_currency() -> None:
+    for currency in ("rand", "won", "lek", "dinar", "franc"):
+        evidence = f"Fee 500 {currency}"
+        assert _stated_payment_amount_and_currency(evidence) == ("500", currency)
+        assert _optional_values_are_supported(
+            {"payment": "paid"},
+            {"payment": evidence},
+        )
 
 
 def test_currency_evidence_disambiguates_iso_prose_and_ordinary_qualifiers() -> None:
@@ -1287,10 +1360,22 @@ def test_semantic_evidence_is_bound_to_the_authoritative_source_body() -> None:
 def test_optional_facts_reject_forward_payment_homonyms_and_filled_roles() -> None:
     assert not _optional_values_are_supported(
         {"positions": ["forward"]},
+        {"positions": "Please forward this message to the player"},
+    )
+    assert not _optional_values_are_supported(
+        {"positions": ["forward"]},
         {"positions": "forward"},
         authoritative_body=(
             "Football match 20 August 2026. Need a goalkeeper. "
             "Please forward this message"
+        ),
+    )
+    assert not _optional_values_are_supported(
+        {"positions": ["forward"]},
+        {"positions": "Please forward this message to the player"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need one player. "
+            "Please forward this message to the player"
         ),
     )
 
