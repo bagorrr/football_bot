@@ -18,7 +18,10 @@ from modules.application import (
     _select_response_route,
     _stated_payment_amount_and_currency,
 )
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    PROPOSITION_EVIDENCE_VERSION,
+    classifier_output_is_schema_valid,
+)
 from modules.contracts import JsonValue
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
 from modules.testkit import ControlledModelAdapter
@@ -99,6 +102,12 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
             assert isinstance(candidate, dict)
             evidence = candidate["evidence"]
             assert isinstance(evidence, dict)
+            proposition_evidence = candidate["proposition_evidence"]
+            assert isinstance(proposition_evidence, dict)
+            assert (
+                proposition_evidence["contract_version"] == PROPOSITION_EVIDENCE_VERSION
+            )
+            assert proposition_evidence["coverage"] == "complete_source_revision"
             assert _optional_values_are_supported(candidate, evidence)
             assert candidate["opportunity_type"] == expected["opportunity_type"]
             assert candidate["open_places"] == expected["open_places"]

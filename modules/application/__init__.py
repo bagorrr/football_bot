@@ -17,7 +17,10 @@ from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    classifier_output_is_schema_valid,
+    proposition_evidence_is_schema_valid,
+)
 from modules.contracts import (
     SUB_CITY_GEOGRAPHIC_TYPES,
     SUPPORTED_CONTRACTS,
@@ -8787,6 +8790,62 @@ def _accepted_city_display_labels(
     return {locale: city_label for locale in ("en", "ru", "es", "fr")}
 
 
+def _proposition_evidence_is_authoritative(
+    value: JsonValue,
+    *,
+    body: str,
+    candidate_key: str,
+    evidence: dict[str, JsonValue],
+    routes: list[JsonValue],
+) -> bool:
+    """Accept only one complete, positive, current proposition graph."""
+    if not proposition_evidence_is_schema_valid(
+        value,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    ):
+        return False
+    contract = cast(dict[str, JsonValue], value)
+    root = contract.get("root")
+    facts = contract.get("facts")
+    structured_routes = contract.get("routes")
+    relations = contract.get("relations")
+    if (
+        not isinstance(root, dict)
+        or root.get("domain") != "football_match"
+        or root.get("polarity") != "positive"
+        or root.get("currentness") != "current"
+        or not isinstance(facts, dict)
+        or not isinstance(structured_routes, list)
+        or not isinstance(relations, list)
+    ):
+        return False
+    for fact in facts.values():
+        if not isinstance(fact, dict) or (
+            fact.get("proposition_id") != candidate_key
+            or fact.get("polarity") != "positive"
+            or fact.get("currentness") != "current"
+        ):
+            return False
+    for route in structured_routes:
+        if not isinstance(route, dict) or (
+            route.get("proposition_id") != candidate_key
+            or route.get("polarity") != "positive"
+            or route.get("currentness") != "current"
+        ):
+            return False
+    for relation in relations:
+        if not isinstance(relation, dict):
+            return False
+        if relation.get("kind") in {"negates", "replaces", "competes_with"}:
+            return False
+        if relation.get("kind") != "supports":
+            return False
+    return True
+
+
 def _validated_open_match_proposal(
     payload_value: JsonValue,
     *,
@@ -8836,9 +8895,10 @@ def _validated_open_match_proposal(
         "playing_surfaces",
         "payment",
     }
+    structured = {"proposition_evidence"}
     if (
         not required.issubset(candidate)
-        or set(candidate) - required - optional
+        or set(candidate) - required - optional - structured
         or candidate.get("opportunity_type") != "open_match"
     ):
         return None
@@ -8866,6 +8926,15 @@ def _validated_open_match_proposal(
         proposed_routes=routes,
         bounded_metadata=payload_value.get("bounded_metadata"),
     )
+    proposition_evidence = candidate.get("proposition_evidence")
+    if not _proposition_evidence_is_authoritative(
+        proposition_evidence,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    ):
+        return None
     if route is None:
         return None
     route_value = route["value"]
@@ -9073,43 +9142,127 @@ def _validated_open_match_proposal(
         "opportunity_type": "open_match",
         "publication_state": "active",
         "accepted_facts": accepted_facts,
-        "evidence": evidence,
+        "evidence": {
+            **evidence,
+            "proposition_evidence": proposition_evidence,
+        },
         "response_route": {"kind": route["kind"], "value": route_value},
     }
 
 
 def _body_establishes_current_open_match(body: str) -> bool:
-    """Require an unambiguous football-game proposition in authoritative text."""
+    """Require one positive, unambiguous football-match proposition."""
     normalized = re.sub(r"['’]", " ", body.casefold())
-    if re.search(
+    game_pattern = re.compile(
+        r"\b(?:match(?:es)?|game|games|матч\w*|игр(?:а|ы|у|е|ой|аем|ают)|"
+        r"partid\w*|encuentro\w*|matchs?|rencontre\w*)\b"
+    )
+    localized_game_pattern = re.compile(
+        r"\b(?:матч\w*|игр\w*|partid\w*|encuentro\w*|matchs?|rencontre\w*)\b"
+    )
+    football_pattern = re.compile(r"\b(?:football|soccer|футбол\w*|f[úu]tbol\w*)\b")
+    role_pattern = re.compile(
+        r"\b(?:goalkeeper|defender|midfielder|striker|вратар\w*|"
+        r"защитник\w*|полузащитник\w*|нападающ\w*|portero\w*|defensa|"
+        r"centrocampista\w*|delantero\w*|gardien\w*|d[ée]fenseur\w*|"
+        r"milieu\w*|attaquant\w*)\b"
+    )
+    localized_role_pattern = re.compile(
+        r"\b(?:вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"portero\w*|defensa\w*|centrocampista\w*|delantero\w*|"
+        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b"
+    )
+    player_pattern = re.compile(r"\b(?:player\w*|игрок\w*|jugador\w*|joueur\w*)\b")
+    competing_pattern = re.compile(
+        r"\b(?:basketball|baseball|hockey|volleyball|tennis|баскетбол\w*|"
+        r"бейсбол\w*|хоккей\w*|волейбол\w*|теннис\w*|baloncesto|"
+        r"b[ée]isbol|hockey|voleibol|tenis|basket|baseball|volley|"
+        r"tournament|league|турнир\w*|лиг\w*|torneo\w*|liga\w*|"
+        r"tournoi\w*|ligue\w*)\b"
+    )
+    practice_pattern = re.compile(
         r"\b(?:practice|training|scrimmage|тренир\w*|трениров\w*|"
-        r"entrenamient\w*|pr[áa]ctic\w*|entra[îi]nement\w*|s[ée]ance\w*)\b",
-        normalized,
-    ):
-        return False
-    explicit_game = re.search(
-        r"\b(?:football\s+match|football\s+game|match(?:es)?|game|games|"
-        r"матч\w*|игр(?:а|ы|у|е|ой|аем|ают)|"
-        r"partid\w*|encuentro\w*|matchs?|rencontre\w*)\b",
-        normalized,
+        r"entrenamient\w*|pr[áa]ctic\w*|entra[îi]nement\w*|s[ée]ance\w*)\b"
     )
-    football_role = re.search(
-        r"\b(?:goalkeeper|defender|midfielder|striker|"
-        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
-        r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
-        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b",
-        normalized,
+    opening_pattern = re.compile(
+        r"\b(?:need\w*|look(?:ing)?\s+for|wanted|seeking|нуж\w*|ищ\w*|"
+        r"треб\w*|есть|necesit\w*|busc\w*|disponible\w*|cherch\w*|"
+        r"recherch\w*|besoin|reste\w*)\b"
     )
-    team_format = re.search(r"(?<!\w)(?:[5-9]|10|11)x(?:[5-9]|10|11)(?!\w)", normalized)
+    playing_pattern = re.compile(
+        r"\b(?:play(?:ing)?|игра\w*|jugamos|jugando|jouons|jouant)\b"
+    )
+    location_pattern = re.compile(r"\b(?:at|in|on|у|на|в|en|a|à)\b")
+
+    def positive_match(pattern: re.Pattern[str], clause: str) -> re.Match[str] | None:
+        for match in pattern.finditer(clause):
+            prefix = clause[: match.start()]
+            if re.search(
+                r"(?:\bnot\b|\bno\b|\bne\b|\bpas\b|\bне\b|\bни\b)"
+                r"(?:\s+[^.!?;\n]+){0,4}\s*$",
+                prefix,
+            ):
+                continue
+            return match
+        return None
+
+    clauses = re.split(r"[.!?;\n]+", normalized)
+    for clause in clauses:
+        if positive_match(competing_pattern, clause) is not None:
+            return False
+        game = positive_match(game_pattern, clause)
+        football = positive_match(football_pattern, clause)
+        role = positive_match(role_pattern, clause)
+        team_format = re.search(r"(?<!\w)(?:[5-9]|10|11)x(?:[5-9]|10|11)(?!\w)", clause)
+        opening = positive_match(opening_pattern, clause)
+        playing = positive_match(playing_pattern, clause)
+        if game is not None and (
+            football is not None or role is not None or team_format
+        ):
+            return positive_match(practice_pattern, clause) is None
+        if (
+            role is not None
+            and opening is not None
+            and (football is not None or team_format is not None)
+        ):
+            return True
+        if (
+            game is not None
+            and localized_game_pattern.search(clause) is not None
+            and opening is not None
+            and location_pattern.search(clause) is not None
+        ):
+            return positive_match(practice_pattern, clause) is None
+        if (
+            role is not None
+            and localized_role_pattern.search(clause) is not None
+            and opening is not None
+            and location_pattern.search(clause) is not None
+        ):
+            return positive_match(practice_pattern, clause) is None
+        if (
+            playing is not None
+            and opening is not None
+            and (team_format is not None or location_pattern.search(clause) is not None)
+        ):
+            return True
+    positive_game = any(
+        positive_match(game_pattern, clause) is not None for clause in clauses
+    )
     return (
-        explicit_game is not None
-        or football_role is not None
-        or team_format is not None
+        positive_game
+        and opening_pattern.search(normalized) is not None
+        and location_pattern.search(normalized) is not None
+        and (
+            role_pattern.search(normalized) is not None
+            or player_pattern.search(normalized) is not None
+        )
+        and practice_pattern.search(normalized) is None
     )
 
 
 def _location_mention_is_authoritative(body: str, mention: str) -> bool:
-    """Accept resolver-backed geography only from a positive single proposition."""
+    """Bind one location mention to the current proposition in the full body."""
     normalized_body = re.sub(r"['’]", " ", body.casefold())
     normalized_mention = re.sub(r"['’]", " ", mention.casefold())
     if not normalized_mention:
@@ -9117,6 +9270,18 @@ def _location_mention_is_authoritative(body: str, mention: str) -> bool:
     occurrences = tuple(re.finditer(re.escape(normalized_mention), normalized_body))
     if not occurrences:
         return False
+    replacement = re.compile(
+        r"\b(?:instead|rather|updated?|changed?|moved?|replaced?|"
+        r"вместо|замен\w*|обновлен\w*|перенес\w*|"
+        r"en\s+vez\s+de|sustituid\w*|actualizad\w*|cambi\w*|"
+        r"au\s+lieu\s+de|remplac\w*|mis[ée]\s+[àa]\s+jour)\b"
+    )
+    replacement_positions = tuple(
+        match.start() for match in replacement.finditer(normalized_body)
+    )
+    competing = re.compile(r"\b(?:or|или|o|ou)\b")
+    positive_occurrences: list[re.Match[str]] = []
+    negative_positions: list[int] = []
     for occurrence in occurrences:
         clause_start = (
             max(
@@ -9132,7 +9297,7 @@ def _location_mention_is_authoritative(body: str, mention: str) -> bool:
         )
         clause_end = min(following_boundaries, default=len(normalized_body))
         clause = normalized_body[clause_start:clause_end]
-        if re.search(r"\b(?:or|или|o|ou)\b", clause):
+        if competing.search(clause):
             return False
         prefix = normalized_body[clause_start : occurrence.start()]
         if re.search(
@@ -9146,8 +9311,49 @@ def _location_mention_is_authoritative(body: str, mention: str) -> bool:
             r"\s*$",
             prefix,
         ):
-            return False
-    return True
+            negative_positions.append(occurrence.start())
+            continue
+        suffix = normalized_body[occurrence.end() : clause_end]
+        if re.search(
+            r"^\s*(?:is|was|will\s+be|est|era|fue|ser[áa]|"
+            r"был\w*|будет|явля\w*)?\s*(?:not|no|ne|pas|не|ни)\s+"
+            r"(?:the\s+)?(?:venue|location|place|lugar|lieu|"
+            r"мест\w*|площад\w*|ubicaci[oó]n)\b",
+            suffix,
+        ):
+            negative_positions.append(occurrence.start())
+            continue
+        positive_occurrences.append(occurrence)
+    if not positive_occurrences:
+        return False
+    if negative_positions and max(negative_positions) > max(
+        occurrence.start() for occurrence in positive_occurrences
+    ):
+        return False
+    latest_replacement = max(replacement_positions, default=-1)
+    for occurrence in positive_occurrences:
+        if occurrence.start() > latest_replacement:
+            return True
+        clause_start = (
+            max(
+                normalized_body.rfind(boundary, 0, occurrence.start())
+                for boundary in ".!?;\n"
+            )
+            + 1
+        )
+        clause_end = min(
+            (
+                position
+                for boundary in ".!?;\n"
+                if (position := normalized_body.find(boundary, occurrence.end())) >= 0
+            ),
+            default=len(normalized_body),
+        )
+        if any(
+            clause_start <= position < clause_end for position in replacement_positions
+        ):
+            return True
+    return False
 
 
 def _select_response_route(
@@ -9171,7 +9377,7 @@ def _select_response_route(
             and isinstance(route_evidence, str)
             and route_evidence in body
             and value in route_evidence
-            and _route_has_explicit_contact_semantics(body, value)
+            and _route_has_explicit_contact_semantics(body, value, route_evidence)
             and (
                 (
                     kind == "explicit_telegram_username"
@@ -9216,32 +9422,61 @@ def _select_response_route(
     return None
 
 
-def _route_has_explicit_contact_semantics(body: str, value: str) -> bool:
+def _route_has_explicit_contact_semantics(
+    body: str, value: str, route_evidence: str | None = None
+) -> bool:
     normalized = re.sub(r"['’]", " ", body.casefold())
-    value_start = normalized.find(value.casefold())
-    if value_start < 0:
+    normalized_value = value.casefold()
+    normalized_evidence = (route_evidence or value).casefold()
+    evidence_occurrences = tuple(
+        re.finditer(re.escape(normalized_evidence), normalized)
+    )
+    if not evidence_occurrences:
         return False
-    clause_start = max(
-        normalized.rfind(boundary, 0, value_start) for boundary in ".!?;\n"
+    action_pattern = re.compile(
+        r"\b(?:contact|message|write|text|call|reply|register|apply|form|join|"
+        r"пиш\w*|напис\w*|звон\w*|связ\w*|контакт\w*|регистр\w*|запис\w*|"
+        r"форм\w*|присоедин\w*|escrib\w*|mensaje\w*|llam\w*|contact\w*|"
+        r"registr\w*|inscri\w*|formulari\w*|[ée]cri\w*|message\w*|appel\w*|"
+        r"contact\w*|inscri\w*|formulair\w*)\b"
     )
-    clause_start += 1
-    following = tuple(
-        position
-        for boundary in ".!?;\n"
-        if (position := normalized.find(boundary, value_start)) >= 0
+    negative_pattern = re.compile(
+        r"\b(?:do\s+not|does\s+not|did\s+not|don't|never|not|no|ne|pas|"
+        r"не|ни|sin|sans)\s+(?:\w+\s+){0,2}(?:contact|message|write|text|"
+        r"call|reply|register|apply|join|контакт\w*|связ\w*|напис\w*|"
+        r"llam\w*|contact\w*|[ée]cri\w*|appel\w*)\b"
     )
-    clause = normalized[clause_start : min(following, default=len(normalized))]
-    return (
-        re.search(
-            r"\b(?:contact|message|write|text|call|reply|register|apply|form|join|"
-            r"пиш\w*|напис\w*|звон\w*|связ\w*|контакт\w*|регистр\w*|запис\w*|"
-            r"форм\w*|присоедин\w*|escrib\w*|mensaje\w*|llam\w*|contact\w*|"
-            r"registr\w*|inscri\w*|formulari\w*|[ée]cri\w*|message\w*|appel\w*|"
-            r"contact\w*|inscri\w*|formulair\w*)\b",
-            clause,
+    venue_contact_pattern = re.compile(
+        r"\b(?:venue|location|place|lugar|lieu|мест\w*|площад\w*|"
+        r"ubicaci[oó]n)\b[^.!?;\n]{0,40}\b"
+        r"(?:contact|контакт\w*|contact\w*)\b|"
+        r"\b(?:contact|контакт\w*|contact\w*)\b[^.!?;\n]{0,24}\b"
+        r"(?:for|of|at)\s+(?:the\s+)?(?:venue|location|place|lugar|"
+        r"lieu|мест\w*|площад\w*|ubicaci[oó]n)\b"
+    )
+    for evidence_occurrence in evidence_occurrences:
+        clause_start = (
+            max(
+                normalized.rfind(boundary, 0, evidence_occurrence.start())
+                for boundary in ".!?;\n"
+            )
+            + 1
         )
-        is not None
-    )
+        following = tuple(
+            position
+            for boundary in ".!?;\n"
+            if (position := normalized.find(boundary, evidence_occurrence.end())) >= 0
+        )
+        clause_end = min(following, default=len(normalized))
+        clause = normalized[clause_start:clause_end]
+        value_start = clause.find(normalized_value)
+        if value_start < 0:
+            continue
+        if negative_pattern.search(clause) or venue_contact_pattern.search(clause):
+            continue
+        if action_pattern.search(clause):
+            return True
+    return False
 
 
 def _is_safe_response_url(value: str) -> bool:
@@ -9315,9 +9550,10 @@ def _event_time_is_supported(
     source_event_time: datetime | None = None,
     source_timezone: str | None = None,
     authoritative_body: str | None = None,
+    _scoped_body_check: bool = False,
 ) -> bool:
     if authoritative_body is not None:
-        return _event_time_is_supported(
+        if not _event_time_is_supported(
             start,
             end,
             exact_time,
@@ -9325,7 +9561,9 @@ def _event_time_is_supported(
             day_part=day_part,
             source_event_time=source_event_time,
             source_timezone=source_timezone,
-        ) and _event_time_is_supported(
+        ):
+            return False
+        return _event_time_is_supported(
             start,
             end,
             exact_time,
@@ -9333,9 +9571,10 @@ def _event_time_is_supported(
             day_part=day_part,
             source_event_time=source_event_time,
             source_timezone=source_timezone,
+            _scoped_body_check=True,
         )
     normalized = evidence.casefold()
-    if _body_has_terminal_retraction(normalized):
+    if not _scoped_body_check and _body_has_terminal_retraction(normalized):
         return False
     month_stems = {
         1: ("january", "январ", "enero", "janvier"),
@@ -9590,7 +9829,21 @@ def _event_time_is_supported(
             r"\bn['’]aura\s+pas\s+lieu\b",
             r"\bne\s+se\s+(?:joue|tiendra)\s+pas\b",
         )
-        return any(re.search(pattern, clause) for pattern in cancellation_patterns)
+        if any(re.search(pattern, clause) for pattern in cancellation_patterns):
+            return True
+        return bool(
+            not re.search(
+                r"\b(?:not|no|ne|pas|не|ни|sin|sans)\s+"
+                r"(?:cancelled|canceled|cancelad\w*|annul[ée]\w*|"
+                r"отмен\w*|withdrawn|retir[ée]\w*|снят\w*|retirad\w*)\b",
+                clause,
+            )
+            and re.search(
+                r"\b(?:cancelled|canceled|called\s+off|withdrawn|"
+                r"cancelad\w*|retirad\w*|annul[ée]\w*|отмен\w*|снят\w*)\b",
+                clause,
+            )
+        )
 
     positive_expressions = [
         (start_span, end_span, *clause_bounds(start_span, end_span))
@@ -9603,6 +9856,39 @@ def _event_time_is_supported(
     ]
     if not positive_expressions:
         return False
+
+    if _scoped_body_check:
+        unrelated_subject = re.compile(
+            r"\b(?:previous|last|earlier|another|other)\s+"
+            r"(?:match|game|fixture|event)\b|"
+            r"\b(?:предыдущ\w*|прошл\w*|друг\w*)\s+"
+            r"(?:матч\w*|игр\w*|событи\w*)\b|"
+            r"\b(?:partido|encuentro)\s+(?:anterior|previo|otro)\b|"
+            r"\b(?:match|rencontre)\s+(?:pr[ée]c[ée]dent\w*|dernier\w*|autre\w*)\b|"
+            r"\b(?:payment|fee|venue|stadium|reservation|booking|request|"
+            r"opening|training|practice|meeting|плат[её]ж\w*|оплат\w*|"
+            r"площадк\w*|бронирован\w*|заявк\w*|трениров\w*|встреч\w*|"
+            r"pago|tarifa|reserva|entrenamiento|pr[ée]ctica|reuni[oó]n|"
+            r"paiement|r[ée]servation|entra[îi]nement|r[ée]union)\b"
+        )
+        related_subject = re.compile(
+            r"\b(?:match|game|fixture|event|матч\w*|игр\w*|событи\w*|"
+            r"partido\w*|encuentro\w*|rencontre\w*|it|this|that|он|его|"
+            r"эт\w*|lo|este|ese|il|le|ce|ça)\b"
+        )
+        update_marker = re.compile(
+            r"\b(?:update|updated|actualiz\w*|обновлен\w*|"
+            r"mise\s+à\s+jour)\b"
+        )
+        for _, _, _, clause_end in positive_expressions:
+            for clause in re.split(r"[.!?;\n]+", normalized[clause_end:]):
+                if not clause.strip() or not _body_has_terminal_retraction(clause):
+                    continue
+                if unrelated_subject.search(clause):
+                    continue
+                if related_subject.search(clause) or update_marker.search(clause):
+                    return False
+                return False
 
     if day_part is not None:
         day_part_patterns = {
@@ -10214,6 +10500,21 @@ def _open_places_are_supported(
         r"\bne\s+(?:cherch|recherch|demand|voul)\w*\s+(?:pas|plus)\b|"
         r"\bne\s+\w+\s+plus\b|\bplus\s+besoin\b|\bpas\s+besoin\b)"
     )
+    complete_body_closure = re.compile(
+        r"\b(?:found|got|have|has)\s+(?:one|a|an)\b|"
+        r"\b(?:opening|position|role|place)\s+(?:is\s+)?"
+        r"(?:no\s+longer\s+available|filled|closed|taken|occupied)\b|"
+        r"\b(?:нашл\w*|нашли|нашёл)\s+(?:одного|одну|один)\b|"
+        r"\b(?:одного|одну|один)\s+(?:уже\s+)?нашл\w*\b|"
+        r"\b(?:мест\w*|позици\w*|роль\w*)\s+(?:больше\s+не\s+доступ\w*|"
+        r"занят\w*|заполн\w*|закрыт\w*)\b|"
+        r"\b(?:encontr\w*)\s+(?:uno|una|un)\b|"
+        r"\b(?:plaza|puesto|posici[oó]n)\w*\s+(?:ya\s+no\s+est[áa]\s+"
+        r"disponible|cubiert\w*|ocupad\w*|cerrad\w*)\b|"
+        r"\b(?:trouv\w*)\s+(?:un|une)\b|"
+        r"\b(?:place|poste|r[oô]le)\w*\s+(?:n['’]est\s+plus\s+"
+        r"disponible|pourvu\w*|occup[ée]\w*|ferm[ée]\w*)\b"
+    )
     if _body_has_terminal_retraction(normalized_evidence) or re.search(
         r"\b(?:both\s+)?(?:slots?|places?|spots?)\b[^.!?;\n]{0,30}\b"
         r"(?:filled|occupied|closed|taken)\b|"
@@ -10224,6 +10525,10 @@ def _open_places_are_supported(
         r"\bplaces?\b[^.!?;\n]{0,30}\b"
         r"(?:pourvu\w*|occup[ée]\w*|ferm[ée]\w*)\b",
         normalized_evidence,
+    ):
+        return False
+    if (has_explicit_player or has_generic_opening) and complete_body_closure.search(
+        normalized_evidence
     ):
         return False
     for clause in re.split(r"[.!?;\n]+", normalized_evidence):
@@ -10323,7 +10628,7 @@ def _open_places_are_supported(
             )
             and not clause_words.intersection(non_player_context | referee_words)
             and any(
-                opening_index <= noun_index
+                abs(opening_index - noun_index) <= 5
                 for opening_index in opening_indexes
                 for noun_index in noun_indexes
             )
@@ -10398,7 +10703,7 @@ _ISO_CURRENCY_CODES = frozenset(
     ZWG""".split()  # noqa: SIM905 - compact, auditable ISO 4217 allowlist
 )
 _CURRENCY_NAME_MODIFIER_PATTERN = (
-    r"(?:(?-i:[A-Z]{2,4})|"
+    r"(?:(?-i:[A-Z]{2,4})|czech|thai|"
     r"[a-zà-öø-ÿ]+(?:ian|ean|an|ese|ish|ic|ense|anos?|inos?|eños?|"
     r"ains?|aises?|ois(?:es)?|iens?|iennes?|ges?|iques?|sses?)|"
     r"[а-яё]+(?:ских|цких|ийских|ых|их))"
@@ -10408,7 +10713,8 @@ _CURRENCY_NAME_HEAD_PATTERN = (
     r"rublos?|euros?|евро|pounds?|фунт\w*|libras?|livres?|"
     r"francs?|франк\w*|francos?|pesos?|песо|yuan(?:es|s)?|юан\w*|"
     r"yens?|(?:и|й)ен\w*|dirhams?|дирхам\w*|dinares?|dinars?|динар\w*|"
-    r"soles|грив(?:ен|ны|на|ну))"
+    r"soles|грив(?:ен|ны|на|ну)|korun\w*|kron(?:er|or|a)s?|"
+    r"zlot\w*|złot\w*|baht)"
 )
 _STATED_CURRENCY_PATTERN = (
     r"(?i:(?:[₽$€£¥₴₸₹₾₺]|(?:" + "|".join(sorted(_ISO_CURRENCY_CODES)) + r")|"
@@ -10628,6 +10934,11 @@ def _optional_values_are_supported(
     if authoritative_body is not None:
         if _body_has_terminal_retraction(authoritative_body):
             return False
+        if candidate.get("positions") is not None and not _open_places_are_supported(
+            None,
+            authoritative_body,
+        ):
+            return False
         authoritative_evidence: dict[str, JsonValue] = {
             field_name: authoritative_body
             for field_name in (
@@ -10838,7 +11149,9 @@ def _optional_values_are_supported(
             "paid": (
                 r"\bpaid\b",
                 r"\bвзнос\w*\b",
+                r"\bоплат\w*\b",
                 r"\bde\s+pago\b",
+                r"\bpag\w*\b",
                 r"\bcuota\b",
                 r"\bpayant\w*\b",
                 r"\bpay[ée]\w*\b",
@@ -10907,8 +11220,8 @@ def _payment_has_opportunity_semantics(
     """Reject paid/free homonyms unrelated to joining the football opportunity."""
     payment_context = re.compile(
         r"\b(?:participation|entry|fee|cost|price|payment|pay|registration|"
-        r"player|team|match|game|"
-        r"участ\w*|взнос\w*|стоим\w*|цен\w*|оплат\w*|регистрац\w*|игрок\w*|"
+        r"participant|"
+        r"участ\w*|взнос\w*|стоим\w*|цен\w*|оплат\w*|регистрац\w*|"
         r"participaci[oó]n|entrada|tarifa|precio|cuota|pago|inscripci[oó]n|"
         r"participation|entr[ée]e|tarif\w*|prix|co[uû]t\w*|cotisation|frais|"
         r"inscription)\b"
@@ -10916,7 +11229,8 @@ def _payment_has_opportunity_semantics(
     unrelated_context = re.compile(
         r"\b(?:parking|car|ticket|spectator|parking\w*|парков\w*|билет\w*|"
         r"aparcamiento|estacionamiento|entrada\s+de\s+espectador|"
-        r"stationnement|billet\w*)\b"
+        r"stationnement|billet\w*|referee\w*|судь\w*|"
+        r"[áa]rbitro\w*|arbitre\w*)\b"
     )
     for source_clause in re.split(r"[.!?;\n]+", source_body):
         clause = source_clause.casefold()
@@ -10966,8 +11280,19 @@ def _patterns_have_football_clause_support(
             r"c[ée]sped|superficie|gazon|terrain|parquet)\b"
         ),
     }[field_name]
+    participation_context = re.compile(
+        r"\b(?:need\w*|look(?:ing)?\s+for|seek\w*|want\w*|wanted|"
+        r"open\w*|available|position|role|player\w*|players|"
+        r"нуж\w*|ищ\w*|треб\w*|свобод\w*|позици\w*|роль\w*|игрок\w*|"
+        r"necesit\w*|busc\w*|quer\w*|disponible|puesto\w*|posici[oó]n\w*|"
+        r"cherch\w*|recherch\w*|besoin|poste\w*|joueur\w*)\b"
+    )
     for clause in re.split(r"[.!?;\n]+", normalized_body):
         if not any(re.search(pattern, clause) for pattern in patterns):
+            continue
+        if field_name == "positions":
+            if participation_context.search(clause):
+                return True
             continue
         if re.search(common_context, clause) or re.search(field_context, clause):
             return True

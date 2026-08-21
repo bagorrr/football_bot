@@ -5,6 +5,7 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -441,15 +442,100 @@ class ControlledModelAdapter:
         """Return only configured offline output and retain policy provenance."""
         self.requests.append(request)
         try:
-            return self._results[request.body]
+            result = self._results[request.body]
         except KeyError as error:
             raise RuntimeError(
                 "controlled classifier result is not configured"
             ) from error
+        return replace(
+            result,
+            output=_ensure_test_proposition_evidence(
+                result.output,
+                body=request.body,
+            ),
+        )
 
     def proposal_id(self, revision_id: str) -> str:
         """Return a stable non-authoritative proposal identity."""
         return f"proposal:{revision_id}"
+
+
+def _ensure_test_proposition_evidence(
+    output: dict[str, JsonValue], *, body: str
+) -> dict[str, JsonValue]:
+    """Give legacy controlled fixtures the current structured model shape."""
+    enriched = deepcopy(output)
+    if enriched.get("disposition") != "accepted":
+        return enriched
+    candidates = enriched.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return enriched
+    candidate = candidates[0]
+    if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
+        return enriched
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    routes = candidate.get("response_routes")
+    if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
+        return enriched
+    if not all(isinstance(value, str) and value in body for value in evidence.values()):
+        return enriched
+    if not isinstance(routes, list):
+        return enriched
+    route_values: list[tuple[str, str, str]] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            return enriched
+        kind = route.get("kind")
+        value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(isinstance(item, str) for item in (kind, value, route_evidence)):
+            return enriched
+        assert isinstance(kind, str)
+        assert isinstance(value, str)
+        assert isinstance(route_evidence, str)
+        if route_evidence not in body:
+            return enriched
+        route_values.append((kind, value, route_evidence))
+
+    def span(text: str) -> dict[str, JsonValue]:
+        start = body.index(text)
+        return {"start": start, "end": start + len(text), "text": text}
+
+    candidate["proposition_evidence"] = {
+        "contract_version": "source-proposition-evidence-v1",
+        "coverage": "complete_source_revision",
+        "root": {
+            "proposition_id": candidate_key,
+            "domain": "football_match",
+            "polarity": "positive",
+            "currentness": "current",
+            "span": {"start": 0, "end": len(body), "text": body},
+        },
+        "facts": {
+            fact_name: {
+                "proposition_id": candidate_key,
+                "polarity": "positive",
+                "currentness": "current",
+                "span": span(fact_evidence),
+            }
+            for fact_name, fact_evidence in evidence.items()
+            if isinstance(fact_evidence, str)
+        },
+        "routes": [
+            {
+                "kind": kind,
+                "value": value,
+                "proposition_id": candidate_key,
+                "polarity": "positive",
+                "currentness": "current",
+                "span": span(route_evidence),
+            }
+            for kind, value, route_evidence in route_values
+        ],
+        "relations": [],
+    }
+    return enriched
 
 
 @dataclass(slots=True)

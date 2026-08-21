@@ -35,6 +35,7 @@ _OPTIONAL_CANDIDATE_FIELDS = {
     "playing_surfaces",
     "payment",
 }
+_STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence"}
 _CANONICAL_LISTS = {
     "team_formats": {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
     "positions": {"goalkeeper", "defender", "midfielder", "forward"},
@@ -56,6 +57,13 @@ _CANONICAL_LISTS = {
         "wood_parquet",
     },
 }
+
+PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
+_PROPOSITION_DOMAINS = {"football_match"}
+_PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
+_PROPOSITION_CURRENTNESS = {"current", "superseded", "withdrawn", "unknown"}
+_PROPOSITION_RELATIONS = {"supports", "negates", "replaces", "competes_with"}
+_PROPOSITION_RELATION_DIRECTIONS = {"incoming", "outgoing"}
 
 
 def classifier_output_is_schema_valid(
@@ -79,11 +87,17 @@ def classifier_output_is_schema_valid(
     candidate = candidates[0]
     if (
         not _REQUIRED_CANDIDATE_FIELDS.issubset(candidate)
-        or set(candidate) - _REQUIRED_CANDIDATE_FIELDS - _OPTIONAL_CANDIDATE_FIELDS
+        or set(candidate)
+        - _REQUIRED_CANDIDATE_FIELDS
+        - _OPTIONAL_CANDIDATE_FIELDS
+        - _STRUCTURED_CANDIDATE_FIELDS
         or candidate.get("opportunity_type") != "open_match"
         or not isinstance(candidate.get("candidate_key"), str)
         or not candidate["candidate_key"]
     ):
+        return False
+    candidate_key = candidate.get("candidate_key")
+    if not isinstance(candidate_key, str) or not candidate_key:
         return False
     evidence = candidate.get("evidence")
     expected_evidence = {
@@ -171,7 +185,211 @@ def classifier_output_is_schema_valid(
             return False
     if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
         return False
-    return all(_valid_response_route(route, body=body) for route in routes)
+    if not all(_valid_response_route(route, body=body) for route in routes):
+        return False
+    proposition_evidence = candidate.get("proposition_evidence")
+    return proposition_evidence is None or proposition_evidence_is_schema_valid(
+        proposition_evidence,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    )
+
+
+def proposition_evidence_is_schema_valid(
+    value: JsonValue,
+    *,
+    body: str,
+    candidate_key: str,
+    evidence: dict[str, JsonValue],
+    routes: list[JsonValue],
+) -> bool:
+    """Validate the versioned source-proposition/evidence wire contract.
+
+    This check is deliberately structural. It proves that the model's
+    proposed semantic graph is complete, source-bound, and internally
+    addressable. Application code separately decides whether the graph is
+    current, positive, non-competing, and publishable.
+    """
+    if not isinstance(value, dict) or set(value) != {
+        "contract_version",
+        "coverage",
+        "root",
+        "facts",
+        "routes",
+        "relations",
+    }:
+        return False
+    if (
+        value.get("contract_version") != PROPOSITION_EVIDENCE_VERSION
+        or value.get("coverage") != "complete_source_revision"
+        or not body
+    ):
+        return False
+    root = value.get("root")
+    if not isinstance(root, dict) or set(root) != {
+        "proposition_id",
+        "domain",
+        "polarity",
+        "currentness",
+        "span",
+    }:
+        return False
+    if (
+        root.get("proposition_id") != candidate_key
+        or root.get("domain") not in _PROPOSITION_DOMAINS
+        or root.get("polarity") not in _PROPOSITION_POLARITIES
+        or root.get("currentness") not in _PROPOSITION_CURRENTNESS
+        or not _valid_source_span(root.get("span"), body, expected_text=body)
+    ):
+        return False
+    facts = value.get("facts")
+    if not isinstance(facts, dict) or set(facts) != set(evidence):
+        return False
+    for fact_name, fact_value in facts.items():
+        expected_text = evidence.get(fact_name)
+        if not isinstance(expected_text, str) or not expected_text:
+            return False
+        if not _valid_proposition_fact(
+            fact_value,
+            body=body,
+            candidate_key=candidate_key,
+            expected_text=expected_text,
+        ):
+            return False
+    structured_routes = value.get("routes")
+    if not isinstance(structured_routes, list) or len(structured_routes) != len(routes):
+        return False
+    structured_route_keys: list[tuple[str, str, str]] = []
+    expected_route_keys: list[tuple[str, str, str]] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            return False
+        kind = route.get("kind")
+        route_value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(
+            isinstance(item, str) and item
+            for item in (kind, route_value, route_evidence)
+        ):
+            return False
+        assert isinstance(kind, str)
+        assert isinstance(route_value, str)
+        assert isinstance(route_evidence, str)
+        expected_route_keys.append((kind, route_value, route_evidence))
+    for route in structured_routes:
+        if not isinstance(route, dict) or set(route) != {
+            "kind",
+            "value",
+            "proposition_id",
+            "polarity",
+            "currentness",
+            "span",
+        }:
+            return False
+        kind = route.get("kind")
+        route_value = route.get("value")
+        span = route.get("span")
+        if not isinstance(kind, str) or not isinstance(route_value, str):
+            return False
+        expected_span_text: str | None = None
+        if isinstance(span, dict):
+            raw_span_text = span.get("text")
+            if isinstance(raw_span_text, str):
+                expected_span_text = raw_span_text
+        if not _valid_proposition_fact(
+            {
+                "proposition_id": route.get("proposition_id"),
+                "polarity": route.get("polarity"),
+                "currentness": route.get("currentness"),
+                "span": span,
+            },
+            body=body,
+            candidate_key=candidate_key,
+            expected_text=expected_span_text,
+        ):
+            return False
+        if not isinstance(span, dict):
+            return False
+        span_text = span.get("text")
+        if not isinstance(span_text, str):
+            return False
+        structured_route_keys.append((kind, route_value, span_text))
+    if sorted(structured_route_keys) != sorted(expected_route_keys):
+        return False
+    relations = value.get("relations")
+    if not isinstance(relations, list) or len(relations) > 32:
+        return False
+    valid_targets = {"root", *facts}
+    valid_targets.update(
+        f"route:{kind}:{route_value}" for kind, route_value, _ in expected_route_keys
+    )
+    for relation in relations:
+        if not isinstance(relation, dict) or set(relation) != {
+            "kind",
+            "direction",
+            "target",
+            "span",
+        }:
+            return False
+        if (
+            relation.get("kind") not in _PROPOSITION_RELATIONS
+            or relation.get("direction") not in _PROPOSITION_RELATION_DIRECTIONS
+            or relation.get("target") not in valid_targets
+            or not _valid_source_span(relation.get("span"), body)
+        ):
+            return False
+    return True
+
+
+def _valid_proposition_fact(
+    value: JsonValue,
+    *,
+    body: str,
+    candidate_key: str,
+    expected_text: str | None,
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "proposition_id",
+        "polarity",
+        "currentness",
+        "span",
+    }:
+        return False
+    return (
+        value.get("proposition_id") == candidate_key
+        and value.get("polarity") in _PROPOSITION_POLARITIES
+        and value.get("currentness") in _PROPOSITION_CURRENTNESS
+        and _valid_source_span(value.get("span"), body, expected_text=expected_text)
+    )
+
+
+def _valid_source_span(
+    value: JsonValue,
+    body: str,
+    *,
+    expected_text: str | None = None,
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {"start", "end", "text"}:
+        return False
+    start = value.get("start")
+    end = value.get("end")
+    text = value.get("text")
+    if (
+        not isinstance(start, int)
+        or isinstance(start, bool)
+        or not isinstance(end, int)
+        or isinstance(end, bool)
+        or not isinstance(text, str)
+        or not text
+        or start < 0
+        or end <= start
+        or end > len(body)
+        or body[start:end] != text
+    ):
+        return False
+    return expected_text is None or text == expected_text
 
 
 def _valid_response_route(value: JsonValue, *, body: str) -> bool:

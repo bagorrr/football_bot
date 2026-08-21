@@ -94,6 +94,7 @@ def test_authoritative_body_must_establish_one_current_open_match() -> None:
         "Partido de fútbol 20 agosto 2026 en Estación Central. "
         "Necesitamos dos jugadores",
         "Match de football le 20 août 2026 à la Gare Centrale. Besoin de deux joueurs",
+        "В субботу в 19:00 на [ЛОКАЦИИ] нужен один защитник",
     ):
         assert _body_establishes_current_open_match(body)
 
@@ -120,6 +121,16 @@ def test_resolved_location_requires_positive_unambiguous_source_geography() -> N
         assert _location_mention_is_authoritative(body, mention)
 
 
+def test_location_evidence_tracks_current_replacement_across_the_revision() -> None:
+    assert not _location_mention_is_authoritative(
+        "Football match at Central Station. Central Station is not the venue",
+        "Central Station",
+    )
+    revised = "Football match at Central Station. Update: North Station instead"
+    assert not _location_mention_is_authoritative(revised, "Central Station")
+    assert _location_mention_is_authoritative(revised, "North Station")
+
+
 def test_explicit_route_requires_contact_semantics_before_fallback_priority() -> None:
     fallback: JsonValue = {
         "reply_route_url": "https://t.me/source_chat/49?comment=1",
@@ -139,6 +150,26 @@ def test_explicit_route_requires_contact_semantics_before_fallback_priority() ->
         "kind": "reply_thread",
         "value": "https://t.me/source_chat/49?comment=1",
     }
+
+    for body in (
+        "Do not contact @stadium; reply here to join",
+        "Venue contact: @stadium; reply here to join",
+        "The venue contact is @stadium; reply here to join",
+    ):
+        assert _select_response_route(
+            body=body,
+            proposed_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@stadium",
+                    "evidence": "@stadium",
+                }
+            ],
+            bounded_metadata=fallback,
+        ) == {
+            "kind": "reply_thread",
+            "value": "https://t.me/source_chat/49?comment=1",
+        }
 
     for body, kind, value in (
         (
@@ -678,6 +709,37 @@ def test_complete_body_vetoes_separate_temporal_retraction_and_competition() -> 
         )
 
 
+def test_complete_body_temporal_retraction_must_refer_to_the_same_event() -> None:
+    event_date = date(2026, 8, 20)
+    for body in (
+        "Football match 20 August 2026. The previous match was cancelled",
+        "Футбольный матч 20 августа 2026. Предыдущий матч был отменён",
+        "Partido de fútbol 20 agosto 2026. El partido anterior fue cancelado",
+        "Match de football le 20 août 2026. Le match précédent a été annulé",
+    ):
+        assert _event_time_is_supported(
+            event_date,
+            event_date,
+            None,
+            body.split(".", 1)[0],
+            authoritative_body=body,
+        )
+
+    for body in (
+        "Football match 20 August 2026. Match cancelled",
+        "Футбольный матч 20 августа 2026. Матч отменён",
+        "Partido de fútbol 20 agosto 2026. Partido cancelado",
+        "Match de football le 20 août 2026. Match annulé",
+    ):
+        assert not _event_time_is_supported(
+            event_date,
+            event_date,
+            None,
+            body.split(".", 1)[0],
+            authoritative_body=body,
+        )
+
+
 def test_open_player_evidence_accepts_positive_counts_and_rejects_closure() -> None:
     positive_cases = (
         (6, "Need six players"),
@@ -796,6 +858,44 @@ def test_current_role_opening_allows_unknown_count_and_whole_body_veto() -> None
         assert not _open_places_are_supported(None, body)
 
 
+def test_current_individual_opening_is_proven_across_the_complete_body() -> None:
+    for body in (
+        "Goalkeeper wanted",
+        "Нужен вратарь",
+        "Se busca portero",
+        "Gardien recherché",
+    ):
+        assert _open_places_are_supported(None, body)
+
+    for body in (
+        "Looking for a goalkeeper. We found one",
+        "Ищем вратаря. Одного уже нашли",
+        "Buscamos un portero. Ya encontramos uno",
+        "Nous cherchons un gardien. On en a trouvé un",
+    ):
+        assert not _open_places_are_supported(None, body)
+
+
+def test_open_match_proposition_requires_positive_unambiguous_football_meaning() -> (
+    None
+):
+    for body in (
+        "Basketball game tomorrow",
+        "Tournament match tomorrow",
+        "League game tomorrow",
+    ):
+        assert not _body_establishes_current_open_match(body)
+
+    for body in (
+        "Football match tomorrow",
+        "This is not training. Football match tomorrow",
+        "Футбольный матч завтра",
+        "Partido de fútbol mañana",
+        "Match de football demain",
+    ):
+        assert _body_establishes_current_open_match(body)
+
+
 def test_explicit_amount_and_currency_establishes_paid_without_inference() -> None:
     for evidence in (
         "Fee 500 EUR",
@@ -868,6 +968,10 @@ def test_named_currencies_preserve_the_complete_source_span() -> None:
         ("Tarif 500 francs belges par joueur", ("500", "francs belges")),
         ("Fee 500 dirhams UAE. Contact @sample", ("500", "dirhams UAE")),
         ("Tarif 500 dirhams marocains", ("500", "dirhams marocains")),
+        ("Fee 500 Czech koruna", ("500", "Czech koruna")),
+        ("Fee 500 Norwegian kroner", ("500", "Norwegian kroner")),
+        ("Fee 500 Polish zloty", ("500", "Polish zloty")),
+        ("Fee 500 Thai baht", ("500", "Thai baht")),
     )
     for evidence, expected in cases:
         assert _stated_payment_amount_and_currency(evidence) == expected
@@ -1101,6 +1205,76 @@ def test_semantic_evidence_is_bound_to_the_authoritative_source_body() -> None:
         {"payment": "Participation fee is paid"},
         authoritative_body=("Football match 20 August 2026. Participation fee is paid"),
     )
+
+
+def test_optional_facts_reject_forward_payment_homonyms_and_filled_roles() -> None:
+    assert not _optional_values_are_supported(
+        {"positions": ["forward"]},
+        {"positions": "forward"},
+        authoritative_body=(
+            "Football match 20 August 2026. Need a goalkeeper. "
+            "Please forward this message"
+        ),
+    )
+
+    payment_cases: tuple[
+        tuple[dict[str, JsonValue], dict[str, JsonValue], str], ...
+    ] = (
+        (
+            {"payment": "paid"},
+            {"payment": "paid"},
+            "Football match 20 August 2026. The team paid the referee",
+        ),
+        (
+            {"payment": "paid"},
+            {"payment": "оплачено"},
+            "Футбольный матч 20 августа 2026. Команда оплатила судье",
+        ),
+        (
+            {"payment": "paid"},
+            {"payment": "pagado"},
+            "Partido de fútbol 20 agosto 2026. El equipo pagó al árbitro",
+        ),
+        (
+            {"payment": "paid"},
+            {"payment": "payé"},
+            "Match de football le 20 août 2026. L’équipe a payé l’arbitre",
+        ),
+    )
+    for payment_candidate, payment_evidence, payment_body in payment_cases:
+        assert not _optional_values_are_supported(
+            payment_candidate,
+            payment_evidence,
+            authoritative_body=payment_body,
+        )
+
+    role_cases = (
+        (
+            "Football match 20 August 2026. Need a defender. We found one",
+            "Need a defender",
+        ),
+        (
+            "Футбольный матч 20 августа 2026. Нужен защитник. Одного уже нашли",
+            "Нужен защитник",
+        ),
+        (
+            "Partido de fútbol 20 agosto 2026. Necesitamos defensa. Ya encontramos uno",
+            "Necesitamos defensa",
+        ),
+        (
+            "Match de football le 20 août 2026. Besoin d’un défenseur. "
+            "On en a trouvé un",
+            "Besoin d’un défenseur",
+        ),
+    )
+    role_candidate: dict[str, JsonValue] = {"positions": ["defender"]}
+    for body, role_evidence in role_cases:
+        role_evidence_value: dict[str, JsonValue] = {"positions": role_evidence}
+        assert not _optional_values_are_supported(
+            role_candidate,
+            role_evidence_value,
+            authoritative_body=body,
+        )
 
 
 def test_weekday_relative_evidence_uses_source_chat_local_calendar() -> None:
