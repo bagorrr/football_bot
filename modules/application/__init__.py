@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from modules.classifier_contract import (
     classifier_output_is_schema_valid,
     proposition_evidence_is_schema_valid,
+    semantic_proof_is_authoritative,
+    semantic_proof_is_schema_valid,
 )
 from modules.contracts import (
     SUB_CITY_GEOGRAPHIC_TYPES,
@@ -6726,7 +6728,7 @@ class RuntimeApplication:
                         ContractName.CLASSIFICATION_PROPOSAL,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
-                    and definition.version == 2
+                    and definition.version in {2, 3}
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -7165,7 +7167,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and incoming.contract_version == 2
+            and incoming.contract_version in {2, 3}
             and supported_incoming is not None
         ):
             self._accept_classification_proposal(supported_incoming)
@@ -7357,6 +7359,9 @@ class RuntimeApplication:
             else "unresolved"
         )
         provenance_complete = _classifier_adapter_result_has_complete_provenance(result)
+        primary_output_is_valid = classifier_output_is_schema_valid(
+            result.output, body=body
+        )
         manifest = {
             "source_message_revision_id": request.source_message_revision_id,
             "body": body,
@@ -7386,10 +7391,163 @@ class RuntimeApplication:
             ).encode("utf-8")
         ).hexdigest()
         proposal_id = f"proposal:{revision_id}"
+        semantic_proof_result: ClassifierAdapterResult | None = None
+        semantic_proof_output: dict[str, JsonValue] | None = None
+        semantic_proof_execution: dict[str, JsonValue] | None = None
+        semantic_proof_ready = False
+        if (
+            result_disposition == "accepted"
+            and provenance_complete
+            and primary_output_is_valid
+        ):
+            semantic_proof_request = replace(
+                request,
+                context_bundle_version="semantic-proof-context-v1",
+                prompt_version="open-match-semantic-proof-v1",
+                schema_version="source-semantic-proof-v1",
+                context_policy_version="semantic-proof-context-v1",
+            )
+            semantic_proof_result = self.model.semantic_proof(semantic_proof_request)
+            semantic_proof_output = semantic_proof_result.output
+            primary_candidates = result.output.get("candidates")
+            proof_candidate = (
+                primary_candidates[0]
+                if isinstance(primary_candidates, list) and primary_candidates
+                else None
+            )
+            if (
+                isinstance(proof_candidate, dict)
+                and isinstance(proof_candidate.get("candidate_key"), str)
+                and isinstance(proof_candidate.get("evidence"), dict)
+                and isinstance(proof_candidate.get("response_routes"), list)
+            ):
+                proof_manifest = {
+                    **manifest,
+                    "context_bundle_version": (
+                        semantic_proof_request.context_bundle_version
+                    ),
+                    "prompt_version": semantic_proof_request.prompt_version,
+                    "schema_version": semantic_proof_request.schema_version,
+                    "context_policy_version": (
+                        semantic_proof_request.context_policy_version
+                    ),
+                    "pass_number": 2,
+                    "attempt_number": 1,
+                }
+                proof_input_manifest_hash = sha256(
+                    json.dumps(
+                        proof_manifest,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                semantic_proof_execution = {
+                    "requested_model": semantic_proof_request.requested_model,
+                    "effective_model": semantic_proof_result.effective_model,
+                    "requested_reasoning_effort": (
+                        semantic_proof_request.requested_reasoning_effort
+                    ),
+                    "effective_reasoning_effort": (
+                        semantic_proof_result.effective_reasoning_effort
+                    ),
+                    "prompt_version": semantic_proof_request.prompt_version,
+                    "schema_version": semantic_proof_request.schema_version,
+                    "glossary_version": semantic_proof_request.glossary_version,
+                    "context_policy_version": (
+                        semantic_proof_request.context_policy_version
+                    ),
+                    "routing_policy_version": (
+                        semantic_proof_request.routing_policy_version
+                    ),
+                    "context_bundle_version": (
+                        semantic_proof_request.context_bundle_version
+                    ),
+                    "codex_version": semantic_proof_result.codex_version,
+                    "adapter_kind": semantic_proof_result.adapter_kind,
+                    "adapter_version": semantic_proof_result.adapter_version,
+                    "pass_number": 2,
+                    "attempt_number": 1,
+                    "input_manifest_hash": proof_input_manifest_hash,
+                    "duration_ms": _nonnegative_metric_or_zero(
+                        semantic_proof_result.duration_ms
+                    ),
+                    "input_tokens": _nonnegative_metric_or_zero(
+                        semantic_proof_result.input_tokens
+                    ),
+                    "output_tokens": _nonnegative_metric_or_zero(
+                        semantic_proof_result.output_tokens
+                    ),
+                    "status": "succeeded",
+                }
+                semantic_proof_ready = _semantic_proof_result_has_pinned_provenance(
+                    semantic_proof_result
+                ) and semantic_proof_is_schema_valid(
+                    semantic_proof_output,
+                    body=body,
+                    source_message_revision_reference=(
+                        request.source_message_revision_id
+                    ),
+                    candidate_key=cast(str, proof_candidate["candidate_key"]),
+                    evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
+                    routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+                )
+        proposal_version = (
+            3
+            if semantic_proof_ready
+            else 2
+            if result_disposition != "accepted"
+            else None
+        )
+        proposal_payload: dict[str, JsonValue] = {
+            "proposal_id": proposal_id,
+            "classification_command_id": str(incoming.message_id),
+            "source_message_revision_id": revision_id,
+            "body": body,
+            "source_event_time": payload.get("source_event_time"),
+            "source_recorded_at": payload.get("source_recorded_at"),
+            "context_bundle_version": payload.get("context_bundle_version"),
+            "source_chat_reference": payload.get("source_chat_reference"),
+            "source_chat_registry_generation": payload.get(
+                "source_chat_registry_generation"
+            ),
+            "source_chat_timezone": payload.get("source_chat_timezone"),
+            "source_chat_geography": payload.get("source_chat_geography"),
+            "bounded_metadata": payload.get("bounded_metadata"),
+            "eligible_reply_context": payload.get("eligible_reply_context"),
+            "direct_reply_to_telegram_message_id": payload.get(
+                "direct_reply_to_telegram_message_id"
+            ),
+            "output": result.output,
+            "requested_model": request.requested_model,
+            "effective_model": result.effective_model,
+            "requested_reasoning_effort": request.requested_reasoning_effort,
+            "effective_reasoning_effort": result.effective_reasoning_effort,
+            "prompt_version": request.prompt_version,
+            "schema_version": request.schema_version,
+            "glossary_version": request.glossary_version,
+            "context_policy_version": request.context_policy_version,
+            "routing_policy_version": request.routing_policy_version,
+            "codex_version": result.codex_version,
+            "adapter_kind": result.adapter_kind,
+            "adapter_version": result.adapter_version,
+            "pass_number": 1,
+            "attempt_number": 1,
+            "input_manifest_hash": input_manifest_hash,
+            "duration_ms": result.duration_ms,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "classification_status": "succeeded",
+        }
+        if semantic_proof_ready:
+            assert semantic_proof_output is not None
+            assert semantic_proof_execution is not None
+            proposal_payload["semantic_proof"] = semantic_proof_output
+            proposal_payload["semantic_proof_execution"] = semantic_proof_execution
         outgoing = (
             ContractEnvelope(
                 contract_name=ContractName.CLASSIFICATION_PROPOSAL,
-                contract_version=2,
+                contract_version=proposal_version,
                 message_id=derive_contract_message_id(
                     incoming.message_id, ContractName.CLASSIFICATION_PROPOSAL
                 ),
@@ -7401,48 +7559,9 @@ class RuntimeApplication:
                 causation_id=incoming.message_id,
                 correlation_id=incoming.correlation_id,
                 recorded_at=self.clock.now(),
-                payload={
-                    "proposal_id": proposal_id,
-                    "classification_command_id": str(incoming.message_id),
-                    "source_message_revision_id": revision_id,
-                    "body": body,
-                    "source_event_time": payload.get("source_event_time"),
-                    "source_recorded_at": payload.get("source_recorded_at"),
-                    "context_bundle_version": payload.get("context_bundle_version"),
-                    "source_chat_reference": payload.get("source_chat_reference"),
-                    "source_chat_registry_generation": payload.get(
-                        "source_chat_registry_generation"
-                    ),
-                    "source_chat_timezone": payload.get("source_chat_timezone"),
-                    "source_chat_geography": payload.get("source_chat_geography"),
-                    "bounded_metadata": payload.get("bounded_metadata"),
-                    "eligible_reply_context": payload.get("eligible_reply_context"),
-                    "direct_reply_to_telegram_message_id": payload.get(
-                        "direct_reply_to_telegram_message_id"
-                    ),
-                    "output": result.output,
-                    "requested_model": request.requested_model,
-                    "effective_model": result.effective_model,
-                    "requested_reasoning_effort": request.requested_reasoning_effort,
-                    "effective_reasoning_effort": result.effective_reasoning_effort,
-                    "prompt_version": request.prompt_version,
-                    "schema_version": request.schema_version,
-                    "glossary_version": request.glossary_version,
-                    "context_policy_version": request.context_policy_version,
-                    "routing_policy_version": request.routing_policy_version,
-                    "codex_version": result.codex_version,
-                    "adapter_kind": result.adapter_kind,
-                    "adapter_version": result.adapter_version,
-                    "pass_number": 1,
-                    "attempt_number": 1,
-                    "input_manifest_hash": input_manifest_hash,
-                    "duration_ms": result.duration_ms,
-                    "input_tokens": result.input_tokens,
-                    "output_tokens": result.output_tokens,
-                    "classification_status": "succeeded",
-                },
+                payload=proposal_payload,
             )
-            if provenance_complete
+            if provenance_complete and proposal_version is not None
             else None
         )
         recorded_result = replace(
@@ -7474,7 +7593,7 @@ class RuntimeApplication:
             input_tokens=recorded_result.input_tokens,
             output_tokens=recorded_result.output_tokens,
             disposition=disposition,
-            status="succeeded" if provenance_complete else "failed",
+            status="succeeded" if outgoing is not None else "failed",
         )
         self.store.record_classification_attempt(
             incoming=incoming,
@@ -7497,7 +7616,7 @@ class RuntimeApplication:
         if source_revision is None or source_revision.body is None:
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2,),
+                supported_versions=(2, 3),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -7509,7 +7628,7 @@ class RuntimeApplication:
         if not source_message_scope.endswith(generation_suffix):
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2,),
+                supported_versions=(2, 3),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -7532,7 +7651,7 @@ class RuntimeApplication:
         if source_chat is None:
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2,),
+                supported_versions=(2, 3),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -7568,7 +7687,7 @@ class RuntimeApplication:
         ):
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2,),
+                supported_versions=(2, 3),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -7599,7 +7718,7 @@ class RuntimeApplication:
         if accepted is None:
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2,),
+                supported_versions=(2, 3),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -8517,6 +8636,17 @@ def _classifier_adapter_result_has_complete_provenance(
     )
 
 
+def _semantic_proof_result_has_pinned_provenance(
+    result: ClassifierAdapterResult,
+) -> bool:
+    """Require the bounded proof pass to use the same pinned product model."""
+    return (
+        _classifier_adapter_result_has_complete_provenance(result)
+        and result.effective_model == "gpt-5.6-sol"
+        and result.effective_reasoning_effort == "high"
+    )
+
+
 def _source_chat_request_identity_matches_provenance(
     incoming: RawContractEnvelope,
     provenance: SourceChatAdmissionProvenance | None,
@@ -8803,8 +8933,19 @@ def _proposition_evidence_is_authoritative(
     candidate_key: str,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    semantic_proof: JsonValue | None = None,
+    source_message_revision_reference: str | None = None,
 ) -> bool:
-    """Accept only one complete, positive, current proposition graph."""
+    """Accept one graph only when the Application semantic-proof boundary passes."""
+    if source_message_revision_reference is None or not semantic_proof_is_authoritative(
+        semantic_proof,
+        body=body,
+        source_message_revision_reference=source_message_revision_reference,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    ):
+        return False
     if not proposition_evidence_is_schema_valid(
         value,
         body=body,
@@ -8826,7 +8967,6 @@ def _proposition_evidence_is_authoritative(
         or not graph.has_complete_support_topology()
         or not graph.has_exact_support_spans()
         or not _proposition_graph_has_closed_target_set(graph, evidence, routes)
-        or not _source_open_match_semantics_are_authoritative(body)
     ):
         return False
     contract = cast(dict[str, JsonValue], value)
@@ -9000,17 +9140,6 @@ def _source_player_participation_is_current(body: str) -> bool:
     )
 
 
-def _source_open_match_semantics_are_authoritative(body: str) -> bool:
-    """Apply the bounded rejection-only semantic gate to the graph root.
-
-    The classifier remains the primary semantic interpreter. This Application
-    gate only admits a graph whose target-specific root can be independently
-    established as one current positive Open Match; unknown or contradictory
-    source meaning remains unpublished.
-    """
-    return _body_establishes_current_open_match(body)
-
-
 def _validated_open_match_proposal(
     payload_value: JsonValue,
     *,
@@ -9022,11 +9151,11 @@ def _validated_open_match_proposal(
     body = payload_value.get("body")
     revision_id = payload_value.get("source_message_revision_id")
     output = payload_value.get("output")
+    semantic_proof = payload_value.get("semantic_proof")
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
         or _is_explicit_children_only_game(body)
-        or not _body_establishes_current_open_match(body)
         or not _classifier_proposal_has_pinned_provenance(
             payload_value,
             revision_id=revision_id,
@@ -9098,6 +9227,10 @@ def _validated_open_match_proposal(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        semantic_proof=semantic_proof,
+        source_message_revision_reference=_opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
     ):
         return None
     if route is None:
@@ -9316,7 +9449,7 @@ def _validated_open_match_proposal(
 
 
 def _body_establishes_current_open_match(body: str) -> bool:
-    """Require one positive, unambiguous football-match proposition."""
+    """Retain the offline corpus guard; publication does not call this helper."""
     normalized = re.sub(r"['’]", " ", body.casefold())
     if not _source_player_participation_is_current(body):
         return False

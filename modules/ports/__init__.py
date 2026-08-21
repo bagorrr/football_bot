@@ -184,6 +184,10 @@ class ModelAdapter(Protocol):
         """Return one strict, non-authoritative structured proposal."""
         ...
 
+    def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return one strict, source-bound semantic-proof proposal."""
+        ...
+
     def proposal_id(self, revision_id: str) -> str:
         """Return one non-authoritative synthetic proposal identity."""
         ...

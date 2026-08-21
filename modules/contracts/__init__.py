@@ -10,7 +10,10 @@ from typing import TypeAlias, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    classifier_output_is_schema_valid,
+    semantic_proof_is_schema_valid,
+)
 from modules.domain import SourceChatAddressKind, is_valid_source_chat_address
 
 JsonValue: TypeAlias = (
@@ -187,6 +190,13 @@ SUPPORTED_CONTRACTS = (
     ContractDefinition(
         ContractName.CLASSIFICATION_PROPOSAL,
         2,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        3,
         RuntimeRole.CLASSIFICATION,
         RuntimeRole.APPLICATION,
         "proposal_id",
@@ -421,7 +431,7 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_classify_source_message_revision(self, self.payload)
         elif (
             self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and self.contract_version == 2
+            and self.contract_version in {2, 3}
         ):
             _validate_classification_proposal(self, self.payload)
         elif (
@@ -1195,10 +1205,15 @@ def _validate_classification_proposal(
         "classification_status",
         "classification_command_id",
     }
+    semantic_fields = {
+        "semantic_proof",
+        "semantic_proof_execution",
+    }
     allowed = (
         {"proposal_id", "source_message_revision_id", "body"}
         | context_fields
         | provenance_fields
+        | (semantic_fields if envelope.contract_version == 3 else set())
     )
     if set(payload) != allowed:
         raise ValueError("ClassificationProposal has incomplete semantics")
@@ -1236,6 +1251,39 @@ def _validate_classification_proposal(
         raise TypeError("ClassificationProposal output must be an object")
     if not classifier_output_is_schema_valid(payload["output"], body=body):
         raise ValueError("ClassificationProposal output violates its public schema")
+    if envelope.contract_version == 3:
+        if payload["output"].get("disposition") != "accepted":
+            raise ValueError("ClassificationProposal v3 requires an accepted output")
+        candidates = payload["output"].get("candidates")
+        if not isinstance(candidates, list) or len(candidates) != 1:
+            raise ValueError("ClassificationProposal v3 requires one candidate")
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise TypeError("ClassificationProposal v3 candidate must be an object")
+        candidate_key = candidate.get("candidate_key")
+        evidence = candidate.get("evidence")
+        routes = candidate.get("response_routes")
+        proof = payload.get("semantic_proof")
+        if (
+            not isinstance(candidate_key, str)
+            or not isinstance(evidence, dict)
+            or not isinstance(routes, list)
+            or not isinstance(proof, dict)
+        ):
+            raise ValueError("ClassificationProposal v3 semantic proof is incomplete")
+        proof_reference = proof.get("source_message_revision_reference")
+        if not isinstance(proof_reference, str) or not proof_reference:
+            raise ValueError("ClassificationProposal v3 proof reference is invalid")
+        if not semantic_proof_is_schema_valid(
+            proof,
+            body=body,
+            source_message_revision_reference=proof_reference,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+        ):
+            raise ValueError("ClassificationProposal v3 semantic proof is invalid")
+        _validate_semantic_proof_execution(payload["semantic_proof_execution"])
     for field_name in ("pass_number", "attempt_number"):
         metric = payload[field_name]
         if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
@@ -1289,6 +1337,79 @@ def _validate_classification_proposal(
     _validate_direct_causation(envelope, ContractName.CLASSIFICATION_PROPOSAL)
     if envelope.idempotency_key != f"classification-proposal:{revision_id}":
         raise ValueError("ClassificationProposal idempotency key is not canonical")
+
+
+def _validate_semantic_proof_execution(value: JsonValue) -> None:
+    """Validate the pinned bounded semantic-proof pass provenance."""
+    fields = {
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "pass_number",
+        "attempt_number",
+        "input_manifest_hash",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "status",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("semantic-proof execution metadata is incomplete")
+    for field_name in (
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "input_manifest_hash",
+    ):
+        _required_text(value, field_name)
+    if value["status"] != "succeeded":
+        raise ValueError("semantic-proof execution status is invalid")
+    for field_name in ("pass_number", "attempt_number"):
+        metric = value[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
+            raise TypeError(f"semantic-proof execution requires positive {field_name}")
+    for field_name in ("duration_ms", "input_tokens", "output_tokens"):
+        metric = value[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            raise TypeError(
+                f"semantic-proof execution requires non-negative {field_name}"
+            )
+    pinned = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "open-match-semantic-proof-v1",
+        "schema_version": "source-semantic-proof-v1",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "semantic-proof-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+        "context_bundle_version": "semantic-proof-context-v1",
+    }
+    if any(value[field_name] != expected for field_name, expected in pinned.items()):
+        raise ValueError("semantic-proof execution provenance is not pinned")
+    if re.fullmatch(r"[0-9a-f]{64}", str(value["input_manifest_hash"])) is None:
+        raise ValueError("semantic-proof execution manifest hash is invalid")
 
 
 def _validate_opportunity_publication_changed(

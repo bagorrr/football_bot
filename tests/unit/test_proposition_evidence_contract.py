@@ -13,6 +13,7 @@ from modules.application import (
 )
 from modules.classifier_contract import proposition_evidence_is_schema_valid
 from modules.contracts import JsonValue
+from modules.testkit import semantic_proof_result_for
 
 
 def _span(body: str, text: str) -> dict[str, int | str]:
@@ -124,13 +125,32 @@ def _authoritative(
     candidate_key: str,
     evidence: dict[str, str],
     routes: list[dict[str, str]],
+    semantic_proof: JsonValue | None = None,
+    include_semantic_proof: bool = True,
 ) -> bool:
+    if semantic_proof is None and include_semantic_proof:
+        semantic_proof = semantic_proof_result_for(
+            output={
+                "candidates": [
+                    {
+                        "candidate_key": candidate_key,
+                        "evidence": cast(JsonValue, evidence),
+                        "response_routes": cast(JsonValue, routes),
+                    }
+                ]
+            },
+            body=body,
+        ).output
     return _proposition_evidence_is_authoritative(
         cast(JsonValue, contract),
         body=body,
         candidate_key=candidate_key,
         evidence=cast(dict[str, JsonValue], evidence),
         routes=cast(list[JsonValue], routes),
+        semantic_proof=semantic_proof,
+        source_message_revision_reference=(
+            "controlled-revision-reference" if semantic_proof is not None else None
+        ),
     )
 
 
@@ -427,6 +447,7 @@ def test_application_rejects_all_positive_graph_for_negated_player_participation
         candidate_key="open-place",
         evidence=evidence,
         routes=routes,
+        include_semantic_proof=False,
     )
 
 
@@ -490,6 +511,7 @@ def test_application_rejects_negated_player_participation_in_all_locales() -> No
             candidate_key="open-place",
             evidence=evidence,
             routes=routes,
+            include_semantic_proof=False,
         )
 
 
@@ -680,6 +702,123 @@ def test_application_rejects_equivalent_negated_player_meanings_in_all_locales()
                 candidate_key="open-place",
                 evidence=evidence,
                 routes=routes,
+                include_semantic_proof=expected,
             )
             is expected
+        )
+
+
+def test_application_semantic_proof_rejects_latest_all_positive_graph_negations() -> (
+    None
+):
+    cases = (
+        (
+            "Football match is reserved for teams; individual players are excluded.",
+            "Football match is reserved for teams; individual players are excluded.",
+        ),
+        (
+            "Football match is for teams only; individual players are not admitted.",
+            "Football match is for teams only; individual players are not admitted.",
+        ),
+        (
+            "Футбольный матч только для команд; отдельные игроки не допускаются.",
+            "Футбольный матч только для команд; отдельные игроки не допускаются.",
+        ),
+        (
+            "El partido de fútbol es solo para equipos; no se admiten "
+            "jugadores individuales.",
+            "El partido de fútbol es solo para equipos; no se admiten "
+            "jugadores individuales.",
+        ),
+        (
+            "Le match de football est réservé aux équipes; les joueurs "
+            "individuels ne sont pas admis.",
+            "Le match de football est réservé aux équipes; les joueurs "
+            "individuels ne sont pas admis.",
+        ),
+    )
+    for opening, opportunity in cases:
+        body = (
+            f"{opening} 20 August 2026 at Central Station. "
+            "Need one player. Contact @match_contact"
+        )
+        event_time = "20 August 2026"
+        location = "at Central Station"
+        open_places = "Need one player"
+        evidence = {
+            "opportunity": opportunity,
+            "event_time": event_time,
+            "location": location,
+            "open_places": open_places,
+        }
+        routes = [
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@match_contact",
+                "evidence": "Contact @match_contact",
+            }
+        ]
+        contract = _contract(body, evidence=evidence, routes=routes)
+        assert not _authoritative(
+            contract,
+            body=body,
+            candidate_key="open-place",
+            evidence=evidence,
+            routes=routes,
+            include_semantic_proof=False,
+        )
+        contradictory_proof = semantic_proof_result_for(
+            output={
+                "candidates": [
+                    {
+                        "candidate_key": "open-place",
+                        "evidence": cast(JsonValue, evidence),
+                        "response_routes": cast(JsonValue, routes),
+                    }
+                ]
+            },
+            body=body,
+            check_state="present",
+        ).output
+        assert not _authoritative(
+            contract,
+            body=body,
+            candidate_key="open-place",
+            evidence=evidence,
+            routes=routes,
+            semantic_proof=contradictory_proof,
+        )
+
+
+def test_application_semantic_proof_accepts_valid_counterparts() -> None:
+    cases = (
+        "Football match is open to individual players.",
+        "Матч открыт для отдельных игроков.",
+        "El partido está abierto a jugadores individuales.",
+        "Le match est ouvert aux joueurs individuels.",
+    )
+    for opening in cases:
+        body = (
+            f"{opening} 20 August 2026 at Central Station. "
+            "Need one player. Contact @match_contact"
+        )
+        evidence = {
+            "opportunity": opening,
+            "event_time": "20 August 2026",
+            "location": "at Central Station",
+            "open_places": "Need one player",
+        }
+        routes = [
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@match_contact",
+                "evidence": "Contact @match_contact",
+            }
+        ]
+        assert _authoritative(
+            _contract(body, evidence=evidence, routes=routes),
+            body=body,
+            candidate_key="open-place",
+            evidence=evidence,
+            routes=routes,
         )

@@ -42,6 +42,7 @@ from modules.testkit import (
     ControlledTimezoneDataAdapter,
     FrozenClock,
     boot_acceptance_spine,
+    semantic_proof_result_for,
 )
 
 
@@ -287,6 +288,33 @@ def test_semantically_negated_open_match_has_no_postgres_publication_effect() ->
             "Football match is not for teams, but for individual players.",
             True,
         ),
+        (
+            "s1_en_reserved_excluded",
+            "Football match is reserved for teams; individual players are excluded.",
+            False,
+        ),
+        (
+            "s1_en_only_not_admitted",
+            "Football match is for teams only; individual players are not admitted.",
+            False,
+        ),
+        (
+            "s1_ru_only_not_admitted",
+            "Футбольный матч только для команд; отдельные игроки не допускаются.",
+            False,
+        ),
+        (
+            "s1_es_only_not_admitted",
+            "El partido de fútbol es solo para equipos; no se admiten "
+            "jugadores individuales.",
+            False,
+        ),
+        (
+            "s1_fr_reserved_not_admitted",
+            "Le match de football est réservé aux équipes; les joueurs "
+            "individuels ne sont pas admis.",
+            False,
+        ),
     )
     expected_active_count = 0
     for case_index, (case_key, opening, expected_active) in enumerate(semantic_cases):
@@ -295,7 +323,17 @@ def test_semantically_negated_open_match_has_no_postgres_publication_effect() ->
             f"{opening} 20 August 2026 in whole city. Need one player. "
             f"Contact {contact}"
         )
-        classifier.return_for(body=body, result=result_for(body, contact))
+        primary_result = result_for(body, contact)
+        classifier.return_for(body=body, result=primary_result)
+        if not expected_active:
+            classifier.return_proof_for(
+                body=body,
+                result=semantic_proof_result_for(
+                    output=primary_result.output,
+                    body=body,
+                    check_state="present",
+                ),
+            )
         source_event_id = f"source-event:open-match:{case_key}"
         from_checkpoint = TelegramChannelCheckpoint(pts=4920 + case_index)
         to_checkpoint = TelegramChannelCheckpoint(pts=4921 + case_index)
@@ -325,13 +363,22 @@ def test_semantically_negated_open_match_has_no_postgres_publication_effect() ->
         assert attempts[-1].disposition == "accepted"
         assert len(attempts) == case_index + 1
         assert len(classifier.requests) == case_index + 1
+        assert len(classifier.proof_requests) == case_index + 1
+        assert classifier.proof_requests[-1].requested_model == "gpt-5.6-sol"
+        assert classifier.proof_requests[-1].requested_reasoning_effort == "high"
+        assert classifier.proof_requests[-1].prompt_version == (
+            "open-match-semantic-proof-v1"
+        )
+        assert classifier.proof_requests[-1].schema_version == (
+            "source-semantic-proof-v1"
+        )
         if not expected_active:
-            assert system.opportunities() == ()
+            assert len(system.opportunities()) == expected_active_count
             assert system.opportunity_publication_contracts(revision_id) == ()
             assert not system.redeliver_source_event(source_event_id)
             system.process_opportunities_until_idle()
             assert system.classification_attempts() == attempts
-            assert system.opportunities() == ()
+            assert len(system.opportunities()) == expected_active_count
             assert system.opportunity_publication_contracts(revision_id) == ()
             continue
 
@@ -574,6 +621,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     system.process_opportunities_until_idle()
 
     request = classifier.requests[0]
+    proof_request = classifier.proof_requests[0]
     assert request.source_event_time == "2026-08-18T09:05:00+00:00"
     assert request.context_bundle_version == "primary-classifier-context-v1"
     assert request.source_chat_reference.startswith("classifier-source-chat:")
@@ -587,6 +635,10 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         "message_language": None,
         "attachment_types": [],
     }
+    assert proof_request.requested_model == "gpt-5.6-sol"
+    assert proof_request.requested_reasoning_effort == "high"
+    assert proof_request.prompt_version == "open-match-semantic-proof-v1"
+    assert proof_request.schema_version == "source-semantic-proof-v1"
     serialized_request = json.dumps(asdict(request), sort_keys=True)
     assert "4900100" not in serialized_request
     assert "source-chat:channel" not in serialized_request
@@ -3434,6 +3486,15 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
                 open_places=invalid_open_places,
             )
         classifier.return_for(body=invalid_body, result=invalid_result)
+        if invalid_result.output.get("disposition") == "accepted":
+            classifier.return_proof_for(
+                body=invalid_body,
+                result=semantic_proof_result_for(
+                    output=invalid_result.output,
+                    body=invalid_body,
+                    check_state="present",
+                ),
+            )
         message_id = 1300 + offset
         invalid_message_ids.append(message_id)
         source_event_id = f"source-event:open-match:{label}"

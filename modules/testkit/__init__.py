@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -432,11 +433,17 @@ class ControlledModelAdapter:
     """Deterministic model adapter with no provider access."""
 
     _results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    _proof_results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
     requests: list[ClassifierRequest] = field(default_factory=list)
+    proof_requests: list[ClassifierRequest] = field(default_factory=list)
 
     def return_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
         """Configure one deterministic structured classifier response."""
         self._results[body] = result
+
+    def return_proof_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
+        """Configure one deterministic semantic-proof response."""
+        self._proof_results[body] = result
 
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return only configured offline output and retain policy provenance."""
@@ -454,6 +461,31 @@ class ControlledModelAdapter:
                 body=request.body,
             ),
         )
+
+    def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return a controlled proof pass without changing primary request counts."""
+        self.proof_requests.append(request)
+        try:
+            result = self._proof_results[request.body]
+        except KeyError:
+            try:
+                primary = self._results[request.body]
+            except KeyError as error:
+                raise RuntimeError(
+                    "controlled classifier result is not configured"
+                ) from error
+            output = _build_test_semantic_proof(
+                _ensure_test_proposition_evidence(primary.output, body=request.body),
+                body=request.body,
+                source_message_revision_reference=request.source_message_revision_id,
+            )
+            return replace(primary, output=output)
+        output = deepcopy(result.output)
+        if isinstance(output, dict):
+            output["source_message_revision_reference"] = (
+                request.source_message_revision_id
+            )
+        return replace(result, output=output)
 
     def proposal_id(self, revision_id: str) -> str:
         """Return a stable non-authoritative proposal identity."""
@@ -564,6 +596,171 @@ def _ensure_test_proposition_evidence(
         "relations": relations,
     }
     return enriched
+
+
+def _build_test_semantic_proof(
+    output: dict[str, JsonValue],
+    *,
+    body: str,
+    source_message_revision_reference: str,
+    root_state: str = "current_positive",
+    fact_state: str = "current_positive",
+    route_state: str = "current_positive",
+    check_state: str = "none",
+) -> dict[str, JsonValue]:
+    """Build a complete proof fixture for controlled acceptance tests."""
+    candidates = output.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return {}
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return {}
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    routes = candidate.get("response_routes")
+    if (
+        not isinstance(candidate_key, str)
+        or not isinstance(evidence, dict)
+        or not isinstance(routes, list)
+    ):
+        return {}
+
+    def span(text: str) -> dict[str, JsonValue]:
+        start = body.index(text)
+        return {"start": start, "end": start + len(text), "text": text}
+
+    facts: dict[str, JsonValue] = {}
+    assertion_target_ids = {"root"}
+    for fact_name, fact_value in evidence.items():
+        if not isinstance(fact_value, str):
+            return {}
+        target_id = f"fact:{fact_name}"
+        assertion_target_ids.add(target_id)
+        facts[fact_name] = {
+            "target_id": target_id,
+            "state": fact_state,
+            "span": span(fact_value),
+        }
+
+    structured_routes: list[JsonValue] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            return {}
+        kind = route.get("kind")
+        value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(
+            isinstance(item, str) and item for item in (kind, value, route_evidence)
+        ):
+            return {}
+        assert isinstance(kind, str)
+        assert isinstance(value, str)
+        assert isinstance(route_evidence, str)
+        target_id = f"route:{kind}:{value}"
+        assertion_target_ids.add(target_id)
+        structured_routes.append(
+            {
+                "kind": kind,
+                "value": value,
+                "target_id": target_id,
+                "state": route_state,
+                "span": span(route_evidence),
+            }
+        )
+
+    relations: list[JsonValue] = []
+    expected_supports: list[tuple[str, str]] = [("root", body)]
+    expected_supports.extend(
+        (f"fact:{fact_name}", fact_value)
+        for fact_name, fact_value in evidence.items()
+        if isinstance(fact_value, str)
+    )
+    expected_supports.extend(
+        (
+            f"route:{route['kind']}:{route['value']}",
+            cast(str, route["evidence"]),
+        )
+        for route in routes
+        if isinstance(route, dict)
+        and isinstance(route.get("kind"), str)
+        and isinstance(route.get("value"), str)
+        and isinstance(route.get("evidence"), str)
+    )
+    for target_id, target_text in expected_supports:
+        relations.append(
+            {
+                "kind": "supports",
+                "direction": "outgoing",
+                "source": "root",
+                "target": target_id,
+                "span": span(target_text),
+            }
+        )
+    for check_name in ("contradiction", "competition", "replacement", "closure"):
+        relations.append(
+            {
+                "kind": "covers",
+                "direction": "outgoing",
+                "source": "root",
+                "target": f"check:{check_name}",
+                "span": {"start": 0, "end": len(body), "text": body},
+            }
+        )
+    return {
+        "contract_version": "source-semantic-proof-v1",
+        "source_message_revision_reference": source_message_revision_reference,
+        "candidate_key": candidate_key,
+        "coverage": "complete_source_revision",
+        "root": {
+            "target_id": "root",
+            "domain": "football_match",
+            "meaning": "open_match",
+            "state": root_state,
+            "span": {"start": 0, "end": len(body), "text": body},
+        },
+        "facts": facts,
+        "routes": structured_routes,
+        "checks": {
+            check_name: {
+                "state": check_state,
+                "spans": [{"start": 0, "end": len(body), "text": body}],
+                "target_ids": cast(JsonValue, sorted(assertion_target_ids)),
+            }
+            for check_name in ("contradiction", "competition", "replacement", "closure")
+        },
+        "relations": relations,
+    }
+
+
+def semantic_proof_result_for(
+    *,
+    output: dict[str, JsonValue],
+    body: str,
+    root_state: str = "current_positive",
+    fact_state: str = "current_positive",
+    route_state: str = "current_positive",
+    check_state: str = "none",
+) -> ClassifierAdapterResult:
+    """Return a proof adapter result for adversarial controlled tests."""
+    return ClassifierAdapterResult(
+        output=_build_test_semantic_proof(
+            output,
+            body=body,
+            source_message_revision_reference="controlled-revision-reference",
+            root_state=root_state,
+            fact_state=fact_state,
+            route_state=route_state,
+            check_state=check_state,
+        ),
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="classifier-recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
 
 
 @dataclass(slots=True)

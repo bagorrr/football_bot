@@ -59,11 +59,22 @@ _CANONICAL_LISTS = {
 }
 
 PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
+SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
 _PROPOSITION_DOMAINS = {"football_match"}
 _PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
 _PROPOSITION_CURRENTNESS = {"current", "superseded", "withdrawn", "unknown"}
 _PROPOSITION_RELATIONS = {"supports", "negates", "replaces", "competes_with"}
 _PROPOSITION_RELATION_DIRECTIONS = {"incoming", "outgoing"}
+_SEMANTIC_PROOF_STATES = {
+    "current_positive",
+    "current_negative",
+    "ambiguous",
+    "withdrawn",
+    "superseded",
+    "unknown",
+}
+_SEMANTIC_CHECK_STATES = {"none", "present", "ambiguous", "unknown"}
+_SEMANTIC_CHECKS = ("contradiction", "competition", "replacement", "closure")
 
 
 def classifier_output_is_schema_valid(
@@ -340,6 +351,291 @@ def proposition_evidence_is_schema_valid(
             or relation.get("direction") not in _PROPOSITION_RELATION_DIRECTIONS
             or relation.get("target") not in valid_targets
             or not _valid_source_span(relation.get("span"), body)
+        ):
+            return False
+    return True
+
+
+def semantic_proof_is_schema_valid(
+    value: JsonValue,
+    *,
+    body: str,
+    source_message_revision_reference: str,
+    candidate_key: str,
+    evidence: dict[str, JsonValue],
+    routes: list[JsonValue],
+) -> bool:
+    """Validate the strict, source-bound semantic-proof representation.
+
+    This is intentionally separate from the v1 proposition graph. The graph is
+    useful model evidence, while this pass records the target-specific meaning
+    decision and the explicit coverage needed before Application can consider
+    any fact publishable.
+    """
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "contract_version",
+            "source_message_revision_reference",
+            "candidate_key",
+            "coverage",
+            "root",
+            "facts",
+            "routes",
+            "checks",
+            "relations",
+        }
+        or value.get("contract_version") != SEMANTIC_PROOF_VERSION
+        or value.get("coverage") != "complete_source_revision"
+        or not body
+        or value.get("source_message_revision_reference")
+        != source_message_revision_reference
+        or value.get("candidate_key") != candidate_key
+    ):
+        return False
+
+    assertion_target_ids = {"root"}
+    root = value.get("root")
+    if not isinstance(root, dict) or set(root) != {
+        "target_id",
+        "domain",
+        "meaning",
+        "state",
+        "span",
+    }:
+        return False
+    if (
+        root.get("target_id") != "root"
+        or root.get("domain") != "football_match"
+        or root.get("meaning") != "open_match"
+        or root.get("state") not in _SEMANTIC_PROOF_STATES
+        or not _valid_source_span(root.get("span"), body, expected_text=body)
+    ):
+        return False
+
+    facts = value.get("facts")
+    if not isinstance(facts, dict) or set(facts) != set(evidence):
+        return False
+    for fact_name, fact_value in facts.items():
+        expected_text = evidence.get(fact_name)
+        target_id = f"fact:{fact_name}"
+        if (
+            not isinstance(expected_text, str)
+            or not isinstance(fact_value, dict)
+            or set(fact_value) != {"target_id", "state", "span"}
+            or fact_value.get("target_id") != target_id
+            or fact_value.get("state") not in _SEMANTIC_PROOF_STATES
+            or not _valid_source_span(
+                fact_value.get("span"), body, expected_text=expected_text
+            )
+        ):
+            return False
+        assertion_target_ids.add(target_id)
+
+    structured_routes = value.get("routes")
+    if not isinstance(structured_routes, list) or len(structured_routes) != len(routes):
+        return False
+    expected_route_keys: set[tuple[str, str, str]] = set()
+    structured_route_keys: set[tuple[str, str, str]] = set()
+    for route in routes:
+        if not isinstance(route, dict):
+            return False
+        kind = route.get("kind")
+        route_value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(
+            isinstance(item, str) and item
+            for item in (kind, route_value, route_evidence)
+        ):
+            return False
+        assert isinstance(kind, str)
+        assert isinstance(route_value, str)
+        assert isinstance(route_evidence, str)
+        expected_route_keys.add((kind, route_value, route_evidence))
+    for route in structured_routes:
+        if not isinstance(route, dict) or set(route) != {
+            "kind",
+            "value",
+            "target_id",
+            "state",
+            "span",
+        }:
+            return False
+        structured_kind = route.get("kind")
+        structured_route_value = route.get("value")
+        structured_target_id = route.get("target_id")
+        span = route.get("span")
+        if (
+            not isinstance(structured_kind, str)
+            or not isinstance(structured_route_value, str)
+            or not isinstance(structured_target_id, str)
+            or not isinstance(span, dict)
+        ):
+            return False
+        span_text = span.get("text")
+        if (
+            structured_target_id != f"route:{structured_kind}:{structured_route_value}"
+            or route.get("state") not in _SEMANTIC_PROOF_STATES
+            or not isinstance(span_text, str)
+            or not _valid_source_span(span, body, expected_text=span_text)
+        ):
+            return False
+        assert isinstance(span_text, str)
+        structured_route_keys.add((structured_kind, structured_route_value, span_text))
+        assertion_target_ids.add(structured_target_id)
+    if structured_route_keys != expected_route_keys:
+        return False
+
+    checks = value.get("checks")
+    if not isinstance(checks, dict) or set(checks) != set(_SEMANTIC_CHECKS):
+        return False
+    for check_name in _SEMANTIC_CHECKS:
+        check = checks.get(check_name)
+        if not isinstance(check, dict) or set(check) != {
+            "state",
+            "spans",
+            "target_ids",
+        }:
+            return False
+        spans = check.get("spans")
+        target_ids = check.get("target_ids")
+        if (
+            check.get("state") not in _SEMANTIC_CHECK_STATES
+            or not isinstance(spans, list)
+            or not spans
+            or not all(_valid_source_span(span, body) for span in spans)
+            or not isinstance(target_ids, list)
+            or any(not isinstance(target_id, str) for target_id in target_ids)
+            or len(target_ids) != len(set(target_ids))
+            or set(target_ids) != assertion_target_ids
+        ):
+            return False
+
+    relations = value.get("relations")
+    if not isinstance(relations, list):
+        return False
+    expected_relation_spans: dict[tuple[str, str], str] = {
+        ("supports", "root"): body,
+    }
+    for fact_name, fact_value in evidence.items():
+        if isinstance(fact_value, str):
+            expected_relation_spans[("supports", f"fact:{fact_name}")] = fact_value
+    for route in routes:
+        if not isinstance(route, dict):
+            return False
+        kind = route.get("kind")
+        route_value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(
+            isinstance(item, str) and item
+            for item in (kind, route_value, route_evidence)
+        ):
+            return False
+        assert isinstance(kind, str)
+        assert isinstance(route_value, str)
+        assert isinstance(route_evidence, str)
+        expected_relation_spans[("supports", f"route:{kind}:{route_value}")] = (
+            route_evidence
+        )
+    for check_name in _SEMANTIC_CHECKS:
+        expected_relation_spans[("covers", f"check:{check_name}")] = body
+    if len(relations) != len(expected_relation_spans):
+        return False
+    observed_relation_targets: set[tuple[str, str]] = set()
+    for relation in relations:
+        if not isinstance(relation, dict) or set(relation) != {
+            "kind",
+            "direction",
+            "source",
+            "target",
+            "span",
+        }:
+            return False
+        kind = relation.get("kind")
+        target = relation.get("target")
+        span = relation.get("span")
+        if not isinstance(kind, str) or not isinstance(target, str):
+            return False
+        relation_key = (kind, target)
+        expected_span = expected_relation_spans.get(relation_key)
+        if (
+            kind not in {"supports", "covers"}
+            or relation.get("direction") != "outgoing"
+            or relation.get("source") != "root"
+            or not isinstance(target, str)
+            or expected_span is None
+            or not _valid_source_span(span, body, expected_text=expected_span)
+            or relation_key in observed_relation_targets
+        ):
+            return False
+        observed_relation_targets.add(relation_key)
+    return observed_relation_targets == set(expected_relation_spans)
+
+
+def semantic_proof_is_authoritative(
+    value: JsonValue,
+    *,
+    body: str,
+    source_message_revision_reference: str,
+    candidate_key: str,
+    evidence: dict[str, JsonValue],
+    routes: list[JsonValue],
+) -> bool:
+    """Accept only a complete current-positive proof with clean coverage."""
+    if not semantic_proof_is_schema_valid(
+        value,
+        body=body,
+        source_message_revision_reference=source_message_revision_reference,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    ):
+        return False
+    assert isinstance(value, dict)
+    root = value["root"]
+    facts = value["facts"]
+    structured_routes = value["routes"]
+    checks = value["checks"]
+    if (
+        not isinstance(root, dict)
+        or root.get("state") != "current_positive"
+        or not isinstance(facts, dict)
+        or not isinstance(structured_routes, list)
+        or not isinstance(checks, dict)
+    ):
+        return False
+    if any(
+        not isinstance(fact, dict) or fact.get("state") != "current_positive"
+        for fact in facts.values()
+    ):
+        return False
+    if any(
+        not isinstance(route, dict) or route.get("state") != "current_positive"
+        for route in structured_routes
+    ):
+        return False
+    assertion_target_ids = {
+        "root",
+        *(f"fact:{fact_name}" for fact_name in evidence),
+        *(
+            f"route:{route['kind']}:{route['value']}"
+            for route in routes
+            if isinstance(route, dict)
+            and isinstance(route.get("kind"), str)
+            and isinstance(route.get("value"), str)
+        ),
+    }
+    for check_name in _SEMANTIC_CHECKS:
+        check = checks.get(check_name)
+        if not isinstance(check, dict) or check.get("state") != "none":
+            return False
+        spans = check.get("spans")
+        target_ids = check.get("target_ids")
+        if (
+            spans != [{"start": 0, "end": len(body), "text": body}]
+            or set(target_ids if isinstance(target_ids, list) else [])
+            != assertion_target_ids
         ):
             return False
     return True
