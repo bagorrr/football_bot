@@ -8747,30 +8747,39 @@ class RuntimeApplication:
             )
             return
         if incoming.contract_version == 4:
-            adjacent_revisions = self.store.adjacent_source_message_revisions(
-                identity=source_chat.identity,
-                registry_generation=source_revision.registry_generation,
-                telegram_message_id=int(
-                    source_revision.source_message_id.rsplit(":message:", 1)[1]
-                ),
-                current_event_time=source_revision.event_time,
+            adjacent_context = payload.get("adjacent_context")
+            output = payload.get("output")
+            routing = output.get("routing") if isinstance(output, dict) else None
+            requires_adjacent_validation = bool(adjacent_context) or (
+                payload.get("pass_number") == 2
+                and isinstance(routing, dict)
+                and routing.get("required_context") == "adjacent_revisions"
             )
-            if not _adjacent_context_matches_revisions(
-                payload.get("adjacent_context"),
-                adjacent_revisions,
-            ):
-                self.store.record_classification_routing_outcome(
-                    incoming=incoming,
-                    outcome=_classification_routing_outcome(
-                        payload,
-                        source_message_revision_id=revision_id,
-                        reason_code="provenance_invalid",
-                        recorded_at=self.clock.now(),
-                        pass_number=_classification_pass_number(payload),
+            if requires_adjacent_validation:
+                adjacent_revisions = self.store.adjacent_source_message_revisions(
+                    identity=source_chat.identity,
+                    registry_generation=source_revision.registry_generation,
+                    telegram_message_id=int(
+                        source_revision.source_message_id.rsplit(":message:", 1)[1]
                     ),
-                    received_at=self.clock.now(),
+                    current_event_time=source_revision.event_time,
                 )
-                return
+                if not _adjacent_context_matches_revisions(
+                    adjacent_context,
+                    adjacent_revisions,
+                ):
+                    self.store.record_classification_routing_outcome(
+                        incoming=incoming,
+                        outcome=_classification_routing_outcome(
+                            payload,
+                            source_message_revision_id=revision_id,
+                            reason_code="provenance_invalid",
+                            recorded_at=self.clock.now(),
+                            pass_number=_classification_pass_number(payload),
+                        ),
+                        received_at=self.clock.now(),
+                    )
+                    return
         authoritative_payload: dict[str, JsonValue] = {
             **payload,
             "body": source_revision.body,
