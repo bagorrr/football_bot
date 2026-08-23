@@ -114,6 +114,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0015_fail_closed_ingestion.sql",
     "0016_classification_routing_outcomes.sql",
     "0017_application_proposition_identities.sql",
+    "0018_legacy_v4_proposition_identity_backfill.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -133,6 +134,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "36fb8c2c6a1b9dcfe475315439f9486da96e44b30b169324264344f72ab47003",
     "eb414763ca320bcc06cd6980f4fe1860f9a63c5bf8ef07cd14e43b9c38460dbc",
     "c717b66b3394868348d3f7d7869d44485f222053af50633bf65176efeff07768",
+    "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
     "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
 )
 
@@ -3281,6 +3283,85 @@ class PostgresRoleStore:
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
         )
 
+    def adjacent_source_message_revisions(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> tuple[SourceMessageRevision, ...]:
+        """Read at most four retained messages in the exact adjacent window."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT revision.source_message_revision_id,
+                       revision.source_message_id,
+                       revision.source_event_id,
+                       revision.revision,
+                       revision.event_kind,
+                       revision.body,
+                       revision.event_time,
+                       revision.recorded_at,
+                       revision.registry_generation,
+                       revision.bounded_metadata,
+                       revision.reply_to_telegram_message_id
+                FROM football_runtime.source_messages AS message
+                JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_id = message.source_message_id
+                 AND revision.revision = message.current_revision
+                 AND revision.registry_generation = message.registry_generation
+                JOIN football_runtime.source_chat_registry AS registry
+                  ON registry.peer_kind = message.peer_kind
+                 AND registry.telegram_chat_id = message.telegram_chat_id
+                 AND registry.registry_generation = message.registry_generation
+                 AND registry.enabled
+                WHERE message.peer_kind = %s
+                  AND message.telegram_chat_id = %s
+                  AND message.registry_generation = %s
+                  AND message.telegram_message_id <> %s
+                  AND abs(message.telegram_message_id - %s) <= 2
+                  AND NOT message.tombstoned
+                  AND message.recorded_at >= registry.processing_started_at
+                  AND revision.body IS NOT NULL
+                  AND revision.event_time BETWEEN
+                      %s - INTERVAL '24 hours'
+                      AND %s + INTERVAL '24 hours'
+                ORDER BY message.telegram_message_id
+                LIMIT 4
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    telegram_message_id,
+                    telegram_message_id,
+                    current_event_time,
+                    current_event_time,
+                ),
+            ).fetchall()
+        return tuple(
+            SourceMessageRevision(
+                source_message_revision_id=row["source_message_revision_id"],
+                source_message_id=row["source_message_id"],
+                source_event_id=row["source_event_id"],
+                revision=row["revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+                registry_generation=row["registry_generation"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            )
+            for row in rows
+        )
+
     def claim_next(
         self,
         *,
@@ -3598,6 +3679,52 @@ class PostgresRoleStore:
             ).fetchall()
         return tuple((row["proposition_slot"], row["opportunity_id"]) for row in rows)
 
+    def proposition_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read Application-owned lineage and latest accepted target facts."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT lineage.proposition_slot,
+                       opportunity.opportunity_id,
+                       opportunity.opportunity_type,
+                       opportunity.accepted_facts,
+                       opportunity.evidence,
+                       opportunity.response_route
+                FROM (
+                    SELECT DISTINCT ON (opportunity_id)
+                           opportunity_id, opportunity_type,
+                           accepted_facts, evidence, response_route
+                    FROM football_runtime.application_opportunities
+                    WHERE source_message_revision_id LIKE %s
+                    ORDER BY opportunity_id, accepted_at DESC
+                ) AS opportunity
+                LEFT JOIN football_runtime.application_proposition_identities
+                    AS lineage
+                  ON lineage.opportunity_id = opportunity.opportunity_id
+                ORDER BY lineage.proposition_slot NULLS LAST,
+                         opportunity.opportunity_id
+                """,
+                (f"{source_message_id}:revision:%",),
+            ).fetchall()
+        return tuple(
+            {
+                "proposition_slot": row["proposition_slot"],
+                "opportunity_id": row["opportunity_id"],
+                "opportunity_type": row["opportunity_type"],
+                "accepted_facts": row["accepted_facts"],
+                "evidence": row["evidence"],
+                "response_route": row["response_route"],
+            }
+            for row in rows
+        )
+
     def record_classification_routing_outcome(
         self,
         *,
@@ -3678,6 +3805,42 @@ class PostgresRoleStore:
                         received_at,
                     ),
                 )
+            proposition_slot = opportunity.get("proposition_slot")
+            source_message_revision_id = opportunity.get("source_message_revision_id")
+            opportunity_id = opportunity.get("opportunity_id")
+            if (
+                not isinstance(proposition_slot, int)
+                or isinstance(proposition_slot, bool)
+                or proposition_slot < 1
+                or not isinstance(source_message_revision_id, str)
+                or not isinstance(opportunity_id, str)
+            ):
+                raise ValueError(
+                    "publication requires an Application proposition lineage"
+                )
+            source_message_id = source_message_revision_id.rsplit(":revision:", 1)[0]
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_proposition_identities (
+                    source_message_id, proposition_slot, opportunity_id, created_at
+                ) VALUES (%s, %s, %s, %s)
+                ON CONFLICT (source_message_id, proposition_slot) DO NOTHING
+                """,
+                (source_message_id, proposition_slot, opportunity_id, received_at),
+            )
+            mapped_opportunity_id = connection.execute(
+                """
+                SELECT opportunity_id
+                FROM football_runtime.application_proposition_identities
+                WHERE source_message_id = %s AND proposition_slot = %s
+                """,
+                (source_message_id, proposition_slot),
+            ).fetchone()
+            if (
+                mapped_opportunity_id is None
+                or mapped_opportunity_id[0] != opportunity_id
+            ):
+                raise RuntimeError("Application proposition identity mapping changed")
             connection.execute(
                 """
                 INSERT INTO football_runtime.application_opportunities (

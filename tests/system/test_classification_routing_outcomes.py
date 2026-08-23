@@ -7,6 +7,8 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import cast
 
+import pytest
+
 from modules.contracts import ContractName, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
@@ -218,6 +220,282 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
     assert system.opportunity_publication_contracts(revision_id) == ()
 
 
+@pytest.mark.parametrize(
+    ("invalid_model", "invalid_reasoning"),
+    (
+        ("gpt-5.6-sol-wrong", "high"),
+        ("gpt-5.6-sol", "wrong"),
+        ("", "high"),
+        ("gpt-5.6-sol", ""),
+    ),
+)
+def test_primary_effective_provenance_is_retryable_before_any_classification(
+    invalid_model: str, invalid_reasoning: str
+) -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_118
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_108,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4908",
+    )
+    body = "A wrong effective classifier execution is not a classification."
+    classifier.enable_primary_v2()
+    invalid_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "irrelevant",
+        "candidates": [],
+        "routing": {"reason_code": "irrelevant", "required_context": "none"},
+    }
+    invalid_result = ClassifierAdapterResult(
+        output=invalid_output,
+        effective_model=invalid_model,
+        effective_reasoning_effort=invalid_reasoning,
+        codex_version="controlled-offline",
+        adapter_kind="classifier-recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
+    valid_result = ClassifierAdapterResult(
+        output=invalid_output,
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="classifier-recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
+    classifier.return_for(body=body, result=invalid_result)
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4908),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4909),
+        source_event_id="source-event:classification-routing:wrong-effective",
+        telegram_message_id=49010,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    revision_id = "source-chat:channel:4900108:generation:1:message:49010:revision:1"
+    assert [attempt.status for attempt in system.classification_attempts()] == [
+        "failed"
+    ]
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    classifier.return_for(body=body, result=valid_result)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    assert [attempt.attempt_number for attempt in system.classification_attempts()] == [
+        1,
+        2,
+    ]
+    assert [attempt.status for attempt in system.classification_attempts()] == [
+        "failed",
+        "succeeded",
+    ]
+    assert len(system.classification_routing_outcomes()) == 1
+    assert system.classification_routing_outcomes()[0].disposition == "irrelevant"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_adjacent_second_pass_uses_only_application_selected_bounded_context() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_119
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_109,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4909",
+    )
+    primary_body = (
+        "The adjacent messages make this deterministic only in the second pass."
+    )
+    primary_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "needs_second_pass",
+        "candidates": [],
+        "routing": {
+            "reason_code": "deterministic_ambiguity",
+            "required_context": "adjacent_revisions",
+        },
+    }
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=primary_body,
+        result=ClassifierAdapterResult(
+            output=primary_output,
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="classifier-recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    classifier.return_second_pass_for(
+        body=primary_body,
+        result=ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="classifier-recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    for message_id in (49011, 49012, 49014, 49015):
+        classifier.return_for(
+            body=f"Retained adjacent message {message_id}.",
+            result=ClassifierAdapterResult(
+                output={
+                    "schema_version": "source-message-classification-v2",
+                    "disposition": "irrelevant",
+                    "candidates": [],
+                    "routing": {
+                        "reason_code": "irrelevant",
+                        "required_context": "none",
+                    },
+                },
+                effective_model="gpt-5.6-sol",
+                effective_reasoning_effort="high",
+                codex_version="controlled-offline",
+                adapter_kind="classifier-recording",
+                adapter_version="classifier-recording-v1",
+                duration_ms=3,
+                input_tokens=30,
+                output_tokens=20,
+            ),
+        )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    messages = (
+        (49011, "Retained adjacent message 49011.", 5),
+        (49012, "Retained adjacent message 49012.", 6),
+        (49014, "Retained adjacent message 49014.", 7),
+        (49015, "Retained adjacent message 49015.", 8),
+        (49013, primary_body, 9),
+    )
+    for offset, (message_id, message_body, minute) in enumerate(messages):
+        telegram.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=4909 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=4910 + offset),
+            source_event_id=f"source-event:adjacent-context:{message_id}",
+            telegram_message_id=message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=message_body,
+            event_time=datetime(2026, 8, 18, 9, minute, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        assert system.process_next_source_event()
+        system.process_opportunities_until_idle()
+
+    primary_requests = [
+        request for request in classifier.requests if request.body == primary_body
+    ]
+    assert len(primary_requests) == 2
+    assert primary_requests[0].adjacent_context == ()
+    assert len(classifier.second_pass_requests) == 1
+    selected = classifier.second_pass_requests[0].adjacent_context
+    assert [item["body"] for item in selected] == [
+        "Retained adjacent message 49011.",
+        "Retained adjacent message 49012.",
+        "Retained adjacent message 49014.",
+        "Retained adjacent message 49015.",
+    ]
+    assert all(
+        set(item)
+        == {
+            "relationship_kind",
+            "source_message_revision_reference",
+            "body",
+            "source_event_time",
+        }
+        for item in selected
+    )
+    assert all(
+        isinstance(item["source_message_revision_reference"], str)
+        and item["source_message_revision_reference"].startswith("classifier-revision:")
+        for item in selected
+    )
+    assert system.opportunities() == ()
+
+
 def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() -> None:
     telegram = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
@@ -328,7 +606,16 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
             output_tokens=20,
         ),
     )
-    classifier.return_second_pass_for(body=body, result=second_pass)
+    invalid_second_pass = replace_classifier_output(
+        second_pass,
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "accepted",
+            "candidates": [],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        },
+    )
+    classifier.return_second_pass_for(body=body, result=invalid_second_pass)
     classifier.return_proof_for(
         body=body,
         result=semantic_proof_result_for(
@@ -369,7 +656,7 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
         registry_generation=1,
     )
     assert system.process_next_source_event()
-    system.process_opportunities_until_idle()
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
 
     revision_id = "source-chat:channel:4900101:generation:1:message:49002:revision:1"
     attempts = system.classification_attempts()
@@ -377,10 +664,27 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
         "primary",
         "ambiguity_second_pass",
     ]
+    assert [attempt.status for attempt in attempts] == ["succeeded", "failed"]
     assert len(classifier.second_pass_requests) == 1
     assert classifier.second_pass_requests[0].prompt_version == (
         "open-match-ambiguity-v1"
     )
+    assert system.opportunities() == ()
+
+    classifier.return_second_pass_for(body=body, result=second_pass)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    attempts = system.classification_attempts()
+    assert [attempt.pass_kind for attempt in attempts] == [
+        "primary",
+        "ambiguity_second_pass",
+        "ambiguity_second_pass",
+    ]
+    assert [attempt.attempt_number for attempt in attempts] == [1, 1, 2]
+    assert len(classifier.second_pass_requests) == 2
+    assert len(classifier.requests) == 3
     assert len(classifier.proof_requests) == 1
     assert classifier.proof_requests[0].pass_kind == "semantic_proof"
     assert system.opportunities(), repr(
@@ -807,6 +1111,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         candidate["source_context"] = source_context.replace(
             "20 August 2026", "21 August 2026"
         ).replace("22 August 2026", "23 August 2026")
+    reclassified_candidates.reverse()
     reclassified_result = replace_classifier_output(
         _minimal_classifier_result(
             candidate_key="reclassified-candidate-1",

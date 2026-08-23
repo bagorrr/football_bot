@@ -1066,6 +1066,65 @@ def _validate_direct_causation(
         raise ValueError(f"{contract_name.value} message identity is not canonical")
 
 
+def _validate_adjacent_context(
+    value: JsonValue,
+    *,
+    source_chat_reference: str,
+    source_chat_generation: int,
+    current_telegram_message_id: int,
+    current_event_time: str,
+) -> None:
+    """Validate the Application-selected four-message adjacency window."""
+    if not isinstance(value, list) or len(value) > 4:
+        raise ValueError("adjacent_context must contain at most four messages")
+    try:
+        current_time = datetime.fromisoformat(current_event_time)
+    except ValueError as error:
+        raise ValueError("adjacent_context current time is invalid") from error
+    previous_message_id = 0
+    seen_message_ids: set[int] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "relationship_kind",
+            "source_message_revision_id",
+            "telegram_message_id",
+            "body",
+            "source_event_time",
+        }:
+            raise ValueError("adjacent_context item is incomplete")
+        if item["relationship_kind"] != "adjacent_message":
+            raise ValueError("adjacent_context relationship is invalid")
+        message_id = item["telegram_message_id"]
+        if (
+            not isinstance(message_id, int)
+            or isinstance(message_id, bool)
+            or message_id < 1
+            or message_id == current_telegram_message_id
+            or abs(message_id - current_telegram_message_id) > 2
+            or message_id in seen_message_ids
+            or message_id <= previous_message_id
+        ):
+            raise ValueError("adjacent_context message identity is invalid")
+        seen_message_ids.add(message_id)
+        previous_message_id = message_id
+        revision_id = _required_text(item, "source_message_revision_id")
+        if (
+            re.fullmatch(
+                rf"{re.escape(source_chat_reference)}:generation:"
+                rf"{source_chat_generation}:message:{message_id}:revision:[1-9][0-9]*",
+                revision_id,
+            )
+            is None
+        ):
+            raise ValueError("adjacent_context revision lineage is invalid")
+        _required_text(item, "body")
+        adjacent_time = datetime.fromisoformat(
+            _required_iso_datetime(item, "source_event_time")
+        )
+        if abs(current_time - adjacent_time) > timedelta(hours=24):
+            raise ValueError("adjacent_context exceeds the 24-hour bound")
+
+
 def _validate_classify_source_message_revision(
     envelope: RawContractEnvelope,
     payload: dict[str, JsonValue],
@@ -1084,7 +1143,8 @@ def _validate_classify_source_message_revision(
         "eligible_reply_context",
         "direct_reply_to_telegram_message_id",
     }
-    if set(payload) != allowed:
+    allowed_with_adjacent = allowed | {"adjacent_context"}
+    if set(payload) not in (allowed, allowed_with_adjacent):
         raise ValueError("ClassifySourceMessageRevision has incomplete semantics")
     revision_id = _validate_source_revision_lineage(envelope, payload)
     _required_text(payload, "body")
@@ -1120,6 +1180,13 @@ def _validate_classify_source_message_revision(
         current_telegram_message_id,
     ):
         raise ValueError("Source Message identity is not generation-bound")
+    _validate_adjacent_context(
+        payload.get("adjacent_context", []),
+        source_chat_reference=source_chat_reference,
+        source_chat_generation=source_chat_generation,
+        current_telegram_message_id=current_telegram_message_id,
+        current_event_time=_required_iso_datetime(payload, "source_event_time"),
+    )
     direct_reply_target = payload["direct_reply_to_telegram_message_id"]
     if direct_reply_target is not None and (
         not isinstance(direct_reply_target, int)
@@ -1262,9 +1329,14 @@ def _validate_classification_proposal(
         if envelope.contract_version == 4
         else set()
     )
+    proposal_context_fields = (
+        context_fields | {"adjacent_context"}
+        if envelope.contract_version == 4
+        else context_fields
+    )
     allowed = (
         {"proposal_id", "source_message_revision_id", "body"}
-        | context_fields
+        | proposal_context_fields
         | provenance_fields
         | (semantic_fields if envelope.contract_version in {3, 4} else set())
     )
@@ -1338,6 +1410,17 @@ def _validate_classification_proposal(
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
     if envelope.contract_version == 4:
+        _validate_adjacent_context(
+            payload["adjacent_context"],
+            source_chat_reference=_required_text(payload, "source_chat_reference"),
+            source_chat_generation=cast(
+                int, payload["source_chat_registry_generation"]
+            ),
+            current_telegram_message_id=int(
+                envelope.subject_id.rsplit(":message:", 1)[1]
+            ),
+            current_event_time=_required_iso_datetime(payload, "source_event_time"),
+        )
         _validate_classification_proposal_v4(payload, body=body)
     for field_name in ("pass_number", "attempt_number"):
         metric = payload[field_name]
@@ -1492,7 +1575,13 @@ def _validate_classification_proposal_v4(
             or candidate_key not in candidate_by_key
         ):
             raise ValueError("ClassificationProposal v4 execution identity is invalid")
-        _validate_semantic_proof_execution(wrapper.get("execution"))
+        execution = wrapper.get("execution")
+        if (
+            not isinstance(execution, dict)
+            or "candidate_target_manifest_hash" not in execution
+        ):
+            raise ValueError("ClassificationProposal v4 target manifest is incomplete")
+        _validate_semantic_proof_execution(execution)
         execution_keys.add(candidate_key)
     if output.get("disposition") == "accepted" and (
         proof_keys != execution_keys or proof_keys != set(candidate_by_key)
@@ -1579,7 +1668,12 @@ def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
         or value["routing_policy_version"] != "classifier-routing-v1"
     ):
         raise ValueError("ambiguity-pass policy provenance is invalid")
-    if value["pass_number"] != 2 or value["attempt_number"] != 1:
+    if (
+        value["pass_number"] != 2
+        or not isinstance(value["attempt_number"], int)
+        or isinstance(value["attempt_number"], bool)
+        or not 1 <= value["attempt_number"] <= 3
+    ):
         raise ValueError("ambiguity-pass numbering is invalid")
     for field_name in ("duration_ms", "input_tokens", "output_tokens"):
         metric = value[field_name]
@@ -1613,7 +1707,11 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         "output_tokens",
         "status",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    candidate_bound_fields = fields | {"candidate_target_manifest_hash"}
+    if not isinstance(value, dict) or set(value) not in {
+        fields,
+        candidate_bound_fields,
+    }:
         raise ValueError("semantic-proof execution metadata is incomplete")
     for field_name in (
         "requested_model",
@@ -1660,6 +1758,12 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         raise ValueError("semantic-proof execution provenance is not pinned")
     if re.fullmatch(r"[0-9a-f]{64}", str(value["input_manifest_hash"])) is None:
         raise ValueError("semantic-proof execution manifest hash is invalid")
+    if (
+        "candidate_target_manifest_hash" in value
+        and re.fullmatch(r"[0-9a-f]{64}", str(value["candidate_target_manifest_hash"]))
+        is None
+    ):
+        raise ValueError("semantic-proof target manifest hash is invalid")
 
 
 def _validate_opportunity_publication_changed(
@@ -1681,10 +1785,13 @@ def _validate_opportunity_publication_changed(
     if opportunity_id != envelope.subject_id:
         raise ValueError("OpportunityPublicationChanged subject is inconsistent")
     source_revision_id = _required_text(payload, "source_message_revision_id")
-    if (
-        opportunity_id
-        != f"opportunity:{source_revision_id.rsplit(':revision:', 1)[0]}:open_match"
-    ):
+    source_scope = source_revision_id.rsplit(":revision:", 1)[0]
+    legacy_identity = f"opportunity:{source_scope}:open_match"
+    lineage_identity = re.fullmatch(
+        rf"opportunity:{re.escape(source_scope)}:open_match:proposition:[0-9a-f]{{16}}",
+        opportunity_id,
+    )
+    if opportunity_id != legacy_identity and lineage_identity is None:
         raise ValueError(
             "Opportunity identity is inconsistent with its source revision"
         )

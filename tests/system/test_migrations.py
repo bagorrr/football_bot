@@ -745,6 +745,114 @@ def test_migrate_adopts_untracked_current_schema_without_replaying(
     ]
 
 
+def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=17)
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    candidate_source = "source-chat:channel:4918100:generation:1:message:1001"
+    proposition_source = "source-chat:channel:4918100:generation:1:message:1002"
+    with psycopg.connect(fresh_database_url) as connection:
+        for source_message_id, identity_marker in (
+            (candidate_source, "candidate:aaaaaaaaaaaaaaaa"),
+            (proposition_source, "proposition:bbbbbbbbbbbbbbbb"),
+        ):
+            opportunity_id = (
+                f"opportunity:{source_message_id}:open_match:{identity_marker}"
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                    %s
+                )
+                """,
+                (
+                    opportunity_id,
+                    f"{opportunity_id}:revision:1",
+                    f"{source_message_id}:revision:1",
+                    recorded_at,
+                ),
+            )
+
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        mappings = connection.execute(
+            """
+            SELECT source_message_id, proposition_slot, opportunity_id
+            FROM football_runtime.application_proposition_identities
+            WHERE source_message_id IN (%s, %s)
+            ORDER BY source_message_id
+            """,
+            (candidate_source, proposition_source),
+        ).fetchall()
+    assert mappings == [
+        (
+            candidate_source,
+            1,
+            f"opportunity:{candidate_source}:open_match:candidate:aaaaaaaaaaaaaaaa",
+        ),
+        (
+            proposition_source,
+            1,
+            f"opportunity:{proposition_source}:open_match:proposition:bbbbbbbbbbbbbbbb",
+        ),
+    ]
+
+
+def test_0018_fails_closed_for_mixed_legacy_v4_identity_formats(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=17)
+    source_message_id = "source-chat:channel:4918101:generation:1:message:1003"
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        for identity_marker in (
+            "candidate:cccccccccccccccc",
+            "proposition:dddddddddddddddd",
+        ):
+            opportunity_id = (
+                f"opportunity:{source_message_id}:open_match:{identity_marker}"
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                    %s
+                )
+                """,
+                (
+                    opportunity_id,
+                    f"{opportunity_id}:revision:1",
+                    f"{source_message_id}:revision:1",
+                    recorded_at,
+                ),
+            )
+
+    with pytest.raises(
+        psycopg.errors.RaiseException,
+        match="legacy v4 proposition identity formats are ambiguous",
+    ):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+
 @pytest.mark.parametrize("applied_count", range(1, 9))
 def test_migrate_adopts_each_exact_partial_prefix_and_upgrades_it(
     fresh_database_url: str,

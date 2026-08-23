@@ -826,6 +826,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read Application-owned proposition slots for one Source Message."""
         ...
 
+    def proposition_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read durable proposition lineage facts for one Source Message."""
+        ...
+
     def record_classification_routing_outcome(
         self,
         *,
@@ -892,6 +898,17 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         current_event_time: datetime,
     ) -> SourceMessageRevision | None:
         """Return one retained current direct-reply target after the start boundary."""
+        ...
+
+    def adjacent_source_message_revisions(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> tuple[SourceMessageRevision, ...]:
+        """Return the bounded same-generation adjacent context candidates."""
         ...
 
     def claim_next(
