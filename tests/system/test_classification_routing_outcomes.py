@@ -107,7 +107,9 @@ def test_irrelevant_classifier_outcome_is_durable_and_unpublished() -> None:
     assert system.classification_routing_outcomes() == outcomes
 
 
-def test_schema_invalid_primary_retries_then_records_failed_without_proposal() -> None:
+def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal() -> (
+    None
+):
     telegram = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
     clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
@@ -178,18 +180,39 @@ def test_schema_invalid_primary_retries_then_records_failed_without_proposal() -
         registry_generation=1,
     )
     assert system.process_next_source_event()
-    system.process_opportunities_until_idle()
+
+    # Each invalid execution must release the same durable classifier handoff
+    # for a later queue claim, including after a role restart.
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
 
     revision_id = "source-chat:channel:4900106:generation:1:message:49008:revision:1"
+    attempts = system.classification_attempts()
+    assert len(classifier.requests) == 1
+    assert [attempt.attempt_number for attempt in attempts] == [1]
+    assert [attempt.status for attempt in attempts] == ["failed"]
+    assert [attempt.source_message_revision_id for attempt in attempts] == [revision_id]
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(classifier.requests) == 2
+    assert [attempt.attempt_number for attempt in system.classification_attempts()] == [
+        1,
+        2,
+    ]
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
     attempts = system.classification_attempts()
     assert len(classifier.requests) == 3
     assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3]
     assert [attempt.status for attempt in attempts] == ["failed", "failed", "failed"]
-    assert [attempt.source_message_revision_id for attempt in attempts] == [
-        revision_id,
-        revision_id,
-        revision_id,
-    ]
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    # The exhausted handoff is terminal and replay-safe: no Application
+    # consumer work was emitted, and another restart cannot recreate it.
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
     assert system.classification_routing_outcomes() == ()
     assert system.opportunities() == ()
     assert system.opportunity_publication_contracts(revision_id) == ()
@@ -757,16 +780,37 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     assert len(system.opportunities()) == 2
     assert len(system.opportunity_publication_contracts(revision_id)) == 1
 
+    revised_body = body.replace("20 August 2026", "21 August 2026").replace(
+        "22 August 2026", "23 August 2026"
+    )
     reclassified_output = deepcopy(primary_output)
     reclassified_candidates = reclassified_output.get("candidates")
     assert isinstance(reclassified_candidates, list)
     for index, candidate in enumerate(reclassified_candidates, start=1):
         assert isinstance(candidate, dict)
         candidate["candidate_key"] = f"reclassified-candidate-{index}"
+        revised_date = "2026-08-21" if index == 1 else "2026-08-23"
+        revised_date_evidence = "21 August 2026" if index == 1 else "23 August 2026"
+        candidate["event_time"] = {
+            "start_local_date": revised_date,
+            "end_local_date": revised_date,
+            "iana_timezone": "Europe/Moscow",
+        }
+        candidate_evidence = candidate.get("evidence")
+        assert isinstance(candidate_evidence, dict)
+        candidate["evidence"] = {
+            **candidate_evidence,
+            "event_time": revised_date_evidence,
+        }
+        source_context = candidate.get("source_context")
+        assert isinstance(source_context, str)
+        candidate["source_context"] = source_context.replace(
+            "20 August 2026", "21 August 2026"
+        ).replace("22 August 2026", "23 August 2026")
     reclassified_result = replace_classifier_output(
         _minimal_classifier_result(
             candidate_key="reclassified-candidate-1",
-            body=body,
+            body=revised_body,
             response_routes=[
                 {
                     "kind": "explicit_telegram_username",
@@ -777,7 +821,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         ),
         reclassified_output,
     )
-    classifier.return_for(body=body, result=reclassified_result)
+    classifier.return_for(body=revised_body, result=reclassified_result)
     for candidate in reclassified_candidates:
         assert isinstance(candidate, dict)
         reclassified_key = candidate.get("candidate_key")
@@ -790,11 +834,11 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
             },
         )
         classifier.return_proof_for(
-            body=body,
+            body=revised_body,
             candidate_key=reclassified_key,
             result=semantic_proof_result_for(
                 output=reclassified_candidate_output,
-                body=body,
+                body=revised_body,
             ),
         )
     telegram.add_channel_difference_event(
@@ -805,7 +849,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         telegram_message_id=49003,
         revision=2,
         kind=SourceEventKind.EDIT,
-        body=body,
+        body=revised_body,
         event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
     )
     assert system.process_next_channel_telegram_difference(

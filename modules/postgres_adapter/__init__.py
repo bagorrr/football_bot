@@ -113,6 +113,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0014_open_match_game_search.sql",
     "0015_fail_closed_ingestion.sql",
     "0016_classification_routing_outcomes.sql",
+    "0017_application_proposition_identities.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -132,6 +133,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "36fb8c2c6a1b9dcfe475315439f9486da96e44b30b169324264344f72ab47003",
     "eb414763ca320bcc06cd6980f4fe1860f9a63c5bf8ef07cd14e43b9c38460dbc",
     "c717b66b3394868348d3f7d7869d44485f222053af50633bf65176efeff07768",
+    "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -608,6 +610,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.protected_content_skips,
                      football_runtime.classification_attempts,
                      football_runtime.classification_routing_outcomes,
+                     football_runtime.application_proposition_identities,
                      football_runtime.application_opportunities,
                      football_runtime.recommendation_opportunities,
                      football_runtime.source_message_revisions,
@@ -3470,12 +3473,15 @@ class PostgresRoleStore:
         outgoing: ContractEnvelope | None,
         received_at: datetime,
         additional_attempts: tuple[tuple[ClassificationAttempt, Any], ...] = (),
+        finalize: bool = True,
     ) -> ConsumeResult:
-        """Atomically retain provenance and publish only a valid proposal."""
+        """Retain one execution and optionally complete its queue handoff."""
         if self._role is not RuntimeRole.CLASSIFICATION:
             raise ConversationAccessDeniedError
+        if not finalize and outgoing is not None:
+            raise ValueError("a retryable classifier attempt cannot publish")
         with psycopg.connect(self._database_url) as connection:
-            if not _begin_owned_contract(
+            if finalize and not _begin_owned_contract(
                 connection,
                 consumer=self._role,
                 incoming=incoming,
@@ -3530,10 +3536,67 @@ class PostgresRoleStore:
                         received_at,
                     ),
                 )
-            if outgoing is not None:
+            if finalize and outgoing is not None:
                 _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
+
+    def classification_attempts_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[ClassificationAttempt, ...]:
+        """Read prior owned attempts before claiming the next bounded retry."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT attempt_id, source_message_revision_id, requested_model,
+                       effective_model, requested_reasoning_effort,
+                       effective_reasoning_effort, prompt_version, schema_version,
+                       glossary_version, context_policy_version,
+                       routing_policy_version, codex_version, adapter_kind,
+                       adapter_version, pass_number, pass_kind, attempt_number,
+                       input_manifest_hash, evidence_references, duration_ms,
+                       input_tokens, output_tokens, disposition, status
+                FROM football_runtime.classification_attempts
+                WHERE source_message_revision_id = %s
+                ORDER BY attempt_number, pass_number, attempt_id
+                """,
+                (source_message_revision_id,),
+            ).fetchall()
+        return tuple(
+            ClassificationAttempt(
+                **{
+                    **row,
+                    "evidence_references": tuple(row["evidence_references"]),
+                }
+            )
+            for row in rows
+        )
+
+    def proposition_opportunity_ids(
+        self, source_message_id: str
+    ) -> tuple[tuple[int, str], ...]:
+        """Read Application-owned proposition slots for one Source Message."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT proposition_slot, opportunity_id
+                FROM football_runtime.application_proposition_identities
+                WHERE source_message_id = %s
+                ORDER BY proposition_slot
+                """,
+                (source_message_id,),
+            ).fetchall()
+        return tuple((row["proposition_slot"], row["opportunity_id"]) for row in rows)
 
     def record_classification_routing_outcome(
         self,
@@ -3691,6 +3754,49 @@ class PostgresRoleStore:
                     ),
                 )
             for opportunity in opportunities:
+                source_message_revision_id = opportunity["source_message_revision_id"]
+                proposition_slot = opportunity.get("proposition_slot")
+                if (
+                    not isinstance(source_message_revision_id, str)
+                    or not isinstance(proposition_slot, int)
+                    or isinstance(proposition_slot, bool)
+                    or proposition_slot < 1
+                ):
+                    raise ValueError(
+                        "compound publication requires an App proposition slot"
+                    )
+                source_message_id = source_message_revision_id.rsplit(":revision:", 1)[
+                    0
+                ]
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.application_proposition_identities (
+                        source_message_id, proposition_slot, opportunity_id, created_at
+                    ) VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (source_message_id, proposition_slot) DO NOTHING
+                    """,
+                    (
+                        source_message_id,
+                        proposition_slot,
+                        opportunity["opportunity_id"],
+                        received_at,
+                    ),
+                )
+                mapped_opportunity_id = connection.execute(
+                    """
+                    SELECT opportunity_id
+                    FROM football_runtime.application_proposition_identities
+                    WHERE source_message_id = %s AND proposition_slot = %s
+                    """,
+                    (source_message_id, proposition_slot),
+                ).fetchone()
+                if (
+                    mapped_opportunity_id is None
+                    or mapped_opportunity_id[0] != opportunity["opportunity_id"]
+                ):
+                    raise RuntimeError(
+                        "Application proposition identity mapping changed"
+                    )
                 connection.execute(
                     """
                     INSERT INTO football_runtime.application_opportunities (

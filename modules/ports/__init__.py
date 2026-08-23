@@ -809,8 +809,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         additional_attempts: tuple[
             tuple[ClassificationAttempt, ClassifierAdapterResult], ...
         ] = (),
+        finalize: bool = True,
     ) -> ConsumeResult:
-        """Atomically retain provenance and publish only a valid proposal."""
+        """Retain one execution and optionally complete its queue handoff."""
+        ...
+
+    def classification_attempts_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[ClassificationAttempt, ...]:
+        """Read prior classifier attempts needed for bounded queue retry."""
+        ...
+
+    def proposition_opportunity_ids(
+        self, source_message_id: str
+    ) -> tuple[tuple[int, str], ...]:
+        """Read Application-owned proposition slots for one Source Message."""
         ...
 
     def record_classification_routing_outcome(

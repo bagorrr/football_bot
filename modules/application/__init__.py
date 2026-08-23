@@ -8084,19 +8084,33 @@ class RuntimeApplication:
                 == "source-message-classification-v2"
             )
 
+        prior_attempts = self.store.classification_attempts_for_revision(revision_id)
+        prior_primary_attempts = tuple(
+            attempt
+            for attempt in prior_attempts
+            if attempt.pass_number == 1 and attempt.pass_kind == "primary"
+        )
+        primary_attempt_number = (
+            max(
+                (attempt.attempt_number for attempt in prior_primary_attempts),
+                default=0,
+            )
+            + 1
+        )
+        if primary_attempt_number > 3:
+            raise RuntimeError("classifier retry budget was already exhausted")
         primary_results = [self.model.classify(request)]
-        while len(primary_results) < 3 and not primary_result_is_valid(
-            primary_results[-1]
-        ):
-            primary_results.append(self.model.classify(request))
         primary_result = primary_results[-1]
         primary_valid = primary_result_is_valid(primary_result)
         primary_attempts = tuple(
             ClassificationAttempt(
                 attempt_id=(
                     f"classification-attempt:{revision_id}"
-                    if attempt_number == 1
-                    else f"classification-attempt:{revision_id}:retry:{attempt_number}"
+                    if primary_attempt_number == 1
+                    else (
+                        f"classification-attempt:{revision_id}:"
+                        f"retry:{primary_attempt_number}"
+                    )
                 ),
                 source_message_revision_id=revision_id,
                 requested_model=request.requested_model,
@@ -8113,9 +8127,9 @@ class RuntimeApplication:
                 adapter_version=result.adapter_version,
                 pass_number=1,
                 pass_kind="primary",
-                attempt_number=attempt_number,
+                attempt_number=primary_attempt_number,
                 input_manifest_hash=manifest_for(
-                    request, pass_number=1, attempt_number=attempt_number
+                    request, pass_number=1, attempt_number=primary_attempt_number
                 ),
                 evidence_references=_classification_evidence_references(result.output),
                 duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
@@ -8126,7 +8140,7 @@ class RuntimeApplication:
                 ),
                 status="succeeded" if primary_result_is_valid(result) else "failed",
             )
-            for attempt_number, result in enumerate(primary_results, start=1)
+            for result in primary_results
         )
         final_request = request
         final_result = primary_result
@@ -8135,20 +8149,7 @@ class RuntimeApplication:
         ambiguity_execution: dict[str, JsonValue] | None = None
         additional_attempts: list[
             tuple[ClassificationAttempt, ClassifierAdapterResult]
-        ] = [
-            (
-                attempt,
-                replace(
-                    result,
-                    duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
-                    input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
-                    output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
-                ),
-            )
-            for attempt, result in zip(
-                primary_attempts[1:], primary_results[1:], strict=True
-            )
-        ]
+        ] = []
         primary_disposition = primary_result.output.get("disposition")
         routing = primary_result.output.get("routing")
         required_context = (
@@ -8276,20 +8277,18 @@ class RuntimeApplication:
                 incoming=incoming,
                 attempt=primary_attempts[0],
                 result=replace(
-                    primary_results[0],
-                    duration_ms=_nonnegative_metric_or_zero(
-                        primary_results[0].duration_ms
-                    ),
+                    primary_result,
+                    duration_ms=_nonnegative_metric_or_zero(primary_result.duration_ms),
                     input_tokens=_nonnegative_metric_or_zero(
-                        primary_results[0].input_tokens
+                        primary_result.input_tokens
                     ),
                     output_tokens=_nonnegative_metric_or_zero(
-                        primary_results[0].output_tokens
+                        primary_result.output_tokens
                     ),
                 ),
                 outgoing=None,
                 received_at=self.clock.now(),
-                additional_attempts=tuple(additional_attempts),
+                finalize=primary_attempt_number >= 3,
             )
             return
 
@@ -8372,6 +8371,9 @@ class RuntimeApplication:
             final_output = _safe_v2_review_output()
             final_disposition = "needs_review"
         primary_attempt = primary_attempts[0]
+        final_attempt_number = (
+            1 if final_pass_number == 2 else primary_attempt.attempt_number
+        )
         final_metrics = replace(
             final_result,
             duration_ms=_nonnegative_metric_or_zero(final_result.duration_ms),
@@ -8411,9 +8413,11 @@ class RuntimeApplication:
             "adapter_kind": final_metrics.adapter_kind,
             "adapter_version": final_metrics.adapter_version,
             "pass_number": final_pass_number,
-            "attempt_number": 1,
+            "attempt_number": final_attempt_number,
             "input_manifest_hash": manifest_for(
-                final_request, pass_number=final_pass_number, attempt_number=1
+                final_request,
+                pass_number=final_pass_number,
+                attempt_number=final_attempt_number,
             ),
             "duration_ms": final_metrics.duration_ms,
             "input_tokens": final_metrics.input_tokens,
@@ -8654,7 +8658,11 @@ class RuntimeApplication:
             if len(v4_candidates) != 1:
                 accepted_opportunities: list[dict[str, JsonValue]] = []
                 publication_items: list[dict[str, JsonValue]] = []
-                for candidate in v4_candidates:
+                source_message_id = revision_id.rsplit(":revision:", 1)[0]
+                persisted_proposition_ids = dict(
+                    self.store.proposition_opportunity_ids(source_message_id)
+                )
+                for proposition_slot, candidate in enumerate(v4_candidates, start=1):
                     if not isinstance(candidate, dict):
                         self.store.record_classification_routing_outcome(
                             incoming=incoming,
@@ -8724,7 +8732,11 @@ class RuntimeApplication:
                         )
                         return
                     opportunity_id = _v4_candidate_opportunity_id(
-                        revision_id, accepted_candidate
+                        revision_id,
+                        proposition_slot=proposition_slot,
+                        persisted_opportunity_id=persisted_proposition_ids.get(
+                            proposition_slot
+                        ),
                     )
                     opportunity_revision_id = (
                         f"{opportunity_id}:revision:{incoming.subject_revision}"
@@ -8733,6 +8745,7 @@ class RuntimeApplication:
                         **accepted_candidate,
                         "opportunity_id": opportunity_id,
                         "opportunity_revision_id": opportunity_revision_id,
+                        "proposition_slot": proposition_slot,
                     }
                     accepted_opportunities.append(accepted_candidate)
                     publication_items.append(
@@ -9963,6 +9976,13 @@ def _v2_classifier_proposal_has_pinned_provenance(
     pass_number = payload.get("pass_number")
     if pass_number not in {1, 2}:
         return False
+    attempt_number = payload.get("attempt_number")
+    if (
+        not isinstance(attempt_number, int)
+        or isinstance(attempt_number, bool)
+        or attempt_number < 1
+    ):
+        return False
     prompt_version = (
         "open-match-ambiguity-v1" if pass_number == 2 else "open-match-primary-v2"
     )
@@ -10007,7 +10027,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "routing_policy_version": pinned["routing_policy_version"],
         "pass_kind": pass_kind,
         "pass_number": pass_number,
-        "attempt_number": 1,
+        "attempt_number": attempt_number,
     }
     expected_manifest_hash = sha256(
         json.dumps(
@@ -10023,7 +10043,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
             isinstance(payload.get(key), str) and bool(str(payload[key]).strip())
             for key in ("codex_version", "adapter_kind", "adapter_version")
         )
-        and payload.get("attempt_number") == 1
+        and payload.get("attempt_number") == attempt_number
         and payload.get("input_manifest_hash") == expected_manifest_hash
         and all(
             isinstance(metric := payload.get(key), int)
@@ -10650,42 +10670,19 @@ def _single_v4_candidate_payload(
 
 
 def _v4_candidate_opportunity_id(
-    revision_id: str, accepted_candidate: dict[str, JsonValue]
+    revision_id: str,
+    *,
+    proposition_slot: int,
+    persisted_opportunity_id: str | None,
 ) -> str:
-    """Derive a compound Opportunity identity from Application-owned facts."""
+    """Return the Application-owned identity for one compound proposition slot."""
     source_scope = revision_id.rsplit(":revision:", 1)[0]
-    accepted_facts = accepted_candidate.get("accepted_facts")
-    if not isinstance(accepted_facts, dict):
-        raise ValueError("accepted Opportunity facts are required for identity")
-    identity_facts = {
-        key: accepted_facts[key]
-        for key in (
-            "start_local_date",
-            "end_local_date",
-            "exact_local_time",
-            "day_part",
-            "iana_timezone",
-            "country_id",
-            "city_id",
-            "place_id",
-            "open_places",
-            "team_formats",
-            "positions",
-            "playing_levels",
-            "venue_settings",
-            "playing_surfaces",
-            "payment",
-            "payment_amount",
-            "payment_currency",
-        )
-    }
+    if proposition_slot < 1:
+        raise ValueError("Application proposition slots must be positive")
+    if persisted_opportunity_id is not None:
+        return persisted_opportunity_id
     proposition_digest = sha256(
-        json.dumps(
-            identity_facts,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        f"{source_scope}:open_match:proposition:{proposition_slot}".encode()
     ).hexdigest()[:16]
     return f"opportunity:{source_scope}:open_match:proposition:{proposition_digest}"
 
