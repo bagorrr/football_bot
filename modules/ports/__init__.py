@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
@@ -22,6 +22,7 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
+    ClassificationAttempt,
     CompletedSearch,
     CompletedSearchView,
     ConversationState,
@@ -36,6 +37,7 @@ from modules.domain import (
     LocationResolution,
     LocationResolutionQuery,
     OldChatViewCleanup,
+    Opportunity,
     ProtectedContentSkip,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
@@ -183,9 +185,54 @@ class TelegramDeliveryOutcomeUnknownError(RuntimeError):
 class ModelAdapter(Protocol):
     """Controlled model boundary for the acceptance spine."""
 
+    def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return one strict, non-authoritative structured proposal."""
+        ...
+
+    def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return one strict, source-bound semantic-proof proposal."""
+        ...
+
     def proposal_id(self, revision_id: str) -> str:
         """Return one non-authoritative synthetic proposal identity."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifierRequest:
+    """Pinned classifier request with immutable policy provenance."""
+
+    source_message_revision_id: str
+    body: str
+    source_event_time: str
+    context_bundle_version: str
+    source_chat_reference: str
+    source_chat_timezone: str | None
+    source_chat_geography: dict[str, JsonValue]
+    bounded_metadata: dict[str, JsonValue]
+    eligible_reply_context: dict[str, JsonValue] | None
+    requested_model: str
+    requested_reasoning_effort: str
+    prompt_version: str
+    schema_version: str
+    glossary_version: str
+    context_policy_version: str
+    routing_policy_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifierAdapterResult:
+    """Provider-neutral classifier response plus effective provenance."""
+
+    output: dict[str, JsonValue]
+    effective_model: str
+    effective_reasoning_effort: str
+    codex_version: str
+    adapter_kind: str
+    adapter_version: str
+    duration_ms: int
+    input_tokens: int
+    output_tokens: int
 
 
 class LocationResolverAdapter(Protocol):
@@ -450,6 +497,7 @@ class ConversationStore(Protocol):
         expected_state_revision: int,
         expected_draft_revision: int,
         message: TelegramMessage,
+        current_result: SearchResult | None,
         received_at: datetime,
     ) -> ConsumeResult:
         """Queue zero-result presentation without activating it prematurely."""
@@ -615,6 +663,18 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read application-owned Source Chats through a stable query."""
         ...
 
+    def configure_source_chat_classifier_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        iana_timezone: str,
+        country_id: str | None,
+        city_id: str | None,
+    ) -> None:
+        """Set bounded Application-owned context for one active generation."""
+        ...
+
     def eligible_source_chat_generation(
         self,
         *,
@@ -729,8 +789,41 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Apply one Source Event to Application-owned Source Message state."""
+        ...
+
+    def record_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: ClassifierAdapterResult,
+        outgoing: ContractEnvelope | None,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain provenance and publish only a valid proposal."""
+        ...
+
+    def publish_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity: dict[str, JsonValue],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically accept Application facts and publish one state change."""
+        ...
+
+    def project_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one accepted publication to Recommendation's projection."""
         ...
 
     def owned_source_events(self) -> tuple[SourceEventRecord, ...]:
@@ -739,6 +832,23 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
 
     def owned_source_messages(self) -> tuple[SourceMessage, ...]:
         """Read Application-owned Source Messages with the current credential."""
+        ...
+
+    def source_message_revision(
+        self, source_message_revision_id: str
+    ) -> SourceMessageRevision | None:
+        """Read one Application-owned immutable Source Message revision."""
+        ...
+
+    def eligible_reply_revision(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> SourceMessageRevision | None:
+        """Return one retained current direct-reply target after the start boundary."""
         ...
 
     def claim_next(
@@ -804,7 +914,19 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically persist a zero-result Completed Search and its event."""
+        """Evaluate one snapshot and atomically persist Search, Results and event."""
+        ...
+
+    def set_search_snapshot_hook(self, hook: Callable[[], None]) -> None:
+        """Install one controlled test hook after candidate snapshot selection."""
+        ...
+
+    def find_search_results(
+        self,
+        completed_search: CompletedSearch,
+        game_search_details: Mapping[str, tuple[str, ...]],
+    ) -> tuple[SearchResult, ...]:
+        """Deterministically match active Recommendation projections."""
         ...
 
     def source_chat_registration_context(
@@ -897,6 +1019,36 @@ class AcceptanceObserver(Protocol):
         """Observe SourceEventRecorded outbox signals through the testkit."""
         ...
 
+    def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
+        """Observe durable classifier execution provenance."""
+        ...
+
+    def opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Application-authoritative accepted Opportunities."""
+        ...
+
+    def opportunity_publication_contracts(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe publication outbox effects for one Source Message revision."""
+        ...
+
+    def completed_search_opportunity_revision_inputs(
+        self, completed_search_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Observe the immutable evaluated Opportunity revision input set."""
+        ...
+
+    def inject_concurrent_opportunity_revision(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        open_places: int,
+    ) -> None:
+        """Inject a controlled projection revision for snapshot concurrency tests."""
+        ...
+
     def replace_source_event_contract_version(
         self,
         message_id: UUID,
@@ -960,6 +1112,18 @@ class AcceptanceObserver(Protocol):
         """Replace one Source Chat payload at the privileged test seam."""
         ...
 
+    def invalidate_classifier_context(
+        self,
+        source_message_revision_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+        *,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+    ) -> RawContractEnvelope:
+        """Inject one classifier-context wire fault at the test seam."""
+        ...
+
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical query at the privileged test seam."""
         ...
@@ -1010,6 +1174,11 @@ class AcceptanceObserver(Protocol):
         """Observe Source Chat outcomes for one external registration origin."""
         ...
 
-    def snapshot(self, probe_id: str) -> AcceptanceObservation:
+    def snapshot(
+        self,
+        probe_id: str,
+        *,
+        message_id: UUID | None = None,
+    ) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical tables."""
         ...

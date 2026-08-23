@@ -34,6 +34,14 @@ evidence checks determine acceptance. The Bot Assistant persists only
 user-confirmed Discovery Criteria. Matching consumes both records without
 merging their provenance.
 
+Application acceptance additionally requires a current-positive,
+source-revision-specific semantic proof for every mandatory target fact and
+every present optional fact or payment fact that would be persisted. This
+semantic evidence boundary is separate from Discovery Criteria: a user’s
+criteria cannot repair absent or contradictory source meaning, and a model
+label or exact lexical span cannot publish a fact without complete proof
+coverage.
+
 The normalized vocabularies, Opportunity acceptance requirements, and
 direction-specific discovery flows live in
 [`docs/product/opportunity-fields-and-discovery-details.md`](../product/opportunity-fields-and-discovery-details.md).

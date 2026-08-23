@@ -5,10 +5,12 @@ from __future__ import annotations
 import secrets
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from threading import Condition
 from time import monotonic
+from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -33,6 +35,7 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
+    ClassificationAttempt,
     CompletedSearch,
     ConversationStage,
     ConversationState,
@@ -49,6 +52,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    Opportunity,
     ProtectedContentSkip,
     RequiredDate,
     RequiredDateConfirmationEvent,
@@ -73,6 +77,8 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObserver,
+    ClassifierAdapterResult,
+    ClassifierRequest,
     Clock,
     ConversationAccessDeniedError,
     ConversationLanguageAdapter,
@@ -293,6 +299,13 @@ class ControlledTelegramIngestionAdapter:
         kind: SourceEventKind,
         body: str | None,
         event_time: datetime,
+        message_language: str | None = None,
+        attachment_types: tuple[str, ...] = (),
+        source_author_dm_url: str | None = None,
+        reply_route_url: str | None = None,
+        source_message_url: str | None = None,
+        source_message_reply_capable: bool = False,
+        reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
         self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
@@ -306,6 +319,15 @@ class ControlledTelegramIngestionAdapter:
             body=body,
             event_time=event_time,
             registry_generation=registry_generation,
+            bounded_metadata={
+                "message_language": message_language,
+                "attachment_types": list(attachment_types),
+                "source_author_dm_url": source_author_dm_url,
+                "reply_route_url": reply_route_url,
+                "source_message_url": source_message_url,
+                "source_message_reply_capable": source_message_reply_capable,
+            },
+            reply_to_telegram_message_id=reply_to_telegram_message_id,
         )
 
     def add_unavailable_protection_account_difference_event(
@@ -437,6 +459,13 @@ class ControlledTelegramIngestionAdapter:
         kind: SourceEventKind,
         body: str | None,
         event_time: datetime,
+        message_language: str | None = None,
+        attachment_types: tuple[str, ...] = (),
+        source_author_dm_url: str | None = None,
+        reply_route_url: str | None = None,
+        source_message_url: str | None = None,
+        source_message_reply_capable: bool = False,
+        reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
         self._channel_difference_events[(identity, from_checkpoint)] = (
@@ -450,6 +479,15 @@ class ControlledTelegramIngestionAdapter:
                 kind=kind,
                 body=body,
                 event_time=event_time,
+                bounded_metadata={
+                    "message_language": message_language,
+                    "attachment_types": list(attachment_types),
+                    "source_author_dm_url": source_author_dm_url,
+                    "reply_route_url": reply_route_url,
+                    "source_message_url": source_message_url,
+                    "source_message_reply_capable": source_message_reply_capable,
+                },
+                reply_to_telegram_message_id=reply_to_telegram_message_id,
             )
         )
 
@@ -740,12 +778,339 @@ class ControlledTelegramDeliveryAdapter:
             raise InjectedTelegramDeliveryInterruptionError
 
 
+@dataclass(slots=True)
 class ControlledModelAdapter:
     """Deterministic model adapter with no provider access."""
+
+    _results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    _proof_results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    requests: list[ClassifierRequest] = field(default_factory=list)
+    proof_requests: list[ClassifierRequest] = field(default_factory=list)
+
+    def return_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
+        """Configure one deterministic structured classifier response."""
+        self._results[body] = result
+
+    def return_proof_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
+        """Configure one deterministic semantic-proof response."""
+        self._proof_results[body] = result
+
+    def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return only configured offline output and retain policy provenance."""
+        self.requests.append(request)
+        try:
+            result = self._results[request.body]
+        except KeyError as error:
+            raise RuntimeError(
+                "controlled classifier result is not configured"
+            ) from error
+        return replace(
+            result,
+            output=_ensure_test_proposition_evidence(
+                result.output,
+                body=request.body,
+            ),
+        )
+
+    def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        """Return a controlled proof pass without changing primary request counts."""
+        self.proof_requests.append(request)
+        try:
+            result = self._proof_results[request.body]
+        except KeyError:
+            try:
+                primary = self._results[request.body]
+            except KeyError as error:
+                raise RuntimeError(
+                    "controlled classifier result is not configured"
+                ) from error
+            output = _build_test_semantic_proof(
+                _ensure_test_proposition_evidence(primary.output, body=request.body),
+                body=request.body,
+                source_message_revision_reference=request.source_message_revision_id,
+            )
+            return replace(primary, output=output)
+        output = deepcopy(result.output)
+        if isinstance(output, dict):
+            output["source_message_revision_reference"] = (
+                request.source_message_revision_id
+            )
+        return replace(result, output=output)
 
     def proposal_id(self, revision_id: str) -> str:
         """Return a stable non-authoritative proposal identity."""
         return f"proposal:{revision_id}"
+
+
+def _ensure_test_proposition_evidence(
+    output: dict[str, JsonValue], *, body: str
+) -> dict[str, JsonValue]:
+    """Give legacy controlled fixtures the current structured model shape."""
+    enriched = deepcopy(output)
+    if enriched.get("disposition") != "accepted":
+        return enriched
+    candidates = enriched.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return enriched
+    candidate = candidates[0]
+    if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
+        return enriched
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    routes = candidate.get("response_routes")
+    if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
+        return enriched
+    if not all(isinstance(value, str) and value in body for value in evidence.values()):
+        return enriched
+    if not isinstance(routes, list):
+        return enriched
+    route_values: list[tuple[str, str, str]] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            return enriched
+        kind = route.get("kind")
+        value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(isinstance(item, str) for item in (kind, value, route_evidence)):
+            return enriched
+        assert isinstance(kind, str)
+        assert isinstance(value, str)
+        assert isinstance(route_evidence, str)
+        if route_evidence not in body:
+            return enriched
+        route_values.append((kind, value, route_evidence))
+
+    def span(text: str) -> dict[str, JsonValue]:
+        start = body.index(text)
+        return {"start": start, "end": start + len(text), "text": text}
+
+    relations: list[JsonValue] = [
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "target": "root",
+            "span": {"start": 0, "end": len(body), "text": body},
+        }
+    ]
+    for fact_name, fact_evidence in evidence.items():
+        if isinstance(fact_evidence, str):
+            relations.append(
+                {
+                    "kind": "supports",
+                    "direction": "outgoing",
+                    "target": fact_name,
+                    "span": span(fact_evidence),
+                }
+            )
+    for kind, value, route_evidence in route_values:
+        relations.append(
+            {
+                "kind": "supports",
+                "direction": "outgoing",
+                "target": f"route:{kind}:{value}",
+                "span": span(route_evidence),
+            }
+        )
+    candidate["proposition_evidence"] = {
+        "contract_version": "source-proposition-evidence-v1",
+        "coverage": "complete_source_revision",
+        "root": {
+            "proposition_id": candidate_key,
+            "domain": "football_match",
+            "meaning": "open_match",
+            "polarity": "positive",
+            "currentness": "current",
+            "span": {"start": 0, "end": len(body), "text": body},
+        },
+        "facts": {
+            fact_name: {
+                "proposition_id": candidate_key,
+                "polarity": "positive",
+                "currentness": "current",
+                "span": span(fact_evidence),
+            }
+            for fact_name, fact_evidence in evidence.items()
+            if isinstance(fact_evidence, str)
+        },
+        "routes": [
+            {
+                "kind": kind,
+                "value": value,
+                "proposition_id": candidate_key,
+                "polarity": "positive",
+                "currentness": "current",
+                "span": span(route_evidence),
+            }
+            for kind, value, route_evidence in route_values
+        ],
+        "relations": relations,
+    }
+    return enriched
+
+
+def _build_test_semantic_proof(
+    output: dict[str, JsonValue],
+    *,
+    body: str,
+    source_message_revision_reference: str,
+    root_state: str = "current_positive",
+    fact_state: str = "current_positive",
+    route_state: str = "current_positive",
+    check_state: str = "none",
+) -> dict[str, JsonValue]:
+    """Build a complete proof fixture for controlled acceptance tests."""
+    candidates = output.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return {}
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return {}
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    routes = candidate.get("response_routes")
+    if (
+        not isinstance(candidate_key, str)
+        or not isinstance(evidence, dict)
+        or not isinstance(routes, list)
+    ):
+        return {}
+
+    def span(text: str) -> dict[str, JsonValue]:
+        start = body.index(text)
+        return {"start": start, "end": start + len(text), "text": text}
+
+    facts: dict[str, JsonValue] = {}
+    assertion_target_ids = {"root"}
+    for fact_name, fact_value in evidence.items():
+        if not isinstance(fact_value, str):
+            return {}
+        target_id = f"fact:{fact_name}"
+        assertion_target_ids.add(target_id)
+        facts[fact_name] = {
+            "target_id": target_id,
+            "state": fact_state,
+            "span": span(fact_value),
+        }
+
+    structured_routes: list[JsonValue] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            return {}
+        kind = route.get("kind")
+        value = route.get("value")
+        route_evidence = route.get("evidence")
+        if not all(
+            isinstance(item, str) and item for item in (kind, value, route_evidence)
+        ):
+            return {}
+        assert isinstance(kind, str)
+        assert isinstance(value, str)
+        assert isinstance(route_evidence, str)
+        target_id = f"route:{kind}:{value}"
+        assertion_target_ids.add(target_id)
+        structured_routes.append(
+            {
+                "kind": kind,
+                "value": value,
+                "target_id": target_id,
+                "state": route_state,
+                "span": span(route_evidence),
+            }
+        )
+
+    relations: list[JsonValue] = []
+    expected_supports: list[tuple[str, str]] = [("root", body)]
+    expected_supports.extend(
+        (f"fact:{fact_name}", fact_value)
+        for fact_name, fact_value in evidence.items()
+        if isinstance(fact_value, str)
+    )
+    expected_supports.extend(
+        (
+            f"route:{route['kind']}:{route['value']}",
+            cast(str, route["evidence"]),
+        )
+        for route in routes
+        if isinstance(route, dict)
+        and isinstance(route.get("kind"), str)
+        and isinstance(route.get("value"), str)
+        and isinstance(route.get("evidence"), str)
+    )
+    for target_id, target_text in expected_supports:
+        relations.append(
+            {
+                "kind": "supports",
+                "direction": "outgoing",
+                "source": "root",
+                "target": target_id,
+                "span": span(target_text),
+            }
+        )
+    for check_name in ("contradiction", "competition", "replacement", "closure"):
+        relations.append(
+            {
+                "kind": "covers",
+                "direction": "outgoing",
+                "source": "root",
+                "target": f"check:{check_name}",
+                "span": {"start": 0, "end": len(body), "text": body},
+            }
+        )
+    return {
+        "contract_version": "source-semantic-proof-v1",
+        "source_message_revision_reference": source_message_revision_reference,
+        "candidate_key": candidate_key,
+        "coverage": "complete_source_revision",
+        "root": {
+            "target_id": "root",
+            "domain": "football_match",
+            "meaning": "open_match",
+            "state": root_state,
+            "span": {"start": 0, "end": len(body), "text": body},
+        },
+        "facts": facts,
+        "routes": structured_routes,
+        "checks": {
+            check_name: {
+                "state": check_state,
+                "spans": [{"start": 0, "end": len(body), "text": body}],
+                "target_ids": cast(JsonValue, sorted(assertion_target_ids)),
+            }
+            for check_name in ("contradiction", "competition", "replacement", "closure")
+        },
+        "relations": relations,
+    }
+
+
+def semantic_proof_result_for(
+    *,
+    output: dict[str, JsonValue],
+    body: str,
+    root_state: str = "current_positive",
+    fact_state: str = "current_positive",
+    route_state: str = "current_positive",
+    check_state: str = "none",
+) -> ClassifierAdapterResult:
+    """Return a proof adapter result for adversarial controlled tests."""
+    return ClassifierAdapterResult(
+        output=_build_test_semantic_proof(
+            output,
+            body=body,
+            source_message_revision_reference="controlled-revision-reference",
+            root_state=root_state,
+            fact_state=fact_state,
+            route_state=route_state,
+            check_state=check_state,
+        ),
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="classifier-recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
 
 
 @dataclass(slots=True)
@@ -1455,6 +1820,26 @@ class AcceptanceSpine:
         """Observe authoritative Source Messages through the stable testkit."""
         return self._observer.source_messages()
 
+    def configure_source_chat_classifier_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        iana_timezone: str,
+        country_id: str | None,
+        city_id: str | None,
+    ) -> None:
+        """Configure bounded primary-classifier context at the public seam."""
+        self._roles[
+            RuntimeRole.APPLICATION
+        ].store.configure_source_chat_classifier_context(
+            identity=identity,
+            registry_generation=registry_generation,
+            iana_timezone=iana_timezone,
+            country_id=country_id,
+            city_id=city_id,
+        )
+
     def source_events(self) -> tuple[SourceEventRecord, ...]:
         """Observe durable Source Events through the stable testkit."""
         return self._observer.source_events()
@@ -1478,6 +1863,59 @@ class AcceptanceSpine:
     def source_event_contracts(self) -> tuple[RawContractEnvelope, ...]:
         """Observe durable SourceEventRecorded outbox signals."""
         return self._observer.source_event_contracts()
+
+    def process_opportunities_until_idle(self) -> None:
+        """Drive Source Message classification, acceptance, and publication."""
+        while any(
+            self._roles[role].process_next()
+            for role in (
+                RuntimeRole.APPLICATION,
+                RuntimeRole.CLASSIFICATION,
+                RuntimeRole.APPLICATION,
+                RuntimeRole.RECOMMENDATION,
+            )
+        ):
+            pass
+
+    def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
+        """Observe durable primary-classifier provenance."""
+        return self._observer.classification_attempts()
+
+    def opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Application-authoritative accepted Opportunities."""
+        return self._observer.opportunities()
+
+    def opportunity_publication_contracts(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe publication outbox effects for one Source Message revision."""
+        return self._observer.opportunity_publication_contracts(
+            source_message_revision_id
+        )
+
+    def completed_search_opportunity_revision_inputs(
+        self, completed_search_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Observe the persisted immutable Recommendation revision input set."""
+        return self._observer.completed_search_opportunity_revision_inputs(
+            completed_search_id
+        )
+
+    def inject_projection_change_during_next_search(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        open_places: int,
+    ) -> None:
+        """Change a projection after the next Search has selected its snapshot."""
+        self._roles[RuntimeRole.RECOMMENDATION].store.set_search_snapshot_hook(
+            lambda: self._observer.inject_concurrent_opportunity_revision(
+                opportunity_id=opportunity_id,
+                opportunity_revision_id=opportunity_revision_id,
+                open_places=open_places,
+            )
+        )
 
     def redeliver_source_event(self, source_event_id: str) -> bool:
         """Redeliver one durable Source Event at the external contract seam."""
@@ -1557,25 +1995,45 @@ class AcceptanceSpine:
         producer: RuntimeRole | None = None,
         include_telegram_user_id: bool = True,
         payload: dict[str, JsonValue] | None = None,
+        message_id: UUID | None = None,
+        subject_id: str | None = None,
+        subject_revision: int | None = None,
+        idempotency_key: str | None = None,
+        causation_id: UUID | None = None,
+        correlation_id: UUID | None = None,
     ) -> None:
-        """Record one synthetic Recommendation event for contract-boundary tests."""
+        """Record one synthetic handoff for public contract-boundary tests."""
         if contract_name not in {
+            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+            ContractName.CLASSIFICATION_PROPOSAL,
+            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
             ContractName.RUN_SEARCH,
             ContractName.SEARCH_COMPLETED,
             ContractName.SEARCH_FAILED,
             ContractName.GET_COMPLETED_SEARCH,
         }:
-            raise ValueError("only Search outcome events can use this testkit port")
+            raise ValueError("contract cannot use this testkit port")
+        definition = _CONTRACTS.get((contract_name, contract_version))
         event_producer = producer or (
-            RuntimeRole.BOT_ASSISTANT
-            if contract_name is ContractName.RUN_SEARCH
-            else RuntimeRole.RECOMMENDATION
+            definition.producer
+            if definition is not None
+            else (
+                RuntimeRole.BOT_ASSISTANT
+                if contract_name is ContractName.RUN_SEARCH
+                else RuntimeRole.RECOMMENDATION
+            )
         )
         consumer = (
-            RuntimeRole.RECOMMENDATION
-            if contract_name is ContractName.RUN_SEARCH
-            else RuntimeRole.BOT_ASSISTANT
+            definition.consumer
+            if definition is not None
+            else (
+                RuntimeRole.RECOMMENDATION
+                if contract_name is ContractName.RUN_SEARCH
+                else RuntimeRole.BOT_ASSISTANT
+            )
         )
+        if consumer is None:
+            raise ValueError("contract has no consumer")
         event_payload: dict[str, JsonValue]
         if payload is not None:
             event_payload = dict(payload)
@@ -1604,14 +2062,14 @@ class AcceptanceSpine:
         envelope = RawContractEnvelope(
             contract_name=contract_name,
             contract_version=contract_version,
-            message_id=_identifier(probe_id, contract_name.value),
+            message_id=message_id or _identifier(probe_id, contract_name.value),
             producer=event_producer,
             consumer=consumer,
-            subject_id=probe_id,
-            subject_revision=1,
-            idempotency_key=f"{probe_id}:{contract_name.value}",
-            causation_id=_identifier(probe_id, "causation"),
-            correlation_id=_identifier(probe_id, "correlation"),
+            subject_id=subject_id or probe_id,
+            subject_revision=subject_revision or 1,
+            idempotency_key=(idempotency_key or f"{probe_id}:{contract_name.value}"),
+            causation_id=causation_id or _identifier(probe_id, "causation"),
+            correlation_id=correlation_id or _identifier(probe_id, "correlation"),
             recorded_at=self._roles[event_producer].clock.now(),
             payload=event_payload,
         )
@@ -1649,9 +2107,14 @@ class AcceptanceSpine:
             if not progressed:
                 return self.observe(probe_id)
 
-    def observe(self, probe_id: str) -> AcceptanceSnapshot:
+    def observe(
+        self,
+        probe_id: str,
+        *,
+        message_id: UUID | None = None,
+    ) -> AcceptanceSnapshot:
         """Observe business-neutral durable outcomes through the testkit."""
-        values = self._observer.snapshot(probe_id)
+        values = self._observer.snapshot(probe_id, message_id=message_id)
         return AcceptanceSnapshot(
             owner_state_roles=values.roles,
             owner_state_records=values.owner_state_records,
@@ -1670,6 +2133,10 @@ class AcceptanceSpine:
     ) -> RawContractEnvelope:
         """Recover a rejected or pending envelope without acknowledging it."""
         return self._observer.envelope(_identifier(probe_id, contract_name.value))
+
+    def recoverable_contract_message(self, message_id: UUID) -> RawContractEnvelope:
+        """Recover one rejected or pending envelope by its public wire identity."""
+        return self._observer.envelope(message_id)
 
     def delete_completed_search_query(
         self, completed_search_id: str
@@ -1737,6 +2204,24 @@ class AcceptanceSpine:
             _identifier(update_id, ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value),
             contract_name,
             payload,
+        )
+
+    def invalidate_classifier_context(
+        self,
+        *,
+        source_message_revision_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+    ) -> RawContractEnvelope:
+        """Inject one classifier-context fault at the external contract seam."""
+        return self._observer.invalidate_classifier_context(
+            source_message_revision_id,
+            contract_name,
+            payload_updates,
+            new_subject_id=new_subject_id,
+            new_idempotency_key=new_idempotency_key,
         )
 
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
@@ -1835,6 +2320,7 @@ class AcceptanceSpine:
         update_id: str,
         telegram_user_id: int,
         screen_revision: int | None = None,
+        game_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -1845,6 +2331,116 @@ class AcceptanceSpine:
                 if screen_revision is not None
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
+            game_search_details=game_search_details,
+        )
+
+    def open_game_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive the visible Details callback through Bot Assistant."""
+        self._conversation_onboarding().open_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def open_game_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        detail_key: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one Details-hub criterion callback through Bot Assistant."""
+        self._conversation_onboarding().open_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.discovery_draft(telegram_user_id).screen_revision
+            ),
+        )
+
+    def toggle_game_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        value: str,
+    ) -> None:
+        """Drive one temporary multi-select toggle through Bot Assistant."""
+        self._conversation_onboarding().toggle_game_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_game_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Done for the current Game Search detail submenu."""
+        self._conversation_onboarding().commit_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_game_search_time(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        value: str | None,
+    ) -> None:
+        """Drive one immediate Time choice through Bot Assistant."""
+        self._conversation_onboarding().select_game_search_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_game_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the exact-time prompt callback through Bot Assistant."""
+        self._conversation_onboarding().open_game_search_exact_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_game_search_exact_time_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Drive exact-time text input through Bot Assistant."""
+        self._conversation_onboarding().submit_game_search_exact_time_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_game_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from a submenu or the Details hub."""
+        self._conversation_onboarding().back_from_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
     def open_main_menu(
@@ -2040,6 +2636,10 @@ class AcceptanceSpine:
         """Process one durable Search handoff without presenting Telegram output."""
         if role not in {RuntimeRole.RECOMMENDATION, RuntimeRole.BOT_ASSISTANT}:
             raise ValueError("Search handoff role must own the Search pipeline")
+        return self._roles[role].process_next()
+
+    def process_next_contract_handoff(self, role: RuntimeRole) -> bool:
+        """Process one handoff through its actual runtime consumer."""
         return self._roles[role].process_next()
 
     @contextmanager

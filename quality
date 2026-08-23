@@ -34,4 +34,5 @@ fi
 "${quality_python}" -m ruff check .
 "${quality_python}" -m ruff format --check .
 "${quality_python}" -m mypy
-"${quality_python}" -m pytest
+"${quality_python}" -m pytest tests/classifier_regression
+"${quality_python}" -m pytest --ignore=tests/classifier_regression

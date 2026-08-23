@@ -83,6 +83,18 @@ persistence, publication, deterministic matching, Completed Searches, Result
 IDs, accepted facts, and Bot Assistant delivery. The model cannot establish any
 of them by assertion.
 
+For every mandatory Open Match target fact and every present optional fact or
+payment fact that could be persisted, Application also requires the versioned
+`source-semantic-proof-v1` representation. It is bound to the exact Source
+Message revision and candidate, carries target-specific current state and exact
+source spans, and records typed support plus explicit contradiction,
+competition, replacement, and closure coverage. The classifier and this
+bounded proof pass provide proposals/evidence only; missing, ambiguous,
+contradictory, incomplete, or non-target proof fails closed. The proof pass
+uses the same pinned model and high reasoning policy, and the next proposal
+wire version is additive so v1/v2 replay remains readable without changing
+their contracts.
+
 Every result records the effective model, reasoning effort, Codex version or an
 explicit non-Codex sentinel, adapter and pass, prompt version, schema version,
 glossary version, context and routing policy versions, attempt status, duration,

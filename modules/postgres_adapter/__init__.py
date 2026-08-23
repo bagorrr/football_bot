@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg import conninfo, sql
@@ -25,12 +27,14 @@ from modules.contracts import (
     OperatorAlert,
     RawContractEnvelope,
     RuntimeRole,
+    canonical_source_message_id,
     derive_contract_message_id,
 )
 from modules.domain import (
     AcceptedLocation,
     ActiveChatView,
     ActiveResultContext,
+    ClassificationAttempt,
     CompletedSearch,
     CompletedSearchView,
     ConversationStage,
@@ -48,6 +52,9 @@ from modules.domain import (
     IntentBranch,
     LocaleSource,
     OldChatViewCleanup,
+    Opportunity,
+    OpportunityResponseRoute,
+    OpportunityRevisionProjection,
     ProtectedContentSkip,
     ReplyKeyboardAction,
     RequiredDate,
@@ -75,6 +82,8 @@ from modules.domain import (
     TelegramProtectedContentEvent,
     TelegramProtectionUnavailableEvent,
     UserIntent,
+    empty_bounded_source_metadata,
+    evaluate_game_search,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -100,7 +109,8 @@ _LEGACY_MIGRATION_NAMES = (
     "0011_source_chat_registry.sql",
     "0012_source_chat_admission_provenance.sql",
     "0013_source_message_ingestion.sql",
-    "0014_fail_closed_ingestion.sql",
+    "0014_open_match_game_search.sql",
+    "0015_fail_closed_ingestion.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -117,7 +127,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9c711681bec25a31b24b73b448bbfe4e12d149ecea447ff268c2b3727fa678a9",
     "ee5c3a9e11fae8570d7141c87e02d3dcb9b0c399499e22f990c1b95ee2f8363c",
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
-    "b8d8201423c0aa17c012eaad73ceb7fd210f55f42d13b8d266e708ca2571e05a",
+    "36fb8c2c6a1b9dcfe475315439f9486da96e44b30b169324264344f72ab47003",
+    "eb414763ca320bcc06cd6980f4fe1860f9a63c5bf8ef07cd14e43b9c38460dbc",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -592,6 +603,9 @@ class PostgresAcceptanceObserver:
             TRUNCATE football_runtime.bot_callback_outbox,
                      football_runtime.ingestion_failures,
                      football_runtime.protected_content_skips,
+                     football_runtime.classification_attempts,
+                     football_runtime.application_opportunities,
+                     football_runtime.recommendation_opportunities,
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
@@ -690,7 +704,8 @@ class PostgresAcceptanceObserver:
                 SELECT source_message_id, peer_kind, telegram_chat_id,
                        registry_generation, telegram_message_id,
                        current_revision, event_kind, body, event_time,
-                       recorded_at, tombstoned
+                       recorded_at, tombstoned, bounded_metadata,
+                       reply_to_telegram_message_id
                 FROM football_runtime.source_messages
                 ORDER BY source_message_id
                 """
@@ -710,6 +725,8 @@ class PostgresAcceptanceObserver:
                 event_time=row["event_time"],
                 recorded_at=row["recorded_at"],
                 tombstoned=row["tombstoned"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
             )
             for row in rows
         )
@@ -725,7 +742,8 @@ class PostgresAcceptanceObserver:
                 SELECT source_event_id, peer_kind, telegram_chat_id,
                        registry_generation, telegram_message_id,
                        source_message_revision, event_kind, body, event_time,
-                       recorded_at
+                       recorded_at, bounded_metadata,
+                       reply_to_telegram_message_id
                 FROM football_runtime.source_event_records
                 ORDER BY recorded_at, source_event_id
                 """
@@ -733,9 +751,10 @@ class PostgresAcceptanceObserver:
         return tuple(
             SourceEventRecord(
                 source_event_id=row["source_event_id"],
-                source_message_id=(
-                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}:"
-                    f"message:{row['telegram_message_id']}"
+                source_message_id=canonical_source_message_id(
+                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}",
+                    row["registry_generation"],
+                    row["telegram_message_id"],
                 ),
                 source_chat_identity=TelegramPeerIdentity(
                     kind=TelegramPeerKind(row["peer_kind"]),
@@ -748,6 +767,8 @@ class PostgresAcceptanceObserver:
                 body=row["body"],
                 event_time=row["event_time"],
                 recorded_at=row["recorded_at"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
             )
             for row in rows
         )
@@ -762,7 +783,9 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT source_message_revision_id, source_message_id,
                        source_event_id, revision, event_kind, body,
-                       event_time, recorded_at
+                       event_time, recorded_at, registry_generation,
+                       bounded_metadata,
+                       reply_to_telegram_message_id
                 FROM football_runtime.source_message_revisions
                 ORDER BY source_message_id, revision
                 """
@@ -777,6 +800,9 @@ class PostgresAcceptanceObserver:
                 body=row["body"],
                 event_time=row["event_time"],
                 recorded_at=row["recorded_at"],
+                registry_generation=row["registry_generation"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
             )
             for row in rows
         )
@@ -873,6 +899,109 @@ class PostgresAcceptanceObserver:
                 """
             ).fetchall()
         return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
+
+    def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
+        """Observe durable primary-classifier provenance."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT attempt_id, source_message_revision_id, requested_model,
+                       effective_model, requested_reasoning_effort,
+                       effective_reasoning_effort, prompt_version, schema_version,
+                       glossary_version, context_policy_version,
+                       routing_policy_version, codex_version, adapter_kind,
+                       adapter_version, pass_number, attempt_number,
+                       input_manifest_hash, evidence_references, duration_ms,
+                       input_tokens, output_tokens, disposition, status
+                FROM football_runtime.classification_attempts
+                ORDER BY recorded_at, attempt_id
+                """
+            ).fetchall()
+        return tuple(
+            ClassificationAttempt(
+                **{
+                    **row,
+                    "evidence_references": tuple(row["evidence_references"]),
+                }
+            )
+            for row in rows
+        )
+
+    def opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Application-authoritative accepted Opportunities."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT opportunity_id, opportunity_revision_id,
+                       source_message_revision_id,
+                       opportunity_type, publication_state, response_route
+                FROM football_runtime.application_opportunities
+                ORDER BY accepted_at, opportunity_id
+                """
+            ).fetchall()
+        return tuple(
+            Opportunity(
+                opportunity_id=row["opportunity_id"],
+                opportunity_revision_id=row["opportunity_revision_id"],
+                source_message_revision_id=row["source_message_revision_id"],
+                opportunity_type=row["opportunity_type"],
+                publication_state=row["publication_state"],
+                response_route=OpportunityResponseRoute(
+                    kind=row["response_route"]["kind"],
+                    value=row["response_route"]["value"],
+                ),
+            )
+            for row in rows
+        )
+
+    def completed_search_opportunity_revision_inputs(
+        self, completed_search_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Observe the immutable full revision input set for one Search."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT opportunity_revision_inputs
+                FROM football_runtime.recommendation_completed_searches
+                WHERE completed_search_id = %s
+                """,
+                (completed_search_id,),
+            ).fetchone()
+        if row is None:
+            return ()
+        return tuple(cast(list[dict[str, JsonValue]], row[0]))
+
+    def inject_concurrent_opportunity_revision(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        open_places: int,
+    ) -> None:
+        """Insert one controlled newer projection revision from another connection."""
+        with psycopg.connect(self._admin_database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.recommendation_opportunities (
+                    opportunity_id, opportunity_revision_id, opportunity_type,
+                    publication_state, accepted_facts, response_route, published_at
+                )
+                SELECT opportunity_id, %s, opportunity_type, publication_state,
+                       jsonb_set(accepted_facts, '{open_places}', to_jsonb(%s::int)),
+                       response_route, published_at + interval '1 second'
+                FROM football_runtime.recommendation_opportunities
+                WHERE opportunity_id = %s
+                ORDER BY published_at DESC
+                LIMIT 1
+                """,
+                (opportunity_revision_id, open_places, opportunity_id),
+            )
+            if inserted.rowcount != 1:
+                raise ValueError("Opportunity projection does not exist")
 
     def replace_source_event_contract_version(
         self,
@@ -1112,6 +1241,61 @@ class PostgresAcceptanceObserver:
             raise LookupError(correlation_id)
         return _row_to_envelope(changed, validate_registered=False)
 
+    def invalidate_classifier_context(
+        self,
+        source_message_revision_id: str,
+        contract_name: ContractName,
+        payload_updates: dict[str, JsonValue],
+        *,
+        new_subject_id: str | None = None,
+        new_idempotency_key: str | None = None,
+    ) -> RawContractEnvelope:
+        """Inject one classifier-context wire fault at the test seam."""
+        if contract_name not in {
+            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+            ContractName.CLASSIFICATION_PROPOSAL,
+        }:
+            raise ValueError("only classifier context contracts can use this seam")
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = %s
+                  AND payload ->> 'source_message_revision_id' = %s
+                FOR UPDATE
+                """,
+                (contract_name.value, source_message_revision_id),
+            ).fetchone()
+            if row is None:
+                raise LookupError(source_message_revision_id)
+            payload = row["payload"]
+            if not isinstance(payload, dict):
+                raise TypeError("classifier contract payload must be an object")
+            payload.update(payload_updates)
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.contract_outbox
+                SET payload = %s::jsonb,
+                    subject_id = COALESCE(%s, subject_id),
+                    idempotency_key = COALESCE(%s, idempotency_key)
+                WHERE message_id = %s
+                RETURNING *
+                """,
+                (
+                    json.dumps(payload),
+                    new_subject_id,
+                    new_idempotency_key,
+                    row["message_id"],
+                ),
+            ).fetchone()
+        if changed is None:
+            raise LookupError(source_message_revision_id)
+        return _row_to_envelope(changed, validate_registered=False)
+
     def restore_completed_search_query(self, query: RawContractEnvelope) -> None:
         """Restore one corrected canonical query after a controlled fault."""
         if query.contract_name is not ContractName.GET_COMPLETED_SEARCH:
@@ -1268,7 +1452,9 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT completed_search_id, telegram_user_id, search_update_id,
                        user_intent, country_id, city_id, sub_city_area_ids,
-                       whole_city, required_date, completed_at
+                       sub_city_area_geographic_types,
+                       sub_city_area_verified_parent_ids,
+                       whole_city, required_date, game_search_details, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE telegram_user_id = %s
                 ORDER BY completed_at, completed_search_id
@@ -1285,7 +1471,8 @@ class PostgresAcceptanceObserver:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT result_id, completed_search_id, absolute_position
+                SELECT result_id, completed_search_id, absolute_position,
+                       result_class, card_facts
                 FROM football_runtime.recommendation_results
                 WHERE completed_search_id = %s
                 ORDER BY absolute_position
@@ -1297,6 +1484,8 @@ class PostgresAcceptanceObserver:
                 result_id=row["result_id"],
                 completed_search_id=row["completed_search_id"],
                 absolute_position=row["absolute_position"],
+                result_class=row["result_class"],
+                card_facts=tuple(sorted(row["card_facts"].items())),
             )
             for row in rows
         )
@@ -1321,6 +1510,26 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_row_to_envelope(row) for row in rows)
 
+    def opportunity_publication_contracts(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe publication outbox effects for one Source Message revision."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'OpportunityPublicationChanged'
+                  AND payload ->> 'source_message_revision_id' = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (source_message_revision_id,),
+            ).fetchall()
+        return tuple(_row_to_envelope(row) for row in rows)
+
     def source_chat_contracts(
         self,
         correlation_id: UUID,
@@ -1342,7 +1551,12 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
 
-    def snapshot(self, probe_id: str) -> AcceptanceObservation:
+    def snapshot(
+        self,
+        probe_id: str,
+        *,
+        message_id: UUID | None = None,
+    ) -> AcceptanceObservation:
         """Observe durable outcomes without exposing physical table layout."""
         with psycopg.connect(
             self._admin_database_url,
@@ -1366,14 +1580,27 @@ class PostgresAcceptanceObserver:
                 SELECT
                     count(*) FILTER (
                         WHERE payload ->> 'probe_id' = %s
+                           OR message_id = %s
+                           OR causation_id = %s
                     ) AS outbox_records,
                     count(*) FILTER (
                         WHERE consumer_role IS NULL
-                          AND payload ->> 'probe_id' = %s
+                          AND (
+                              payload ->> 'probe_id' = %s
+                              OR message_id = %s
+                              OR causation_id = %s
+                          )
                     ) AS completed_records
                 FROM football_runtime.contract_outbox
                 """,
-                (probe_id, probe_id),
+                (
+                    probe_id,
+                    message_id,
+                    message_id,
+                    probe_id,
+                    message_id,
+                    message_id,
+                ),
             ).fetchone()
             inbox_counts = connection.execute(
                 """
@@ -1386,8 +1613,10 @@ class PostgresAcceptanceObserver:
                 JOIN football_runtime.contract_outbox AS outbox
                   ON outbox.message_id = inbox.message_id
                 WHERE outbox.payload ->> 'probe_id' = %s
+                   OR outbox.message_id = %s
+                   OR outbox.causation_id = %s
                 """,
-                (probe_id,),
+                (probe_id, message_id, message_id),
             ).fetchone()
             alert_rows = connection.execute(
                 """
@@ -1399,9 +1628,11 @@ class PostgresAcceptanceObserver:
                 JOIN football_runtime.contract_outbox AS outbox
                   ON outbox.message_id = alert.message_id
                 WHERE outbox.payload ->> 'probe_id' = %s
+                   OR outbox.message_id = %s
+                   OR outbox.causation_id = %s
                 ORDER BY alert.observed_at, alert.consumer_role
                 """,
-                (probe_id,),
+                (probe_id, message_id, message_id),
             ).fetchall()
         if counts is None or inbox_counts is None:
             msg = "PostgreSQL aggregate query returned no row"
@@ -1434,6 +1665,7 @@ class PostgresRoleStore:
     def __init__(self, role: RuntimeRole, database_url: str) -> None:
         self._role = role
         self._database_url = database_url
+        self._search_snapshot_hook: Callable[[], None] | None = None
 
     @property
     def role(self) -> RuntimeRole:
@@ -1807,8 +2039,13 @@ class PostgresRoleStore:
                         address_kind, current_address,
                         processing_started_at, transport_boundary, enabled,
                         initial_consent_attestation, attested_at,
+                        classifier_timezone, classifier_country_id,
+                        classifier_city_id,
                         created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s
+                    )
                     ON CONFLICT (
                         peer_kind, telegram_chat_id, registry_generation
                     ) DO UPDATE
@@ -1827,6 +2064,9 @@ class PostgresRoleStore:
                         entry.enabled,
                         initial_consent_attestation,
                         attested_at,
+                        entry.classifier_timezone,
+                        entry.classifier_country_id,
+                        entry.classifier_city_id,
                         received_at,
                         received_at,
                     ),
@@ -1860,7 +2100,9 @@ class PostgresRoleStore:
                 SELECT peer_kind, telegram_chat_id, registry_generation,
                        address_kind, current_address,
                        processing_started_at, transport_boundary, enabled,
-                       initial_consent_attestation, attested_at
+                       initial_consent_attestation, attested_at,
+                       classifier_timezone, classifier_country_id,
+                       classifier_city_id
                 FROM football_runtime.source_chat_registry
                 ORDER BY peer_kind, telegram_chat_id, registry_generation
                 """
@@ -1881,9 +2123,48 @@ class PostgresRoleStore:
                     row["initial_consent_attestation"]
                 ),
                 attested_at=row["attested_at"],
+                classifier_timezone=row["classifier_timezone"],
+                classifier_country_id=row["classifier_country_id"],
+                classifier_city_id=row["classifier_city_id"],
             )
             for row in rows
         )
+
+    def configure_source_chat_classifier_context(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        iana_timezone: str,
+        country_id: str | None,
+        city_id: str | None,
+    ) -> None:
+        """Set bounded classifier context through Application ownership."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        ZoneInfo(iana_timezone)
+        with psycopg.connect(self._database_url) as connection:
+            updated = connection.execute(
+                """
+                UPDATE football_runtime.source_chat_registry
+                SET classifier_timezone = %s,
+                    classifier_country_id = %s,
+                    classifier_city_id = %s,
+                    updated_at = transaction_timestamp()
+                WHERE peer_kind = %s AND telegram_chat_id = %s
+                  AND registry_generation = %s AND enabled
+                """,
+                (
+                    iana_timezone,
+                    country_id,
+                    city_id,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Source Chat generation is not active")
 
     def eligible_source_chat_generation(
         self,
@@ -1903,7 +2184,9 @@ class PostgresRoleStore:
                 SELECT peer_kind, telegram_chat_id, registry_generation,
                        address_kind, current_address,
                        processing_started_at, transport_boundary, enabled,
-                       initial_consent_attestation, attested_at
+                       initial_consent_attestation, attested_at,
+                       classifier_timezone, classifier_country_id,
+                       classifier_city_id
                 FROM football_runtime.source_chat_registry
                 WHERE peer_kind = %s
                   AND telegram_chat_id = %s
@@ -1933,6 +2216,9 @@ class PostgresRoleStore:
                 row["initial_consent_attestation"]
             ),
             attested_at=row["attested_at"],
+            classifier_timezone=row["classifier_timezone"],
+            classifier_country_id=row["classifier_country_id"],
+            classifier_city_id=row["classifier_city_id"],
         )
 
     def source_chat_ingestion_context(
@@ -2427,8 +2713,12 @@ class PostgresRoleStore:
                         source_event_id, message_id, peer_kind, telegram_chat_id,
                         registry_generation, telegram_message_id,
                         source_message_revision, event_kind, body, event_time,
-                        recorded_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        recorded_at, bounded_metadata,
+                        reply_to_telegram_message_id
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s::jsonb, %s
+                    )
                     ON CONFLICT (source_event_id) DO NOTHING
                     RETURNING source_event_id
                     """,
@@ -2444,6 +2734,8 @@ class PostgresRoleStore:
                         event.body,
                         event.event_time,
                         recorded_at,
+                        json.dumps(dict(event.bounded_metadata)),
+                        event.reply_to_telegram_message_id,
                     ),
                 ).fetchone()
                 if inserted is not None:
@@ -2455,7 +2747,8 @@ class PostgresRoleStore:
                         """
                         SELECT message_id, peer_kind, telegram_chat_id,
                                registry_generation, telegram_message_id,
-                               source_message_revision, event_kind, body, event_time
+                               source_message_revision, event_kind, body, event_time,
+                               bounded_metadata, reply_to_telegram_message_id
                         FROM football_runtime.source_event_records
                         WHERE source_event_id = %s
                         """,
@@ -2471,6 +2764,10 @@ class PostgresRoleStore:
                         "event_kind": event.kind.value,
                         "body": event.body,
                         "event_time": event.event_time,
+                        "bounded_metadata": dict(event.bounded_metadata),
+                        "reply_to_telegram_message_id": (
+                            event.reply_to_telegram_message_id
+                        ),
                     }
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError
@@ -2523,6 +2820,7 @@ class PostgresRoleStore:
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Create one Application-owned Source Message from a Source Event."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -2565,6 +2863,10 @@ class PostgresRoleStore:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             event_time = datetime.fromisoformat(str(payload["event_time"]))
+            bounded_metadata = payload.get(
+                "bounded_metadata", empty_bounded_source_metadata()
+            )
+            reply_to_message_id = payload.get("reply_to_telegram_message_id")
             if payload["event_kind"] == SourceEventKind.CREATE.value:
                 connection.execute(
                     """
@@ -2572,9 +2874,11 @@ class PostgresRoleStore:
                         source_message_id, peer_kind, telegram_chat_id,
                         registry_generation, telegram_message_id,
                         current_revision, event_kind, body, event_time,
-                        recorded_at, tombstoned
+                        recorded_at, tombstoned, bounded_metadata,
+                        reply_to_telegram_message_id
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false,
+                        %s::jsonb, %s
                     )
                     """,
                     (
@@ -2588,6 +2892,8 @@ class PostgresRoleStore:
                         payload["body"],
                         event_time,
                         incoming.recorded_at,
+                        json.dumps(bounded_metadata),
+                        reply_to_message_id,
                     ),
                 )
             elif payload["event_kind"] == SourceEventKind.EDIT.value:
@@ -2595,7 +2901,9 @@ class PostgresRoleStore:
                     """
                     UPDATE football_runtime.source_messages
                     SET current_revision = %s, event_kind = %s, body = %s,
-                        event_time = %s, recorded_at = %s, tombstoned = false
+                        event_time = %s, recorded_at = %s, tombstoned = false,
+                        bounded_metadata = %s::jsonb,
+                        reply_to_telegram_message_id = %s
                     WHERE source_message_id = %s
                       AND current_revision < %s
                     RETURNING source_message_id
@@ -2606,6 +2914,8 @@ class PostgresRoleStore:
                         payload["body"],
                         event_time,
                         incoming.recorded_at,
+                        json.dumps(bounded_metadata),
+                        reply_to_message_id,
                         incoming.subject_id,
                         incoming.subject_revision,
                     ),
@@ -2626,9 +2936,11 @@ class PostgresRoleStore:
                                 source_message_id, peer_kind, telegram_chat_id,
                                 registry_generation, telegram_message_id,
                                 current_revision, event_kind, body, event_time,
-                                recorded_at, tombstoned
+                                recorded_at, tombstoned, bounded_metadata,
+                                reply_to_telegram_message_id
                             ) VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, false
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                false, %s::jsonb, %s
                             )
                             """,
                             (
@@ -2642,6 +2954,8 @@ class PostgresRoleStore:
                                 payload["body"],
                                 event_time,
                                 incoming.recorded_at,
+                                json.dumps(bounded_metadata),
+                                reply_to_message_id,
                             ),
                         )
             elif payload["event_kind"] == SourceEventKind.DELETE.value:
@@ -2649,7 +2963,9 @@ class PostgresRoleStore:
                     """
                     UPDATE football_runtime.source_messages
                     SET current_revision = %s, event_kind = %s, body = NULL,
-                        event_time = %s, recorded_at = %s, tombstoned = true
+                        event_time = %s, recorded_at = %s, tombstoned = true,
+                        bounded_metadata = %s::jsonb,
+                        reply_to_telegram_message_id = %s
                     WHERE source_message_id = %s
                       AND current_revision < %s
                     RETURNING source_message_id
@@ -2659,6 +2975,8 @@ class PostgresRoleStore:
                         payload["event_kind"],
                         event_time,
                         incoming.recorded_at,
+                        json.dumps(bounded_metadata),
+                        reply_to_message_id,
                         incoming.subject_id,
                         incoming.subject_revision,
                     ),
@@ -2679,9 +2997,11 @@ class PostgresRoleStore:
                                 source_message_id, peer_kind, telegram_chat_id,
                                 registry_generation, telegram_message_id,
                                 current_revision, event_kind, body, event_time,
-                                recorded_at, tombstoned
+                                recorded_at, tombstoned, bounded_metadata,
+                                reply_to_telegram_message_id
                             ) VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, true
+                                %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s,
+                                true, %s::jsonb, %s
                             )
                             """,
                             (
@@ -2694,6 +3014,8 @@ class PostgresRoleStore:
                                 payload["event_kind"],
                                 event_time,
                                 incoming.recorded_at,
+                                json.dumps(bounded_metadata),
+                                reply_to_message_id,
                             ),
                         )
             else:
@@ -2703,8 +3025,12 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.source_message_revisions (
                     source_message_revision_id, source_message_id,
                     source_event_id, revision, event_kind, body,
-                    event_time, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    event_time, recorded_at, registry_generation,
+                    bounded_metadata,
+                    reply_to_telegram_message_id
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                )
                 """,
                 (
                     payload["source_message_revision_id"],
@@ -2715,8 +3041,13 @@ class PostgresRoleStore:
                     payload["body"],
                     event_time,
                     incoming.recorded_at,
+                    payload["registry_generation"],
+                    json.dumps(bounded_metadata),
+                    reply_to_message_id,
                 ),
             )
+            if outgoing is not None:
+                _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -2732,7 +3063,8 @@ class PostgresRoleStore:
                     SELECT source_event_id, peer_kind, telegram_chat_id,
                            registry_generation, telegram_message_id,
                            source_message_revision, event_kind, body,
-                           event_time, recorded_at
+                           event_time, recorded_at, bounded_metadata,
+                           reply_to_telegram_message_id
                     FROM football_runtime.source_event_records
                     ORDER BY recorded_at, source_event_id
                     """
@@ -2742,9 +3074,10 @@ class PostgresRoleStore:
         return tuple(
             SourceEventRecord(
                 source_event_id=row["source_event_id"],
-                source_message_id=(
-                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}:"
-                    f"message:{row['telegram_message_id']}"
+                source_message_id=canonical_source_message_id(
+                    f"source-chat:{row['peer_kind']}:{row['telegram_chat_id']}",
+                    row["registry_generation"],
+                    row["telegram_message_id"],
                 ),
                 source_chat_identity=TelegramPeerIdentity(
                     kind=TelegramPeerKind(row["peer_kind"]),
@@ -2757,6 +3090,8 @@ class PostgresRoleStore:
                 body=row["body"],
                 event_time=row["event_time"],
                 recorded_at=row["recorded_at"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
             )
             for row in rows
         )
@@ -2773,7 +3108,8 @@ class PostgresRoleStore:
                     SELECT source_message_id, peer_kind, telegram_chat_id,
                            registry_generation, telegram_message_id,
                            current_revision, event_kind, body, event_time,
-                           recorded_at, tombstoned
+                           recorded_at, tombstoned, bounded_metadata,
+                           reply_to_telegram_message_id
                     FROM football_runtime.source_messages
                     ORDER BY source_message_id
                     """
@@ -2795,8 +3131,129 @@ class PostgresRoleStore:
                 event_time=row["event_time"],
                 recorded_at=row["recorded_at"],
                 tombstoned=row["tombstoned"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
             )
             for row in rows
+        )
+
+    def source_message_revision(
+        self, source_message_revision_id: str
+    ) -> SourceMessageRevision | None:
+        """Read one immutable revision through Application's owner boundary."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT revision.source_message_revision_id,
+                       revision.source_message_id,
+                       revision.source_event_id,
+                       revision.revision,
+                       revision.event_kind,
+                       revision.body,
+                       revision.event_time,
+                       revision.recorded_at,
+                       revision.registry_generation,
+                       revision.bounded_metadata,
+                       revision.reply_to_telegram_message_id
+                FROM football_runtime.source_message_revisions AS revision
+                JOIN football_runtime.source_messages AS message
+                  ON message.source_message_id = revision.source_message_id
+                 AND message.current_revision = revision.revision
+                 AND message.registry_generation = revision.registry_generation
+                 AND NOT message.tombstoned
+                WHERE revision.source_message_revision_id = %s
+                """,
+                (source_message_revision_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceMessageRevision(
+            source_message_revision_id=row["source_message_revision_id"],
+            source_message_id=row["source_message_id"],
+            source_event_id=row["source_event_id"],
+            revision=row["revision"],
+            event_kind=SourceEventKind(row["event_kind"]),
+            body=row["body"],
+            event_time=row["event_time"],
+            recorded_at=row["recorded_at"],
+            registry_generation=row["registry_generation"],
+            bounded_metadata=row["bounded_metadata"],
+            reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+        )
+
+    def eligible_reply_revision(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> SourceMessageRevision | None:
+        """Read one current same-generation direct-reply target after its boundary."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT revision.source_message_revision_id,
+                       revision.source_message_id,
+                       revision.source_event_id,
+                       revision.revision,
+                       revision.event_kind,
+                       revision.body,
+                       revision.event_time,
+                       revision.recorded_at,
+                       revision.registry_generation,
+                       revision.bounded_metadata,
+                       revision.reply_to_telegram_message_id
+                FROM football_runtime.source_messages AS message
+                JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_id = message.source_message_id
+                 AND revision.revision = message.current_revision
+                 AND revision.registry_generation = message.registry_generation
+                JOIN football_runtime.source_chat_registry AS registry
+                  ON registry.peer_kind = message.peer_kind
+                 AND registry.telegram_chat_id = message.telegram_chat_id
+                 AND registry.registry_generation = message.registry_generation
+                 AND registry.enabled
+                WHERE message.peer_kind = %s
+                  AND message.telegram_chat_id = %s
+                  AND message.registry_generation = %s
+                  AND message.telegram_message_id = %s
+                  AND NOT message.tombstoned
+                  AND revision.body IS NOT NULL
+                  AND revision.event_time <= %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    telegram_message_id,
+                    current_event_time,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceMessageRevision(
+            source_message_revision_id=row["source_message_revision_id"],
+            source_message_id=row["source_message_id"],
+            source_event_id=row["source_event_id"],
+            revision=row["revision"],
+            event_kind=SourceEventKind(row["event_kind"]),
+            body=row["body"],
+            event_time=row["event_time"],
+            recorded_at=row["recorded_at"],
+            registry_generation=row["registry_generation"],
+            bounded_metadata=row["bounded_metadata"],
+            reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
         )
 
     def claim_next(
@@ -2982,6 +3439,166 @@ class PostgresRoleStore:
                 (presented_at, self._role.value, message_id),
             )
 
+    def record_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: Any,
+        outgoing: ContractEnvelope | None,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain provenance and publish only a valid proposal."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.classification_attempts (
+                    attempt_id, source_message_revision_id, requested_model,
+                    effective_model, requested_reasoning_effort,
+                    effective_reasoning_effort, prompt_version, schema_version,
+                    glossary_version, context_policy_version,
+                    routing_policy_version, codex_version, adapter_kind,
+                    adapter_version, pass_number, attempt_number,
+                    input_manifest_hash, evidence_references, duration_ms,
+                    input_tokens, output_tokens, disposition, status, recorded_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
+                ) ON CONFLICT (attempt_id) DO NOTHING
+                """,
+                (
+                    attempt.attempt_id,
+                    attempt.source_message_revision_id,
+                    attempt.requested_model,
+                    attempt.effective_model,
+                    attempt.requested_reasoning_effort,
+                    attempt.effective_reasoning_effort,
+                    attempt.prompt_version,
+                    attempt.schema_version,
+                    attempt.glossary_version,
+                    attempt.context_policy_version,
+                    attempt.routing_policy_version,
+                    result.codex_version,
+                    result.adapter_kind,
+                    result.adapter_version,
+                    attempt.pass_number,
+                    attempt.attempt_number,
+                    attempt.input_manifest_hash,
+                    json.dumps(attempt.evidence_references),
+                    result.duration_ms,
+                    result.input_tokens,
+                    result.output_tokens,
+                    attempt.disposition,
+                    attempt.status,
+                    received_at,
+                ),
+            )
+            if outgoing is not None:
+                _insert_outbox(connection, outgoing)
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def publish_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity: dict[str, JsonValue],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain accepted facts and emit publication state."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence, response_route,
+                    accepted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                ON CONFLICT (opportunity_id) DO UPDATE
+                SET source_message_revision_id = EXCLUDED.source_message_revision_id,
+                    publication_state = EXCLUDED.publication_state,
+                    accepted_facts = EXCLUDED.accepted_facts,
+                    evidence = EXCLUDED.evidence,
+                    response_route = EXCLUDED.response_route,
+                    accepted_at = EXCLUDED.accepted_at
+                """,
+                (
+                    opportunity["opportunity_id"],
+                    opportunity["opportunity_revision_id"],
+                    opportunity["source_message_revision_id"],
+                    opportunity["opportunity_type"],
+                    opportunity["publication_state"],
+                    json.dumps(opportunity["accepted_facts"]),
+                    json.dumps(opportunity["evidence"]),
+                    json.dumps(opportunity["response_route"]),
+                    received_at,
+                ),
+            )
+            _insert_outbox(connection, outgoing)
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def project_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one accepted publication to Recommendation's projection."""
+        if self._role is not RuntimeRole.RECOMMENDATION:
+            raise ConversationAccessDeniedError
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("OpportunityPublicationChanged payload must be an object")
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            connection.execute(
+                """
+                INSERT INTO football_runtime.recommendation_opportunities (
+                    opportunity_id, opportunity_revision_id, opportunity_type,
+                    publication_state, accepted_facts, response_route, published_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                ON CONFLICT (opportunity_revision_id) DO NOTHING
+                """,
+                (
+                    payload["opportunity_id"],
+                    payload["opportunity_revision_id"],
+                    payload["opportunity_type"],
+                    payload["publication_state"],
+                    json.dumps(payload["accepted_facts"]),
+                    json.dumps(payload["response_route"]),
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
     def consume(
         self,
         *,
@@ -3134,6 +3751,46 @@ class PostgresRoleStore:
         except psycopg.errors.UniqueViolation as error:
             raise OutboxConflictError from error
 
+    def find_search_results(
+        self,
+        completed_search: CompletedSearch,
+        game_search_details: Mapping[str, tuple[str, ...]],
+    ) -> tuple[SearchResult, ...]:
+        """Load accepted projections and delegate deterministic evaluation."""
+        if self._role is not RuntimeRole.RECOMMENDATION:
+            raise ConversationAccessDeniedError
+        if completed_search.user_intent is not UserIntent.GAME_SEARCH:
+            return ()
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ON (opportunity_id)
+                       opportunity_id, opportunity_revision_id, opportunity_type,
+                       publication_state, accepted_facts, response_route
+                FROM football_runtime.recommendation_opportunities
+                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                """
+            ).fetchall()
+        return evaluate_game_search(
+            completed_search,
+            game_search_details,
+            tuple(
+                OpportunityRevisionProjection(
+                    opportunity_id=row["opportunity_id"],
+                    opportunity_revision_id=row["opportunity_revision_id"],
+                    opportunity_type=row["opportunity_type"],
+                    publication_state=row["publication_state"],
+                    accepted_facts=row["accepted_facts"],
+                    response_route=row["response_route"],
+                )
+                for row in rows
+            ),
+        )
+
+    def set_search_snapshot_hook(self, hook: Callable[[], None]) -> None:
+        """Install one controlled hook after candidate snapshot selection."""
+        self._search_snapshot_hook = hook
+
     def complete_search(
         self,
         *,
@@ -3143,7 +3800,7 @@ class PostgresRoleStore:
         outgoing: ContractEnvelope,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Commit one immutable zero-result Search and SearchCompleted event."""
+        """Evaluate one database snapshot and atomically commit immutable outputs."""
         with psycopg.connect(self._database_url) as connection:
             existing = connection.execute(
                 """
@@ -3204,13 +3861,65 @@ class PostgresRoleStore:
             if existing_search is not None:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
+            opportunity_rows = connection.execute(
+                """
+                SELECT DISTINCT ON (opportunity_id)
+                       opportunity_id, opportunity_revision_id, opportunity_type,
+                       publication_state, accepted_facts, response_route, published_at
+                FROM football_runtime.recommendation_opportunities
+                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                """
+            ).fetchall()
+            if self._search_snapshot_hook is not None:
+                hook, self._search_snapshot_hook = self._search_snapshot_hook, None
+                hook()
+            input_set = [
+                {
+                    "opportunity_id": row[0],
+                    "opportunity_revision_id": row[1],
+                    "opportunity_type": row[2],
+                    "publication_state": row[3],
+                    "accepted_facts": row[4],
+                    "response_route": row[5],
+                    "published_at": row[6].isoformat(),
+                }
+                for row in opportunity_rows
+            ]
+            results = evaluate_game_search(
+                completed_search,
+                dict(completed_search.game_search_details),
+                tuple(
+                    OpportunityRevisionProjection(
+                        opportunity_id=row[0],
+                        opportunity_revision_id=row[1],
+                        opportunity_type=row[2],
+                        publication_state=row[3],
+                        accepted_facts=row[4],
+                        response_route=row[5],
+                    )
+                    for row in opportunity_rows
+                ),
+            )
+            outgoing_payload = outgoing.payload
+            if not isinstance(outgoing_payload, dict):
+                raise TypeError("SearchCompleted payload must be an object")
+            outgoing = replace(
+                outgoing,
+                payload={**outgoing_payload, "result_count": len(results)},
+            )
+            query = GetCompletedSearch.from_search_completed(outgoing)
             connection.execute(
                 """
                 INSERT INTO football_runtime.recommendation_completed_searches (
                     completed_search_id, telegram_user_id, search_update_id,
                     user_intent, country_id, city_id, sub_city_area_ids,
-                    whole_city, required_date, completed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s)
+                    sub_city_area_geographic_types,
+                    sub_city_area_verified_parent_ids, whole_city, required_date,
+                    game_search_details, opportunity_revision_inputs, completed_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s
+                )
                 """,
                 (
                     completed_search.completed_search_id,
@@ -3220,11 +3929,31 @@ class PostgresRoleStore:
                     completed_search.country_id,
                     completed_search.city_id,
                     json.dumps(completed_search.sub_city_area_ids),
+                    json.dumps(completed_search.sub_city_area_geographic_types),
+                    json.dumps(completed_search.sub_city_area_verified_parent_ids),
                     completed_search.whole_city,
                     json.dumps(_required_date_json(completed_search.required_date)),
+                    json.dumps(dict(completed_search.game_search_details)),
+                    json.dumps(input_set),
                     completed_search.completed_at,
                 ),
             )
+            for result in results:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.recommendation_results (
+                        result_id, completed_search_id, absolute_position,
+                        result_class, card_facts
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        result.result_id,
+                        result.completed_search_id,
+                        result.absolute_position,
+                        result.result_class,
+                        json.dumps(dict(result.card_facts)),
+                    ),
+                )
             _insert_outbox(connection, query)
             _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
@@ -3614,6 +4343,8 @@ class PostgresRoleStore:
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
                            screen_revision, revision, last_activity_at,
                            country, city, sub_city_areas, whole_city, required_date,
+                           game_search_details, editing_game_search_detail,
+                           game_search_detail_draft, game_search_exact_time_prompt,
                            search_submission_update_id
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
@@ -3643,6 +4374,13 @@ class PostgresRoleStore:
             ),
             whole_city=row["whole_city"],
             required_date=_optional_required_date(row["required_date"]),
+            game_search_details=tuple(
+                (key, tuple(values))
+                for key, values in sorted(row["game_search_details"].items())
+            ),
+            editing_game_search_detail=row["editing_game_search_detail"],
+            game_search_detail_draft=tuple(row["game_search_detail_draft"]),
+            game_search_exact_time_prompt=row["game_search_exact_time_prompt"],
             search_submission_update_id=row["search_submission_update_id"],
         )
 
@@ -3798,6 +4536,10 @@ class PostgresRoleStore:
                     ),
                     draft.whole_city,
                     json.dumps(_required_date_json(draft.required_date)),
+                    json.dumps(dict(draft.game_search_details)),
+                    draft.editing_game_search_detail,
+                    json.dumps(draft.game_search_detail_draft),
+                    draft.game_search_exact_time_prompt,
                     recorded_at,
                 )
                 if draft.revision == 1:
@@ -3807,10 +4549,13 @@ class PostgresRoleStore:
                             telegram_user_id, stage, intent_branch, user_intent,
                             screen_revision, revision, last_activity_at,
                             country, city, sub_city_areas, whole_city,
-                            required_date, updated_at
+                            required_date, game_search_details,
+                            editing_game_search_detail, game_search_detail_draft,
+                            game_search_exact_time_prompt, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s,
-                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s
+                            %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb,
+                            %s::jsonb, %s, %s::jsonb, %s, %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -3832,6 +4577,10 @@ class PostgresRoleStore:
                             sub_city_areas = %s::jsonb,
                             whole_city = %s,
                             required_date = %s::jsonb,
+                            game_search_details = %s::jsonb,
+                            editing_game_search_detail = %s,
+                            game_search_detail_draft = %s::jsonb,
+                            game_search_exact_time_prompt = %s,
                             updated_at = %s
                         WHERE telegram_user_id = %s AND revision = %s
                         RETURNING revision
@@ -4514,6 +5263,7 @@ class PostgresRoleStore:
         expected_state_revision: int,
         expected_draft_revision: int,
         message: TelegramMessage,
+        current_result: SearchResult | None,
         received_at: datetime,
     ) -> ConsumeResult:
         """Queue one zero-result screen and defer activation until delivery."""
@@ -4608,13 +5358,18 @@ class PostgresRoleStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.bot_search_presentations (
-                    delivery_id, telegram_user_id, completed_search_id, accepted_at
-                ) VALUES (%s, %s, %s, %s)
+                    delivery_id, telegram_user_id, completed_search_id,
+                    current_result_id, absolute_position, accepted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
                     message.telegram_user_id,
                     completed_search_id,
+                    None if current_result is None else current_result.result_id,
+                    None
+                    if current_result is None
+                    else current_result.absolute_position,
                     received_at,
                 ),
             )
@@ -4864,7 +5619,9 @@ class PostgresRoleStore:
                 """
                 SELECT completed_search_id, telegram_user_id, search_update_id,
                        user_intent, country_id, city_id, sub_city_area_ids,
-                       whole_city, required_date, completed_at
+                       sub_city_area_geographic_types,
+                       sub_city_area_verified_parent_ids,
+                       whole_city, required_date, game_search_details, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
                 """,
@@ -4874,7 +5631,8 @@ class PostgresRoleStore:
                 return CompletedSearchQueryResult(CompletedSearchQueryStatus.ACCEPTED)
             result_rows = connection.execute(
                 """
-                SELECT result_id, completed_search_id, absolute_position
+                SELECT result_id, completed_search_id, absolute_position,
+                       result_class, card_facts
                 FROM football_runtime.recommendation_results
                 WHERE completed_search_id = %s
                 ORDER BY absolute_position
@@ -4890,6 +5648,8 @@ class PostgresRoleStore:
                         result_id=row["result_id"],
                         completed_search_id=row["completed_search_id"],
                         absolute_position=row["absolute_position"],
+                        result_class=row["result_class"],
+                        card_facts=tuple(sorted(row["card_facts"].items())),
                     )
                     for row in result_rows
                 ),
@@ -5293,7 +6053,7 @@ class PostgresRoleStore:
                     )
                 search_presentation = connection.execute(
                     """
-                    SELECT completed_search_id
+                    SELECT completed_search_id, current_result_id, absolute_position
                     FROM football_runtime.bot_search_presentations
                     WHERE delivery_id = %s AND telegram_user_id = %s
                     """,
@@ -5301,6 +6061,8 @@ class PostgresRoleStore:
                 ).fetchone()
                 if search_presentation is not None:
                     completed_search_id = search_presentation[0]
+                    current_result_id = search_presentation[1]
+                    absolute_position = search_presentation[2]
                     changed = connection.execute(
                         """
                         UPDATE football_runtime.bot_users
@@ -5331,17 +6093,19 @@ class PostgresRoleStore:
                             telegram_user_id, completed_search_id,
                             current_result_id, absolute_position,
                             screen_revision, activated_at
-                        ) VALUES (%s, %s, NULL, NULL, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (telegram_user_id) DO UPDATE
                         SET completed_search_id = EXCLUDED.completed_search_id,
-                            current_result_id = NULL,
-                            absolute_position = NULL,
+                            current_result_id = EXCLUDED.current_result_id,
+                            absolute_position = EXCLUDED.absolute_position,
                             screen_revision = EXCLUDED.screen_revision,
                             activated_at = EXCLUDED.activated_at
                         """,
                         (
                             telegram_user_id,
                             completed_search_id,
+                            current_result_id,
+                            absolute_position,
                             screen_revision,
                             delivered_at,
                         ),
@@ -5492,9 +6256,17 @@ def _completed_search(row: dict[str, Any]) -> CompletedSearch:
         country_id=row["country_id"],
         city_id=row["city_id"],
         sub_city_area_ids=tuple(row["sub_city_area_ids"]),
+        sub_city_area_geographic_types=tuple(row["sub_city_area_geographic_types"]),
+        sub_city_area_verified_parent_ids=tuple(
+            tuple(values) for values in row["sub_city_area_verified_parent_ids"]
+        ),
         whole_city=row["whole_city"],
         required_date=_optional_required_date(row["required_date"]),
         completed_at=row["completed_at"],
+        game_search_details=tuple(
+            (key, tuple(values))
+            for key, values in sorted(row["game_search_details"].items())
+        ),
     )
 
 
@@ -5513,6 +6285,7 @@ def _accepted_location(value: Any) -> AcceptedLocation:
         resolver_version=value["resolver_version"],
         glossary_version=value["glossary_version"],
         localized_display_names=tuple(value.get("localized_display_names", {}).items()),
+        verified_disjoint_place_ids=tuple(value.get("verified_disjoint_place_ids", [])),
     )
 
 
@@ -5535,6 +6308,7 @@ def _accepted_location_json(location: AcceptedLocation | None) -> Any:
         "resolver_version": location.resolver_version,
         "glossary_version": location.glossary_version,
         "localized_display_names": dict(location.localized_display_names),
+        "verified_disjoint_place_ids": list(location.verified_disjoint_place_ids),
     }
 
 
@@ -5675,6 +6449,50 @@ def _accept_contract_inbox(
             received_at,
         ),
     )
+
+
+def _begin_owned_contract(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    *,
+    consumer: RuntimeRole,
+    incoming: RawContractEnvelope,
+    received_at: datetime,
+) -> bool:
+    """Begin an owner-state transition inside its single durable transaction."""
+    existing = connection.execute(
+        """
+        SELECT processing_status
+        FROM football_runtime.contract_inbox
+        WHERE consumer_role = %s AND message_id = %s
+        FOR UPDATE
+        """,
+        (consumer.value, incoming.message_id),
+    ).fetchone()
+    if existing is not None and existing[0] == "accepted":
+        _release_claim(connection, incoming.message_id)
+        return False
+    _accept_contract_inbox(
+        connection,
+        consumer=consumer,
+        incoming=incoming,
+        received_at=received_at,
+    )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.acceptance_state (
+            owner_role, probe_id, contract_name, incoming_message_id, applied_at
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            consumer.value,
+            incoming.subject_id,
+            incoming.contract_name.value,
+            incoming.message_id,
+            received_at,
+        ),
+    )
+    return True
 
 
 def _insert_alert(

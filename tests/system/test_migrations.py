@@ -14,7 +14,25 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from modules.contracts import RuntimeRole, derive_source_event_message_id
+from modules.domain import (
+    SourceEventKind,
+    TelegramChannelCheckpoint,
+    TelegramPeerIdentity,
+    TelegramPeerKind,
+    empty_bounded_source_metadata,
+)
+from modules.ports import ClassifierAdapterResult
 from modules.postgres_adapter import PostgresAcceptanceMigrator
+from modules.testkit import (
+    ControlledLocationResolverAdapter,
+    ControlledModelAdapter,
+    ControlledTelegramDeliveryAdapter,
+    ControlledTelegramIngestionAdapter,
+    FrozenClock,
+    OwnershipViolationError,
+    boot_acceptance_spine,
+)
 
 
 def _migration_paths() -> list[Path]:
@@ -750,6 +768,293 @@ def test_migrate_adopts_each_exact_partial_prefix_and_upgrades_it(
         applied_count=applied_count,
     )
     _assert_final_migration_state(fresh_database_url)
+
+
+def test_0014_rekeys_populated_generation_two_source_history(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=13)
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_914_200,
+    )
+    generation = 2
+    telegram_message_id = 909
+    source_event_id = "source-event:migration-0014:generation-two:create"
+    source_event_message_id = derive_source_event_message_id(source_event_id)
+    legacy_message_id = "source-chat:channel:4914200:message:909"
+    legacy_revision_id = f"{legacy_message_id}:revision:1"
+    canonical_message_id = "source-chat:channel:4914200:generation:2:message:909"
+    canonical_revision_id = f"{canonical_message_id}:revision:1"
+    recorded_at = datetime(2026, 8, 19, 18, 0, tzinfo=UTC)
+    legacy_payload = {
+        "source_event_id": source_event_id,
+        "source_chat_key": "source-chat:channel:4914200",
+        "telegram_peer_kind": "channel",
+        "telegram_chat_id": identity.telegram_id,
+        "registry_generation": generation,
+        "telegram_message_id": telegram_message_id,
+        "event_kind": "create",
+        "source_message_revision_id": legacy_revision_id,
+        "event_time": recorded_at.isoformat(),
+        "body": "Generation two legacy body.",
+    }
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_chat_registry (
+                peer_kind, telegram_chat_id, registry_generation,
+                address_kind, current_address, processing_started_at,
+                transport_boundary, enabled, initial_consent_attestation,
+                attested_at, created_at, updated_at
+            ) VALUES (
+                'channel', %s, %s, 'public_username',
+                '@migration_generation_two', %s, 'channel-pts:1300', true,
+                'confirmed', %s, %s, %s
+            )
+            """,
+            (
+                identity.telegram_id,
+                generation,
+                recorded_at,
+                recorded_at,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.telegram_channel_difference_checkpoints (
+                peer_kind, telegram_chat_id, registry_generation,
+                channel_pts, advanced_at
+            ) VALUES ('channel', %s, %s, 1300, %s)
+            """,
+            (identity.telegram_id, generation, recorded_at),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'ingestion', 'application', 'SourceEventRecorded', 3,
+                %s, 1, %s, %s,
+                '00000000-0000-0000-0000-000000001314', %s, %s::jsonb
+            )
+            """,
+            (
+                source_event_message_id,
+                legacy_message_id,
+                f"source-event-recorded:{source_event_id}",
+                source_event_message_id,
+                recorded_at,
+                json.dumps(legacy_payload),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_inbox (
+                consumer_role, message_id, producer_role, contract_name,
+                contract_version, processing_status, received_at
+            ) VALUES (
+                'application', %s, 'ingestion', 'SourceEventRecorded',
+                3, 'accepted', %s
+            )
+            """,
+            (source_event_message_id, recorded_at),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_event_records (
+                source_event_id, message_id, peer_kind, telegram_chat_id,
+                registry_generation, telegram_message_id,
+                source_message_revision, event_kind, body, event_time, recorded_at
+            ) VALUES (
+                %s, %s, 'channel', %s, %s, %s, 1,
+                'create', 'Generation two legacy body.', %s, %s
+            )
+            """,
+            (
+                source_event_id,
+                source_event_message_id,
+                identity.telegram_id,
+                generation,
+                telegram_message_id,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_messages (
+                source_message_id, peer_kind, telegram_chat_id,
+                registry_generation, telegram_message_id, current_revision,
+                event_kind, body, event_time, recorded_at, tombstoned
+            ) VALUES (
+                %s, 'channel', %s, %s, %s, 1, 'create',
+                'Generation two legacy body.', %s, %s, false
+            )
+            """,
+            (
+                legacy_message_id,
+                identity.telegram_id,
+                generation,
+                telegram_message_id,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_message_revisions (
+                source_message_revision_id, source_message_id, source_event_id,
+                revision, event_kind, body, event_time, recorded_at
+            ) VALUES (
+                %s, %s, %s, 1, 'create',
+                'Generation two legacy body.', %s, %s
+            )
+            """,
+            (
+                legacy_revision_id,
+                legacy_message_id,
+                source_event_id,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        canonical_state = connection.execute(
+            """
+            SELECT message.source_message_id,
+                   revision.source_message_revision_id,
+                   revision.registry_generation,
+                   event.contract_version,
+                   event.subject_id,
+                   event.payload,
+                   revision.bounded_metadata
+            FROM football_runtime.source_messages AS message
+            JOIN football_runtime.source_message_revisions AS revision
+              ON revision.source_message_id = message.source_message_id
+             AND revision.revision = message.current_revision
+             AND revision.registry_generation = message.registry_generation
+            JOIN football_runtime.contract_outbox AS event
+              ON event.message_id = %s
+            WHERE NOT message.tombstoned
+            """,
+            (source_event_message_id,),
+        ).fetchone()
+    assert canonical_state == (
+        canonical_message_id,
+        canonical_revision_id,
+        generation,
+        4,
+        canonical_message_id,
+        {
+            **legacy_payload,
+            "source_message_revision_id": canonical_revision_id,
+            "bounded_metadata": empty_bounded_source_metadata(),
+            "reply_to_telegram_message_id": None,
+        },
+        empty_bounded_source_metadata(),
+    )
+
+    classifier = ControlledModelAdapter()
+    edited_body = "Generation two edited body."
+    classifier.return_for(
+        body=edited_body,
+        result=ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v1",
+                "disposition": "irrelevant",
+                "candidates": [],
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="controlled_recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=1,
+            input_tokens=3,
+            output_tokens=2,
+        ),
+    )
+    telegram = ControlledTelegramIngestionAdapter()
+    edit_event_id = "source-event:migration-0014:generation-two:edit"
+    edit_time = datetime(2026, 8, 20, 19, 1, tzinfo=UTC)
+    telegram.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=1300),
+        to_checkpoint=TelegramChannelCheckpoint(pts=1301),
+        source_event_id=edit_event_id,
+        telegram_message_id=telegram_message_id,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=edited_body,
+        event_time=edit_time,
+    )
+    clock = FrozenClock(datetime(2026, 8, 20, 19, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=ControlledLocationResolverAdapter(),
+    )
+
+    assert not system.redeliver_source_event(source_event_id)
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.redeliver_source_event(source_event_id)
+    assert [
+        message.source_message_id
+        for message in system.source_messages_as(RuntimeRole.APPLICATION)
+    ] == [canonical_message_id]
+    assert [
+        event.source_message_id
+        for event in system.source_events_as(RuntimeRole.INGESTION)
+    ] == [canonical_message_id]
+    for actor in RuntimeRole:
+        if actor is not RuntimeRole.APPLICATION:
+            with pytest.raises(OwnershipViolationError):
+                system.source_messages_as(actor)
+        if actor is not RuntimeRole.INGESTION:
+            with pytest.raises(OwnershipViolationError):
+                system.source_events_as(actor)
+
+    clock.advance_to(edit_time)
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=generation,
+    )
+    system.restart(RuntimeRole.APPLICATION)
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.redeliver_source_event(source_event_id)
+    assert not system.redeliver_source_event(edit_event_id)
+    assert system.source_messages()[0].current_revision == 2
+    assert system.source_messages()[0].body == edited_body
+    assert {
+        revision.source_message_revision_id
+        for revision in system.source_message_revisions()
+    } == {
+        canonical_revision_id,
+        f"{canonical_message_id}:revision:2",
+    }
+    assert {
+        revision.registry_generation for revision in system.source_message_revisions()
+    } == {generation}
+    assert [
+        attempt.source_message_revision_id
+        for attempt in system.classification_attempts()
+    ] == [f"{canonical_message_id}:revision:2"]
+    migrator.migrate()
 
 
 def test_migrate_reconciles_supported_pre_0003_legacy_delivery_state(
