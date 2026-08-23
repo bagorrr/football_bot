@@ -342,6 +342,27 @@ class SourceEventKind(StrEnum):
     DELETE = "delete"
 
 
+class IngestionFailureScope(StrEnum):
+    """Durable boundary stopped by one fail-closed ingestion outcome."""
+
+    SOURCE_STREAM = "source_stream"
+    ACCOUNT_STREAM = "account_stream"
+    INGESTION_ROLE = "ingestion_role"
+
+
+class IngestionFailureReason(StrEnum):
+    """Low-cardinality body-free reason for stopping ingestion."""
+
+    PROTECTION_UNAVAILABLE = "protection_unavailable"
+    CHECKPOINT_UNAVAILABLE = "checkpoint_unavailable"
+    CHECKPOINT_INVALID = "checkpoint_invalid"
+    ACCESS_LOST = "access_lost"
+    DIFFERENCE_TOO_LONG = "difference_too_long"
+    UNRECOVERABLE_GAP = "unrecoverable_gap"
+    SESSION_REVOKED = "session_revoked"
+    AUTHENTICATION_LOST = "authentication_lost"
+
+
 def empty_bounded_source_metadata() -> dict[str, Any]:
     """Return the complete bounded source-metadata shape with no usable route."""
     return {
@@ -459,9 +480,9 @@ class SourceChatRegistryEntry:
             raise ValueError("Source Chat registry address is invalid")
 
 
-@dataclass(frozen=True, slots=True)
-class TelegramDifferenceEvent:
-    """One controlled, recoverable event returned from a durable checkpoint."""
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _TelegramDifferenceProgress:
+    """Body-agnostic progress shared by concrete Telegram difference outcomes."""
 
     source_chat_identity: TelegramPeerIdentity
     from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
@@ -470,7 +491,6 @@ class TelegramDifferenceEvent:
     telegram_message_id: int
     revision: int
     kind: SourceEventKind
-    body: str | None
     event_time: datetime
     registry_generation: int = 1
     bounded_metadata: Mapping[str, Any] = field(
@@ -502,6 +522,16 @@ class TelegramDifferenceEvent:
             raise ValueError("Source Message identity and revision must be positive")
         if self.event_time.tzinfo is None:
             raise ValueError("Source Event time must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramDifferenceEvent(_TelegramDifferenceProgress):
+    """One copy-permitted event returned from a durable checkpoint."""
+
+    body: str | None
+
+    def __post_init__(self) -> None:
+        _TelegramDifferenceProgress.__post_init__(self)
         if self.kind is SourceEventKind.DELETE and self.body is not None:
             raise ValueError("Deletion transport events must be body-free")
         if (
@@ -509,6 +539,35 @@ class TelegramDifferenceEvent:
             and self.reply_to_telegram_message_id < 1
         ):
             raise ValueError("direct-reply target identity must be positive")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramProtectedContentEvent(_TelegramDifferenceProgress):
+    """Body-free progress for one copy-protected Telegram event."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramProtectionUnavailableEvent(_TelegramDifferenceProgress):
+    """Body-free event whose copy-protection state could not be established."""
+
+    persistent: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramDifferenceFailure:
+    """Body-free controlled failure returned at one durable checkpoint."""
+
+    source_chat_identity: TelegramPeerIdentity
+    checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
+    reason: IngestionFailureReason
+
+
+TelegramDifferenceResult = (
+    TelegramDifferenceEvent
+    | TelegramProtectedContentEvent
+    | TelegramProtectionUnavailableEvent
+    | TelegramDifferenceFailure
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -559,6 +618,29 @@ class SourceEventRecord:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedContentSkip:
+    """Ingestion-owned body-free observation of one protected event."""
+
+    protected_content_skip_id: UUID
+    source_chat_identity: TelegramPeerIdentity
+    registry_generation: int
+    telegram_message_id: int
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionFailure:
+    """Operator-visible body-free state for one stopped ingestion boundary."""
+
+    ingestion_failure_id: UUID
+    scope: IngestionFailureScope
+    reason: IngestionFailureReason
+    source_chat_identity: TelegramPeerIdentity | None
+    registry_generation: int | None
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
