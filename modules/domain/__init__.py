@@ -1132,6 +1132,21 @@ class ClassificationAttempt:
     output_tokens: int
     disposition: str
     status: str
+    pass_kind: str = "primary"
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationRoutingOutcome:
+    """Body-free, low-cardinality Application routing for one proposal."""
+
+    outcome_id: str
+    source_message_revision_id: str
+    disposition: str
+    route: str
+    reason_code: str
+    pass_number: int
+    candidate_count: int
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

@@ -42,6 +42,7 @@ from modules.contracts import (
 from modules.domain import (
     AcceptedLocation,
     ClassificationAttempt,
+    ClassificationRoutingOutcome,
     CompletedSearch,
     ConversationStage,
     ConversationState,
@@ -6734,7 +6735,7 @@ class RuntimeApplication:
                         ContractName.CLASSIFICATION_PROPOSAL,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
-                    and definition.version in {2, 3}
+                    and definition.version in {2, 3, 4}
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -7516,14 +7517,14 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and incoming.contract_version in {2, 3}
+            and incoming.contract_version in {2, 3, 4}
             and supported_incoming is not None
         ):
             self._accept_classification_proposal(supported_incoming)
             return True
         if (
             incoming.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
-            and incoming.contract_version == 2
+            and incoming.contract_version in {2, 3}
             and supported_incoming is not None
         ):
             self.store.project_opportunity(
@@ -7665,6 +7666,11 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
+        if getattr(self.model, "primary_schema_version", None) == (
+            "source-message-classification-v2"
+        ):
+            self._classify_source_message_v2(incoming)
+            return
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -7946,6 +7952,7 @@ class RuntimeApplication:
             adapter_kind=result.adapter_kind,
             adapter_version=result.adapter_version,
             pass_number=1,
+            pass_kind="primary",
             attempt_number=1,
             input_manifest_hash=input_manifest_hash,
             evidence_references=_classification_evidence_references(result.output),
@@ -7963,6 +7970,417 @@ class RuntimeApplication:
             received_at=self.clock.now(),
         )
 
+    def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
+        """Run the additive multi-candidate classifier and one-way ambiguity pass."""
+        if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
+            raise RuntimeError("only Classification executes the v2 classifier")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("ClassifySourceMessageRevision payload must be an object")
+        revision_id = payload.get("source_message_revision_id")
+        body = payload.get("body")
+        if not isinstance(revision_id, str) or not isinstance(body, str):
+            raise ValueError("classifier command requires revision identity and body")
+
+        request = ClassifierRequest(
+            source_message_revision_id=_opaque_classifier_reference(
+                revision_id, kind="revision"
+            ),
+            body=body,
+            source_event_time=str(payload["source_event_time"]),
+            context_bundle_version=str(payload["context_bundle_version"]),
+            source_chat_reference=_opaque_classifier_reference(
+                str(payload["source_chat_reference"]), kind="source-chat"
+            ),
+            source_chat_timezone=(
+                str(payload["source_chat_timezone"])
+                if payload["source_chat_timezone"] is not None
+                else None
+            ),
+            source_chat_geography=cast(
+                dict[str, JsonValue], payload["source_chat_geography"]
+            ),
+            bounded_metadata=_classifier_bounded_metadata(
+                cast(dict[str, JsonValue], payload["bounded_metadata"])
+            ),
+            eligible_reply_context=_classifier_reply_context(
+                cast(dict[str, JsonValue] | None, payload["eligible_reply_context"])
+            ),
+            requested_model="gpt-5.6-sol",
+            requested_reasoning_effort="high",
+            prompt_version="open-match-primary-v2",
+            schema_version="source-message-classification-v2",
+            glossary_version="football-opportunity-glossary-v1",
+            context_policy_version="classifier-context-v1",
+            routing_policy_version="classifier-routing-v1",
+            pass_kind="primary",
+        )
+
+        def manifest_for(
+            pass_request: ClassifierRequest, *, pass_number: int, attempt_number: int
+        ) -> str:
+            manifest = {
+                "source_message_revision_id": pass_request.source_message_revision_id,
+                "body": body,
+                "source_event_time": pass_request.source_event_time,
+                "context_bundle_version": pass_request.context_bundle_version,
+                "source_chat_reference": pass_request.source_chat_reference,
+                "source_chat_timezone": pass_request.source_chat_timezone,
+                "source_chat_geography": pass_request.source_chat_geography,
+                "bounded_metadata": pass_request.bounded_metadata,
+                "eligible_reply_context": pass_request.eligible_reply_context,
+                "adjacent_context": list(pass_request.adjacent_context),
+                "model": pass_request.requested_model,
+                "reasoning_effort": pass_request.requested_reasoning_effort,
+                "prompt_version": pass_request.prompt_version,
+                "schema_version": pass_request.schema_version,
+                "glossary_version": pass_request.glossary_version,
+                "context_policy_version": pass_request.context_policy_version,
+                "routing_policy_version": pass_request.routing_policy_version,
+                "pass_kind": pass_request.pass_kind,
+                "pass_number": pass_number,
+                "attempt_number": attempt_number,
+            }
+            return sha256(
+                json.dumps(
+                    manifest,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+
+        primary_result = self.model.classify(request)
+        primary_valid = (
+            _classifier_adapter_result_has_complete_provenance(primary_result)
+            and classifier_output_is_schema_valid(primary_result.output, body=body)
+            and primary_result.output.get("schema_version")
+            == "source-message-classification-v2"
+        )
+        final_request = request
+        final_result = primary_result
+        final_output = primary_result.output
+        final_pass_number = 1
+        ambiguity_execution: dict[str, JsonValue] | None = None
+        additional_attempts: list[
+            tuple[ClassificationAttempt, ClassifierAdapterResult]
+        ] = []
+        primary_disposition = primary_result.output.get("disposition")
+        routing = primary_result.output.get("routing")
+        required_context = (
+            routing.get("required_context") if isinstance(routing, dict) else None
+        )
+        second_pass_eligible = (
+            primary_valid
+            and primary_disposition == "needs_second_pass"
+            and (
+                required_context == "refined_prompt"
+                or (
+                    required_context == "direct_reply"
+                    and payload.get("eligible_reply_context") is not None
+                )
+            )
+        )
+        if second_pass_eligible:
+            second_request = replace(
+                request,
+                prompt_version="open-match-ambiguity-v1",
+                pass_kind="ambiguity_second_pass",
+            )
+            second_result = self.model.classify(second_request)
+            second_valid = (
+                _classifier_adapter_result_has_complete_provenance(second_result)
+                and second_result.effective_model == "gpt-5.6-sol"
+                and second_result.effective_reasoning_effort == "high"
+                and classifier_output_is_schema_valid(second_result.output, body=body)
+                and second_result.output.get("schema_version")
+                == "source-message-classification-v2"
+            )
+            if second_valid:
+                final_request = second_request
+                final_result = second_result
+                final_output = second_result.output
+                final_pass_number = 2
+                ambiguity_execution = {
+                    "requested_model": second_request.requested_model,
+                    "effective_model": second_result.effective_model,
+                    "requested_reasoning_effort": (
+                        second_request.requested_reasoning_effort
+                    ),
+                    "effective_reasoning_effort": (
+                        second_result.effective_reasoning_effort
+                    ),
+                    "prompt_version": second_request.prompt_version,
+                    "schema_version": second_request.schema_version,
+                    "glossary_version": second_request.glossary_version,
+                    "context_policy_version": second_request.context_policy_version,
+                    "routing_policy_version": second_request.routing_policy_version,
+                    "context_bundle_version": second_request.context_bundle_version,
+                    "codex_version": second_result.codex_version,
+                    "adapter_kind": second_result.adapter_kind,
+                    "adapter_version": second_result.adapter_version,
+                    "pass_number": 2,
+                    "attempt_number": 1,
+                    "input_manifest_hash": manifest_for(
+                        second_request, pass_number=2, attempt_number=1
+                    ),
+                    "duration_ms": _nonnegative_metric_or_zero(
+                        second_result.duration_ms
+                    ),
+                    "input_tokens": _nonnegative_metric_or_zero(
+                        second_result.input_tokens
+                    ),
+                    "output_tokens": _nonnegative_metric_or_zero(
+                        second_result.output_tokens
+                    ),
+                    "status": "succeeded",
+                }
+            else:
+                final_output = _safe_v2_review_output()
+
+            second_attempt = ClassificationAttempt(
+                attempt_id=f"classification-attempt:{revision_id}:second-pass",
+                source_message_revision_id=revision_id,
+                requested_model=second_request.requested_model,
+                effective_model=second_result.effective_model,
+                requested_reasoning_effort=second_request.requested_reasoning_effort,
+                effective_reasoning_effort=second_result.effective_reasoning_effort,
+                prompt_version=second_request.prompt_version,
+                schema_version=second_request.schema_version,
+                glossary_version=second_request.glossary_version,
+                context_policy_version=second_request.context_policy_version,
+                routing_policy_version=second_request.routing_policy_version,
+                codex_version=second_result.codex_version,
+                adapter_kind=second_result.adapter_kind,
+                adapter_version=second_result.adapter_version,
+                pass_number=2,
+                pass_kind="ambiguity_second_pass",
+                attempt_number=1,
+                input_manifest_hash=manifest_for(
+                    second_request, pass_number=2, attempt_number=1
+                ),
+                evidence_references=_classification_evidence_references(
+                    second_result.output
+                ),
+                duration_ms=_nonnegative_metric_or_zero(second_result.duration_ms),
+                input_tokens=_nonnegative_metric_or_zero(second_result.input_tokens),
+                output_tokens=_nonnegative_metric_or_zero(second_result.output_tokens),
+                disposition=_classification_disposition_or_review(
+                    second_result.output.get("disposition")
+                ),
+                status="succeeded" if second_valid else "failed",
+            )
+            additional_attempts.append(
+                (
+                    second_attempt,
+                    replace(
+                        second_result,
+                        duration_ms=_nonnegative_metric_or_zero(
+                            second_result.duration_ms
+                        ),
+                        input_tokens=_nonnegative_metric_or_zero(
+                            second_result.input_tokens
+                        ),
+                        output_tokens=_nonnegative_metric_or_zero(
+                            second_result.output_tokens
+                        ),
+                    ),
+                )
+            )
+        if not primary_valid:
+            final_output = _safe_v2_review_output()
+
+        semantic_proofs: list[JsonValue] = []
+        semantic_proof_executions: list[JsonValue] = []
+        if final_output.get(
+            "disposition"
+        ) == "accepted" and classifier_output_is_schema_valid(final_output, body=body):
+            candidates = final_output.get("candidates")
+            if isinstance(candidates, list):
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_key = candidate.get("candidate_key")
+                    evidence = candidate.get("evidence")
+                    routes = candidate.get("response_routes")
+                    if (
+                        not isinstance(candidate_key, str)
+                        or not isinstance(evidence, dict)
+                        or not isinstance(routes, list)
+                    ):
+                        continue
+                    proof_request = replace(
+                        final_request,
+                        prompt_version="open-match-semantic-proof-v1",
+                        schema_version="source-semantic-proof-v1",
+                        context_bundle_version="semantic-proof-context-v1",
+                        context_policy_version="semantic-proof-context-v1",
+                        pass_kind="semantic_proof",
+                        proof_candidate_key=candidate_key,
+                    )
+                    proof_result = self.model.semantic_proof(proof_request)
+                    proof_is_valid = _semantic_proof_result_has_pinned_provenance(
+                        proof_result
+                    ) and semantic_proof_is_schema_valid(
+                        proof_result.output,
+                        body=body,
+                        source_message_revision_reference=final_request.source_message_revision_id,
+                        candidate_key=candidate_key,
+                        evidence=evidence,
+                        routes=routes,
+                    )
+                    if not proof_is_valid:
+                        continue
+                    semantic_proofs.append(
+                        {"candidate_key": candidate_key, "proof": proof_result.output}
+                    )
+                    semantic_proof_executions.append(
+                        {
+                            "candidate_key": candidate_key,
+                            "execution": _semantic_proof_execution_metadata(
+                                proof_request,
+                                proof_result,
+                                manifest_hash=manifest_for(
+                                    proof_request,
+                                    pass_number=3 if final_pass_number == 2 else 2,
+                                    attempt_number=1,
+                                ),
+                                pass_number=3 if final_pass_number == 2 else 2,
+                            ),
+                        }
+                    )
+        if final_output.get("disposition") == "accepted":
+            candidates = final_output.get("candidates")
+            if not isinstance(candidates, list) or len(semantic_proofs) != len(
+                candidates
+            ):
+                final_output = _safe_v2_review_output()
+                semantic_proofs = []
+                semantic_proof_executions = []
+
+        final_disposition = final_output.get("disposition")
+        if final_disposition not in {
+            "accepted",
+            "needs_second_pass",
+            "needs_review",
+            "irrelevant",
+            "unresolved",
+        }:
+            final_output = _safe_v2_review_output()
+            final_disposition = "needs_review"
+        primary_attempt = ClassificationAttempt(
+            attempt_id=f"classification-attempt:{revision_id}",
+            source_message_revision_id=revision_id,
+            requested_model=request.requested_model,
+            effective_model=primary_result.effective_model,
+            requested_reasoning_effort=request.requested_reasoning_effort,
+            effective_reasoning_effort=primary_result.effective_reasoning_effort,
+            prompt_version=request.prompt_version,
+            schema_version=request.schema_version,
+            glossary_version=request.glossary_version,
+            context_policy_version=request.context_policy_version,
+            routing_policy_version=request.routing_policy_version,
+            codex_version=primary_result.codex_version,
+            adapter_kind=primary_result.adapter_kind,
+            adapter_version=primary_result.adapter_version,
+            pass_number=1,
+            pass_kind="primary",
+            attempt_number=1,
+            input_manifest_hash=manifest_for(request, pass_number=1, attempt_number=1),
+            evidence_references=_classification_evidence_references(
+                primary_result.output
+            ),
+            duration_ms=_nonnegative_metric_or_zero(primary_result.duration_ms),
+            input_tokens=_nonnegative_metric_or_zero(primary_result.input_tokens),
+            output_tokens=_nonnegative_metric_or_zero(primary_result.output_tokens),
+            disposition=_classification_disposition_or_review(
+                primary_result.output.get("disposition")
+            ),
+            status="succeeded" if primary_valid else "failed",
+        )
+        final_metrics = replace(
+            final_result,
+            duration_ms=_nonnegative_metric_or_zero(final_result.duration_ms),
+            input_tokens=_nonnegative_metric_or_zero(final_result.input_tokens),
+            output_tokens=_nonnegative_metric_or_zero(final_result.output_tokens),
+        )
+        proposal_payload: dict[str, JsonValue] = {
+            "proposal_id": f"proposal:{revision_id}",
+            "classification_command_id": str(incoming.message_id),
+            "source_message_revision_id": revision_id,
+            "body": body,
+            "source_event_time": payload.get("source_event_time"),
+            "source_recorded_at": payload.get("source_recorded_at"),
+            "context_bundle_version": payload.get("context_bundle_version"),
+            "source_chat_reference": payload.get("source_chat_reference"),
+            "source_chat_registry_generation": payload.get(
+                "source_chat_registry_generation"
+            ),
+            "source_chat_timezone": payload.get("source_chat_timezone"),
+            "source_chat_geography": payload.get("source_chat_geography"),
+            "bounded_metadata": payload.get("bounded_metadata"),
+            "eligible_reply_context": payload.get("eligible_reply_context"),
+            "direct_reply_to_telegram_message_id": payload.get(
+                "direct_reply_to_telegram_message_id"
+            ),
+            "output": final_output,
+            "requested_model": final_request.requested_model,
+            "effective_model": final_metrics.effective_model,
+            "requested_reasoning_effort": final_request.requested_reasoning_effort,
+            "effective_reasoning_effort": final_metrics.effective_reasoning_effort,
+            "prompt_version": final_request.prompt_version,
+            "schema_version": final_request.schema_version,
+            "glossary_version": final_request.glossary_version,
+            "context_policy_version": final_request.context_policy_version,
+            "routing_policy_version": final_request.routing_policy_version,
+            "codex_version": final_metrics.codex_version,
+            "adapter_kind": final_metrics.adapter_kind,
+            "adapter_version": final_metrics.adapter_version,
+            "pass_number": final_pass_number,
+            "attempt_number": 1,
+            "input_manifest_hash": manifest_for(
+                final_request, pass_number=final_pass_number, attempt_number=1
+            ),
+            "duration_ms": final_metrics.duration_ms,
+            "input_tokens": final_metrics.input_tokens,
+            "output_tokens": final_metrics.output_tokens,
+            "classification_status": "succeeded",
+            "semantic_proofs": semantic_proofs,
+            "semantic_proof_executions": semantic_proof_executions,
+            "ambiguity_pass_execution": ambiguity_execution,
+        }
+        outgoing = None
+        if _classifier_adapter_result_has_complete_provenance(final_metrics):
+            outgoing = ContractEnvelope(
+                contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+                contract_version=4,
+                message_id=derive_contract_message_id(
+                    incoming.message_id, ContractName.CLASSIFICATION_PROPOSAL
+                ),
+                producer=RuntimeRole.CLASSIFICATION,
+                consumer=RuntimeRole.APPLICATION,
+                subject_id=incoming.subject_id,
+                subject_revision=incoming.subject_revision,
+                idempotency_key=f"classification-proposal:{revision_id}",
+                causation_id=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=self.clock.now(),
+                payload=proposal_payload,
+            )
+        self.store.record_classification_attempt(
+            incoming=incoming,
+            attempt=primary_attempt,
+            result=replace(
+                primary_result,
+                duration_ms=_nonnegative_metric_or_zero(primary_result.duration_ms),
+                input_tokens=_nonnegative_metric_or_zero(primary_result.input_tokens),
+                output_tokens=_nonnegative_metric_or_zero(primary_result.output_tokens),
+            ),
+            outgoing=outgoing,
+            received_at=self.clock.now(),
+            additional_attempts=tuple(additional_attempts),
+        )
+
     def _accept_classification_proposal(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.APPLICATION or self.location_resolver is None:
             raise RuntimeError("only Application accepts classifier proposals")
@@ -7976,7 +8394,9 @@ class RuntimeApplication:
         if source_revision is None or source_revision.body is None:
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2, 3),
+                supported_versions=self.versions_for(
+                    ContractName.CLASSIFICATION_PROPOSAL
+                ),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -7988,7 +8408,9 @@ class RuntimeApplication:
         if not source_message_scope.endswith(generation_suffix):
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2, 3),
+                supported_versions=self.versions_for(
+                    ContractName.CLASSIFICATION_PROPOSAL
+                ),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -8011,7 +8433,9 @@ class RuntimeApplication:
         if source_chat is None:
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2, 3),
+                supported_versions=self.versions_for(
+                    ContractName.CLASSIFICATION_PROPOSAL
+                ),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -8047,7 +8471,9 @@ class RuntimeApplication:
         ):
             self.store.consume(
                 incoming=incoming,
-                supported_versions=(2, 3),
+                supported_versions=self.versions_for(
+                    ContractName.CLASSIFICATION_PROPOSAL
+                ),
                 received_at=self.clock.now(),
                 outgoing=None,
             )
@@ -8071,21 +8497,273 @@ class RuntimeApplication:
             "eligible_reply_context": authoritative_reply_context,
             "validation_time": self.clock.now().isoformat(),
         }
+        if incoming.contract_version == 4:
+            v4_output = authoritative_payload.get("output")
+            v4_pass_number = authoritative_payload.get("pass_number")
+            if not isinstance(v4_output, dict):
+                self.store.record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="schema_invalid",
+                        recorded_at=self.clock.now(),
+                        pass_number=(
+                            v4_pass_number if isinstance(v4_pass_number, int) else 1
+                        ),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            v4_disposition = v4_output.get("disposition")
+            if v4_disposition != "accepted":
+                routing = v4_output.get("routing")
+                routing_reason = (
+                    routing.get("reason_code") if isinstance(routing, dict) else None
+                )
+                reason_code = (
+                    "prompt_injection"
+                    if routing_reason == "prompt_injection"
+                    else "second_pass_exhausted"
+                    if v4_disposition == "needs_second_pass" and v4_pass_number == 2
+                    else "second_pass_unavailable"
+                    if v4_disposition == "needs_second_pass"
+                    else "classifier_disposition"
+                )
+                self.store.record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code=reason_code,
+                        recorded_at=self.clock.now(),
+                        pass_number=(
+                            v4_pass_number if isinstance(v4_pass_number, int) else 1
+                        ),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            v4_candidates = v4_output.get("candidates")
+            v4_proofs = authoritative_payload.get("semantic_proofs")
+            if not isinstance(v4_candidates, list) or not isinstance(v4_proofs, list):
+                self.store.record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            if len(v4_candidates) != 1:
+                accepted_opportunities: list[dict[str, JsonValue]] = []
+                publication_items: list[dict[str, JsonValue]] = []
+                for candidate in v4_candidates:
+                    if not isinstance(candidate, dict):
+                        self.store.record_classification_routing_outcome(
+                            incoming=incoming,
+                            outcome=_classification_routing_outcome(
+                                authoritative_payload,
+                                source_message_revision_id=revision_id,
+                                reason_code="provenance_invalid",
+                                recorded_at=self.clock.now(),
+                            ),
+                            received_at=self.clock.now(),
+                        )
+                        return
+                    candidate_key = candidate.get("candidate_key")
+                    if not isinstance(candidate_key, str):
+                        self.store.record_classification_routing_outcome(
+                            incoming=incoming,
+                            outcome=_classification_routing_outcome(
+                                authoritative_payload,
+                                source_message_revision_id=revision_id,
+                                reason_code="provenance_invalid",
+                                recorded_at=self.clock.now(),
+                            ),
+                            received_at=self.clock.now(),
+                        )
+                        return
+                    proof = next(
+                        (
+                            wrapper.get("proof")
+                            for wrapper in v4_proofs
+                            if isinstance(wrapper, dict)
+                            and wrapper.get("candidate_key") == candidate_key
+                        ),
+                        None,
+                    )
+                    if not isinstance(proof, dict):
+                        self.store.record_classification_routing_outcome(
+                            incoming=incoming,
+                            outcome=_classification_routing_outcome(
+                                authoritative_payload,
+                                source_message_revision_id=revision_id,
+                                reason_code="provenance_invalid",
+                                recorded_at=self.clock.now(),
+                            ),
+                            received_at=self.clock.now(),
+                        )
+                        return
+                    candidate_payload = _single_v4_candidate_payload(
+                        authoritative_payload,
+                        output=v4_output,
+                        candidate=candidate,
+                        proof=proof,
+                    )
+                    accepted_candidate = _validated_open_match_proposal(
+                        candidate_payload,
+                        resolver=self.location_resolver,
+                    )
+                    if accepted_candidate is None:
+                        self.store.record_classification_routing_outcome(
+                            incoming=incoming,
+                            outcome=_classification_routing_outcome(
+                                authoritative_payload,
+                                source_message_revision_id=revision_id,
+                                reason_code="application_validation_failed",
+                                recorded_at=self.clock.now(),
+                            ),
+                            received_at=self.clock.now(),
+                        )
+                        return
+                    opportunity_id = _v4_candidate_opportunity_id(
+                        revision_id, candidate_key
+                    )
+                    opportunity_revision_id = (
+                        f"{opportunity_id}:revision:{incoming.subject_revision}"
+                    )
+                    accepted_candidate = {
+                        **accepted_candidate,
+                        "opportunity_id": opportunity_id,
+                        "opportunity_revision_id": opportunity_revision_id,
+                    }
+                    accepted_opportunities.append(accepted_candidate)
+                    publication_items.append(
+                        {
+                            "opportunity_id": opportunity_id,
+                            "opportunity_revision_id": opportunity_revision_id,
+                            "opportunity_type": "open_match",
+                            "accepted_facts": accepted_candidate["accepted_facts"],
+                            "response_route": accepted_candidate["response_route"],
+                        }
+                    )
+                if len({item["opportunity_id"] for item in publication_items}) != len(
+                    publication_items
+                ):
+                    self.store.record_classification_routing_outcome(
+                        incoming=incoming,
+                        outcome=_classification_routing_outcome(
+                            authoritative_payload,
+                            source_message_revision_id=revision_id,
+                            reason_code="provenance_invalid",
+                            recorded_at=self.clock.now(),
+                        ),
+                        received_at=self.clock.now(),
+                    )
+                    return
+                batch_outgoing = ContractEnvelope(
+                    contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                    contract_version=3,
+                    message_id=derive_contract_message_id(
+                        incoming.message_id,
+                        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                    ),
+                    producer=RuntimeRole.APPLICATION,
+                    consumer=RuntimeRole.RECOMMENDATION,
+                    subject_id=f"opportunity-batch:{revision_id}",
+                    subject_revision=incoming.subject_revision,
+                    idempotency_key=(
+                        f"opportunity-publication-batch:{revision_id}:"
+                        f"revision:{incoming.subject_revision}"
+                    ),
+                    causation_id=incoming.message_id,
+                    correlation_id=incoming.correlation_id,
+                    recorded_at=self.clock.now(),
+                    payload={
+                        "source_message_revision_id": revision_id,
+                        "publication_state": "active",
+                        "opportunities": cast(JsonValue, publication_items),
+                    },
+                )
+                self.store.publish_opportunities(
+                    incoming=incoming,
+                    opportunities=tuple(accepted_opportunities),
+                    outgoing=batch_outgoing,
+                    received_at=self.clock.now(),
+                    routing_outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="classifier_disposition",
+                        recorded_at=self.clock.now(),
+                        pass_number=_classification_pass_number(authoritative_payload),
+                    ),
+                )
+                return
+            candidate = v4_candidates[0]
+            if not isinstance(candidate, dict):
+                self.store.record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            candidate_key = candidate.get("candidate_key")
+            proof = next(
+                (
+                    wrapper.get("proof")
+                    for wrapper in v4_proofs
+                    if isinstance(wrapper, dict)
+                    and wrapper.get("candidate_key") == candidate_key
+                ),
+                None,
+            )
+            if not isinstance(candidate_key, str) or not isinstance(proof, dict):
+                self.store.record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            authoritative_payload = _single_v4_candidate_payload(
+                authoritative_payload,
+                output=v4_output,
+                candidate=candidate,
+                proof=proof,
+            )
         accepted = _validated_open_match_proposal(
             authoritative_payload,
             resolver=self.location_resolver,
         )
         if accepted is None:
-            self.store.consume(
+            self.store.record_classification_routing_outcome(
                 incoming=incoming,
-                supported_versions=(2, 3),
+                outcome=_classification_routing_outcome(
+                    payload,
+                    source_message_revision_id=revision_id,
+                    reason_code=_classification_validation_reason(payload),
+                    recorded_at=self.clock.now(),
+                ),
                 received_at=self.clock.now(),
-                outgoing=None,
             )
             return
-        opportunity_id = accepted["opportunity_id"]
-        if not isinstance(opportunity_id, str):
+        single_opportunity_id = accepted["opportunity_id"]
+        if not isinstance(single_opportunity_id, str):
             raise RuntimeError("validated Opportunity identity is missing")
+        opportunity_id = single_opportunity_id
         opportunity_revision_id = (
             f"{opportunity_id}:revision:{incoming.subject_revision}"
         )
@@ -8119,6 +8797,13 @@ class RuntimeApplication:
             opportunity=accepted,
             outgoing=outgoing,
             received_at=self.clock.now(),
+            routing_outcome=_classification_routing_outcome(
+                authoritative_payload,
+                source_message_revision_id=revision_id,
+                reason_code="classifier_disposition",
+                recorded_at=self.clock.now(),
+                pass_number=_classification_pass_number(authoritative_payload),
+            ),
         )
 
     def fail_next_search(self) -> None:
@@ -9103,6 +9788,12 @@ def _classifier_proposal_has_pinned_provenance(
     revision_id: str,
     body: str,
 ) -> bool:
+    if payload.get("schema_version") == "source-message-classification-v2":
+        return _v2_classifier_proposal_has_pinned_provenance(
+            payload,
+            revision_id=revision_id,
+            body=body,
+        )
     pinned = {
         "requested_model": "gpt-5.6-sol",
         "effective_model": "gpt-5.6-sol",
@@ -9157,6 +9848,87 @@ def _classifier_proposal_has_pinned_provenance(
             for key in ("codex_version", "adapter_kind", "adapter_version")
         )
         and payload.get("pass_number") == 1
+        and payload.get("attempt_number") == 1
+        and payload.get("input_manifest_hash") == expected_manifest_hash
+        and all(
+            isinstance(metric := payload.get(key), int)
+            and not isinstance(metric, bool)
+            and metric >= 0
+            for key in ("duration_ms", "input_tokens", "output_tokens")
+        )
+        and payload.get("classification_status") == "succeeded"
+    )
+
+
+def _v2_classifier_proposal_has_pinned_provenance(
+    payload: dict[str, JsonValue],
+    *,
+    revision_id: str,
+    body: str,
+) -> bool:
+    """Validate v2 final-pass provenance and its deterministic input manifest."""
+    pass_number = payload.get("pass_number")
+    if pass_number not in {1, 2}:
+        return False
+    prompt_version = (
+        "open-match-ambiguity-v1" if pass_number == 2 else "open-match-primary-v2"
+    )
+    pass_kind = "ambiguity_second_pass" if pass_number == 2 else "primary"
+    pinned = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": prompt_version,
+        "schema_version": "source-message-classification-v2",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+    }
+    manifest = {
+        "source_message_revision_id": _opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
+        "body": body,
+        "source_event_time": payload.get("source_event_time"),
+        "context_bundle_version": payload.get("context_bundle_version"),
+        "source_chat_reference": _opaque_classifier_reference(
+            str(payload.get("source_chat_reference")), kind="source-chat"
+        ),
+        "source_chat_timezone": payload.get("source_chat_timezone"),
+        "source_chat_geography": payload.get("source_chat_geography"),
+        "bounded_metadata": _classifier_bounded_metadata(
+            cast(dict[str, JsonValue], payload.get("bounded_metadata"))
+        ),
+        "eligible_reply_context": _classifier_reply_context(
+            cast(dict[str, JsonValue] | None, payload.get("eligible_reply_context"))
+        ),
+        "adjacent_context": [],
+        "model": pinned["requested_model"],
+        "reasoning_effort": pinned["requested_reasoning_effort"],
+        "prompt_version": pinned["prompt_version"],
+        "schema_version": pinned["schema_version"],
+        "glossary_version": pinned["glossary_version"],
+        "context_policy_version": pinned["context_policy_version"],
+        "routing_policy_version": pinned["routing_policy_version"],
+        "pass_kind": pass_kind,
+        "pass_number": pass_number,
+        "attempt_number": 1,
+    }
+    expected_manifest_hash = sha256(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return (
+        all(payload.get(key) == value for key, value in pinned.items())
+        and all(
+            isinstance(payload.get(key), str) and bool(str(payload[key]).strip())
+            for key in ("codex_version", "adapter_kind", "adapter_version")
+        )
         and payload.get("attempt_number") == 1
         and payload.get("input_manifest_hash") == expected_manifest_hash
         and all(
@@ -9412,6 +10184,151 @@ _OPTIONAL_OPEN_MATCH_FACTS = frozenset(
 )
 
 
+_CLASSIFICATION_ROUTING_ROUTES = {
+    "accepted": "accepted",
+    "needs_second_pass": "second_pass",
+    "needs_review": "review",
+    "irrelevant": "irrelevant",
+    "unresolved": "unresolved",
+}
+
+
+def _classification_disposition_or_review(value: JsonValue) -> str:
+    """Normalize an untrusted proposal disposition for durable attempts."""
+    return (
+        value
+        if isinstance(value, str)
+        and value
+        in {
+            "accepted",
+            "needs_second_pass",
+            "needs_review",
+            "irrelevant",
+            "unresolved",
+        }
+        else "needs_review"
+    )
+
+
+def _classification_pass_number(payload: dict[str, JsonValue]) -> int:
+    """Read a positive classifier pass number without trusting its wire type."""
+    value = payload.get("pass_number")
+    return value if isinstance(value, int) and value >= 1 else 1
+
+
+def _classification_validation_reason(payload: dict[str, JsonValue]) -> str:
+    """Distinguish an invalid accepted proposal from a terminal classifier route."""
+    output = payload.get("output")
+    return (
+        "application_validation_failed"
+        if isinstance(output, dict) and output.get("disposition") == "accepted"
+        else "classifier_disposition"
+    )
+
+
+def _classification_routing_outcome(
+    payload: dict[str, JsonValue],
+    *,
+    source_message_revision_id: str,
+    reason_code: str,
+    recorded_at: datetime,
+    pass_number: int = 1,
+) -> ClassificationRoutingOutcome:
+    """Build a body-free routing record from an untrusted proposal envelope."""
+    raw_output = payload.get("output")
+    output = raw_output if isinstance(raw_output, dict) else {}
+    raw_disposition = output.get("disposition")
+    disposition = (
+        raw_disposition
+        if raw_disposition in _CLASSIFICATION_ROUTING_ROUTES
+        else "needs_review"
+    )
+    if disposition == "accepted" and reason_code != "classifier_disposition":
+        disposition = "needs_review"
+    raw_candidates = output.get("candidates")
+    candidate_count = len(raw_candidates) if isinstance(raw_candidates, list) else 0
+    route = _CLASSIFICATION_ROUTING_ROUTES[disposition]
+    return ClassificationRoutingOutcome(
+        outcome_id=(
+            f"classification-routing:{source_message_revision_id}:"
+            f"pass:{pass_number}:{route}"
+        ),
+        source_message_revision_id=source_message_revision_id,
+        disposition=disposition,
+        route=route,
+        reason_code=reason_code,
+        pass_number=pass_number,
+        candidate_count=candidate_count,
+        recorded_at=recorded_at,
+    )
+
+
+def _safe_v2_review_output() -> dict[str, JsonValue]:
+    """Create a strict, body-free review disposition after validation failure."""
+    return {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "needs_review",
+        "candidates": [],
+        "routing": {"reason_code": "needs_review", "required_context": "none"},
+    }
+
+
+def _single_v4_candidate_payload(
+    payload: dict[str, JsonValue],
+    *,
+    output: dict[str, JsonValue],
+    candidate: dict[str, JsonValue],
+    proof: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Project one v4 candidate into the existing #49 validation seam."""
+    normalized_output = dict(output)
+    normalized_output["candidates"] = [candidate]
+    return {
+        **payload,
+        "output": normalized_output,
+        "semantic_proof": proof,
+    }
+
+
+def _v4_candidate_opportunity_id(revision_id: str, candidate_key: str) -> str:
+    """Derive a stable, body-free Opportunity identity for one candidate."""
+    source_scope = revision_id.rsplit(":revision:", 1)[0]
+    candidate_digest = sha256(candidate_key.encode("utf-8")).hexdigest()[:16]
+    return f"opportunity:{source_scope}:open_match:candidate:{candidate_digest}"
+
+
+def _semantic_proof_execution_metadata(
+    request: ClassifierRequest,
+    result: ClassifierAdapterResult,
+    *,
+    manifest_hash: str,
+    pass_number: int,
+) -> dict[str, JsonValue]:
+    """Record proof provenance separately from primary/ambiguity routing."""
+    return {
+        "requested_model": request.requested_model,
+        "effective_model": result.effective_model,
+        "requested_reasoning_effort": request.requested_reasoning_effort,
+        "effective_reasoning_effort": result.effective_reasoning_effort,
+        "prompt_version": request.prompt_version,
+        "schema_version": request.schema_version,
+        "glossary_version": request.glossary_version,
+        "context_policy_version": request.context_policy_version,
+        "routing_policy_version": request.routing_policy_version,
+        "context_bundle_version": request.context_bundle_version,
+        "codex_version": result.codex_version,
+        "adapter_kind": result.adapter_kind,
+        "adapter_version": result.adapter_version,
+        "pass_number": pass_number,
+        "attempt_number": 1,
+        "input_manifest_hash": manifest_hash,
+        "duration_ms": _nonnegative_metric_or_zero(result.duration_ms),
+        "input_tokens": _nonnegative_metric_or_zero(result.input_tokens),
+        "output_tokens": _nonnegative_metric_or_zero(result.output_tokens),
+        "status": "succeeded",
+    }
+
+
 def _proposition_graph_has_closed_target_set(
     graph: CanonicalPropositionGraph,
     evidence: dict[str, JsonValue],
@@ -9549,7 +10466,7 @@ def _validated_open_match_proposal(
         "playing_surfaces",
         "payment",
     }
-    structured = {"proposition_evidence"}
+    structured = {"proposition_evidence", "source_context"}
     if (
         not required.issubset(candidate)
         or set(candidate) - required - optional - structured
@@ -9561,6 +10478,7 @@ def _validated_open_match_proposal(
     location = candidate.get("location")
     event_time = candidate.get("event_time")
     routes = candidate.get("response_routes")
+    source_context = candidate.get("source_context")
     if (
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
@@ -9573,10 +10491,16 @@ def _validated_open_match_proposal(
         or not isinstance(location, dict)
         or not isinstance(event_time, dict)
         or not isinstance(routes, list)
+        or (
+            source_context is not None
+            and (not isinstance(source_context, str) or not source_context)
+        )
+        or (isinstance(source_context, str) and source_context not in body)
     ):
         return None
+    validation_body = source_context if isinstance(source_context, str) else body
     route = _select_response_route(
-        body=body,
+        body=validation_body,
         proposed_routes=routes,
         bounded_metadata=payload_value.get("bounded_metadata"),
     )
@@ -9727,19 +10651,19 @@ def _validated_open_match_proposal(
                 if payload_value.get("source_chat_timezone") is not None
                 else None
             ),
-            authoritative_body=body,
+            authoritative_body=validation_body,
         )
         or mention not in str(evidence["location"])
-        or not _location_mention_is_authoritative(body, mention)
+        or not _location_mention_is_authoritative(validation_body, mention)
         or not _open_places_are_supported(
             open_places,
             f"{evidence['opportunity']}. {evidence['open_places']}",
-            authoritative_body=body,
+            authoritative_body=validation_body,
         )
         or not _optional_values_are_supported(
             candidate,
             evidence,
-            authoritative_body=body,
+            authoritative_body=validation_body,
         )
     ):
         return None

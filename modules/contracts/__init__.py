@@ -213,6 +213,13 @@ SUPPORTED_CONTRACTS = (
         "proposal_id",
     ),
     ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        4,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
         1,
         RuntimeRole.APPLICATION,
@@ -225,6 +232,13 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         RuntimeRole.RECOMMENDATION,
         "opportunity_id",
+    ),
+    ContractDefinition(
+        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        3,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.RECOMMENDATION,
+        "source_message_revision_id",
     ),
     ContractDefinition(
         ContractName.RUN_SEARCH,
@@ -458,7 +472,7 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_classify_source_message_revision(self, self.payload)
         elif (
             self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and self.contract_version in {2, 3}
+            and self.contract_version in {2, 3, 4}
         ):
             _validate_classification_proposal(self, self.payload)
         elif (
@@ -466,6 +480,11 @@ class ContractEnvelope(RawContractEnvelope):
             and self.contract_version == 2
         ):
             _validate_opportunity_publication_changed(self, self.payload)
+        elif (
+            self.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            and self.contract_version == 3
+        ):
+            _validate_opportunity_publication_batch_changed(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
             _validate_search_completed(self, self.payload)
         elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
@@ -1232,15 +1251,22 @@ def _validate_classification_proposal(
         "classification_status",
         "classification_command_id",
     }
-    semantic_fields = {
-        "semantic_proof",
-        "semantic_proof_execution",
-    }
+    semantic_fields = (
+        {"semantic_proof", "semantic_proof_execution"}
+        if envelope.contract_version == 3
+        else {
+            "semantic_proofs",
+            "semantic_proof_executions",
+            "ambiguity_pass_execution",
+        }
+        if envelope.contract_version == 4
+        else set()
+    )
     allowed = (
         {"proposal_id", "source_message_revision_id", "body"}
         | context_fields
         | provenance_fields
-        | (semantic_fields if envelope.contract_version == 3 else set())
+        | (semantic_fields if envelope.contract_version in {3, 4} else set())
     )
     if set(payload) != allowed:
         raise ValueError("ClassificationProposal has incomplete semantics")
@@ -1311,6 +1337,8 @@ def _validate_classification_proposal(
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
+    if envelope.contract_version == 4:
+        _validate_classification_proposal_v4(payload, body=body)
     for field_name in ("pass_number", "attempt_number"):
         metric = payload[field_name]
         if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
@@ -1321,18 +1349,37 @@ def _validate_classification_proposal(
             raise TypeError(
                 f"ClassificationProposal requires non-negative {field_name}"
             )
-    pinned = {
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "high",
-        "effective_reasoning_effort": "high",
-        "prompt_version": "open-match-primary-v1",
-        "schema_version": "source-message-classification-v1",
-        "glossary_version": "football-opportunity-glossary-v1",
-        "context_policy_version": "classifier-context-v1",
-        "routing_policy_version": "classifier-routing-v1",
-        "context_bundle_version": "primary-classifier-context-v1",
-    }
+    pinned = (
+        {
+            "requested_model": "gpt-5.6-sol",
+            "effective_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "high",
+            "effective_reasoning_effort": "high",
+            "prompt_version": "open-match-primary-v1",
+            "schema_version": "source-message-classification-v1",
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": "classifier-context-v1",
+            "routing_policy_version": "classifier-routing-v1",
+            "context_bundle_version": "primary-classifier-context-v1",
+        }
+        if envelope.contract_version < 4
+        else {
+            "requested_model": "gpt-5.6-sol",
+            "effective_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "high",
+            "effective_reasoning_effort": "high",
+            "prompt_version": (
+                "open-match-ambiguity-v1"
+                if payload["pass_number"] == 2
+                else "open-match-primary-v2"
+            ),
+            "schema_version": "source-message-classification-v2",
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": "classifier-context-v1",
+            "routing_policy_version": "classifier-routing-v1",
+            "context_bundle_version": "primary-classifier-context-v1",
+        }
+    )
     if any(payload[field_name] != value for field_name, value in pinned.items()):
         raise ValueError("ClassificationProposal provenance version is unsupported")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
@@ -1364,6 +1411,170 @@ def _validate_classification_proposal(
     _validate_direct_causation(envelope, ContractName.CLASSIFICATION_PROPOSAL)
     if envelope.idempotency_key != f"classification-proposal:{revision_id}":
         raise ValueError("ClassificationProposal idempotency key is not canonical")
+
+
+def _validate_classification_proposal_v4(
+    payload: dict[str, JsonValue], *, body: str
+) -> None:
+    """Validate multi-candidate proof and one-way ambiguity-pass provenance."""
+    output = payload["output"]
+    assert isinstance(output, dict)
+    candidates = output.get("candidates")
+    if not isinstance(candidates, list):
+        raise TypeError("ClassificationProposal v4 candidates must be a list")
+    candidate_by_key: dict[str, dict[str, JsonValue]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise TypeError("ClassificationProposal v4 candidate must be an object")
+        candidate_key = candidate.get("candidate_key")
+        if not isinstance(candidate_key, str) or not candidate_key:
+            raise ValueError("ClassificationProposal v4 candidate key is invalid")
+        if candidate_key in candidate_by_key:
+            raise ValueError("ClassificationProposal v4 candidate keys are duplicated")
+        candidate_by_key[candidate_key] = candidate
+    raw_proofs = payload["semantic_proofs"]
+    raw_executions = payload["semantic_proof_executions"]
+    if not isinstance(raw_proofs, list) or not isinstance(raw_executions, list):
+        raise TypeError("ClassificationProposal v4 proof collections are invalid")
+    if output.get("disposition") != "accepted":
+        if raw_proofs or raw_executions:
+            raise ValueError("non-accepted v4 proposals cannot carry proofs")
+    elif len(raw_proofs) != len(candidate_by_key) or len(raw_executions) != len(
+        candidate_by_key
+    ):
+        raise ValueError("ClassificationProposal v4 proof coverage is incomplete")
+    proof_keys: set[str] = set()
+    for wrapper in raw_proofs:
+        if not isinstance(wrapper, dict) or set(wrapper) != {"candidate_key", "proof"}:
+            raise ValueError("ClassificationProposal v4 proof wrapper is invalid")
+        candidate_key = wrapper.get("candidate_key")
+        proof = wrapper.get("proof")
+        candidate = (
+            candidate_by_key.get(candidate_key)
+            if isinstance(candidate_key, str)
+            else None
+        )
+        if (
+            not isinstance(candidate_key, str)
+            or candidate_key in proof_keys
+            or candidate is None
+            or not isinstance(proof, dict)
+        ):
+            raise ValueError("ClassificationProposal v4 proof identity is invalid")
+        evidence = candidate.get("evidence")
+        routes = candidate.get("response_routes")
+        if not isinstance(evidence, dict) or not isinstance(routes, list):
+            raise ValueError("ClassificationProposal v4 proof target is incomplete")
+        proof_reference = proof.get("source_message_revision_reference")
+        if not isinstance(proof_reference, str):
+            raise ValueError("ClassificationProposal v4 proof reference is invalid")
+        if not semantic_proof_is_schema_valid(
+            proof,
+            body=body,
+            source_message_revision_reference=proof_reference,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+        ):
+            raise ValueError("ClassificationProposal v4 semantic proof is invalid")
+        proof_keys.add(candidate_key)
+    execution_keys: set[str] = set()
+    for wrapper in raw_executions:
+        if not isinstance(wrapper, dict) or set(wrapper) != {
+            "candidate_key",
+            "execution",
+        }:
+            raise ValueError("ClassificationProposal v4 execution wrapper is invalid")
+        candidate_key = wrapper.get("candidate_key")
+        if (
+            not isinstance(candidate_key, str)
+            or candidate_key in execution_keys
+            or candidate_key not in candidate_by_key
+        ):
+            raise ValueError("ClassificationProposal v4 execution identity is invalid")
+        _validate_semantic_proof_execution(wrapper.get("execution"))
+        execution_keys.add(candidate_key)
+    if output.get("disposition") == "accepted" and (
+        proof_keys != execution_keys or proof_keys != set(candidate_by_key)
+    ):
+        raise ValueError("ClassificationProposal v4 proof provenance is incomplete")
+    ambiguity_execution = payload["ambiguity_pass_execution"]
+    if ambiguity_execution is not None:
+        _validate_ambiguity_pass_execution(ambiguity_execution)
+
+
+def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
+    """Validate the one allowed semantic ambiguity-pass execution."""
+    fields = {
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "pass_number",
+        "attempt_number",
+        "input_manifest_hash",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "status",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("ambiguity-pass execution metadata is incomplete")
+    for field_name in (
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "input_manifest_hash",
+    ):
+        _required_text(value, field_name)
+    if value["status"] != "succeeded":
+        raise ValueError("ambiguity-pass execution status is invalid")
+    if value["prompt_version"] != "open-match-ambiguity-v1":
+        raise ValueError("ambiguity-pass prompt provenance is invalid")
+    if value["schema_version"] != "source-message-classification-v2":
+        raise ValueError("ambiguity-pass schema provenance is invalid")
+    if value["context_bundle_version"] != "primary-classifier-context-v1":
+        raise ValueError("ambiguity-pass context provenance is invalid")
+    if (
+        value["requested_model"] != "gpt-5.6-sol"
+        or value["effective_model"] != "gpt-5.6-sol"
+    ):
+        raise ValueError("ambiguity-pass model provenance is invalid")
+    if (
+        value["requested_reasoning_effort"] != "high"
+        or value["effective_reasoning_effort"] != "high"
+        or value["glossary_version"] != "football-opportunity-glossary-v1"
+        or value["context_policy_version"] != "classifier-context-v1"
+        or value["routing_policy_version"] != "classifier-routing-v1"
+    ):
+        raise ValueError("ambiguity-pass policy provenance is invalid")
+    if value["pass_number"] != 2 or value["attempt_number"] != 1:
+        raise ValueError("ambiguity-pass numbering is invalid")
+    for field_name in ("duration_ms", "input_tokens", "output_tokens"):
+        metric = value[field_name]
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            raise TypeError(f"ambiguity-pass requires non-negative {field_name}")
+    if re.fullmatch(r"[0-9a-f]{64}", str(value["input_manifest_hash"])) is None:
+        raise ValueError("ambiguity-pass manifest hash is invalid")
 
 
 def _validate_semantic_proof_execution(value: JsonValue) -> None:
@@ -1516,6 +1727,116 @@ def _validate_opportunity_publication_changed(
         raise ValueError(
             "OpportunityPublicationChanged idempotency key is not canonical"
         )
+
+
+def _validate_opportunity_publication_batch_changed(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    """Validate the explicit v3 batch wire contract for compound candidates."""
+    allowed = {
+        "source_message_revision_id",
+        "publication_state",
+        "opportunities",
+    }
+    if set(payload) != allowed:
+        raise ValueError("OpportunityPublicationChanged v3 has incomplete semantics")
+    source_revision_id = _required_text(payload, "source_message_revision_id")
+    source_scope, separator, revision_suffix = source_revision_id.rpartition(
+        ":revision:"
+    )
+    if not separator or not source_scope or not revision_suffix.isdigit():
+        raise ValueError("OpportunityPublicationChanged v3 source lineage is invalid")
+    if envelope.subject_id != f"opportunity-batch:{source_revision_id}":
+        raise ValueError("OpportunityPublicationChanged v3 subject is inconsistent")
+    publication_state = payload["publication_state"]
+    if publication_state not in {
+        "active",
+        "held_for_review",
+        "suppressed",
+        "expired",
+    }:
+        raise ValueError(
+            "OpportunityPublicationChanged v3 publication state is invalid"
+        )
+    opportunities = payload["opportunities"]
+    if not isinstance(opportunities, list) or not 2 <= len(opportunities) <= 8:
+        raise ValueError("OpportunityPublicationChanged v3 batch size is invalid")
+    opportunity_ids: set[str] = set()
+    for opportunity in opportunities:
+        if not isinstance(opportunity, dict) or set(opportunity) != {
+            "opportunity_id",
+            "opportunity_revision_id",
+            "opportunity_type",
+            "accepted_facts",
+            "response_route",
+        }:
+            raise ValueError("OpportunityPublicationChanged v3 item is incomplete")
+        opportunity_id = _required_text(opportunity, "opportunity_id")
+        if (
+            re.fullmatch(
+                rf"opportunity:{re.escape(source_scope)}:open_match:candidate:[0-9a-f]{{16}}",
+                opportunity_id,
+            )
+            is None
+            or opportunity_id in opportunity_ids
+        ):
+            raise ValueError(
+                "OpportunityPublicationChanged v3 item identity is invalid"
+            )
+        opportunity_ids.add(opportunity_id)
+        opportunity_revision_id = _required_text(opportunity, "opportunity_revision_id")
+        if (
+            opportunity_revision_id
+            != f"{opportunity_id}:revision:{envelope.subject_revision}"
+        ):
+            raise ValueError("OpportunityPublicationChanged v3 revision is invalid")
+        if opportunity["opportunity_type"] != "open_match":
+            raise ValueError("OpportunityPublicationChanged v3 type is invalid")
+        accepted_facts = opportunity["accepted_facts"]
+        if not isinstance(accepted_facts, dict):
+            raise TypeError("OpportunityPublicationChanged v3 facts must be an object")
+        _validate_open_match_accepted_facts(accepted_facts)
+        route = opportunity["response_route"]
+        if not isinstance(route, dict) or set(route) != {"kind", "value"}:
+            raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
+        _validate_publication_response_route(route)
+    _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
+    if envelope.idempotency_key != (
+        f"opportunity-publication-batch:{source_revision_id}:"
+        f"revision:{envelope.subject_revision}"
+    ):
+        raise ValueError(
+            "OpportunityPublicationChanged v3 idempotency key is not canonical"
+        )
+
+
+def _validate_publication_response_route(route: dict[str, JsonValue]) -> None:
+    """Validate one response route shared by publication wire versions."""
+    route_kind = route.get("kind")
+    route_value = route.get("value")
+    valid_route = (
+        isinstance(route_value, str)
+        and bool(route_value)
+        and (
+            (
+                route_kind == "explicit_telegram_username"
+                and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
+            )
+            or (
+                route_kind == "explicit_phone"
+                and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value) is not None
+                and 7 <= sum(character.isdigit() for character in route_value) <= 15
+            )
+            or (route_kind == "explicit_url" and _is_safe_http_route(route_value))
+            or (
+                route_kind in {"direct_message", "reply_thread", "source_message"}
+                and _is_safe_telegram_route(route_value)
+            )
+        )
+    )
+    if not valid_route:
+        raise ValueError("response_route is invalid")
 
 
 def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:

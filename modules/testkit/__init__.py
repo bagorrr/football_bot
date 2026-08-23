@@ -36,6 +36,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationRoutingOutcome,
     CompletedSearch,
     ConversationStage,
     ConversationState,
@@ -783,23 +784,57 @@ class ControlledModelAdapter:
     """Deterministic model adapter with no provider access."""
 
     _results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    _second_pass_results: dict[str, ClassifierAdapterResult] = field(
+        default_factory=dict
+    )
+    _candidate_proof_results: dict[tuple[str, str], ClassifierAdapterResult] = field(
+        default_factory=dict
+    )
     _proof_results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
     requests: list[ClassifierRequest] = field(default_factory=list)
+    second_pass_requests: list[ClassifierRequest] = field(default_factory=list)
     proof_requests: list[ClassifierRequest] = field(default_factory=list)
+    primary_schema_version: str = "source-message-classification-v1"
 
     def return_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
         """Configure one deterministic structured classifier response."""
         self._results[body] = result
 
-    def return_proof_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
+    def return_proof_for(
+        self,
+        *,
+        body: str,
+        result: ClassifierAdapterResult,
+        candidate_key: str | None = None,
+    ) -> None:
         """Configure one deterministic semantic-proof response."""
-        self._proof_results[body] = result
+        if candidate_key is None:
+            self._proof_results[body] = result
+        else:
+            self._candidate_proof_results[(body, candidate_key)] = result
+
+    def return_second_pass_for(
+        self, *, body: str, result: ClassifierAdapterResult
+    ) -> None:
+        """Configure one deterministic bounded ambiguity-pass response."""
+        self._second_pass_results[body] = result
+
+    def enable_primary_v2(self) -> None:
+        """Opt the controlled model boundary into the additive v2 output."""
+        self.primary_schema_version = "source-message-classification-v2"
 
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return only configured offline output and retain policy provenance."""
         self.requests.append(request)
+        if request.pass_kind == "ambiguity_second_pass":
+            self.second_pass_requests.append(request)
+        configured_results = (
+            self._second_pass_results
+            if request.pass_kind == "ambiguity_second_pass"
+            else self._results
+        )
         try:
-            result = self._results[request.body]
+            result = configured_results[request.body]
         except KeyError as error:
             raise RuntimeError(
                 "controlled classifier result is not configured"
@@ -816,7 +851,12 @@ class ControlledModelAdapter:
         """Return a controlled proof pass without changing primary request counts."""
         self.proof_requests.append(request)
         try:
-            result = self._proof_results[request.body]
+            result = (
+                self._candidate_proof_results.get(
+                    (request.body, request.proof_candidate_key or "")
+                )
+                or self._proof_results[request.body]
+            )
         except KeyError:
             try:
                 primary = self._results[request.body]
@@ -850,34 +890,41 @@ def _ensure_test_proposition_evidence(
     if enriched.get("disposition") != "accepted":
         return enriched
     candidates = enriched.get("candidates")
-    if not isinstance(candidates, list) or len(candidates) != 1:
+    if not isinstance(candidates, list):
         return enriched
-    candidate = candidates[0]
-    if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
-        return enriched
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
+            continue
+        _add_test_proposition_evidence(candidate, body=body)
+    return enriched
+
+
+def _add_test_proposition_evidence(
+    candidate: dict[str, JsonValue], *, body: str
+) -> None:
     candidate_key = candidate.get("candidate_key")
     evidence = candidate.get("evidence")
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
-        return enriched
+        return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
-        return enriched
+        return
     if not isinstance(routes, list):
-        return enriched
+        return
     route_values: list[tuple[str, str, str]] = []
     for route in routes:
         if not isinstance(route, dict):
-            return enriched
+            return
         kind = route.get("kind")
         value = route.get("value")
         route_evidence = route.get("evidence")
         if not all(isinstance(item, str) for item in (kind, value, route_evidence)):
-            return enriched
+            return
         assert isinstance(kind, str)
         assert isinstance(value, str)
         assert isinstance(route_evidence, str)
         if route_evidence not in body:
-            return enriched
+            return
         route_values.append((kind, value, route_evidence))
 
     def span(text: str) -> dict[str, JsonValue]:
@@ -945,7 +992,6 @@ def _ensure_test_proposition_evidence(
         ],
         "relations": relations,
     }
-    return enriched
 
 
 def _build_test_semantic_proof(
@@ -1880,6 +1926,12 @@ class AcceptanceSpine:
     def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
         """Observe durable primary-classifier provenance."""
         return self._observer.classification_attempts()
+
+    def classification_routing_outcomes(
+        self,
+    ) -> tuple[ClassificationRoutingOutcome, ...]:
+        """Observe body-free Application classifier routing state."""
+        return self._observer.classification_routing_outcomes()
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""

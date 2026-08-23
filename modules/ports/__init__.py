@@ -23,6 +23,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationRoutingOutcome,
     CompletedSearch,
     CompletedSearchView,
     ConversationState,
@@ -218,6 +219,9 @@ class ClassifierRequest:
     glossary_version: str
     context_policy_version: str
     routing_policy_version: str
+    pass_kind: str = "primary"
+    adjacent_context: tuple[dict[str, JsonValue], ...] = ()
+    proof_candidate_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,8 +806,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         result: ClassifierAdapterResult,
         outgoing: ContractEnvelope | None,
         received_at: datetime,
+        additional_attempts: tuple[
+            tuple[ClassificationAttempt, ClassifierAdapterResult], ...
+        ] = (),
     ) -> ConsumeResult:
         """Atomically retain provenance and publish only a valid proposal."""
+        ...
+
+    def record_classification_routing_outcome(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        outcome: ClassificationRoutingOutcome,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Atomically retain one body-free Application routing outcome."""
         ...
 
     def publish_opportunity(
@@ -813,8 +830,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         opportunity: dict[str, JsonValue],
         outgoing: ContractEnvelope,
         received_at: datetime,
+        routing_outcome: ClassificationRoutingOutcome | None = None,
     ) -> ConsumeResult:
         """Atomically accept Application facts and publish one state change."""
+        ...
+
+    def publish_opportunities(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunities: tuple[dict[str, JsonValue], ...],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+        routing_outcome: ClassificationRoutingOutcome | None = None,
+    ) -> ConsumeResult:
+        """Atomically accept a compound candidate batch and publish one state change."""
         ...
 
     def project_opportunity(
@@ -1021,6 +1051,12 @@ class AcceptanceObserver(Protocol):
 
     def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
         """Observe durable classifier execution provenance."""
+        ...
+
+    def classification_routing_outcomes(
+        self,
+    ) -> tuple[ClassificationRoutingOutcome, ...]:
+        """Observe body-free classifier routing state."""
         ...
 
     def opportunities(self) -> tuple[Opportunity, ...]:

@@ -27,6 +27,7 @@ _REQUIRED_CANDIDATE_FIELDS = {
     "open_places",
     "response_routes",
 }
+_REQUIRED_V2_CANDIDATE_FIELDS = _REQUIRED_CANDIDATE_FIELDS | {"source_context"}
 _OPTIONAL_CANDIDATE_FIELDS = {
     "team_formats",
     "positions",
@@ -36,6 +37,7 @@ _OPTIONAL_CANDIDATE_FIELDS = {
     "payment",
 }
 _STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence"}
+_V2_STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence", "source_context"}
 _CANONICAL_LISTS = {
     "team_formats": {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
     "positions": {"goalkeeper", "defender", "midfielder", "forward"},
@@ -81,6 +83,8 @@ def classifier_output_is_schema_valid(
     output: dict[str, JsonValue], *, body: str
 ) -> bool:
     """Validate strict structure and exact evidence before normalization."""
+    if output.get("schema_version") == "source-message-classification-v2":
+        return _classifier_output_v2_is_schema_valid(output, body=body)
     if (
         set(output) != {"schema_version", "disposition", "candidates"}
         or output.get("schema_version") != "source-message-classification-v1"
@@ -197,6 +201,224 @@ def classifier_output_is_schema_valid(
     if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
         return False
     if not all(_valid_response_route(route, body=body) for route in routes):
+        return False
+    proposition_evidence = candidate.get("proposition_evidence")
+    return proposition_evidence is None or proposition_evidence_is_schema_valid(
+        proposition_evidence,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    )
+
+
+def _classifier_output_v2_is_schema_valid(
+    output: dict[str, JsonValue], *, body: str
+) -> bool:
+    """Validate the additive multi-candidate and alternatives contract."""
+    if set(output) != {"schema_version", "disposition", "candidates", "routing"}:
+        return False
+    disposition = output.get("disposition")
+    candidates = output.get("candidates")
+    routing = output.get("routing")
+    if disposition not in _DISPOSITIONS or not isinstance(candidates, list):
+        return False
+    if not isinstance(routing, dict) or set(routing) != {
+        "reason_code",
+        "required_context",
+    }:
+        return False
+    reason_code = routing.get("reason_code")
+    required_context = routing.get("required_context")
+    if reason_code not in {
+        "accepted",
+        "compound_propositions",
+        "deterministic_ambiguity",
+        "competing_interpretations",
+        "irrelevant",
+        "needs_review",
+        "prompt_injection",
+    } or required_context not in {
+        "none",
+        "refined_prompt",
+        "direct_reply",
+        "adjacent_revisions",
+    }:
+        return False
+    if len(candidates) > 8:
+        return False
+    if disposition == "accepted":
+        if not 1 <= len(candidates) <= 8:
+            return False
+        if reason_code not in {"accepted", "compound_propositions"}:
+            return False
+        return all(
+            isinstance(candidate, dict)
+            and _accepted_candidate_is_schema_valid(candidate, body=body)
+            for candidate in candidates
+        )
+    if disposition == "unresolved":
+        if reason_code != "competing_interpretations" or len(candidates) != 1:
+            return False
+        candidate = candidates[0]
+        if not isinstance(candidate, dict) or set(candidate) != {
+            "candidate_key",
+            "opportunity_type",
+            "evidence",
+            "alternatives",
+        }:
+            return False
+        if (
+            candidate.get("opportunity_type") != "open_match"
+            or not isinstance(candidate.get("candidate_key"), str)
+            or not candidate["candidate_key"]
+            or not _source_bound_text_map(candidate.get("evidence"), body)
+        ):
+            return False
+        alternatives = candidate.get("alternatives")
+        if not isinstance(alternatives, list) or not 2 <= len(alternatives) <= 8:
+            return False
+        keys: set[str] = set()
+        for alternative in alternatives:
+            if not isinstance(alternative, dict) or set(alternative) != {
+                "alternative_key",
+                "evidence",
+            }:
+                return False
+            key = alternative.get("alternative_key")
+            if not isinstance(key, str) or not key or key in keys:
+                return False
+            keys.add(key)
+            if not _source_bound_text_map(alternative.get("evidence"), body):
+                return False
+        return True
+    if candidates:
+        return False
+    expected_reason = {
+        "needs_second_pass": "deterministic_ambiguity",
+        "needs_review": {"needs_review", "prompt_injection"},
+        "irrelevant": "irrelevant",
+    }.get(disposition)
+    if isinstance(expected_reason, set):
+        return reason_code in expected_reason
+    return reason_code == expected_reason
+
+
+def _source_bound_text_map(value: JsonValue, body: str) -> bool:
+    """Require bounded evidence maps to contain only exact source substrings."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and len(value) <= 8
+        and all(isinstance(key, str) and key for key in value)
+        and all(
+            isinstance(text, str) and bool(text) and text in body
+            for text in value.values()
+        )
+    )
+
+
+def _accepted_candidate_is_schema_valid(
+    candidate: dict[str, JsonValue], *, body: str
+) -> bool:
+    """Validate one v2 accepted candidate using the v1 fact contract."""
+    if (
+        not _REQUIRED_V2_CANDIDATE_FIELDS.issubset(candidate)
+        or set(candidate)
+        - _REQUIRED_CANDIDATE_FIELDS
+        - _OPTIONAL_CANDIDATE_FIELDS
+        - _V2_STRUCTURED_CANDIDATE_FIELDS
+        or candidate.get("opportunity_type") != "open_match"
+        or not isinstance(candidate.get("candidate_key"), str)
+        or not candidate["candidate_key"]
+    ):
+        return False
+    candidate_key = candidate["candidate_key"]
+    assert isinstance(candidate_key, str)
+    evidence = candidate.get("evidence")
+    expected_evidence = {
+        "opportunity",
+        "event_time",
+        "location",
+        "open_places",
+    } | (set(candidate) & _OPTIONAL_CANDIDATE_FIELDS)
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != expected_evidence
+        or not all(
+            isinstance(value, str) and bool(value) and value in body
+            for value in evidence.values()
+        )
+    ):
+        return False
+    location = candidate.get("location")
+    event_time = candidate.get("event_time")
+    open_places = candidate.get("open_places")
+    routes = candidate.get("response_routes")
+    if (
+        not isinstance(location, dict)
+        or set(location) != {"mention", "place_id", "country_id", "city_id"}
+        or not all(isinstance(value, str) and value for value in location.values())
+        or not isinstance(event_time, dict)
+        or set(event_time)
+        not in (
+            {"start_local_date", "end_local_date", "iana_timezone"},
+            {"start_local_date", "end_local_date", "exact_local_time", "iana_timezone"},
+            {"start_local_date", "end_local_date", "day_part", "iana_timezone"},
+        )
+        or (
+            open_places is not None
+            and (
+                not isinstance(open_places, int)
+                or isinstance(open_places, bool)
+                or open_places < 1
+            )
+        )
+        or not isinstance(routes, list)
+        or len(routes) > 8
+    ):
+        return False
+    try:
+        start = date.fromisoformat(str(event_time["start_local_date"]))
+        end = date.fromisoformat(str(event_time["end_local_date"]))
+    except (KeyError, ValueError):
+        return False
+    exact_time = event_time.get("exact_local_time")
+    day_part = event_time.get("day_part")
+    if (
+        start > end
+        or not isinstance(event_time.get("iana_timezone"), str)
+        or not event_time["iana_timezone"]
+        or (
+            exact_time is not None
+            and (
+                not isinstance(exact_time, str)
+                or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
+            )
+        )
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
+    ):
+        return False
+    for field_name, allowed in _CANONICAL_LISTS.items():
+        values = candidate.get(field_name)
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(item for item in values if isinstance(item, str)))
+            or not all(isinstance(item, str) and item in allowed for item in values)
+        ):
+            return False
+    if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
+        return False
+    if not all(_valid_response_route(route, body=body) for route in routes):
+        return False
+    source_context = candidate.get("source_context")
+    if (
+        not isinstance(source_context, str)
+        or not source_context
+        or source_context not in body
+    ):
         return False
     proposition_evidence = candidate.get("proposition_evidence")
     return proposition_evidence is None or proposition_evidence_is_schema_valid(
