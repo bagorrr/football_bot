@@ -1708,10 +1708,10 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         "status",
     }
     candidate_bound_fields = fields | {"candidate_target_manifest_hash"}
-    if not isinstance(value, dict) or set(value) not in {
+    if not isinstance(value, dict) or set(value) not in (
         fields,
         candidate_bound_fields,
-    }:
+    ):
         raise ValueError("semantic-proof execution metadata is incomplete")
     for field_name in (
         "requested_model",
