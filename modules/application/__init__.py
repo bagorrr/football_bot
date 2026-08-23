@@ -7349,6 +7349,32 @@ class RuntimeApplication:
                         incoming=incoming
                     )
                     return True
+                if (
+                    self.role is RuntimeRole.APPLICATION
+                    and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
+                    and incoming.contract_version == 4
+                ):
+                    invalid_payload = (
+                        incoming.payload if isinstance(incoming.payload, dict) else {}
+                    )
+                    raw_revision_id = invalid_payload.get("source_message_revision_id")
+                    invalid_revision_id = (
+                        raw_revision_id
+                        if isinstance(raw_revision_id, str) and raw_revision_id
+                        else f"invalid:{incoming.message_id}"
+                    )
+                    self.store.record_classification_routing_outcome(
+                        incoming=cast(ContractEnvelope, incoming),
+                        outcome=_classification_routing_outcome(
+                            invalid_payload,
+                            source_message_revision_id=invalid_revision_id,
+                            reason_code="provenance_invalid",
+                            recorded_at=self.clock.now(),
+                            pass_number=_classification_pass_number(invalid_payload),
+                        ),
+                        received_at=self.clock.now(),
+                    )
+                    return True
                 outgoing = None
                 if self.role is RuntimeRole.APPLICATION:
                     if (
@@ -8050,12 +8076,57 @@ class RuntimeApplication:
                 ).encode("utf-8")
             ).hexdigest()
 
-        primary_result = self.model.classify(request)
-        primary_valid = (
-            _classifier_adapter_result_has_complete_provenance(primary_result)
-            and classifier_output_is_schema_valid(primary_result.output, body=body)
-            and primary_result.output.get("schema_version")
-            == "source-message-classification-v2"
+        def primary_result_is_valid(result: ClassifierAdapterResult) -> bool:
+            return (
+                _classifier_adapter_result_has_complete_provenance(result)
+                and classifier_output_is_schema_valid(result.output, body=body)
+                and result.output.get("schema_version")
+                == "source-message-classification-v2"
+            )
+
+        primary_results = [self.model.classify(request)]
+        while len(primary_results) < 3 and not primary_result_is_valid(
+            primary_results[-1]
+        ):
+            primary_results.append(self.model.classify(request))
+        primary_result = primary_results[-1]
+        primary_valid = primary_result_is_valid(primary_result)
+        primary_attempts = tuple(
+            ClassificationAttempt(
+                attempt_id=(
+                    f"classification-attempt:{revision_id}"
+                    if attempt_number == 1
+                    else f"classification-attempt:{revision_id}:retry:{attempt_number}"
+                ),
+                source_message_revision_id=revision_id,
+                requested_model=request.requested_model,
+                effective_model=result.effective_model,
+                requested_reasoning_effort=request.requested_reasoning_effort,
+                effective_reasoning_effort=result.effective_reasoning_effort,
+                prompt_version=request.prompt_version,
+                schema_version=request.schema_version,
+                glossary_version=request.glossary_version,
+                context_policy_version=request.context_policy_version,
+                routing_policy_version=request.routing_policy_version,
+                codex_version=result.codex_version,
+                adapter_kind=result.adapter_kind,
+                adapter_version=result.adapter_version,
+                pass_number=1,
+                pass_kind="primary",
+                attempt_number=attempt_number,
+                input_manifest_hash=manifest_for(
+                    request, pass_number=1, attempt_number=attempt_number
+                ),
+                evidence_references=_classification_evidence_references(result.output),
+                duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
+                input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
+                output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
+                disposition=_classification_disposition_or_review(
+                    result.output.get("disposition")
+                ),
+                status="succeeded" if primary_result_is_valid(result) else "failed",
+            )
+            for attempt_number, result in enumerate(primary_results, start=1)
         )
         final_request = request
         final_result = primary_result
@@ -8064,7 +8135,20 @@ class RuntimeApplication:
         ambiguity_execution: dict[str, JsonValue] | None = None
         additional_attempts: list[
             tuple[ClassificationAttempt, ClassifierAdapterResult]
-        ] = []
+        ] = [
+            (
+                attempt,
+                replace(
+                    result,
+                    duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
+                    input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
+                    output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
+                ),
+            )
+            for attempt, result in zip(
+                primary_attempts[1:], primary_results[1:], strict=True
+            )
+        ]
         primary_disposition = primary_result.output.get("disposition")
         routing = primary_result.output.get("routing")
         required_context = (
@@ -8188,7 +8272,26 @@ class RuntimeApplication:
                 )
             )
         if not primary_valid:
-            final_output = _safe_v2_review_output()
+            self.store.record_classification_attempt(
+                incoming=incoming,
+                attempt=primary_attempts[0],
+                result=replace(
+                    primary_results[0],
+                    duration_ms=_nonnegative_metric_or_zero(
+                        primary_results[0].duration_ms
+                    ),
+                    input_tokens=_nonnegative_metric_or_zero(
+                        primary_results[0].input_tokens
+                    ),
+                    output_tokens=_nonnegative_metric_or_zero(
+                        primary_results[0].output_tokens
+                    ),
+                ),
+                outgoing=None,
+                received_at=self.clock.now(),
+                additional_attempts=tuple(additional_attempts),
+            )
+            return
 
         semantic_proofs: list[JsonValue] = []
         semantic_proof_executions: list[JsonValue] = []
@@ -8268,36 +8371,7 @@ class RuntimeApplication:
         }:
             final_output = _safe_v2_review_output()
             final_disposition = "needs_review"
-        primary_attempt = ClassificationAttempt(
-            attempt_id=f"classification-attempt:{revision_id}",
-            source_message_revision_id=revision_id,
-            requested_model=request.requested_model,
-            effective_model=primary_result.effective_model,
-            requested_reasoning_effort=request.requested_reasoning_effort,
-            effective_reasoning_effort=primary_result.effective_reasoning_effort,
-            prompt_version=request.prompt_version,
-            schema_version=request.schema_version,
-            glossary_version=request.glossary_version,
-            context_policy_version=request.context_policy_version,
-            routing_policy_version=request.routing_policy_version,
-            codex_version=primary_result.codex_version,
-            adapter_kind=primary_result.adapter_kind,
-            adapter_version=primary_result.adapter_version,
-            pass_number=1,
-            pass_kind="primary",
-            attempt_number=1,
-            input_manifest_hash=manifest_for(request, pass_number=1, attempt_number=1),
-            evidence_references=_classification_evidence_references(
-                primary_result.output
-            ),
-            duration_ms=_nonnegative_metric_or_zero(primary_result.duration_ms),
-            input_tokens=_nonnegative_metric_or_zero(primary_result.input_tokens),
-            output_tokens=_nonnegative_metric_or_zero(primary_result.output_tokens),
-            disposition=_classification_disposition_or_review(
-                primary_result.output.get("disposition")
-            ),
-            status="succeeded" if primary_valid else "failed",
-        )
+        primary_attempt = primary_attempts[0]
         final_metrics = replace(
             final_result,
             duration_ms=_nonnegative_metric_or_zero(final_result.duration_ms),
@@ -8558,6 +8632,25 @@ class RuntimeApplication:
                     received_at=self.clock.now(),
                 )
                 return
+            if not _v4_classifier_provenance_is_current(
+                authoritative_payload,
+                revision_id=revision_id,
+                body=source_revision.body,
+            ):
+                self.store.record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                        pass_number=(
+                            v4_pass_number if isinstance(v4_pass_number, int) else 1
+                        ),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
             if len(v4_candidates) != 1:
                 accepted_opportunities: list[dict[str, JsonValue]] = []
                 publication_items: list[dict[str, JsonValue]] = []
@@ -8631,7 +8724,7 @@ class RuntimeApplication:
                         )
                         return
                     opportunity_id = _v4_candidate_opportunity_id(
-                        revision_id, candidate_key
+                        revision_id, accepted_candidate
                     )
                     opportunity_revision_id = (
                         f"{opportunity_id}:revision:{incoming.subject_revision}"
@@ -9884,6 +9977,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "classifier-context-v1",
         "routing_policy_version": "classifier-routing-v1",
+        "context_bundle_version": "primary-classifier-context-v1",
     }
     manifest = {
         "source_message_revision_id": _opaque_classifier_reference(
@@ -9939,6 +10033,271 @@ def _v2_classifier_proposal_has_pinned_provenance(
         )
         and payload.get("classification_status") == "succeeded"
     )
+
+
+def _classifier_input_manifest_hash(
+    payload: dict[str, JsonValue],
+    *,
+    revision_id: str,
+    body: str,
+    prompt_version: str,
+    schema_version: str,
+    context_bundle_version: str,
+    context_policy_version: str,
+    routing_policy_version: str,
+    pass_kind: str,
+    pass_number: int,
+    attempt_number: int,
+) -> str | None:
+    """Recompute one classifier execution manifest from current Application facts."""
+    source_chat_reference = payload.get("source_chat_reference")
+    metadata = payload.get("bounded_metadata")
+    reply_context = payload.get("eligible_reply_context")
+    if not isinstance(source_chat_reference, str) or not isinstance(metadata, dict):
+        return None
+    if reply_context is not None and not isinstance(reply_context, dict):
+        return None
+    try:
+        manifest = {
+            "source_message_revision_id": _opaque_classifier_reference(
+                revision_id, kind="revision"
+            ),
+            "body": body,
+            "source_event_time": payload.get("source_event_time"),
+            "context_bundle_version": context_bundle_version,
+            "source_chat_reference": _opaque_classifier_reference(
+                source_chat_reference, kind="source-chat"
+            ),
+            "source_chat_timezone": payload.get("source_chat_timezone"),
+            "source_chat_geography": payload.get("source_chat_geography"),
+            "bounded_metadata": _classifier_bounded_metadata(metadata),
+            "eligible_reply_context": _classifier_reply_context(reply_context),
+            "adjacent_context": [],
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "prompt_version": prompt_version,
+            "schema_version": schema_version,
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": context_policy_version,
+            "routing_policy_version": routing_policy_version,
+            "pass_kind": pass_kind,
+            "pass_number": pass_number,
+            "attempt_number": attempt_number,
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    return sha256(
+        json.dumps(
+            manifest,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _classifier_execution_metadata_is_current(
+    metadata: JsonValue,
+    *,
+    payload: dict[str, JsonValue],
+    revision_id: str,
+    body: str,
+    prompt_version: str,
+    schema_version: str,
+    context_bundle_version: str,
+    context_policy_version: str,
+    routing_policy_version: str,
+    pass_kind: str,
+    pass_number: int,
+    attempt_number: int,
+) -> bool:
+    """Check one execution wrapper against the current bounded classifier input."""
+    if not isinstance(metadata, dict):
+        return False
+    required_fields = {
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "context_bundle_version",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "pass_number",
+        "attempt_number",
+        "input_manifest_hash",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+        "status",
+    }
+    if set(metadata) != required_fields:
+        return False
+    expected_text = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": prompt_version,
+        "schema_version": schema_version,
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": context_policy_version,
+        "routing_policy_version": routing_policy_version,
+        "context_bundle_version": context_bundle_version,
+        "pass_number": pass_number,
+        "attempt_number": attempt_number,
+        "status": "succeeded",
+    }
+    if any(metadata.get(key) != value for key, value in expected_text.items()):
+        return False
+    if any(
+        not isinstance(metadata.get(key), str) or not str(metadata[key]).strip()
+        for key in (
+            "codex_version",
+            "adapter_kind",
+            "adapter_version",
+            "input_manifest_hash",
+        )
+    ):
+        return False
+    for key in ("duration_ms", "input_tokens", "output_tokens"):
+        metric = metadata.get(key)
+        if not isinstance(metric, int) or isinstance(metric, bool) or metric < 0:
+            return False
+    expected_manifest_hash = _classifier_input_manifest_hash(
+        payload,
+        revision_id=revision_id,
+        body=body,
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        context_bundle_version=context_bundle_version,
+        context_policy_version=context_policy_version,
+        routing_policy_version=routing_policy_version,
+        pass_kind=pass_kind,
+        pass_number=pass_number,
+        attempt_number=attempt_number,
+    )
+    return expected_manifest_hash is not None and (
+        metadata["input_manifest_hash"] == expected_manifest_hash
+    )
+
+
+def _v4_classifier_provenance_is_current(
+    payload: dict[str, JsonValue], *, revision_id: str, body: str
+) -> bool:
+    """Require current ambiguity and distinct proof execution per candidate."""
+    output = payload.get("output")
+    if (
+        not isinstance(output, dict)
+        or output.get("disposition") != "accepted"
+        or not _v2_classifier_proposal_has_pinned_provenance(
+            payload,
+            revision_id=revision_id,
+            body=body,
+        )
+    ):
+        return False
+    pass_number = payload.get("pass_number")
+    if pass_number not in {1, 2}:
+        return False
+    ambiguity_execution = payload.get("ambiguity_pass_execution")
+    if pass_number == 2:
+        if not _classifier_execution_metadata_is_current(
+            ambiguity_execution,
+            payload=payload,
+            revision_id=revision_id,
+            body=body,
+            prompt_version="open-match-ambiguity-v1",
+            schema_version="source-message-classification-v2",
+            context_bundle_version="primary-classifier-context-v1",
+            context_policy_version="classifier-context-v1",
+            routing_policy_version="classifier-routing-v1",
+            pass_kind="ambiguity_second_pass",
+            pass_number=2,
+            attempt_number=1,
+        ):
+            return False
+    elif ambiguity_execution is not None:
+        return False
+
+    candidates = output.get("candidates")
+    raw_proofs = payload.get("semantic_proofs")
+    raw_executions = payload.get("semantic_proof_executions")
+    if (
+        not isinstance(candidates, list)
+        or not isinstance(raw_proofs, list)
+        or not isinstance(raw_executions, list)
+        or not 1 <= len(candidates) <= 8
+        or len(raw_proofs) != len(candidates)
+        or len(raw_executions) != len(candidates)
+    ):
+        return False
+    candidate_by_key: dict[str, dict[str, JsonValue]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            return False
+        candidate_key = candidate.get("candidate_key")
+        if not isinstance(candidate_key, str) or not candidate_key:
+            return False
+        if candidate_key in candidate_by_key:
+            return False
+        candidate_by_key[candidate_key] = candidate
+
+    proof_by_key: dict[str, dict[str, JsonValue]] = {}
+    for wrapper in raw_proofs:
+        if not isinstance(wrapper, dict) or set(wrapper) != {"candidate_key", "proof"}:
+            return False
+        candidate_key = wrapper.get("candidate_key")
+        proof = wrapper.get("proof")
+        if (
+            not isinstance(candidate_key, str)
+            or candidate_key in proof_by_key
+            or candidate_key not in candidate_by_key
+            or not isinstance(proof, dict)
+            or proof.get("candidate_key") != candidate_key
+            or proof.get("source_message_revision_reference")
+            != _opaque_classifier_reference(revision_id, kind="revision")
+        ):
+            return False
+        proof_by_key[candidate_key] = proof
+
+    proof_pass_number = 3 if pass_number == 2 else 2
+    execution_keys: set[str] = set()
+    for wrapper in raw_executions:
+        if not isinstance(wrapper, dict) or set(wrapper) != {
+            "candidate_key",
+            "execution",
+        }:
+            return False
+        candidate_key = wrapper.get("candidate_key")
+        if (
+            not isinstance(candidate_key, str)
+            or candidate_key in execution_keys
+            or candidate_key not in candidate_by_key
+            or candidate_key not in proof_by_key
+            or not _classifier_execution_metadata_is_current(
+                wrapper.get("execution"),
+                payload=payload,
+                revision_id=revision_id,
+                body=body,
+                prompt_version="open-match-semantic-proof-v1",
+                schema_version="source-semantic-proof-v1",
+                context_bundle_version="semantic-proof-context-v1",
+                context_policy_version="semantic-proof-context-v1",
+                routing_policy_version="classifier-routing-v1",
+                pass_kind="semantic_proof",
+                pass_number=proof_pass_number,
+                attempt_number=1,
+            )
+        ):
+            return False
+        execution_keys.add(candidate_key)
+    return execution_keys == set(candidate_by_key) == set(proof_by_key)
 
 
 def _resolve_source_location_across_supported_locales(
@@ -10290,11 +10649,45 @@ def _single_v4_candidate_payload(
     }
 
 
-def _v4_candidate_opportunity_id(revision_id: str, candidate_key: str) -> str:
-    """Derive a stable, body-free Opportunity identity for one candidate."""
+def _v4_candidate_opportunity_id(
+    revision_id: str, accepted_candidate: dict[str, JsonValue]
+) -> str:
+    """Derive a compound Opportunity identity from Application-owned facts."""
     source_scope = revision_id.rsplit(":revision:", 1)[0]
-    candidate_digest = sha256(candidate_key.encode("utf-8")).hexdigest()[:16]
-    return f"opportunity:{source_scope}:open_match:candidate:{candidate_digest}"
+    accepted_facts = accepted_candidate.get("accepted_facts")
+    if not isinstance(accepted_facts, dict):
+        raise ValueError("accepted Opportunity facts are required for identity")
+    identity_facts = {
+        key: accepted_facts[key]
+        for key in (
+            "start_local_date",
+            "end_local_date",
+            "exact_local_time",
+            "day_part",
+            "iana_timezone",
+            "country_id",
+            "city_id",
+            "place_id",
+            "open_places",
+            "team_formats",
+            "positions",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+            "payment_amount",
+            "payment_currency",
+        )
+    }
+    proposition_digest = sha256(
+        json.dumps(
+            identity_facts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+    return f"opportunity:{source_scope}:open_match:proposition:{proposition_digest}"
 
 
 def _semantic_proof_execution_metadata(

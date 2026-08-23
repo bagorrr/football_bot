@@ -3624,7 +3624,8 @@ class PostgresRoleStore:
                     accepted_at
                 ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
                 ON CONFLICT (opportunity_id) DO UPDATE
-                SET source_message_revision_id = EXCLUDED.source_message_revision_id,
+                SET opportunity_revision_id = EXCLUDED.opportunity_revision_id,
+                    source_message_revision_id = EXCLUDED.source_message_revision_id,
                     publication_state = EXCLUDED.publication_state,
                     accepted_facts = EXCLUDED.accepted_facts,
                     evidence = EXCLUDED.evidence,
@@ -3699,7 +3700,8 @@ class PostgresRoleStore:
                         accepted_at
                     ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
                     ON CONFLICT (opportunity_id) DO UPDATE
-                    SET source_message_revision_id =
+                    SET opportunity_revision_id = EXCLUDED.opportunity_revision_id,
+                        source_message_revision_id =
                             EXCLUDED.source_message_revision_id,
                         publication_state = EXCLUDED.publication_state,
                         accepted_facts = EXCLUDED.accepted_facts,

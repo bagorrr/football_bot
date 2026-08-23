@@ -1499,6 +1499,18 @@ def _validate_classification_proposal_v4(
     ):
         raise ValueError("ClassificationProposal v4 proof provenance is incomplete")
     ambiguity_execution = payload["ambiguity_pass_execution"]
+    if (
+        output.get("disposition") == "accepted"
+        and payload["pass_number"] == 2
+        and ambiguity_execution is None
+    ):
+        raise ValueError("accepted v4 pass 2 requires ambiguity-pass provenance")
+    if (
+        output.get("disposition") == "accepted"
+        and payload["pass_number"] == 1
+        and ambiguity_execution is not None
+    ):
+        raise ValueError("v4 pass 1 cannot carry ambiguity-pass provenance")
     if ambiguity_execution is not None:
         _validate_ambiguity_pass_execution(ambiguity_execution)
 
@@ -1775,7 +1787,7 @@ def _validate_opportunity_publication_batch_changed(
         opportunity_id = _required_text(opportunity, "opportunity_id")
         if (
             re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:open_match:candidate:[0-9a-f]{{16}}",
+                rf"opportunity:{re.escape(source_scope)}:open_match:(?:candidate|proposition):[0-9a-f]{{16}}",
                 opportunity_id,
             )
             is None

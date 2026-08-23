@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import cast
 
-from modules.contracts import JsonValue, RuntimeRole
+from modules.contracts import ContractName, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
     GeographicType,
@@ -104,6 +105,94 @@ def test_irrelevant_classifier_outcome_is_durable_and_unpublished() -> None:
 
     system.process_opportunities_until_idle()
     assert system.classification_routing_outcomes() == outcomes
+
+
+def test_schema_invalid_primary_retries_then_records_failed_without_proposal() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_116
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_106,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4906",
+    )
+    body = "Malformed classifier output must never become a review proposal."
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v2",
+                "disposition": "accepted",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "accepted",
+                    "required_context": "none",
+                },
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="classifier-recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        source_event_id="source-event:classification-routing:schema-invalid",
+        telegram_message_id=49008,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    revision_id = "source-chat:channel:4900106:generation:1:message:49008:revision:1"
+    attempts = system.classification_attempts()
+    assert len(classifier.requests) == 3
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3]
+    assert [attempt.status for attempt in attempts] == ["failed", "failed", "failed"]
+    assert [attempt.source_message_revision_id for attempt in attempts] == [
+        revision_id,
+        revision_id,
+        revision_id,
+    ]
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
 
 
 def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() -> None:
@@ -280,6 +369,169 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
     )
     assert len(system.opportunity_publication_contracts(revision_id)) == 1
     assert system.classification_routing_outcomes()[0].disposition == "accepted"
+
+
+def test_v4_missing_ambiguity_provenance_routes_before_publication() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_117
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_107,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4907",
+    )
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                                ("ru", "Санкт-Петербург"),
+                            ),
+                        ),
+                    ),
+                    whole_city=True,
+                ),
+            ),
+        ),
+    )
+    body = "20 August 2026 in whole city. Need one player. Contact @missing_proof."
+    primary: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "needs_second_pass",
+        "candidates": [],
+        "routing": {
+            "reason_code": "deterministic_ambiguity",
+            "required_context": "refined_prompt",
+        },
+    }
+    accepted = _minimal_classifier_result(
+        candidate_key="missing-proof-candidate",
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@missing_proof",
+                "evidence": "@missing_proof",
+            }
+        ],
+        event_time_evidence="20 August 2026",
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    accepted_output = deepcopy(accepted.output)
+    candidates = accepted_output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    candidate_evidence = candidate.get("evidence")
+    assert isinstance(candidate_evidence, dict)
+    candidate["evidence"] = {**candidate_evidence, "location": "whole city"}
+    candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    candidate["source_context"] = body
+    accepted_output["schema_version"] = "source-message-classification-v2"
+    accepted_output["routing"] = {
+        "reason_code": "accepted",
+        "required_context": "none",
+    }
+    second_pass = replace_classifier_output(accepted, accepted_output)
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=ClassifierAdapterResult(
+            output=primary,
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="classifier-recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    classifier.return_second_pass_for(body=body, result=second_pass)
+    classifier.return_proof_for(
+        body=body,
+        result=semantic_proof_result_for(output=accepted_output, body=body),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        location_resolver=resolver,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4908),
+        source_event_id="source-event:classification-routing:missing-ambiguity",
+        telegram_message_id=49009,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    revision_id = "source-chat:channel:4900107:generation:1:message:49009:revision:1"
+    system.invalidate_classifier_context(
+        source_message_revision_id=revision_id,
+        contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+        payload_updates={"ambiguity_pass_execution": None},
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+
+    outcomes = system.classification_routing_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].reason_code == "provenance_invalid"
+    assert body not in repr(outcomes[0])
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
 
 
 def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None:
@@ -484,6 +736,9 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         "@open_match_one",
         "@open_match_two",
     }
+    first_ids = {
+        item.response_route.value: item.opportunity_id for item in opportunities
+    }
     publication_contracts = system.opportunity_publication_contracts(revision_id)
     assert len(publication_contracts) == 1
     publication = publication_contracts[0]
@@ -501,6 +756,76 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     system.process_opportunities_until_idle()
     assert len(system.opportunities()) == 2
     assert len(system.opportunity_publication_contracts(revision_id)) == 1
+
+    reclassified_output = deepcopy(primary_output)
+    reclassified_candidates = reclassified_output.get("candidates")
+    assert isinstance(reclassified_candidates, list)
+    for index, candidate in enumerate(reclassified_candidates, start=1):
+        assert isinstance(candidate, dict)
+        candidate["candidate_key"] = f"reclassified-candidate-{index}"
+    reclassified_result = replace_classifier_output(
+        _minimal_classifier_result(
+            candidate_key="reclassified-candidate-1",
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@open_match_one",
+                    "evidence": "@open_match_one",
+                }
+            ],
+        ),
+        reclassified_output,
+    )
+    classifier.return_for(body=body, result=reclassified_result)
+    for candidate in reclassified_candidates:
+        assert isinstance(candidate, dict)
+        reclassified_key = candidate.get("candidate_key")
+        assert isinstance(reclassified_key, str)
+        reclassified_candidate_output = cast(
+            dict[str, JsonValue],
+            {
+                **reclassified_output,
+                "candidates": [candidate],
+            },
+        )
+        classifier.return_proof_for(
+            body=body,
+            candidate_key=reclassified_key,
+            result=semantic_proof_result_for(
+                output=reclassified_candidate_output,
+                body=body,
+            ),
+        )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4903),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4904),
+        source_event_id="source-event:classification-routing:compound-reclassified",
+        telegram_message_id=49003,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    revised_revision_id = (
+        "source-chat:channel:4900102:generation:1:message:49003:revision:2"
+    )
+    revised_opportunities = system.opportunities()
+    assert {
+        item.response_route.value: item.opportunity_id for item in revised_opportunities
+    } == first_ids
+    assert {item.opportunity_revision_id for item in revised_opportunities} == {
+        f"{opportunity_id}:revision:2" for opportunity_id in first_ids.values()
+    }
+    assert len(system.opportunity_publication_contracts(revised_revision_id)) == 1
 
 
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:
