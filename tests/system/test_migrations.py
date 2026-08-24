@@ -870,13 +870,15 @@ def test_0020_fails_closed_for_ambiguous_and_colliding_legacy_identities(
                 ),
             )
 
-    with pytest.raises(
-        psycopg.errors.ProgrammingError,
-        match="legacy v4 proposition identity mapping is ambiguous",
-    ):
-        PostgresAcceptanceMigrator(fresh_database_url).migrate()
-
+    migration_sql = _migration_paths()[19].read_text(encoding="utf-8")
     with psycopg.connect(fresh_database_url) as connection:
+        connection.execute("SAVEPOINT mixed_identity_failure")
+        with pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping is ambiguous",
+        ):
+            connection.execute(migration_sql)
+        connection.execute("ROLLBACK TO SAVEPOINT mixed_identity_failure")
         connection.execute(
             """
             DELETE FROM football_runtime.application_opportunities
@@ -932,11 +934,13 @@ def test_0020_fails_closed_for_ambiguous_and_colliding_legacy_identities(
             ),
         )
 
-    with pytest.raises(
-        psycopg.errors.ProgrammingError,
-        match="legacy v4 proposition identity mapping collides with lineage",
-    ):
-        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+        connection.execute("SAVEPOINT lineage_collision_failure")
+        with pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping collides with lineage",
+        ):
+            connection.execute(migration_sql)
+        connection.execute("ROLLBACK TO SAVEPOINT lineage_collision_failure")
 
 
 def test_0018_fails_closed_for_mixed_legacy_v4_identity_formats(
