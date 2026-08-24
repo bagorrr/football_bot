@@ -830,11 +830,11 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
     ]
 
 
-def test_0020_fails_closed_for_mixed_legacy_identity_formats(
+def test_0020_fails_closed_for_ambiguous_and_colliding_legacy_identities(
     fresh_database_url: str,
 ) -> None:
     _apply_untracked_repository_migrations(fresh_database_url, applied_count=19)
-    source_message_id = "source-chat:channel:4920000:generation:1:message:2001"
+    mixed_source_message_id = "source-chat:channel:4920000:generation:1:message:2001"
     recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
     with psycopg.connect(fresh_database_url) as connection:
         for identity_marker in (
@@ -842,7 +842,7 @@ def test_0020_fails_closed_for_mixed_legacy_identity_formats(
             "proposition:bbbbbbbbbbbbbbbb",
         ):
             opportunity_id = (
-                f"opportunity:{source_message_id}:open_match:{identity_marker}"
+                f"opportunity:{mixed_source_message_id}:open_match:{identity_marker}"
             )
             connection.execute(
                 """
@@ -860,7 +860,7 @@ def test_0020_fails_closed_for_mixed_legacy_identity_formats(
                 (
                     opportunity_id,
                     f"{opportunity_id}:revision:1",
-                    f"{source_message_id}:revision:1",
+                    f"{mixed_source_message_id}:revision:1",
                     recorded_at,
                 ),
             )
@@ -871,17 +871,25 @@ def test_0020_fails_closed_for_mixed_legacy_identity_formats(
     ):
         PostgresAcceptanceMigrator(fresh_database_url).migrate()
 
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_opportunities
+            WHERE source_message_revision_id = %s
+            """,
+            (f"{mixed_source_message_id}:revision:1",),
+        )
 
-def test_0020_fails_closed_for_existing_canonical_lineage_collision(
-    fresh_database_url: str,
-) -> None:
-    _apply_untracked_repository_migrations(fresh_database_url, applied_count=19)
-    source_message_id = "source-chat:channel:4920001:generation:1:message:2002"
+    collision_source_message_id = (
+        "source-chat:channel:4920001:generation:1:message:2002"
+    )
     legacy_opportunity_id = (
-        f"opportunity:{source_message_id}:open_match:candidate:cccccccccccccccc"
+        f"opportunity:{collision_source_message_id}:open_match:"
+        "candidate:cccccccccccccccc"
     )
     canonical_opportunity_id = (
-        f"opportunity:{source_message_id}:open_match:proposition:cccccccccccccccc"
+        f"opportunity:{collision_source_message_id}:open_match:"
+        "proposition:cccccccccccccccc"
     )
     with psycopg.connect(fresh_database_url) as connection:
         connection.execute(
@@ -900,7 +908,7 @@ def test_0020_fails_closed_for_existing_canonical_lineage_collision(
             (
                 legacy_opportunity_id,
                 f"{legacy_opportunity_id}:revision:1",
-                f"{source_message_id}:revision:1",
+                f"{collision_source_message_id}:revision:1",
                 datetime(2026, 8, 20, 18, 0, tzinfo=UTC),
             ),
         )
@@ -912,7 +920,7 @@ def test_0020_fails_closed_for_existing_canonical_lineage_collision(
             ) VALUES (%s, 1, %s, %s, %s)
             """,
             (
-                source_message_id,
+                collision_source_message_id,
                 canonical_opportunity_id,
                 "canonical-collision",
                 datetime(2026, 8, 20, 18, 0, tzinfo=UTC),
