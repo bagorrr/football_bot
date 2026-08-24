@@ -158,6 +158,7 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
         clock=clock,
         telegram_ingestion=telegram,
         model=classifier,
+        location_resolver=_whole_city_resolver(),
         telegram_admin_user_id=administrator_id,
     )
     system.reset()
@@ -228,6 +229,18 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
         classifier=classifier,
         telegram=telegram,
         clock=clock,
+        source_identity=source_identity,
+    )
+    _exercise_legacy_v1_semantic_proof_retry_cases(
+        system=system,
+        classifier=classifier,
+        telegram=telegram,
+        source_identity=source_identity,
+    )
+    _exercise_v1_semantic_proof_exhaustion(
+        system=system,
+        classifier=classifier,
+        telegram=telegram,
         source_identity=source_identity,
     )
 
@@ -661,27 +674,14 @@ def _exercise_legacy_v1_invalid_primary_execution(
         assert system.opportunity_publication_contracts(revision_id) == ()
 
 
-def test_legacy_v1_semantic_proof_has_own_restartable_budget() -> None:
-    classifier = ControlledModelAdapter()
-    telegram = ControlledTelegramIngestionAdapter()
-    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
-        admin_database_url=os.environ["TEST_DATABASE_URL"],
-        clock=clock,
-        telegram_ingestion=telegram,
-        model=classifier,
-        location_resolver=_whole_city_resolver(),
-        telegram_admin_user_id=49_129,
-    )
-    system.reset()
-    source_identity = _prepare_source_chat_on_existing_spine(
-        system=system,
-        telegram=telegram,
-        clock=clock,
-        telegram_id=4_900_129,
-        checkpoint=4929,
-        administrator_id=49_129,
-    )
+def _exercise_legacy_v1_semantic_proof_retry_cases(
+    *,
+    system: AcceptanceSpine,
+    classifier: ControlledModelAdapter,
+    telegram: ControlledTelegramIngestionAdapter,
+    source_identity: TelegramPeerIdentity,
+) -> None:
+    """Exercise v1 proof retries on the existing invalid-primary spine."""
     for offset, proof_failure in enumerate(("exception", "schema", "provenance")):
         body = (
             f"20 August 2026 in whole city. Need one player. "
@@ -749,8 +749,8 @@ def test_legacy_v1_semantic_proof_has_own_restartable_budget() -> None:
             telegram=telegram,
             source_identity=source_identity,
             body=body,
-            telegram_message_id=4_900_129 + offset,
-            checkpoint=4929 + offset,
+            telegram_message_id=4_900_131 + offset,
+            checkpoint=4910 + offset,
         )
 
         proof_request_count = len(classifier.proof_requests)
@@ -788,13 +788,6 @@ def test_legacy_v1_semantic_proof_has_own_restartable_budget() -> None:
             for request in classifier.proof_requests[proof_request_count:]
         )
         assert len(system.opportunity_publication_contracts(revision_id)) == 1
-
-    _exercise_v1_semantic_proof_exhaustion(
-        system=system,
-        classifier=classifier,
-        telegram=telegram,
-        source_identity=source_identity,
-    )
 
 
 def _exercise_v1_semantic_proof_exhaustion(
@@ -862,8 +855,8 @@ def _exercise_v1_semantic_proof_exhaustion(
             telegram=telegram,
             source_identity=source_identity,
             body=body,
-            telegram_message_id=4_900_132 + offset,
-            checkpoint=4932 + offset,
+            telegram_message_id=4_900_134 + offset,
+            checkpoint=4913 + offset,
         )
 
         proof_request_count = len(classifier.proof_requests)
@@ -901,28 +894,14 @@ def _exercise_v1_semantic_proof_exhaustion(
         assert system.opportunity_publication_contracts(revision_id) == ()
 
 
-def test_v2_semantic_proof_retries_and_exhaustion_are_body_free() -> None:
-    classifier = ControlledModelAdapter()
-    classifier.enable_primary_v2()
-    telegram = ControlledTelegramIngestionAdapter()
-    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
-        admin_database_url=os.environ["TEST_DATABASE_URL"],
-        clock=clock,
-        telegram_ingestion=telegram,
-        model=classifier,
-        location_resolver=_whole_city_resolver(),
-        telegram_admin_user_id=49_130,
-    )
-    system.reset()
-    source_identity = _prepare_source_chat_on_existing_spine(
-        system=system,
-        telegram=telegram,
-        clock=clock,
-        telegram_id=4_900_130,
-        checkpoint=4930,
-        administrator_id=49_130,
-    )
+def _exercise_v2_semantic_proof_cases(
+    *,
+    system: AcceptanceSpine,
+    classifier: ControlledModelAdapter,
+    telegram: ControlledTelegramIngestionAdapter,
+    source_identity: TelegramPeerIdentity,
+) -> None:
+    """Exercise v2 proof retries and exhaustion on one acceptance spine."""
     for offset, failure_kind in enumerate(
         ("exception_retry", "schema_exhaustion", "provenance_exhaustion")
     ):
@@ -955,14 +934,17 @@ def test_v2_semantic_proof_retries_and_exhaustion_are_body_free() -> None:
             telegram=telegram,
             source_identity=source_identity,
             body=body,
-            telegram_message_id=4_900_130 + offset,
-            checkpoint=4930 + offset,
+            telegram_message_id=49_003 + offset,
+            checkpoint=4902 + offset,
         )
 
         proof_request_count = len(classifier.proof_requests)
         if failure_kind == "exception_retry":
             assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-            assert system.opportunities() == ()
+            assert not any(
+                opportunity.source_message_revision_id == revision_id
+                for opportunity in system.opportunities()
+            )
             system.restart(RuntimeRole.CLASSIFICATION)
             assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
             system.process_opportunities_until_idle()
@@ -1378,6 +1360,12 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
     )
     assert len(system.opportunity_publication_contracts(revision_id)) == 1
     assert system.classification_routing_outcomes()[0].disposition == "accepted"
+    _exercise_v2_semantic_proof_cases(
+        system=system,
+        classifier=classifier,
+        telegram=telegram,
+        source_identity=source_identity,
+    )
 
 
 def test_v4_missing_ambiguity_provenance_routes_before_publication() -> None:
