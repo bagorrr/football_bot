@@ -8,11 +8,14 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
-from threading import Condition
+from threading import Condition, get_ident
 from time import monotonic
-from typing import cast
+from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import psycopg
+from psycopg import conninfo
 
 from modules.application import (
     ConversationOnboarding,
@@ -113,6 +116,95 @@ _CONTRACTS = {
 _TESTKIT_MIGRATED_DATABASE_URLS: set[str] = set()
 _TESTKIT_RUNTIME_PASSWORDS: dict[str, dict[RuntimeRole, str]] = {}
 _TESTKIT_LAST_PROVISIONED_DATABASE_URL: str | None = None
+_TESTKIT_RUNTIME_CONNECTION_CACHE: dict[
+    tuple[str, int, str], psycopg.Connection[Any]
+] = {}
+_TESTKIT_RUNTIME_CONNECTION_ACTIVE: dict[tuple[str, int, str], int] = {}
+_TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED = False
+
+
+def _runtime_connection_key(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[str, int, str] | None:
+    """Identify only runtime-role connections eligible for test reuse."""
+    if not args or not isinstance(args[0], str):
+        return None
+    connection_info = conninfo.conninfo_to_dict(args[0])
+    runtime_role_names = {role.database_role for role in RuntimeRole}
+    if connection_info.get("user") not in runtime_role_names:
+        return None
+    option_key = repr(sorted((name, repr(value)) for name, value in kwargs.items()))
+    return args[0], get_ident(), option_key
+
+
+@contextmanager
+def _runtime_connection_context(
+    *,
+    key: tuple[str, int, str],
+    connection: psycopg.Connection[Any],
+    transient: bool,
+) -> Iterator[psycopg.Connection[Any]]:
+    """Commit or roll back one operation without closing reused connections."""
+    _TESTKIT_RUNTIME_CONNECTION_ACTIVE[key] = (
+        _TESTKIT_RUNTIME_CONNECTION_ACTIVE.get(key, 0) + 1
+    )
+    try:
+        yield connection
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    finally:
+        active_count = _TESTKIT_RUNTIME_CONNECTION_ACTIVE.get(key, 1) - 1
+        if active_count > 0:
+            _TESTKIT_RUNTIME_CONNECTION_ACTIVE[key] = active_count
+        else:
+            _TESTKIT_RUNTIME_CONNECTION_ACTIVE.pop(key)
+        if transient:
+            connection.close()
+
+
+def _install_runtime_connection_cache() -> None:
+    """Reuse only testkit runtime connections while preserving transaction scopes."""
+    global _TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED
+    if _TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED:
+        return
+    original_connect = psycopg.connect
+
+    def cached_connect(*args: Any, **kwargs: Any) -> Any:
+        key = _runtime_connection_key(args, kwargs)
+        if key is None:
+            return original_connect(*args, **kwargs)
+        connection = _TESTKIT_RUNTIME_CONNECTION_CACHE.get(key)
+        if connection is None or connection.closed:
+            connection = original_connect(*args, **kwargs)
+            _TESTKIT_RUNTIME_CONNECTION_CACHE[key] = connection
+        if _TESTKIT_RUNTIME_CONNECTION_ACTIVE.get(key, 0):
+            transient = original_connect(*args, **kwargs)
+            return _runtime_connection_context(
+                key=key,
+                connection=transient,
+                transient=True,
+            )
+        return _runtime_connection_context(
+            key=key,
+            connection=connection,
+            transient=False,
+        )
+
+    psycopg.connect = cast(Any, cached_connect)
+    _TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED = True
+
+
+def _invalidate_runtime_connections(database_url: str) -> None:
+    """Close cached role sessions when the acceptance seam simulates restart."""
+    for key in tuple(_TESTKIT_RUNTIME_CONNECTION_CACHE):
+        if key[0] != database_url:
+            continue
+        connection = _TESTKIT_RUNTIME_CONNECTION_CACHE.pop(key)
+        _TESTKIT_RUNTIME_CONNECTION_ACTIVE.pop(key, None)
+        connection.close()
 
 
 @dataclass(slots=True)
@@ -3107,6 +3199,7 @@ def boot_acceptance_spine(
         runtime_database_url,
     )
 
+    _install_runtime_connection_cache()
     migrator = PostgresAcceptanceMigrator(admin_database_url)
     if admin_database_url not in _TESTKIT_MIGRATED_DATABASE_URLS:
         migrator.migrate()
@@ -3136,6 +3229,7 @@ def boot_acceptance_spine(
     installed_timezone_data = timezone_data or InstalledTimezoneDataAdapter()
 
     def restart_role(role: RuntimeRole) -> AcceptanceRole:
+        _invalidate_runtime_connections(role_urls[role])
         return boot_acceptance_role(
             role=role,
             database_url=role_urls[role],
