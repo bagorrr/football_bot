@@ -9148,7 +9148,9 @@ class RuntimeApplication:
                     if not proof_is_valid:
                         semantic_proof_failed = True
                         semantic_proof_retryable = (
-                            semantic_proof_retryable or proof_attempt_number < 3
+                            semantic_proof_retryable
+                            or proof_attempt_number < 3
+                            or semantic_proof_circuit_state is not None
                         )
                         if semantic_proof_circuit_state is not None:
                             break

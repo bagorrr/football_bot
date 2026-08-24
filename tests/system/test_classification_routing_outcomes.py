@@ -953,6 +953,130 @@ def test_legacy_v1_semantic_proof_typed_circuits_retain_and_replay(
 
 
 @pytest.mark.parametrize("circuit_kind", ("authentication", "quota"))
+def test_v2_semantic_proof_typed_circuit_retains_third_attempt_until_recovery(
+    circuit_kind: str,
+) -> None:
+    body = (
+        f"20 August 2026 in whole city. Need one player. Contact @v2_proof. "
+        f"Semantic proof {circuit_kind} recovery."
+    )
+    candidate_key = f"v2-{circuit_kind}-semantic-proof-circuit"
+    accepted = _v2_accepted_result(body=body, candidate_key=candidate_key)
+    primary = replace_classifier_output(
+        accepted,
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "needs_second_pass",
+            "candidates": [],
+            "routing": {
+                "reason_code": "deterministic_ambiguity",
+                "required_context": "refined_prompt",
+            },
+        },
+    )
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(body=body, result=primary)
+    classifier.return_second_pass_for(body=body, result=accepted)
+    for _ in range(3):
+        classifier.raise_for(
+            pass_kind="semantic_proof",
+            error=(
+                ClassifierAuthenticationError()
+                if circuit_kind == "authentication"
+                else ClassifierQuotaError(retry_after_seconds=240)
+            ),
+        )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_162 if circuit_kind == "authentication" else 4_900_163,
+        checkpoint=4962 if circuit_kind == "authentication" else 4963,
+        administrator_id=49_162 if circuit_kind == "authentication" else 49_163,
+        location_resolver=_whole_city_resolver(),
+        clock=clock,
+    )
+
+    for attempt_number in range(1, 4):
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        health = system.classification_queue_health()
+        assert health.queue_depth == 1
+        assert health.terminal_failure_count == 0
+        assert health.circuits[0].state == f"{circuit_kind}_open"
+        assert len(classifier.proof_requests) == attempt_number
+        with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+            assert connection.execute(
+                """
+                SELECT count(*)
+                FROM football_runtime.classification_proof_work
+                WHERE source_message_revision_id = %s
+                """,
+                (revision_id,),
+            ).fetchone() == (1,)
+            assert connection.execute(
+                """
+                SELECT inbox.processing_status, outbox.claimed_until
+                FROM football_runtime.contract_outbox AS outbox
+                LEFT JOIN football_runtime.contract_inbox AS inbox
+                  ON inbox.consumer_role = outbox.consumer_role
+                 AND inbox.message_id = outbox.message_id
+                WHERE outbox.consumer_role = 'classification'
+                  AND outbox.contract_name = 'ClassifySourceMessageRevision'
+                  AND outbox.payload ->> 'source_message_revision_id' = %s
+                """,
+                (revision_id,),
+            ).fetchone() == (None, None)
+
+        if attempt_number < 3:
+            system.restart(RuntimeRole.CLASSIFICATION)
+            if circuit_kind == "authentication":
+                assert system.recover_classifier_authentication()
+            else:
+                next_probe_at = health.circuits[0].next_probe_at
+                assert next_probe_at is not None
+                clock.advance_to(next_probe_at)
+
+    assert len(classifier.requests) == 2
+    if circuit_kind == "authentication":
+        system.restart(RuntimeRole.CLASSIFICATION)
+        assert system.recover_classifier_authentication()
+    else:
+        next_probe_at = system.classification_queue_health().circuits[0].next_probe_at
+        assert next_probe_at is not None
+        clock.advance_to(next_probe_at)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(classifier.proof_requests) == 3
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+    health = system.classification_queue_health()
+    assert health.queue_depth == 0
+    assert health.terminal_failure_count == 1
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.classification_proof_work
+            WHERE source_message_revision_id = %s
+            """,
+            (revision_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            """
+            SELECT inbox.processing_status
+            FROM football_runtime.contract_outbox AS outbox
+            JOIN football_runtime.contract_inbox AS inbox
+              ON inbox.consumer_role = outbox.consumer_role
+             AND inbox.message_id = outbox.message_id
+            WHERE outbox.consumer_role = 'classification'
+              AND outbox.contract_name = 'ClassifySourceMessageRevision'
+              AND outbox.payload ->> 'source_message_revision_id' = %s
+            """,
+            (revision_id,),
+        ).fetchone() == ("accepted",)
+
+
+@pytest.mark.parametrize("circuit_kind", ("authentication", "quota"))
 def test_third_circuit_failure_is_not_terminal_until_budget_finalization(
     circuit_kind: str,
 ) -> None:
