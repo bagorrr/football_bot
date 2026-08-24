@@ -39,6 +39,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationQueueHealth,
     ClassificationRoutingOutcome,
     CompletedSearch,
     ConversationStage,
@@ -890,11 +891,21 @@ class ControlledModelAdapter:
         default_factory=dict
     )
     _proof_results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
-    _classify_failures: dict[str, list[Exception]] = field(default_factory=dict)
+    _classify_failures: dict[str, list[BaseException]] = field(default_factory=dict)
     requests: list[ClassifierRequest] = field(default_factory=list)
     second_pass_requests: list[ClassifierRequest] = field(default_factory=list)
     proof_requests: list[ClassifierRequest] = field(default_factory=list)
     primary_schema_version: str = "source-message-classification-v1"
+    smoke_test_passes: bool = True
+
+    @property
+    def adapter_kind(self) -> str:
+        """Identify the isolated controlled adapter without a provider call."""
+        return "controlled_recording"
+
+    def schema_smoke_test(self) -> bool:
+        """Return the configured synthetic schema-smoke result."""
+        return self.smoke_test_passes
 
     def return_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
         """Configure one deterministic structured classifier response."""
@@ -923,7 +934,7 @@ class ControlledModelAdapter:
         """Opt the controlled model boundary into the additive v2 output."""
         self.primary_schema_version = "source-message-classification-v2"
 
-    def raise_for(self, *, pass_kind: str = "primary", error: Exception) -> None:
+    def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
         self._classify_failures.setdefault(pass_kind, []).append(error)
 
@@ -1796,6 +1807,10 @@ class InjectedInterruptionError(RuntimeError):
     """A controlled process exit interrupted work after a durable commit."""
 
 
+class InjectedClassifierCrash(BaseException):
+    """A controlled worker exit after its durable execution attempt began."""
+
+
 class InjectedTelegramDeliveryError(TelegramDeliveryPreEffectError):
     """A controlled Bot API failure left durable presentation work pending."""
 
@@ -2036,6 +2051,22 @@ class AcceptanceSpine:
     def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
         """Observe durable primary-classifier provenance."""
         return self._observer.classification_attempts()
+
+    def classification_queue_health(self) -> ClassificationQueueHealth:
+        """Observe low-cardinality classifier operations at the public seam."""
+        role = self._roles[RuntimeRole.CLASSIFICATION]
+        return self._observer.classification_queue_health(role.clock.now())
+
+    def recover_classifier_authentication(self) -> bool:
+        """Run the protected synthetic smoke test before closing the circuit."""
+        role = self._roles[RuntimeRole.CLASSIFICATION]
+        if role.model is None or not role.model.schema_smoke_test():
+            return False
+        role.store.close_classifier_authentication_circuit(
+            adapter_kind=role.model.adapter_kind,
+            closed_at=role.clock.now(),
+        )
+        return True
 
     def classification_routing_outcomes(
         self,

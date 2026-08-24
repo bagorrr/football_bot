@@ -35,7 +35,9 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationQueueHealth,
     ClassificationRoutingOutcome,
+    ClassifierCircuitState,
     CompletedSearch,
     CompletedSearchView,
     ConversationStage,
@@ -119,6 +121,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0019_application_proposition_discriminators.sql",
     "0020_application_legacy_proposition_identity_compatibility.sql",
     "0021_classification_proof_work.sql",
+    "0022_classifier_execution_recovery.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -143,6 +146,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "97f5851b2f72c5a69d342ce3e72d0908a309dd85bd98495184d43b13508354c9",
     "2a151808ef6854d40f567f778212218f043eda691fec2ce21fb0e241b277f291",
     "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
+    "0315157b15c682039beb369dba0523ff770900a674be50d3b449dfbc2d019747",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -458,8 +462,9 @@ def _assert_material_schema(
     if applied_count < 1:
         return
     expected = _MATERIAL_SCHEMA_FINGERPRINTS[applied_count - 1]
-    if _material_schema_fingerprint(connection) != expected:
-        raise RuntimeError("Migration history has material schema drift")
+    actual = _material_schema_fingerprint(connection)
+    if actual != expected:
+        raise RuntimeError(f"Migration history has material schema drift: {actual}")
 
 
 def _legacy_migration_prefix(
@@ -617,6 +622,7 @@ class PostgresAcceptanceObserver:
             TRUNCATE football_runtime.bot_callback_outbox,
                      football_runtime.ingestion_failures,
                      football_runtime.protected_content_skips,
+                     football_runtime.classifier_adapter_circuits,
                      football_runtime.classification_attempts,
                      football_runtime.classification_proof_work,
                      football_runtime.classification_routing_outcomes,
@@ -944,6 +950,60 @@ class PostgresAcceptanceObserver:
                 }
             )
             for row in rows
+        )
+
+    def classification_queue_health(
+        self, observed_at: datetime
+    ) -> ClassificationQueueHealth:
+        """Observe only low-cardinality classifier operational state."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            queue = connection.execute(
+                """
+                SELECT count(*)::integer AS queue_depth,
+                       COALESCE(max(EXTRACT(EPOCH FROM (%s - outbox.recorded_at))), 0)
+                           ::integer AS oldest_ready_job_age_seconds,
+                       COALESCE(max(EXTRACT(EPOCH FROM (%s - outbox.claim_started_at)))
+                           FILTER (WHERE outbox.claim_started_at IS NOT NULL), 0)
+                           ::integer AS oldest_lease_age_seconds
+                FROM football_runtime.contract_outbox AS outbox
+                LEFT JOIN football_runtime.contract_inbox AS inbox
+                  ON inbox.consumer_role = 'classification'
+                 AND inbox.message_id = outbox.message_id
+                WHERE outbox.consumer_role = 'classification'
+                  AND outbox.contract_name = 'ClassifySourceMessageRevision'
+                  AND COALESCE(inbox.processing_status, '') NOT IN (
+                      'accepted', 'rejected_invalid_contract'
+                  )
+                """,
+                (observed_at, observed_at),
+            ).fetchone()
+            circuits = connection.execute(
+                """
+                SELECT adapter_kind, state, opened_at, next_probe_at, probe_count
+                FROM football_runtime.classifier_adapter_circuits
+                ORDER BY adapter_kind
+                """
+            ).fetchall()
+            terminal_failures = connection.execute(
+                """
+                SELECT count(*)::integer
+                FROM football_runtime.classification_attempts
+                WHERE status = 'failed' AND attempt_number = 3
+                """
+            ).fetchone()
+        assert queue is not None
+        assert terminal_failures is not None
+        age = queue["oldest_ready_job_age_seconds"]
+        severity = "critical" if age > 1800 else "warning" if age > 300 else "ok"
+        return ClassificationQueueHealth(
+            queue_depth=queue["queue_depth"],
+            oldest_ready_job_age_seconds=age,
+            oldest_lease_age_seconds=queue["oldest_lease_age_seconds"],
+            terminal_failure_count=terminal_failures["count"],
+            severity=severity,
+            circuits=tuple(ClassifierCircuitState(**row) for row in circuits),
         )
 
     def classification_routing_outcomes(
@@ -3391,6 +3451,52 @@ class PostgresRoleStore:
             self._database_url,
             row_factory=dict_row,
         ) as connection:
+            if self._role is RuntimeRole.CLASSIFICATION:
+                circuit = connection.execute(
+                    """
+                    SELECT adapter_kind, state, next_probe_at
+                    FROM football_runtime.classifier_adapter_circuits
+                    WHERE state <> 'closed'
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """
+                ).fetchone()
+                if circuit is not None:
+                    if circuit["state"] == "authentication_open":
+                        return None
+                    if (
+                        circuit["next_probe_at"] is None
+                        or circuit["next_probe_at"] > claimed_at
+                    ):
+                        return None
+                    connection.execute(
+                        """
+                        UPDATE football_runtime.classifier_adapter_circuits
+                        SET next_probe_at = %s, probe_count = probe_count + 1,
+                            updated_at = %s
+                        WHERE adapter_kind = %s
+                        """,
+                        (
+                            claimed_at + timedelta(seconds=180),
+                            claimed_at,
+                            circuit["adapter_kind"],
+                        ),
+                    )
+                active_lease = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM football_runtime.contract_outbox
+                        WHERE consumer_role = 'classification'
+                          AND claim_started_at IS NOT NULL
+                          AND claimed_until > %s
+                    ) AS present
+                    """,
+                    (claimed_at,),
+                ).fetchone()
+                if active_lease is not None and active_lease["present"]:
+                    return None
             rows = connection.execute(
                 """
                 SELECT outbox.*, inbox.processing_status AS inbox_status
@@ -3423,10 +3529,17 @@ class PostgresRoleStore:
                 connection.execute(
                     """
                     UPDATE football_runtime.contract_outbox
-                    SET claimed_until = %s, claim_attempts = claim_attempts + 1
+                    SET claimed_until = %s, claim_started_at = %s,
+                        claim_attempts = claim_attempts + 1
                     WHERE message_id = %s
                     """,
-                    (claimed_at + timedelta(seconds=30), row["message_id"]),
+                    (
+                        claimed_at + timedelta(seconds=180)
+                        if self._role is RuntimeRole.CLASSIFICATION
+                        else claimed_at + timedelta(seconds=30),
+                        claimed_at,
+                        row["message_id"],
+                    ),
                 )
                 return ClaimedContract(
                     envelope=_row_to_envelope(row, validate_registered=False),
@@ -3575,12 +3688,19 @@ class PostgresRoleStore:
         finalize: bool = True,
         proof_work: ClassificationProofWork | None = None,
         clear_proof_work: bool = False,
+        retry_at: datetime | None = None,
+        circuit_state: str | None = None,
+        circuit_retry_at: datetime | None = None,
     ) -> ConsumeResult:
         """Retain one execution and optionally complete its queue handoff."""
         if self._role is not RuntimeRole.CLASSIFICATION:
             raise ConversationAccessDeniedError
         if not finalize and outgoing is not None:
             raise ValueError("a retryable classifier attempt cannot publish")
+        if finalize and retry_at is not None:
+            raise ValueError("a terminal classifier attempt cannot be rescheduled")
+        if circuit_state not in {None, "authentication_open", "quota_open"}:
+            raise ValueError("classifier circuit state is invalid")
         with psycopg.connect(self._database_url) as connection:
             if finalize and not _begin_owned_contract(
                 connection,
@@ -3607,7 +3727,22 @@ class PostgresRoleStore:
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
-                ) ON CONFLICT (attempt_id) DO NOTHING
+                ) ON CONFLICT (attempt_id) DO UPDATE
+                SET effective_model = EXCLUDED.effective_model,
+                    effective_reasoning_effort = EXCLUDED.effective_reasoning_effort,
+                    codex_version = EXCLUDED.codex_version,
+                    adapter_kind = EXCLUDED.adapter_kind,
+                    adapter_version = EXCLUDED.adapter_version,
+                    evidence_references = EXCLUDED.evidence_references,
+                    duration_ms = EXCLUDED.duration_ms,
+                    input_tokens = EXCLUDED.input_tokens,
+                    output_tokens = EXCLUDED.output_tokens,
+                    disposition = EXCLUDED.disposition,
+                    status = EXCLUDED.status,
+                    recorded_at = LEAST(
+                        football_runtime.classification_attempts.recorded_at,
+                        EXCLUDED.recorded_at
+                    )
                     """,
                     (
                         stored_attempt.attempt_id,
@@ -3675,8 +3810,146 @@ class PostgresRoleStore:
                         received_at,
                     ),
                 )
-            _release_claim(connection, incoming.message_id)
+            if circuit_state is not None:
+                if (
+                    circuit_state == "authentication_open"
+                    and circuit_retry_at is not None
+                ):
+                    raise ValueError("authentication recovery cannot be automatic")
+                if circuit_state == "quota_open" and circuit_retry_at is None:
+                    raise ValueError("quota recovery requires its next probe time")
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.classifier_adapter_circuits (
+                        adapter_kind, state, opened_at, next_probe_at,
+                        probe_count, updated_at
+                    ) VALUES (%s, %s, %s, %s, 0, %s)
+                    ON CONFLICT (adapter_kind) DO UPDATE
+                    SET state = EXCLUDED.state,
+                        opened_at = COALESCE(
+                            football_runtime.classifier_adapter_circuits.opened_at,
+                            EXCLUDED.opened_at
+                        ),
+                        next_probe_at = EXCLUDED.next_probe_at,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        result.adapter_kind,
+                        circuit_state,
+                        received_at,
+                        circuit_retry_at,
+                        received_at,
+                    ),
+                )
+            elif attempt.status == "succeeded":
+                connection.execute(
+                    """
+                    UPDATE football_runtime.classifier_adapter_circuits
+                    SET state = 'closed', opened_at = NULL, next_probe_at = NULL,
+                        probe_count = 0, updated_at = %s
+                    WHERE adapter_kind = %s AND state = 'quota_open'
+                    """,
+                    (received_at, result.adapter_kind),
+                )
+            if retry_at is None:
+                _release_claim(connection, incoming.message_id)
+            else:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.contract_outbox
+                    SET claimed_until = %s, claim_started_at = NULL
+                    WHERE message_id = %s
+                    """,
+                    (retry_at, incoming.message_id),
+                )
         return ConsumeResult.APPLIED
+
+    def begin_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: Any,
+        started_at: datetime,
+    ) -> None:
+        """Commit one body-free attempt before the external model call."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.classification_attempts (
+                    attempt_id, source_message_revision_id, requested_model,
+                    effective_model, requested_reasoning_effort,
+                    effective_reasoning_effort, prompt_version, schema_version,
+                    glossary_version, context_policy_version,
+                    routing_policy_version, codex_version, adapter_kind,
+                    adapter_version, pass_number, pass_kind, attempt_number,
+                    input_manifest_hash, evidence_references, duration_ms,
+                    input_tokens, output_tokens, disposition, status, recorded_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, '[]'::jsonb, 0, 0, 0,
+                    %s, 'failed', %s
+                ) ON CONFLICT (attempt_id) DO NOTHING
+                """,
+                (
+                    attempt.attempt_id,
+                    attempt.source_message_revision_id,
+                    attempt.requested_model,
+                    attempt.effective_model,
+                    attempt.requested_reasoning_effort,
+                    attempt.effective_reasoning_effort,
+                    attempt.prompt_version,
+                    attempt.schema_version,
+                    attempt.glossary_version,
+                    attempt.context_policy_version,
+                    attempt.routing_policy_version,
+                    result.codex_version,
+                    result.adapter_kind,
+                    result.adapter_version,
+                    attempt.pass_number,
+                    attempt.pass_kind,
+                    attempt.attempt_number,
+                    attempt.input_manifest_hash,
+                    attempt.disposition,
+                    started_at,
+                ),
+            )
+
+    def close_classifier_authentication_circuit(
+        self, *, adapter_kind: str, closed_at: datetime
+    ) -> None:
+        """Close only the named authentication circuit after a smoke test."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                UPDATE football_runtime.classifier_adapter_circuits
+                SET state = 'closed', opened_at = NULL, next_probe_at = NULL,
+                    probe_count = 0, updated_at = %s
+                WHERE adapter_kind = %s AND state = 'authentication_open'
+                """,
+                (closed_at, adapter_kind),
+            )
+
+    def classifier_circuit_state(
+        self, adapter_kind: str
+    ) -> ClassifierCircuitState | None:
+        """Read only this Classification owner's adapter circuit."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT adapter_kind, state, opened_at, next_probe_at, probe_count
+                FROM football_runtime.classifier_adapter_circuits
+                WHERE adapter_kind = %s
+                """,
+                (adapter_kind,),
+            ).fetchone()
+        return None if row is None else ClassifierCircuitState(**row)
 
     def classification_attempts_for_revision(
         self, source_message_revision_id: str
@@ -7684,7 +7957,7 @@ def _release_claim(
     connection.execute(
         """
         UPDATE football_runtime.contract_outbox
-        SET claimed_until = NULL
+        SET claimed_until = NULL, claim_started_at = NULL
         WHERE message_id = %s
         """,
         (message_id,),

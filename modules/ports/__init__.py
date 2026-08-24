@@ -23,7 +23,9 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationQueueHealth,
     ClassificationRoutingOutcome,
+    ClassifierCircuitState,
     CompletedSearch,
     CompletedSearchView,
     ConversationState,
@@ -197,6 +199,41 @@ class ModelAdapter(Protocol):
     def proposal_id(self, revision_id: str) -> str:
         """Return one non-authoritative synthetic proposal identity."""
         ...
+
+    @property
+    def adapter_kind(self) -> str:
+        """Return the low-cardinality adapter identity used by its circuit."""
+        ...
+
+    def schema_smoke_test(self) -> bool:
+        """Run one synthetic structured-output recovery probe."""
+        ...
+
+
+class ClassifierAuthenticationError(RuntimeError):
+    """The dedicated classifier identity requires protected recovery."""
+
+
+class ClassifierQuotaError(RuntimeError):
+    """The selected adapter cannot execute until provider capacity recovers."""
+
+    def __init__(self, *, retry_after_seconds: int | None = None) -> None:
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("classifier quota unavailable")
+
+
+class ClassifierExecutionTimeoutError(RuntimeError):
+    """One adapter execution reached the classifier's hard deadline."""
+
+
+class ClassifierTransientError(RuntimeError):
+    """One retryable provider failure, optionally with a required delay."""
+
+    def __init__(self, *, retry_after_seconds: int | None = None) -> None:
+        if retry_after_seconds is not None and retry_after_seconds < 0:
+            raise ValueError("classifier Retry-After cannot be negative")
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__("classifier provider request failed transiently")
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,14 +861,40 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         finalize: bool = True,
         proof_work: ClassificationProofWork | None = None,
         clear_proof_work: bool = False,
+        retry_at: datetime | None = None,
+        circuit_state: str | None = None,
+        circuit_retry_at: datetime | None = None,
     ) -> ConsumeResult:
         """Retain one execution and optionally complete its queue handoff."""
+        ...
+
+    def begin_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: ClassifierAdapterResult,
+        started_at: datetime,
+    ) -> None:
+        """Persist an execution identity before crossing the model boundary."""
         ...
 
     def classification_attempts_for_revision(
         self, source_message_revision_id: str
     ) -> tuple[ClassificationAttempt, ...]:
         """Read prior classifier attempts needed for bounded queue retry."""
+        ...
+
+    def close_classifier_authentication_circuit(
+        self, *, adapter_kind: str, closed_at: datetime
+    ) -> None:
+        """Close one authentication circuit after its protected smoke test."""
+        ...
+
+    def classifier_circuit_state(
+        self, adapter_kind: str
+    ) -> ClassifierCircuitState | None:
+        """Read the adapter's body-free circuit for bounded recovery timing."""
         ...
 
     def classification_proof_work_for_revision(
@@ -1113,6 +1176,12 @@ class AcceptanceObserver(Protocol):
 
     def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
         """Observe durable classifier execution provenance."""
+        ...
+
+    def classification_queue_health(
+        self, observed_at: datetime
+    ) -> ClassificationQueueHealth:
+        """Observe body-free queue age, leases, failures, and circuit state."""
         ...
 
     def classification_routing_outcomes(
