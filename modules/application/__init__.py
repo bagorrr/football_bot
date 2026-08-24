@@ -7778,7 +7778,20 @@ class RuntimeApplication:
             + 1
         )
         if primary_attempt_number > 3:
-            raise RuntimeError("classifier retry budget was already exhausted")
+            prior_primary_attempts = tuple(
+                attempt
+                for attempt in prior_attempts
+                if attempt.pass_number == 1 and attempt.pass_kind == "primary"
+            )
+            self._terminalize_exhausted_classification_attempt(
+                incoming=incoming,
+                request=request,
+                attempt=max(
+                    prior_primary_attempts,
+                    key=lambda attempt: attempt.attempt_number,
+                ),
+            )
+            return
         manifest = {
             "source_message_revision_id": request.source_message_revision_id,
             "body": body,
@@ -7807,6 +7820,24 @@ class RuntimeApplication:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        primary_started_result = replace(
+            _classifier_failure_result(request),
+            adapter_kind=self.model.adapter_kind,
+        )
+        primary_started_attempt = _classifier_failure_attempt(
+            request,
+            revision_id=revision_id,
+            pass_number=1,
+            pass_kind="primary",
+            attempt_number=primary_attempt_number,
+            input_manifest_hash=input_manifest_hash,
+        )
+        self.store.begin_classification_attempt(
+            incoming=incoming,
+            attempt=primary_started_attempt,
+            result=primary_started_result,
+            started_at=self.clock.now(),
+        )
         try:
             result = self.model.classify(request)
         except Exception:
@@ -7926,6 +7957,19 @@ class RuntimeApplication:
                 pass_number=2,
                 candidate_key=proof_candidate_key,
             )
+            prior_proof_attempts = _semantic_proof_attempts(
+                prior_attempts,
+                revision_id=revision_id,
+                pass_number=2,
+                candidate_key=proof_candidate_key,
+            )
+            if proof_attempt_number > 3:
+                self._terminalize_exhausted_classification_attempt(
+                    incoming=incoming,
+                    request=semantic_proof_request,
+                    attempt=prior_proof_attempts[-1],
+                )
+                return
             proof_manifest = {
                 **manifest,
                 "context_bundle_version": semantic_proof_request.context_bundle_version,
@@ -7963,6 +8007,25 @@ class RuntimeApplication:
                 attempt_number=primary_attempt_number,
                 input_manifest_hash=input_manifest_hash,
                 status="succeeded",
+            )
+            proof_started_result = replace(
+                _classifier_failure_result(semantic_proof_request),
+                adapter_kind=self.model.adapter_kind,
+            )
+            proof_started_attempt = _classifier_failure_attempt(
+                semantic_proof_request,
+                revision_id=revision_id,
+                pass_number=2,
+                pass_kind="semantic_proof",
+                attempt_number=proof_attempt_number,
+                input_manifest_hash=proof_input_manifest_hash,
+                candidate_key=proof_candidate_key,
+            )
+            self.store.begin_classification_attempt(
+                incoming=incoming,
+                attempt=proof_started_attempt,
+                result=proof_started_result,
+                started_at=self.clock.now(),
             )
             try:
                 semantic_proof_result = self.model.semantic_proof(
@@ -8197,6 +8260,7 @@ class RuntimeApplication:
             outgoing=None,
             received_at=self.clock.now(),
             finalize=True,
+            clear_proof_work=True,
         )
 
     def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
@@ -8928,6 +8992,19 @@ class RuntimeApplication:
                         pass_number=proof_pass_number,
                         candidate_key=candidate_key,
                     )
+                    prior_proof_attempts = _semantic_proof_attempts(
+                        prior_attempts,
+                        revision_id=revision_id,
+                        pass_number=proof_pass_number,
+                        candidate_key=candidate_key,
+                    )
+                    if proof_attempt_number > 3:
+                        self._terminalize_exhausted_classification_attempt(
+                            incoming=incoming,
+                            request=proof_request,
+                            attempt=prior_proof_attempts[-1],
+                        )
+                        return
                     proof_manifest_hash = manifest_for(
                         proof_request,
                         pass_number=proof_pass_number,
@@ -11021,24 +11098,48 @@ def _semantic_proof_attempt_number(
     candidate_key: str,
 ) -> int:
     """Return the next bounded attempt for this candidate-bound proof pass."""
+    return (
+        max(
+            (
+                attempt.attempt_number
+                for attempt in _semantic_proof_attempts(
+                    prior_attempts,
+                    revision_id=revision_id,
+                    pass_number=pass_number,
+                    candidate_key=candidate_key,
+                )
+            ),
+            default=0,
+        )
+        + 1
+    )
+
+
+def _semantic_proof_attempts(
+    prior_attempts: tuple[ClassificationAttempt, ...],
+    *,
+    revision_id: str,
+    pass_number: int,
+    candidate_key: str,
+) -> tuple[ClassificationAttempt, ...]:
+    """Return durable proof attempts for one candidate in execution order."""
     prefix = _classification_attempt_id(
         revision_id,
         pass_kind="semantic_proof",
         attempt_number=1,
         candidate_key=candidate_key,
     )
-    return (
-        max(
+    return tuple(
+        sorted(
             (
-                attempt.attempt_number
+                attempt
                 for attempt in prior_attempts
                 if attempt.pass_number == pass_number
                 and attempt.pass_kind == "semantic_proof"
                 and attempt.attempt_id.startswith(prefix)
             ),
-            default=0,
+            key=lambda attempt: attempt.attempt_number,
         )
-        + 1
     )
 
 

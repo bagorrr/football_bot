@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import signal
 import subprocess
 from collections.abc import Callable, Mapping
@@ -15,10 +14,9 @@ from typing import Protocol, cast
 from modules.contracts import JsonValue
 from modules.ports import (
     ClassifierAdapterResult,
-    ClassifierAuthenticationError,
     ClassifierExecutionTimeoutError,
-    ClassifierQuotaError,
     ClassifierRequest,
+    classifier_provider_error_from_metadata,
 )
 
 EXECUTION_TIMEOUT_SECONDS = 180
@@ -174,6 +172,14 @@ class CodexCliClassifierAdapter:
             )
         except TimeoutError as error:
             raise ClassifierExecutionTimeoutError from error
+        except Exception as error:
+            provider_error = classifier_provider_error_from_metadata(error)
+            if provider_error is not None:
+                raise provider_error from None
+            raise
+        provider_error = classifier_provider_error_from_metadata(execution)
+        if provider_error is not None:
+            raise provider_error
         output = execution.get("output")
         if not isinstance(output, dict):
             raise RuntimeError("Codex classifier result has no structured output")
@@ -269,125 +275,11 @@ def _codex_jsonl_failure(stdout: str) -> Exception | None:
 
 
 def _classifier_failure_from_event(event: Mapping[str, object]) -> Exception | None:
-    tokens = _failure_tokens(event)
-    joined = " ".join(tokens)
-    if _contains_any(
-        joined,
-        (
-            "authentication",
-            "authentication_required",
-            "unauthorized",
-            "unauthorised",
-            "invalid_api_key",
-            "invalid_api_token",
-            "login_required",
-            "not_authenticated",
-            "token_expired",
-            "credential",
-            "401",
-        ),
-    ):
-        return ClassifierAuthenticationError()
-    if _contains_any(
-        joined,
-        (
-            "quota",
-            "rate_limit",
-            "rate limited",
-            "too_many_requests",
-            "too many requests",
-            "usage_limit",
-            "usage limit",
-            "insufficient_quota",
-            "subscription",
-            "billing",
-            "429",
-        ),
-    ):
-        return ClassifierQuotaError(retry_after_seconds=_retry_after_seconds(event))
-    return None
+    return classifier_provider_error_from_metadata(event)
 
 
 def _classifier_failure_from_text(text: str) -> Exception | None:
-    normalized = text.casefold().replace("-", "_")
-    if _contains_any(
-        normalized,
-        (
-            "authentication",
-            "authentication_required",
-            "unauthorized",
-            "unauthorised",
-            "invalid_api_key",
-            "invalid_api_token",
-            "login_required",
-            "not_authenticated",
-            "token_expired",
-            "credential",
-            "401",
-        ),
-    ):
-        return ClassifierAuthenticationError()
-    if _contains_any(
-        normalized,
-        (
-            "quota",
-            "rate_limit",
-            "rate limited",
-            "too_many_requests",
-            "too many requests",
-            "usage_limit",
-            "usage limit",
-            "insufficient_quota",
-            "subscription",
-            "billing",
-            "429",
-        ),
-    ):
-        match = re.search(r"retry(?:[_ -]after)[^0-9]{0,20}(\d+)", normalized)
-        return ClassifierQuotaError(
-            retry_after_seconds=int(match.group(1)) if match else None
-        )
-    return None
-
-
-def _failure_tokens(value: object, *, depth: int = 0) -> list[str]:
-    if depth > 3:
-        return []
-    if isinstance(value, Mapping):
-        tokens: list[str] = []
-        for key, nested in value.items():
-            if isinstance(key, str):
-                tokens.append(key.casefold().replace("-", "_"))
-            tokens.extend(_failure_tokens(nested, depth=depth + 1))
-        return tokens
-    if isinstance(value, str):
-        return [value.casefold().replace("-", "_")]
-    if isinstance(value, int) and not isinstance(value, bool):
-        return [str(value)]
-    return []
-
-
-def _retry_after_seconds(value: object, *, depth: int = 0) -> int | None:
-    if depth > 3:
-        return None
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            normalized_key = (
-                key.casefold().replace("-", "_") if isinstance(key, str) else ""
-            )
-            if normalized_key in {"retry_after", "retry_after_seconds"}:
-                if isinstance(nested, int) and not isinstance(nested, bool):
-                    return nested if nested >= 0 else None
-                if isinstance(nested, str) and nested.isdigit():
-                    return int(nested)
-            retry_after = _retry_after_seconds(nested, depth=depth + 1)
-            if retry_after is not None:
-                return retry_after
-    return None
-
-
-def _contains_any(value: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in value for needle in needles)
+    return classifier_provider_error_from_metadata(text)
 
 
 def _request_payload(request: ClassifierRequest) -> dict[str, object]:

@@ -33,6 +33,7 @@ from modules.ports import (
     ClassifierAuthenticationError,
     ClassifierQuotaError,
     ClassifierRequest,
+    ClassifierTransientError,
     ModelAdapter,
 )
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
@@ -959,6 +960,56 @@ def test_quota_circuit_honors_retry_after_before_one_probe() -> None:
     assert system.classification_queue_health().circuits[0].state == "closed"
 
 
+def test_provider_5xx_honors_retry_after_without_opening_a_fallback_path() -> None:
+    body = "Provider 5xx recovery keeps the pinned classifier and delays its retry."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.raise_for(error=ClassifierTransientError(retry_after_seconds=240))
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        ),
+    )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_163,
+        checkpoint=4963,
+        administrator_id=49_163,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert system.classification_queue_health().queue_depth == 1
+    assert not system.classification_queue_health().circuits
+    clock.advance_to(clock.now() + timedelta(seconds=239))
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=1))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    assert [attempt.attempt_number for attempt in system.classification_attempts()] == [
+        1,
+        2,
+    ]
+    assert classifier.requests[-1].requested_model == "gpt-5.6-sol"
+    assert classifier.requests[-1].requested_reasoning_effort == "high"
+    assert system.classification_routing_outcomes()[0].disposition == "irrelevant"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
 def test_worker_crash_preserves_attempt_and_lease_for_restart_recovery() -> None:
     body = "A worker crash cannot lose or duplicate classifier work."
     classifier = ControlledModelAdapter()
@@ -1119,6 +1170,132 @@ def test_repeated_ambiguity_worker_crashes_terminalize_after_attempt_budget() ->
     assert health.terminal_failure_count == 1
     assert system.classification_routing_outcomes() == ()
     assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_v1_semantic_proof_crash_replay_stops_at_three_attempts() -> None:
+    body = "20 August 2026 in whole city. Need one player. Contact @v1_crash."
+    classifier = ControlledModelAdapter()
+    primary = _legacy_v1_accepted_result(body=body)
+    classifier.return_for(body=body, result=primary)
+    classifier.raise_for(
+        pass_kind="semantic_proof", error=TimeoutError("proof attempt 1")
+    )
+    classifier.raise_for(
+        pass_kind="semantic_proof", error=InjectedClassifierCrash("proof attempt 2")
+    )
+    classifier.raise_for(
+        pass_kind="semantic_proof", error=InjectedClassifierCrash("proof attempt 3")
+    )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_161,
+        checkpoint=4961,
+        administrator_id=49_161,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    for _attempt_number in (2, 3):
+        system.restart(RuntimeRole.CLASSIFICATION)
+        clock.advance_to(clock.now() + timedelta(seconds=180))
+        with pytest.raises(InjectedClassifierCrash):
+            system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    proof_request_count = len(classifier.proof_requests)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=180))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(classifier.proof_requests) == proof_request_count
+
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.source_message_revision_id == revision_id
+        and attempt.pass_kind == "semantic_proof"
+    )
+    assert [(attempt.attempt_number, attempt.status) for attempt in proof_attempts] == [
+        (1, "failed"),
+        (2, "failed"),
+        (3, "failed"),
+    ]
+    assert system.classification_queue_health().terminal_failure_count >= 1
+    assert system.opportunities() == ()
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_v2_semantic_proof_crash_replay_stops_at_three_attempts() -> None:
+    body = "20 August 2026 in whole city. Need one player. Contact @v2_proof."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "needs_second_pass",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "deterministic_ambiguity",
+                    "required_context": "refined_prompt",
+                },
+            },
+        ),
+    )
+    classifier.return_second_pass_for(
+        body=body,
+        result=_v2_accepted_result(body=body, candidate_key="v2-crash-candidate"),
+    )
+    classifier.raise_for(
+        pass_kind="semantic_proof", error=TimeoutError("proof attempt 1")
+    )
+    classifier.raise_for(
+        pass_kind="semantic_proof", error=InjectedClassifierCrash("proof attempt 2")
+    )
+    classifier.raise_for(
+        pass_kind="semantic_proof", error=InjectedClassifierCrash("proof attempt 3")
+    )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_162,
+        checkpoint=4962,
+        administrator_id=49_162,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    for _attempt_number in (2, 3):
+        system.restart(RuntimeRole.CLASSIFICATION)
+        clock.advance_to(clock.now() + timedelta(seconds=180))
+        with pytest.raises(InjectedClassifierCrash):
+            system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    proof_request_count = len(classifier.proof_requests)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=180))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(classifier.proof_requests) == proof_request_count
+
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.source_message_revision_id == revision_id
+        and attempt.pass_kind == "semantic_proof"
+    )
+    assert [(attempt.attempt_number, attempt.status) for attempt in proof_attempts] == [
+        (1, "failed"),
+        (2, "failed"),
+        (3, "failed"),
+    ]
+    assert system.classification_queue_health().terminal_failure_count == 1
+    assert system.opportunities() == ()
+    assert system.classification_routing_outcomes() == ()
     assert system.opportunity_publication_contracts(revision_id) == ()
 
 
@@ -3977,6 +4154,40 @@ def _v2_accepted_result(*, body: str, candidate_key: str) -> ClassifierAdapterRe
     candidate["source_context"] = body
     output["schema_version"] = "source-message-classification-v2"
     output["routing"] = {"reason_code": "accepted", "required_context": "none"}
+    return replace_classifier_output(result, output)
+
+
+def _legacy_v1_accepted_result(*, body: str) -> ClassifierAdapterResult:
+    """Build one accepted v1 fixture with a location-bound proof target."""
+    result = _minimal_classifier_result(
+        candidate_key="v1-crash-candidate",
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@v1_crash",
+                "evidence": "@v1_crash",
+            }
+        ],
+        event_time_evidence="20 August 2026",
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    output = deepcopy(result.output)
+    candidates = output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    candidate["evidence"] = {
+        **cast(dict[str, JsonValue], candidate["evidence"]),
+        "location": "whole city",
+    }
+    candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
     return replace_classifier_output(result, output)
 
 

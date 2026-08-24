@@ -11,6 +11,7 @@ from modules.ports import (
     ClassifierAdapterResult,
     ClassifierExecutionTimeoutError,
     ClassifierRequest,
+    classifier_provider_error_from_metadata,
 )
 
 EXECUTION_TIMEOUT_SECONDS = 180
@@ -98,6 +99,14 @@ class ResponsesClassifierAdapter:
             )
         except TimeoutError as error:
             raise ClassifierExecutionTimeoutError from error
+        except Exception as error:
+            provider_error = classifier_provider_error_from_metadata(error)
+            if provider_error is not None:
+                raise provider_error from None
+            raise
+        provider_error = classifier_provider_error_from_metadata(response)
+        if provider_error is not None:
+            raise provider_error
         output = response.get("output")
         if not isinstance(output, dict):
             raise RuntimeError("Responses classifier result has no structured output")

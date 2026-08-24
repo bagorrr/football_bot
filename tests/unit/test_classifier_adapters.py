@@ -17,6 +17,7 @@ from modules.ports import (
     ClassifierExecutionTimeoutError,
     ClassifierQuotaError,
     ClassifierRequest,
+    ClassifierTransientError,
 )
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
 
@@ -168,6 +169,45 @@ for event in events:
     assert result["output_tokens"] == 8
 
 
+def test_codex_adapter_maps_provider_5xx_and_retry_after_without_body(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "fake-codex"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "print(json.dumps({'type': 'error', 'status': 503, "
+        "'headers': {'Retry-After': '240'}, "
+        "'error': {'code': 'server_error', "
+        "'message': 'provider body must not cross the port'}}}))\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    schema = tmp_path / "schema.json"
+    schema.write_text("{}", encoding="utf-8")
+    prompt = tmp_path / "primary.prompt.md"
+    prompt.write_text("primary prompt", encoding="utf-8")
+    (tmp_path / "codex-home").mkdir()
+    (tmp_path / "workspace").mkdir()
+    adapter = CodexCliClassifierAdapter(
+        codex_executable=script,
+        codex_home=tmp_path / "codex-home",
+        workspace=tmp_path / "workspace",
+        schema_paths={"source-message-classification-v2": schema},
+        prompt_paths={"open-match-primary-v2": prompt},
+        runner=SubprocessCodexRunner(),
+        codex_version="codex-test-version",
+        adapter_version="codex-classifier-v1",
+    )
+
+    with pytest.raises(ClassifierTransientError) as raised:
+        adapter.classify(_request())
+
+    assert raised.value.retry_after_seconds == 240
+    assert "provider body" not in str(raised.value)
+
+
 def test_codex_adapter_enforces_isolation_and_180_second_timeout(
     tmp_path: Path,
 ) -> None:
@@ -240,6 +280,148 @@ class RecordingResponsesTransport:
             "output_tokens": 8,
             "duration_ms": 40,
         }
+
+
+@dataclass(slots=True)
+class ProviderErrorResponsesTransport:
+    response: dict[str, object]
+
+    def create_response(
+        self, payload: dict[str, object], *, timeout_seconds: int
+    ) -> dict[str, object]:
+        return self.response
+
+
+@dataclass(slots=True)
+class RaisingResponsesTransport:
+    error: Exception
+
+    def create_response(
+        self, payload: dict[str, object], *, timeout_seconds: int
+    ) -> dict[str, object]:
+        raise self.error
+
+
+def test_responses_adapter_maps_provider_5xx_and_retry_after_without_body(
+    tmp_path: Path,
+) -> None:
+    prompt = tmp_path / "primary.prompt.md"
+    prompt.write_text("primary prompt", encoding="utf-8")
+    transport = ProviderErrorResponsesTransport(
+        response={
+            "status_code": 503,
+            "headers": {"Retry-After": "240"},
+            "error": {"message": "provider body must not cross the port"},
+        }
+    )
+    adapter = ResponsesClassifierAdapter(
+        transport=transport,
+        schemas={"source-message-classification-v2": {}},
+        prompt_paths={"open-match-primary-v2": prompt},
+        adapter_version="responses-classifier-v1",
+    )
+
+    with pytest.raises(ClassifierTransientError) as raised:
+        adapter.classify(_request())
+
+    assert raised.value.retry_after_seconds == 240
+    assert "provider body" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_code", "expected_type", "retry_after_seconds"),
+    (
+        (401, "invalid_api_key", ClassifierAuthenticationError, None),
+        (429, "quota_exhausted", ClassifierQuotaError, 240),
+    ),
+)
+def test_responses_adapter_maps_auth_and_quota_provider_failures(
+    status_code: int,
+    error_code: str,
+    expected_type: type[ClassifierAuthenticationError | ClassifierQuotaError],
+    retry_after_seconds: int | None,
+    tmp_path: Path,
+) -> None:
+    prompt = tmp_path / "primary.prompt.md"
+    prompt.write_text("primary prompt", encoding="utf-8")
+    response: dict[str, object] = {
+        "status_code": status_code,
+        "error": {
+            "code": error_code,
+            "message": "provider body must not cross the port",
+        },
+    }
+    if retry_after_seconds is not None:
+        response["headers"] = {"retry-after": str(retry_after_seconds)}
+    adapter = ResponsesClassifierAdapter(
+        transport=ProviderErrorResponsesTransport(response=response),
+        schemas={"source-message-classification-v2": {}},
+        prompt_paths={"open-match-primary-v2": prompt},
+        adapter_version="responses-classifier-v1",
+    )
+
+    with pytest.raises(expected_type) as raised:
+        adapter.classify(_request())
+
+    if isinstance(raised.value, ClassifierQuotaError):
+        assert raised.value.retry_after_seconds == retry_after_seconds
+    assert "provider body" not in str(raised.value)
+
+
+def test_responses_adapter_maps_untyped_provider_exception_to_body_free_error(
+    tmp_path: Path,
+) -> None:
+    prompt = tmp_path / "primary.prompt.md"
+    prompt.write_text("primary prompt", encoding="utf-8")
+    adapter = ResponsesClassifierAdapter(
+        transport=RaisingResponsesTransport(
+            RuntimeError(
+                "HTTP 503 provider body must not cross the port; Retry-After: 240"
+            )
+        ),
+        schemas={"source-message-classification-v2": {}},
+        prompt_paths={"open-match-primary-v2": prompt},
+        adapter_version="responses-classifier-v1",
+    )
+
+    with pytest.raises(ClassifierTransientError) as raised:
+        adapter.classify(_request())
+
+    assert raised.value.retry_after_seconds == 240
+    assert "provider body" not in str(raised.value)
+
+
+def test_responses_adapter_does_not_scan_success_output_as_provider_metadata(
+    tmp_path: Path,
+) -> None:
+    prompt = tmp_path / "primary.prompt.md"
+    prompt.write_text("primary prompt", encoding="utf-8")
+    adapter = ResponsesClassifierAdapter(
+        transport=ProviderErrorResponsesTransport(
+            response={
+                "output": {
+                    "schema_version": "source-message-classification-v2",
+                    "disposition": "irrelevant",
+                    "candidates": [],
+                    "routing": {
+                        "reason_code": "quota_is_not_a_provider_error_here",
+                        "required_context": "none",
+                    },
+                },
+                "effective_model": "gpt-5.6-sol",
+            }
+        ),
+        schemas={"source-message-classification-v2": {}},
+        prompt_paths={"open-match-primary-v2": prompt},
+        adapter_version="responses-classifier-v1",
+    )
+
+    result = adapter.classify(_request())
+
+    assert result.output["routing"] == {
+        "reason_code": "quota_is_not_a_provider_error_here",
+        "required_context": "none",
+    }
 
 
 @pytest.mark.parametrize("adapter_kind", ("codex_cli", "responses_api"))
