@@ -44,8 +44,9 @@ def _apply_untracked_repository_migrations(
     database_url: str,
     *,
     applied_count: int | None = None,
+    single_transaction: bool = False,
 ) -> None:
-    with psycopg.connect(database_url, autocommit=True) as connection:
+    with psycopg.connect(database_url, autocommit=not single_transaction) as connection:
         migration_paths = _migration_paths()
         for migration_path in migration_paths[:applied_count]:
             connection.execute(migration_path.read_text(encoding="utf-8"))
@@ -833,7 +834,11 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
 def test_0020_fails_closed_for_ambiguous_and_colliding_legacy_identities(
     fresh_database_url: str,
 ) -> None:
-    _apply_untracked_repository_migrations(fresh_database_url, applied_count=19)
+    _apply_untracked_repository_migrations(
+        fresh_database_url,
+        applied_count=19,
+        single_transaction=True,
+    )
     mixed_source_message_id = "source-chat:channel:4920000:generation:1:message:2001"
     recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
     with psycopg.connect(fresh_database_url) as connection:
