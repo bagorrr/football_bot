@@ -8,11 +8,14 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
-from threading import Condition
+from threading import Condition, get_ident
 from time import monotonic
-from typing import cast
+from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import psycopg
+from psycopg import conninfo
 
 from modules.application import (
     ConversationOnboarding,
@@ -36,6 +39,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationRoutingOutcome,
     CompletedSearch,
     ConversationStage,
     ConversationState,
@@ -105,6 +109,102 @@ _CONTRACTS = {
     (definition.name, definition.version): definition
     for definition in SUPPORTED_CONTRACTS
 }
+
+# System acceptance tests reuse one database while resetting only synthetic data.
+# Keep migration verification on the first boot for that database; dedicated
+# migration tests continue to exercise PostgresAcceptanceMigrator directly.
+_TESTKIT_MIGRATED_DATABASE_URLS: set[str] = set()
+_TESTKIT_RUNTIME_PASSWORDS: dict[str, dict[RuntimeRole, str]] = {}
+_TESTKIT_LAST_PROVISIONED_DATABASE_URL: str | None = None
+_TESTKIT_RUNTIME_CONNECTION_CACHE: dict[
+    tuple[str, int, str], psycopg.Connection[Any]
+] = {}
+_TESTKIT_RUNTIME_CONNECTION_ACTIVE: dict[tuple[str, int, str], int] = {}
+_TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED = False
+
+
+def _runtime_connection_key(
+    args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> tuple[str, int, str] | None:
+    """Identify only runtime-role connections eligible for test reuse."""
+    if not args or not isinstance(args[0], str):
+        return None
+    connection_info = conninfo.conninfo_to_dict(args[0])
+    runtime_role_names = {role.database_role for role in RuntimeRole}
+    if connection_info.get("user") not in runtime_role_names:
+        return None
+    option_key = repr(sorted((name, repr(value)) for name, value in kwargs.items()))
+    return args[0], get_ident(), option_key
+
+
+@contextmanager
+def _runtime_connection_context(
+    *,
+    key: tuple[str, int, str],
+    connection: psycopg.Connection[Any],
+    transient: bool,
+) -> Iterator[psycopg.Connection[Any]]:
+    """Commit or roll back one operation without closing reused connections."""
+    _TESTKIT_RUNTIME_CONNECTION_ACTIVE[key] = (
+        _TESTKIT_RUNTIME_CONNECTION_ACTIVE.get(key, 0) + 1
+    )
+    try:
+        yield connection
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+    finally:
+        active_count = _TESTKIT_RUNTIME_CONNECTION_ACTIVE.get(key, 1) - 1
+        if active_count > 0:
+            _TESTKIT_RUNTIME_CONNECTION_ACTIVE[key] = active_count
+        else:
+            _TESTKIT_RUNTIME_CONNECTION_ACTIVE.pop(key)
+        if transient:
+            connection.close()
+
+
+def _install_runtime_connection_cache() -> None:
+    """Reuse only testkit runtime connections while preserving transaction scopes."""
+    global _TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED
+    if _TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED:
+        return
+    original_connect = psycopg.connect
+
+    def cached_connect(*args: Any, **kwargs: Any) -> Any:
+        key = _runtime_connection_key(args, kwargs)
+        if key is None:
+            return original_connect(*args, **kwargs)
+        connection = _TESTKIT_RUNTIME_CONNECTION_CACHE.get(key)
+        if connection is None or connection.closed:
+            connection = original_connect(*args, **kwargs)
+            _TESTKIT_RUNTIME_CONNECTION_CACHE[key] = connection
+        if _TESTKIT_RUNTIME_CONNECTION_ACTIVE.get(key, 0):
+            transient = original_connect(*args, **kwargs)
+            return _runtime_connection_context(
+                key=key,
+                connection=transient,
+                transient=True,
+            )
+        return _runtime_connection_context(
+            key=key,
+            connection=connection,
+            transient=False,
+        )
+
+    psycopg.connect = cast(Any, cached_connect)
+    _TESTKIT_RUNTIME_CONNECTION_CACHE_INSTALLED = True
+
+
+def _invalidate_runtime_connections(database_url: str) -> None:
+    """Close cached role sessions when the acceptance seam simulates restart."""
+    for key in tuple(_TESTKIT_RUNTIME_CONNECTION_CACHE):
+        if key[0] != database_url:
+            continue
+        connection = _TESTKIT_RUNTIME_CONNECTION_CACHE.pop(key)
+        _TESTKIT_RUNTIME_CONNECTION_ACTIVE.pop(key, None)
+        connection.close()
 
 
 @dataclass(slots=True)
@@ -783,23 +883,65 @@ class ControlledModelAdapter:
     """Deterministic model adapter with no provider access."""
 
     _results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    _second_pass_results: dict[str, ClassifierAdapterResult] = field(
+        default_factory=dict
+    )
+    _candidate_proof_results: dict[tuple[str, str], ClassifierAdapterResult] = field(
+        default_factory=dict
+    )
     _proof_results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    _classify_failures: dict[str, list[Exception]] = field(default_factory=dict)
     requests: list[ClassifierRequest] = field(default_factory=list)
+    second_pass_requests: list[ClassifierRequest] = field(default_factory=list)
     proof_requests: list[ClassifierRequest] = field(default_factory=list)
+    primary_schema_version: str = "source-message-classification-v1"
 
     def return_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
         """Configure one deterministic structured classifier response."""
         self._results[body] = result
 
-    def return_proof_for(self, *, body: str, result: ClassifierAdapterResult) -> None:
+    def return_proof_for(
+        self,
+        *,
+        body: str,
+        result: ClassifierAdapterResult,
+        candidate_key: str | None = None,
+    ) -> None:
         """Configure one deterministic semantic-proof response."""
-        self._proof_results[body] = result
+        if candidate_key is None:
+            self._proof_results[body] = result
+        else:
+            self._candidate_proof_results[(body, candidate_key)] = result
+
+    def return_second_pass_for(
+        self, *, body: str, result: ClassifierAdapterResult
+    ) -> None:
+        """Configure one deterministic bounded ambiguity-pass response."""
+        self._second_pass_results[body] = result
+
+    def enable_primary_v2(self) -> None:
+        """Opt the controlled model boundary into the additive v2 output."""
+        self.primary_schema_version = "source-message-classification-v2"
+
+    def raise_for(self, *, pass_kind: str = "primary", error: Exception) -> None:
+        """Inject one provider/process failure at the controlled classifier seam."""
+        self._classify_failures.setdefault(pass_kind, []).append(error)
 
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return only configured offline output and retain policy provenance."""
         self.requests.append(request)
+        if request.pass_kind == "ambiguity_second_pass":
+            self.second_pass_requests.append(request)
+        failures = self._classify_failures.get(request.pass_kind)
+        if failures:
+            raise failures.pop(0)
+        configured_results = (
+            self._second_pass_results
+            if request.pass_kind == "ambiguity_second_pass"
+            else self._results
+        )
         try:
-            result = self._results[request.body]
+            result = configured_results[request.body]
         except KeyError as error:
             raise RuntimeError(
                 "controlled classifier result is not configured"
@@ -815,8 +957,16 @@ class ControlledModelAdapter:
     def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return a controlled proof pass without changing primary request counts."""
         self.proof_requests.append(request)
+        failures = self._classify_failures.get(request.pass_kind)
+        if failures:
+            raise failures.pop(0)
         try:
-            result = self._proof_results[request.body]
+            result = (
+                self._candidate_proof_results.get(
+                    (request.body, request.proof_candidate_key or "")
+                )
+                or self._proof_results[request.body]
+            )
         except KeyError:
             try:
                 primary = self._results[request.body]
@@ -850,34 +1000,41 @@ def _ensure_test_proposition_evidence(
     if enriched.get("disposition") != "accepted":
         return enriched
     candidates = enriched.get("candidates")
-    if not isinstance(candidates, list) or len(candidates) != 1:
+    if not isinstance(candidates, list):
         return enriched
-    candidate = candidates[0]
-    if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
-        return enriched
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
+            continue
+        _add_test_proposition_evidence(candidate, body=body)
+    return enriched
+
+
+def _add_test_proposition_evidence(
+    candidate: dict[str, JsonValue], *, body: str
+) -> None:
     candidate_key = candidate.get("candidate_key")
     evidence = candidate.get("evidence")
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
-        return enriched
+        return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
-        return enriched
+        return
     if not isinstance(routes, list):
-        return enriched
+        return
     route_values: list[tuple[str, str, str]] = []
     for route in routes:
         if not isinstance(route, dict):
-            return enriched
+            return
         kind = route.get("kind")
         value = route.get("value")
         route_evidence = route.get("evidence")
         if not all(isinstance(item, str) for item in (kind, value, route_evidence)):
-            return enriched
+            return
         assert isinstance(kind, str)
         assert isinstance(value, str)
         assert isinstance(route_evidence, str)
         if route_evidence not in body:
-            return enriched
+            return
         route_values.append((kind, value, route_evidence))
 
     def span(text: str) -> dict[str, JsonValue]:
@@ -945,7 +1102,6 @@ def _ensure_test_proposition_evidence(
         ],
         "relations": relations,
     }
-    return enriched
 
 
 def _build_test_semantic_proof(
@@ -1880,6 +2036,12 @@ class AcceptanceSpine:
     def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
         """Observe durable primary-classifier provenance."""
         return self._observer.classification_attempts()
+
+    def classification_routing_outcomes(
+        self,
+    ) -> tuple[ClassificationRoutingOutcome, ...]:
+        """Observe body-free Application classifier routing state."""
+        return self._observer.classification_routing_outcomes()
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
@@ -3037,10 +3199,19 @@ def boot_acceptance_spine(
         runtime_database_url,
     )
 
+    _install_runtime_connection_cache()
     migrator = PostgresAcceptanceMigrator(admin_database_url)
-    migrator.migrate()
-    passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
-    migrator.provision_runtime_credentials(passwords)
+    if admin_database_url not in _TESTKIT_MIGRATED_DATABASE_URLS:
+        migrator.migrate()
+        _TESTKIT_MIGRATED_DATABASE_URLS.add(admin_database_url)
+    passwords = _TESTKIT_RUNTIME_PASSWORDS.get(admin_database_url)
+    if passwords is None:
+        passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
+        _TESTKIT_RUNTIME_PASSWORDS[admin_database_url] = passwords
+    global _TESTKIT_LAST_PROVISIONED_DATABASE_URL
+    if admin_database_url != _TESTKIT_LAST_PROVISIONED_DATABASE_URL:
+        migrator.provision_runtime_credentials(passwords)
+        _TESTKIT_LAST_PROVISIONED_DATABASE_URL = admin_database_url
     role_urls = {
         role: runtime_database_url(admin_database_url, role, passwords[role])
         for role in RuntimeRole
@@ -3058,6 +3229,7 @@ def boot_acceptance_spine(
     installed_timezone_data = timezone_data or InstalledTimezoneDataAdapter()
 
     def restart_role(role: RuntimeRole) -> AcceptanceRole:
+        _invalidate_runtime_connections(role_urls[role])
         return boot_acceptance_role(
             role=role,
             database_url=role_urls[role],

@@ -359,9 +359,12 @@ def test_semantically_negated_open_match_has_no_postgres_publication_effect() ->
             if revision.source_event_id == source_event_id
         )
         attempts = system.classification_attempts()
+        assert attempts[-2].status == "succeeded"
+        assert attempts[-2].disposition == "accepted"
         assert attempts[-1].status == "succeeded"
-        assert attempts[-1].disposition == "accepted"
-        assert len(attempts) == case_index + 1
+        assert attempts[-1].pass_kind == "semantic_proof"
+        assert attempts[-1].disposition == "needs_review"
+        assert len(attempts) == 2 * (case_index + 1)
         assert len(classifier.requests) == case_index + 1
         assert len(classifier.proof_requests) == case_index + 1
         assert classifier.proof_requests[-1].requested_model == "gpt-5.6-sol"
@@ -651,7 +654,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     } == {"en", "es", "fr", "ru"}
 
     attempts = system.classification_attempts()
-    assert len(attempts) == 1
+    assert len(attempts) == 2
     assert attempts[0].requested_model == "gpt-5.6-sol"
     assert attempts[0].effective_model == "gpt-5.6-sol"
     assert attempts[0].requested_reasoning_effort == "high"
@@ -673,6 +676,9 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     assert attempts[0].disposition == "accepted"
     assert attempts[0].status == "succeeded"
+    assert attempts[1].pass_kind == "semantic_proof"
+    assert attempts[1].attempt_number == 1
+    assert attempts[1].status == "succeeded"
     opportunities = system.opportunities()
     assert len(opportunities) == 1
     assert opportunities[0].opportunity_type == "open_match"

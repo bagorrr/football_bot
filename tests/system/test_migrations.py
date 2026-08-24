@@ -745,6 +745,385 @@ def test_migrate_adopts_untracked_current_schema_without_replaying(
     ]
 
 
+def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=17)
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    candidate_source = "source-chat:channel:4918100:generation:1:message:1001"
+    proposition_source = "source-chat:channel:4918100:generation:1:message:1002"
+    with psycopg.connect(fresh_database_url) as connection:
+        for source_message_id, identity_marker in (
+            (candidate_source, "candidate:aaaaaaaaaaaaaaaa"),
+            (proposition_source, "proposition:bbbbbbbbbbbbbbbb"),
+        ):
+            opportunity_id = (
+                f"opportunity:{source_message_id}:open_match:{identity_marker}"
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                    %s
+                )
+                """,
+                (
+                    opportunity_id,
+                    f"{opportunity_id}:revision:1",
+                    f"{source_message_id}:revision:1",
+                    recorded_at,
+                ),
+            )
+
+    migration_paths = _migration_paths()
+    with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+        for migration_path in migration_paths[17:19]:
+            connection.execute(migration_path.read_text(encoding="utf-8"))
+
+    mixed_source_message_id = "source-chat:channel:4920000:generation:1:message:2001"
+    with psycopg.connect(fresh_database_url) as connection:
+        for identity_marker in (
+            "candidate:aaaaaaaaaaaaaaaa",
+            "proposition:bbbbbbbbbbbbbbbb",
+        ):
+            opportunity_id = (
+                f"opportunity:{mixed_source_message_id}:open_match:{identity_marker}"
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{}'::jsonb, %s
+                )
+                """,
+                (
+                    opportunity_id,
+                    f"{opportunity_id}:revision:1",
+                    f"{mixed_source_message_id}:revision:1",
+                    recorded_at,
+                ),
+            )
+
+    migration_sql = migration_paths[19].read_text(encoding="utf-8")
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute("SAVEPOINT mixed_identity_failure")
+        with pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping is ambiguous",
+        ):
+            connection.execute(migration_sql)
+        connection.execute("ROLLBACK TO SAVEPOINT mixed_identity_failure")
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_opportunities
+            WHERE source_message_revision_id = %s
+            """,
+            (f"{mixed_source_message_id}:revision:1",),
+        )
+
+        collision_source_message_id = (
+            "source-chat:channel:4920001:generation:1:message:2002"
+        )
+        legacy_opportunity_id = (
+            f"opportunity:{collision_source_message_id}:open_match:"
+            "candidate:cccccccccccccccc"
+        )
+        canonical_opportunity_id = (
+            f"opportunity:{collision_source_message_id}:open_match:"
+            "proposition:cccccccccccccccc"
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type,
+                publication_state, accepted_facts, evidence,
+                response_route, accepted_at
+            ) VALUES (
+                %s, %s, %s, 'open_match', 'active',
+                '{}'::jsonb, '{}'::jsonb,
+                '{}'::jsonb, %s
+            )
+            """,
+            (
+                legacy_opportunity_id,
+                f"{legacy_opportunity_id}:revision:1",
+                f"{collision_source_message_id}:revision:1",
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_proposition_identities (
+                source_message_id, proposition_slot, opportunity_id,
+                proposition_discriminator, created_at
+            ) VALUES (%s, 1, %s, %s, %s)
+            """,
+            (
+                collision_source_message_id,
+                canonical_opportunity_id,
+                "canonical-collision",
+                recorded_at,
+            ),
+        )
+        connection.execute("SAVEPOINT lineage_collision_failure")
+        with pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping collides with lineage",
+        ):
+            connection.execute(migration_sql)
+        connection.execute("ROLLBACK TO SAVEPOINT lineage_collision_failure")
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_opportunities
+            WHERE source_message_revision_id = %s
+            """,
+            (f"{collision_source_message_id}:revision:1",),
+        )
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_proposition_identities
+            WHERE source_message_id = %s
+            """,
+            (collision_source_message_id,),
+        )
+
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        mappings = connection.execute(
+            """
+            SELECT source_message_id, proposition_slot, opportunity_id,
+                   proposition_discriminator
+            FROM football_runtime.application_proposition_identities
+            WHERE source_message_id IN (%s, %s)
+            ORDER BY source_message_id
+            """,
+            (candidate_source, proposition_source),
+        ).fetchall()
+        compatibility = connection.execute(
+            """
+            SELECT source_message_id, legacy_opportunity_id,
+                   canonical_opportunity_id
+            FROM football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id IN (%s, %s)
+            ORDER BY source_message_id
+            """,
+            (candidate_source, proposition_source),
+        ).fetchall()
+    assert mappings == [
+        (
+            candidate_source,
+            1,
+            f"opportunity:{candidate_source}:open_match:candidate:aaaaaaaaaaaaaaaa",
+            f"opportunity:{candidate_source}:open_match:candidate:aaaaaaaaaaaaaaaa",
+        ),
+        (
+            proposition_source,
+            1,
+            f"opportunity:{proposition_source}:open_match:proposition:bbbbbbbbbbbbbbbb",
+            f"opportunity:{proposition_source}:open_match:proposition:bbbbbbbbbbbbbbbb",
+        ),
+    ]
+    assert compatibility == [
+        (
+            candidate_source,
+            f"opportunity:{candidate_source}:open_match:candidate:aaaaaaaaaaaaaaaa",
+            f"opportunity:{candidate_source}:open_match:proposition:aaaaaaaaaaaaaaaa",
+        )
+    ]
+
+
+def test_0020_rejects_overlong_legacy_candidate_identity_before_mapping(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=19)
+    source_message_id = "source-chat:channel:4918103:generation:1:message:1006"
+    legacy_opportunity_id = (
+        f"opportunity:{source_message_id}:open_match:candidate:aaaaaaaaaaaaaaaaa"
+    )
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type,
+                publication_state, accepted_facts, evidence,
+                response_route, accepted_at
+            ) VALUES (
+                %s, %s, %s, 'open_match', 'active',
+                '{}'::jsonb, '{}'::jsonb,
+                '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                %s
+            )
+            """,
+            (
+                legacy_opportunity_id,
+                f"{legacy_opportunity_id}:revision:1",
+                f"{source_message_id}:revision:1",
+                recorded_at,
+            ),
+        )
+
+    migration_sql = _migration_paths()[19].read_text(encoding="utf-8")
+    with (
+        pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping is malformed",
+        ),
+        psycopg.connect(fresh_database_url) as connection,
+    ):
+        connection.execute(migration_sql)
+
+    with psycopg.connect(fresh_database_url) as connection:
+        assert connection.execute(
+            """
+            SELECT to_regclass(
+                'football_runtime.application_legacy_proposition_identity_compatibility'
+            )
+            """
+        ).fetchone() == (None,)
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_proposition_identities
+            WHERE source_message_id = %s
+            """,
+            (source_message_id,),
+        ).fetchone() == (0,)
+
+
+def test_0018_fails_closed_for_mixed_legacy_v4_identity_formats(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=17)
+    source_message_id = "source-chat:channel:4918101:generation:1:message:1003"
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        for identity_marker in (
+            "candidate:cccccccccccccccc",
+            "proposition:dddddddddddddddd",
+        ):
+            opportunity_id = (
+                f"opportunity:{source_message_id}:open_match:{identity_marker}"
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                    %s
+                )
+                """,
+                (
+                    opportunity_id,
+                    f"{opportunity_id}:revision:1",
+                    f"{source_message_id}:revision:1",
+                    recorded_at,
+                ),
+            )
+
+    with pytest.raises(
+        psycopg.errors.RaiseException,
+        match="legacy v4 proposition identity formats are ambiguous",
+    ):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+
+@pytest.mark.parametrize(
+    "identity_marker",
+    ("candidate:eeeeeeeeeeeeeeee", "proposition:ffffffffffffffff"),
+)
+def test_0018_fails_closed_for_cross_source_legacy_identity_collision_before_insert(
+    fresh_database_url: str,
+    identity_marker: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=17)
+    first_source = "source-chat:channel:4918102:generation:1:message:1004"
+    second_source = "source-chat:channel:4918102:generation:1:message:1005"
+    shared_opportunity_id = f"opportunity:legacy-shared:open_match:{identity_marker}"
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            ALTER TABLE football_runtime.application_opportunities
+            DROP CONSTRAINT application_opportunities_pkey
+            """
+        )
+        for source_message_id, revision_number in (
+            (first_source, 1),
+            (second_source, 2),
+        ):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                    %s
+                )
+                """,
+                (
+                    shared_opportunity_id,
+                    f"{shared_opportunity_id}:revision:{revision_number}",
+                    f"{source_message_id}:revision:{revision_number}",
+                    recorded_at,
+                ),
+            )
+
+    with (
+        pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity collides across source messages",
+        ),
+        psycopg.connect(fresh_database_url) as connection,
+    ):
+        connection.execute(
+            (
+                Path(__file__).resolve().parents[2]
+                / "db"
+                / "migrations"
+                / "0018_legacy_v4_proposition_identity_backfill.sql"
+            ).read_text(encoding="utf-8")
+        )
+
+    with psycopg.connect(fresh_database_url) as connection:
+        identity_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_proposition_identities
+            """
+        ).fetchone()
+    assert identity_count == (0,)
+
+
 @pytest.mark.parametrize("applied_count", range(1, 9))
 def test_migrate_adopts_each_exact_partial_prefix_and_upgrades_it(
     fresh_database_url: str,

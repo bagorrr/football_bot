@@ -23,6 +23,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationRoutingOutcome,
     CompletedSearch,
     CompletedSearchView,
     ConversationState,
@@ -218,6 +219,9 @@ class ClassifierRequest:
     glossary_version: str
     context_policy_version: str
     routing_policy_version: str
+    pass_kind: str = "primary"
+    adjacent_context: tuple[dict[str, JsonValue], ...] = ()
+    proof_candidate_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +237,18 @@ class ClassifierAdapterResult:
     duration_ms: int
     input_tokens: int
     output_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationProofWork:
+    """Protected durable candidate state for a retryable semantic-proof pass."""
+
+    source_message_revision_id: str
+    ambiguity_output: dict[str, JsonValue]
+    ambiguity_pass_execution: dict[str, JsonValue]
+    ambiguity_adjacent_context: tuple[dict[str, JsonValue], ...]
+    semantic_proofs: tuple[dict[str, JsonValue], ...] = ()
+    semantic_proof_executions: tuple[dict[str, JsonValue], ...] = ()
 
 
 class LocationResolverAdapter(Protocol):
@@ -802,8 +818,56 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         result: ClassifierAdapterResult,
         outgoing: ContractEnvelope | None,
         received_at: datetime,
+        additional_attempts: tuple[
+            tuple[ClassificationAttempt, ClassifierAdapterResult], ...
+        ] = (),
+        finalize: bool = True,
+        proof_work: ClassificationProofWork | None = None,
+        clear_proof_work: bool = False,
     ) -> ConsumeResult:
-        """Atomically retain provenance and publish only a valid proposal."""
+        """Retain one execution and optionally complete its queue handoff."""
+        ...
+
+    def classification_attempts_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[ClassificationAttempt, ...]:
+        """Read prior classifier attempts needed for bounded queue retry."""
+        ...
+
+    def classification_proof_work_for_revision(
+        self, source_message_revision_id: str
+    ) -> ClassificationProofWork | None:
+        """Read protected candidate state for a retryable semantic-proof pass."""
+        ...
+
+    def proposition_opportunity_ids(
+        self, source_message_id: str
+    ) -> tuple[tuple[int, str], ...]:
+        """Read Application-owned proposition slots for one Source Message."""
+        ...
+
+    def proposition_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read durable proposition lineage facts for one Source Message."""
+        ...
+
+    def active_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read all currently active Application opportunities for one source."""
+        ...
+
+    def record_classification_routing_outcome(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        outcome: ClassificationRoutingOutcome,
+        received_at: datetime,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
+    ) -> ConsumeResult:
+        """Atomically retain one body-free Application routing outcome."""
         ...
 
     def publish_opportunity(
@@ -813,8 +877,25 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         opportunity: dict[str, JsonValue],
         outgoing: ContractEnvelope,
         received_at: datetime,
+        routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically accept Application facts and publish one state change."""
+        ...
+
+    def publish_opportunities(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunities: tuple[dict[str, JsonValue], ...],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+        routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
+    ) -> ConsumeResult:
+        """Atomically accept a compound candidate batch and publish one state change."""
         ...
 
     def project_opportunity(
@@ -849,6 +930,17 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         current_event_time: datetime,
     ) -> SourceMessageRevision | None:
         """Return one retained current direct-reply target after the start boundary."""
+        ...
+
+    def adjacent_source_message_revisions(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> tuple[SourceMessageRevision, ...]:
+        """Return the bounded same-generation adjacent context candidates."""
         ...
 
     def claim_next(
@@ -1021,6 +1113,12 @@ class AcceptanceObserver(Protocol):
 
     def classification_attempts(self) -> tuple[ClassificationAttempt, ...]:
         """Observe durable classifier execution provenance."""
+        ...
+
+    def classification_routing_outcomes(
+        self,
+    ) -> tuple[ClassificationRoutingOutcome, ...]:
+        """Observe body-free classifier routing state."""
         ...
 
     def opportunities(self) -> tuple[Opportunity, ...]:

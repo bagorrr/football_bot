@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -35,6 +35,7 @@ from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
     ClassificationAttempt,
+    ClassificationRoutingOutcome,
     CompletedSearch,
     CompletedSearchView,
     ConversationStage,
@@ -88,6 +89,7 @@ from modules.domain import (
 from modules.ports import (
     AcceptanceObservation,
     ClaimedContract,
+    ClassificationProofWork,
     CompletedSearchQueryResult,
     CompletedSearchQueryStatus,
     ConsumeResult,
@@ -111,6 +113,12 @@ _LEGACY_MIGRATION_NAMES = (
     "0013_source_message_ingestion.sql",
     "0014_open_match_game_search.sql",
     "0015_fail_closed_ingestion.sql",
+    "0016_classification_routing_outcomes.sql",
+    "0017_application_proposition_identities.sql",
+    "0018_legacy_v4_proposition_identity_backfill.sql",
+    "0019_application_proposition_discriminators.sql",
+    "0020_application_legacy_proposition_identity_compatibility.sql",
+    "0021_classification_proof_work.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -129,6 +137,12 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "ca73cda707a72b03c72e090e1fb51a763fb648d099554b039c9df4dbad1e95c5",
     "36fb8c2c6a1b9dcfe475315439f9486da96e44b30b169324264344f72ab47003",
     "eb414763ca320bcc06cd6980f4fe1860f9a63c5bf8ef07cd14e43b9c38460dbc",
+    "c717b66b3394868348d3f7d7869d44485f222053af50633bf65176efeff07768",
+    "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
+    "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
+    "97f5851b2f72c5a69d342ce3e72d0908a309dd85bd98495184d43b13508354c9",
+    "2a151808ef6854d40f567f778212218f043eda691fec2ce21fb0e241b277f291",
+    "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -604,6 +618,9 @@ class PostgresAcceptanceObserver:
                      football_runtime.ingestion_failures,
                      football_runtime.protected_content_skips,
                      football_runtime.classification_attempts,
+                     football_runtime.classification_proof_work,
+                     football_runtime.classification_routing_outcomes,
+                     football_runtime.application_proposition_identities,
                      football_runtime.application_opportunities,
                      football_runtime.recommendation_opportunities,
                      football_runtime.source_message_revisions,
@@ -912,7 +929,7 @@ class PostgresAcceptanceObserver:
                        effective_reasoning_effort, prompt_version, schema_version,
                        glossary_version, context_policy_version,
                        routing_policy_version, codex_version, adapter_kind,
-                       adapter_version, pass_number, attempt_number,
+                       adapter_version, pass_number, pass_kind, attempt_number,
                        input_manifest_hash, evidence_references, duration_ms,
                        input_tokens, output_tokens, disposition, status
                 FROM football_runtime.classification_attempts
@@ -928,6 +945,24 @@ class PostgresAcceptanceObserver:
             )
             for row in rows
         )
+
+    def classification_routing_outcomes(
+        self,
+    ) -> tuple[ClassificationRoutingOutcome, ...]:
+        """Observe body-free Application classifier routing state."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT outcome_id, source_message_revision_id, disposition,
+                       route, reason_code, pass_number, candidate_count,
+                       recorded_at
+                FROM football_runtime.classification_routing_outcomes
+                ORDER BY recorded_at, outcome_id
+                """
+            ).fetchall()
+        return tuple(ClassificationRoutingOutcome(**row) for row in rows)
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
@@ -2828,6 +2863,7 @@ class PostgresRoleStore:
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("SourceEventRecorded payload must be an object")
+        source_message_revision_id = payload.get("source_message_revision_id")
         with psycopg.connect(self._database_url) as connection:
             existing = connection.execute(
                 """
@@ -3046,6 +3082,15 @@ class PostgresRoleStore:
                     reply_to_message_id,
                 ),
             )
+            if isinstance(source_message_revision_id, str):
+                source_suppression_outgoings = _suppress_source_event_opportunities(
+                    connection,
+                    incoming=incoming,
+                    source_message_revision_id=source_message_revision_id,
+                    recorded_at=received_at,
+                )
+                for suppression_outgoing in source_suppression_outgoings:
+                    _insert_outbox(connection, suppression_outgoing)
             if outgoing is not None:
                 _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
@@ -3256,6 +3301,85 @@ class PostgresRoleStore:
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
         )
 
+    def adjacent_source_message_revisions(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+        current_event_time: datetime,
+    ) -> tuple[SourceMessageRevision, ...]:
+        """Read at most four retained messages in the exact adjacent window."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT revision.source_message_revision_id,
+                       revision.source_message_id,
+                       revision.source_event_id,
+                       revision.revision,
+                       revision.event_kind,
+                       revision.body,
+                       revision.event_time,
+                       revision.recorded_at,
+                       revision.registry_generation,
+                       revision.bounded_metadata,
+                       revision.reply_to_telegram_message_id
+                FROM football_runtime.source_messages AS message
+                JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_id = message.source_message_id
+                 AND revision.revision = message.current_revision
+                 AND revision.registry_generation = message.registry_generation
+                JOIN football_runtime.source_chat_registry AS registry
+                  ON registry.peer_kind = message.peer_kind
+                 AND registry.telegram_chat_id = message.telegram_chat_id
+                 AND registry.registry_generation = message.registry_generation
+                 AND registry.enabled
+                WHERE message.peer_kind = %s
+                  AND message.telegram_chat_id = %s
+                  AND message.registry_generation = %s
+                  AND message.telegram_message_id <> %s
+                  AND abs(message.telegram_message_id - %s) <= 2
+                  AND NOT message.tombstoned
+                  AND message.recorded_at >= registry.processing_started_at
+                  AND revision.body IS NOT NULL
+                  AND revision.event_time BETWEEN
+                      %s - INTERVAL '24 hours'
+                      AND %s + INTERVAL '24 hours'
+                ORDER BY message.telegram_message_id
+                LIMIT 4
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    telegram_message_id,
+                    telegram_message_id,
+                    current_event_time,
+                    current_event_time,
+                ),
+            ).fetchall()
+        return tuple(
+            SourceMessageRevision(
+                source_message_revision_id=row["source_message_revision_id"],
+                source_message_id=row["source_message_id"],
+                source_event_id=row["source_event_id"],
+                revision=row["revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+                registry_generation=row["registry_generation"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            )
+            for row in rows
+        )
+
     def claim_next(
         self,
         *,
@@ -3447,75 +3571,344 @@ class PostgresRoleStore:
         result: Any,
         outgoing: ContractEnvelope | None,
         received_at: datetime,
+        additional_attempts: tuple[tuple[ClassificationAttempt, Any], ...] = (),
+        finalize: bool = True,
+        proof_work: ClassificationProofWork | None = None,
+        clear_proof_work: bool = False,
     ) -> ConsumeResult:
-        """Atomically retain provenance and publish only a valid proposal."""
+        """Retain one execution and optionally complete its queue handoff."""
         if self._role is not RuntimeRole.CLASSIFICATION:
             raise ConversationAccessDeniedError
+        if not finalize and outgoing is not None:
+            raise ValueError("a retryable classifier attempt cannot publish")
         with psycopg.connect(self._database_url) as connection:
-            if not _begin_owned_contract(
+            if finalize and not _begin_owned_contract(
                 connection,
                 consumer=self._role,
                 incoming=incoming,
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
-            connection.execute(
-                """
+            for stored_attempt, stored_result in (
+                (attempt, result),
+                *additional_attempts,
+            ):
+                connection.execute(
+                    """
                 INSERT INTO football_runtime.classification_attempts (
                     attempt_id, source_message_revision_id, requested_model,
                     effective_model, requested_reasoning_effort,
                     effective_reasoning_effort, prompt_version, schema_version,
                     glossary_version, context_policy_version,
                     routing_policy_version, codex_version, adapter_kind,
-                    adapter_version, pass_number, attempt_number,
+                    adapter_version, pass_number, pass_kind, attempt_number,
                     input_manifest_hash, evidence_references, duration_ms,
                     input_tokens, output_tokens, disposition, status, recorded_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s
                 ) ON CONFLICT (attempt_id) DO NOTHING
-                """,
-                (
-                    attempt.attempt_id,
-                    attempt.source_message_revision_id,
-                    attempt.requested_model,
-                    attempt.effective_model,
-                    attempt.requested_reasoning_effort,
-                    attempt.effective_reasoning_effort,
-                    attempt.prompt_version,
-                    attempt.schema_version,
-                    attempt.glossary_version,
-                    attempt.context_policy_version,
-                    attempt.routing_policy_version,
-                    result.codex_version,
-                    result.adapter_kind,
-                    result.adapter_version,
-                    attempt.pass_number,
-                    attempt.attempt_number,
-                    attempt.input_manifest_hash,
-                    json.dumps(attempt.evidence_references),
-                    result.duration_ms,
-                    result.input_tokens,
-                    result.output_tokens,
-                    attempt.disposition,
-                    attempt.status,
-                    received_at,
-                ),
-            )
-            if outgoing is not None:
+                    """,
+                    (
+                        stored_attempt.attempt_id,
+                        stored_attempt.source_message_revision_id,
+                        stored_attempt.requested_model,
+                        stored_attempt.effective_model,
+                        stored_attempt.requested_reasoning_effort,
+                        stored_attempt.effective_reasoning_effort,
+                        stored_attempt.prompt_version,
+                        stored_attempt.schema_version,
+                        stored_attempt.glossary_version,
+                        stored_attempt.context_policy_version,
+                        stored_attempt.routing_policy_version,
+                        stored_result.codex_version,
+                        stored_result.adapter_kind,
+                        stored_result.adapter_version,
+                        stored_attempt.pass_number,
+                        stored_attempt.pass_kind,
+                        stored_attempt.attempt_number,
+                        stored_attempt.input_manifest_hash,
+                        json.dumps(stored_attempt.evidence_references),
+                        stored_result.duration_ms,
+                        stored_result.input_tokens,
+                        stored_result.output_tokens,
+                        stored_attempt.disposition,
+                        stored_attempt.status,
+                        received_at,
+                    ),
+                )
+            if finalize and outgoing is not None:
                 _insert_outbox(connection, outgoing)
+            if clear_proof_work:
+                connection.execute(
+                    """
+                    DELETE FROM football_runtime.classification_proof_work
+                    WHERE source_message_revision_id = %s
+                    """,
+                    (attempt.source_message_revision_id,),
+                )
+            elif proof_work is not None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.classification_proof_work (
+                        source_message_revision_id, ambiguity_output,
+                        ambiguity_pass_execution, ambiguity_adjacent_context,
+                        semantic_proofs, semantic_proof_executions, updated_at
+                    ) VALUES (%s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                              %s::jsonb, %s)
+                    ON CONFLICT (source_message_revision_id) DO UPDATE
+                    SET ambiguity_output = EXCLUDED.ambiguity_output,
+                        ambiguity_pass_execution = EXCLUDED.ambiguity_pass_execution,
+                        ambiguity_adjacent_context =
+                            EXCLUDED.ambiguity_adjacent_context,
+                        semantic_proofs = EXCLUDED.semantic_proofs,
+                        semantic_proof_executions = EXCLUDED.semantic_proof_executions,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        proof_work.source_message_revision_id,
+                        json.dumps(proof_work.ambiguity_output),
+                        json.dumps(proof_work.ambiguity_pass_execution),
+                        json.dumps(list(proof_work.ambiguity_adjacent_context)),
+                        json.dumps(list(proof_work.semantic_proofs)),
+                        json.dumps(list(proof_work.semantic_proof_executions)),
+                        received_at,
+                    ),
+                )
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
-    def publish_opportunity(
+    def classification_attempts_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[ClassificationAttempt, ...]:
+        """Read prior owned attempts before claiming the next bounded retry."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT attempt_id, source_message_revision_id, requested_model,
+                       effective_model, requested_reasoning_effort,
+                       effective_reasoning_effort, prompt_version, schema_version,
+                       glossary_version, context_policy_version,
+                       routing_policy_version, codex_version, adapter_kind,
+                       adapter_version, pass_number, pass_kind, attempt_number,
+                       input_manifest_hash, evidence_references, duration_ms,
+                       input_tokens, output_tokens, disposition, status
+                FROM football_runtime.classification_attempts
+                WHERE source_message_revision_id = %s
+                ORDER BY attempt_number, pass_number, attempt_id
+                """,
+                (source_message_revision_id,),
+            ).fetchall()
+        return tuple(
+            ClassificationAttempt(
+                **{
+                    **row,
+                    "evidence_references": tuple(row["evidence_references"]),
+                }
+            )
+            for row in rows
+        )
+
+    def classification_proof_work_for_revision(
+        self, source_message_revision_id: str
+    ) -> ClassificationProofWork | None:
+        """Read protected candidate state needed for a proof-only retry."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT source_message_revision_id, ambiguity_output,
+                       ambiguity_pass_execution, ambiguity_adjacent_context,
+                       semantic_proofs, semantic_proof_executions
+                FROM football_runtime.classification_proof_work
+                WHERE source_message_revision_id = %s
+                """,
+                (source_message_revision_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ClassificationProofWork(
+            source_message_revision_id=row["source_message_revision_id"],
+            ambiguity_output=cast(dict[str, JsonValue], row["ambiguity_output"]),
+            ambiguity_pass_execution=cast(
+                dict[str, JsonValue], row["ambiguity_pass_execution"]
+            ),
+            ambiguity_adjacent_context=tuple(
+                cast(list[dict[str, JsonValue]], row["ambiguity_adjacent_context"])
+            ),
+            semantic_proofs=tuple(
+                cast(list[dict[str, JsonValue]], row["semantic_proofs"])
+            ),
+            semantic_proof_executions=tuple(
+                cast(list[dict[str, JsonValue]], row["semantic_proof_executions"])
+            ),
+        )
+
+    def proposition_opportunity_ids(
+        self, source_message_id: str
+    ) -> tuple[tuple[int, str], ...]:
+        """Read Application-owned proposition slots for one Source Message."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT identity.proposition_slot,
+                       COALESCE(compatibility.canonical_opportunity_id,
+                                identity.opportunity_id) AS opportunity_id
+                FROM football_runtime.application_proposition_identities AS identity
+                LEFT JOIN
+                    football_runtime.application_legacy_proposition_identity_compatibility
+                    AS compatibility
+                  ON compatibility.legacy_opportunity_id = identity.opportunity_id
+                WHERE identity.source_message_id = %s
+                ORDER BY proposition_slot
+                """,
+                (source_message_id,),
+            ).fetchall()
+        return tuple((row["proposition_slot"], row["opportunity_id"]) for row in rows)
+
+    def proposition_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read Application-owned lineage and latest accepted target facts."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT lineage.proposition_slot,
+                       lineage.proposition_discriminator,
+                       opportunity.normalized_opportunity_id AS opportunity_id,
+                       opportunity.opportunity_type,
+                       opportunity.accepted_facts,
+                       opportunity.evidence,
+                       opportunity.response_route
+                FROM (
+                    SELECT DISTINCT ON (
+                        COALESCE(compatibility.canonical_opportunity_id,
+                                 opportunity.opportunity_id)
+                    )
+                           opportunity.opportunity_id AS raw_opportunity_id,
+                           COALESCE(compatibility.canonical_opportunity_id,
+                                    opportunity.opportunity_id)
+                               AS normalized_opportunity_id,
+                           opportunity.opportunity_type,
+                           accepted_facts, evidence, response_route
+                    FROM football_runtime.application_opportunities AS opportunity
+                    LEFT JOIN
+                        football_runtime.application_legacy_proposition_identity_compatibility
+                        AS compatibility
+                      ON compatibility.legacy_opportunity_id =
+                         opportunity.opportunity_id
+                    WHERE opportunity.source_message_revision_id LIKE %s
+                    ORDER BY COALESCE(compatibility.canonical_opportunity_id,
+                                      opportunity.opportunity_id),
+                             opportunity.accepted_at DESC,
+                             opportunity.opportunity_id
+                ) AS opportunity
+                LEFT JOIN football_runtime.application_proposition_identities
+                    AS lineage
+                  ON lineage.opportunity_id = opportunity.raw_opportunity_id
+                  OR lineage.opportunity_id = opportunity.normalized_opportunity_id
+                  OR EXISTS (
+                      SELECT 1
+                      FROM
+                          football_runtime.application_legacy_proposition_identity_compatibility
+                          AS lineage_compatibility
+                      WHERE lineage_compatibility.legacy_opportunity_id =
+                            lineage.opportunity_id
+                        AND lineage_compatibility.canonical_opportunity_id =
+                            opportunity.normalized_opportunity_id
+                  )
+                ORDER BY lineage.proposition_slot NULLS LAST,
+                         opportunity.normalized_opportunity_id
+                """,
+                (f"{source_message_id}:revision:%",),
+            ).fetchall()
+        return tuple(
+            {
+                "proposition_slot": row["proposition_slot"],
+                "proposition_discriminator": row["proposition_discriminator"],
+                "opportunity_id": row["opportunity_id"],
+                "opportunity_type": row["opportunity_type"],
+                "accepted_facts": row["accepted_facts"],
+                "evidence": row["evidence"],
+                "response_route": row["response_route"],
+            }
+            for row in rows
+        )
+
+    def active_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read active Application rows that must be reconciled by current revision."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT opportunity.opportunity_id AS raw_opportunity_id,
+                       COALESCE(compatibility.canonical_opportunity_id,
+                                opportunity.opportunity_id) AS opportunity_id,
+                       opportunity.source_message_revision_id,
+                       opportunity.opportunity_type,
+                       opportunity.accepted_facts,
+                       opportunity.evidence,
+                       opportunity.response_route
+                FROM football_runtime.application_opportunities AS opportunity
+                LEFT JOIN
+                    football_runtime.application_legacy_proposition_identity_compatibility
+                    AS compatibility
+                  ON compatibility.legacy_opportunity_id =
+                     opportunity.opportunity_id
+                WHERE opportunity.source_message_revision_id LIKE %s
+                  AND opportunity.publication_state = 'active'
+                ORDER BY opportunity.opportunity_id
+                """,
+                (f"{source_message_id}:revision:%",),
+            ).fetchall()
+        return tuple(
+            {
+                "raw_opportunity_id": row["raw_opportunity_id"],
+                "opportunity_id": row["opportunity_id"],
+                "source_message_revision_id": row["source_message_revision_id"],
+                "opportunity_type": row["opportunity_type"],
+                "accepted_facts": row["accepted_facts"],
+                "evidence": row["evidence"],
+                "response_route": row["response_route"],
+            }
+            for row in rows
+        )
+
+    def record_classification_routing_outcome(
         self,
         *,
         incoming: ContractEnvelope,
-        opportunity: dict[str, JsonValue],
-        outgoing: ContractEnvelope,
+        outcome: ClassificationRoutingOutcome,
         received_at: datetime,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
-        """Atomically retain accepted facts and emit publication state."""
+        """Atomically retain one body-free Application routing outcome."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         with psycopg.connect(self._database_url) as connection:
@@ -3528,6 +3921,102 @@ class PostgresRoleStore:
                 return ConsumeResult.REPLAYED
             connection.execute(
                 """
+                INSERT INTO football_runtime.classification_routing_outcomes (
+                    outcome_id, source_message_revision_id, disposition, route,
+                    reason_code, pass_number, candidate_count, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (outcome_id) DO NOTHING
+                """,
+                (
+                    outcome.outcome_id,
+                    outcome.source_message_revision_id,
+                    outcome.disposition,
+                    outcome.route,
+                    outcome.reason_code,
+                    outcome.pass_number,
+                    outcome.candidate_count,
+                    received_at,
+                ),
+            )
+            _suppress_application_opportunities(
+                connection,
+                suppressed_opportunities=suppressed_opportunities,
+                recorded_at=received_at,
+            )
+            for additional_outgoing in additional_outgoings:
+                _insert_outbox(connection, additional_outgoing)
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def publish_opportunity(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity: dict[str, JsonValue],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+        routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
+    ) -> ConsumeResult:
+        """Atomically retain accepted facts and emit publication state."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            if routing_outcome is not None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.classification_routing_outcomes (
+                        outcome_id, source_message_revision_id, disposition, route,
+                        reason_code, pass_number, candidate_count, recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (outcome_id) DO NOTHING
+                    """,
+                    (
+                        routing_outcome.outcome_id,
+                        routing_outcome.source_message_revision_id,
+                        routing_outcome.disposition,
+                        routing_outcome.route,
+                        routing_outcome.reason_code,
+                        routing_outcome.pass_number,
+                        routing_outcome.candidate_count,
+                        received_at,
+                    ),
+                )
+            proposition_slot = opportunity.get("proposition_slot")
+            proposition_discriminator = opportunity.get("proposition_discriminator")
+            source_message_revision_id = opportunity.get("source_message_revision_id")
+            opportunity_id = opportunity.get("opportunity_id")
+            if (
+                not isinstance(proposition_slot, int)
+                or isinstance(proposition_slot, bool)
+                or proposition_slot < 1
+                or not isinstance(source_message_revision_id, str)
+                or not isinstance(opportunity_id, str)
+                or not isinstance(proposition_discriminator, str)
+                or not proposition_discriminator
+            ):
+                raise ValueError(
+                    "publication requires an Application proposition lineage"
+                )
+            source_message_id = source_message_revision_id.rsplit(":revision:", 1)[0]
+            _ensure_application_proposition_identity_mapping(
+                connection,
+                source_message_id=source_message_id,
+                proposition_slot=proposition_slot,
+                opportunity_id=opportunity_id,
+                proposition_discriminator=proposition_discriminator,
+                created_at=received_at,
+            )
+            connection.execute(
+                """
                 INSERT INTO football_runtime.application_opportunities (
                     opportunity_id, opportunity_revision_id,
                     source_message_revision_id, opportunity_type,
@@ -3535,12 +4024,25 @@ class PostgresRoleStore:
                     accepted_at
                 ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
                 ON CONFLICT (opportunity_id) DO UPDATE
-                SET source_message_revision_id = EXCLUDED.source_message_revision_id,
+                SET opportunity_revision_id = EXCLUDED.opportunity_revision_id,
+                    source_message_revision_id = EXCLUDED.source_message_revision_id,
                     publication_state = EXCLUDED.publication_state,
                     accepted_facts = EXCLUDED.accepted_facts,
                     evidence = EXCLUDED.evidence,
                     response_route = EXCLUDED.response_route,
                     accepted_at = EXCLUDED.accepted_at
+                WHERE (
+                    SELECT revision
+                    FROM football_runtime.source_message_revisions
+                    WHERE source_message_revision_id =
+                          EXCLUDED.source_message_revision_id
+                ) >= (
+                    SELECT revision
+                    FROM football_runtime.source_message_revisions
+                    WHERE source_message_revision_id =
+                          football_runtime.application_opportunities.
+                          source_message_revision_id
+                )
                 """,
                 (
                     opportunity["opportunity_id"],
@@ -3554,7 +4056,140 @@ class PostgresRoleStore:
                     received_at,
                 ),
             )
+            _suppress_application_opportunities(
+                connection,
+                suppressed_opportunities=suppressed_opportunities,
+                recorded_at=received_at,
+            )
             _insert_outbox(connection, outgoing)
+            for additional_outgoing in additional_outgoings:
+                _insert_outbox(connection, additional_outgoing)
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def publish_opportunities(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunities: tuple[dict[str, JsonValue], ...],
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+        routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
+    ) -> ConsumeResult:
+        """Atomically retain a compound candidate batch and emit publication."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        if not opportunities:
+            raise ValueError("compound publication requires at least one opportunity")
+        with psycopg.connect(self._database_url) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            if routing_outcome is not None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.classification_routing_outcomes (
+                        outcome_id, source_message_revision_id, disposition, route,
+                        reason_code, pass_number, candidate_count, recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (outcome_id) DO NOTHING
+                    """,
+                    (
+                        routing_outcome.outcome_id,
+                        routing_outcome.source_message_revision_id,
+                        routing_outcome.disposition,
+                        routing_outcome.route,
+                        routing_outcome.reason_code,
+                        routing_outcome.pass_number,
+                        routing_outcome.candidate_count,
+                        received_at,
+                    ),
+                )
+            for opportunity in opportunities:
+                source_message_revision_id = opportunity["source_message_revision_id"]
+                proposition_slot = opportunity.get("proposition_slot")
+                proposition_discriminator = opportunity.get("proposition_discriminator")
+                if (
+                    not isinstance(source_message_revision_id, str)
+                    or not isinstance(proposition_slot, int)
+                    or isinstance(proposition_slot, bool)
+                    or proposition_slot < 1
+                    or not isinstance(proposition_discriminator, str)
+                    or not proposition_discriminator
+                ):
+                    raise ValueError(
+                        "compound publication requires an App proposition slot"
+                    )
+                source_message_id = source_message_revision_id.rsplit(":revision:", 1)[
+                    0
+                ]
+                opportunity_id = opportunity.get("opportunity_id")
+                if not isinstance(opportunity_id, str):
+                    raise ValueError("compound publication requires an opportunity id")
+                _ensure_application_proposition_identity_mapping(
+                    connection,
+                    source_message_id=source_message_id,
+                    proposition_slot=proposition_slot,
+                    opportunity_id=opportunity_id,
+                    proposition_discriminator=proposition_discriminator,
+                    created_at=received_at,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.application_opportunities (
+                        opportunity_id, opportunity_revision_id,
+                        source_message_revision_id, opportunity_type,
+                        publication_state, accepted_facts, evidence, response_route,
+                        accepted_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                    ON CONFLICT (opportunity_id) DO UPDATE
+                    SET opportunity_revision_id = EXCLUDED.opportunity_revision_id,
+                        source_message_revision_id =
+                            EXCLUDED.source_message_revision_id,
+                        publication_state = EXCLUDED.publication_state,
+                        accepted_facts = EXCLUDED.accepted_facts,
+                        evidence = EXCLUDED.evidence,
+                        response_route = EXCLUDED.response_route,
+                        accepted_at = EXCLUDED.accepted_at
+                    WHERE (
+                        SELECT revision
+                        FROM football_runtime.source_message_revisions
+                        WHERE source_message_revision_id =
+                              EXCLUDED.source_message_revision_id
+                    ) >= (
+                        SELECT revision
+                        FROM football_runtime.source_message_revisions
+                        WHERE source_message_revision_id =
+                              football_runtime.application_opportunities.
+                              source_message_revision_id
+                    )
+                    """,
+                    (
+                        opportunity["opportunity_id"],
+                        opportunity["opportunity_revision_id"],
+                        opportunity["source_message_revision_id"],
+                        opportunity["opportunity_type"],
+                        opportunity["publication_state"],
+                        json.dumps(opportunity["accepted_facts"]),
+                        json.dumps(opportunity["evidence"]),
+                        json.dumps(opportunity["response_route"]),
+                        received_at,
+                    ),
+                )
+            _suppress_application_opportunities(
+                connection,
+                suppressed_opportunities=suppressed_opportunities,
+                recorded_at=received_at,
+            )
+            _insert_outbox(connection, outgoing)
+            for additional_outgoing in additional_outgoings:
+                _insert_outbox(connection, additional_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -3570,6 +4205,14 @@ class PostgresRoleStore:
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("OpportunityPublicationChanged payload must be an object")
+        source_suppression_guard = ""
+        if incoming.idempotency_key.startswith(
+            "opportunity-publication-source-suppression:"
+        ):
+            source_suppression_guard = """
+                          AND recommendation_opportunities.publication_state <>
+                              'active'
+            """
         with psycopg.connect(self._database_url) as connection:
             if not _begin_owned_contract(
                 connection,
@@ -3578,24 +4221,70 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
-            connection.execute(
-                """
-                INSERT INTO football_runtime.recommendation_opportunities (
-                    opportunity_id, opportunity_revision_id, opportunity_type,
-                    publication_state, accepted_facts, response_route, published_at
-                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
-                ON CONFLICT (opportunity_revision_id) DO NOTHING
-                """,
-                (
-                    payload["opportunity_id"],
-                    payload["opportunity_revision_id"],
-                    payload["opportunity_type"],
-                    payload["publication_state"],
-                    json.dumps(payload["accepted_facts"]),
-                    json.dumps(payload["response_route"]),
-                    received_at,
-                ),
-            )
+            if incoming.contract_version == 3:
+                batch = payload["opportunities"]
+                if not isinstance(batch, list):
+                    raise TypeError("OpportunityPublicationChanged v3 batch is invalid")
+                for opportunity in batch:
+                    if not isinstance(opportunity, dict):
+                        raise TypeError(
+                            "OpportunityPublicationChanged v3 item is invalid"
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO football_runtime.recommendation_opportunities (
+                            opportunity_id, opportunity_revision_id, opportunity_type,
+                            publication_state, accepted_facts, response_route,
+                            published_at
+                        ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                        ON CONFLICT (opportunity_revision_id) DO UPDATE
+                        SET opportunity_id = EXCLUDED.opportunity_id,
+                            opportunity_type = EXCLUDED.opportunity_type,
+                            publication_state = EXCLUDED.publication_state,
+                            accepted_facts = EXCLUDED.accepted_facts,
+                            response_route = EXCLUDED.response_route,
+                            published_at = EXCLUDED.published_at
+                        WHERE recommendation_opportunities.opportunity_id =
+                              EXCLUDED.opportunity_id
+                        """,
+                        (
+                            opportunity["opportunity_id"],
+                            opportunity["opportunity_revision_id"],
+                            opportunity["opportunity_type"],
+                            payload["publication_state"],
+                            json.dumps(opportunity["accepted_facts"]),
+                            json.dumps(opportunity["response_route"]),
+                            received_at,
+                        ),
+                    )
+            else:
+                connection.execute(
+                    f"""
+                    INSERT INTO football_runtime.recommendation_opportunities (
+                        opportunity_id, opportunity_revision_id, opportunity_type,
+                        publication_state, accepted_facts, response_route, published_at
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                        ON CONFLICT (opportunity_revision_id) DO UPDATE
+                        SET opportunity_id = EXCLUDED.opportunity_id,
+                            opportunity_type = EXCLUDED.opportunity_type,
+                            publication_state = EXCLUDED.publication_state,
+                            accepted_facts = EXCLUDED.accepted_facts,
+                            response_route = EXCLUDED.response_route,
+                            published_at = EXCLUDED.published_at
+                    WHERE recommendation_opportunities.opportunity_id =
+                          EXCLUDED.opportunity_id
+                    {source_suppression_guard}
+                    """,
+                    (
+                        payload["opportunity_id"],
+                        payload["opportunity_revision_id"],
+                        payload["opportunity_type"],
+                        payload["publication_state"],
+                        json.dumps(payload["accepted_facts"]),
+                        json.dumps(payload["response_route"]),
+                        received_at,
+                    ),
+                )
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -3768,7 +4457,11 @@ class PostgresRoleStore:
                        opportunity_id, opportunity_revision_id, opportunity_type,
                        publication_state, accepted_facts, response_route
                 FROM football_runtime.recommendation_opportunities
-                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                ORDER BY opportunity_id,
+                         (substring(opportunity_revision_id
+                                    FROM ':revision:([0-9]+)$'))::bigint DESC,
+                         published_at DESC,
+                         opportunity_revision_id DESC
                 """
             ).fetchall()
         return evaluate_game_search(
@@ -3867,7 +4560,11 @@ class PostgresRoleStore:
                        opportunity_id, opportunity_revision_id, opportunity_type,
                        publication_state, accepted_facts, response_route, published_at
                 FROM football_runtime.recommendation_opportunities
-                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                ORDER BY opportunity_id,
+                         (substring(opportunity_revision_id
+                                    FROM ':revision:([0-9]+)$'))::bigint DESC,
+                         published_at DESC,
+                         opportunity_revision_id DESC
                 """
             ).fetchall()
             if self._search_snapshot_hook is not None:
@@ -6347,6 +7044,342 @@ def runtime_database_url(
     )
 
 
+def _legacy_candidate_opportunity_id(
+    *,
+    source_message_id: str,
+    opportunity_id: str,
+) -> str | None:
+    """Map one legacy v4 candidate identity to its canonical proposition id."""
+    prefix = f"opportunity:{source_message_id}:open_match:candidate:"
+    if not opportunity_id.startswith(prefix):
+        return None
+    candidate_hash = opportunity_id.removeprefix(prefix)
+    if len(candidate_hash) != 16 or any(
+        character not in "0123456789abcdef" for character in candidate_hash
+    ):
+        return None
+    return f"opportunity:{source_message_id}:open_match:proposition:{candidate_hash}"
+
+
+def _ensure_application_proposition_identity_mapping(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+    proposition_slot: int,
+    opportunity_id: str,
+    proposition_discriminator: str,
+    created_at: datetime,
+) -> None:
+    """Persist one canonical lineage while retaining a legacy candidate alias."""
+    existing = connection.execute(
+        """
+        SELECT opportunity_id
+        FROM football_runtime.application_proposition_identities
+        WHERE source_message_id = %s AND proposition_slot = %s
+        FOR UPDATE
+        """,
+        (source_message_id, proposition_slot),
+    ).fetchone()
+    canonical_identity = connection.execute(
+        """
+        SELECT source_message_id, proposition_slot
+        FROM football_runtime.application_proposition_identities
+        WHERE opportunity_id = %s
+        FOR UPDATE
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    if canonical_identity is not None and canonical_identity != (
+        source_message_id,
+        proposition_slot,
+    ):
+        raise RuntimeError("Application proposition identity collides")
+    canonical_owner = connection.execute(
+        """
+        SELECT legacy_opportunity_id
+        FROM football_runtime.application_legacy_proposition_identity_compatibility
+        WHERE canonical_opportunity_id = %s
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    if canonical_owner is not None and (
+        existing is None or canonical_owner[0] != existing[0]
+    ):
+        raise RuntimeError("Application legacy proposition identity collides")
+    if existing is not None and existing[0] != opportunity_id:
+        legacy_opportunity_id = existing[0]
+        expected_canonical_id = _legacy_candidate_opportunity_id(
+            source_message_id=source_message_id,
+            opportunity_id=legacy_opportunity_id,
+        )
+        if expected_canonical_id != opportunity_id:
+            raise RuntimeError("Application proposition identity mapping changed")
+        connection.execute(
+            """
+            INSERT INTO
+                football_runtime.application_legacy_proposition_identity_compatibility (
+                source_message_id, legacy_opportunity_id,
+                canonical_opportunity_id, created_at
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (legacy_opportunity_id) DO NOTHING
+            """,
+            (
+                source_message_id,
+                legacy_opportunity_id,
+                opportunity_id,
+                created_at,
+            ),
+        )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.application_proposition_identities (
+            source_message_id, proposition_slot, opportunity_id,
+            proposition_discriminator, created_at
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (source_message_id, proposition_slot) DO UPDATE
+        SET proposition_discriminator = EXCLUDED.proposition_discriminator
+        """,
+        (
+            source_message_id,
+            proposition_slot,
+            opportunity_id,
+            proposition_discriminator,
+            created_at,
+        ),
+    )
+    mapped_opportunity_id = connection.execute(
+        """
+        SELECT COALESCE(compatibility.canonical_opportunity_id,
+                        identity.opportunity_id)
+        FROM football_runtime.application_proposition_identities AS identity
+        LEFT JOIN
+            football_runtime.application_legacy_proposition_identity_compatibility
+            AS compatibility
+          ON compatibility.legacy_opportunity_id = identity.opportunity_id
+        WHERE identity.source_message_id = %s
+          AND identity.proposition_slot = %s
+        """,
+        (source_message_id, proposition_slot),
+    ).fetchone()
+    if mapped_opportunity_id is None or mapped_opportunity_id[0] != opportunity_id:
+        raise RuntimeError("Application proposition identity mapping changed")
+
+
+def _legacy_candidate_alias_for_canonical(
+    *,
+    source_message_id: str,
+    opportunity_id: str,
+) -> str | None:
+    """Return the exact historical candidate alias for one proposition id."""
+    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
+    if not opportunity_id.startswith(prefix):
+        return None
+    candidate_hash = opportunity_id.removeprefix(prefix)
+    if len(candidate_hash) != 16 or any(
+        character not in "0123456789abcdef" for character in candidate_hash
+    ):
+        return None
+    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
+
+
+def _suppress_source_event_opportunities(
+    connection: psycopg.Connection[Any],
+    *,
+    incoming: ContractEnvelope,
+    source_message_revision_id: str,
+    recorded_at: datetime,
+) -> tuple[ContractEnvelope, ...]:
+    """Suppress every prior derived identity while accepting an edit or delete."""
+    current_revision = connection.execute(
+        """
+        SELECT current_revision
+        FROM football_runtime.source_messages
+        WHERE source_message_id = %s
+        FOR UPDATE
+        """,
+        (incoming.subject_id,),
+    ).fetchone()
+    revision_record = connection.execute(
+        """
+        SELECT source_message_id, revision
+        FROM football_runtime.source_message_revisions
+        WHERE source_message_revision_id = %s
+        """,
+        (source_message_revision_id,),
+    ).fetchone()
+    if (
+        current_revision is None
+        or revision_record is None
+        or revision_record[0] != incoming.subject_id
+        or revision_record[1] != incoming.subject_revision
+        or current_revision[0] != incoming.subject_revision
+    ):
+        return ()
+
+    compatibility_rows = connection.execute(
+        """
+        SELECT legacy_opportunity_id, canonical_opportunity_id
+        FROM football_runtime.application_legacy_proposition_identity_compatibility
+        WHERE source_message_id = %s
+        ORDER BY legacy_opportunity_id
+        """,
+        (incoming.subject_id,),
+    ).fetchall()
+    aliases_by_canonical: dict[str, tuple[str, ...]] = {}
+    for legacy_opportunity_id, canonical_opportunity_id in compatibility_rows:
+        expected_alias = _legacy_candidate_alias_for_canonical(
+            source_message_id=incoming.subject_id,
+            opportunity_id=canonical_opportunity_id,
+        )
+        if expected_alias != legacy_opportunity_id:
+            raise RuntimeError("Application proposition identity mapping is ambiguous")
+        existing_aliases = aliases_by_canonical.get(canonical_opportunity_id, ())
+        if existing_aliases and existing_aliases != (legacy_opportunity_id,):
+            raise RuntimeError("Application proposition identity mapping is ambiguous")
+        aliases_by_canonical[canonical_opportunity_id] = (legacy_opportunity_id,)
+
+    rows = connection.execute(
+        """
+        SELECT opportunity.opportunity_id AS storage_opportunity_id,
+               COALESCE(compatibility.canonical_opportunity_id,
+                        opportunity.opportunity_id) AS canonical_opportunity_id,
+               opportunity.source_message_revision_id,
+               opportunity.opportunity_type,
+               opportunity.publication_state,
+               opportunity.accepted_facts,
+               opportunity.evidence,
+               opportunity.response_route
+        FROM football_runtime.application_opportunities AS opportunity
+        JOIN football_runtime.source_message_revisions AS stored_revision
+          ON stored_revision.source_message_revision_id =
+             opportunity.source_message_revision_id
+        LEFT JOIN
+            football_runtime.application_legacy_proposition_identity_compatibility
+            AS compatibility
+          ON compatibility.legacy_opportunity_id = opportunity.opportunity_id
+        WHERE stored_revision.source_message_id = %s
+          AND stored_revision.revision < %s
+        ORDER BY opportunity.opportunity_id
+        FOR UPDATE OF opportunity
+        """,
+        (incoming.subject_id, incoming.subject_revision),
+    ).fetchall()
+    if not rows:
+        return ()
+
+    suppressed_opportunities: list[dict[str, JsonValue]] = []
+    target_items: dict[str, dict[str, JsonValue]] = {}
+    for row in rows:
+        storage_opportunity_id = row[0]
+        canonical_opportunity_id = row[1]
+        if not isinstance(storage_opportunity_id, str) or not storage_opportunity_id:
+            raise RuntimeError("Application proposition identity is incomplete")
+        if (
+            not isinstance(canonical_opportunity_id, str)
+            or not canonical_opportunity_id
+        ):
+            raise RuntimeError("Application proposition identity is incomplete")
+        item: dict[str, JsonValue] = {
+            "opportunity_id": canonical_opportunity_id,
+            "storage_opportunity_id": storage_opportunity_id,
+            "opportunity_revision_id": (
+                f"{canonical_opportunity_id}:revision:{incoming.subject_revision}"
+            ),
+            "storage_opportunity_revision_id": (
+                f"{storage_opportunity_id}:revision:{incoming.subject_revision}"
+            ),
+            "source_message_revision_id": source_message_revision_id,
+            "opportunity_type": row[3],
+            "source_publication_state": row[4],
+            "publication_state": "suppressed",
+            "accepted_facts": row[5],
+            "evidence": row[6],
+            "response_route": row[7],
+        }
+        suppressed_opportunities.append(item)
+        target_ids = {canonical_opportunity_id, storage_opportunity_id}
+        target_ids.update(aliases_by_canonical.get(canonical_opportunity_id, ()))
+        for target_id in target_ids:
+            previous = target_items.get(target_id)
+            if previous is not None and any(
+                previous[field] != item[field]
+                for field in (
+                    "opportunity_type",
+                    "accepted_facts",
+                    "response_route",
+                )
+            ):
+                state_priority = {
+                    "active": 2,
+                    "held_for_review": 1,
+                    "suppressed": 0,
+                    "expired": 0,
+                }
+                previous_state = previous.get("source_publication_state")
+                current_state = item.get("source_publication_state")
+                previous_priority = (
+                    state_priority.get(previous_state, -1)
+                    if isinstance(previous_state, str)
+                    else -1
+                )
+                current_priority = (
+                    state_priority.get(current_state, -1)
+                    if isinstance(current_state, str)
+                    else -1
+                )
+                if current_priority == previous_priority:
+                    raise RuntimeError("Application proposition identity is ambiguous")
+                if current_priority < previous_priority:
+                    continue
+            target_items[target_id] = item
+
+    _suppress_application_opportunities(
+        connection,
+        suppressed_opportunities=tuple(suppressed_opportunities),
+        recorded_at=recorded_at,
+        current_source_message_revision_id=source_message_revision_id,
+    )
+    outgoings: list[ContractEnvelope] = []
+    for target_id in sorted(target_items):
+        item = target_items[target_id]
+        opportunity_revision_id = f"{target_id}:revision:{incoming.subject_revision}"
+        causation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{incoming.message_id}:source-suppression:{target_id}",
+        )
+        outgoings.append(
+            ContractEnvelope(
+                contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                contract_version=2,
+                message_id=derive_contract_message_id(
+                    causation_id,
+                    ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                ),
+                producer=RuntimeRole.APPLICATION,
+                consumer=RuntimeRole.RECOMMENDATION,
+                subject_id=target_id,
+                subject_revision=incoming.subject_revision,
+                idempotency_key=(
+                    "opportunity-publication-source-suppression:"
+                    f"{opportunity_revision_id}"
+                ),
+                causation_id=causation_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+                payload={
+                    "opportunity_id": target_id,
+                    "opportunity_revision_id": opportunity_revision_id,
+                    "source_message_revision_id": source_message_revision_id,
+                    "publication_state": "suppressed",
+                    "opportunity_type": item["opportunity_type"],
+                    "accepted_facts": item["accepted_facts"],
+                    "response_route": item["response_route"],
+                },
+            )
+        )
+    return tuple(outgoings)
+
+
 def _insert_outbox(
     connection: psycopg.Connection[Any],
     envelope: RawContractEnvelope,
@@ -6421,6 +7454,120 @@ def _insert_outbox(
             source_chat_admission_provenance_id,
         ),
     )
+
+
+def _suppress_application_opportunities(
+    connection: psycopg.Connection[Any],
+    *,
+    suppressed_opportunities: tuple[dict[str, JsonValue], ...],
+    recorded_at: datetime,
+    current_source_message_revision_id: str | None = None,
+) -> None:
+    """Move disappeared Application rows to the current revision atomically."""
+    for opportunity in suppressed_opportunities:
+        opportunity_id = opportunity.get("opportunity_id")
+        storage_opportunity_id = opportunity.get("storage_opportunity_id")
+        opportunity_revision_id = opportunity.get("opportunity_revision_id")
+        storage_opportunity_revision_id = opportunity.get(
+            "storage_opportunity_revision_id"
+        )
+        source_message_revision_id = opportunity.get("source_message_revision_id")
+        opportunity_type = opportunity.get("opportunity_type")
+        accepted_facts = opportunity.get("accepted_facts")
+        evidence = opportunity.get("evidence")
+        response_route = opportunity.get("response_route")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                opportunity_id,
+                opportunity_revision_id,
+                source_message_revision_id,
+                opportunity_type,
+            )
+        ) or not all(
+            isinstance(value, dict)
+            for value in (accepted_facts, evidence, response_route)
+        ):
+            raise ValueError("suppressed opportunity state is incomplete")
+        if not isinstance(storage_opportunity_id, str) or not storage_opportunity_id:
+            storage_opportunity_id = opportunity_id
+        if (
+            not isinstance(storage_opportunity_revision_id, str)
+            or not storage_opportunity_revision_id
+        ):
+            storage_opportunity_revision_id = opportunity_revision_id
+        if (
+            not isinstance(storage_opportunity_id, str)
+            or not storage_opportunity_id
+            or not isinstance(storage_opportunity_revision_id, str)
+            or not storage_opportunity_revision_id
+        ):
+            raise ValueError("suppressed opportunity storage identity is incomplete")
+        assert isinstance(source_message_revision_id, str)
+        if current_source_message_revision_id is None:
+            current_revision_guard = """
+              AND EXISTS (
+                  SELECT 1
+                  FROM football_runtime.source_message_revisions AS current_revision
+                  JOIN football_runtime.source_message_revisions AS stored_revision
+                    ON stored_revision.source_message_revision_id =
+                       opportunity.source_message_revision_id
+                  WHERE current_revision.source_message_revision_id = %s
+                    AND current_revision.source_message_id =
+                        stored_revision.source_message_id
+                    AND current_revision.revision > stored_revision.revision
+              )
+            """
+            current_revision_parameters: tuple[str, ...] = (source_message_revision_id,)
+        else:
+            current_revision_guard = """
+              AND EXISTS (
+                  SELECT 1
+                  FROM football_runtime.source_message_revisions AS current_revision
+                  JOIN football_runtime.source_messages AS current_message
+                    ON current_message.source_message_id =
+                       current_revision.source_message_id
+                   AND current_message.current_revision = current_revision.revision
+                  JOIN football_runtime.source_message_revisions AS stored_revision
+                    ON stored_revision.source_message_revision_id =
+                       opportunity.source_message_revision_id
+                  WHERE current_revision.source_message_revision_id = %s
+                    AND current_revision.source_message_revision_id = %s
+                    AND current_revision.source_message_id =
+                        stored_revision.source_message_id
+                    AND current_revision.revision > stored_revision.revision
+              )
+            """
+            current_revision_parameters = (
+                current_source_message_revision_id,
+                source_message_revision_id,
+            )
+        connection.execute(
+            f"""
+            UPDATE football_runtime.application_opportunities AS opportunity
+            SET opportunity_revision_id = %s,
+                source_message_revision_id = %s,
+                opportunity_type = %s,
+                publication_state = 'suppressed',
+                accepted_facts = %s::jsonb,
+                evidence = %s::jsonb,
+                response_route = %s::jsonb,
+                accepted_at = %s
+            WHERE opportunity.opportunity_id = %s
+            {current_revision_guard}
+            """,
+            (
+                storage_opportunity_revision_id,
+                source_message_revision_id,
+                opportunity_type,
+                json.dumps(accepted_facts),
+                json.dumps(evidence),
+                json.dumps(response_route),
+                recorded_at,
+                storage_opportunity_id,
+                *current_revision_parameters,
+            ),
+        )
 
 
 def _accept_contract_inbox(

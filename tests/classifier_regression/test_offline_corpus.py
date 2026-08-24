@@ -170,6 +170,106 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     )
 
 
+def test_v2_provider_schemas_match_strict_application_evidence_contract() -> None:
+    """Both provider artifacts declare the same strict v2 wire contract."""
+    repository_root = Path(__file__).parents[2]
+    schema_paths = (
+        repository_root
+        / "classifier"
+        / "open-match-primary-v2"
+        / "source-message-classification-v2.schema.json",
+        repository_root
+        / "classifier"
+        / "open-match-ambiguity-v1"
+        / "source-message-classification-v2.schema.json",
+    )
+
+    expected_event_time = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["start_local_date", "end_local_date", "iana_timezone"],
+        "not": {"required": ["exact_local_time", "day_part"]},
+        "properties": {
+            "start_local_date": {"type": "string", "format": "date"},
+            "end_local_date": {"type": "string", "format": "date"},
+            "exact_local_time": {
+                "type": "string",
+                "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+            },
+            "day_part": {"enum": ["morning", "daytime", "evening", "night"]},
+            "iana_timezone": {"type": "string", "minLength": 1},
+        },
+    }
+    expected_proposition_evidence = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "contract_version",
+            "coverage",
+            "root",
+            "facts",
+            "routes",
+            "relations",
+        ],
+        "properties": {
+            "contract_version": {"const": "source-proposition-evidence-v1"},
+            "coverage": {"const": "complete_source_revision"},
+            "root": {"$ref": "#/$defs/propositionRoot"},
+            "facts": {
+                "type": "object",
+                "additionalProperties": {"$ref": "#/$defs/propositionFact"},
+            },
+            "routes": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"$ref": "#/$defs/propositionRoute"},
+            },
+            "relations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "items": {"$ref": "#/$defs/propositionRelation"},
+            },
+        },
+    }
+
+    for schema_path in schema_paths:
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        assert schema["$id"] == "source-message-classification-v2"
+        assert schema["$defs"]["eventTime"] == expected_event_time
+        assert schema["$defs"]["propositionEvidence"] == expected_proposition_evidence
+        for definition_name, required_fields in {
+            "sourceSpan": ["start", "end", "text"],
+            "propositionFact": [
+                "proposition_id",
+                "polarity",
+                "currentness",
+                "span",
+            ],
+            "propositionRoot": [
+                "proposition_id",
+                "domain",
+                "meaning",
+                "polarity",
+                "currentness",
+                "span",
+            ],
+            "propositionRoute": [
+                "kind",
+                "value",
+                "proposition_id",
+                "polarity",
+                "currentness",
+                "span",
+            ],
+            "propositionRelation": ["kind", "direction", "target", "span"],
+        }.items():
+            definition = schema["$defs"][definition_name]
+            assert definition["type"] == "object"
+            assert definition["additionalProperties"] is False
+            assert definition["required"] == required_fields
+
+
 def test_offline_corpus_rejects_unrelated_numeric_date_cooccurrence() -> None:
     """A wrong normalized day cannot borrow another fact's numeric token."""
     assert not _event_time_is_supported(
