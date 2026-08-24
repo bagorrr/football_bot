@@ -86,6 +86,7 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceRoleStore,
+    ClassificationProofWork,
     ClassifierAdapterResult,
     ClassifierRequest,
     Clock,
@@ -8274,17 +8275,29 @@ class RuntimeApplication:
             for attempt in prior_attempts
             if attempt.pass_number == 2 and attempt.pass_kind == "ambiguity_second_pass"
         )
-        resume_ambiguity = bool(prior_ambiguity_attempts) and any(
-            attempt.status == "succeeded" for attempt in prior_primary_attempts
+        completed_ambiguity_attempt = next(
+            (
+                attempt
+                for attempt in reversed(prior_ambiguity_attempts)
+                if attempt.status == "succeeded"
+            ),
+            None,
         )
-        if resume_ambiguity and any(
-            attempt.status == "succeeded" for attempt in prior_ambiguity_attempts
-        ):
-            raise RuntimeError("completed ambiguity pass was redelivered")
+        prior_proof_work = self.store.classification_proof_work_for_revision(
+            revision_id
+        )
+        resume_completed_ambiguity = (
+            completed_ambiguity_attempt is not None and prior_proof_work is not None
+        )
+        resume_ambiguity = (
+            bool(prior_ambiguity_attempts)
+            and any(attempt.status == "succeeded" for attempt in prior_primary_attempts)
+            and not resume_completed_ambiguity
+        )
 
         primary_result: ClassifierAdapterResult | None
         primary_attempts: tuple[ClassificationAttempt, ...]
-        if resume_ambiguity:
+        if resume_completed_ambiguity or resume_ambiguity:
             primary_result = None
             primary_attempts = ()
             primary_attempt_number = prior_primary_attempts[-1].attempt_number
@@ -8383,7 +8396,35 @@ class RuntimeApplication:
         )
         primary_disposition: str | None
         required_context: str | None
-        if resume_ambiguity:
+        if resume_completed_ambiguity:
+            assert completed_ambiguity_attempt is not None
+            assert prior_proof_work is not None
+            final_request = replace(
+                request,
+                prompt_version="open-match-ambiguity-v1",
+                pass_kind="ambiguity_second_pass",
+                adjacent_context=prior_proof_work.ambiguity_adjacent_context,
+            )
+            final_result = ClassifierAdapterResult(
+                output=prior_proof_work.ambiguity_output,
+                effective_model=completed_ambiguity_attempt.effective_model,
+                effective_reasoning_effort=(
+                    completed_ambiguity_attempt.effective_reasoning_effort
+                ),
+                codex_version=completed_ambiguity_attempt.codex_version,
+                adapter_kind=completed_ambiguity_attempt.adapter_kind,
+                adapter_version=completed_ambiguity_attempt.adapter_version,
+                duration_ms=completed_ambiguity_attempt.duration_ms,
+                input_tokens=completed_ambiguity_attempt.input_tokens,
+                output_tokens=completed_ambiguity_attempt.output_tokens,
+            )
+            final_output = prior_proof_work.ambiguity_output
+            final_pass_number = 2
+            ambiguity_execution = prior_proof_work.ambiguity_pass_execution
+            selected_adjacent_context = prior_proof_work.ambiguity_adjacent_context
+            primary_disposition = None
+            required_context = None
+        elif resume_ambiguity:
             primary_disposition = "needs_second_pass"
             required_context = (
                 "adjacent_revisions"
@@ -8405,6 +8446,7 @@ class RuntimeApplication:
             )
         second_pass_eligible = (
             primary_valid
+            and not resume_completed_ambiguity
             and (resume_ambiguity or primary_disposition == "needs_second_pass")
             and (
                 required_context == "refined_prompt"
@@ -8655,8 +8697,22 @@ class RuntimeApplication:
             )
             return
 
-        semantic_proofs: list[JsonValue] = []
-        semantic_proof_executions: list[JsonValue] = []
+        semantic_proofs: list[JsonValue] = (
+            list(prior_proof_work.semantic_proofs)
+            if resume_completed_ambiguity and prior_proof_work is not None
+            else []
+        )
+        semantic_proof_executions: list[JsonValue] = (
+            list(prior_proof_work.semantic_proof_executions)
+            if resume_completed_ambiguity and prior_proof_work is not None
+            else []
+        )
+        stored_proof_keys = {
+            wrapper.get("candidate_key")
+            for wrapper in semantic_proofs
+            if isinstance(wrapper, dict)
+            and isinstance(wrapper.get("candidate_key"), str)
+        }
         semantic_proof_attempts: list[
             tuple[ClassificationAttempt, ClassifierAdapterResult]
         ] = []
@@ -8678,6 +8734,8 @@ class RuntimeApplication:
                         or not isinstance(evidence, dict)
                         or not isinstance(routes, list)
                     ):
+                        continue
+                    if candidate_key in stored_proof_keys:
                         continue
                     proof_request = replace(
                         final_request,
@@ -8785,8 +8843,35 @@ class RuntimeApplication:
                             ),
                         }
                     )
+        proof_work_to_store: ClassificationProofWork | None = None
+        if (
+            semantic_proof_failed
+            and final_pass_number == 2
+            and ambiguity_execution is not None
+            and final_output.get("disposition") == "accepted"
+        ):
+            proof_work_to_store = ClassificationProofWork(
+                source_message_revision_id=revision_id,
+                ambiguity_output=final_output,
+                ambiguity_pass_execution=ambiguity_execution,
+                ambiguity_adjacent_context=final_request.adjacent_context,
+                semantic_proofs=tuple(
+                    proof for proof in semantic_proofs if isinstance(proof, dict)
+                ),
+                semantic_proof_executions=tuple(
+                    execution
+                    for execution in semantic_proof_executions
+                    if isinstance(execution, dict)
+                ),
+            )
         if semantic_proof_failed:
-            if resume_ambiguity:
+            if resume_completed_ambiguity:
+                assert completed_ambiguity_attempt is not None
+                assert final_result is not None
+                record_attempt = completed_ambiguity_attempt
+                record_result = final_result
+                attempts_to_store = tuple(semantic_proof_attempts)
+            elif resume_ambiguity:
                 if not additional_attempts:
                     raise RuntimeError(
                         "proof retry did not produce an ambiguity attempt"
@@ -8822,6 +8907,8 @@ class RuntimeApplication:
                 received_at=self.clock.now(),
                 additional_attempts=attempts_to_store,
                 finalize=not semantic_proof_retryable,
+                proof_work=proof_work_to_store,
+                clear_proof_work=not semantic_proof_retryable,
             )
             return
         if final_output.get("disposition") == "accepted":
@@ -8843,7 +8930,13 @@ class RuntimeApplication:
         }:
             final_output = _safe_v2_review_output()
             final_disposition = "needs_review"
-        if resume_ambiguity:
+        if resume_completed_ambiguity:
+            assert completed_ambiguity_attempt is not None
+            assert final_result is not None
+            record_attempt = completed_ambiguity_attempt
+            record_result = final_result
+            attempts_to_store = tuple(semantic_proof_attempts)
+        elif resume_ambiguity:
             if not additional_attempts:
                 raise RuntimeError("ambiguity retry did not produce an attempt")
             record_attempt = additional_attempts[0][0]
@@ -8861,7 +8954,9 @@ class RuntimeApplication:
                 semantic_proof_attempts
             )
         final_attempt_number = (
-            additional_attempts[0][0].attempt_number
+            completed_ambiguity_attempt.attempt_number
+            if resume_completed_ambiguity and completed_ambiguity_attempt is not None
+            else additional_attempts[0][0].attempt_number
             if final_pass_number == 2
             else record_attempt.attempt_number
         )
@@ -8957,7 +9052,128 @@ class RuntimeApplication:
             outgoing=outgoing,
             received_at=self.clock.now(),
             additional_attempts=attempts_to_store,
+            clear_proof_work=resume_completed_ambiguity,
         )
+
+    def _record_classification_routing_outcome(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        outcome: ClassificationRoutingOutcome,
+        received_at: datetime,
+    ) -> None:
+        """Record a routing outcome and suppress every stale current identity."""
+        suppressed_opportunities, suppression_outgoings = (
+            self._stale_opportunity_suppression(
+                incoming=incoming,
+                source_message_revision_id=outcome.source_message_revision_id,
+                retained_opportunity_ids=(),
+            )
+        )
+        self.store.record_classification_routing_outcome(
+            incoming=incoming,
+            outcome=outcome,
+            received_at=received_at,
+            suppressed_opportunities=suppressed_opportunities,
+            additional_outgoings=suppression_outgoings,
+        )
+
+    def _stale_opportunity_suppression(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        source_message_revision_id: str,
+        retained_opportunity_ids: tuple[str, ...],
+    ) -> tuple[tuple[dict[str, JsonValue], ...], tuple[ContractEnvelope, ...]]:
+        """Build current-revision suppression facts and Recommendation handoffs."""
+        source_revision = self.store.source_message_revision(source_message_revision_id)
+        if source_revision is None or source_revision.body is None:
+            return (), ()
+        retained = set(retained_opportunity_ids)
+        records = self.store.active_opportunity_records(
+            source_revision.source_message_id
+        )
+        stale_by_storage_id: dict[str, dict[str, JsonValue]] = {}
+        for record in records:
+            raw_opportunity_id = record.get("raw_opportunity_id")
+            opportunity_id = record.get("opportunity_id")
+            if (
+                not isinstance(raw_opportunity_id, str)
+                or not isinstance(opportunity_id, str)
+                or opportunity_id in retained
+            ):
+                continue
+            if raw_opportunity_id in stale_by_storage_id:
+                continue
+            stale_by_storage_id[raw_opportunity_id] = {
+                "opportunity_id": opportunity_id,
+                "storage_opportunity_id": raw_opportunity_id,
+                "opportunity_revision_id": (
+                    f"{opportunity_id}:revision:{incoming.subject_revision}"
+                ),
+                "storage_opportunity_revision_id": (
+                    f"{raw_opportunity_id}:revision:{incoming.subject_revision}"
+                ),
+                "source_message_revision_id": source_message_revision_id,
+                "opportunity_type": record["opportunity_type"],
+                "publication_state": "suppressed",
+                "accepted_facts": record["accepted_facts"],
+                "evidence": record["evidence"],
+                "response_route": record["response_route"],
+            }
+        suppressed = tuple(stale_by_storage_id.values())
+        suppression_outgoings: list[ContractEnvelope] = []
+        emitted_opportunity_ids: set[str] = set()
+        for suppressed_item in suppressed:
+            opportunity_id = suppressed_item.get("opportunity_id")
+            opportunity_revision_id = suppressed_item.get("opportunity_revision_id")
+            opportunity_type = suppressed_item.get("opportunity_type")
+            if (
+                not isinstance(opportunity_id, str)
+                or not opportunity_id
+                or not isinstance(opportunity_revision_id, str)
+                or not opportunity_revision_id
+                or not isinstance(opportunity_type, str)
+                or not opportunity_type
+            ):
+                raise ValueError("suppression identity is incomplete")
+            if opportunity_id in emitted_opportunity_ids:
+                continue
+            emitted_opportunity_ids.add(opportunity_id)
+            suppression_causation_id = uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{incoming.message_id}:suppression:{opportunity_id}",
+            )
+            suppression_outgoings.append(
+                ContractEnvelope(
+                    contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                    contract_version=2,
+                    message_id=derive_contract_message_id(
+                        suppression_causation_id,
+                        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                    ),
+                    producer=RuntimeRole.APPLICATION,
+                    consumer=RuntimeRole.RECOMMENDATION,
+                    subject_id=opportunity_id,
+                    subject_revision=incoming.subject_revision,
+                    idempotency_key=(
+                        f"opportunity-publication:{opportunity_revision_id}"
+                    ),
+                    causation_id=suppression_causation_id,
+                    correlation_id=incoming.correlation_id,
+                    recorded_at=self.clock.now(),
+                    payload={
+                        "opportunity_id": opportunity_id,
+                        "opportunity_revision_id": opportunity_revision_id,
+                        "source_message_revision_id": source_message_revision_id,
+                        "publication_state": "suppressed",
+                        "opportunity_type": opportunity_type,
+                        "accepted_facts": suppressed_item["accepted_facts"],
+                        "response_route": suppressed_item["response_route"],
+                    },
+                )
+            )
+        return suppressed, tuple(suppression_outgoings)
 
     def _accept_classification_proposal(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.APPLICATION or self.location_resolver is None:
@@ -9078,7 +9294,7 @@ class RuntimeApplication:
                     adjacent_context,
                     adjacent_revisions,
                 ):
-                    self.store.record_classification_routing_outcome(
+                    self._record_classification_routing_outcome(
                         incoming=incoming,
                         outcome=_classification_routing_outcome(
                             payload,
@@ -9113,7 +9329,7 @@ class RuntimeApplication:
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
             if not isinstance(v4_output, dict):
-                self.store.record_classification_routing_outcome(
+                self._record_classification_routing_outcome(
                     incoming=incoming,
                     outcome=_classification_routing_outcome(
                         authoritative_payload,
@@ -9142,7 +9358,7 @@ class RuntimeApplication:
                     if v4_disposition == "needs_second_pass"
                     else "classifier_disposition"
                 )
-                self.store.record_classification_routing_outcome(
+                self._record_classification_routing_outcome(
                     incoming=incoming,
                     outcome=_classification_routing_outcome(
                         authoritative_payload,
@@ -9159,7 +9375,7 @@ class RuntimeApplication:
             v4_candidates = v4_output.get("candidates")
             v4_proofs = authoritative_payload.get("semantic_proofs")
             if not isinstance(v4_candidates, list) or not isinstance(v4_proofs, list):
-                self.store.record_classification_routing_outcome(
+                self._record_classification_routing_outcome(
                     incoming=incoming,
                     outcome=_classification_routing_outcome(
                         authoritative_payload,
@@ -9175,7 +9391,7 @@ class RuntimeApplication:
                 revision_id=revision_id,
                 body=source_revision.body,
             ):
-                self.store.record_classification_routing_outcome(
+                self._record_classification_routing_outcome(
                     incoming=incoming,
                     outcome=_classification_routing_outcome(
                         authoritative_payload,
@@ -9195,7 +9411,7 @@ class RuntimeApplication:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
                 for candidate in v4_candidates:
                     if not isinstance(candidate, dict):
-                        self.store.record_classification_routing_outcome(
+                        self._record_classification_routing_outcome(
                             incoming=incoming,
                             outcome=_classification_routing_outcome(
                                 authoritative_payload,
@@ -9208,7 +9424,7 @@ class RuntimeApplication:
                         return
                     candidate_key = candidate.get("candidate_key")
                     if not isinstance(candidate_key, str):
-                        self.store.record_classification_routing_outcome(
+                        self._record_classification_routing_outcome(
                             incoming=incoming,
                             outcome=_classification_routing_outcome(
                                 authoritative_payload,
@@ -9229,7 +9445,7 @@ class RuntimeApplication:
                         None,
                     )
                     if not isinstance(proof, dict):
-                        self.store.record_classification_routing_outcome(
+                        self._record_classification_routing_outcome(
                             incoming=incoming,
                             outcome=_classification_routing_outcome(
                                 authoritative_payload,
@@ -9251,7 +9467,7 @@ class RuntimeApplication:
                         resolver=self.location_resolver,
                     )
                     if accepted_candidate is None:
-                        self.store.record_classification_routing_outcome(
+                        self._record_classification_routing_outcome(
                             incoming=incoming,
                             outcome=_classification_routing_outcome(
                                 authoritative_payload,
@@ -9271,7 +9487,7 @@ class RuntimeApplication:
                     ),
                 )
                 if lineages is None or len(lineages) != len(accepted_opportunities):
-                    self.store.record_classification_routing_outcome(
+                    self._record_classification_routing_outcome(
                         incoming=incoming,
                         outcome=_classification_routing_outcome(
                             authoritative_payload,
@@ -9310,7 +9526,7 @@ class RuntimeApplication:
                 if len({item["opportunity_id"] for item in publication_items}) != len(
                     publication_items
                 ):
-                    self.store.record_classification_routing_outcome(
+                    self._record_classification_routing_outcome(
                         incoming=incoming,
                         outcome=_classification_routing_outcome(
                             authoritative_payload,
@@ -9321,6 +9537,17 @@ class RuntimeApplication:
                         received_at=self.clock.now(),
                     )
                     return
+                retained_opportunity_ids = tuple(
+                    cast(str, opportunity["opportunity_id"])
+                    for opportunity in accepted_opportunities
+                )
+                suppressed_opportunities, suppression_outgoings = (
+                    self._stale_opportunity_suppression(
+                        incoming=incoming,
+                        source_message_revision_id=revision_id,
+                        retained_opportunity_ids=retained_opportunity_ids,
+                    )
+                )
                 batch_outgoing = ContractEnvelope(
                     contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     contract_version=3,
@@ -9357,11 +9584,13 @@ class RuntimeApplication:
                         recorded_at=self.clock.now(),
                         pass_number=_classification_pass_number(authoritative_payload),
                     ),
+                    suppressed_opportunities=suppressed_opportunities,
+                    additional_outgoings=suppression_outgoings,
                 )
                 return
             candidate = v4_candidates[0]
             if not isinstance(candidate, dict):
-                self.store.record_classification_routing_outcome(
+                self._record_classification_routing_outcome(
                     incoming=incoming,
                     outcome=_classification_routing_outcome(
                         authoritative_payload,
@@ -9383,7 +9612,7 @@ class RuntimeApplication:
                 None,
             )
             if not isinstance(candidate_key, str) or not isinstance(proof, dict):
-                self.store.record_classification_routing_outcome(
+                self._record_classification_routing_outcome(
                     incoming=incoming,
                     outcome=_classification_routing_outcome(
                         authoritative_payload,
@@ -9405,7 +9634,7 @@ class RuntimeApplication:
             resolver=self.location_resolver,
         )
         if accepted is None:
-            self.store.record_classification_routing_outcome(
+            self._record_classification_routing_outcome(
                 incoming=incoming,
                 outcome=_classification_routing_outcome(
                     payload,
@@ -9425,7 +9654,7 @@ class RuntimeApplication:
             ),
         )
         if lineages is None or len(lineages) != 1:
-            self.store.record_classification_routing_outcome(
+            self._record_classification_routing_outcome(
                 incoming=incoming,
                 outcome=_classification_routing_outcome(
                     authoritative_payload,
@@ -9447,6 +9676,13 @@ class RuntimeApplication:
             "proposition_discriminator": proposition_discriminator,
             "opportunity_revision_id": opportunity_revision_id,
         }
+        suppressed_opportunities, suppression_outgoings = (
+            self._stale_opportunity_suppression(
+                incoming=incoming,
+                source_message_revision_id=revision_id,
+                retained_opportunity_ids=(opportunity_id,),
+            )
+        )
         outgoing = ContractEnvelope(
             contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
             contract_version=2,
@@ -9483,6 +9719,8 @@ class RuntimeApplication:
                 recorded_at=self.clock.now(),
                 pass_number=_classification_pass_number(authoritative_payload),
             ),
+            suppressed_opportunities=suppressed_opportunities,
+            additional_outgoings=suppression_outgoings,
         )
 
     def fail_next_search(self) -> None:

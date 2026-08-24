@@ -1153,7 +1153,10 @@ def test_adjacent_second_pass_uses_only_application_selected_bounded_context() -
     assert system.opportunities() == ()
 
 
-def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() -> None:
+@pytest.mark.parametrize("proof_failure", ("exception", "schema", "provenance"))
+def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof(
+    proof_failure: str,
+) -> None:
     telegram = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
     resolver = ControlledLocationResolverAdapter()
@@ -1263,23 +1266,29 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
             output_tokens=20,
         ),
     )
-    invalid_second_pass = replace_classifier_output(
-        second_pass,
-        {
-            "schema_version": "source-message-classification-v2",
-            "disposition": "accepted",
-            "candidates": [],
-            "routing": {"reason_code": "accepted", "required_context": "none"},
-        },
-    )
-    classifier.return_second_pass_for(body=body, result=invalid_second_pass)
-    classifier.return_proof_for(
+    classifier.return_second_pass_for(body=body, result=second_pass)
+    valid_proof = semantic_proof_result_for(
+        output=accepted_output,
         body=body,
-        result=semantic_proof_result_for(
-            output=accepted_output,
-            body=body,
-        ),
     )
+    if proof_failure == "exception":
+        classifier.raise_for(
+            pass_kind="semantic_proof",
+            error=ConnectionError("controlled proof transport failure"),
+        )
+    elif proof_failure == "schema":
+        classifier.return_proof_for(
+            body=body,
+            result=replace_classifier_output(
+                valid_proof,
+                {"source_message_revision_reference": "invalid-proof"},
+            ),
+        )
+    else:
+        classifier.return_proof_for(
+            body=body,
+            result=replace(valid_proof, effective_model="wrong-model"),
+        )
     system = boot_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
@@ -1320,15 +1329,29 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
     assert [attempt.pass_kind for attempt in attempts] == [
         "primary",
         "ambiguity_second_pass",
+        "semantic_proof",
     ]
-    assert [attempt.status for attempt in attempts] == ["succeeded", "failed"]
+    assert [attempt.status for attempt in attempts] == [
+        "succeeded",
+        "succeeded",
+        "failed",
+    ]
     assert len(classifier.second_pass_requests) == 1
     assert classifier.second_pass_requests[0].prompt_version == (
         "open-match-ambiguity-v1"
     )
     assert system.opportunities() == ()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.classification_proof_work
+            WHERE source_message_revision_id = %s
+            """,
+            (revision_id,),
+        ).fetchone() == (1,)
 
-    classifier.return_second_pass_for(body=body, result=second_pass)
+    classifier.return_proof_for(body=body, result=valid_proof)
     system.restart(RuntimeRole.CLASSIFICATION)
     assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
     system.process_opportunities_until_idle()
@@ -1337,19 +1360,19 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
     assert [attempt.pass_kind for attempt in attempts] == [
         "primary",
         "ambiguity_second_pass",
-        "ambiguity_second_pass",
+        "semantic_proof",
         "semantic_proof",
     ]
-    assert [attempt.attempt_number for attempt in attempts] == [1, 1, 2, 1]
+    assert [attempt.attempt_number for attempt in attempts] == [1, 1, 1, 2]
     assert [attempt.status for attempt in attempts] == [
+        "succeeded",
         "succeeded",
         "failed",
         "succeeded",
-        "succeeded",
     ]
-    assert len(classifier.second_pass_requests) == 2
-    assert len(classifier.requests) == 3
-    assert len(classifier.proof_requests) == 1
+    assert len(classifier.second_pass_requests) == 1
+    assert len(classifier.requests) == 2
+    assert len(classifier.proof_requests) == 2
     assert classifier.proof_requests[0].pass_kind == "semantic_proof"
     assert system.opportunities(), repr(
         {
@@ -1359,6 +1382,15 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
         }
     )
     assert len(system.opportunity_publication_contracts(revision_id)) == 1
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.classification_proof_work
+            WHERE source_message_revision_id = %s
+            """,
+            (revision_id,),
+        ).fetchone() == (0,)
     assert system.classification_routing_outcomes()[0].disposition == "accepted"
     _exercise_v2_semantic_proof_cases(
         system=system,
@@ -1366,6 +1398,109 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
         telegram=telegram,
         source_identity=source_identity,
     )
+
+
+@pytest.mark.parametrize("proof_failure", ("exception", "schema", "provenance"))
+def test_successful_ambiguity_proof_exhaustion_stays_unpublished(
+    proof_failure: str,
+) -> None:
+    body = (
+        f"20 August 2026 in whole city. Need one player. Contact @v2_proof. "
+        f"Exhaustion {proof_failure}."
+    )
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    accepted = _v2_accepted_result(
+        body=body,
+        candidate_key=f"ambiguity-exhaustion-{proof_failure}",
+    )
+    primary = replace_classifier_output(
+        accepted,
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "needs_second_pass",
+            "candidates": [],
+            "routing": {
+                "reason_code": "deterministic_ambiguity",
+                "required_context": "refined_prompt",
+            },
+        },
+    )
+    classifier.return_for(body=body, result=primary)
+    classifier.return_second_pass_for(body=body, result=accepted)
+    valid_proof = semantic_proof_result_for(output=accepted.output, body=body)
+    if proof_failure == "exception":
+        for attempt_number in range(1, 4):
+            classifier.raise_for(
+                pass_kind="semantic_proof",
+                error=ConnectionError(f"proof-{attempt_number}"),
+            )
+    elif proof_failure == "schema":
+        classifier.return_proof_for(
+            body=body,
+            result=replace_classifier_output(
+                valid_proof,
+                {"source_message_revision_reference": "invalid-proof"},
+            ),
+        )
+    else:
+        classifier.return_proof_for(
+            body=body,
+            result=replace(valid_proof, effective_model="wrong-model"),
+        )
+
+    failure_index = ("exception", "schema", "provenance").index(proof_failure)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_140 + failure_index,
+        checkpoint=4920 + failure_index,
+        administrator_id=49_140,
+        location_resolver=_whole_city_resolver(),
+    )
+
+    for attempt_number in range(1, 4):
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        if attempt_number < 3:
+            system.restart(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.source_message_revision_id == revision_id
+        and attempt.pass_kind == "semantic_proof"
+    )
+    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
+    assert [attempt.status for attempt in proof_attempts] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert len(classifier.requests) == 2
+    assert len(classifier.second_pass_requests) == 1
+    assert len(classifier.proof_requests) == 3
+    assert not any(
+        opportunity.source_message_revision_id == revision_id
+        for opportunity in system.opportunities()
+    )
+    assert not any(
+        outcome.source_message_revision_id == revision_id
+        for outcome in system.classification_routing_outcomes()
+    )
+    assert system.opportunity_publication_contracts(revision_id) == ()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.classification_proof_work
+            WHERE source_message_revision_id = %s
+            """,
+            (revision_id,),
+        ).fetchone() == (0,)
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
 
 
 def test_v4_missing_ambiguity_provenance_routes_before_publication() -> None:
@@ -1866,6 +2001,17 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         f"{opportunity_id}:revision:2" for opportunity_id in first_ids.values()
     }
     assert len(system.opportunity_publication_contracts(revised_revision_id)) == 1
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        revised_facts = connection.execute(
+            """
+            SELECT accepted_facts->>'start_local_date'
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_revision_id LIKE %s
+            ORDER BY accepted_facts->>'start_local_date'
+            """,
+            ("%:revision:2",),
+        ).fetchall()
+    assert revised_facts == [("2026-08-21",), ("2026-08-23",)]
 
     canonical_first_id = first_ids["@open_match_one"]
     assert ":proposition:" in canonical_first_id
@@ -1963,14 +2109,38 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     assert {
         opportunity.response_route.value: opportunity.opportunity_id
         for opportunity in singleton_opportunities
-    } == first_ids
+        if opportunity.publication_state == "active"
+    } == {"@open_match_one": first_ids["@open_match_one"]}
+    removed_opportunity = next(
+        opportunity
+        for opportunity in singleton_opportunities
+        if opportunity.opportunity_id == first_ids["@open_match_two"]
+    )
+    assert removed_opportunity.publication_state == "suppressed"
+    assert removed_opportunity.opportunity_revision_id.endswith(":revision:3")
     singleton_publications = system.opportunity_publication_contracts(
         singleton_revision_id
     )
-    assert len(singleton_publications) == 1
-    singleton_payload = singleton_publications[0].payload
-    assert isinstance(singleton_payload, dict)
-    assert singleton_payload["opportunity_id"] == first_ids["@open_match_one"]
+    assert len(singleton_publications) == 2
+    singleton_payloads = [
+        publication.payload
+        for publication in singleton_publications
+        if isinstance(publication.payload, dict)
+    ]
+    assert {payload["publication_state"] for payload in singleton_payloads} == {
+        "active",
+        "suppressed",
+    }
+    assert any(
+        payload["opportunity_id"] == first_ids["@open_match_one"]
+        and payload["publication_state"] == "active"
+        for payload in singleton_payloads
+    )
+    assert any(
+        payload["opportunity_id"] == first_ids["@open_match_two"]
+        and payload["publication_state"] == "suppressed"
+        for payload in singleton_payloads
+    )
     assert any(
         opportunity.response_route.value == "@open_match_one"
         and opportunity.opportunity_revision_id
@@ -1989,9 +2159,24 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
             (source_message_id, legacy_first_id, canonical_first_id),
         ).fetchone() == (1,)
     system.process_opportunities_until_idle()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        latest_projection_states = connection.execute(
+            """
+            SELECT DISTINCT ON (opportunity_id)
+                   opportunity_id, publication_state
+            FROM football_runtime.recommendation_opportunities
+            WHERE opportunity_id IN (%s, %s)
+            ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+            """,
+            (first_ids["@open_match_one"], first_ids["@open_match_two"]),
+        ).fetchall()
+    assert dict(latest_projection_states) == {
+        first_ids["@open_match_one"]: "active",
+        first_ids["@open_match_two"]: "suppressed",
+    }
     system.restart(RuntimeRole.APPLICATION)
     system.process_opportunities_until_idle()
-    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 1
+    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 2
 
     classifier.return_for(body=revised_body, result=reclassified_result)
     for candidate in reclassified_candidates:
@@ -2052,6 +2237,71 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         for item in compound_items
         if isinstance(item, dict)
     } == set(first_ids.values())
+
+    nonaccepted_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "irrelevant",
+        "candidates": [],
+        "routing": {"reason_code": "irrelevant", "required_context": "none"},
+    }
+    classifier.return_for(
+        body=revised_body,
+        result=replace_classifier_output(reclassified_result, nonaccepted_output),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        source_event_id="source-event:classification-routing:all-removed",
+        telegram_message_id=49003,
+        revision=5,
+        kind=SourceEventKind.EDIT,
+        body=revised_body,
+        event_time=datetime(2026, 8, 18, 9, 10, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    all_removed_revision_id = (
+        "source-chat:channel:4900102:generation:1:message:49003:revision:5"
+    )
+    assert all(
+        opportunity.publication_state == "suppressed"
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id in set(first_ids.values())
+        or opportunity.opportunity_id == legacy_first_id
+    )
+    all_removed_publications = system.opportunity_publication_contracts(
+        all_removed_revision_id
+    )
+    assert len(all_removed_publications) == 2
+    assert all(
+        isinstance(publication.payload, dict)
+        and publication.payload["publication_state"] == "suppressed"
+        for publication in all_removed_publications
+    )
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        latest_projection_states = connection.execute(
+            """
+            SELECT DISTINCT ON (opportunity_id)
+                   opportunity_id, publication_state
+            FROM football_runtime.recommendation_opportunities
+            WHERE opportunity_id IN (%s, %s)
+            ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+            """,
+            (first_ids["@open_match_one"], first_ids["@open_match_two"]),
+        ).fetchall()
+    assert dict(latest_projection_states) == {
+        first_ids["@open_match_one"]: "suppressed",
+        first_ids["@open_match_two"]: "suppressed",
+    }
+    system.restart(RuntimeRole.APPLICATION)
+    system.process_opportunities_until_idle()
+    assert len(system.opportunity_publication_contracts(all_removed_revision_id)) == 2
 
 
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:

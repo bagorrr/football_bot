@@ -239,6 +239,18 @@ class ClassifierAdapterResult:
     output_tokens: int
 
 
+@dataclass(frozen=True, slots=True)
+class ClassificationProofWork:
+    """Protected durable candidate state for a retryable semantic-proof pass."""
+
+    source_message_revision_id: str
+    ambiguity_output: dict[str, JsonValue]
+    ambiguity_pass_execution: dict[str, JsonValue]
+    ambiguity_adjacent_context: tuple[dict[str, JsonValue], ...]
+    semantic_proofs: tuple[dict[str, JsonValue], ...] = ()
+    semantic_proof_executions: tuple[dict[str, JsonValue], ...] = ()
+
+
 class LocationResolverAdapter(Protocol):
     """Controlled location boundary for accepted publication facts."""
 
@@ -810,6 +822,8 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
             tuple[ClassificationAttempt, ClassifierAdapterResult], ...
         ] = (),
         finalize: bool = True,
+        proof_work: ClassificationProofWork | None = None,
+        clear_proof_work: bool = False,
     ) -> ConsumeResult:
         """Retain one execution and optionally complete its queue handoff."""
         ...
@@ -818,6 +832,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         self, source_message_revision_id: str
     ) -> tuple[ClassificationAttempt, ...]:
         """Read prior classifier attempts needed for bounded queue retry."""
+        ...
+
+    def classification_proof_work_for_revision(
+        self, source_message_revision_id: str
+    ) -> ClassificationProofWork | None:
+        """Read protected candidate state for a retryable semantic-proof pass."""
         ...
 
     def proposition_opportunity_ids(
@@ -832,12 +852,20 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read durable proposition lineage facts for one Source Message."""
         ...
 
+    def active_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read all currently active Application opportunities for one source."""
+        ...
+
     def record_classification_routing_outcome(
         self,
         *,
         incoming: ContractEnvelope,
         outcome: ClassificationRoutingOutcome,
         received_at: datetime,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically retain one body-free Application routing outcome."""
         ...
@@ -850,6 +878,8 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         outgoing: ContractEnvelope,
         received_at: datetime,
         routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically accept Application facts and publish one state change."""
         ...
@@ -862,6 +892,8 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         outgoing: ContractEnvelope,
         received_at: datetime,
         routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically accept a compound candidate batch and publish one state change."""
         ...

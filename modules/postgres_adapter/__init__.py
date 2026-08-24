@@ -89,6 +89,7 @@ from modules.domain import (
 from modules.ports import (
     AcceptanceObservation,
     ClaimedContract,
+    ClassificationProofWork,
     CompletedSearchQueryResult,
     CompletedSearchQueryStatus,
     ConsumeResult,
@@ -117,6 +118,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0018_legacy_v4_proposition_identity_backfill.sql",
     "0019_application_proposition_discriminators.sql",
     "0020_application_legacy_proposition_identity_compatibility.sql",
+    "0021_classification_proof_work.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -140,6 +142,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
     "97f5851b2f72c5a69d342ce3e72d0908a309dd85bd98495184d43b13508354c9",
     "2a151808ef6854d40f567f778212218f043eda691fec2ce21fb0e241b277f291",
+    "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -615,6 +618,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.ingestion_failures,
                      football_runtime.protected_content_skips,
                      football_runtime.classification_attempts,
+                     football_runtime.classification_proof_work,
                      football_runtime.classification_routing_outcomes,
                      football_runtime.application_proposition_identities,
                      football_runtime.application_opportunities,
@@ -3559,6 +3563,8 @@ class PostgresRoleStore:
         received_at: datetime,
         additional_attempts: tuple[tuple[ClassificationAttempt, Any], ...] = (),
         finalize: bool = True,
+        proof_work: ClassificationProofWork | None = None,
+        clear_proof_work: bool = False,
     ) -> ConsumeResult:
         """Retain one execution and optionally complete its queue handoff."""
         if self._role is not RuntimeRole.CLASSIFICATION:
@@ -3623,6 +3629,42 @@ class PostgresRoleStore:
                 )
             if finalize and outgoing is not None:
                 _insert_outbox(connection, outgoing)
+            if clear_proof_work:
+                connection.execute(
+                    """
+                    DELETE FROM football_runtime.classification_proof_work
+                    WHERE source_message_revision_id = %s
+                    """,
+                    (attempt.source_message_revision_id,),
+                )
+            elif proof_work is not None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.classification_proof_work (
+                        source_message_revision_id, ambiguity_output,
+                        ambiguity_pass_execution, ambiguity_adjacent_context,
+                        semantic_proofs, semantic_proof_executions, updated_at
+                    ) VALUES (%s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                              %s::jsonb, %s)
+                    ON CONFLICT (source_message_revision_id) DO UPDATE
+                    SET ambiguity_output = EXCLUDED.ambiguity_output,
+                        ambiguity_pass_execution = EXCLUDED.ambiguity_pass_execution,
+                        ambiguity_adjacent_context =
+                            EXCLUDED.ambiguity_adjacent_context,
+                        semantic_proofs = EXCLUDED.semantic_proofs,
+                        semantic_proof_executions = EXCLUDED.semantic_proof_executions,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        proof_work.source_message_revision_id,
+                        json.dumps(proof_work.ambiguity_output),
+                        json.dumps(proof_work.ambiguity_pass_execution),
+                        json.dumps(list(proof_work.ambiguity_adjacent_context)),
+                        json.dumps(list(proof_work.semantic_proofs)),
+                        json.dumps(list(proof_work.semantic_proof_executions)),
+                        received_at,
+                    ),
+                )
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -3660,6 +3702,45 @@ class PostgresRoleStore:
                 }
             )
             for row in rows
+        )
+
+    def classification_proof_work_for_revision(
+        self, source_message_revision_id: str
+    ) -> ClassificationProofWork | None:
+        """Read protected candidate state needed for a proof-only retry."""
+        if self._role is not RuntimeRole.CLASSIFICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT source_message_revision_id, ambiguity_output,
+                       ambiguity_pass_execution, ambiguity_adjacent_context,
+                       semantic_proofs, semantic_proof_executions
+                FROM football_runtime.classification_proof_work
+                WHERE source_message_revision_id = %s
+                """,
+                (source_message_revision_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ClassificationProofWork(
+            source_message_revision_id=row["source_message_revision_id"],
+            ambiguity_output=cast(dict[str, JsonValue], row["ambiguity_output"]),
+            ambiguity_pass_execution=cast(
+                dict[str, JsonValue], row["ambiguity_pass_execution"]
+            ),
+            ambiguity_adjacent_context=tuple(
+                cast(list[dict[str, JsonValue]], row["ambiguity_adjacent_context"])
+            ),
+            semantic_proofs=tuple(
+                cast(list[dict[str, JsonValue]], row["semantic_proofs"])
+            ),
+            semantic_proof_executions=tuple(
+                cast(list[dict[str, JsonValue]], row["semantic_proof_executions"])
+            ),
         )
 
     def proposition_opportunity_ids(
@@ -3763,12 +3844,59 @@ class PostgresRoleStore:
             for row in rows
         )
 
+    def active_opportunity_records(
+        self, source_message_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read active Application rows that must be reconciled by current revision."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT opportunity.opportunity_id AS raw_opportunity_id,
+                       COALESCE(compatibility.canonical_opportunity_id,
+                                opportunity.opportunity_id) AS opportunity_id,
+                       opportunity.source_message_revision_id,
+                       opportunity.opportunity_type,
+                       opportunity.accepted_facts,
+                       opportunity.evidence,
+                       opportunity.response_route
+                FROM football_runtime.application_opportunities AS opportunity
+                LEFT JOIN
+                    football_runtime.application_legacy_proposition_identity_compatibility
+                    AS compatibility
+                  ON compatibility.legacy_opportunity_id =
+                     opportunity.opportunity_id
+                WHERE opportunity.source_message_revision_id LIKE %s
+                  AND opportunity.publication_state = 'active'
+                ORDER BY opportunity.opportunity_id
+                """,
+                (f"{source_message_id}:revision:%",),
+            ).fetchall()
+        return tuple(
+            {
+                "raw_opportunity_id": row["raw_opportunity_id"],
+                "opportunity_id": row["opportunity_id"],
+                "source_message_revision_id": row["source_message_revision_id"],
+                "opportunity_type": row["opportunity_type"],
+                "accepted_facts": row["accepted_facts"],
+                "evidence": row["evidence"],
+                "response_route": row["response_route"],
+            }
+            for row in rows
+        )
+
     def record_classification_routing_outcome(
         self,
         *,
         incoming: ContractEnvelope,
         outcome: ClassificationRoutingOutcome,
         received_at: datetime,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically retain one body-free Application routing outcome."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -3800,6 +3928,13 @@ class PostgresRoleStore:
                     received_at,
                 ),
             )
+            _suppress_application_opportunities(
+                connection,
+                suppressed_opportunities=suppressed_opportunities,
+                recorded_at=received_at,
+            )
+            for additional_outgoing in additional_outgoings:
+                _insert_outbox(connection, additional_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -3811,6 +3946,8 @@ class PostgresRoleStore:
         outgoing: ContractEnvelope,
         received_at: datetime,
         routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically retain accepted facts and emit publication state."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -3884,6 +4021,18 @@ class PostgresRoleStore:
                     evidence = EXCLUDED.evidence,
                     response_route = EXCLUDED.response_route,
                     accepted_at = EXCLUDED.accepted_at
+                WHERE (
+                    SELECT revision
+                    FROM football_runtime.source_message_revisions
+                    WHERE source_message_revision_id =
+                          EXCLUDED.source_message_revision_id
+                ) >= (
+                    SELECT revision
+                    FROM football_runtime.source_message_revisions
+                    WHERE source_message_revision_id =
+                          football_runtime.application_opportunities.
+                          source_message_revision_id
+                )
                 """,
                 (
                     opportunity["opportunity_id"],
@@ -3897,7 +4046,14 @@ class PostgresRoleStore:
                     received_at,
                 ),
             )
+            _suppress_application_opportunities(
+                connection,
+                suppressed_opportunities=suppressed_opportunities,
+                recorded_at=received_at,
+            )
             _insert_outbox(connection, outgoing)
+            for additional_outgoing in additional_outgoings:
+                _insert_outbox(connection, additional_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -3909,6 +4065,8 @@ class PostgresRoleStore:
         outgoing: ContractEnvelope,
         received_at: datetime,
         routing_outcome: ClassificationRoutingOutcome | None = None,
+        suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
+        additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically retain a compound candidate batch and emit publication."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -3989,6 +4147,18 @@ class PostgresRoleStore:
                         evidence = EXCLUDED.evidence,
                         response_route = EXCLUDED.response_route,
                         accepted_at = EXCLUDED.accepted_at
+                    WHERE (
+                        SELECT revision
+                        FROM football_runtime.source_message_revisions
+                        WHERE source_message_revision_id =
+                              EXCLUDED.source_message_revision_id
+                    ) >= (
+                        SELECT revision
+                        FROM football_runtime.source_message_revisions
+                        WHERE source_message_revision_id =
+                              football_runtime.application_opportunities.
+                              source_message_revision_id
+                    )
                     """,
                     (
                         opportunity["opportunity_id"],
@@ -4002,7 +4172,14 @@ class PostgresRoleStore:
                         received_at,
                     ),
                 )
+            _suppress_application_opportunities(
+                connection,
+                suppressed_opportunities=suppressed_opportunities,
+                recorded_at=received_at,
+            )
             _insert_outbox(connection, outgoing)
+            for additional_outgoing in additional_outgoings:
+                _insert_outbox(connection, additional_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -4245,7 +4422,11 @@ class PostgresRoleStore:
                        opportunity_id, opportunity_revision_id, opportunity_type,
                        publication_state, accepted_facts, response_route
                 FROM football_runtime.recommendation_opportunities
-                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                ORDER BY opportunity_id,
+                         (substring(opportunity_revision_id
+                                    FROM ':revision:([0-9]+)$'))::bigint DESC,
+                         published_at DESC,
+                         opportunity_revision_id DESC
                 """
             ).fetchall()
         return evaluate_game_search(
@@ -4344,7 +4525,11 @@ class PostgresRoleStore:
                        opportunity_id, opportunity_revision_id, opportunity_type,
                        publication_state, accepted_facts, response_route, published_at
                 FROM football_runtime.recommendation_opportunities
-                ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+                ORDER BY opportunity_id,
+                         (substring(opportunity_revision_id
+                                    FROM ':revision:([0-9]+)$'))::bigint DESC,
+                         published_at DESC,
+                         opportunity_revision_id DESC
                 """
             ).fetchall()
             if self._search_snapshot_hook is not None:
@@ -7019,6 +7204,90 @@ def _insert_outbox(
             source_chat_admission_provenance_id,
         ),
     )
+
+
+def _suppress_application_opportunities(
+    connection: psycopg.Connection[Any],
+    *,
+    suppressed_opportunities: tuple[dict[str, JsonValue], ...],
+    recorded_at: datetime,
+) -> None:
+    """Move disappeared Application rows to the current revision atomically."""
+    for opportunity in suppressed_opportunities:
+        opportunity_id = opportunity.get("opportunity_id")
+        storage_opportunity_id = opportunity.get("storage_opportunity_id")
+        opportunity_revision_id = opportunity.get("opportunity_revision_id")
+        storage_opportunity_revision_id = opportunity.get(
+            "storage_opportunity_revision_id"
+        )
+        source_message_revision_id = opportunity.get("source_message_revision_id")
+        opportunity_type = opportunity.get("opportunity_type")
+        accepted_facts = opportunity.get("accepted_facts")
+        evidence = opportunity.get("evidence")
+        response_route = opportunity.get("response_route")
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                opportunity_id,
+                opportunity_revision_id,
+                source_message_revision_id,
+                opportunity_type,
+            )
+        ) or not all(
+            isinstance(value, dict)
+            for value in (accepted_facts, evidence, response_route)
+        ):
+            raise ValueError("suppressed opportunity state is incomplete")
+        if not isinstance(storage_opportunity_id, str) or not storage_opportunity_id:
+            storage_opportunity_id = opportunity_id
+        if (
+            not isinstance(storage_opportunity_revision_id, str)
+            or not storage_opportunity_revision_id
+        ):
+            storage_opportunity_revision_id = opportunity_revision_id
+        if (
+            not isinstance(storage_opportunity_id, str)
+            or not storage_opportunity_id
+            or not isinstance(storage_opportunity_revision_id, str)
+            or not storage_opportunity_revision_id
+        ):
+            raise ValueError("suppressed opportunity storage identity is incomplete")
+        connection.execute(
+            """
+            UPDATE football_runtime.application_opportunities AS opportunity
+            SET opportunity_revision_id = %s,
+                source_message_revision_id = %s,
+                opportunity_type = %s,
+                publication_state = 'suppressed',
+                accepted_facts = %s::jsonb,
+                evidence = %s::jsonb,
+                response_route = %s::jsonb,
+                accepted_at = %s
+            WHERE opportunity.opportunity_id = %s
+              AND EXISTS (
+                  SELECT 1
+                  FROM football_runtime.source_message_revisions AS current_revision
+                  JOIN football_runtime.source_message_revisions AS stored_revision
+                    ON stored_revision.source_message_revision_id =
+                       opportunity.source_message_revision_id
+                  WHERE current_revision.source_message_revision_id = %s
+                    AND current_revision.source_message_id =
+                        stored_revision.source_message_id
+                    AND current_revision.revision > stored_revision.revision
+              )
+            """,
+            (
+                storage_opportunity_revision_id,
+                source_message_revision_id,
+                opportunity_type,
+                json.dumps(accepted_facts),
+                json.dumps(evidence),
+                json.dumps(response_route),
+                recorded_at,
+                storage_opportunity_id,
+                source_message_revision_id,
+            ),
+        )
 
 
 def _accept_contract_inbox(
