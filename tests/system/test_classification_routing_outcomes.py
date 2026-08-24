@@ -563,350 +563,461 @@ def test_primary_effective_provenance_is_retryable_before_any_classification(
     assert system.opportunity_publication_contracts(revision_id) == ()
 
 
-@pytest.mark.parametrize("invalid_kind", ("schema", "metadata", "exception"))
-def test_legacy_v1_invalid_primary_execution_uses_durable_retry_budget(
-    invalid_kind: str,
-) -> None:
-    body = f"Legacy v1 invalid primary {invalid_kind} must remain retryable."
+def test_legacy_v1_invalid_primary_execution_uses_durable_retry_budget() -> None:
     classifier = ControlledModelAdapter()
-    if invalid_kind == "exception":
-        classifier.raise_for(error=TimeoutError("primary"))
-        invalid_result = _irrelevant_classifier_result()
-    elif invalid_kind == "schema":
-        invalid_result = ClassifierAdapterResult(
-            output={
-                "schema_version": "source-message-classification-v1",
-                "disposition": "accepted",
-                "candidates": [],
-            },
-            effective_model="gpt-5.6-sol",
-            effective_reasoning_effort="high",
-            codex_version="controlled-offline",
-            adapter_kind="classifier-recording",
-            adapter_version="classifier-recording-v1",
-            duration_ms=3,
-            input_tokens=30,
-            output_tokens=20,
-        )
-    else:
-        invalid_result = ClassifierAdapterResult(
-            output=_irrelevant_classifier_result().output,
-            effective_model="",
-            effective_reasoning_effort="high",
-            codex_version="controlled-offline",
-            adapter_kind="classifier-recording",
-            adapter_version="classifier-recording-v1",
-            duration_ms=3,
-            input_tokens=30,
-            output_tokens=20,
-        )
-    classifier.return_for(body=body, result=invalid_result)
-    system, _, _, revision_id = _stage_v2_source_delivery(
-        classifier=classifier,
-        body=body,
+    telegram = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        telegram_admin_user_id=49_128,
+    )
+    system.reset()
+    source_identity = _prepare_source_chat_on_existing_spine(
+        system=system,
+        telegram=telegram,
+        clock=clock,
         telegram_id=4_900_128,
         checkpoint=4928,
         administrator_id=49_128,
     )
-
-    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    assert [
-        (attempt.pass_kind, attempt.attempt_number, attempt.status)
-        for attempt in system.classification_attempts()
-    ] == [("primary", 1, "failed")]
-    assert system.opportunity_publication_contracts(revision_id) == ()
-
-    classifier.return_for(body=body, result=_irrelevant_classifier_result())
-    system.restart(RuntimeRole.CLASSIFICATION)
-    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    system.process_opportunities_until_idle()
-    assert [
-        (attempt.pass_kind, attempt.attempt_number, attempt.status)
-        for attempt in system.classification_attempts()
-    ] == [("primary", 1, "failed"), ("primary", 2, "succeeded")]
-    assert len(classifier.requests) == 2
-    assert len(system.classification_routing_outcomes()) == 1
-    assert system.opportunity_publication_contracts(revision_id) == ()
-
-
-@pytest.mark.parametrize("proof_failure", ("exception", "schema", "provenance"))
-def test_legacy_v1_semantic_proof_has_own_restartable_budget(
-    proof_failure: str,
-) -> None:
-    body = (
-        f"20 August 2026 in whole city. Need one player. "
-        f"Contact @legacy_v1_proof. Proof failure {proof_failure}."
-    )
-    classifier = ControlledModelAdapter()
-    primary = _minimal_classifier_result(
-        candidate_key="legacy-v1-proof-candidate",
-        body=body,
-        response_routes=[
-            {
-                "kind": "explicit_telegram_username",
-                "value": "@legacy_v1_proof",
-                "evidence": "@legacy_v1_proof",
-            }
-        ],
-        event_time_evidence="20 August 2026",
-        opportunity_evidence="Need one player",
-        open_places_evidence="Need one player",
-    )
-    primary_candidates = primary.output["candidates"]
-    assert isinstance(primary_candidates, list) and len(primary_candidates) == 1
-    primary_candidate = primary_candidates[0]
-    assert isinstance(primary_candidate, dict)
-    primary_candidate["evidence"] = {
-        **cast(dict[str, JsonValue], primary_candidate["evidence"]),
-        "location": "whole city",
-    }
-    primary_candidate["location"] = {
-        "mention": "whole city",
-        "place_id": "city:ru:saint-petersburg",
-        "country_id": "country:ru",
-        "city_id": "city:ru:saint-petersburg",
-    }
-    classifier.return_for(body=body, result=primary)
-    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
-    if proof_failure == "exception":
-        classifier.raise_for(pass_kind="semantic_proof", error=TimeoutError("proof"))
-    elif proof_failure == "schema":
-        classifier.return_proof_for(
-            body=body,
-            result=replace_classifier_output(
-                valid_proof,
-                {"source_message_revision_reference": "invalid-proof"},
-            ),
-        )
-    else:
-        classifier.return_proof_for(
-            body=body,
-            result=ClassifierAdapterResult(
-                output=valid_proof.output,
-                effective_model="wrong-model",
+    for offset, invalid_kind in enumerate(("schema", "metadata", "exception")):
+        body = f"Legacy v1 invalid primary {invalid_kind} must remain retryable."
+        if invalid_kind == "exception":
+            classifier.raise_for(error=TimeoutError("primary"))
+            invalid_result = _irrelevant_classifier_result()
+        elif invalid_kind == "schema":
+            invalid_result = ClassifierAdapterResult(
+                output={
+                    "schema_version": "source-message-classification-v1",
+                    "disposition": "accepted",
+                    "candidates": [],
+                },
+                effective_model="gpt-5.6-sol",
                 effective_reasoning_effort="high",
-                codex_version=valid_proof.codex_version,
-                adapter_kind=valid_proof.adapter_kind,
-                adapter_version=valid_proof.adapter_version,
-                duration_ms=valid_proof.duration_ms,
-                input_tokens=valid_proof.input_tokens,
-                output_tokens=valid_proof.output_tokens,
-            ),
+                codex_version="controlled-offline",
+                adapter_kind="classifier-recording",
+                adapter_version="classifier-recording-v1",
+                duration_ms=3,
+                input_tokens=30,
+                output_tokens=20,
+            )
+        else:
+            invalid_result = ClassifierAdapterResult(
+                output=_irrelevant_classifier_result().output,
+                effective_model="",
+                effective_reasoning_effort="high",
+                codex_version="controlled-offline",
+                adapter_kind="classifier-recording",
+                adapter_version="classifier-recording-v1",
+                duration_ms=3,
+                input_tokens=30,
+                output_tokens=20,
+            )
+        classifier.return_for(body=body, result=invalid_result)
+        revision_id = _stage_registered_source_message(
+            system=system,
+            telegram=telegram,
+            source_identity=source_identity,
+            body=body,
+            telegram_message_id=4_900_128 + offset,
+            checkpoint=4928 + offset,
         )
-    system, _, _, revision_id = _stage_v2_source_delivery(
-        classifier=classifier,
-        body=body,
+
+        request_count = len(classifier.requests)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        current_attempts = tuple(
+            attempt
+            for attempt in system.classification_attempts()
+            if attempt.source_message_revision_id == revision_id
+        )
+        assert [
+            (attempt.pass_kind, attempt.attempt_number, attempt.status)
+            for attempt in current_attempts
+        ] == [("primary", 1, "failed")]
+        assert system.opportunity_publication_contracts(revision_id) == ()
+
+        classifier.return_for(body=body, result=_irrelevant_classifier_result())
+        system.restart(RuntimeRole.CLASSIFICATION)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        system.process_opportunities_until_idle()
+        current_attempts = tuple(
+            attempt
+            for attempt in system.classification_attempts()
+            if attempt.source_message_revision_id == revision_id
+        )
+        assert [
+            (attempt.pass_kind, attempt.attempt_number, attempt.status)
+            for attempt in current_attempts
+        ] == [("primary", 1, "failed"), ("primary", 2, "succeeded")]
+        assert len(classifier.requests) - request_count == 2
+        assert (
+            sum(
+                outcome.source_message_revision_id == revision_id
+                for outcome in system.classification_routing_outcomes()
+            )
+            == 1
+        )
+        assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_legacy_v1_semantic_proof_has_own_restartable_budget() -> None:
+    classifier = ControlledModelAdapter()
+    telegram = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=49_129,
+    )
+    system.reset()
+    source_identity = _prepare_source_chat_on_existing_spine(
+        system=system,
+        telegram=telegram,
+        clock=clock,
         telegram_id=4_900_129,
         checkpoint=4929,
         administrator_id=49_129,
-        location_resolver=_whole_city_resolver(),
     )
+    for offset, proof_failure in enumerate(("exception", "schema", "provenance")):
+        body = (
+            f"20 August 2026 in whole city. Need one player. "
+            f"Contact @legacy_v1_proof. Proof failure {proof_failure}."
+        )
+        primary = _minimal_classifier_result(
+            candidate_key="legacy-v1-proof-candidate",
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@legacy_v1_proof",
+                    "evidence": "@legacy_v1_proof",
+                }
+            ],
+            event_time_evidence="20 August 2026",
+            opportunity_evidence="Need one player",
+            open_places_evidence="Need one player",
+        )
+        primary_candidates = primary.output["candidates"]
+        assert isinstance(primary_candidates, list) and len(primary_candidates) == 1
+        primary_candidate = primary_candidates[0]
+        assert isinstance(primary_candidate, dict)
+        primary_candidate["evidence"] = {
+            **cast(dict[str, JsonValue], primary_candidate["evidence"]),
+            "location": "whole city",
+        }
+        primary_candidate["location"] = {
+            "mention": "whole city",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        }
+        classifier.return_for(body=body, result=primary)
+        valid_proof = semantic_proof_result_for(output=primary.output, body=body)
+        if proof_failure == "exception":
+            classifier.raise_for(
+                pass_kind="semantic_proof", error=TimeoutError("proof")
+            )
+        elif proof_failure == "schema":
+            classifier.return_proof_for(
+                body=body,
+                result=replace_classifier_output(
+                    valid_proof,
+                    {"source_message_revision_reference": "invalid-proof"},
+                ),
+            )
+        else:
+            classifier.return_proof_for(
+                body=body,
+                result=ClassifierAdapterResult(
+                    output=valid_proof.output,
+                    effective_model="wrong-model",
+                    effective_reasoning_effort="high",
+                    codex_version=valid_proof.codex_version,
+                    adapter_kind=valid_proof.adapter_kind,
+                    adapter_version=valid_proof.adapter_version,
+                    duration_ms=valid_proof.duration_ms,
+                    input_tokens=valid_proof.input_tokens,
+                    output_tokens=valid_proof.output_tokens,
+                ),
+            )
+        revision_id = _stage_registered_source_message(
+            system=system,
+            telegram=telegram,
+            source_identity=source_identity,
+            body=body,
+            telegram_message_id=4_900_129 + offset,
+            checkpoint=4929 + offset,
+        )
 
-    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    attempts = system.classification_attempts()
-    assert [
-        (attempt.pass_kind, attempt.attempt_number, attempt.status)
-        for attempt in attempts
-    ] == [("primary", 1, "succeeded"), ("semantic_proof", 1, "failed")]
-    assert system.opportunities() == ()
-    assert system.opportunity_publication_contracts(revision_id) == ()
+        proof_request_count = len(classifier.proof_requests)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        attempts = tuple(
+            attempt
+            for attempt in system.classification_attempts()
+            if attempt.source_message_revision_id == revision_id
+        )
+        assert [
+            (attempt.pass_kind, attempt.attempt_number, attempt.status)
+            for attempt in attempts
+        ] == [("primary", 1, "succeeded"), ("semantic_proof", 1, "failed")]
+        assert not any(
+            opportunity.source_message_revision_id == revision_id
+            for opportunity in system.opportunities()
+        )
+        assert system.opportunity_publication_contracts(revision_id) == ()
 
-    classifier.return_proof_for(body=body, result=valid_proof)
-    system.restart(RuntimeRole.CLASSIFICATION)
-    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    system.process_opportunities_until_idle()
-    proof_attempts = tuple(
-        attempt
-        for attempt in system.classification_attempts()
-        if attempt.pass_kind == "semantic_proof"
-    )
-    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2]
-    assert [attempt.status for attempt in proof_attempts] == ["failed", "succeeded"]
-    assert len(classifier.proof_requests) == 2
-    assert all(
-        request.pass_kind == "semantic_proof" for request in classifier.proof_requests
-    )
-    assert len(system.opportunity_publication_contracts(revision_id)) == 1
+        classifier.return_proof_for(body=body, result=valid_proof)
+        system.restart(RuntimeRole.CLASSIFICATION)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        system.process_opportunities_until_idle()
+        proof_attempts = tuple(
+            attempt
+            for attempt in system.classification_attempts()
+            if attempt.source_message_revision_id == revision_id
+            and attempt.pass_kind == "semantic_proof"
+        )
+        assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2]
+        assert [attempt.status for attempt in proof_attempts] == ["failed", "succeeded"]
+        assert len(classifier.proof_requests) - proof_request_count == 2
+        assert all(
+            request.pass_kind == "semantic_proof"
+            for request in classifier.proof_requests[proof_request_count:]
+        )
+        assert len(system.opportunity_publication_contracts(revision_id)) == 1
 
 
-def test_v2_semantic_proof_exception_retries_without_recursive_semantic_pass() -> None:
-    body = "20 August 2026 in whole city. Need one player. Contact @v2_proof."
+def test_v1_semantic_proof_exhaustion_is_durable_and_unpublished() -> None:
     classifier = ControlledModelAdapter()
-    classifier.enable_primary_v2()
-    primary = _v2_accepted_result(body=body, candidate_key="v2-proof-candidate")
-    classifier.return_for(body=body, result=primary)
-    classifier.raise_for(pass_kind="semantic_proof", error=ConnectionError("proof"))
-    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
-    classifier.return_proof_for(body=body, result=valid_proof)
-    system, _, _, revision_id = _stage_v2_source_delivery(
-        classifier=classifier,
-        body=body,
-        telegram_id=4_900_130,
-        checkpoint=4930,
-        administrator_id=49_130,
+    telegram = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
         location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=49_131,
     )
-
-    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    assert system.opportunities() == ()
-    system.restart(RuntimeRole.CLASSIFICATION)
-    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    system.process_opportunities_until_idle()
-    proof_attempts = tuple(
-        attempt
-        for attempt in system.classification_attempts()
-        if attempt.pass_kind == "semantic_proof"
-    )
-    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2]
-    assert [attempt.status for attempt in proof_attempts] == ["failed", "succeeded"]
-    assert len(classifier.proof_requests) == 2
-    assert len(system.opportunity_publication_contracts(revision_id)) == 1
-
-
-@pytest.mark.parametrize("failure_kind", ("timeout", "provider_5xx", "process"))
-def test_legacy_v1_semantic_proof_exhaustion_is_durable_and_unpublished(
-    failure_kind: str,
-) -> None:
-    body = (
-        f"20 August 2026 in whole city. Need one player. "
-        f"Contact @legacy_v1_exhaustion. Failure {failure_kind}."
-    )
-    classifier = ControlledModelAdapter()
-    primary = _minimal_classifier_result(
-        candidate_key="legacy-v1-exhaustion-candidate",
-        body=body,
-        response_routes=[
-            {
-                "kind": "explicit_telegram_username",
-                "value": "@legacy_v1_exhaustion",
-                "evidence": "@legacy_v1_exhaustion",
-            }
-        ],
-        event_time_evidence="20 August 2026",
-        opportunity_evidence="Need one player",
-        open_places_evidence="Need one player",
-    )
-    primary_candidate = cast(list[JsonValue], primary.output["candidates"])[0]
-    assert isinstance(primary_candidate, dict)
-    primary_candidate["evidence"] = {
-        **cast(dict[str, JsonValue], primary_candidate["evidence"]),
-        "location": "whole city",
-    }
-    primary_candidate["location"] = {
-        "mention": "whole city",
-        "place_id": "city:ru:saint-petersburg",
-        "country_id": "country:ru",
-        "city_id": "city:ru:saint-petersburg",
-    }
-    classifier.return_for(body=body, result=primary)
-    if failure_kind == "timeout":
-        failures: tuple[Exception, ...] = (
-            TimeoutError("proof-1"),
-            TimeoutError("proof-2"),
-            TimeoutError("proof-3"),
-        )
-    elif failure_kind == "provider_5xx":
-        failures = (
-            ConnectionError("proof-1"),
-            ConnectionError("proof-2"),
-            ConnectionError("proof-3"),
-        )
-    else:
-        failures = (
-            RuntimeError("proof-1"),
-            RuntimeError("proof-2"),
-            RuntimeError("proof-3"),
-        )
-    for failure in failures:
-        classifier.raise_for(pass_kind="semantic_proof", error=failure)
-    system, _, _, revision_id = _stage_v2_source_delivery(
-        classifier=classifier,
-        body=body,
+    system.reset()
+    source_identity = _prepare_source_chat_on_existing_spine(
+        system=system,
+        telegram=telegram,
+        clock=clock,
         telegram_id=4_900_131,
         checkpoint=4931,
         administrator_id=49_131,
-        location_resolver=_whole_city_resolver(),
     )
+    for offset, failure_kind in enumerate(("timeout", "provider_5xx", "process")):
+        body = (
+            f"20 August 2026 in whole city. Need one player. "
+            f"Contact @legacy_v1_exhaustion. Failure {failure_kind}."
+        )
+        primary = _minimal_classifier_result(
+            candidate_key="legacy-v1-exhaustion-candidate",
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@legacy_v1_exhaustion",
+                    "evidence": "@legacy_v1_exhaustion",
+                }
+            ],
+            event_time_evidence="20 August 2026",
+            opportunity_evidence="Need one player",
+            open_places_evidence="Need one player",
+        )
+        primary_candidate = cast(list[JsonValue], primary.output["candidates"])[0]
+        assert isinstance(primary_candidate, dict)
+        primary_candidate["evidence"] = {
+            **cast(dict[str, JsonValue], primary_candidate["evidence"]),
+            "location": "whole city",
+        }
+        primary_candidate["location"] = {
+            "mention": "whole city",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        }
+        classifier.return_for(body=body, result=primary)
+        if failure_kind == "timeout":
+            failures: tuple[Exception, ...] = (
+                TimeoutError("proof-1"),
+                TimeoutError("proof-2"),
+                TimeoutError("proof-3"),
+            )
+        elif failure_kind == "provider_5xx":
+            failures = (
+                ConnectionError("proof-1"),
+                ConnectionError("proof-2"),
+                ConnectionError("proof-3"),
+            )
+        else:
+            failures = (
+                RuntimeError("proof-1"),
+                RuntimeError("proof-2"),
+                RuntimeError("proof-3"),
+            )
+        for failure in failures:
+            classifier.raise_for(pass_kind="semantic_proof", error=failure)
+        revision_id = _stage_registered_source_message(
+            system=system,
+            telegram=telegram,
+            source_identity=source_identity,
+            body=body,
+            telegram_message_id=4_900_131 + offset,
+            checkpoint=4931 + offset,
+        )
 
-    for attempt_number in range(1, 4):
-        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-        if attempt_number < 3:
-            system.restart(RuntimeRole.CLASSIFICATION)
-    system.process_opportunities_until_idle()
+        proof_request_count = len(classifier.proof_requests)
+        for attempt_number in range(1, 4):
+            assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+            if attempt_number < 3:
+                system.restart(RuntimeRole.CLASSIFICATION)
+        system.process_opportunities_until_idle()
 
-    proof_attempts = tuple(
-        attempt
-        for attempt in system.classification_attempts()
-        if attempt.pass_kind == "semantic_proof"
-    )
-    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
-    assert [attempt.status for attempt in proof_attempts] == [
-        "failed",
-        "failed",
-        "failed",
-    ]
-    assert len(classifier.proof_requests) == 3
-    assert system.opportunities() == ()
-    assert system.classification_routing_outcomes() == ()
-    assert system.opportunity_publication_contracts(revision_id) == ()
-    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    system.restart(RuntimeRole.CLASSIFICATION)
-    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-    assert system.opportunity_publication_contracts(revision_id) == ()
+        proof_attempts = tuple(
+            attempt
+            for attempt in system.classification_attempts()
+            if attempt.source_message_revision_id == revision_id
+            and attempt.pass_kind == "semantic_proof"
+        )
+        assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
+        assert [attempt.status for attempt in proof_attempts] == [
+            "failed",
+            "failed",
+            "failed",
+        ]
+        assert len(classifier.proof_requests) - proof_request_count == 3
+        assert not any(
+            opportunity.source_message_revision_id == revision_id
+            for opportunity in system.opportunities()
+        )
+        assert not any(
+            outcome.source_message_revision_id == revision_id
+            for outcome in system.classification_routing_outcomes()
+        )
+        assert system.opportunity_publication_contracts(revision_id) == ()
+        assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        system.restart(RuntimeRole.CLASSIFICATION)
+        assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        assert system.opportunity_publication_contracts(revision_id) == ()
 
 
-@pytest.mark.parametrize("failure_kind", ("schema", "provenance"))
-def test_v2_semantic_proof_exhaustion_is_body_free_and_unpublished(
-    failure_kind: str,
-) -> None:
-    body = "20 August 2026 in whole city. Need one player. Contact @v2_proof."
+def test_v2_semantic_proof_retries_and_exhaustion_are_body_free() -> None:
     classifier = ControlledModelAdapter()
     classifier.enable_primary_v2()
-    primary = _v2_accepted_result(body=body, candidate_key="v2-exhaustion-candidate")
-    classifier.return_for(body=body, result=primary)
-    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
-    if failure_kind == "schema":
-        invalid_proof = replace_classifier_output(
-            valid_proof,
-            {"source_message_revision_reference": "invalid-proof"},
-        )
-    else:
-        invalid_proof = replace(
-            valid_proof,
-            effective_model="wrong-model",
-        )
-    classifier.return_proof_for(body=body, result=invalid_proof)
-    system, _, _, revision_id = _stage_v2_source_delivery(
-        classifier=classifier,
-        body=body,
-        telegram_id=4_900_132,
-        checkpoint=4932,
-        administrator_id=49_132,
+    telegram = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
         location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=49_130,
     )
+    system.reset()
+    source_identity = _prepare_source_chat_on_existing_spine(
+        system=system,
+        telegram=telegram,
+        clock=clock,
+        telegram_id=4_900_130,
+        checkpoint=4930,
+        administrator_id=49_130,
+    )
+    for offset, failure_kind in enumerate(
+        ("exception_retry", "schema_exhaustion", "provenance_exhaustion")
+    ):
+        body = (
+            f"20 August 2026 in whole city. Need one player. "
+            f"Contact @v2_proof. Case {failure_kind}."
+        )
+        primary = _v2_accepted_result(
+            body=body,
+            candidate_key=f"v2-proof-candidate-{failure_kind}",
+        )
+        classifier.return_for(body=body, result=primary)
+        valid_proof = semantic_proof_result_for(output=primary.output, body=body)
+        if failure_kind == "exception_retry":
+            classifier.raise_for(
+                pass_kind="semantic_proof", error=ConnectionError("proof")
+            )
+            classifier.return_proof_for(body=body, result=valid_proof)
+        else:
+            if failure_kind == "schema_exhaustion":
+                invalid_proof = replace_classifier_output(
+                    valid_proof,
+                    {"source_message_revision_reference": "invalid-proof"},
+                )
+            else:
+                invalid_proof = replace(valid_proof, effective_model="wrong-model")
+            classifier.return_proof_for(body=body, result=invalid_proof)
+        revision_id = _stage_registered_source_message(
+            system=system,
+            telegram=telegram,
+            source_identity=source_identity,
+            body=body,
+            telegram_message_id=4_900_130 + offset,
+            checkpoint=4930 + offset,
+        )
 
-    for attempt_number in range(1, 4):
-        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
-        if attempt_number < 3:
+        proof_request_count = len(classifier.proof_requests)
+        if failure_kind == "exception_retry":
+            assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+            assert system.opportunities() == ()
             system.restart(RuntimeRole.CLASSIFICATION)
-    system.process_opportunities_until_idle()
-
-    proof_attempts = tuple(
-        attempt
-        for attempt in system.classification_attempts()
-        if attempt.pass_kind == "semantic_proof"
-    )
-    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
-    assert [attempt.status for attempt in proof_attempts] == [
-        "failed",
-        "failed",
-        "failed",
-    ]
-    assert len(classifier.proof_requests) == 3
-    assert system.opportunities() == ()
-    assert system.classification_routing_outcomes() == ()
-    assert system.opportunity_publication_contracts(revision_id) == ()
-    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+            assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+            system.process_opportunities_until_idle()
+            proof_attempts = tuple(
+                attempt
+                for attempt in system.classification_attempts()
+                if attempt.source_message_revision_id == revision_id
+                and attempt.pass_kind == "semantic_proof"
+            )
+            assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2]
+            assert [attempt.status for attempt in proof_attempts] == [
+                "failed",
+                "succeeded",
+            ]
+            assert len(system.opportunity_publication_contracts(revision_id)) == 1
+            assert len(classifier.proof_requests) - proof_request_count == 2
+        else:
+            for attempt_number in range(1, 4):
+                assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+                if attempt_number < 3:
+                    system.restart(RuntimeRole.CLASSIFICATION)
+            system.process_opportunities_until_idle()
+            proof_attempts = tuple(
+                attempt
+                for attempt in system.classification_attempts()
+                if attempt.source_message_revision_id == revision_id
+                and attempt.pass_kind == "semantic_proof"
+            )
+            assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
+            assert [attempt.status for attempt in proof_attempts] == [
+                "failed",
+                "failed",
+                "failed",
+            ]
+            assert not any(
+                opportunity.source_message_revision_id == revision_id
+                for opportunity in system.opportunities()
+            )
+            assert not any(
+                outcome.source_message_revision_id == revision_id
+                for outcome in system.classification_routing_outcomes()
+            )
+            assert system.opportunity_publication_contracts(revision_id) == ()
+            assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+            system.restart(RuntimeRole.CLASSIFICATION)
+            assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+            assert len(classifier.proof_requests) - proof_request_count == 3
 
 
 def test_adjacent_second_pass_uses_only_application_selected_bounded_context() -> None:
@@ -2978,3 +3089,69 @@ def _stage_v2_source_delivery(
         f"message:{telegram_id}:revision:1"
     )
     return system, classifier, source_identity, revision_id
+
+
+def _prepare_source_chat_on_existing_spine(
+    *,
+    system: AcceptanceSpine,
+    telegram: ControlledTelegramIngestionAdapter,
+    clock: FrozenClock,
+    telegram_id: int,
+    checkpoint: int,
+    administrator_id: int,
+) -> TelegramPeerIdentity:
+    """Register one reusable controlled Source Chat without reprovisioning."""
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=telegram_id,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary=f"channel-pts:{checkpoint}",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    return source_identity
+
+
+def _stage_registered_source_message(
+    *,
+    system: AcceptanceSpine,
+    telegram: ControlledTelegramIngestionAdapter,
+    source_identity: TelegramPeerIdentity,
+    body: str,
+    telegram_message_id: int,
+    checkpoint: int,
+) -> str:
+    """Stage one message on a previously registered controlled Source Chat."""
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=checkpoint),
+        to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint + 1),
+        source_event_id=(f"source-event:classification-routing:{telegram_message_id}"),
+        telegram_message_id=telegram_message_id,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    return (
+        f"source-chat:channel:{source_identity.telegram_id}:generation:1:"
+        f"message:{telegram_message_id}:revision:1"
+    )
