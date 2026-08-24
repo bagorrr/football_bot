@@ -858,6 +858,9 @@ class ControlledModelAdapter:
     def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return a controlled proof pass without changing primary request counts."""
         self.proof_requests.append(request)
+        failures = self._classify_failures.get(request.pass_kind)
+        if failures:
+            raise failures.pop(0)
         try:
             result = (
                 self._candidate_proof_results.get(

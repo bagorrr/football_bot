@@ -7843,108 +7843,198 @@ class RuntimeApplication:
         primary_output_is_valid = classifier_output_is_schema_valid(
             result.output, body=body
         )
+        if not provenance_complete or not primary_output_is_valid:
+            recorded_result = replace(
+                result,
+                duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
+                input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
+                output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
+            )
+            invalid_attempt = _classification_attempt_from_result(
+                recorded_result,
+                request,
+                revision_id=revision_id,
+                pass_number=1,
+                pass_kind="primary",
+                attempt_number=primary_attempt_number,
+                input_manifest_hash=input_manifest_hash,
+                status="failed",
+            )
+            self.store.record_classification_attempt(
+                incoming=incoming,
+                attempt=invalid_attempt,
+                result=recorded_result,
+                outgoing=None,
+                received_at=self.clock.now(),
+                finalize=primary_attempt_number >= 3,
+            )
+            return
         proposal_id = f"proposal:{revision_id}"
         semantic_proof_result: ClassifierAdapterResult | None = None
         semantic_proof_output: dict[str, JsonValue] | None = None
         semantic_proof_execution: dict[str, JsonValue] | None = None
+        semantic_proof_attempt: ClassificationAttempt | None = None
+        semantic_proof_recorded_result: ClassifierAdapterResult | None = None
         semantic_proof_ready = False
         if (
             result_disposition == "accepted"
             and provenance_complete
             and primary_output_is_valid
         ):
-            semantic_proof_request = replace(
-                request,
-                context_bundle_version="semantic-proof-context-v1",
-                prompt_version="open-match-semantic-proof-v1",
-                schema_version="source-semantic-proof-v1",
-                context_policy_version="semantic-proof-context-v1",
-            )
-            semantic_proof_result = self.model.semantic_proof(semantic_proof_request)
-            semantic_proof_output = semantic_proof_result.output
             primary_candidates = result.output.get("candidates")
             proof_candidate = (
                 primary_candidates[0]
                 if isinstance(primary_candidates, list) and primary_candidates
                 else None
             )
-            if (
+            if not (
                 isinstance(proof_candidate, dict)
                 and isinstance(proof_candidate.get("candidate_key"), str)
                 and isinstance(proof_candidate.get("evidence"), dict)
                 and isinstance(proof_candidate.get("response_routes"), list)
             ):
-                proof_manifest = {
-                    **manifest,
-                    "context_bundle_version": (
-                        semantic_proof_request.context_bundle_version
-                    ),
-                    "prompt_version": semantic_proof_request.prompt_version,
-                    "schema_version": semantic_proof_request.schema_version,
-                    "context_policy_version": (
-                        semantic_proof_request.context_policy_version
-                    ),
-                    "pass_number": 2,
-                    "attempt_number": 1,
-                }
-                proof_input_manifest_hash = sha256(
-                    json.dumps(
-                        proof_manifest,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest()
-                semantic_proof_execution = {
-                    "requested_model": semantic_proof_request.requested_model,
-                    "effective_model": semantic_proof_result.effective_model,
-                    "requested_reasoning_effort": (
-                        semantic_proof_request.requested_reasoning_effort
-                    ),
-                    "effective_reasoning_effort": (
-                        semantic_proof_result.effective_reasoning_effort
-                    ),
-                    "prompt_version": semantic_proof_request.prompt_version,
-                    "schema_version": semantic_proof_request.schema_version,
-                    "glossary_version": semantic_proof_request.glossary_version,
-                    "context_policy_version": (
-                        semantic_proof_request.context_policy_version
-                    ),
-                    "routing_policy_version": (
-                        semantic_proof_request.routing_policy_version
-                    ),
-                    "context_bundle_version": (
-                        semantic_proof_request.context_bundle_version
-                    ),
-                    "codex_version": semantic_proof_result.codex_version,
-                    "adapter_kind": semantic_proof_result.adapter_kind,
-                    "adapter_version": semantic_proof_result.adapter_version,
-                    "pass_number": 2,
-                    "attempt_number": 1,
-                    "input_manifest_hash": proof_input_manifest_hash,
-                    "duration_ms": _nonnegative_metric_or_zero(
-                        semantic_proof_result.duration_ms
-                    ),
-                    "input_tokens": _nonnegative_metric_or_zero(
-                        semantic_proof_result.input_tokens
-                    ),
-                    "output_tokens": _nonnegative_metric_or_zero(
-                        semantic_proof_result.output_tokens
-                    ),
-                    "status": "succeeded",
-                }
-                semantic_proof_ready = _semantic_proof_result_has_pinned_provenance(
-                    semantic_proof_result
-                ) and semantic_proof_is_schema_valid(
-                    semantic_proof_output,
-                    body=body,
-                    source_message_revision_reference=(
-                        request.source_message_revision_id
-                    ),
-                    candidate_key=cast(str, proof_candidate["candidate_key"]),
-                    evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
-                    routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+                raise RuntimeError("accepted v1 output has no proof-bound candidate")
+            proof_candidate_key = cast(str, proof_candidate["candidate_key"])
+            semantic_proof_request = replace(
+                request,
+                context_bundle_version="semantic-proof-context-v1",
+                prompt_version="open-match-semantic-proof-v1",
+                schema_version="source-semantic-proof-v1",
+                context_policy_version="semantic-proof-context-v1",
+                pass_kind="semantic_proof",
+                proof_candidate_key=proof_candidate_key,
+            )
+            proof_attempt_number = _semantic_proof_attempt_number(
+                prior_attempts,
+                revision_id=revision_id,
+                pass_number=2,
+                candidate_key=proof_candidate_key,
+            )
+            proof_manifest = {
+                **manifest,
+                "context_bundle_version": semantic_proof_request.context_bundle_version,
+                "prompt_version": semantic_proof_request.prompt_version,
+                "schema_version": semantic_proof_request.schema_version,
+                "context_policy_version": semantic_proof_request.context_policy_version,
+                "pass_kind": "semantic_proof",
+                "candidate_target_manifest_hash": _candidate_target_manifest_hash(
+                    revision_id=revision_id,
+                    candidate=proof_candidate,
+                ),
+                "pass_number": 2,
+                "attempt_number": proof_attempt_number,
+            }
+            proof_input_manifest_hash = sha256(
+                json.dumps(
+                    proof_manifest,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            primary_recorded_result = replace(
+                result,
+                duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
+                input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
+                output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
+            )
+            primary_attempt = _classification_attempt_from_result(
+                primary_recorded_result,
+                request,
+                revision_id=revision_id,
+                pass_number=1,
+                pass_kind="primary",
+                attempt_number=primary_attempt_number,
+                input_manifest_hash=input_manifest_hash,
+                status="succeeded",
+            )
+            try:
+                semantic_proof_result = self.model.semantic_proof(
+                    semantic_proof_request
                 )
+            except Exception:
+                semantic_proof_result = _classifier_failure_result(
+                    semantic_proof_request
+                )
+                semantic_proof_attempt = _classifier_failure_attempt(
+                    semantic_proof_request,
+                    revision_id=revision_id,
+                    pass_number=2,
+                    pass_kind="semantic_proof",
+                    attempt_number=proof_attempt_number,
+                    input_manifest_hash=proof_input_manifest_hash,
+                    candidate_key=proof_candidate_key,
+                )
+                self.store.record_classification_attempt(
+                    incoming=incoming,
+                    attempt=primary_attempt,
+                    result=primary_recorded_result,
+                    outgoing=None,
+                    received_at=self.clock.now(),
+                    additional_attempts=(
+                        (semantic_proof_attempt, semantic_proof_result),
+                    ),
+                    finalize=proof_attempt_number >= 3,
+                )
+                return
+            semantic_proof_recorded_result = replace(
+                semantic_proof_result,
+                duration_ms=_nonnegative_metric_or_zero(
+                    semantic_proof_result.duration_ms
+                ),
+                input_tokens=_nonnegative_metric_or_zero(
+                    semantic_proof_result.input_tokens
+                ),
+                output_tokens=_nonnegative_metric_or_zero(
+                    semantic_proof_result.output_tokens
+                ),
+            )
+            semantic_proof_ready = _semantic_proof_result_has_pinned_provenance(
+                semantic_proof_result
+            ) and semantic_proof_is_schema_valid(
+                semantic_proof_result.output,
+                body=body,
+                source_message_revision_reference=request.source_message_revision_id,
+                candidate_key=proof_candidate_key,
+                evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
+                routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+            )
+            semantic_proof_attempt = _classification_attempt_from_result(
+                semantic_proof_recorded_result,
+                semantic_proof_request,
+                revision_id=revision_id,
+                pass_number=2,
+                pass_kind="semantic_proof",
+                attempt_number=proof_attempt_number,
+                input_manifest_hash=proof_input_manifest_hash,
+                status="succeeded" if semantic_proof_ready else "failed",
+                candidate_key=proof_candidate_key,
+            )
+            if not semantic_proof_ready:
+                self.store.record_classification_attempt(
+                    incoming=incoming,
+                    attempt=primary_attempt,
+                    result=primary_recorded_result,
+                    outgoing=None,
+                    received_at=self.clock.now(),
+                    additional_attempts=(
+                        (semantic_proof_attempt, semantic_proof_recorded_result),
+                    ),
+                    finalize=proof_attempt_number >= 3,
+                )
+                return
+            semantic_proof_output = semantic_proof_result.output
+            semantic_proof_execution = _semantic_proof_execution_metadata(
+                semantic_proof_request,
+                semantic_proof_result,
+                manifest_hash=proof_input_manifest_hash,
+                pass_number=2,
+                attempt_number=proof_attempt_number,
+                candidate_target_manifest_hash=_candidate_target_manifest_hash(
+                    revision_id=revision_id,
+                    candidate=proof_candidate,
+                ),
+            )
         proposal_version = (
             3
             if semantic_proof_ready
@@ -8062,6 +8152,12 @@ class RuntimeApplication:
             result=recorded_result,
             outgoing=outgoing,
             received_at=self.clock.now(),
+            additional_attempts=(
+                ((semantic_proof_attempt, semantic_proof_recorded_result),)
+                if semantic_proof_attempt is not None
+                and semantic_proof_recorded_result is not None
+                else ()
+            ),
         )
 
     def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
@@ -8561,6 +8657,11 @@ class RuntimeApplication:
 
         semantic_proofs: list[JsonValue] = []
         semantic_proof_executions: list[JsonValue] = []
+        semantic_proof_attempts: list[
+            tuple[ClassificationAttempt, ClassifierAdapterResult]
+        ] = []
+        semantic_proof_failed = False
+        semantic_proof_retryable = False
         if final_output.get(
             "disposition"
         ) == "accepted" and classifier_output_is_schema_valid(final_output, body=body):
@@ -8587,35 +8688,94 @@ class RuntimeApplication:
                         pass_kind="semantic_proof",
                         proof_candidate_key=candidate_key,
                     )
-                    proof_result = self.model.semantic_proof(proof_request)
-                    proof_is_valid = _semantic_proof_result_has_pinned_provenance(
-                        proof_result
-                    ) and semantic_proof_is_schema_valid(
-                        proof_result.output,
-                        body=body,
-                        source_message_revision_reference=final_request.source_message_revision_id,
+                    proof_pass_number = 3 if final_pass_number == 2 else 2
+                    proof_attempt_number = _semantic_proof_attempt_number(
+                        prior_attempts,
+                        revision_id=revision_id,
+                        pass_number=proof_pass_number,
                         candidate_key=candidate_key,
-                        evidence=evidence,
-                        routes=routes,
+                    )
+                    proof_manifest_hash = manifest_for(
+                        proof_request,
+                        pass_number=proof_pass_number,
+                        attempt_number=proof_attempt_number,
+                        candidate=candidate,
+                    )
+                    try:
+                        proof_result = self.model.semantic_proof(proof_request)
+                    except Exception:
+                        proof_result = _classifier_failure_result(proof_request)
+                        proof_attempt = _classifier_failure_attempt(
+                            proof_request,
+                            revision_id=revision_id,
+                            pass_number=proof_pass_number,
+                            pass_kind="semantic_proof",
+                            attempt_number=proof_attempt_number,
+                            input_manifest_hash=proof_manifest_hash,
+                            candidate_key=candidate_key,
+                        )
+                        proof_recorded_result = proof_result
+                        proof_is_valid = False
+                    else:
+                        proof_recorded_result = replace(
+                            proof_result,
+                            duration_ms=_nonnegative_metric_or_zero(
+                                proof_result.duration_ms
+                            ),
+                            input_tokens=_nonnegative_metric_or_zero(
+                                proof_result.input_tokens
+                            ),
+                            output_tokens=_nonnegative_metric_or_zero(
+                                proof_result.output_tokens
+                            ),
+                        )
+                        proof_is_valid = _semantic_proof_result_has_pinned_provenance(
+                            proof_result
+                        ) and semantic_proof_is_schema_valid(
+                            proof_result.output,
+                            body=body,
+                            source_message_revision_reference=(
+                                final_request.source_message_revision_id
+                            ),
+                            candidate_key=candidate_key,
+                            evidence=evidence,
+                            routes=routes,
+                        )
+                        proof_attempt = _classification_attempt_from_result(
+                            proof_recorded_result,
+                            proof_request,
+                            revision_id=revision_id,
+                            pass_number=proof_pass_number,
+                            pass_kind="semantic_proof",
+                            attempt_number=proof_attempt_number,
+                            input_manifest_hash=proof_manifest_hash,
+                            status="succeeded" if proof_is_valid else "failed",
+                            candidate_key=candidate_key,
+                        )
+                    semantic_proof_attempts.append(
+                        (proof_attempt, proof_recorded_result)
                     )
                     if not proof_is_valid:
+                        semantic_proof_failed = True
+                        semantic_proof_retryable = (
+                            semantic_proof_retryable or proof_attempt_number < 3
+                        )
                         continue
                     semantic_proofs.append(
-                        {"candidate_key": candidate_key, "proof": proof_result.output}
+                        {
+                            "candidate_key": candidate_key,
+                            "proof": proof_recorded_result.output,
+                        }
                     )
                     semantic_proof_executions.append(
                         {
                             "candidate_key": candidate_key,
                             "execution": _semantic_proof_execution_metadata(
                                 proof_request,
-                                proof_result,
-                                manifest_hash=manifest_for(
-                                    proof_request,
-                                    pass_number=3 if final_pass_number == 2 else 2,
-                                    attempt_number=1,
-                                    candidate=candidate,
-                                ),
-                                pass_number=3 if final_pass_number == 2 else 2,
+                                proof_recorded_result,
+                                manifest_hash=proof_manifest_hash,
+                                pass_number=proof_pass_number,
+                                attempt_number=proof_attempt_number,
                                 candidate_target_manifest_hash=(
                                     _candidate_target_manifest_hash(
                                         revision_id=revision_id,
@@ -8625,6 +8785,45 @@ class RuntimeApplication:
                             ),
                         }
                     )
+        if semantic_proof_failed:
+            if resume_ambiguity:
+                if not additional_attempts:
+                    raise RuntimeError(
+                        "proof retry did not produce an ambiguity attempt"
+                    )
+                record_attempt = additional_attempts[0][0]
+                record_result = additional_attempts[0][1]
+                attempts_to_store = tuple(additional_attempts[1:]) + tuple(
+                    semantic_proof_attempts
+                )
+            else:
+                assert primary_result is not None
+                if not primary_attempts:
+                    raise RuntimeError("proof execution has no durable primary attempt")
+                record_attempt = primary_attempts[0]
+                record_result = primary_result
+                attempts_to_store = tuple(additional_attempts) + tuple(
+                    semantic_proof_attempts
+                )
+            self.store.record_classification_attempt(
+                incoming=incoming,
+                attempt=record_attempt,
+                result=replace(
+                    record_result,
+                    duration_ms=_nonnegative_metric_or_zero(record_result.duration_ms),
+                    input_tokens=_nonnegative_metric_or_zero(
+                        record_result.input_tokens
+                    ),
+                    output_tokens=_nonnegative_metric_or_zero(
+                        record_result.output_tokens
+                    ),
+                ),
+                outgoing=None,
+                received_at=self.clock.now(),
+                additional_attempts=attempts_to_store,
+                finalize=not semantic_proof_retryable,
+            )
+            return
         if final_output.get("disposition") == "accepted":
             candidates = final_output.get("candidates")
             if not isinstance(candidates, list) or len(semantic_proofs) != len(
@@ -8649,14 +8848,18 @@ class RuntimeApplication:
                 raise RuntimeError("ambiguity retry did not produce an attempt")
             record_attempt = additional_attempts[0][0]
             record_result = additional_attempts[0][1]
-            attempts_to_store = tuple(additional_attempts[1:])
+            attempts_to_store = tuple(additional_attempts[1:]) + tuple(
+                semantic_proof_attempts
+            )
         else:
             assert primary_result is not None
             if not primary_attempts:
                 raise RuntimeError("primary execution has no durable attempt")
             record_attempt = primary_attempts[0]
             record_result = primary_result
-            attempts_to_store = tuple(additional_attempts)
+            attempts_to_store = tuple(additional_attempts) + tuple(
+                semantic_proof_attempts
+            )
         final_attempt_number = (
             additional_attempts[0][0].attempt_number
             if final_pass_number == 2
@@ -10255,6 +10458,128 @@ def _classifier_adapter_result_has_complete_provenance(
     )
 
 
+def _semantic_proof_candidate_token(candidate_key: str) -> str:
+    """Return a body-free stable token for one candidate proof pass."""
+    return sha256(candidate_key.encode("utf-8")).hexdigest()
+
+
+def _classification_attempt_id(
+    revision_id: str,
+    *,
+    pass_kind: str,
+    attempt_number: int,
+    candidate_key: str | None = None,
+) -> str:
+    """Derive one collision-free durable execution identity."""
+    if pass_kind == "primary":
+        return (
+            f"classification-attempt:{revision_id}"
+            if attempt_number == 1
+            else f"classification-attempt:{revision_id}:retry:{attempt_number}"
+        )
+    if pass_kind == "ambiguity_second_pass":
+        return (
+            f"classification-attempt:{revision_id}:second-pass"
+            if attempt_number == 1
+            else (
+                f"classification-attempt:{revision_id}:second-pass:"
+                f"retry:{attempt_number}"
+            )
+        )
+    if pass_kind == "semantic_proof":
+        if not isinstance(candidate_key, str) or not candidate_key:
+            raise ValueError("semantic-proof attempt requires a candidate key")
+        candidate_token = _semantic_proof_candidate_token(candidate_key)
+        return (
+            f"classification-attempt:{revision_id}:semantic-proof:{candidate_token}"
+            if attempt_number == 1
+            else (
+                f"classification-attempt:{revision_id}:semantic-proof:"
+                f"{candidate_token}:retry:{attempt_number}"
+            )
+        )
+    raise ValueError(f"unsupported classification pass kind: {pass_kind}")
+
+
+def _semantic_proof_attempt_number(
+    prior_attempts: tuple[ClassificationAttempt, ...],
+    *,
+    revision_id: str,
+    pass_number: int,
+    candidate_key: str,
+) -> int:
+    """Return the next bounded attempt for this candidate-bound proof pass."""
+    prefix = _classification_attempt_id(
+        revision_id,
+        pass_kind="semantic_proof",
+        attempt_number=1,
+        candidate_key=candidate_key,
+    )
+    return (
+        max(
+            (
+                attempt.attempt_number
+                for attempt in prior_attempts
+                if attempt.pass_number == pass_number
+                and attempt.pass_kind == "semantic_proof"
+                and attempt.attempt_id.startswith(prefix)
+            ),
+            default=0,
+        )
+        + 1
+    )
+
+
+def _classification_attempt_from_result(
+    result: ClassifierAdapterResult,
+    request: ClassifierRequest,
+    *,
+    revision_id: str,
+    pass_number: int,
+    pass_kind: str,
+    attempt_number: int,
+    input_manifest_hash: str,
+    status: str,
+    candidate_key: str | None = None,
+) -> ClassificationAttempt:
+    """Build one body-free durable attempt from a controlled adapter result."""
+    if status not in {"succeeded", "failed"}:
+        raise ValueError("classification attempt status is invalid")
+    return ClassificationAttempt(
+        attempt_id=_classification_attempt_id(
+            revision_id,
+            pass_kind=pass_kind,
+            attempt_number=attempt_number,
+            candidate_key=candidate_key,
+        ),
+        source_message_revision_id=revision_id,
+        requested_model=request.requested_model,
+        effective_model=result.effective_model,
+        requested_reasoning_effort=request.requested_reasoning_effort,
+        effective_reasoning_effort=result.effective_reasoning_effort,
+        prompt_version=request.prompt_version,
+        schema_version=request.schema_version,
+        glossary_version=request.glossary_version,
+        context_policy_version=request.context_policy_version,
+        routing_policy_version=request.routing_policy_version,
+        codex_version=result.codex_version,
+        adapter_kind=result.adapter_kind,
+        adapter_version=result.adapter_version,
+        pass_number=pass_number,
+        pass_kind=pass_kind,
+        attempt_number=attempt_number,
+        input_manifest_hash=input_manifest_hash,
+        evidence_references=_classification_evidence_references(result.output),
+        duration_ms=_nonnegative_metric_or_zero(result.duration_ms),
+        input_tokens=_nonnegative_metric_or_zero(result.input_tokens),
+        output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
+        disposition=_classification_disposition_or_review(
+            result.output.get("disposition")
+        ),
+        status=status,
+    )
+
+
 def _classifier_failure_result(request: ClassifierRequest) -> ClassifierAdapterResult:
     """Represent a raised classifier call without retaining exception text."""
     return ClassifierAdapterResult(
@@ -10278,23 +10603,14 @@ def _classifier_failure_attempt(
     pass_kind: str,
     attempt_number: int,
     input_manifest_hash: str,
+    candidate_key: str | None = None,
 ) -> ClassificationAttempt:
     """Build one durable, body-free failed attempt for a raised model call."""
-    attempt_id = (
-        f"classification-attempt:{revision_id}"
-        if pass_kind == "primary" and attempt_number == 1
-        else (
-            f"classification-attempt:{revision_id}:retry:{attempt_number}"
-            if pass_kind == "primary"
-            else (
-                f"classification-attempt:{revision_id}:second-pass"
-                if attempt_number == 1
-                else (
-                    f"classification-attempt:{revision_id}:second-pass:"
-                    f"retry:{attempt_number}"
-                )
-            )
-        )
+    attempt_id = _classification_attempt_id(
+        revision_id,
+        pass_kind=pass_kind,
+        attempt_number=attempt_number,
+        candidate_key=candidate_key,
     )
     return ClassificationAttempt(
         attempt_id=attempt_id,
@@ -10437,6 +10753,14 @@ def _classifier_proposal_has_pinned_provenance(
             revision_id=revision_id,
             body=body,
         )
+    attempt_number = payload.get("attempt_number")
+    if (
+        not isinstance(attempt_number, int)
+        or isinstance(attempt_number, bool)
+        or attempt_number < 1
+        or attempt_number > 3
+    ):
+        return False
     pinned = {
         "requested_model": "gpt-5.6-sol",
         "effective_model": "gpt-5.6-sol",
@@ -10474,7 +10798,7 @@ def _classifier_proposal_has_pinned_provenance(
         "context_policy_version": pinned["context_policy_version"],
         "routing_policy_version": pinned["routing_policy_version"],
         "pass_number": 1,
-        "attempt_number": 1,
+        "attempt_number": attempt_number,
     }
     expected_manifest_hash = sha256(
         json.dumps(
@@ -10491,7 +10815,7 @@ def _classifier_proposal_has_pinned_provenance(
             for key in ("codex_version", "adapter_kind", "adapter_version")
         )
         and payload.get("pass_number") == 1
-        and payload.get("attempt_number") == 1
+        and payload.get("attempt_number") == attempt_number
         and payload.get("input_manifest_hash") == expected_manifest_hash
         and all(
             isinstance(metric := payload.get(key), int)
@@ -10870,13 +11194,20 @@ def _v4_classifier_provenance_is_current(
         }:
             return False
         candidate_key = wrapper.get("candidate_key")
+        execution = wrapper.get("execution")
+        proof_attempt_number = (
+            execution.get("attempt_number") if isinstance(execution, dict) else None
+        )
         if (
             not isinstance(candidate_key, str)
             or candidate_key in execution_keys
             or candidate_key not in candidate_by_key
             or candidate_key not in proof_by_key
+            or not isinstance(proof_attempt_number, int)
+            or isinstance(proof_attempt_number, bool)
+            or not 1 <= proof_attempt_number <= 3
             or not _classifier_execution_metadata_is_current(
-                wrapper.get("execution"),
+                execution,
                 payload=payload,
                 revision_id=revision_id,
                 body=body,
@@ -10887,7 +11218,7 @@ def _v4_classifier_provenance_is_current(
                 routing_policy_version="classifier-routing-v1",
                 pass_kind="semantic_proof",
                 pass_number=proof_pass_number,
-                attempt_number=1,
+                attempt_number=proof_attempt_number,
                 candidate=candidate_by_key[candidate_key],
             )
         ):
@@ -11333,6 +11664,45 @@ def _proposition_opportunity_id(source_message_id: str, anchor: str) -> str:
     return f"opportunity:{source_message_id}:open_match:proposition:{anchor[:16]}"
 
 
+def _canonicalize_legacy_proposition_records(
+    *,
+    source_message_id: str,
+    persisted_records: tuple[dict[str, JsonValue], ...],
+) -> tuple[dict[str, JsonValue], ...] | None:
+    """Reconcile legacy candidate rows into the canonical Application lineage."""
+    canonical_records: list[dict[str, JsonValue]] = []
+    seen_opportunity_ids: set[str] = set()
+    for record in persisted_records:
+        opportunity_id = record.get("opportunity_id")
+        if not isinstance(opportunity_id, str) or not opportunity_id:
+            canonical_records.append(dict(record))
+            continue
+        legacy_prefix = f"opportunity:{source_message_id}:open_match:candidate:"
+        if ":candidate:" in opportunity_id:
+            if not opportunity_id.startswith(legacy_prefix):
+                return None
+            candidate_hash = opportunity_id.removeprefix(legacy_prefix)
+            if len(candidate_hash) != 16 or any(
+                character not in "0123456789abcdef" for character in candidate_hash
+            ):
+                return None
+            opportunity_id = (
+                f"opportunity:{source_message_id}:open_match:proposition:"
+                f"{candidate_hash}"
+            )
+        elif ":proposition:" in opportunity_id and not opportunity_id.startswith(
+            f"opportunity:{source_message_id}:open_match:proposition:"
+        ):
+            return None
+        if opportunity_id in seen_opportunity_ids:
+            return None
+        seen_opportunity_ids.add(opportunity_id)
+        canonical_record = dict(record)
+        canonical_record["opportunity_id"] = opportunity_id
+        canonical_records.append(canonical_record)
+    return tuple(canonical_records)
+
+
 def _reconcile_proposition_lineages(
     *,
     source_message_id: str,
@@ -11340,6 +11710,13 @@ def _reconcile_proposition_lineages(
     persisted_records: tuple[dict[str, JsonValue], ...],
 ) -> tuple[tuple[int, str, str], ...] | None:
     """Reconcile candidates by durable target lineage, never by model identity."""
+    canonical_records = _canonicalize_legacy_proposition_records(
+        source_message_id=source_message_id,
+        persisted_records=persisted_records,
+    )
+    if canonical_records is None:
+        return None
+    persisted_records = canonical_records
     anchors = [_proposition_lineage_anchor(candidate) for candidate in candidates]
     if len(set(anchors)) != len(anchors):
         return None
@@ -11584,6 +11961,7 @@ def _semantic_proof_execution_metadata(
     *,
     manifest_hash: str,
     pass_number: int,
+    attempt_number: int = 1,
     candidate_target_manifest_hash: str,
 ) -> dict[str, JsonValue]:
     """Record proof provenance separately from primary/ambiguity routing."""
@@ -11602,7 +11980,7 @@ def _semantic_proof_execution_metadata(
         "adapter_kind": result.adapter_kind,
         "adapter_version": result.adapter_version,
         "pass_number": pass_number,
-        "attempt_number": 1,
+        "attempt_number": attempt_number,
         "input_manifest_hash": manifest_hash,
         "candidate_target_manifest_hash": candidate_target_manifest_hash,
         "duration_ms": _nonnegative_metric_or_zero(result.duration_ms),

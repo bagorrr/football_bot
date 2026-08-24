@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
+import psycopg
 import pytest
 
 from modules.contracts import ContractName, JsonValue, RuntimeRole
@@ -561,6 +563,352 @@ def test_primary_effective_provenance_is_retryable_before_any_classification(
     assert system.opportunity_publication_contracts(revision_id) == ()
 
 
+@pytest.mark.parametrize("invalid_kind", ("schema", "metadata", "exception"))
+def test_legacy_v1_invalid_primary_execution_uses_durable_retry_budget(
+    invalid_kind: str,
+) -> None:
+    body = f"Legacy v1 invalid primary {invalid_kind} must remain retryable."
+    classifier = ControlledModelAdapter()
+    if invalid_kind == "exception":
+        classifier.raise_for(error=TimeoutError("primary"))
+        invalid_result = _irrelevant_classifier_result()
+    elif invalid_kind == "schema":
+        invalid_result = ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v1",
+                "disposition": "accepted",
+                "candidates": [],
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="classifier-recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        )
+    else:
+        invalid_result = ClassifierAdapterResult(
+            output=_irrelevant_classifier_result().output,
+            effective_model="",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="classifier-recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        )
+    classifier.return_for(body=body, result=invalid_result)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_128,
+        checkpoint=4928,
+        administrator_id=49_128,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert [
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in system.classification_attempts()
+    ] == [("primary", 1, "failed")]
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    classifier.return_for(body=body, result=_irrelevant_classifier_result())
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    assert [
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in system.classification_attempts()
+    ] == [("primary", 1, "failed"), ("primary", 2, "succeeded")]
+    assert len(classifier.requests) == 2
+    assert len(system.classification_routing_outcomes()) == 1
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+@pytest.mark.parametrize("proof_failure", ("exception", "schema", "provenance"))
+def test_legacy_v1_semantic_proof_has_own_restartable_budget(
+    proof_failure: str,
+) -> None:
+    body = (
+        f"20 August 2026 in whole city. Need one player. "
+        f"Contact @legacy_v1_proof. Proof failure {proof_failure}."
+    )
+    classifier = ControlledModelAdapter()
+    primary = _minimal_classifier_result(
+        candidate_key="legacy-v1-proof-candidate",
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@legacy_v1_proof",
+                "evidence": "@legacy_v1_proof",
+            }
+        ],
+        event_time_evidence="20 August 2026",
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    primary_candidates = primary.output["candidates"]
+    assert isinstance(primary_candidates, list) and len(primary_candidates) == 1
+    primary_candidate = primary_candidates[0]
+    assert isinstance(primary_candidate, dict)
+    primary_candidate["evidence"] = {
+        **cast(dict[str, JsonValue], primary_candidate["evidence"]),
+        "location": "whole city",
+    }
+    primary_candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    classifier.return_for(body=body, result=primary)
+    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
+    if proof_failure == "exception":
+        classifier.raise_for(pass_kind="semantic_proof", error=TimeoutError("proof"))
+    elif proof_failure == "schema":
+        classifier.return_proof_for(
+            body=body,
+            result=replace_classifier_output(
+                valid_proof,
+                {"source_message_revision_reference": "invalid-proof"},
+            ),
+        )
+    else:
+        classifier.return_proof_for(
+            body=body,
+            result=ClassifierAdapterResult(
+                output=valid_proof.output,
+                effective_model="wrong-model",
+                effective_reasoning_effort="high",
+                codex_version=valid_proof.codex_version,
+                adapter_kind=valid_proof.adapter_kind,
+                adapter_version=valid_proof.adapter_version,
+                duration_ms=valid_proof.duration_ms,
+                input_tokens=valid_proof.input_tokens,
+                output_tokens=valid_proof.output_tokens,
+            ),
+        )
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_129,
+        checkpoint=4929,
+        administrator_id=49_129,
+        location_resolver=_whole_city_resolver(),
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    attempts = system.classification_attempts()
+    assert [
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in attempts
+    ] == [("primary", 1, "succeeded"), ("semantic_proof", 1, "failed")]
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    classifier.return_proof_for(body=body, result=valid_proof)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.pass_kind == "semantic_proof"
+    )
+    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2]
+    assert [attempt.status for attempt in proof_attempts] == ["failed", "succeeded"]
+    assert len(classifier.proof_requests) == 2
+    assert all(
+        request.pass_kind == "semantic_proof" for request in classifier.proof_requests
+    )
+    assert len(system.opportunity_publication_contracts(revision_id)) == 1
+
+
+def test_v2_semantic_proof_exception_retries_without_recursive_semantic_pass() -> None:
+    body = "20 August 2026 in whole city. Need one player. Contact @v2_proof."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    primary = _v2_accepted_result(body=body, candidate_key="v2-proof-candidate")
+    classifier.return_for(body=body, result=primary)
+    classifier.raise_for(pass_kind="semantic_proof", error=ConnectionError("proof"))
+    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
+    classifier.return_proof_for(body=body, result=valid_proof)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_130,
+        checkpoint=4930,
+        administrator_id=49_130,
+        location_resolver=_whole_city_resolver(),
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert system.opportunities() == ()
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.pass_kind == "semantic_proof"
+    )
+    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2]
+    assert [attempt.status for attempt in proof_attempts] == ["failed", "succeeded"]
+    assert len(classifier.proof_requests) == 2
+    assert len(system.opportunity_publication_contracts(revision_id)) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ("timeout", "provider_5xx", "process"))
+def test_legacy_v1_semantic_proof_exhaustion_is_durable_and_unpublished(
+    failure_kind: str,
+) -> None:
+    body = (
+        f"20 August 2026 in whole city. Need one player. "
+        f"Contact @legacy_v1_exhaustion. Failure {failure_kind}."
+    )
+    classifier = ControlledModelAdapter()
+    primary = _minimal_classifier_result(
+        candidate_key="legacy-v1-exhaustion-candidate",
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@legacy_v1_exhaustion",
+                "evidence": "@legacy_v1_exhaustion",
+            }
+        ],
+        event_time_evidence="20 August 2026",
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    primary_candidate = cast(list[JsonValue], primary.output["candidates"])[0]
+    assert isinstance(primary_candidate, dict)
+    primary_candidate["evidence"] = {
+        **cast(dict[str, JsonValue], primary_candidate["evidence"]),
+        "location": "whole city",
+    }
+    primary_candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    classifier.return_for(body=body, result=primary)
+    if failure_kind == "timeout":
+        failures: tuple[Exception, ...] = (
+            TimeoutError("proof-1"),
+            TimeoutError("proof-2"),
+            TimeoutError("proof-3"),
+        )
+    elif failure_kind == "provider_5xx":
+        failures = (
+            ConnectionError("proof-1"),
+            ConnectionError("proof-2"),
+            ConnectionError("proof-3"),
+        )
+    else:
+        failures = (
+            RuntimeError("proof-1"),
+            RuntimeError("proof-2"),
+            RuntimeError("proof-3"),
+        )
+    for failure in failures:
+        classifier.raise_for(pass_kind="semantic_proof", error=failure)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_131,
+        checkpoint=4931,
+        administrator_id=49_131,
+        location_resolver=_whole_city_resolver(),
+    )
+
+    for attempt_number in range(1, 4):
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        if attempt_number < 3:
+            system.restart(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.pass_kind == "semantic_proof"
+    )
+    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
+    assert [attempt.status for attempt in proof_attempts] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert len(classifier.proof_requests) == 3
+    assert system.opportunities() == ()
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+@pytest.mark.parametrize("failure_kind", ("schema", "provenance"))
+def test_v2_semantic_proof_exhaustion_is_body_free_and_unpublished(
+    failure_kind: str,
+) -> None:
+    body = "20 August 2026 in whole city. Need one player. Contact @v2_proof."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    primary = _v2_accepted_result(body=body, candidate_key="v2-exhaustion-candidate")
+    classifier.return_for(body=body, result=primary)
+    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
+    if failure_kind == "schema":
+        invalid_proof = replace_classifier_output(
+            valid_proof,
+            {"source_message_revision_reference": "invalid-proof"},
+        )
+    else:
+        invalid_proof = replace(
+            valid_proof,
+            effective_model="wrong-model",
+        )
+    classifier.return_proof_for(body=body, result=invalid_proof)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_132,
+        checkpoint=4932,
+        administrator_id=49_132,
+        location_resolver=_whole_city_resolver(),
+    )
+
+    for attempt_number in range(1, 4):
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        if attempt_number < 3:
+            system.restart(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    proof_attempts = tuple(
+        attempt
+        for attempt in system.classification_attempts()
+        if attempt.pass_kind == "semantic_proof"
+    )
+    assert [attempt.attempt_number for attempt in proof_attempts] == [1, 2, 3]
+    assert [attempt.status for attempt in proof_attempts] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
+    assert len(classifier.proof_requests) == 3
+    assert system.opportunities() == ()
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+
 def test_adjacent_second_pass_uses_only_application_selected_bounded_context() -> None:
     telegram = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
@@ -905,8 +1253,15 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof() 
         "primary",
         "ambiguity_second_pass",
         "ambiguity_second_pass",
+        "semantic_proof",
     ]
-    assert [attempt.attempt_number for attempt in attempts] == [1, 1, 2]
+    assert [attempt.attempt_number for attempt in attempts] == [1, 1, 2, 1]
+    assert [attempt.status for attempt in attempts] == [
+        "succeeded",
+        "failed",
+        "succeeded",
+        "succeeded",
+    ]
     assert len(classifier.second_pass_requests) == 2
     assert len(classifier.requests) == 3
     assert len(classifier.proof_requests) == 1
@@ -1530,6 +1885,282 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     assert len(system.opportunity_publication_contracts(compound_revision_id)) == 1
 
 
+def test_legacy_v4_candidate_identity_reconciles_through_upgrade_and_replay() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    resolver = _whole_city_resolver()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_133
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_133,
+    )
+    source_message_id = "source-chat:channel:4900133:generation:1:message:49303"
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            DELETE FROM
+                football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s
+            """,
+            (source_message_id,),
+        )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4933",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        location_resolver=resolver,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    def configure_classifier(
+        body: str,
+        candidates: list[dict[str, JsonValue]],
+    ) -> None:
+        primary_output: dict[str, JsonValue] = {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "accepted",
+            "candidates": cast(JsonValue, candidates),
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        }
+        first = candidates[0]
+        first_routes = first.get("response_routes")
+        assert isinstance(first_routes, list)
+        first_route = first_routes[0]
+        assert isinstance(first_route, dict)
+        base = _minimal_classifier_result(
+            candidate_key=str(first["candidate_key"]),
+            body=body,
+            response_routes=[first_route],
+            event_time_evidence=str(
+                cast(dict[str, JsonValue], first["evidence"])["event_time"]
+            ),
+            opportunity_evidence="Need one player",
+            open_places_evidence="Need one player",
+        )
+        classifier.return_for(
+            body=body,
+            result=replace_classifier_output(base, primary_output),
+        )
+        for candidate in candidates:
+            candidate_key = candidate.get("candidate_key")
+            assert isinstance(candidate_key, str)
+            candidate_output: dict[str, JsonValue] = {
+                **primary_output,
+                "candidates": cast(JsonValue, [candidate]),
+            }
+            classifier.return_proof_for(
+                body=body,
+                candidate_key=candidate_key,
+                result=semantic_proof_result_for(
+                    output=candidate_output,
+                    body=body,
+                ),
+            )
+
+    def add_revision(
+        *,
+        body: str,
+        revision: int,
+        checkpoint: int,
+        kind: SourceEventKind,
+    ) -> str:
+        source_event_id = f"source-event:legacy-v4-compatibility:{revision}"
+        telegram.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=checkpoint),
+            to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint + 1),
+            source_event_id=source_event_id,
+            telegram_message_id=49303,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=datetime(2026, 8, 18, 9, 6 + revision, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        assert system.process_next_source_event()
+        system.process_opportunities_until_idle()
+        return (
+            "source-chat:channel:4900133:generation:1:message:49303:revision:"
+            f"{revision}"
+        )
+
+    first_body = (
+        "20 August 2026 in whole city. Need one player. Contact @legacy_compat."
+    )
+    first_candidates = [
+        _v2_open_match_candidate(
+            body=first_body,
+            candidate_key="legacy-v4-original",
+            event_time_evidence="20 August 2026",
+            start_local_date="2026-08-20",
+            route_value="@legacy_compat",
+        )
+    ]
+    configure_classifier(first_body, first_candidates)
+    first_revision_id = add_revision(
+        body=first_body,
+        revision=1,
+        checkpoint=4933,
+        kind=SourceEventKind.CREATE,
+    )
+    first_opportunity = system.opportunities()[0]
+    canonical_id = first_opportunity.opportunity_id
+    assert ":proposition:" in canonical_id
+    assert first_revision_id.rsplit(":revision:", 1)[0] == source_message_id
+    legacy_id = canonical_id.replace(":proposition:", ":candidate:")
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.application_opportunities
+            SET opportunity_id = %s,
+                opportunity_revision_id = %s
+            WHERE opportunity_id = %s
+            """,
+            (legacy_id, f"{legacy_id}:revision:1", canonical_id),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_proposition_identities
+            SET opportunity_id = %s
+            WHERE source_message_id = %s
+            """,
+            (legacy_id, source_message_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO
+                football_runtime.application_legacy_proposition_identity_compatibility (
+                source_message_id, legacy_opportunity_id,
+                canonical_opportunity_id, created_at
+            ) VALUES (%s, %s, %s, %s)
+            """,
+            (source_message_id, legacy_id, canonical_id, clock.now()),
+        )
+
+    configure_classifier(first_body, first_candidates)
+    singleton_revision_id = add_revision(
+        body=first_body,
+        revision=2,
+        checkpoint=4934,
+        kind=SourceEventKind.EDIT,
+    )
+    singleton_publications = system.opportunity_publication_contracts(
+        singleton_revision_id
+    )
+    assert len(singleton_publications) == 1
+    singleton_payload = singleton_publications[0].payload
+    assert isinstance(singleton_payload, dict)
+    assert singleton_payload["opportunity_id"] == canonical_id
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s
+              AND legacy_opportunity_id = %s
+              AND canonical_opportunity_id = %s
+            """,
+            (source_message_id, legacy_id, canonical_id),
+        ).fetchone() == (1,)
+
+    system.process_opportunities_until_idle()
+    system.restart(RuntimeRole.APPLICATION)
+    system.process_opportunities_until_idle()
+    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 1
+
+    compound_body = (
+        "20 August 2026 in whole city. Need one player. Contact @legacy_compat. "
+        "22 August 2026 in whole city. Need one player. Contact @compound_new."
+    )
+    compound_candidates = [
+        _v2_open_match_candidate(
+            body=compound_body,
+            candidate_key="legacy-v4-original",
+            event_time_evidence="20 August 2026",
+            start_local_date="2026-08-20",
+            route_value="@legacy_compat",
+        ),
+        _v2_open_match_candidate(
+            body=compound_body,
+            candidate_key="legacy-v4-new",
+            event_time_evidence="22 August 2026",
+            start_local_date="2026-08-22",
+            route_value="@compound_new",
+        ),
+    ]
+    configure_classifier(compound_body, compound_candidates)
+    compound_revision_id = add_revision(
+        body=compound_body,
+        revision=3,
+        checkpoint=4935,
+        kind=SourceEventKind.EDIT,
+    )
+    compound_opportunities = system.opportunities()
+    compound_ids = {
+        opportunity.response_route.value: opportunity.opportunity_id
+        for opportunity in compound_opportunities
+    }
+    assert compound_ids["@legacy_compat"] == canonical_id
+    assert compound_ids["@compound_new"] != canonical_id
+    compound_publications = system.opportunity_publication_contracts(
+        compound_revision_id
+    )
+    assert len(compound_publications) == 1
+    assert compound_publications[0].contract_version == 3
+
+    reclassified_body = compound_body.replace(
+        "20 August 2026", "21 August 2026"
+    ).replace("22 August 2026", "23 August 2026")
+    reclassified_candidates = [
+        _v2_open_match_candidate(
+            body=reclassified_body,
+            candidate_key="reclassified-legacy",
+            event_time_evidence="21 August 2026",
+            start_local_date="2026-08-21",
+            route_value="@legacy_compat",
+        ),
+        _v2_open_match_candidate(
+            body=reclassified_body,
+            candidate_key="reclassified-new",
+            event_time_evidence="23 August 2026",
+            start_local_date="2026-08-23",
+            route_value="@compound_new",
+        ),
+    ]
+    configure_classifier(reclassified_body, reclassified_candidates)
+    reclassified_revision_id = add_revision(
+        body=reclassified_body,
+        revision=4,
+        checkpoint=4936,
+        kind=SourceEventKind.EDIT,
+    )
+    assert {
+        opportunity.response_route.value: opportunity.opportunity_id
+        for opportunity in system.opportunities()
+    } == compound_ids
+    assert len(system.opportunity_publication_contracts(reclassified_revision_id)) == 1
+
+
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:
     telegram = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
@@ -2142,6 +2773,125 @@ def replace_classifier_output(
     )
 
 
+def _v2_open_match_candidate(
+    *,
+    body: str,
+    candidate_key: str,
+    event_time_evidence: str,
+    start_local_date: str,
+    route_value: str,
+) -> dict[str, JsonValue]:
+    """Build one accepted v2 candidate for lineage compatibility scenarios."""
+    result = _minimal_classifier_result(
+        candidate_key=candidate_key,
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": route_value,
+                "evidence": route_value,
+            }
+        ],
+        event_time_evidence=event_time_evidence,
+        start_local_date=start_local_date,
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    output = deepcopy(result.output)
+    candidates = output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    evidence = candidate.get("evidence")
+    assert isinstance(evidence, dict)
+    candidate["evidence"] = {**evidence, "location": "whole city"}
+    candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    candidate["source_context"] = (
+        f"{event_time_evidence} in whole city. Need one player. Contact {route_value}."
+    )
+    return candidate
+
+
+def _v2_accepted_result(*, body: str, candidate_key: str) -> ClassifierAdapterResult:
+    """Build the smallest accepted v2 fixture for proof retry tests."""
+    result = _minimal_classifier_result(
+        candidate_key=candidate_key,
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@v2_proof",
+                "evidence": "@v2_proof",
+            }
+        ],
+        event_time_evidence="20 August 2026",
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    output = deepcopy(result.output)
+    candidates = output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    candidate["evidence"] = {
+        **cast(dict[str, JsonValue], candidate["evidence"]),
+        "location": "whole city",
+    }
+    candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    candidate["source_context"] = body
+    output["schema_version"] = "source-message-classification-v2"
+    output["routing"] = {"reason_code": "accepted", "required_context": "none"}
+    return replace_classifier_output(result, output)
+
+
+def _whole_city_resolver() -> ControlledLocationResolverAdapter:
+    """Provide the isolated source-bound location used by retry fixtures."""
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("ru", "Санкт-Петербург"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                            ),
+                        ),
+                    ),
+                    whole_city=True,
+                ),
+            ),
+        ),
+    )
+    return resolver
+
+
 def _stage_v2_source_delivery(
     *,
     classifier: ControlledModelAdapter,
@@ -2150,6 +2900,7 @@ def _stage_v2_source_delivery(
     checkpoint: int,
     administrator_id: int,
     adjacent_bodies: tuple[str, ...] = (),
+    location_resolver: ControlledLocationResolverAdapter | None = None,
 ) -> tuple[AcceptanceSpine, ControlledModelAdapter, TelegramPeerIdentity, str]:
     """Stage one v2 classifier command without consuming its classifier handoff."""
     telegram = ControlledTelegramIngestionAdapter()
@@ -2168,6 +2919,7 @@ def _stage_v2_source_delivery(
         clock=clock,
         telegram_ingestion=telegram,
         model=classifier,
+        location_resolver=location_resolver,
         telegram_admin_user_id=administrator_id,
     )
     system.reset()

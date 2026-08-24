@@ -116,6 +116,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0017_application_proposition_identities.sql",
     "0018_legacy_v4_proposition_identity_backfill.sql",
     "0019_application_proposition_discriminators.sql",
+    "0020_application_legacy_proposition_identity_compatibility.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -138,6 +139,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
     "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
     "97f5851b2f72c5a69d342ce3e72d0908a309dd85bd98495184d43b13508354c9",
+    "2a151808ef6854d40f567f778212218f043eda691fec2ce21fb0e241b277f291",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -3672,9 +3674,15 @@ class PostgresRoleStore:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT proposition_slot, opportunity_id
-                FROM football_runtime.application_proposition_identities
-                WHERE source_message_id = %s
+                SELECT identity.proposition_slot,
+                       COALESCE(compatibility.canonical_opportunity_id,
+                                identity.opportunity_id) AS opportunity_id
+                FROM football_runtime.application_proposition_identities AS identity
+                LEFT JOIN
+                    football_runtime.application_legacy_proposition_identity_compatibility
+                    AS compatibility
+                  ON compatibility.legacy_opportunity_id = identity.opportunity_id
+                WHERE identity.source_message_id = %s
                 ORDER BY proposition_slot
                 """,
                 (source_message_id,),
@@ -3695,24 +3703,50 @@ class PostgresRoleStore:
                 """
                 SELECT lineage.proposition_slot,
                        lineage.proposition_discriminator,
-                       opportunity.opportunity_id,
+                       opportunity.normalized_opportunity_id AS opportunity_id,
                        opportunity.opportunity_type,
                        opportunity.accepted_facts,
                        opportunity.evidence,
                        opportunity.response_route
                 FROM (
-                    SELECT DISTINCT ON (opportunity_id)
-                           opportunity_id, opportunity_type,
+                    SELECT DISTINCT ON (
+                        COALESCE(compatibility.canonical_opportunity_id,
+                                 opportunity.opportunity_id)
+                    )
+                           opportunity.opportunity_id AS raw_opportunity_id,
+                           COALESCE(compatibility.canonical_opportunity_id,
+                                    opportunity.opportunity_id)
+                               AS normalized_opportunity_id,
+                           opportunity.opportunity_type,
                            accepted_facts, evidence, response_route
-                    FROM football_runtime.application_opportunities
-                    WHERE source_message_revision_id LIKE %s
-                    ORDER BY opportunity_id, accepted_at DESC
+                    FROM football_runtime.application_opportunities AS opportunity
+                    LEFT JOIN
+                        football_runtime.application_legacy_proposition_identity_compatibility
+                        AS compatibility
+                      ON compatibility.legacy_opportunity_id =
+                         opportunity.opportunity_id
+                    WHERE opportunity.source_message_revision_id LIKE %s
+                    ORDER BY COALESCE(compatibility.canonical_opportunity_id,
+                                      opportunity.opportunity_id),
+                             opportunity.accepted_at DESC,
+                             opportunity.opportunity_id
                 ) AS opportunity
                 LEFT JOIN football_runtime.application_proposition_identities
                     AS lineage
-                  ON lineage.opportunity_id = opportunity.opportunity_id
+                  ON lineage.opportunity_id = opportunity.raw_opportunity_id
+                  OR lineage.opportunity_id = opportunity.normalized_opportunity_id
+                  OR EXISTS (
+                      SELECT 1
+                      FROM
+                          football_runtime.application_legacy_proposition_identity_compatibility
+                          AS lineage_compatibility
+                      WHERE lineage_compatibility.legacy_opportunity_id =
+                            lineage.opportunity_id
+                        AND lineage_compatibility.canonical_opportunity_id =
+                            opportunity.normalized_opportunity_id
+                  )
                 ORDER BY lineage.proposition_slot NULLS LAST,
-                         opportunity.opportunity_id
+                         opportunity.normalized_opportunity_id
                 """,
                 (f"{source_message_id}:revision:%",),
             ).fetchall()
@@ -3826,36 +3860,14 @@ class PostgresRoleStore:
                     "publication requires an Application proposition lineage"
                 )
             source_message_id = source_message_revision_id.rsplit(":revision:", 1)[0]
-            connection.execute(
-                """
-                INSERT INTO football_runtime.application_proposition_identities (
-                    source_message_id, proposition_slot, opportunity_id,
-                    proposition_discriminator, created_at
-                ) VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (source_message_id, proposition_slot) DO UPDATE
-                SET proposition_discriminator = EXCLUDED.proposition_discriminator
-                """,
-                (
-                    source_message_id,
-                    proposition_slot,
-                    opportunity_id,
-                    proposition_discriminator,
-                    received_at,
-                ),
+            _ensure_application_proposition_identity_mapping(
+                connection,
+                source_message_id=source_message_id,
+                proposition_slot=proposition_slot,
+                opportunity_id=opportunity_id,
+                proposition_discriminator=proposition_discriminator,
+                created_at=received_at,
             )
-            mapped_opportunity_id = connection.execute(
-                """
-                SELECT opportunity_id
-                FROM football_runtime.application_proposition_identities
-                WHERE source_message_id = %s AND proposition_slot = %s
-                """,
-                (source_message_id, proposition_slot),
-            ).fetchone()
-            if (
-                mapped_opportunity_id is None
-                or mapped_opportunity_id[0] != opportunity_id
-            ):
-                raise RuntimeError("Application proposition identity mapping changed")
             connection.execute(
                 """
                 INSERT INTO football_runtime.application_opportunities (
@@ -3949,38 +3961,17 @@ class PostgresRoleStore:
                 source_message_id = source_message_revision_id.rsplit(":revision:", 1)[
                     0
                 ]
-                connection.execute(
-                    """
-                    INSERT INTO football_runtime.application_proposition_identities (
-                        source_message_id, proposition_slot, opportunity_id,
-                        proposition_discriminator, created_at
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (source_message_id, proposition_slot) DO UPDATE
-                    SET proposition_discriminator = EXCLUDED.proposition_discriminator
-                    """,
-                    (
-                        source_message_id,
-                        proposition_slot,
-                        opportunity["opportunity_id"],
-                        proposition_discriminator,
-                        received_at,
-                    ),
+                opportunity_id = opportunity.get("opportunity_id")
+                if not isinstance(opportunity_id, str):
+                    raise ValueError("compound publication requires an opportunity id")
+                _ensure_application_proposition_identity_mapping(
+                    connection,
+                    source_message_id=source_message_id,
+                    proposition_slot=proposition_slot,
+                    opportunity_id=opportunity_id,
+                    proposition_discriminator=proposition_discriminator,
+                    created_at=received_at,
                 )
-                mapped_opportunity_id = connection.execute(
-                    """
-                    SELECT opportunity_id
-                    FROM football_runtime.application_proposition_identities
-                    WHERE source_message_id = %s AND proposition_slot = %s
-                    """,
-                    (source_message_id, proposition_slot),
-                ).fetchone()
-                if (
-                    mapped_opportunity_id is None
-                    or mapped_opportunity_id[0] != opportunity["opportunity_id"]
-                ):
-                    raise RuntimeError(
-                        "Application proposition identity mapping changed"
-                    )
                 connection.execute(
                     """
                     INSERT INTO football_runtime.application_opportunities (
@@ -6831,6 +6822,127 @@ def runtime_database_url(
         user=role.database_role,
         password=password,
     )
+
+
+def _legacy_candidate_opportunity_id(
+    *,
+    source_message_id: str,
+    opportunity_id: str,
+) -> str | None:
+    """Map one legacy v4 candidate identity to its canonical proposition id."""
+    prefix = f"opportunity:{source_message_id}:open_match:candidate:"
+    if not opportunity_id.startswith(prefix):
+        return None
+    candidate_hash = opportunity_id.removeprefix(prefix)
+    if len(candidate_hash) != 16 or any(
+        character not in "0123456789abcdef" for character in candidate_hash
+    ):
+        return None
+    return f"opportunity:{source_message_id}:open_match:proposition:{candidate_hash}"
+
+
+def _ensure_application_proposition_identity_mapping(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+    proposition_slot: int,
+    opportunity_id: str,
+    proposition_discriminator: str,
+    created_at: datetime,
+) -> None:
+    """Persist one canonical lineage while retaining a legacy candidate alias."""
+    existing = connection.execute(
+        """
+        SELECT opportunity_id
+        FROM football_runtime.application_proposition_identities
+        WHERE source_message_id = %s AND proposition_slot = %s
+        FOR UPDATE
+        """,
+        (source_message_id, proposition_slot),
+    ).fetchone()
+    canonical_identity = connection.execute(
+        """
+        SELECT source_message_id, proposition_slot
+        FROM football_runtime.application_proposition_identities
+        WHERE opportunity_id = %s
+        FOR UPDATE
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    if canonical_identity is not None and canonical_identity != (
+        source_message_id,
+        proposition_slot,
+    ):
+        raise RuntimeError("Application proposition identity collides")
+    canonical_owner = connection.execute(
+        """
+        SELECT legacy_opportunity_id
+        FROM football_runtime.application_legacy_proposition_identity_compatibility
+        WHERE canonical_opportunity_id = %s
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    if canonical_owner is not None and (
+        existing is None or canonical_owner[0] != existing[0]
+    ):
+        raise RuntimeError("Application legacy proposition identity collides")
+    if existing is not None and existing[0] != opportunity_id:
+        legacy_opportunity_id = existing[0]
+        expected_canonical_id = _legacy_candidate_opportunity_id(
+            source_message_id=source_message_id,
+            opportunity_id=legacy_opportunity_id,
+        )
+        if expected_canonical_id != opportunity_id:
+            raise RuntimeError("Application proposition identity mapping changed")
+        connection.execute(
+            """
+            INSERT INTO
+                football_runtime.application_legacy_proposition_identity_compatibility (
+                source_message_id, legacy_opportunity_id,
+                canonical_opportunity_id, created_at
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (legacy_opportunity_id) DO NOTHING
+            """,
+            (
+                source_message_id,
+                legacy_opportunity_id,
+                opportunity_id,
+                created_at,
+            ),
+        )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.application_proposition_identities (
+            source_message_id, proposition_slot, opportunity_id,
+            proposition_discriminator, created_at
+        ) VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (source_message_id, proposition_slot) DO UPDATE
+        SET proposition_discriminator = EXCLUDED.proposition_discriminator
+        """,
+        (
+            source_message_id,
+            proposition_slot,
+            opportunity_id,
+            proposition_discriminator,
+            created_at,
+        ),
+    )
+    mapped_opportunity_id = connection.execute(
+        """
+        SELECT COALESCE(compatibility.canonical_opportunity_id,
+                        identity.opportunity_id)
+        FROM football_runtime.application_proposition_identities AS identity
+        LEFT JOIN
+            football_runtime.application_legacy_proposition_identity_compatibility
+            AS compatibility
+          ON compatibility.legacy_opportunity_id = identity.opportunity_id
+        WHERE identity.source_message_id = %s
+          AND identity.proposition_slot = %s
+        """,
+        (source_message_id, proposition_slot),
+    ).fetchone()
+    if mapped_opportunity_id is None or mapped_opportunity_id[0] != opportunity_id:
+        raise RuntimeError("Application proposition identity mapping changed")
 
 
 def _insert_outbox(
