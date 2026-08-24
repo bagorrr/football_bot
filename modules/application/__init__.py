@@ -7357,12 +7357,7 @@ class RuntimeApplication:
                     invalid_payload = (
                         incoming.payload if isinstance(incoming.payload, dict) else {}
                     )
-                    raw_revision_id = invalid_payload.get("source_message_revision_id")
-                    invalid_revision_id = (
-                        raw_revision_id
-                        if isinstance(raw_revision_id, str) and raw_revision_id
-                        else f"invalid:{incoming.message_id}"
-                    )
+                    invalid_revision_id = f"invalid:{incoming.message_id}"
                     self.store.record_classification_routing_outcome(
                         incoming=cast(ContractEnvelope, incoming),
                         outcome=_classification_routing_outcome(
@@ -7764,7 +7759,69 @@ class RuntimeApplication:
             context_policy_version="classifier-context-v1",
             routing_policy_version="classifier-routing-v1",
         )
-        result = self.model.classify(request)
+        prior_attempts = self.store.classification_attempts_for_revision(revision_id)
+        primary_attempt_number = (
+            max(
+                (
+                    attempt.attempt_number
+                    for attempt in prior_attempts
+                    if attempt.pass_number == 1 and attempt.pass_kind == "primary"
+                ),
+                default=0,
+            )
+            + 1
+        )
+        if primary_attempt_number > 3:
+            raise RuntimeError("classifier retry budget was already exhausted")
+        manifest = {
+            "source_message_revision_id": request.source_message_revision_id,
+            "body": body,
+            "source_event_time": request.source_event_time,
+            "context_bundle_version": request.context_bundle_version,
+            "source_chat_reference": request.source_chat_reference,
+            "source_chat_timezone": request.source_chat_timezone,
+            "source_chat_geography": request.source_chat_geography,
+            "bounded_metadata": request.bounded_metadata,
+            "eligible_reply_context": request.eligible_reply_context,
+            "model": request.requested_model,
+            "reasoning_effort": request.requested_reasoning_effort,
+            "prompt_version": request.prompt_version,
+            "schema_version": request.schema_version,
+            "glossary_version": request.glossary_version,
+            "context_policy_version": request.context_policy_version,
+            "routing_policy_version": request.routing_policy_version,
+            "pass_number": 1,
+            "attempt_number": primary_attempt_number,
+        }
+        input_manifest_hash = sha256(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            result = self.model.classify(request)
+        except Exception:
+            failure_result = _classifier_failure_result(request)
+            failure_attempt = _classifier_failure_attempt(
+                request,
+                revision_id=revision_id,
+                pass_number=1,
+                pass_kind="primary",
+                attempt_number=primary_attempt_number,
+                input_manifest_hash=input_manifest_hash,
+            )
+            self.store.record_classification_attempt(
+                incoming=incoming,
+                attempt=failure_attempt,
+                result=failure_result,
+                outgoing=None,
+                received_at=self.clock.now(),
+                finalize=primary_attempt_number >= 3,
+            )
+            return
         result_disposition = result.output.get("disposition")
         disposition = (
             result_disposition
@@ -7786,34 +7843,6 @@ class RuntimeApplication:
         primary_output_is_valid = classifier_output_is_schema_valid(
             result.output, body=body
         )
-        manifest = {
-            "source_message_revision_id": request.source_message_revision_id,
-            "body": body,
-            "source_event_time": request.source_event_time,
-            "context_bundle_version": request.context_bundle_version,
-            "source_chat_reference": request.source_chat_reference,
-            "source_chat_timezone": request.source_chat_timezone,
-            "source_chat_geography": request.source_chat_geography,
-            "bounded_metadata": request.bounded_metadata,
-            "eligible_reply_context": request.eligible_reply_context,
-            "model": request.requested_model,
-            "reasoning_effort": request.requested_reasoning_effort,
-            "prompt_version": request.prompt_version,
-            "schema_version": request.schema_version,
-            "glossary_version": request.glossary_version,
-            "context_policy_version": request.context_policy_version,
-            "routing_policy_version": request.routing_policy_version,
-            "pass_number": 1,
-            "attempt_number": 1,
-        }
-        input_manifest_hash = sha256(
-            json.dumps(
-                manifest,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
         proposal_id = f"proposal:{revision_id}"
         semantic_proof_result: ClassifierAdapterResult | None = None
         semantic_proof_output: dict[str, JsonValue] | None = None
@@ -7956,7 +7985,7 @@ class RuntimeApplication:
             "adapter_kind": result.adapter_kind,
             "adapter_version": result.adapter_version,
             "pass_number": 1,
-            "attempt_number": 1,
+            "attempt_number": primary_attempt_number,
             "input_manifest_hash": input_manifest_hash,
             "duration_ms": result.duration_ms,
             "input_tokens": result.input_tokens,
@@ -7995,7 +8024,14 @@ class RuntimeApplication:
             output_tokens=_nonnegative_metric_or_zero(result.output_tokens),
         )
         attempt = ClassificationAttempt(
-            attempt_id=f"classification-attempt:{revision_id}",
+            attempt_id=(
+                f"classification-attempt:{revision_id}"
+                if primary_attempt_number == 1
+                else (
+                    f"classification-attempt:{revision_id}:"
+                    f"retry:{primary_attempt_number}"
+                )
+            ),
             source_message_revision_id=revision_id,
             requested_model=request.requested_model,
             effective_model=result.effective_model,
@@ -8011,7 +8047,7 @@ class RuntimeApplication:
             adapter_version=result.adapter_version,
             pass_number=1,
             pass_kind="primary",
-            attempt_number=1,
+            attempt_number=primary_attempt_number,
             input_manifest_hash=input_manifest_hash,
             evidence_references=_classification_evidence_references(result.output),
             duration_ms=recorded_result.duration_ms,
@@ -8167,7 +8203,31 @@ class RuntimeApplication:
             )
             if primary_attempt_number > 3:
                 raise RuntimeError("classifier retry budget was already exhausted")
-            primary_result = self.model.classify(request)
+            try:
+                primary_result = self.model.classify(request)
+            except Exception:
+                failure_result = _classifier_failure_result(request)
+                failure_attempt = _classifier_failure_attempt(
+                    request,
+                    revision_id=revision_id,
+                    pass_number=1,
+                    pass_kind="primary",
+                    attempt_number=primary_attempt_number,
+                    input_manifest_hash=manifest_for(
+                        request,
+                        pass_number=1,
+                        attempt_number=primary_attempt_number,
+                    ),
+                )
+                self.store.record_classification_attempt(
+                    incoming=incoming,
+                    attempt=failure_attempt,
+                    result=failure_result,
+                    outgoing=None,
+                    received_at=self.clock.now(),
+                    finalize=primary_attempt_number >= 3,
+                )
+                return
             primary_valid = primary_result_is_valid(primary_result)
             primary_attempts = (
                 ClassificationAttempt(
@@ -8231,7 +8291,7 @@ class RuntimeApplication:
             primary_disposition = "needs_second_pass"
             required_context = (
                 "adjacent_revisions"
-                if selected_adjacent_context
+                if selected_adjacent_context is not None
                 else "direct_reply"
                 if payload.get("eligible_reply_context") is not None
                 else "refined_prompt"
@@ -8258,7 +8318,7 @@ class RuntimeApplication:
                 )
                 or (
                     required_context == "adjacent_revisions"
-                    and bool(selected_adjacent_context)
+                    and selected_adjacent_context is not None
                 )
             )
         )
@@ -8284,7 +8344,54 @@ class RuntimeApplication:
             )
             if second_attempt_number > 3:
                 raise RuntimeError("ambiguity-pass retry budget was already exhausted")
-            second_result = self.model.classify(second_request)
+            try:
+                second_result = self.model.classify(second_request)
+            except Exception:
+                failure_result = _classifier_failure_result(second_request)
+                failure_attempt = _classifier_failure_attempt(
+                    second_request,
+                    revision_id=revision_id,
+                    pass_number=2,
+                    pass_kind="ambiguity_second_pass",
+                    attempt_number=second_attempt_number,
+                    input_manifest_hash=manifest_for(
+                        second_request,
+                        pass_number=2,
+                        attempt_number=second_attempt_number,
+                    ),
+                )
+                if primary_attempts:
+                    assert primary_result is not None
+                    self.store.record_classification_attempt(
+                        incoming=incoming,
+                        attempt=primary_attempts[0],
+                        result=replace(
+                            primary_result,
+                            duration_ms=_nonnegative_metric_or_zero(
+                                primary_result.duration_ms
+                            ),
+                            input_tokens=_nonnegative_metric_or_zero(
+                                primary_result.input_tokens
+                            ),
+                            output_tokens=_nonnegative_metric_or_zero(
+                                primary_result.output_tokens
+                            ),
+                        ),
+                        outgoing=None,
+                        received_at=self.clock.now(),
+                        additional_attempts=((failure_attempt, failure_result),),
+                        finalize=second_attempt_number >= 3,
+                    )
+                else:
+                    self.store.record_classification_attempt(
+                        incoming=incoming,
+                        attempt=failure_attempt,
+                        result=failure_result,
+                        outgoing=None,
+                        received_at=self.clock.now(),
+                        finalize=second_attempt_number >= 3,
+                    )
+                return
             second_valid = (
                 _classifier_adapter_result_has_complete_provenance(second_result)
                 and second_result.effective_model == "gpt-5.6-sol"
@@ -8972,9 +9079,11 @@ class RuntimeApplication:
                         received_at=self.clock.now(),
                     )
                     return
-                for accepted_candidate, (proposition_slot, opportunity_id) in zip(
-                    accepted_opportunities, lineages, strict=True
-                ):
+                for accepted_candidate, (
+                    proposition_slot,
+                    opportunity_id,
+                    proposition_discriminator,
+                ) in zip(accepted_opportunities, lineages, strict=True):
                     opportunity_revision_id = (
                         f"{opportunity_id}:revision:{incoming.subject_revision}"
                     )
@@ -8983,6 +9092,7 @@ class RuntimeApplication:
                             "opportunity_id": opportunity_id,
                             "opportunity_revision_id": opportunity_revision_id,
                             "proposition_slot": proposition_slot,
+                            "proposition_discriminator": proposition_discriminator,
                         }
                     )
                     publication_items.append(
@@ -9123,7 +9233,7 @@ class RuntimeApplication:
                 received_at=self.clock.now(),
             )
             return
-        proposition_slot, opportunity_id = lineages[0]
+        proposition_slot, opportunity_id, proposition_discriminator = lineages[0]
         opportunity_revision_id = (
             f"{opportunity_id}:revision:{incoming.subject_revision}"
         )
@@ -9131,6 +9241,7 @@ class RuntimeApplication:
             **accepted,
             "opportunity_id": opportunity_id,
             "proposition_slot": proposition_slot,
+            "proposition_discriminator": proposition_discriminator,
             "opportunity_revision_id": opportunity_revision_id,
         }
         outgoing = ContractEnvelope(
@@ -10083,7 +10194,7 @@ def _adjacent_context_matches_revisions(
             return False
         expected[revision_id] = (message_id, body, event_time.isoformat())
     if not context:
-        return True
+        return len(expected) == 0
     if len(context) != len(expected):
         return False
     seen: set[str] = set()
@@ -10141,6 +10252,75 @@ def _classifier_adapter_result_has_complete_provenance(
             result.input_tokens,
             result.output_tokens,
         )
+    )
+
+
+def _classifier_failure_result(request: ClassifierRequest) -> ClassifierAdapterResult:
+    """Represent a raised classifier call without retaining exception text."""
+    return ClassifierAdapterResult(
+        output={},
+        effective_model=request.requested_model,
+        effective_reasoning_effort=request.requested_reasoning_effort,
+        codex_version="classifier-exception",
+        adapter_kind="classifier-exception",
+        adapter_version="classifier-exception-v1",
+        duration_ms=0,
+        input_tokens=0,
+        output_tokens=0,
+    )
+
+
+def _classifier_failure_attempt(
+    request: ClassifierRequest,
+    *,
+    revision_id: str,
+    pass_number: int,
+    pass_kind: str,
+    attempt_number: int,
+    input_manifest_hash: str,
+) -> ClassificationAttempt:
+    """Build one durable, body-free failed attempt for a raised model call."""
+    attempt_id = (
+        f"classification-attempt:{revision_id}"
+        if pass_kind == "primary" and attempt_number == 1
+        else (
+            f"classification-attempt:{revision_id}:retry:{attempt_number}"
+            if pass_kind == "primary"
+            else (
+                f"classification-attempt:{revision_id}:second-pass"
+                if attempt_number == 1
+                else (
+                    f"classification-attempt:{revision_id}:second-pass:"
+                    f"retry:{attempt_number}"
+                )
+            )
+        )
+    )
+    return ClassificationAttempt(
+        attempt_id=attempt_id,
+        source_message_revision_id=revision_id,
+        requested_model=request.requested_model,
+        effective_model=request.requested_model,
+        requested_reasoning_effort=request.requested_reasoning_effort,
+        effective_reasoning_effort=request.requested_reasoning_effort,
+        prompt_version=request.prompt_version,
+        schema_version=request.schema_version,
+        glossary_version=request.glossary_version,
+        context_policy_version=request.context_policy_version,
+        routing_policy_version=request.routing_policy_version,
+        codex_version="classifier-exception",
+        adapter_kind="classifier-exception",
+        adapter_version="classifier-exception-v1",
+        pass_number=pass_number,
+        pass_kind=pass_kind,
+        attempt_number=attempt_number,
+        input_manifest_hash=input_manifest_hash,
+        evidence_references=(),
+        duration_ms=0,
+        input_tokens=0,
+        output_tokens=0,
+        disposition="needs_review",
+        status="failed",
     )
 
 
@@ -11015,7 +11195,8 @@ def _classification_routing_outcome(
     raw_disposition = output.get("disposition")
     disposition = (
         raw_disposition
-        if raw_disposition in _CLASSIFICATION_ROUTING_ROUTES
+        if isinstance(raw_disposition, str)
+        and raw_disposition in _CLASSIFICATION_ROUTING_ROUTES
         else "needs_review"
     )
     if disposition == "accepted" and reason_code != "classifier_disposition":
@@ -11065,31 +11246,73 @@ def _single_v4_candidate_payload(
     }
 
 
-def _proposition_lineage_anchor(value: dict[str, JsonValue]) -> str:
-    """Build an order-independent anchor from stable source-bound target facts."""
+_PROPOSITION_LINEAGE_FACT_KEYS = (
+    "start_local_date",
+    "end_local_date",
+    "exact_local_time",
+    "day_part",
+    "iana_timezone",
+    "country_id",
+    "city_id",
+    "place_id",
+    "location_geographic_type",
+    "location_parent_ids",
+    "location_verified_disjoint_place_ids",
+    "open_places",
+    "team_formats",
+    "positions",
+    "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+    "payment_amount",
+    "payment_currency",
+)
+_PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
+    "opportunity",
+    "event_time",
+    "location",
+    "open_places",
+    "team_formats",
+    "positions",
+    "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
+
+
+def _proposition_lineage_features(
+    value: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Project validated target facts into an Application-owned discriminator."""
     accepted_facts = value.get("accepted_facts")
     evidence = value.get("evidence")
-    if not isinstance(accepted_facts, dict) or not isinstance(evidence, dict):
+    response_route = value.get("response_route")
+    if (
+        not isinstance(accepted_facts, dict)
+        or not isinstance(evidence, dict)
+        or not isinstance(response_route, dict)
+    ):
         raise ValueError("proposition lineage target is incomplete")
-    location = {
-        key: accepted_facts.get(key)
-        for key in (
-            "country_id",
-            "city_id",
-            "place_id",
-            "location_geographic_type",
-        )
-    }
-    stable_evidence = {
-        key: evidence.get(key)
-        for key in ("opportunity", "location")
-        if isinstance(evidence.get(key), str)
-    }
-    manifest = {
+    features: dict[str, JsonValue] = {
         "opportunity_type": value.get("opportunity_type"),
-        "location": location,
-        "stable_evidence": stable_evidence,
     }
+    for key in _PROPOSITION_LINEAGE_FACT_KEYS:
+        features[f"fact:{key}"] = accepted_facts.get(key)
+    for key in _PROPOSITION_LINEAGE_EVIDENCE_KEYS:
+        evidence_value = evidence.get(key)
+        features[f"evidence:{key}"] = (
+            evidence_value if isinstance(evidence_value, str) else None
+        )
+    features["route:kind"] = response_route.get("kind")
+    features["route:value"] = response_route.get("value")
+    return features
+
+
+def _proposition_lineage_anchor(value: dict[str, JsonValue]) -> str:
+    """Build a complete, order-independent discriminator from target facts."""
+    manifest = _proposition_lineage_features(value)
     return sha256(
         json.dumps(
             manifest,
@@ -11115,30 +11338,56 @@ def _reconcile_proposition_lineages(
     source_message_id: str,
     candidates: tuple[dict[str, JsonValue], ...],
     persisted_records: tuple[dict[str, JsonValue], ...],
-) -> tuple[tuple[int, str], ...] | None:
-    """Reconcile candidates by durable target lineage, never by output position."""
+) -> tuple[tuple[int, str, str], ...] | None:
+    """Reconcile candidates by durable target lineage, never by model identity."""
     anchors = [_proposition_lineage_anchor(candidate) for candidate in candidates]
     if len(set(anchors)) != len(anchors):
         return None
     record_anchors: list[str] = []
+    record_features: list[dict[str, JsonValue]] = []
     for record in persisted_records:
         try:
             record_anchors.append(_proposition_lineage_anchor(record))
+            record_features.append(_proposition_lineage_features(record))
         except ValueError:
             return None
     if len(set(record_anchors)) != len(record_anchors):
         return None
 
     used_records: set[int] = set()
-    assignments: list[tuple[int, str]] = []
-    used_slots: dict[int, str] = {
-        slot: str(record["opportunity_id"])
-        for record in persisted_records
-        if isinstance(slot := record.get("proposition_slot"), int)
-        and not isinstance(slot, bool)
-        and isinstance(record.get("opportunity_id"), str)
-    }
-    for _candidate, anchor in zip(candidates, anchors, strict=True):
+    assignments: list[tuple[int, str, str] | None] = [None] * len(candidates)
+    used_slots: dict[int, str] = {}
+    for record in persisted_records:
+        slot = record.get("proposition_slot")
+        opportunity_id = record.get("opportunity_id")
+        if (
+            not isinstance(slot, int)
+            or isinstance(slot, bool)
+            or slot < 1
+            or not isinstance(opportunity_id, str)
+            or not opportunity_id
+        ):
+            continue
+        previous_id = used_slots.get(slot)
+        if previous_id is not None and previous_id != opportunity_id:
+            return None
+        used_slots[slot] = opportunity_id
+
+    def assign(
+        candidate_index: int,
+        *,
+        slot: int,
+        opportunity_id: str,
+        discriminator: str,
+    ) -> bool:
+        previous_id = used_slots.get(slot)
+        if previous_id is not None and previous_id != opportunity_id:
+            return False
+        used_slots[slot] = opportunity_id
+        assignments[candidate_index] = (slot, opportunity_id, discriminator)
+        return True
+
+    for candidate_index, anchor in enumerate(anchors):
         matches = [
             index
             for index, record_anchor in enumerate(record_anchors)
@@ -11156,22 +11405,133 @@ def _reconcile_proposition_lineages(
             slot = record.get("proposition_slot")
             if not isinstance(slot, int) or isinstance(slot, bool) or slot < 1:
                 slot = _proposition_lineage_slot(anchor)
-            previous_id = used_slots.get(slot)
-            if previous_id is not None and previous_id != opportunity_id:
+            if not assign(
+                candidate_index,
+                slot=slot,
+                opportunity_id=opportunity_id,
+                discriminator=anchor,
+            ):
                 return None
-            used_slots[slot] = opportunity_id
-            assignments.append((slot, opportunity_id))
+
+    candidate_features = [
+        _proposition_lineage_features(candidate) for candidate in candidates
+    ]
+
+    def score(candidate_index: int, record_index: int) -> int:
+        candidate_values = candidate_features[candidate_index]
+        record_values = record_features[record_index]
+        return sum(
+            candidate_values[key] == record_values[key]
+            for key in candidate_values.keys() & record_values.keys()
+            if candidate_values[key] is not None and record_values[key] is not None
+        )
+
+    minimum_match_score = 4
+    while True:
+        remaining_candidates = [
+            index for index, assignment in enumerate(assignments) if assignment is None
+        ]
+        remaining_records = [
+            index
+            for index in range(len(persisted_records))
+            if index not in used_records
+        ]
+        if not remaining_candidates or not remaining_records:
+            break
+        candidate_best: dict[int, tuple[int, tuple[int, ...]]] = {}
+        for candidate_index in remaining_candidates:
+            scores = {
+                record_index: score(candidate_index, record_index)
+                for record_index in remaining_records
+            }
+            best_score = max(scores.values(), default=0)
+            candidate_best[candidate_index] = (
+                best_score,
+                tuple(
+                    record_index
+                    for record_index, pair_score in scores.items()
+                    if pair_score == best_score
+                ),
+            )
+        record_best: dict[int, tuple[int, tuple[int, ...]]] = {}
+        for record_index in remaining_records:
+            scores = {
+                candidate_index: score(candidate_index, record_index)
+                for candidate_index in remaining_candidates
+            }
+            best_score = max(scores.values(), default=0)
+            record_best[record_index] = (
+                best_score,
+                tuple(
+                    candidate_index
+                    for candidate_index, pair_score in scores.items()
+                    if pair_score == best_score
+                ),
+            )
+        mutual_matches: list[tuple[int, int]] = []
+        for candidate_index, (best_score, best_records) in candidate_best.items():
+            if best_score < minimum_match_score or len(best_records) != 1:
+                continue
+            record_index = best_records[0]
+            record_score, best_candidates = record_best[record_index]
+            if (
+                record_score >= minimum_match_score
+                and len(best_candidates) == 1
+                and best_candidates[0] == candidate_index
+            ):
+                mutual_matches.append((candidate_index, record_index))
+        if not mutual_matches:
+            if any(
+                best_score >= minimum_match_score and len(best_records) > 1
+                for best_score, best_records in candidate_best.values()
+            ) or any(
+                best_score >= minimum_match_score and len(best_candidates) > 1
+                for best_score, best_candidates in record_best.values()
+            ):
+                return None
+            break
+        for candidate_index, record_index in mutual_matches:
+            if (
+                candidate_index not in remaining_candidates
+                or record_index in used_records
+            ):
+                continue
+            used_records.add(record_index)
+            record = persisted_records[record_index]
+            opportunity_id = record.get("opportunity_id")
+            if not isinstance(opportunity_id, str) or not opportunity_id:
+                return None
+            slot = record.get("proposition_slot")
+            if not isinstance(slot, int) or isinstance(slot, bool) or slot < 1:
+                slot = _proposition_lineage_slot(anchors[candidate_index])
+            if not assign(
+                candidate_index,
+                slot=slot,
+                opportunity_id=opportunity_id,
+                discriminator=anchors[candidate_index],
+            ):
+                return None
+
+    for candidate_index, anchor in enumerate(anchors):
+        if assignments[candidate_index] is not None:
             continue
         slot = _proposition_lineage_slot(anchor)
         opportunity_id = _proposition_opportunity_id(source_message_id, anchor)
-        previous_id = used_slots.get(slot)
-        if previous_id is not None and previous_id != opportunity_id:
+        if not assign(
+            candidate_index,
+            slot=slot,
+            opportunity_id=opportunity_id,
+            discriminator=anchor,
+        ):
             return None
-        used_slots[slot] = opportunity_id
-        assignments.append((slot, opportunity_id))
-    if len({opportunity_id for _, opportunity_id in assignments}) != len(assignments):
+    resolved_assignments = tuple(
+        assignment for assignment in assignments if assignment is not None
+    )
+    if len({opportunity_id for _, opportunity_id, _ in resolved_assignments}) != len(
+        resolved_assignments
+    ):
         return None
-    return tuple(assignments)
+    return resolved_assignments
 
 
 def _candidate_target_manifest_hash(

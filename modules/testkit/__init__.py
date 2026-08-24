@@ -791,6 +791,7 @@ class ControlledModelAdapter:
         default_factory=dict
     )
     _proof_results: dict[str, ClassifierAdapterResult] = field(default_factory=dict)
+    _classify_failures: dict[str, list[Exception]] = field(default_factory=dict)
     requests: list[ClassifierRequest] = field(default_factory=list)
     second_pass_requests: list[ClassifierRequest] = field(default_factory=list)
     proof_requests: list[ClassifierRequest] = field(default_factory=list)
@@ -823,11 +824,18 @@ class ControlledModelAdapter:
         """Opt the controlled model boundary into the additive v2 output."""
         self.primary_schema_version = "source-message-classification-v2"
 
+    def raise_for(self, *, pass_kind: str = "primary", error: Exception) -> None:
+        """Inject one provider/process failure at the controlled classifier seam."""
+        self._classify_failures.setdefault(pass_kind, []).append(error)
+
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return only configured offline output and retain policy provenance."""
         self.requests.append(request)
         if request.pass_kind == "ambiguity_second_pass":
             self.second_pass_requests.append(request)
+        failures = self._classify_failures.get(request.pass_kind)
+        if failures:
+            raise failures.pop(0)
         configured_results = (
             self._second_pass_results
             if request.pass_kind == "ambiguity_second_pass"

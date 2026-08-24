@@ -115,6 +115,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0016_classification_routing_outcomes.sql",
     "0017_application_proposition_identities.sql",
     "0018_legacy_v4_proposition_identity_backfill.sql",
+    "0019_application_proposition_discriminators.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -136,6 +137,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "c717b66b3394868348d3f7d7869d44485f222053af50633bf65176efeff07768",
     "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
     "7c4b6ba4b1a645a95d0a272f1ef3dd19e9730d86ef333c7671fdcf70865a99c8",
+    "97f5851b2f72c5a69d342ce3e72d0908a309dd85bd98495184d43b13508354c9",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -3692,6 +3694,7 @@ class PostgresRoleStore:
             rows = connection.execute(
                 """
                 SELECT lineage.proposition_slot,
+                       lineage.proposition_discriminator,
                        opportunity.opportunity_id,
                        opportunity.opportunity_type,
                        opportunity.accepted_facts,
@@ -3716,6 +3719,7 @@ class PostgresRoleStore:
         return tuple(
             {
                 "proposition_slot": row["proposition_slot"],
+                "proposition_discriminator": row["proposition_discriminator"],
                 "opportunity_id": row["opportunity_id"],
                 "opportunity_type": row["opportunity_type"],
                 "accepted_facts": row["accepted_facts"],
@@ -3806,6 +3810,7 @@ class PostgresRoleStore:
                     ),
                 )
             proposition_slot = opportunity.get("proposition_slot")
+            proposition_discriminator = opportunity.get("proposition_discriminator")
             source_message_revision_id = opportunity.get("source_message_revision_id")
             opportunity_id = opportunity.get("opportunity_id")
             if (
@@ -3814,6 +3819,8 @@ class PostgresRoleStore:
                 or proposition_slot < 1
                 or not isinstance(source_message_revision_id, str)
                 or not isinstance(opportunity_id, str)
+                or not isinstance(proposition_discriminator, str)
+                or not proposition_discriminator
             ):
                 raise ValueError(
                     "publication requires an Application proposition lineage"
@@ -3822,11 +3829,19 @@ class PostgresRoleStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.application_proposition_identities (
-                    source_message_id, proposition_slot, opportunity_id, created_at
-                ) VALUES (%s, %s, %s, %s)
-                ON CONFLICT (source_message_id, proposition_slot) DO NOTHING
+                    source_message_id, proposition_slot, opportunity_id,
+                    proposition_discriminator, created_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (source_message_id, proposition_slot) DO UPDATE
+                SET proposition_discriminator = EXCLUDED.proposition_discriminator
                 """,
-                (source_message_id, proposition_slot, opportunity_id, received_at),
+                (
+                    source_message_id,
+                    proposition_slot,
+                    opportunity_id,
+                    proposition_discriminator,
+                    received_at,
+                ),
             )
             mapped_opportunity_id = connection.execute(
                 """
@@ -3919,11 +3934,14 @@ class PostgresRoleStore:
             for opportunity in opportunities:
                 source_message_revision_id = opportunity["source_message_revision_id"]
                 proposition_slot = opportunity.get("proposition_slot")
+                proposition_discriminator = opportunity.get("proposition_discriminator")
                 if (
                     not isinstance(source_message_revision_id, str)
                     or not isinstance(proposition_slot, int)
                     or isinstance(proposition_slot, bool)
                     or proposition_slot < 1
+                    or not isinstance(proposition_discriminator, str)
+                    or not proposition_discriminator
                 ):
                     raise ValueError(
                         "compound publication requires an App proposition slot"
@@ -3934,14 +3952,17 @@ class PostgresRoleStore:
                 connection.execute(
                     """
                     INSERT INTO football_runtime.application_proposition_identities (
-                        source_message_id, proposition_slot, opportunity_id, created_at
-                    ) VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (source_message_id, proposition_slot) DO NOTHING
+                        source_message_id, proposition_slot, opportunity_id,
+                        proposition_discriminator, created_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (source_message_id, proposition_slot) DO UPDATE
+                    SET proposition_discriminator = EXCLUDED.proposition_discriminator
                     """,
                     (
                         source_message_id,
                         proposition_slot,
                         opportunity["opportunity_id"],
+                        proposition_discriminator,
                         received_at,
                     ),
                 )

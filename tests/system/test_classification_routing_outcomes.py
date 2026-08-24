@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import cast
@@ -23,6 +24,7 @@ from modules.domain import (
 )
 from modules.ports import ClassifierAdapterResult
 from modules.testkit import (
+    AcceptanceSpine,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -213,6 +215,228 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
     # The exhausted handoff is terminal and replay-safe: no Application
     # consumer work was emitted, and another restart cannot recreate it.
     system.restart(RuntimeRole.CLASSIFICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+@pytest.mark.parametrize("error_type", (TimeoutError, ConnectionError, RuntimeError))
+def test_raised_primary_model_failures_exhaust_durable_attempt_budget(
+    error_type: type[Exception],
+) -> None:
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    for index in range(3):
+        classifier.raise_for(
+            error=error_type(f"controlled primary failure {index + 1}"),
+        )
+    body = f"Primary failure budget test for {error_type.__name__}."
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_124,
+        checkpoint=4924,
+        administrator_id=49_124,
+    )
+
+    for attempt_number in range(1, 4):
+        if attempt_number > 1:
+            system.restart(RuntimeRole.CLASSIFICATION)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    attempts = system.classification_attempts()
+    assert [attempt.pass_kind for attempt in attempts] == [
+        "primary",
+        "primary",
+        "primary",
+    ]
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3]
+    assert [attempt.status for attempt in attempts] == ["failed", "failed", "failed"]
+    assert all(attempt.disposition == "needs_review" for attempt in attempts)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert system.opportunities() == ()
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_raised_primary_failure_retries_after_restart_and_then_succeeds() -> None:
+    body = "A transient primary model failure should consume one retryable attempt."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.raise_for(error=TimeoutError("controlled timeout"))
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        ),
+    )
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_125,
+        checkpoint=4925,
+        administrator_id=49_125,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert [attempt.status for attempt in system.classification_attempts()] == [
+        "failed"
+    ]
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    attempts = system.classification_attempts()
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2]
+    assert [attempt.status for attempt in attempts] == ["failed", "succeeded"]
+    assert len(classifier.requests) == 2
+    assert len(system.classification_routing_outcomes()) == 1
+    assert system.classification_routing_outcomes()[0].disposition == "irrelevant"
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    assert len(system.classification_routing_outcomes()) == 1
+
+
+def test_raised_ambiguity_failure_has_separate_budget_and_no_recursive_pass() -> None:
+    body = (
+        "A refined ambiguity pass can fail once and resume without primary recursion."
+    )
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "needs_second_pass",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "deterministic_ambiguity",
+                    "required_context": "refined_prompt",
+                },
+            },
+        ),
+    )
+    classifier.raise_for(
+        pass_kind="ambiguity_second_pass",
+        error=ConnectionError("controlled provider transport failure"),
+    )
+    second_result = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {"reason_code": "irrelevant", "required_context": "none"},
+        },
+    )
+    classifier.return_second_pass_for(body=body, result=second_result)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_126,
+        checkpoint=4926,
+        administrator_id=49_126,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    attempts = system.classification_attempts()
+    assert [
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in attempts
+    ] == [
+        ("primary", 1, "succeeded"),
+        ("ambiguity_second_pass", 1, "failed"),
+    ]
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    attempts = system.classification_attempts()
+    assert [attempt.pass_kind for attempt in attempts] == [
+        "primary",
+        "ambiguity_second_pass",
+        "ambiguity_second_pass",
+    ]
+    assert [attempt.attempt_number for attempt in attempts] == [1, 1, 2]
+    assert [attempt.status for attempt in attempts] == [
+        "succeeded",
+        "failed",
+        "succeeded",
+    ]
+    assert len(classifier.requests) == 3
+    assert len(classifier.second_pass_requests) == 2
+    assert len(system.classification_routing_outcomes()) == 1
+    assert system.classification_routing_outcomes()[0].pass_number == 2
+    assert system.classification_routing_outcomes()[0].disposition == "irrelevant"
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_raised_ambiguity_failures_exhaust_only_the_second_pass_budget() -> None:
+    body = "A bounded ambiguity pass must exhaust without recursing into primary."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "needs_second_pass",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "deterministic_ambiguity",
+                    "required_context": "refined_prompt",
+                },
+            },
+        ),
+    )
+    for index in range(3):
+        classifier.raise_for(
+            pass_kind="ambiguity_second_pass",
+            error=RuntimeError(f"controlled ambiguity failure {index + 1}"),
+        )
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_127,
+        checkpoint=4927,
+        administrator_id=49_127,
+    )
+
+    for attempt_number in range(1, 4):
+        if attempt_number > 1:
+            system.restart(RuntimeRole.CLASSIFICATION)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    attempts = system.classification_attempts()
+    assert [
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in attempts
+    ] == [
+        ("primary", 1, "succeeded"),
+        ("ambiguity_second_pass", 1, "failed"),
+        ("ambiguity_second_pass", 2, "failed"),
+        ("ambiguity_second_pass", 3, "failed"),
+    ]
+    assert len(classifier.requests) == 4
+    assert len(classifier.second_pass_requests) == 3
     assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
     system.process_opportunities_until_idle()
     assert system.classification_routing_outcomes() == ()
@@ -909,9 +1133,9 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         ),
     )
     body = (
-        "20 August 2026 in whole city. Need one goalkeeper. "
+        "20 August 2026 in whole city. Need one player. "
         "Contact @open_match_one. 22 August 2026 in whole city. "
-        "Need one defender. Contact @open_match_two."
+        "Need one player. Contact @open_match_two."
     )
     candidates: list[JsonValue] = []
     candidate_outputs: dict[str, dict[str, JsonValue]] = {}
@@ -920,14 +1144,14 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
             "open-match-goalkeeper",
             "20 August 2026",
             "2026-08-20",
-            "Need one goalkeeper",
+            "Need one player",
             "@open_match_one",
         ),
         (
             "open-match-defender",
             "22 August 2026",
             "2026-08-22",
-            "Need one defender",
+            "Need one player",
             "@open_match_two",
         ),
     )
@@ -1047,6 +1271,15 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         registry_generation=1,
     )
     assert system.process_next_source_event()
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        application_results = tuple(
+            executor.map(
+                system.process_next_contract_handoff,
+                (RuntimeRole.APPLICATION, RuntimeRole.APPLICATION),
+            )
+        )
+    assert sorted(application_results) == [False, True]
     system.process_opportunities_until_idle()
 
     revision_id = "source-chat:channel:4900102:generation:1:message:49003:revision:1"
@@ -1175,6 +1408,126 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         f"{opportunity_id}:revision:2" for opportunity_id in first_ids.values()
     }
     assert len(system.opportunity_publication_contracts(revised_revision_id)) == 1
+
+    singleton_candidate: dict[str, JsonValue] | None = None
+    for candidate in reclassified_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        response_routes = candidate.get("response_routes")
+        if not isinstance(response_routes, list):
+            continue
+        if any(
+            isinstance(route, dict) and route.get("value") == "@open_match_one"
+            for route in response_routes
+        ):
+            singleton_candidate = candidate
+            break
+    assert singleton_candidate is not None
+    singleton_key = singleton_candidate.get("candidate_key")
+    assert isinstance(singleton_key, str)
+    singleton_output = deepcopy(reclassified_output)
+    singleton_output["candidates"] = [deepcopy(singleton_candidate)]
+    classifier.return_for(
+        body=revised_body,
+        result=replace_classifier_output(
+            reclassified_result,
+            singleton_output,
+        ),
+    )
+    classifier.return_proof_for(
+        body=revised_body,
+        candidate_key=singleton_key,
+        result=semantic_proof_result_for(
+            output=singleton_output,
+            body=revised_body,
+        ),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4904),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        source_event_id="source-event:classification-routing:compound-to-singleton",
+        telegram_message_id=49003,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body=revised_body,
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    singleton_revision_id = (
+        "source-chat:channel:4900102:generation:1:message:49003:revision:3"
+    )
+    singleton_opportunities = system.opportunities()
+    assert {
+        opportunity.response_route.value: opportunity.opportunity_id
+        for opportunity in singleton_opportunities
+    } == first_ids
+    singleton_publications = system.opportunity_publication_contracts(
+        singleton_revision_id
+    )
+    assert len(singleton_publications) == 1
+    singleton_payload = singleton_publications[0].payload
+    assert isinstance(singleton_payload, dict)
+    assert singleton_payload["opportunity_id"] == first_ids["@open_match_one"]
+    assert any(
+        opportunity.response_route.value == "@open_match_one"
+        and opportunity.opportunity_revision_id
+        == f"{first_ids['@open_match_one']}:revision:3"
+        for opportunity in singleton_opportunities
+    )
+
+    classifier.return_for(body=revised_body, result=reclassified_result)
+    for candidate in reclassified_candidates:
+        assert isinstance(candidate, dict)
+        reclassified_key = candidate.get("candidate_key")
+        assert isinstance(reclassified_key, str)
+        classifier.return_proof_for(
+            body=revised_body,
+            candidate_key=reclassified_key,
+            result=semantic_proof_result_for(
+                output=cast(
+                    dict[str, JsonValue],
+                    {**reclassified_output, "candidates": [candidate]},
+                ),
+                body=revised_body,
+            ),
+        )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        source_event_id="source-event:classification-routing:singleton-to-compound",
+        telegram_message_id=49003,
+        revision=4,
+        kind=SourceEventKind.EDIT,
+        body=revised_body,
+        event_time=datetime(2026, 8, 18, 9, 9, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    compound_revision_id = (
+        "source-chat:channel:4900102:generation:1:message:49003:revision:4"
+    )
+    compound_opportunities = system.opportunities()
+    assert {
+        item.response_route.value: item.opportunity_id
+        for item in compound_opportunities
+    } == first_ids
+    assert {item.opportunity_revision_id for item in compound_opportunities} == {
+        f"{opportunity_id}:revision:4" for opportunity_id in first_ids.values()
+    }
+    assert len(system.opportunity_publication_contracts(compound_revision_id)) == 1
 
 
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:
@@ -1491,6 +1844,287 @@ def test_prompt_injection_routes_to_unpublished_review_without_body_telemetry() 
     assert classifier.second_pass_requests == []
 
 
+@pytest.mark.parametrize("malformed_disposition", ([], {}, 7))
+def test_malformed_v4_disposition_is_consumed_as_one_body_free_review_outcome(
+    malformed_disposition: JsonValue,
+) -> None:
+    body = "Malformed disposition shape must not escape the invalid-contract path."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    valid_result = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {"reason_code": "irrelevant", "required_context": "none"},
+        },
+    )
+    classifier.return_for(body=body, result=valid_result)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_120,
+        checkpoint=4920,
+        administrator_id=49_120,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    malformed_output = deepcopy(valid_result.output)
+    malformed_output["disposition"] = malformed_disposition
+    system.invalidate_classifier_context(
+        source_message_revision_id=revision_id,
+        contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+        payload_updates={"output": malformed_output},
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    outcomes = system.classification_routing_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].disposition == "needs_review"
+    assert outcomes[0].route == "review"
+    assert outcomes[0].reason_code == "provenance_invalid"
+    assert outcomes[0].candidate_count == 0
+    assert body not in repr(outcomes[0])
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert system.classification_routing_outcomes() == outcomes
+
+
+def test_malformed_v4_lineage_uses_fixed_routing_surrogate_without_raw_data() -> None:
+    body = "Malformed lineage must never become durable routing data."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    valid_result = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {"reason_code": "irrelevant", "required_context": "none"},
+        },
+    )
+    classifier.return_for(body=body, result=valid_result)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_121,
+        checkpoint=4921,
+        administrator_id=49_121,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    raw_lineage = "raw-lineage-SECRET_BODY-injection"
+    invalidated = system.invalidate_classifier_context(
+        source_message_revision_id=revision_id,
+        contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+        payload_updates={"source_message_revision_id": raw_lineage},
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    outcomes = system.classification_routing_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].source_message_revision_id == f"invalid:{invalidated.message_id}"
+    assert raw_lineage not in repr(outcomes[0])
+    assert body not in repr(outcomes[0])
+    assert outcomes[0].disposition == "irrelevant"
+    assert outcomes[0].route == "irrelevant"
+    assert outcomes[0].reason_code == "provenance_invalid"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert system.classification_routing_outcomes() == outcomes
+
+
+def test_malformed_v4_missing_canonical_revision_uses_fixed_surrogate() -> None:
+    body = "Missing canonical revision must not route through model-controlled data."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    valid_result = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {"reason_code": "irrelevant", "required_context": "none"},
+        },
+    )
+    classifier.return_for(body=body, result=valid_result)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_128,
+        checkpoint=4928,
+        administrator_id=49_128,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    injected_body = "BODY_SECRET_MUST_NOT_ENTER_ROUTING"
+    invalidated = system.invalidate_classifier_context(
+        source_message_revision_id=revision_id,
+        contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+        payload_updates={
+            "source_message_revision_id": None,
+            "body": injected_body,
+        },
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    outcomes = system.classification_routing_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].source_message_revision_id == f"invalid:{invalidated.message_id}"
+    assert injected_body not in repr(outcomes[0])
+    assert body not in repr(outcomes[0])
+    assert outcomes[0].reason_code == "provenance_invalid"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert system.classification_routing_outcomes() == outcomes
+
+
+def test_empty_adjacent_window_is_valid_when_application_selection_is_empty() -> None:
+    body = "No adjacent messages are selected, so an empty second-pass window is exact."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    primary = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "needs_second_pass",
+            "candidates": [],
+            "routing": {
+                "reason_code": "deterministic_ambiguity",
+                "required_context": "adjacent_revisions",
+            },
+        },
+    )
+    second = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {"reason_code": "irrelevant", "required_context": "none"},
+        },
+    )
+    classifier.return_for(body=body, result=primary)
+    classifier.return_second_pass_for(body=body, result=second)
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_122,
+        checkpoint=4922,
+        administrator_id=49_122,
+    )
+
+    system.process_opportunities_until_idle()
+    assert len(classifier.second_pass_requests) == 1
+    assert classifier.second_pass_requests[0].adjacent_context == ()
+    outcomes = system.classification_routing_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].source_message_revision_id == revision_id
+    assert outcomes[0].pass_number == 2
+    assert outcomes[0].disposition == "irrelevant"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    system.restart(RuntimeRole.APPLICATION)
+    system.process_opportunities_until_idle()
+    assert len(classifier.second_pass_requests) == 1
+    assert system.classification_routing_outcomes() == outcomes
+
+
+def test_empty_forged_adjacent_window_fails_closed_against_current_selection() -> None:
+    body = "A forged empty window must not bypass the selected adjacent context."
+    adjacent_body = "Authoritative adjacent context."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    primary_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "needs_second_pass",
+        "candidates": [],
+        "routing": {
+            "reason_code": "deterministic_ambiguity",
+            "required_context": "adjacent_revisions",
+        },
+    }
+    second_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v2",
+        "disposition": "needs_second_pass",
+        "candidates": [],
+        "routing": {
+            "reason_code": "deterministic_ambiguity",
+            "required_context": "adjacent_revisions",
+        },
+    }
+    adjacent_result = replace_classifier_output(
+        _irrelevant_classifier_result(),
+        {
+            "schema_version": "source-message-classification-v2",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {"reason_code": "irrelevant", "required_context": "none"},
+        },
+    )
+    classifier.return_for(body=adjacent_body, result=adjacent_result)
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(), primary_output
+        ),
+    )
+    classifier.return_second_pass_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(), second_output
+        ),
+    )
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_123,
+        checkpoint=4923,
+        administrator_id=49_123,
+        adjacent_bodies=(adjacent_body,),
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(classifier.second_pass_requests) == 1
+    assert len(classifier.second_pass_requests[0].adjacent_context) == 1
+    system.invalidate_classifier_context(
+        source_message_revision_id=revision_id,
+        contract_name=ContractName.CLASSIFICATION_PROPOSAL,
+        payload_updates={"adjacent_context": []},
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    outcomes = system.classification_routing_outcomes()
+    target_outcomes = tuple(
+        outcome
+        for outcome in outcomes
+        if outcome.source_message_revision_id == revision_id
+    )
+    assert len(target_outcomes) == 1
+    target_outcome = target_outcomes[0]
+    assert target_outcome.reason_code == "provenance_invalid"
+    assert target_outcome.pass_number == 2
+    assert target_outcome.disposition == "needs_second_pass"
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.restart(RuntimeRole.APPLICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert system.classification_routing_outcomes() == outcomes
+
+
 def replace_classifier_output(
     result: ClassifierAdapterResult, output: dict[str, JsonValue]
 ) -> ClassifierAdapterResult:
@@ -1506,3 +2140,89 @@ def replace_classifier_output(
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
     )
+
+
+def _stage_v2_source_delivery(
+    *,
+    classifier: ControlledModelAdapter,
+    body: str,
+    telegram_id: int,
+    checkpoint: int,
+    administrator_id: int,
+    adjacent_bodies: tuple[str, ...] = (),
+) -> tuple[AcceptanceSpine, ControlledModelAdapter, TelegramPeerIdentity, str]:
+    """Stage one v2 classifier command without consuming its classifier handoff."""
+    telegram = ControlledTelegramIngestionAdapter()
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=telegram_id,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary=f"channel-pts:{checkpoint}",
+    )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        model=classifier,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    for offset, adjacent_body in enumerate(adjacent_bodies):
+        adjacent_message_id = telegram_id - len(adjacent_bodies) + offset
+        telegram.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=checkpoint + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint + offset + 1),
+            source_event_id=(
+                f"source-event:classification-routing:{adjacent_message_id}"
+            ),
+            telegram_message_id=adjacent_message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=adjacent_body,
+            event_time=datetime(2026, 8, 18, 9, 5 + offset, tzinfo=UTC),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        assert system.process_next_source_event()
+        system.process_opportunities_until_idle()
+    target_checkpoint = checkpoint + len(adjacent_bodies)
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=target_checkpoint),
+        to_checkpoint=TelegramChannelCheckpoint(pts=target_checkpoint + 1),
+        source_event_id=f"source-event:classification-routing:{telegram_id}",
+        telegram_message_id=telegram_id,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    revision_id = (
+        f"source-chat:channel:{telegram_id}:generation:1:"
+        f"message:{telegram_id}:revision:1"
+    )
+    return system, classifier, source_identity, revision_id

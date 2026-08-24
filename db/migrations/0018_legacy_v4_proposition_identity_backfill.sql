@@ -48,6 +48,30 @@ BEGIN
            OR opportunity_id LIKE '%:proposition:%'
         GROUP BY source_message_id, opportunity_id
     ) AS historical
+    GROUP BY historical.opportunity_id
+    HAVING count(*) > 1
+    ORDER BY historical.opportunity_id
+    LIMIT 1;
+
+    IF conflicting_opportunity IS NOT NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'P0010',
+            MESSAGE = 'legacy v4 proposition identity collides across source messages',
+            DETAIL = conflicting_opportunity;
+    END IF;
+
+    SELECT historical.opportunity_id
+    INTO conflicting_opportunity
+    FROM (
+        SELECT
+            split_part(source_message_revision_id, ':revision:', 1)
+                AS source_message_id,
+            opportunity_id
+        FROM football_runtime.application_opportunities
+        WHERE opportunity_id LIKE '%:candidate:%'
+           OR opportunity_id LIKE '%:proposition:%'
+        GROUP BY source_message_id, opportunity_id
+    ) AS historical
     JOIN football_runtime.application_proposition_identities AS identity
       ON identity.opportunity_id = historical.opportunity_id
      AND identity.source_message_id <> historical.source_message_id

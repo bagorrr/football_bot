@@ -789,7 +789,8 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
     with psycopg.connect(fresh_database_url) as connection:
         mappings = connection.execute(
             """
-            SELECT source_message_id, proposition_slot, opportunity_id
+            SELECT source_message_id, proposition_slot, opportunity_id,
+                   proposition_discriminator
             FROM football_runtime.application_proposition_identities
             WHERE source_message_id IN (%s, %s)
             ORDER BY source_message_id
@@ -801,10 +802,12 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
             candidate_source,
             1,
             f"opportunity:{candidate_source}:open_match:candidate:aaaaaaaaaaaaaaaa",
+            f"opportunity:{candidate_source}:open_match:candidate:aaaaaaaaaaaaaaaa",
         ),
         (
             proposition_source,
             1,
+            f"opportunity:{proposition_source}:open_match:proposition:bbbbbbbbbbbbbbbb",
             f"opportunity:{proposition_source}:open_match:proposition:bbbbbbbbbbbbbbbb",
         ),
     ]
@@ -851,6 +854,78 @@ def test_0018_fails_closed_for_mixed_legacy_v4_identity_formats(
         match="legacy v4 proposition identity formats are ambiguous",
     ):
         PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+
+@pytest.mark.parametrize(
+    "identity_marker",
+    ("candidate:eeeeeeeeeeeeeeee", "proposition:ffffffffffffffff"),
+)
+def test_0018_fails_closed_for_cross_source_legacy_identity_collision_before_insert(
+    fresh_database_url: str,
+    identity_marker: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=17)
+    first_source = "source-chat:channel:4918102:generation:1:message:1004"
+    second_source = "source-chat:channel:4918102:generation:1:message:1005"
+    shared_opportunity_id = f"opportunity:legacy-shared:open_match:{identity_marker}"
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            ALTER TABLE football_runtime.application_opportunities
+            DROP CONSTRAINT application_opportunities_pkey
+            """
+        )
+        for source_message_id, revision_number in (
+            (first_source, 1),
+            (second_source, 2),
+        ):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                    %s
+                )
+                """,
+                (
+                    shared_opportunity_id,
+                    f"{shared_opportunity_id}:revision:{revision_number}",
+                    f"{source_message_id}:revision:{revision_number}",
+                    recorded_at,
+                ),
+            )
+
+    with (
+        pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity collides across source messages",
+        ),
+        psycopg.connect(fresh_database_url) as connection,
+    ):
+        connection.execute(
+            (
+                Path(__file__).resolve().parents[2]
+                / "db"
+                / "migrations"
+                / "0018_legacy_v4_proposition_identity_backfill.sql"
+            ).read_text(encoding="utf-8")
+        )
+
+    with psycopg.connect(fresh_database_url) as connection:
+        identity_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_proposition_identities
+            """
+        ).fetchone()
+    assert identity_count == (0,)
 
 
 @pytest.mark.parametrize("applied_count", range(1, 9))
