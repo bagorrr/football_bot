@@ -1150,6 +1150,29 @@ class ClassificationRoutingOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class ClassifierCircuitState:
+    """Body-free adapter-wide execution circuit visible to operators."""
+
+    adapter_kind: str
+    state: str
+    opened_at: datetime | None
+    next_probe_at: datetime | None
+    probe_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationQueueHealth:
+    """Low-cardinality classifier backlog and lease visibility."""
+
+    queue_depth: int
+    oldest_ready_job_age_seconds: int
+    oldest_lease_age_seconds: int
+    terminal_failure_count: int
+    severity: str
+    circuits: tuple[ClassifierCircuitState, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OpportunityResponseRoute:
     """Exactly one Application-selected usable response route."""
 
