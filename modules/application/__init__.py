@@ -7719,11 +7719,13 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
-        if getattr(self.model, "primary_schema_version", None) == (
-            "source-message-classification-v2"
-        ):
+        if self.model.primary_schema_version == "source-message-classification-v2":
             self._classify_source_message_v2(incoming)
             return
+        if self.model.primary_schema_version != "source-message-classification-v1":
+            raise RuntimeError(
+                "classifier adapter exposes an unsupported primary schema version"
+            )
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -8174,6 +8176,29 @@ class RuntimeApplication:
             ),
         )
 
+    def _terminalize_exhausted_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        request: ClassifierRequest,
+        attempt: ClassificationAttempt,
+    ) -> None:
+        """Close a claimed handoff after a crashed worker exhausted its budget."""
+        if self.model is None:
+            raise RuntimeError("classifier adapter is not configured")
+        result = replace(
+            _classifier_failure_result(request),
+            adapter_kind=self.model.adapter_kind,
+        )
+        self.store.record_classification_attempt(
+            incoming=incoming,
+            attempt=attempt,
+            result=result,
+            outgoing=None,
+            received_at=self.clock.now(),
+            finalize=True,
+        )
+
     def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
         """Run the additive multi-candidate classifier and one-way ambiguity pass."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
@@ -8324,7 +8349,12 @@ class RuntimeApplication:
                 + 1
             )
             if primary_attempt_number > 3:
-                raise RuntimeError("classifier retry budget was already exhausted")
+                self._terminalize_exhausted_classification_attempt(
+                    incoming=incoming,
+                    request=request,
+                    attempt=prior_primary_attempts[-1],
+                )
+                return
             attempt_manifest_hash = manifest_for(
                 request,
                 pass_number=1,
@@ -8535,7 +8565,12 @@ class RuntimeApplication:
                 + 1
             )
             if second_attempt_number > 3:
-                raise RuntimeError("ambiguity-pass retry budget was already exhausted")
+                self._terminalize_exhausted_classification_attempt(
+                    incoming=incoming,
+                    request=second_request,
+                    attempt=prior_ambiguity_attempts[-1],
+                )
+                return
             second_started_result = replace(
                 _classifier_failure_result(second_request),
                 adapter_kind=self.model.adapter_kind,

@@ -188,6 +188,11 @@ class TelegramDeliveryOutcomeUnknownError(RuntimeError):
 class ModelAdapter(Protocol):
     """Controlled model boundary for the acceptance spine."""
 
+    @property
+    def primary_schema_version(self) -> str:
+        """Return the primary classifier schema selected by this adapter."""
+        ...
+
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
         """Return one strict, non-authoritative structured proposal."""
         ...

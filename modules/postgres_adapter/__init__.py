@@ -962,11 +962,21 @@ class PostgresAcceptanceObserver:
             queue = connection.execute(
                 """
                 SELECT count(*)::integer AS queue_depth,
-                       COALESCE(max(EXTRACT(EPOCH FROM (%s - outbox.recorded_at))), 0)
-                           ::integer AS oldest_ready_job_age_seconds,
+                       COALESCE(
+                           max(EXTRACT(EPOCH FROM (%s - outbox.recorded_at)))
+                           FILTER (
+                               WHERE outbox.claimed_until IS NULL
+                                  OR outbox.claimed_until <= %s
+                           ),
+                           0
+                       )::integer AS oldest_ready_job_age_seconds,
                        COALESCE(max(EXTRACT(EPOCH FROM (%s - outbox.claim_started_at)))
-                           FILTER (WHERE outbox.claim_started_at IS NOT NULL), 0)
-                           ::integer AS oldest_lease_age_seconds
+                           FILTER (
+                               WHERE outbox.claim_started_at IS NOT NULL
+                                 AND outbox.claimed_until > %s
+                           ),
+                           0
+                       )::integer AS oldest_lease_age_seconds
                 FROM football_runtime.contract_outbox AS outbox
                 LEFT JOIN football_runtime.contract_inbox AS inbox
                   ON inbox.consumer_role = 'classification'
@@ -977,7 +987,7 @@ class PostgresAcceptanceObserver:
                       'accepted', 'rejected_invalid_contract'
                   )
                 """,
-                (observed_at, observed_at),
+                (observed_at, observed_at, observed_at, observed_at),
             ).fetchone()
             circuits = connection.execute(
                 """

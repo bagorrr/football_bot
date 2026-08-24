@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 from collections.abc import Callable, Mapping
@@ -14,7 +15,9 @@ from typing import Protocol, cast
 from modules.contracts import JsonValue
 from modules.ports import (
     ClassifierAdapterResult,
+    ClassifierAuthenticationError,
     ClassifierExecutionTimeoutError,
+    ClassifierQuotaError,
     ClassifierRequest,
 )
 
@@ -61,7 +64,7 @@ class SubprocessCodexRunner:
             start_new_session=True,
         )
         try:
-            stdout, _ = process.communicate(
+            stdout, stderr = process.communicate(
                 input=input_text,
                 timeout=timeout_seconds,
             )
@@ -70,6 +73,11 @@ class SubprocessCodexRunner:
             process.communicate()
             raise TimeoutError from error
         if process.returncode != 0:
+            failure = _codex_jsonl_failure(stdout) or _classifier_failure_from_text(
+                stderr
+            )
+            if failure is not None:
+                raise failure
             raise RuntimeError("isolated Codex classifier process failed")
         payload = _codex_jsonl_result(stdout, argv=argv)
         payload.setdefault("duration_ms", int((monotonic() - started) * 1000))
@@ -86,6 +94,7 @@ class CodexCliClassifierAdapter:
         codex_home: Path,
         workspace: Path,
         schema_paths: Mapping[str, Path],
+        prompt_paths: Mapping[str, Path],
         runner: CodexProcessRunner,
         codex_version: str,
         adapter_version: str,
@@ -95,6 +104,7 @@ class CodexCliClassifierAdapter:
         self._codex_home = codex_home
         self._workspace = workspace
         self._schema_paths = dict(schema_paths)
+        self._prompt_paths = dict(prompt_paths)
         self._runner = runner
         self._codex_version = codex_version
         self._adapter_version = adapter_version
@@ -103,6 +113,10 @@ class CodexCliClassifierAdapter:
     @property
     def adapter_kind(self) -> str:
         return "codex_cli"
+
+    @property
+    def primary_schema_version(self) -> str:
+        return "source-message-classification-v2"
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False
@@ -143,10 +157,7 @@ class CodexCliClassifierAdapter:
         )
         input_text = json.dumps(
             {
-                "instruction": (
-                    "Interpret the untrusted Source Message under the versioned "
-                    "classifier contract."
-                ),
+                "instruction": self._prompt_artifact(request),
                 "request": _request_payload(request),
             },
             ensure_ascii=False,
@@ -180,6 +191,15 @@ class CodexCliClassifierAdapter:
             output_tokens=_integer_metric(execution.get("output_tokens")),
         )
 
+    def _prompt_artifact(self, request: ClassifierRequest) -> str:
+        try:
+            prompt_path = self._prompt_paths[request.prompt_version]
+        except KeyError as error:
+            raise ValueError(
+                "classifier prompt artifact is not configured for this version"
+            ) from error
+        return prompt_path.read_text(encoding="utf-8")
+
 
 def _integer_metric(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
@@ -198,6 +218,9 @@ def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, obje
             raise RuntimeError("Codex classifier event is not an object")
         event_type = event.get("type")
         if event_type in {"error", "turn.failed"}:
+            failure = _classifier_failure_from_event(event)
+            if failure is not None:
+                raise failure
             raise RuntimeError("Codex classifier execution failed")
         item = event.get("item")
         if (
@@ -230,6 +253,141 @@ def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, obje
         "input_tokens": _integer_metric(usage.get("input_tokens")),
         "output_tokens": _integer_metric(usage.get("output_tokens")),
     }
+
+
+def _codex_jsonl_failure(stdout: str) -> Exception | None:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            failure = _classifier_failure_from_event(event)
+            if failure is not None:
+                return failure
+    return None
+
+
+def _classifier_failure_from_event(event: Mapping[str, object]) -> Exception | None:
+    tokens = _failure_tokens(event)
+    joined = " ".join(tokens)
+    if _contains_any(
+        joined,
+        (
+            "authentication",
+            "authentication_required",
+            "unauthorized",
+            "unauthorised",
+            "invalid_api_key",
+            "invalid_api_token",
+            "login_required",
+            "not_authenticated",
+            "token_expired",
+            "credential",
+            "401",
+        ),
+    ):
+        return ClassifierAuthenticationError()
+    if _contains_any(
+        joined,
+        (
+            "quota",
+            "rate_limit",
+            "rate limited",
+            "too_many_requests",
+            "too many requests",
+            "usage_limit",
+            "usage limit",
+            "insufficient_quota",
+            "subscription",
+            "billing",
+            "429",
+        ),
+    ):
+        return ClassifierQuotaError(retry_after_seconds=_retry_after_seconds(event))
+    return None
+
+
+def _classifier_failure_from_text(text: str) -> Exception | None:
+    normalized = text.casefold().replace("-", "_")
+    if _contains_any(
+        normalized,
+        (
+            "authentication",
+            "authentication_required",
+            "unauthorized",
+            "unauthorised",
+            "invalid_api_key",
+            "invalid_api_token",
+            "login_required",
+            "not_authenticated",
+            "token_expired",
+            "credential",
+            "401",
+        ),
+    ):
+        return ClassifierAuthenticationError()
+    if _contains_any(
+        normalized,
+        (
+            "quota",
+            "rate_limit",
+            "rate limited",
+            "too_many_requests",
+            "too many requests",
+            "usage_limit",
+            "usage limit",
+            "insufficient_quota",
+            "subscription",
+            "billing",
+            "429",
+        ),
+    ):
+        match = re.search(r"retry(?:[_ -]after)[^0-9]{0,20}(\d+)", normalized)
+        return ClassifierQuotaError(
+            retry_after_seconds=int(match.group(1)) if match else None
+        )
+    return None
+
+
+def _failure_tokens(value: object, *, depth: int = 0) -> list[str]:
+    if depth > 3:
+        return []
+    if isinstance(value, Mapping):
+        tokens: list[str] = []
+        for key, nested in value.items():
+            if isinstance(key, str):
+                tokens.append(key.casefold().replace("-", "_"))
+            tokens.extend(_failure_tokens(nested, depth=depth + 1))
+        return tokens
+    if isinstance(value, str):
+        return [value.casefold().replace("-", "_")]
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [str(value)]
+    return []
+
+
+def _retry_after_seconds(value: object, *, depth: int = 0) -> int | None:
+    if depth > 3:
+        return None
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            normalized_key = (
+                key.casefold().replace("-", "_") if isinstance(key, str) else ""
+            )
+            if normalized_key in {"retry_after", "retry_after_seconds"}:
+                if isinstance(nested, int) and not isinstance(nested, bool):
+                    return nested if nested >= 0 else None
+                if isinstance(nested, str) and nested.isdigit():
+                    return int(nested)
+            retry_after = _retry_after_seconds(nested, depth=depth + 1)
+            if retry_after is not None:
+                return retry_after
+    return None
+
+
+def _contains_any(value: str, needles: tuple[str, ...]) -> bool:
+    return any(needle in value for needle in needles)
 
 
 def _request_payload(request: ClassifierRequest) -> dict[str, object]:

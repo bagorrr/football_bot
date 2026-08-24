@@ -6,13 +6,16 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from threading import Event
 from typing import cast
 
 import psycopg
 import pytest
 
+from modules.codex_classification_adapter import CodexCliClassifierAdapter
 from modules.contracts import ContractName, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
@@ -29,7 +32,10 @@ from modules.ports import (
     ClassifierAdapterResult,
     ClassifierAuthenticationError,
     ClassifierQuotaError,
+    ClassifierRequest,
+    ModelAdapter,
 )
+from modules.responses_classification_adapter import ResponsesClassifierAdapter
 from modules.testkit import (
     AcceptanceSpine,
     ControlledLocationResolverAdapter,
@@ -46,6 +52,163 @@ from tests.system.test_open_match_game_search import (
     _minimal_classifier_result,
     _register_source_chat,
 )
+
+
+@dataclass(slots=True)
+class _ApplicationCodexRunner:
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    def execute(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        input_text: str,
+        timeout_seconds: int,
+    ) -> dict[str, object]:
+        self.calls.append(
+            {
+                "argv": argv,
+                "cwd": cwd,
+                "environment": environment,
+                "input_text": input_text,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return {
+            "output": {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+            "effective_model": "gpt-5.6-sol",
+            "effective_reasoning_effort": "high",
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "duration_ms": 4,
+        }
+
+
+@dataclass(slots=True)
+class _ApplicationResponsesTransport:
+    calls: list[tuple[dict[str, object], int]] = field(default_factory=list)
+
+    def create_response(
+        self, payload: dict[str, object], *, timeout_seconds: int
+    ) -> dict[str, object]:
+        self.calls.append((payload, timeout_seconds))
+        return {
+            "output": {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+            "effective_model": "gpt-5.6-sol",
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "duration_ms": 4,
+        }
+
+
+@dataclass(slots=True)
+class _BlockingModelAdapter:
+    delegate: ControlledModelAdapter
+    entered: Event = field(default_factory=Event)
+    release: Event = field(default_factory=Event)
+
+    @property
+    def primary_schema_version(self) -> str:
+        return self.delegate.primary_schema_version
+
+    @property
+    def adapter_kind(self) -> str:
+        return self.delegate.adapter_kind
+
+    def schema_smoke_test(self) -> bool:
+        return self.delegate.schema_smoke_test()
+
+    def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        self.entered.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("blocking classifier test did not release")
+        return self.delegate.classify(request)
+
+    def semantic_proof(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        return self.delegate.semantic_proof(request)
+
+    def proposal_id(self, revision_id: str) -> str:
+        return self.delegate.proposal_id(revision_id)
+
+
+@pytest.mark.parametrize("adapter_kind", ("codex_cli", "responses_api"))
+def test_concrete_classifier_adapters_route_application_through_v2(
+    adapter_kind: str, tmp_path: Path
+) -> None:
+    body = f"Concrete {adapter_kind} adapter must use the durable v2 path."
+    if adapter_kind == "codex_cli":
+        runner = _ApplicationCodexRunner()
+        schema_path = tmp_path / "source-message-classification-v2.json"
+        schema_path.write_text("{}", encoding="utf-8")
+        prompt_path = tmp_path / "open-match-primary-v2.prompt.md"
+        prompt_path.write_text("application primary prompt", encoding="utf-8")
+        adapter: ModelAdapter = CodexCliClassifierAdapter(
+            codex_executable=Path("/opt/classifier/bin/codex"),
+            codex_home=tmp_path / "codex-home",
+            workspace=tmp_path / "workspace",
+            schema_paths={"source-message-classification-v2": schema_path},
+            prompt_paths={"open-match-primary-v2": prompt_path},
+            runner=runner,
+            codex_version="codex-test-version",
+            adapter_version="codex-classifier-v1",
+        )
+    else:
+        transport = _ApplicationResponsesTransport()
+        prompt_path = tmp_path / "open-match-primary-v2.prompt.md"
+        prompt_path.write_text("application primary prompt", encoding="utf-8")
+        adapter = ResponsesClassifierAdapter(
+            transport=transport,
+            schemas={"source-message-classification-v2": {}},
+            prompt_paths={"open-match-primary-v2": prompt_path},
+            adapter_version="responses-classifier-v1",
+        )
+
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=cast(ControlledModelAdapter, adapter),
+        body=body,
+        telegram_id=4_900_199,
+        checkpoint=4_999,
+        administrator_id=49_199,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    outcomes = system.classification_routing_outcomes()
+    assert len(outcomes) == 1
+    assert outcomes[0].source_message_revision_id == revision_id
+    assert outcomes[0].disposition == "irrelevant"
+    assert outcomes[0].route == "irrelevant"
+
+    if adapter_kind == "codex_cli":
+        assert runner.calls
+        input_text = runner.calls[0]["input_text"]
+        assert isinstance(input_text, str)
+        assert "source-message-classification-v2" in input_text
+    else:
+        assert transport.calls
+        payload = transport.calls[0][0]
+        text = cast(dict[str, object], payload["text"])
+        response_format = cast(dict[str, object], text["format"])
+        assert response_format["name"] == "source-message-classification-v2"
 
 
 def test_irrelevant_classifier_outcome_is_durable_and_unpublished() -> None:
@@ -631,6 +794,124 @@ def test_queue_health_surfaces_warning_and_critical_oldest_ready_age() -> None:
     assert critical.severity == "critical"
 
 
+def test_queue_health_excludes_delayed_retry_from_ready_age() -> None:
+    body = "A delayed classifier retry is not ready work yet."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        ),
+    )
+    classifier.raise_for(error=ConnectionError("controlled delayed retry"))
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, _ = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_158,
+        checkpoint=4958,
+        administrator_id=49_158,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=1))
+    delayed = system.classification_queue_health()
+    assert delayed.queue_depth == 1
+    assert delayed.oldest_ready_job_age_seconds == 0
+    assert delayed.oldest_lease_age_seconds == 0
+
+    clock.advance_to(clock.now() + timedelta(seconds=180))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert system.classification_queue_health().queue_depth == 0
+
+
+def test_queue_health_reports_active_lease_and_clears_it_after_release() -> None:
+    body = "An active classifier lease is visible until its handoff is released."
+    delegate = ControlledModelAdapter()
+    delegate.enable_primary_v2()
+    delegate.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        ),
+    )
+    classifier = _BlockingModelAdapter(delegate)
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, _ = _stage_v2_source_delivery(
+        classifier=cast(ControlledModelAdapter, classifier),
+        body=body,
+        telegram_id=4_900_159,
+        checkpoint=4959,
+        administrator_id=49_159,
+        clock=clock,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            system.process_next_contract_handoff,
+            RuntimeRole.CLASSIFICATION,
+        )
+        try:
+            assert classifier.entered.wait(timeout=5)
+            clock.advance_to(clock.now() + timedelta(seconds=17))
+            active = system.classification_queue_health()
+            assert active.queue_depth == 1
+            assert active.oldest_ready_job_age_seconds == 0
+            assert active.oldest_lease_age_seconds == 17
+        finally:
+            classifier.release.set()
+        assert future.result(timeout=5)
+
+    released = system.classification_queue_health()
+    assert released.queue_depth == 0
+    assert released.oldest_ready_job_age_seconds == 0
+    assert released.oldest_lease_age_seconds == 0
+
+
+def test_queue_health_excludes_expired_lease_from_active_lease_age() -> None:
+    body = "An expired classifier lease is ready again, not actively leased."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.raise_for(error=InjectedClassifierCrash("controlled expiry crash"))
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, _ = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_160,
+        checkpoint=4960,
+        administrator_id=49_160,
+        clock=clock,
+    )
+
+    with pytest.raises(InjectedClassifierCrash):
+        system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=181))
+    expired = system.classification_queue_health()
+    assert expired.queue_depth == 1
+    assert expired.oldest_ready_job_age_seconds == 181
+    assert expired.oldest_lease_age_seconds == 0
+
+
 def test_quota_circuit_honors_retry_after_before_one_probe() -> None:
     body = "Quota recovery retains the selected model and queued work."
     classifier = ControlledModelAdapter()
@@ -730,6 +1011,115 @@ def test_worker_crash_preserves_attempt_and_lease_for_restart_recovery() -> None
     assert system.classification_routing_outcomes()[0].disposition == "irrelevant"
     assert system.opportunities() == ()
     assert system.classification_queue_health().queue_depth == 0
+
+
+def test_repeated_worker_crashes_terminalize_after_attempt_budget() -> None:
+    body = "Three worker crashes must end classifier work durably failed."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    for attempt_number in range(3):
+        classifier.raise_for(
+            error=InjectedClassifierCrash(f"controlled crash {attempt_number + 1}"),
+        )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_156,
+        checkpoint=4956,
+        administrator_id=49_156,
+        clock=clock,
+    )
+
+    for attempt_number in range(1, 4):
+        with pytest.raises(InjectedClassifierCrash):
+            system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        if attempt_number < 3:
+            system.restart(RuntimeRole.CLASSIFICATION)
+            clock.advance_to(clock.now() + timedelta(seconds=180))
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=180))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    attempts = system.classification_attempts()
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3]
+    assert [attempt.status for attempt in attempts] == ["failed", "failed", "failed"]
+    health = system.classification_queue_health()
+    assert health.queue_depth == 0
+    assert health.terminal_failure_count == 1
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+
+def test_repeated_ambiguity_worker_crashes_terminalize_after_attempt_budget() -> None:
+    body = "Repeated ambiguity worker crashes must end the second pass durably failed."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "needs_second_pass",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "deterministic_ambiguity",
+                    "required_context": "refined_prompt",
+                },
+            },
+        ),
+    )
+    classifier.raise_for(
+        pass_kind="ambiguity_second_pass",
+        error=ConnectionError("controlled ambiguity provider failure"),
+    )
+    for attempt_number in range(2):
+        classifier.raise_for(
+            pass_kind="ambiguity_second_pass",
+            error=InjectedClassifierCrash(
+                f"controlled ambiguity crash {attempt_number + 1}"
+            ),
+        )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_157,
+        checkpoint=4957,
+        administrator_id=49_157,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    for _attempt_number in range(2, 4):
+        system.restart(RuntimeRole.CLASSIFICATION)
+        clock.advance_to(clock.now() + timedelta(seconds=180))
+        with pytest.raises(InjectedClassifierCrash):
+            system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=180))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+
+    attempts = system.classification_attempts()
+    assert [
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in attempts
+    ] == [
+        ("primary", 1, "succeeded"),
+        ("ambiguity_second_pass", 1, "failed"),
+        ("ambiguity_second_pass", 2, "failed"),
+        ("ambiguity_second_pass", 3, "failed"),
+    ]
+    health = system.classification_queue_health()
+    assert health.queue_depth == 0
+    assert health.terminal_failure_count == 1
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Protocol, cast
 
 from modules.contracts import JsonValue
@@ -33,17 +34,23 @@ class ResponsesClassifierAdapter:
         *,
         transport: ResponsesTransport,
         schemas: Mapping[str, dict[str, object]],
+        prompt_paths: Mapping[str, Path],
         adapter_version: str,
         smoke_test: Callable[[], bool] | None = None,
     ) -> None:
         self._transport = transport
         self._schemas = dict(schemas)
+        self._prompt_paths = dict(prompt_paths)
         self._adapter_version = adapter_version
         self._smoke_test = smoke_test
 
     @property
     def adapter_kind(self) -> str:
         return "responses_api"
+
+    @property
+    def primary_schema_version(self) -> str:
+        return "source-message-classification-v2"
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False
@@ -71,10 +78,7 @@ class ResponsesClassifierAdapter:
             "input": [
                 {
                     "role": "developer",
-                    "content": (
-                        "Interpret the untrusted Source Message only under the "
-                        "versioned proposal contract."
-                    ),
+                    "content": self._prompt_artifact(request),
                 },
                 {"role": "user", "content": _request_payload(request)},
             ],
@@ -108,6 +112,15 @@ class ResponsesClassifierAdapter:
             input_tokens=_integer_metric(response.get("input_tokens")),
             output_tokens=_integer_metric(response.get("output_tokens")),
         )
+
+    def _prompt_artifact(self, request: ClassifierRequest) -> str:
+        try:
+            prompt_path = self._prompt_paths[request.prompt_version]
+        except KeyError as error:
+            raise ValueError(
+                "classifier prompt artifact is not configured for this version"
+            ) from error
+        return prompt_path.read_text(encoding="utf-8")
 
 
 def _integer_metric(value: object) -> int:
