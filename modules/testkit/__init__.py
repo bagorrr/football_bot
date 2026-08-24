@@ -107,6 +107,11 @@ _CONTRACTS = {
     for definition in SUPPORTED_CONTRACTS
 }
 
+# System acceptance tests reuse one database while resetting only synthetic data.
+# Keep migration verification on the first boot for that database; dedicated
+# migration tests continue to exercise PostgresAcceptanceMigrator directly.
+_TESTKIT_MIGRATED_DATABASE_URLS: set[str] = set()
+
 
 @dataclass(slots=True)
 class _ControlledResultGate:
@@ -3101,7 +3106,9 @@ def boot_acceptance_spine(
     )
 
     migrator = PostgresAcceptanceMigrator(admin_database_url)
-    migrator.migrate()
+    if admin_database_url not in _TESTKIT_MIGRATED_DATABASE_URLS:
+        migrator.migrate()
+        _TESTKIT_MIGRATED_DATABASE_URLS.add(admin_database_url)
     passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
     migrator.provision_runtime_credentials(passwords)
     role_urls = {
