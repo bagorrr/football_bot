@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -2863,6 +2863,7 @@ class PostgresRoleStore:
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("SourceEventRecorded payload must be an object")
+        source_message_revision_id = payload.get("source_message_revision_id")
         with psycopg.connect(self._database_url) as connection:
             existing = connection.execute(
                 """
@@ -3081,6 +3082,15 @@ class PostgresRoleStore:
                     reply_to_message_id,
                 ),
             )
+            if isinstance(source_message_revision_id, str):
+                source_suppression_outgoings = _suppress_source_event_opportunities(
+                    connection,
+                    incoming=incoming,
+                    source_message_revision_id=source_message_revision_id,
+                    recorded_at=received_at,
+                )
+                for suppression_outgoing in source_suppression_outgoings:
+                    _insert_outbox(connection, suppression_outgoing)
             if outgoing is not None:
                 _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
@@ -4195,6 +4205,14 @@ class PostgresRoleStore:
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("OpportunityPublicationChanged payload must be an object")
+        source_suppression_guard = ""
+        if incoming.idempotency_key.startswith(
+            "opportunity-publication-source-suppression:"
+        ):
+            source_suppression_guard = """
+                          AND recommendation_opportunities.publication_state <>
+                              'active'
+            """
         with psycopg.connect(self._database_url) as connection:
             if not _begin_owned_contract(
                 connection,
@@ -4219,7 +4237,15 @@ class PostgresRoleStore:
                             publication_state, accepted_facts, response_route,
                             published_at
                         ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
-                        ON CONFLICT (opportunity_revision_id) DO NOTHING
+                        ON CONFLICT (opportunity_revision_id) DO UPDATE
+                        SET opportunity_id = EXCLUDED.opportunity_id,
+                            opportunity_type = EXCLUDED.opportunity_type,
+                            publication_state = EXCLUDED.publication_state,
+                            accepted_facts = EXCLUDED.accepted_facts,
+                            response_route = EXCLUDED.response_route,
+                            published_at = EXCLUDED.published_at
+                        WHERE recommendation_opportunities.opportunity_id =
+                              EXCLUDED.opportunity_id
                         """,
                         (
                             opportunity["opportunity_id"],
@@ -4233,12 +4259,21 @@ class PostgresRoleStore:
                     )
             else:
                 connection.execute(
-                    """
+                    f"""
                     INSERT INTO football_runtime.recommendation_opportunities (
                         opportunity_id, opportunity_revision_id, opportunity_type,
                         publication_state, accepted_facts, response_route, published_at
                     ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
-                    ON CONFLICT (opportunity_revision_id) DO NOTHING
+                        ON CONFLICT (opportunity_revision_id) DO UPDATE
+                        SET opportunity_id = EXCLUDED.opportunity_id,
+                            opportunity_type = EXCLUDED.opportunity_type,
+                            publication_state = EXCLUDED.publication_state,
+                            accepted_facts = EXCLUDED.accepted_facts,
+                            response_route = EXCLUDED.response_route,
+                            published_at = EXCLUDED.published_at
+                    WHERE recommendation_opportunities.opportunity_id =
+                          EXCLUDED.opportunity_id
+                    {source_suppression_guard}
                     """,
                     (
                         payload["opportunity_id"],
@@ -7130,6 +7165,221 @@ def _ensure_application_proposition_identity_mapping(
         raise RuntimeError("Application proposition identity mapping changed")
 
 
+def _legacy_candidate_alias_for_canonical(
+    *,
+    source_message_id: str,
+    opportunity_id: str,
+) -> str | None:
+    """Return the exact historical candidate alias for one proposition id."""
+    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
+    if not opportunity_id.startswith(prefix):
+        return None
+    candidate_hash = opportunity_id.removeprefix(prefix)
+    if len(candidate_hash) != 16 or any(
+        character not in "0123456789abcdef" for character in candidate_hash
+    ):
+        return None
+    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
+
+
+def _suppress_source_event_opportunities(
+    connection: psycopg.Connection[Any],
+    *,
+    incoming: ContractEnvelope,
+    source_message_revision_id: str,
+    recorded_at: datetime,
+) -> tuple[ContractEnvelope, ...]:
+    """Suppress every prior derived identity while accepting an edit or delete."""
+    current_revision = connection.execute(
+        """
+        SELECT current_revision
+        FROM football_runtime.source_messages
+        WHERE source_message_id = %s
+        FOR UPDATE
+        """,
+        (incoming.subject_id,),
+    ).fetchone()
+    revision_record = connection.execute(
+        """
+        SELECT source_message_id, revision
+        FROM football_runtime.source_message_revisions
+        WHERE source_message_revision_id = %s
+        """,
+        (source_message_revision_id,),
+    ).fetchone()
+    if (
+        current_revision is None
+        or revision_record is None
+        or revision_record[0] != incoming.subject_id
+        or revision_record[1] != incoming.subject_revision
+        or current_revision[0] != incoming.subject_revision
+    ):
+        return ()
+
+    compatibility_rows = connection.execute(
+        """
+        SELECT legacy_opportunity_id, canonical_opportunity_id
+        FROM football_runtime.application_legacy_proposition_identity_compatibility
+        WHERE source_message_id = %s
+        ORDER BY legacy_opportunity_id
+        """,
+        (incoming.subject_id,),
+    ).fetchall()
+    aliases_by_canonical: dict[str, tuple[str, ...]] = {}
+    for legacy_opportunity_id, canonical_opportunity_id in compatibility_rows:
+        expected_alias = _legacy_candidate_alias_for_canonical(
+            source_message_id=incoming.subject_id,
+            opportunity_id=canonical_opportunity_id,
+        )
+        if expected_alias != legacy_opportunity_id:
+            raise RuntimeError("Application proposition identity mapping is ambiguous")
+        existing_aliases = aliases_by_canonical.get(canonical_opportunity_id, ())
+        if existing_aliases and existing_aliases != (legacy_opportunity_id,):
+            raise RuntimeError("Application proposition identity mapping is ambiguous")
+        aliases_by_canonical[canonical_opportunity_id] = (legacy_opportunity_id,)
+
+    rows = connection.execute(
+        """
+        SELECT opportunity.opportunity_id AS storage_opportunity_id,
+               COALESCE(compatibility.canonical_opportunity_id,
+                        opportunity.opportunity_id) AS canonical_opportunity_id,
+               opportunity.source_message_revision_id,
+               opportunity.opportunity_type,
+               opportunity.publication_state,
+               opportunity.accepted_facts,
+               opportunity.evidence,
+               opportunity.response_route
+        FROM football_runtime.application_opportunities AS opportunity
+        JOIN football_runtime.source_message_revisions AS stored_revision
+          ON stored_revision.source_message_revision_id =
+             opportunity.source_message_revision_id
+        LEFT JOIN
+            football_runtime.application_legacy_proposition_identity_compatibility
+            AS compatibility
+          ON compatibility.legacy_opportunity_id = opportunity.opportunity_id
+        WHERE stored_revision.source_message_id = %s
+          AND stored_revision.revision < %s
+        ORDER BY opportunity.opportunity_id
+        FOR UPDATE OF opportunity
+        """,
+        (incoming.subject_id, incoming.subject_revision),
+    ).fetchall()
+    if not rows:
+        return ()
+
+    suppressed_opportunities: list[dict[str, JsonValue]] = []
+    target_items: dict[str, dict[str, JsonValue]] = {}
+    for row in rows:
+        storage_opportunity_id = row[0]
+        canonical_opportunity_id = row[1]
+        if not isinstance(storage_opportunity_id, str) or not storage_opportunity_id:
+            raise RuntimeError("Application proposition identity is incomplete")
+        if (
+            not isinstance(canonical_opportunity_id, str)
+            or not canonical_opportunity_id
+        ):
+            raise RuntimeError("Application proposition identity is incomplete")
+        item: dict[str, JsonValue] = {
+            "opportunity_id": canonical_opportunity_id,
+            "storage_opportunity_id": storage_opportunity_id,
+            "opportunity_revision_id": (
+                f"{canonical_opportunity_id}:revision:{incoming.subject_revision}"
+            ),
+            "storage_opportunity_revision_id": (
+                f"{storage_opportunity_id}:revision:{incoming.subject_revision}"
+            ),
+            "source_message_revision_id": source_message_revision_id,
+            "opportunity_type": row[3],
+            "source_publication_state": row[4],
+            "publication_state": "suppressed",
+            "accepted_facts": row[5],
+            "evidence": row[6],
+            "response_route": row[7],
+        }
+        suppressed_opportunities.append(item)
+        target_ids = {canonical_opportunity_id, storage_opportunity_id}
+        target_ids.update(aliases_by_canonical.get(canonical_opportunity_id, ()))
+        for target_id in target_ids:
+            previous = target_items.get(target_id)
+            if previous is not None and any(
+                previous[field] != item[field]
+                for field in (
+                    "opportunity_type",
+                    "accepted_facts",
+                    "response_route",
+                )
+            ):
+                state_priority = {
+                    "active": 2,
+                    "held_for_review": 1,
+                    "suppressed": 0,
+                    "expired": 0,
+                }
+                previous_state = previous.get("source_publication_state")
+                current_state = item.get("source_publication_state")
+                previous_priority = (
+                    state_priority.get(previous_state, -1)
+                    if isinstance(previous_state, str)
+                    else -1
+                )
+                current_priority = (
+                    state_priority.get(current_state, -1)
+                    if isinstance(current_state, str)
+                    else -1
+                )
+                if current_priority == previous_priority:
+                    raise RuntimeError("Application proposition identity is ambiguous")
+                if current_priority < previous_priority:
+                    continue
+            target_items[target_id] = item
+
+    _suppress_application_opportunities(
+        connection,
+        suppressed_opportunities=tuple(suppressed_opportunities),
+        recorded_at=recorded_at,
+        current_source_message_revision_id=source_message_revision_id,
+    )
+    outgoings: list[ContractEnvelope] = []
+    for target_id in sorted(target_items):
+        item = target_items[target_id]
+        opportunity_revision_id = f"{target_id}:revision:{incoming.subject_revision}"
+        causation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{incoming.message_id}:source-suppression:{target_id}",
+        )
+        outgoings.append(
+            ContractEnvelope(
+                contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                contract_version=2,
+                message_id=derive_contract_message_id(
+                    causation_id,
+                    ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                ),
+                producer=RuntimeRole.APPLICATION,
+                consumer=RuntimeRole.RECOMMENDATION,
+                subject_id=target_id,
+                subject_revision=incoming.subject_revision,
+                idempotency_key=(
+                    "opportunity-publication-source-suppression:"
+                    f"{opportunity_revision_id}"
+                ),
+                causation_id=causation_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+                payload={
+                    "opportunity_id": target_id,
+                    "opportunity_revision_id": opportunity_revision_id,
+                    "source_message_revision_id": source_message_revision_id,
+                    "publication_state": "suppressed",
+                    "opportunity_type": item["opportunity_type"],
+                    "accepted_facts": item["accepted_facts"],
+                    "response_route": item["response_route"],
+                },
+            )
+        )
+    return tuple(outgoings)
+
+
 def _insert_outbox(
     connection: psycopg.Connection[Any],
     envelope: RawContractEnvelope,
@@ -7211,6 +7461,7 @@ def _suppress_application_opportunities(
     *,
     suppressed_opportunities: tuple[dict[str, JsonValue], ...],
     recorded_at: datetime,
+    current_source_message_revision_id: str | None = None,
 ) -> None:
     """Move disappeared Application rows to the current revision atomically."""
     for opportunity in suppressed_opportunities:
@@ -7252,18 +7503,9 @@ def _suppress_application_opportunities(
             or not storage_opportunity_revision_id
         ):
             raise ValueError("suppressed opportunity storage identity is incomplete")
-        connection.execute(
-            """
-            UPDATE football_runtime.application_opportunities AS opportunity
-            SET opportunity_revision_id = %s,
-                source_message_revision_id = %s,
-                opportunity_type = %s,
-                publication_state = 'suppressed',
-                accepted_facts = %s::jsonb,
-                evidence = %s::jsonb,
-                response_route = %s::jsonb,
-                accepted_at = %s
-            WHERE opportunity.opportunity_id = %s
+        assert isinstance(source_message_revision_id, str)
+        if current_source_message_revision_id is None:
+            current_revision_guard = """
               AND EXISTS (
                   SELECT 1
                   FROM football_runtime.source_message_revisions AS current_revision
@@ -7275,6 +7517,44 @@ def _suppress_application_opportunities(
                         stored_revision.source_message_id
                     AND current_revision.revision > stored_revision.revision
               )
+            """
+            current_revision_parameters: tuple[str, ...] = (source_message_revision_id,)
+        else:
+            current_revision_guard = """
+              AND EXISTS (
+                  SELECT 1
+                  FROM football_runtime.source_message_revisions AS current_revision
+                  JOIN football_runtime.source_messages AS current_message
+                    ON current_message.source_message_id =
+                       current_revision.source_message_id
+                   AND current_message.current_revision = current_revision.revision
+                  JOIN football_runtime.source_message_revisions AS stored_revision
+                    ON stored_revision.source_message_revision_id =
+                       opportunity.source_message_revision_id
+                  WHERE current_revision.source_message_revision_id = %s
+                    AND current_revision.source_message_revision_id = %s
+                    AND current_revision.source_message_id =
+                        stored_revision.source_message_id
+                    AND current_revision.revision > stored_revision.revision
+              )
+            """
+            current_revision_parameters = (
+                current_source_message_revision_id,
+                source_message_revision_id,
+            )
+        connection.execute(
+            f"""
+            UPDATE football_runtime.application_opportunities AS opportunity
+            SET opportunity_revision_id = %s,
+                source_message_revision_id = %s,
+                opportunity_type = %s,
+                publication_state = 'suppressed',
+                accepted_facts = %s::jsonb,
+                evidence = %s::jsonb,
+                response_route = %s::jsonb,
+                accepted_at = %s
+            WHERE opportunity.opportunity_id = %s
+            {current_revision_guard}
             """,
             (
                 storage_opportunity_revision_id,
@@ -7285,7 +7565,7 @@ def _suppress_application_opportunities(
                 json.dumps(response_route),
                 recorded_at,
                 storage_opportunity_id,
-                source_message_revision_id,
+                *current_revision_parameters,
             ),
         )
 

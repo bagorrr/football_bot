@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -2000,7 +2001,17 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     assert {item.opportunity_revision_id for item in revised_opportunities} == {
         f"{opportunity_id}:revision:2" for opportunity_id in first_ids.values()
     }
-    assert len(system.opportunity_publication_contracts(revised_revision_id)) == 1
+    revised_publications = system.opportunity_publication_contracts(revised_revision_id)
+    assert len(revised_publications) == 3
+    assert (
+        sum(publication.contract_version == 3 for publication in revised_publications)
+        == 1
+    )
+    assert {
+        publication.payload["opportunity_id"]
+        for publication in revised_publications
+        if publication.contract_version == 2 and isinstance(publication.payload, dict)
+    } == set(first_ids.values())
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
         revised_facts = connection.execute(
             """
@@ -2121,7 +2132,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     singleton_publications = system.opportunity_publication_contracts(
         singleton_revision_id
     )
-    assert len(singleton_publications) == 2
+    assert len(singleton_publications) == 4
     singleton_payloads = [
         publication.payload
         for publication in singleton_publications
@@ -2130,6 +2141,20 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     assert {payload["publication_state"] for payload in singleton_payloads} == {
         "active",
         "suppressed",
+    }
+    assert {
+        payload["opportunity_id"]
+        for payload in singleton_payloads
+        if payload["publication_state"] == "active"
+    } == {first_ids["@open_match_one"]}
+    assert {
+        payload["opportunity_id"]
+        for payload in singleton_payloads
+        if payload["publication_state"] == "suppressed"
+    } == {
+        first_ids["@open_match_one"],
+        first_ids["@open_match_two"],
+        legacy_first_id,
     }
     assert any(
         payload["opportunity_id"] == first_ids["@open_match_one"]
@@ -2176,7 +2201,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     }
     system.restart(RuntimeRole.APPLICATION)
     system.process_opportunities_until_idle()
-    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 2
+    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 4
 
     classifier.return_for(body=revised_body, result=reclassified_result)
     for candidate in reclassified_candidates:
@@ -2228,8 +2253,12 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     compound_publications = system.opportunity_publication_contracts(
         compound_revision_id
     )
-    assert len(compound_publications) == 1
-    compound_payload = compound_publications[0].payload
+    assert len(compound_publications) == 4
+    compound_payload = next(
+        publication.payload
+        for publication in compound_publications
+        if publication.contract_version == 3
+    )
     assert isinstance(compound_payload, dict)
     compound_items = cast(list[JsonValue], compound_payload["opportunities"])
     assert {
@@ -2278,7 +2307,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     all_removed_publications = system.opportunity_publication_contracts(
         all_removed_revision_id
     )
-    assert len(all_removed_publications) == 2
+    assert len(all_removed_publications) == 3
     assert all(
         isinstance(publication.payload, dict)
         and publication.payload["publication_state"] == "suppressed"
@@ -2301,7 +2330,290 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     }
     system.restart(RuntimeRole.APPLICATION)
     system.process_opportunities_until_idle()
-    assert len(system.opportunity_publication_contracts(all_removed_revision_id)) == 2
+    assert len(system.opportunity_publication_contracts(all_removed_revision_id)) == 3
+
+
+def test_source_edit_and_delete_immediately_suppress_all_prior_projections() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_114
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_104,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4904",
+    )
+    body = "20 August 2026 in whole city. Need one player. Contact @v2_proof."
+    classifier.return_for(
+        body=body,
+        result=_v2_accepted_result(body=body, candidate_key="source-suppression"),
+    )
+    classifier.return_proof_for(
+        body=body,
+        result=semantic_proof_result_for(
+            output=_v2_accepted_result(
+                body=body,
+                candidate_key="source-suppression",
+            ).output,
+            body=body,
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4904),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        source_event_id="source-event:classification-routing:source-suppression",
+        telegram_message_id=49004,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    source_message_id = "source-chat:channel:4900104:generation:1:message:49004"
+    revision_one = f"{source_message_id}:revision:1"
+    first_opportunity = system.opportunities()[0]
+    assert first_opportunity.publication_state == "active"
+    opportunity_id = first_opportunity.opportunity_id
+    legacy_alias_id = opportunity_id.replace(":proposition:", ":candidate:")
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        accepted_state = connection.execute(
+            """
+            SELECT accepted_facts, response_route
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_id = %s
+            """,
+            (opportunity_id,),
+        ).fetchone()
+        assert accepted_state is not None
+        accepted_facts, response_route = accepted_state
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (%s, %s, 'open_match', 'active', %s, %s, %s)
+            """,
+            (
+                legacy_alias_id,
+                f"{legacy_alias_id}:revision:1",
+                json.dumps(accepted_facts),
+                json.dumps(response_route),
+                clock.now(),
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_opportunities
+            SET opportunity_id = %s,
+                opportunity_revision_id = %s
+            WHERE opportunity_id = %s
+            """,
+            (
+                legacy_alias_id,
+                f"{legacy_alias_id}:revision:1",
+                opportunity_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_proposition_identities
+            SET opportunity_id = %s
+            WHERE source_message_id = %s
+              AND opportunity_id = %s
+            """,
+            (legacy_alias_id, source_message_id, opportunity_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO
+                football_runtime.application_legacy_proposition_identity_compatibility (
+                source_message_id, legacy_opportunity_id,
+                canonical_opportunity_id, created_at
+            ) VALUES (%s, %s, %s, %s)
+            """,
+            (source_message_id, legacy_alias_id, opportunity_id, clock.now()),
+        )
+
+    edited_body = body
+    classifier.return_for(
+        body=edited_body,
+        result=_v2_accepted_result(
+            body=edited_body,
+            candidate_key="source-suppression",
+        ),
+    )
+    classifier.return_proof_for(
+        body=edited_body,
+        result=semantic_proof_result_for(
+            output=_v2_accepted_result(
+                body=edited_body,
+                candidate_key="source-suppression",
+            ).output,
+            body=edited_body,
+        ),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        source_event_id="source-event:classification-routing:source-suppression-edit",
+        telegram_message_id=49004,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=edited_body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    # The edit acceptance boundary must suppress before classifier work runs.
+    edited_revision = f"{source_message_id}:revision:2"
+    edited_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id in {opportunity_id, legacy_alias_id}
+    )
+    assert edited_opportunity.publication_state == "suppressed"
+    edit_publications = system.opportunity_publication_contracts(edited_revision)
+    assert any(
+        isinstance(publication.payload, dict)
+        and publication.payload["opportunity_id"] == opportunity_id
+        and publication.payload["publication_state"] == "suppressed"
+        for publication in edit_publications
+    )
+
+    # The same-revision classifier result may reactivate the identity after
+    # the pending edit has already been removed from search.
+    system.process_opportunities_until_idle()
+    reclassified_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == opportunity_id
+    )
+    assert reclassified_opportunity.publication_state == "active", repr(
+        {
+            "attempts": system.classification_attempts(),
+            "outcomes": system.classification_routing_outcomes(),
+            "publications": system.opportunity_publication_contracts(edited_revision),
+            "opportunities": system.opportunities(),
+        }
+    )
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        latest_projection_states = connection.execute(
+            """
+            SELECT DISTINCT ON (opportunity_id)
+                   opportunity_id, publication_state
+            FROM football_runtime.recommendation_opportunities
+            WHERE opportunity_id IN (%s, %s)
+            ORDER BY opportunity_id, published_at DESC, opportunity_revision_id DESC
+            """,
+            (opportunity_id, legacy_alias_id),
+        ).fetchall()
+    assert dict(latest_projection_states) == {
+        opportunity_id: "active",
+        legacy_alias_id: "suppressed",
+    }, repr(
+        {
+            "states": latest_projection_states,
+            "publications": [
+                publication.payload
+                for publication in system.opportunity_publication_contracts(
+                    edited_revision
+                )
+            ],
+        }
+    )
+
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        source_event_id="source-event:classification-routing:source-suppression-delete",
+        telegram_message_id=49004,
+        revision=3,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    deleted_revision = f"{source_message_id}:revision:3"
+    assert system.source_messages()[0].tombstoned is True
+    assert (
+        next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.opportunity_id in {opportunity_id, legacy_alias_id}
+        ).publication_state
+        == "suppressed"
+    )
+    assert any(
+        isinstance(publication.payload, dict)
+        and publication.payload["opportunity_id"] == opportunity_id
+        and publication.payload["publication_state"] == "suppressed"
+        for publication in system.opportunity_publication_contracts(deleted_revision)
+    )
+    system.process_opportunities_until_idle()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        projection = connection.execute(
+            """
+            SELECT publication_state
+            FROM football_runtime.recommendation_opportunities
+            WHERE opportunity_id = %s
+            ORDER BY published_at DESC, opportunity_revision_id DESC
+            LIMIT 1
+            """,
+            (opportunity_id,),
+        ).fetchone()
+    assert projection == ("suppressed",)
+
+    # Replaying/restarting the source boundary must not recreate publication
+    # rows or make the tombstoned revision visible again.
+    publication_count = len(system.opportunity_publication_contracts(deleted_revision))
+    system.process_opportunities_until_idle()
+    system.restart(RuntimeRole.APPLICATION)
+    system.process_opportunities_until_idle()
+    assert len(system.opportunity_publication_contracts(deleted_revision)) == (
+        publication_count
+    )
+    assert system.opportunity_publication_contracts(revision_one)
 
 
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:

@@ -9126,53 +9126,64 @@ class RuntimeApplication:
         emitted_opportunity_ids: set[str] = set()
         for suppressed_item in suppressed:
             opportunity_id = suppressed_item.get("opportunity_id")
-            opportunity_revision_id = suppressed_item.get("opportunity_revision_id")
+            storage_opportunity_id = suppressed_item.get("storage_opportunity_id")
             opportunity_type = suppressed_item.get("opportunity_type")
             if (
                 not isinstance(opportunity_id, str)
                 or not opportunity_id
-                or not isinstance(opportunity_revision_id, str)
-                or not opportunity_revision_id
                 or not isinstance(opportunity_type, str)
                 or not opportunity_type
             ):
                 raise ValueError("suppression identity is incomplete")
-            if opportunity_id in emitted_opportunity_ids:
-                continue
-            emitted_opportunity_ids.add(opportunity_id)
-            suppression_causation_id = uuid5(
-                NAMESPACE_URL,
-                f"football-bot:{incoming.message_id}:suppression:{opportunity_id}",
+            target_ids = {opportunity_id}
+            if isinstance(storage_opportunity_id, str) and storage_opportunity_id:
+                target_ids.add(storage_opportunity_id)
+            legacy_alias = _legacy_candidate_alias_for_canonical(
+                source_message_id=source_revision.source_message_id,
+                opportunity_id=opportunity_id,
             )
-            suppression_outgoings.append(
-                ContractEnvelope(
-                    contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                    contract_version=2,
-                    message_id=derive_contract_message_id(
-                        suppression_causation_id,
-                        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                    ),
-                    producer=RuntimeRole.APPLICATION,
-                    consumer=RuntimeRole.RECOMMENDATION,
-                    subject_id=opportunity_id,
-                    subject_revision=incoming.subject_revision,
-                    idempotency_key=(
-                        f"opportunity-publication:{opportunity_revision_id}"
-                    ),
-                    causation_id=suppression_causation_id,
-                    correlation_id=incoming.correlation_id,
-                    recorded_at=self.clock.now(),
-                    payload={
-                        "opportunity_id": opportunity_id,
-                        "opportunity_revision_id": opportunity_revision_id,
-                        "source_message_revision_id": source_message_revision_id,
-                        "publication_state": "suppressed",
-                        "opportunity_type": opportunity_type,
-                        "accepted_facts": suppressed_item["accepted_facts"],
-                        "response_route": suppressed_item["response_route"],
-                    },
+            if legacy_alias is not None:
+                target_ids.add(legacy_alias)
+            for target_id in sorted(target_ids):
+                if target_id in emitted_opportunity_ids:
+                    continue
+                emitted_opportunity_ids.add(target_id)
+                opportunity_revision_id = (
+                    f"{target_id}:revision:{incoming.subject_revision}"
                 )
-            )
+                suppression_causation_id = uuid5(
+                    NAMESPACE_URL,
+                    f"football-bot:{incoming.message_id}:suppression:{target_id}",
+                )
+                suppression_outgoings.append(
+                    ContractEnvelope(
+                        contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                        contract_version=2,
+                        message_id=derive_contract_message_id(
+                            suppression_causation_id,
+                            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                        ),
+                        producer=RuntimeRole.APPLICATION,
+                        consumer=RuntimeRole.RECOMMENDATION,
+                        subject_id=target_id,
+                        subject_revision=incoming.subject_revision,
+                        idempotency_key=(
+                            f"opportunity-publication:{opportunity_revision_id}"
+                        ),
+                        causation_id=suppression_causation_id,
+                        correlation_id=incoming.correlation_id,
+                        recorded_at=self.clock.now(),
+                        payload={
+                            "opportunity_id": target_id,
+                            "opportunity_revision_id": opportunity_revision_id,
+                            "source_message_revision_id": source_message_revision_id,
+                            "publication_state": "suppressed",
+                            "opportunity_type": opportunity_type,
+                            "accepted_facts": suppressed_item["accepted_facts"],
+                            "response_route": suppressed_item["response_route"],
+                        },
+                    )
+                )
         return suppressed, tuple(suppression_outgoings)
 
     def _accept_classification_proposal(self, incoming: ContractEnvelope) -> None:
@@ -11900,6 +11911,23 @@ def _proposition_lineage_slot(anchor: str) -> int:
 def _proposition_opportunity_id(source_message_id: str, anchor: str) -> str:
     """Return the stable Application-owned identity for one proposition lineage."""
     return f"opportunity:{source_message_id}:open_match:proposition:{anchor[:16]}"
+
+
+def _legacy_candidate_alias_for_canonical(
+    *,
+    source_message_id: str,
+    opportunity_id: str,
+) -> str | None:
+    """Return the exact historical candidate alias for one proposition id."""
+    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
+    if not opportunity_id.startswith(prefix):
+        return None
+    candidate_hash = opportunity_id.removeprefix(prefix)
+    if len(candidate_hash) != 16 or any(
+        character not in "0123456789abcdef" for character in candidate_hash
+    ):
+        return None
+    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
 
 
 def _canonicalize_legacy_proposition_records(

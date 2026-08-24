@@ -949,6 +949,66 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
     ]
 
 
+def test_0020_rejects_overlong_legacy_candidate_identity_before_mapping(
+    fresh_database_url: str,
+) -> None:
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=19)
+    source_message_id = "source-chat:channel:4918103:generation:1:message:1006"
+    legacy_opportunity_id = (
+        f"opportunity:{source_message_id}:open_match:candidate:aaaaaaaaaaaaaaaaa"
+    )
+    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type,
+                publication_state, accepted_facts, evidence,
+                response_route, accepted_at
+            ) VALUES (
+                %s, %s, %s, 'open_match', 'active',
+                '{}'::jsonb, '{}'::jsonb,
+                '{"kind": "source_message", "value": "https://t.me/x/1"}'::jsonb,
+                %s
+            )
+            """,
+            (
+                legacy_opportunity_id,
+                f"{legacy_opportunity_id}:revision:1",
+                f"{source_message_id}:revision:1",
+                recorded_at,
+            ),
+        )
+
+    migration_sql = _migration_paths()[19].read_text(encoding="utf-8")
+    with (
+        pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping is malformed",
+        ),
+        psycopg.connect(fresh_database_url) as connection,
+    ):
+        connection.execute(migration_sql)
+
+    with psycopg.connect(fresh_database_url) as connection:
+        assert connection.execute(
+            """
+            SELECT to_regclass(
+                'football_runtime.application_legacy_proposition_identity_compatibility'
+            )
+            """
+        ).fetchone() == (None,)
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_proposition_identities
+            WHERE source_message_id = %s
+            """,
+            (source_message_id,),
+        ).fetchone() == (0,)
+
+
 def test_0018_fails_closed_for_mixed_legacy_v4_identity_formats(
     fresh_database_url: str,
 ) -> None:

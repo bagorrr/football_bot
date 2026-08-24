@@ -1787,11 +1787,19 @@ def _validate_opportunity_publication_changed(
     source_revision_id = _required_text(payload, "source_message_revision_id")
     source_scope = source_revision_id.rsplit(":revision:", 1)[0]
     legacy_identity = f"opportunity:{source_scope}:open_match"
+    candidate_identity = re.fullmatch(
+        rf"opportunity:{re.escape(source_scope)}:open_match:candidate:[0-9a-f]{{16}}",
+        opportunity_id,
+    )
     lineage_identity = re.fullmatch(
         rf"opportunity:{re.escape(source_scope)}:open_match:proposition:[0-9a-f]{{16}}",
         opportunity_id,
     )
-    if opportunity_id != legacy_identity and lineage_identity is None:
+    if (
+        opportunity_id != legacy_identity
+        and lineage_identity is None
+        and candidate_identity is None
+    ):
         raise ValueError(
             "Opportunity identity is inconsistent with its source revision"
         )
@@ -1842,7 +1850,12 @@ def _validate_opportunity_publication_changed(
     if not valid_route:
         raise ValueError("response_route is invalid")
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
-    if envelope.idempotency_key != f"opportunity-publication:{opportunity_revision_id}":
+    allowed_idempotency_keys = {f"opportunity-publication:{opportunity_revision_id}"}
+    if payload["publication_state"] == "suppressed":
+        allowed_idempotency_keys.add(
+            f"opportunity-publication-source-suppression:{opportunity_revision_id}"
+        )
+    if envelope.idempotency_key not in allowed_idempotency_keys:
         raise ValueError(
             "OpportunityPublicationChanged idempotency key is not canonical"
         )

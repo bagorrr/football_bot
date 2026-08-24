@@ -26,9 +26,27 @@ BEGIN
         FROM football_runtime.application_opportunities
         WHERE opportunity_id LIKE '%:candidate:%'
     ) AS historical
-    WHERE historical.opportunity_id NOT LIKE
-        'opportunity:' || historical.source_message_id || ':open_match:candidate:%'
-       OR right(historical.opportunity_id, 16) !~ '^[0-9a-f]{16}$'
+    WHERE left(
+              historical.opportunity_id,
+              length(
+                  'opportunity:' || historical.source_message_id ||
+                  ':open_match:candidate:'
+              )
+          ) <> (
+              'opportunity:' || historical.source_message_id ||
+              ':open_match:candidate:'
+          )
+       OR length(historical.opportunity_id) <> length(
+              'opportunity:' || historical.source_message_id ||
+              ':open_match:candidate:'
+          ) + 16
+       OR substring(
+              historical.opportunity_id
+              FROM length(
+                  'opportunity:' || historical.source_message_id ||
+                  ':open_match:candidate:'
+              ) + 1
+          ) !~ '^[0-9a-f]{16}$'
     ORDER BY historical.opportunity_id
     LIMIT 1;
 
