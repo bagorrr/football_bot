@@ -223,6 +223,14 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
     assert system.opportunities() == ()
     assert system.opportunity_publication_contracts(revision_id) == ()
 
+    _exercise_legacy_v1_invalid_primary_execution(
+        system=system,
+        classifier=classifier,
+        telegram=telegram,
+        clock=clock,
+        source_identity=source_identity,
+    )
+
 
 @pytest.mark.parametrize("error_type", (TimeoutError, ConnectionError, RuntimeError))
 def test_raised_primary_model_failures_exhaust_durable_attempt_budget(
@@ -563,26 +571,16 @@ def test_primary_effective_provenance_is_retryable_before_any_classification(
     assert system.opportunity_publication_contracts(revision_id) == ()
 
 
-def test_legacy_v1_invalid_primary_execution_uses_durable_retry_budget() -> None:
-    classifier = ControlledModelAdapter()
-    telegram = ControlledTelegramIngestionAdapter()
-    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
-        admin_database_url=os.environ["TEST_DATABASE_URL"],
-        clock=clock,
-        telegram_ingestion=telegram,
-        model=classifier,
-        telegram_admin_user_id=49_128,
-    )
-    system.reset()
-    source_identity = _prepare_source_chat_on_existing_spine(
-        system=system,
-        telegram=telegram,
-        clock=clock,
-        telegram_id=4_900_128,
-        checkpoint=4928,
-        administrator_id=49_128,
-    )
+def _exercise_legacy_v1_invalid_primary_execution(
+    *,
+    system: AcceptanceSpine,
+    classifier: ControlledModelAdapter,
+    telegram: ControlledTelegramIngestionAdapter,
+    clock: FrozenClock,
+    source_identity: TelegramPeerIdentity,
+) -> None:
+    """Exercise v1 invalid executions on an already booted acceptance spine."""
+    classifier.primary_schema_version = "source-message-classification-v1"
     for offset, invalid_kind in enumerate(("schema", "metadata", "exception")):
         body = f"Legacy v1 invalid primary {invalid_kind} must remain retryable."
         if invalid_kind == "exception":
@@ -623,7 +621,7 @@ def test_legacy_v1_invalid_primary_execution_uses_durable_retry_budget() -> None
             source_identity=source_identity,
             body=body,
             telegram_message_id=4_900_128 + offset,
-            checkpoint=4928 + offset,
+            checkpoint=4907 + offset,
         )
 
         request_count = len(classifier.requests)
@@ -791,28 +789,22 @@ def test_legacy_v1_semantic_proof_has_own_restartable_budget() -> None:
         )
         assert len(system.opportunity_publication_contracts(revision_id)) == 1
 
-
-def test_v1_semantic_proof_exhaustion_is_durable_and_unpublished() -> None:
-    classifier = ControlledModelAdapter()
-    telegram = ControlledTelegramIngestionAdapter()
-    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
-        admin_database_url=os.environ["TEST_DATABASE_URL"],
-        clock=clock,
-        telegram_ingestion=telegram,
-        model=classifier,
-        location_resolver=_whole_city_resolver(),
-        telegram_admin_user_id=49_131,
-    )
-    system.reset()
-    source_identity = _prepare_source_chat_on_existing_spine(
+    _exercise_v1_semantic_proof_exhaustion(
         system=system,
+        classifier=classifier,
         telegram=telegram,
-        clock=clock,
-        telegram_id=4_900_131,
-        checkpoint=4931,
-        administrator_id=49_131,
+        source_identity=source_identity,
     )
+
+
+def _exercise_v1_semantic_proof_exhaustion(
+    *,
+    system: AcceptanceSpine,
+    classifier: ControlledModelAdapter,
+    telegram: ControlledTelegramIngestionAdapter,
+    source_identity: TelegramPeerIdentity,
+) -> None:
+    """Exercise all v1 proof transport failure kinds on one acceptance spine."""
     for offset, failure_kind in enumerate(("timeout", "provider_5xx", "process")):
         body = (
             f"20 August 2026 in whole city. Need one player. "
@@ -870,8 +862,8 @@ def test_v1_semantic_proof_exhaustion_is_durable_and_unpublished() -> None:
             telegram=telegram,
             source_identity=source_identity,
             body=body,
-            telegram_message_id=4_900_131 + offset,
-            checkpoint=4931 + offset,
+            telegram_message_id=4_900_132 + offset,
+            checkpoint=4932 + offset,
         )
 
         proof_request_count = len(classifier.proof_requests)
