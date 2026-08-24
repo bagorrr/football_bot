@@ -408,12 +408,14 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
         system=system,
         classifier=classifier,
         telegram=telegram,
+        clock=clock,
         source_identity=source_identity,
     )
     _exercise_v1_semantic_proof_exhaustion(
         system=system,
         classifier=classifier,
         telegram=telegram,
+        clock=clock,
         source_identity=source_identity,
     )
 
@@ -767,6 +769,239 @@ def test_authentication_circuit_requires_smoke_test_before_retry() -> None:
     assert classifier.requests[-1].requested_model == "gpt-5.6-sol"
     assert classifier.requests[-1].requested_reasoning_effort == "high"
     assert system.classification_queue_health().queue_depth == 0
+
+
+def test_legacy_v1_primary_authentication_circuit_retains_work_until_recovery() -> None:
+    body = "Legacy v1 authentication recovery retains the selected classifier job."
+    classifier = ControlledModelAdapter()
+    classifier.raise_for(error=ClassifierAuthenticationError())
+    classifier.return_for(body=body, result=_irrelevant_classifier_result())
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, _ = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_154,
+        checkpoint=4954,
+        administrator_id=49_154,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    health = system.classification_queue_health()
+    assert health.queue_depth == 1
+    assert health.terminal_failure_count == 0
+    assert [(circuit.adapter_kind, circuit.state) for circuit in health.circuits] == [
+        ("controlled_recording", "authentication_open")
+    ]
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(hours=2))
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert system.recover_classifier_authentication()
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    assert [attempt.attempt_number for attempt in system.classification_attempts()] == [
+        1,
+        2,
+    ]
+    assert [attempt.status for attempt in system.classification_attempts()] == [
+        "failed",
+        "succeeded",
+    ]
+    assert classifier.requests[-1].requested_model == "gpt-5.6-sol"
+    assert classifier.requests[-1].requested_reasoning_effort == "high"
+    assert system.classification_queue_health().queue_depth == 0
+
+
+def test_legacy_v1_primary_quota_circuit_honors_retry_after_before_probe() -> None:
+    body = "Legacy v1 quota recovery honors the provider Retry-After boundary."
+    classifier = ControlledModelAdapter()
+    classifier.raise_for(error=ClassifierQuotaError(retry_after_seconds=240))
+    classifier.return_for(body=body, result=_irrelevant_classifier_result())
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, _ = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_156,
+        checkpoint=4956,
+        administrator_id=49_156,
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    health = system.classification_queue_health()
+    assert health.queue_depth == 1
+    assert health.terminal_failure_count == 0
+    circuit = health.circuits[0]
+    assert circuit.state == "quota_open"
+    assert circuit.next_probe_at == clock.now() + timedelta(seconds=240)
+    clock.advance_to(clock.now() + timedelta(seconds=239))
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    clock.advance_to(clock.now() + timedelta(seconds=1))
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+
+    assert [attempt.attempt_number for attempt in system.classification_attempts()] == [
+        1,
+        2,
+    ]
+    assert system.classification_queue_health().queue_depth == 0
+    assert system.classification_queue_health().circuits[0].state == "closed"
+    assert classifier.requests[-1].requested_model == "gpt-5.6-sol"
+    assert classifier.requests[-1].requested_reasoning_effort == "high"
+
+
+@pytest.mark.parametrize("circuit_kind", ("authentication", "quota"))
+def test_legacy_v1_semantic_proof_typed_circuits_retain_and_replay(
+    circuit_kind: str,
+) -> None:
+    body = (
+        f"20 August 2026 in whole city. Need one player. "
+        f"Contact @legacy_v1_circuit_proof. Proof {circuit_kind} recovery."
+    )
+    candidate_key = f"legacy-v1-{circuit_kind}-proof-candidate"
+    primary = _minimal_classifier_result(
+        candidate_key=candidate_key,
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@legacy_v1_circuit_proof",
+                "evidence": "@legacy_v1_circuit_proof",
+            }
+        ],
+        event_time_evidence="20 August 2026",
+        opportunity_evidence="Need one player",
+        open_places_evidence="Need one player",
+    )
+    primary_candidates = primary.output["candidates"]
+    assert isinstance(primary_candidates, list) and len(primary_candidates) == 1
+    primary_candidate = primary_candidates[0]
+    assert isinstance(primary_candidate, dict)
+    primary_candidate["evidence"] = {
+        **cast(dict[str, JsonValue], primary_candidate["evidence"]),
+        "location": "whole city",
+    }
+    primary_candidate["location"] = {
+        "mention": "whole city",
+        "place_id": "city:ru:saint-petersburg",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    valid_proof = semantic_proof_result_for(output=primary.output, body=body)
+    classifier = ControlledModelAdapter()
+    classifier.return_for(body=body, result=primary)
+    classifier.raise_for(
+        pass_kind="semantic_proof",
+        error=(
+            ClassifierAuthenticationError()
+            if circuit_kind == "authentication"
+            else ClassifierQuotaError(retry_after_seconds=240)
+        ),
+    )
+    classifier.return_proof_for(body=body, result=valid_proof)
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_157,
+        checkpoint=4957,
+        administrator_id=49_157,
+        location_resolver=_whole_city_resolver(),
+        clock=clock,
+    )
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    health = system.classification_queue_health()
+    assert health.queue_depth == 1
+    assert health.terminal_failure_count == 0
+    circuit = health.circuits[0]
+    assert circuit.state == f"{circuit_kind}_open"
+    if circuit_kind == "authentication":
+        system.restart(RuntimeRole.CLASSIFICATION)
+        assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        assert system.recover_classifier_authentication()
+    else:
+        assert circuit.next_probe_at == clock.now() + timedelta(seconds=240)
+        clock.advance_to(clock.now() + timedelta(seconds=239))
+        assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        clock.advance_to(clock.now() + timedelta(seconds=1))
+
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    system.process_opportunities_until_idle()
+    attempts = system.classification_attempts()
+    assert sorted(
+        (
+            attempt.pass_kind,
+            attempt.attempt_number,
+            attempt.status,
+        )
+        for attempt in attempts
+    ) == [
+        ("primary", 1, "succeeded"),
+        ("primary", 2, "succeeded"),
+        ("semantic_proof", 1, "failed"),
+        ("semantic_proof", 2, "succeeded"),
+    ]
+    assert len(system.opportunity_publication_contracts(revision_id)) == 1
+    assert system.classification_queue_health().queue_depth == 0
+
+    system.restart(RuntimeRole.CLASSIFICATION)
+    assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(system.opportunity_publication_contracts(revision_id)) == 1
+
+
+@pytest.mark.parametrize("circuit_kind", ("authentication", "quota"))
+def test_third_circuit_failure_is_not_terminal_until_budget_finalization(
+    circuit_kind: str,
+) -> None:
+    body = f"Third {circuit_kind} circuit failure remains recoverable work."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    for _ in range(3):
+        classifier.raise_for(
+            error=(
+                ClassifierAuthenticationError()
+                if circuit_kind == "authentication"
+                else ClassifierQuotaError(retry_after_seconds=240)
+            )
+        )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    system, _, _, _ = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_161,
+        checkpoint=4961,
+        administrator_id=49_161,
+        clock=clock,
+    )
+
+    for attempt_number in range(1, 4):
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        health = system.classification_queue_health()
+        assert health.queue_depth == 1
+        assert health.terminal_failure_count == 0
+        assert health.circuits[0].state == f"{circuit_kind}_open"
+        if attempt_number < 3:
+            if circuit_kind == "authentication":
+                assert system.recover_classifier_authentication()
+            else:
+                next_probe_at = health.circuits[0].next_probe_at
+                assert next_probe_at is not None
+                clock.advance_to(next_probe_at)
+
+    if circuit_kind == "authentication":
+        assert system.recover_classifier_authentication()
+    else:
+        next_probe_at = system.classification_queue_health().circuits[0].next_probe_at
+        assert next_probe_at is not None
+        clock.advance_to(next_probe_at)
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(classifier.requests) == 3
+    health = system.classification_queue_health()
+    assert health.queue_depth == 0
+    assert health.terminal_failure_count == 1
 
 
 def test_queue_health_surfaces_warning_and_critical_oldest_ready_age() -> None:
@@ -1485,6 +1720,7 @@ def _exercise_legacy_v1_invalid_primary_execution(
 
         classifier.return_for(body=body, result=_irrelevant_classifier_result())
         system.restart(RuntimeRole.CLASSIFICATION)
+        assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
         clock.advance_to(clock.now() + timedelta(seconds=33))
         assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
         system.process_opportunities_until_idle()
@@ -1513,6 +1749,7 @@ def _exercise_legacy_v1_semantic_proof_retry_cases(
     system: AcceptanceSpine,
     classifier: ControlledModelAdapter,
     telegram: ControlledTelegramIngestionAdapter,
+    clock: FrozenClock,
     source_identity: TelegramPeerIdentity,
 ) -> None:
     """Exercise v1 proof retries on the existing invalid-primary spine."""
@@ -1606,6 +1843,8 @@ def _exercise_legacy_v1_semantic_proof_retry_cases(
 
         classifier.return_proof_for(body=body, result=valid_proof)
         system.restart(RuntimeRole.CLASSIFICATION)
+        assert not system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        clock.advance_to(clock.now() + timedelta(seconds=33))
         assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
         system.process_opportunities_until_idle()
         proof_attempts = tuple(
@@ -1629,6 +1868,7 @@ def _exercise_v1_semantic_proof_exhaustion(
     system: AcceptanceSpine,
     classifier: ControlledModelAdapter,
     telegram: ControlledTelegramIngestionAdapter,
+    clock: FrozenClock,
     source_identity: TelegramPeerIdentity,
 ) -> None:
     """Exercise all v1 proof transport failure kinds on one acceptance spine."""
@@ -1695,6 +1935,10 @@ def _exercise_v1_semantic_proof_exhaustion(
 
         proof_request_count = len(classifier.proof_requests)
         for attempt_number in range(1, 4):
+            if attempt_number > 1:
+                clock.advance_to(
+                    clock.now() + timedelta(seconds=33 if attempt_number == 2 else 133)
+                )
             assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
             if attempt_number < 3:
                 system.restart(RuntimeRole.CLASSIFICATION)

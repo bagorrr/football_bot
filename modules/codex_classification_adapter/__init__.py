@@ -11,12 +11,12 @@ from pathlib import Path
 from time import monotonic
 from typing import Protocol, cast
 
+from modules.classifier_adapter import classifier_provider_error_from_metadata
 from modules.contracts import JsonValue
 from modules.ports import (
     ClassifierAdapterResult,
     ClassifierExecutionTimeoutError,
     ClassifierRequest,
-    classifier_provider_error_from_metadata,
 )
 
 EXECUTION_TIMEOUT_SECONDS = 180

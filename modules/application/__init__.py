@@ -7840,33 +7840,45 @@ class RuntimeApplication:
         )
         try:
             result = self.model.classify(request)
-        except Exception:
-            failure_result = _classifier_failure_result(request)
-            failure_attempt = _classifier_failure_attempt(
-                request,
-                revision_id=revision_id,
-                pass_number=1,
-                pass_kind="primary",
-                attempt_number=primary_attempt_number,
-                input_manifest_hash=input_manifest_hash,
+        except Exception as error:
+            failure_result = primary_started_result
+            failure_attempt = primary_started_attempt
+            existing_circuit = (
+                self.store.classifier_circuit_state(self.model.adapter_kind)
+                if isinstance(error, ClassifierQuotaError)
+                else None
             )
+            failed_at = self.clock.now()
+            circuit_state, circuit_retry_at, provider_retry_at = (
+                _classifier_failure_timing(
+                    error,
+                    observed_at=failed_at,
+                    quota_probe_count=(
+                        existing_circuit.probe_count if existing_circuit else 0
+                    ),
+                )
+            )
+            terminal = primary_attempt_number >= 3 and circuit_state is None
             self.store.record_classification_attempt(
                 incoming=incoming,
                 attempt=failure_attempt,
                 result=failure_result,
                 outgoing=None,
-                received_at=self.clock.now(),
-                finalize=primary_attempt_number >= 3,
+                received_at=failed_at,
+                finalize=terminal,
                 retry_at=(
                     None
-                    if primary_attempt_number >= 3
-                    else self.clock.now()
+                    if terminal or circuit_state is not None
+                    else provider_retry_at
+                    or failed_at
                     + _classifier_retry_delay(
                         revision_id=revision_id,
                         pass_kind="primary",
                         attempt_number=primary_attempt_number,
                     )
                 ),
+                circuit_state=circuit_state,
+                circuit_retry_at=circuit_retry_at,
             )
             return
         result_disposition = result.output.get("disposition")
@@ -7907,13 +7919,24 @@ class RuntimeApplication:
                 input_manifest_hash=input_manifest_hash,
                 status="failed",
             )
+            failed_at = self.clock.now()
             self.store.record_classification_attempt(
                 incoming=incoming,
                 attempt=invalid_attempt,
                 result=recorded_result,
                 outgoing=None,
-                received_at=self.clock.now(),
+                received_at=failed_at,
                 finalize=primary_attempt_number >= 3,
+                retry_at=(
+                    None
+                    if primary_attempt_number >= 3
+                    else failed_at
+                    + _classifier_retry_delay(
+                        revision_id=revision_id,
+                        pass_kind="primary",
+                        attempt_number=primary_attempt_number,
+                    )
+                ),
             )
             return
         proposal_id = f"proposal:{revision_id}"
@@ -8031,29 +8054,48 @@ class RuntimeApplication:
                 semantic_proof_result = self.model.semantic_proof(
                     semantic_proof_request
                 )
-            except Exception:
-                semantic_proof_result = _classifier_failure_result(
-                    semantic_proof_request
+            except Exception as error:
+                semantic_proof_result = proof_started_result
+                semantic_proof_attempt = proof_started_attempt
+                existing_circuit = (
+                    self.store.classifier_circuit_state(self.model.adapter_kind)
+                    if isinstance(error, ClassifierQuotaError)
+                    else None
                 )
-                semantic_proof_attempt = _classifier_failure_attempt(
-                    semantic_proof_request,
-                    revision_id=revision_id,
-                    pass_number=2,
-                    pass_kind="semantic_proof",
-                    attempt_number=proof_attempt_number,
-                    input_manifest_hash=proof_input_manifest_hash,
-                    candidate_key=proof_candidate_key,
+                failed_at = self.clock.now()
+                circuit_state, circuit_retry_at, provider_retry_at = (
+                    _classifier_failure_timing(
+                        error,
+                        observed_at=failed_at,
+                        quota_probe_count=(
+                            existing_circuit.probe_count if existing_circuit else 0
+                        ),
+                    )
                 )
+                terminal = proof_attempt_number >= 3 and circuit_state is None
                 self.store.record_classification_attempt(
                     incoming=incoming,
                     attempt=primary_attempt,
                     result=primary_recorded_result,
                     outgoing=None,
-                    received_at=self.clock.now(),
+                    received_at=failed_at,
                     additional_attempts=(
                         (semantic_proof_attempt, semantic_proof_result),
                     ),
-                    finalize=proof_attempt_number >= 3,
+                    finalize=terminal,
+                    retry_at=(
+                        None
+                        if terminal or circuit_state is not None
+                        else provider_retry_at
+                        or failed_at
+                        + _classifier_retry_delay(
+                            revision_id=revision_id,
+                            pass_kind="semantic_proof",
+                            attempt_number=proof_attempt_number,
+                        )
+                    ),
+                    circuit_state=circuit_state,
+                    circuit_retry_at=circuit_retry_at,
                 )
                 return
             semantic_proof_recorded_result = replace(
@@ -8090,16 +8132,27 @@ class RuntimeApplication:
                 candidate_key=proof_candidate_key,
             )
             if not semantic_proof_ready:
+                failed_at = self.clock.now()
                 self.store.record_classification_attempt(
                     incoming=incoming,
                     attempt=primary_attempt,
                     result=primary_recorded_result,
                     outgoing=None,
-                    received_at=self.clock.now(),
+                    received_at=failed_at,
                     additional_attempts=(
                         (semantic_proof_attempt, semantic_proof_recorded_result),
                     ),
                     finalize=proof_attempt_number >= 3,
+                    retry_at=(
+                        None
+                        if proof_attempt_number >= 3
+                        else failed_at
+                        + _classifier_retry_delay(
+                            revision_id=revision_id,
+                            pass_kind="semantic_proof",
+                            attempt_number=proof_attempt_number,
+                        )
+                    ),
                 )
                 return
             semantic_proof_output = semantic_proof_result.output

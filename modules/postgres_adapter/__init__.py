@@ -999,8 +999,21 @@ class PostgresAcceptanceObserver:
             terminal_failures = connection.execute(
                 """
                 SELECT count(*)::integer
-                FROM football_runtime.classification_attempts
-                WHERE status = 'failed' AND attempt_number = 3
+                FROM football_runtime.classification_attempts AS attempts
+                WHERE attempts.status = 'failed'
+                  AND attempts.attempt_number = 3
+                  AND EXISTS (
+                      SELECT 1
+                      FROM football_runtime.contract_outbox AS command
+                      JOIN football_runtime.contract_inbox AS inbox
+                        ON inbox.consumer_role = 'classification'
+                       AND inbox.message_id = command.message_id
+                      WHERE command.consumer_role = 'classification'
+                        AND command.contract_name = 'ClassifySourceMessageRevision'
+                        AND command.payload ->> 'source_message_revision_id'
+                            = attempts.source_message_revision_id
+                        AND inbox.processing_status = 'accepted'
+                  )
                 """
             ).fetchone()
         assert queue is not None
