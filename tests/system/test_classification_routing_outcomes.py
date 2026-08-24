@@ -1561,6 +1561,16 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         kind=TelegramPeerKind.CHANNEL,
         telegram_id=4_900_102,
     )
+    source_message_id = "source-chat:channel:4900102:generation:1:message:49003"
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            DELETE FROM
+                football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s
+            """,
+            (source_message_id,),
+        )
     telegram.allow_public_username(
         address="@synthetic_open_match_source",
         identity=source_identity,
@@ -1783,6 +1793,8 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     assert len(system.opportunities()) == 2
     assert len(system.opportunity_publication_contracts(revision_id)) == 1
 
+    assert revision_id.rsplit(":revision:", 1)[0] == source_message_id
+
     revised_body = body.replace("20 August 2026", "21 August 2026").replace(
         "22 August 2026", "23 August 2026"
     )
@@ -1875,6 +1887,44 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
     }
     assert len(system.opportunity_publication_contracts(revised_revision_id)) == 1
 
+    canonical_first_id = first_ids["@open_match_one"]
+    assert ":proposition:" in canonical_first_id
+    legacy_first_id = canonical_first_id.replace(":proposition:", ":candidate:")
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.application_opportunities
+            SET opportunity_id = %s,
+                opportunity_revision_id = %s
+            WHERE opportunity_id = %s
+            """,
+            (
+                legacy_first_id,
+                f"{legacy_first_id}:revision:2",
+                canonical_first_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_proposition_identities
+            SET opportunity_id = %s
+            WHERE source_message_id = %s
+              AND opportunity_id = %s
+            """,
+            (legacy_first_id, source_message_id, canonical_first_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO
+                football_runtime.application_legacy_proposition_identity_compatibility (
+                source_message_id, legacy_opportunity_id,
+                canonical_opportunity_id, created_at
+            ) VALUES (%s, %s, %s, %s)
+            """,
+            (source_message_id, legacy_first_id, canonical_first_id, clock.now()),
+        )
+    clock.advance_to(datetime(2026, 8, 18, 9, 5, 1, tzinfo=UTC))
+
     singleton_candidate: dict[str, JsonValue] | None = None
     for candidate in reclassified_candidates:
         if not isinstance(candidate, dict):
@@ -1947,6 +1997,21 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         == f"{first_ids['@open_match_one']}:revision:3"
         for opportunity in singleton_opportunities
     )
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s
+              AND legacy_opportunity_id = %s
+              AND canonical_opportunity_id = %s
+            """,
+            (source_message_id, legacy_first_id, canonical_first_id),
+        ).fetchone() == (1,)
+    system.process_opportunities_until_idle()
+    system.restart(RuntimeRole.APPLICATION)
+    system.process_opportunities_until_idle()
+    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 1
 
     classifier.return_for(body=revised_body, result=reclassified_result)
     for candidate in reclassified_candidates:
@@ -1990,286 +2055,23 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
         item.response_route.value: item.opportunity_id
         for item in compound_opportunities
     } == first_ids
-    assert {item.opportunity_revision_id for item in compound_opportunities} == {
-        f"{opportunity_id}:revision:4" for opportunity_id in first_ids.values()
-    }
-    assert len(system.opportunity_publication_contracts(compound_revision_id)) == 1
-
-
-def test_legacy_v4_candidate_identity_reconciles_through_upgrade_and_replay() -> None:
-    telegram = ControlledTelegramIngestionAdapter()
-    classifier = ControlledModelAdapter()
-    classifier.enable_primary_v2()
-    resolver = _whole_city_resolver()
-    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
-    administrator_id = 49_133
-    source_identity = TelegramPeerIdentity(
-        kind=TelegramPeerKind.CHANNEL,
-        telegram_id=4_900_133,
-    )
-    source_message_id = "source-chat:channel:4900133:generation:1:message:49303"
-    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
-        connection.execute(
-            """
-            DELETE FROM
-                football_runtime.application_legacy_proposition_identity_compatibility
-            WHERE source_message_id = %s
-            """,
-            (source_message_id,),
-        )
-    telegram.allow_public_username(
-        address="@synthetic_open_match_source",
-        identity=source_identity,
-        transport_boundary="channel-pts:4933",
-    )
-    system = boot_acceptance_spine(
-        admin_database_url=os.environ["TEST_DATABASE_URL"],
-        clock=clock,
-        telegram_ingestion=telegram,
-        model=classifier,
-        location_resolver=resolver,
-        telegram_admin_user_id=administrator_id,
-    )
-    system.reset()
-    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
-    system.configure_source_chat_classifier_context(
-        identity=source_identity,
-        registry_generation=1,
-        iana_timezone="Europe/Moscow",
-        country_id="country:ru",
-        city_id="city:ru:saint-petersburg",
-    )
-
-    def configure_classifier(
-        body: str,
-        candidates: list[dict[str, JsonValue]],
-    ) -> None:
-        primary_output: dict[str, JsonValue] = {
-            "schema_version": "source-message-classification-v2",
-            "disposition": "accepted",
-            "candidates": cast(JsonValue, candidates),
-            "routing": {"reason_code": "accepted", "required_context": "none"},
-        }
-        first = candidates[0]
-        first_routes = first.get("response_routes")
-        assert isinstance(first_routes, list)
-        first_route = first_routes[0]
-        assert isinstance(first_route, dict)
-        base = _minimal_classifier_result(
-            candidate_key=str(first["candidate_key"]),
-            body=body,
-            response_routes=[first_route],
-            event_time_evidence=str(
-                cast(dict[str, JsonValue], first["evidence"])["event_time"]
-            ),
-            opportunity_evidence="Need one player",
-            open_places_evidence="Need one player",
-        )
-        classifier.return_for(
-            body=body,
-            result=replace_classifier_output(base, primary_output),
-        )
-        for candidate in candidates:
-            candidate_key = candidate.get("candidate_key")
-            assert isinstance(candidate_key, str)
-            candidate_output: dict[str, JsonValue] = {
-                **primary_output,
-                "candidates": cast(JsonValue, [candidate]),
-            }
-            classifier.return_proof_for(
-                body=body,
-                candidate_key=candidate_key,
-                result=semantic_proof_result_for(
-                    output=candidate_output,
-                    body=body,
-                ),
-            )
-
-    def add_revision(
-        *,
-        body: str,
-        revision: int,
-        checkpoint: int,
-        kind: SourceEventKind,
-    ) -> str:
-        source_event_id = f"source-event:legacy-v4-compatibility:{revision}"
-        telegram.add_channel_difference_event(
-            identity=source_identity,
-            from_checkpoint=TelegramChannelCheckpoint(pts=checkpoint),
-            to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint + 1),
-            source_event_id=source_event_id,
-            telegram_message_id=49303,
-            revision=revision,
-            kind=kind,
-            body=body,
-            event_time=datetime(2026, 8, 18, 9, 6 + revision, tzinfo=UTC),
-        )
-        assert system.process_next_channel_telegram_difference(
-            identity=source_identity,
-            registry_generation=1,
-        )
-        assert system.process_next_source_event()
-        system.process_opportunities_until_idle()
-        return (
-            "source-chat:channel:4900133:generation:1:message:49303:revision:"
-            f"{revision}"
-        )
-
-    first_body = (
-        "20 August 2026 in whole city. Need one player. Contact @legacy_compat."
-    )
-    first_candidates = [
-        _v2_open_match_candidate(
-            body=first_body,
-            candidate_key="legacy-v4-original",
-            event_time_evidence="20 August 2026",
-            start_local_date="2026-08-20",
-            route_value="@legacy_compat",
-        )
-    ]
-    configure_classifier(first_body, first_candidates)
-    first_revision_id = add_revision(
-        body=first_body,
-        revision=1,
-        checkpoint=4933,
-        kind=SourceEventKind.CREATE,
-    )
-    first_opportunity = system.opportunities()[0]
-    canonical_id = first_opportunity.opportunity_id
-    assert ":proposition:" in canonical_id
-    assert first_revision_id.rsplit(":revision:", 1)[0] == source_message_id
-    legacy_id = canonical_id.replace(":proposition:", ":candidate:")
-    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
-        connection.execute(
-            """
-            UPDATE football_runtime.application_opportunities
-            SET opportunity_id = %s,
-                opportunity_revision_id = %s
-            WHERE opportunity_id = %s
-            """,
-            (legacy_id, f"{legacy_id}:revision:1", canonical_id),
-        )
-        connection.execute(
-            """
-            UPDATE football_runtime.application_proposition_identities
-            SET opportunity_id = %s
-            WHERE source_message_id = %s
-            """,
-            (legacy_id, source_message_id),
-        )
-        connection.execute(
-            """
-            INSERT INTO
-                football_runtime.application_legacy_proposition_identity_compatibility (
-                source_message_id, legacy_opportunity_id,
-                canonical_opportunity_id, created_at
-            ) VALUES (%s, %s, %s, %s)
-            """,
-            (source_message_id, legacy_id, canonical_id, clock.now()),
-        )
-
-    configure_classifier(first_body, first_candidates)
-    singleton_revision_id = add_revision(
-        body=first_body,
-        revision=2,
-        checkpoint=4934,
-        kind=SourceEventKind.EDIT,
-    )
-    singleton_publications = system.opportunity_publication_contracts(
-        singleton_revision_id
-    )
-    assert len(singleton_publications) == 1
-    singleton_payload = singleton_publications[0].payload
-    assert isinstance(singleton_payload, dict)
-    assert singleton_payload["opportunity_id"] == canonical_id
-    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
-        assert connection.execute(
-            """
-            SELECT count(*)
-            FROM football_runtime.application_legacy_proposition_identity_compatibility
-            WHERE source_message_id = %s
-              AND legacy_opportunity_id = %s
-              AND canonical_opportunity_id = %s
-            """,
-            (source_message_id, legacy_id, canonical_id),
-        ).fetchone() == (1,)
-
-    system.process_opportunities_until_idle()
-    system.restart(RuntimeRole.APPLICATION)
-    system.process_opportunities_until_idle()
-    assert len(system.opportunity_publication_contracts(singleton_revision_id)) == 1
-
-    compound_body = (
-        "20 August 2026 in whole city. Need one player. Contact @legacy_compat. "
-        "22 August 2026 in whole city. Need one player. Contact @compound_new."
-    )
-    compound_candidates = [
-        _v2_open_match_candidate(
-            body=compound_body,
-            candidate_key="legacy-v4-original",
-            event_time_evidence="20 August 2026",
-            start_local_date="2026-08-20",
-            route_value="@legacy_compat",
-        ),
-        _v2_open_match_candidate(
-            body=compound_body,
-            candidate_key="legacy-v4-new",
-            event_time_evidence="22 August 2026",
-            start_local_date="2026-08-22",
-            route_value="@compound_new",
-        ),
-    ]
-    configure_classifier(compound_body, compound_candidates)
-    compound_revision_id = add_revision(
-        body=compound_body,
-        revision=3,
-        checkpoint=4935,
-        kind=SourceEventKind.EDIT,
-    )
-    compound_opportunities = system.opportunities()
-    compound_ids = {
-        opportunity.response_route.value: opportunity.opportunity_id
-        for opportunity in compound_opportunities
-    }
-    assert compound_ids["@legacy_compat"] == canonical_id
-    assert compound_ids["@compound_new"] != canonical_id
+    assert {
+        item.response_route.value: item.opportunity_id
+        for item in compound_opportunities
+        if item.opportunity_revision_id.endswith(":revision:4")
+    } == first_ids
     compound_publications = system.opportunity_publication_contracts(
         compound_revision_id
     )
     assert len(compound_publications) == 1
-    assert compound_publications[0].contract_version == 3
-
-    reclassified_body = compound_body.replace(
-        "20 August 2026", "21 August 2026"
-    ).replace("22 August 2026", "23 August 2026")
-    reclassified_candidates = [
-        _v2_open_match_candidate(
-            body=reclassified_body,
-            candidate_key="reclassified-legacy",
-            event_time_evidence="21 August 2026",
-            start_local_date="2026-08-21",
-            route_value="@legacy_compat",
-        ),
-        _v2_open_match_candidate(
-            body=reclassified_body,
-            candidate_key="reclassified-new",
-            event_time_evidence="23 August 2026",
-            start_local_date="2026-08-23",
-            route_value="@compound_new",
-        ),
-    ]
-    configure_classifier(reclassified_body, reclassified_candidates)
-    reclassified_revision_id = add_revision(
-        body=reclassified_body,
-        revision=4,
-        checkpoint=4936,
-        kind=SourceEventKind.EDIT,
-    )
+    compound_payload = compound_publications[0].payload
+    assert isinstance(compound_payload, dict)
+    compound_items = cast(list[JsonValue], compound_payload["opportunities"])
     assert {
-        opportunity.response_route.value: opportunity.opportunity_id
-        for opportunity in system.opportunities()
-    } == compound_ids
-    assert len(system.opportunity_publication_contracts(reclassified_revision_id)) == 1
+        cast(str, item["opportunity_id"])
+        for item in compound_items
+        if isinstance(item, dict)
+    } == set(first_ids.values())
 
 
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:
