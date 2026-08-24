@@ -44,9 +44,8 @@ def _apply_untracked_repository_migrations(
     database_url: str,
     *,
     applied_count: int | None = None,
-    single_transaction: bool = False,
 ) -> None:
-    with psycopg.connect(database_url, autocommit=not single_transaction) as connection:
+    with psycopg.connect(database_url, autocommit=True) as connection:
         migration_paths = _migration_paths()
         for migration_path in migration_paths[:applied_count]:
             connection.execute(migration_path.read_text(encoding="utf-8"))
@@ -783,6 +782,125 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
                 ),
             )
 
+    migration_paths = _migration_paths()
+    with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+        for migration_path in migration_paths[17:19]:
+            connection.execute(migration_path.read_text(encoding="utf-8"))
+
+    mixed_source_message_id = "source-chat:channel:4920000:generation:1:message:2001"
+    with psycopg.connect(fresh_database_url) as connection:
+        for identity_marker in (
+            "candidate:aaaaaaaaaaaaaaaa",
+            "proposition:bbbbbbbbbbbbbbbb",
+        ):
+            opportunity_id = (
+                f"opportunity:{mixed_source_message_id}:open_match:{identity_marker}"
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (
+                    %s, %s, %s, 'open_match', 'active',
+                    '{}'::jsonb, '{}'::jsonb,
+                    '{}'::jsonb, %s
+                )
+                """,
+                (
+                    opportunity_id,
+                    f"{opportunity_id}:revision:1",
+                    f"{mixed_source_message_id}:revision:1",
+                    recorded_at,
+                ),
+            )
+
+    migration_sql = migration_paths[19].read_text(encoding="utf-8")
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute("SAVEPOINT mixed_identity_failure")
+        with pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping is ambiguous",
+        ):
+            connection.execute(migration_sql)
+        connection.execute("ROLLBACK TO SAVEPOINT mixed_identity_failure")
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_opportunities
+            WHERE source_message_revision_id = %s
+            """,
+            (f"{mixed_source_message_id}:revision:1",),
+        )
+
+        collision_source_message_id = (
+            "source-chat:channel:4920001:generation:1:message:2002"
+        )
+        legacy_opportunity_id = (
+            f"opportunity:{collision_source_message_id}:open_match:"
+            "candidate:cccccccccccccccc"
+        )
+        canonical_opportunity_id = (
+            f"opportunity:{collision_source_message_id}:open_match:"
+            "proposition:cccccccccccccccc"
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type,
+                publication_state, accepted_facts, evidence,
+                response_route, accepted_at
+            ) VALUES (
+                %s, %s, %s, 'open_match', 'active',
+                '{}'::jsonb, '{}'::jsonb,
+                '{}'::jsonb, %s
+            )
+            """,
+            (
+                legacy_opportunity_id,
+                f"{legacy_opportunity_id}:revision:1",
+                f"{collision_source_message_id}:revision:1",
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_proposition_identities (
+                source_message_id, proposition_slot, opportunity_id,
+                proposition_discriminator, created_at
+            ) VALUES (%s, 1, %s, %s, %s)
+            """,
+            (
+                collision_source_message_id,
+                canonical_opportunity_id,
+                "canonical-collision",
+                recorded_at,
+            ),
+        )
+        connection.execute("SAVEPOINT lineage_collision_failure")
+        with pytest.raises(
+            psycopg.errors.ProgrammingError,
+            match="legacy v4 proposition identity mapping collides with lineage",
+        ):
+            connection.execute(migration_sql)
+        connection.execute("ROLLBACK TO SAVEPOINT lineage_collision_failure")
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_opportunities
+            WHERE source_message_revision_id = %s
+            """,
+            (f"{collision_source_message_id}:revision:1",),
+        )
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_proposition_identities
+            WHERE source_message_id = %s
+            """,
+            (collision_source_message_id,),
+        )
+
     migrator = PostgresAcceptanceMigrator(fresh_database_url)
     migrator.migrate()
     migrator.migrate()
@@ -829,118 +947,6 @@ def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
             f"opportunity:{candidate_source}:open_match:proposition:aaaaaaaaaaaaaaaa",
         )
     ]
-
-
-def test_0020_fails_closed_for_ambiguous_and_colliding_legacy_identities(
-    fresh_database_url: str,
-) -> None:
-    _apply_untracked_repository_migrations(
-        fresh_database_url,
-        applied_count=19,
-        single_transaction=True,
-    )
-    mixed_source_message_id = "source-chat:channel:4920000:generation:1:message:2001"
-    recorded_at = datetime(2026, 8, 20, 18, 0, tzinfo=UTC)
-    with psycopg.connect(fresh_database_url) as connection:
-        for identity_marker in (
-            "candidate:aaaaaaaaaaaaaaaa",
-            "proposition:bbbbbbbbbbbbbbbb",
-        ):
-            opportunity_id = (
-                f"opportunity:{mixed_source_message_id}:open_match:{identity_marker}"
-            )
-            connection.execute(
-                """
-                INSERT INTO football_runtime.application_opportunities (
-                    opportunity_id, opportunity_revision_id,
-                    source_message_revision_id, opportunity_type,
-                    publication_state, accepted_facts, evidence,
-                    response_route, accepted_at
-                ) VALUES (
-                    %s, %s, %s, 'open_match', 'active',
-                    '{}'::jsonb, '{}'::jsonb,
-                    '{}'::jsonb, %s
-                )
-                """,
-                (
-                    opportunity_id,
-                    f"{opportunity_id}:revision:1",
-                    f"{mixed_source_message_id}:revision:1",
-                    recorded_at,
-                ),
-            )
-
-    migration_sql = _migration_paths()[19].read_text(encoding="utf-8")
-    with psycopg.connect(fresh_database_url) as connection:
-        connection.execute("SAVEPOINT mixed_identity_failure")
-        with pytest.raises(
-            psycopg.errors.ProgrammingError,
-            match="legacy v4 proposition identity mapping is ambiguous",
-        ):
-            connection.execute(migration_sql)
-        connection.execute("ROLLBACK TO SAVEPOINT mixed_identity_failure")
-        connection.execute(
-            """
-            DELETE FROM football_runtime.application_opportunities
-            WHERE source_message_revision_id = %s
-            """,
-            (f"{mixed_source_message_id}:revision:1",),
-        )
-
-    collision_source_message_id = (
-        "source-chat:channel:4920001:generation:1:message:2002"
-    )
-    legacy_opportunity_id = (
-        f"opportunity:{collision_source_message_id}:open_match:"
-        "candidate:cccccccccccccccc"
-    )
-    canonical_opportunity_id = (
-        f"opportunity:{collision_source_message_id}:open_match:"
-        "proposition:cccccccccccccccc"
-    )
-    with psycopg.connect(fresh_database_url) as connection:
-        connection.execute(
-            """
-            INSERT INTO football_runtime.application_opportunities (
-                opportunity_id, opportunity_revision_id,
-                source_message_revision_id, opportunity_type,
-                publication_state, accepted_facts, evidence,
-                response_route, accepted_at
-            ) VALUES (
-                %s, %s, %s, 'open_match', 'active',
-                '{}'::jsonb, '{}'::jsonb,
-                '{}'::jsonb, %s
-            )
-            """,
-            (
-                legacy_opportunity_id,
-                f"{legacy_opportunity_id}:revision:1",
-                f"{collision_source_message_id}:revision:1",
-                datetime(2026, 8, 20, 18, 0, tzinfo=UTC),
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO football_runtime.application_proposition_identities (
-                source_message_id, proposition_slot, opportunity_id,
-                proposition_discriminator, created_at
-            ) VALUES (%s, 1, %s, %s, %s)
-            """,
-            (
-                collision_source_message_id,
-                canonical_opportunity_id,
-                "canonical-collision",
-                datetime(2026, 8, 20, 18, 0, tzinfo=UTC),
-            ),
-        )
-
-        connection.execute("SAVEPOINT lineage_collision_failure")
-        with pytest.raises(
-            psycopg.errors.ProgrammingError,
-            match="legacy v4 proposition identity mapping collides with lineage",
-        ):
-            connection.execute(migration_sql)
-        connection.execute("ROLLBACK TO SAVEPOINT lineage_collision_failure")
 
 
 def test_0018_fails_closed_for_mixed_legacy_v4_identity_formats(
