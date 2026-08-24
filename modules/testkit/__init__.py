@@ -111,6 +111,8 @@ _CONTRACTS = {
 # Keep migration verification on the first boot for that database; dedicated
 # migration tests continue to exercise PostgresAcceptanceMigrator directly.
 _TESTKIT_MIGRATED_DATABASE_URLS: set[str] = set()
+_TESTKIT_RUNTIME_PASSWORDS: dict[str, dict[RuntimeRole, str]] = {}
+_TESTKIT_LAST_PROVISIONED_DATABASE_URL: str | None = None
 
 
 @dataclass(slots=True)
@@ -3109,8 +3111,14 @@ def boot_acceptance_spine(
     if admin_database_url not in _TESTKIT_MIGRATED_DATABASE_URLS:
         migrator.migrate()
         _TESTKIT_MIGRATED_DATABASE_URLS.add(admin_database_url)
-    passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
-    migrator.provision_runtime_credentials(passwords)
+    passwords = _TESTKIT_RUNTIME_PASSWORDS.get(admin_database_url)
+    if passwords is None:
+        passwords = {role: secrets.token_urlsafe(24) for role in RuntimeRole}
+        _TESTKIT_RUNTIME_PASSWORDS[admin_database_url] = passwords
+    global _TESTKIT_LAST_PROVISIONED_DATABASE_URL
+    if admin_database_url != _TESTKIT_LAST_PROVISIONED_DATABASE_URL:
+        migrator.provision_runtime_credentials(passwords)
+        _TESTKIT_LAST_PROVISIONED_DATABASE_URL = admin_database_url
     role_urls = {
         role: runtime_database_url(admin_database_url, role, passwords[role])
         for role in RuntimeRole
