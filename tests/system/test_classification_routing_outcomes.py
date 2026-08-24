@@ -1456,7 +1456,22 @@ def test_v1_semantic_proof_crash_replay_stops_at_three_attempts() -> None:
         (2, "failed"),
         (3, "failed"),
     ]
-    assert system.classification_queue_health().terminal_failure_count >= 1
+    attempt_streams = {
+        (attempt.pass_kind, attempt.attempt_number, attempt.status)
+        for attempt in system.classification_attempts()
+        if attempt.source_message_revision_id == revision_id
+    }
+    assert attempt_streams == {
+        ("primary", 1, "succeeded"),
+        ("primary", 2, "failed"),
+        ("primary", 3, "failed"),
+        ("semantic_proof", 1, "failed"),
+        ("semantic_proof", 2, "failed"),
+        ("semantic_proof", 3, "failed"),
+    }
+    health = system.classification_queue_health()
+    assert health.queue_depth == 0
+    assert health.terminal_failure_count == 1
     assert system.opportunities() == ()
     assert system.classification_routing_outcomes() == ()
     assert system.opportunity_publication_contracts(revision_id) == ()
@@ -1528,7 +1543,9 @@ def test_v2_semantic_proof_crash_replay_stops_at_three_attempts() -> None:
         (2, "failed"),
         (3, "failed"),
     ]
-    assert system.classification_queue_health().terminal_failure_count == 1
+    health = system.classification_queue_health()
+    assert health.queue_depth == 0
+    assert health.terminal_failure_count == 1
     assert system.opportunities() == ()
     assert system.classification_routing_outcomes() == ()
     assert system.opportunity_publication_contracts(revision_id) == ()

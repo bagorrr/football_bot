@@ -998,7 +998,7 @@ class PostgresAcceptanceObserver:
             ).fetchall()
             terminal_failures = connection.execute(
                 """
-                SELECT count(*)::integer
+                SELECT count(DISTINCT attempts.source_message_revision_id)::integer
                 FROM football_runtime.classification_attempts AS attempts
                 WHERE attempts.status = 'failed'
                   AND attempts.attempt_number = 3
