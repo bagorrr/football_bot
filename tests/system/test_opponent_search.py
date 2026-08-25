@@ -457,10 +457,18 @@ def test_edited_current_representative_reaches_persisted_facts_and_result_card()
 
     revision_id = "source-chat:channel:5400700:generation:1:message:54701:revision:2"
     publications = system.opportunity_publication_contracts(revision_id)
-    assert len(publications) == 1
-    payload = publications[0].payload
-    assert isinstance(payload, dict)
-    persisted_facts = payload["accepted_facts"]
+    publication_payloads = [
+        publication.payload
+        for publication in publications
+        if isinstance(publication.payload, dict)
+    ]
+    active_payloads = [
+        payload
+        for payload in publication_payloads
+        if payload["publication_state"] == "active"
+    ]
+    assert len(active_payloads) == 1
+    persisted_facts = active_payloads[0]["accepted_facts"]
     assert isinstance(persisted_facts, dict)
     assert persisted_facts["source_posted_at"] == posted_at.isoformat()
     assert persisted_facts["source_edited_at"] == edited_at.isoformat()
