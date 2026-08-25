@@ -9,7 +9,7 @@ import re
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from enum import IntEnum
 from hashlib import sha256
 from typing import cast
@@ -928,7 +928,7 @@ _TRANSFER_SEARCH_DETAIL_OPTIONS = {
 _TRANSFER_SEARCH_DETAIL_NAMES = {
     "en": (
         "Positions",
-        "Playing level",
+        "Player playing level",
         "Team format",
         "Seasonal timing",
         "Venue type",
@@ -946,7 +946,7 @@ _TRANSFER_SEARCH_DETAIL_NAMES = {
     ),
     "es": (
         "Posiciones",
-        "Nivel de juego",
+        "Nivel del jugador",
         "Formato del equipo",
         "Periodo de temporada",
         "Tipo de recinto",
@@ -955,7 +955,7 @@ _TRANSFER_SEARCH_DETAIL_NAMES = {
     ),
     "fr": (
         "Postes",
-        "Niveau de jeu",
+        "Niveau du joueur",
         "Format d’équipe",
         "Période de saison",
         "Type de terrain",
@@ -9831,7 +9831,10 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
-        if self.model.primary_schema_version == "source-message-classification-v2":
+        if self.model.primary_schema_version in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
             self._classify_source_message_v2(incoming)
             return
         if self.model.primary_schema_version != "source-message-classification-v1":
@@ -10434,9 +10437,18 @@ class RuntimeApplication:
         )
 
     def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
-        """Run the additive multi-candidate classifier and one-way ambiguity pass."""
+        """Run the active immutable multi-candidate classifier artifacts."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
-            raise RuntimeError("only Classification executes the v2 classifier")
+            raise RuntimeError(
+                "only Classification executes the multi-candidate classifier"
+            )
+        primary_schema_version = self.model.primary_schema_version
+        artifact_versions = _classifier_artifact_versions(primary_schema_version)
+        if artifact_versions is None:
+            raise RuntimeError("classifier adapter exposes unsupported artifacts")
+        primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
+            artifact_versions
+        )
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -10471,8 +10483,8 @@ class RuntimeApplication:
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
-            prompt_version="open-match-primary-v2",
-            schema_version="source-message-classification-v2",
+            prompt_version=primary_prompt_version,
+            schema_version=primary_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
             routing_policy_version="classifier-routing-v1",
@@ -10532,8 +10544,7 @@ class RuntimeApplication:
                 and result.effective_model == "gpt-5.6-sol"
                 and result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(result.output, body=body)
-                and result.output.get("schema_version")
-                == "source-message-classification-v2"
+                and result.output.get("schema_version") == primary_schema_version
             )
 
         prior_attempts = self.store.classification_attempts_for_revision(revision_id)
@@ -10719,7 +10730,7 @@ class RuntimeApplication:
             assert prior_proof_work is not None
             final_request = replace(
                 request,
-                prompt_version="open-match-ambiguity-v1",
+                prompt_version=ambiguity_prompt_version,
                 pass_kind="ambiguity_second_pass",
                 adjacent_context=prior_proof_work.ambiguity_adjacent_context,
             )
@@ -10787,7 +10798,7 @@ class RuntimeApplication:
             )
             second_request = replace(
                 request,
-                prompt_version="open-match-ambiguity-v1",
+                prompt_version=ambiguity_prompt_version,
                 pass_kind="ambiguity_second_pass",
                 adjacent_context=second_pass_adjacent_context,
             )
@@ -10911,8 +10922,7 @@ class RuntimeApplication:
                 and second_result.effective_model == "gpt-5.6-sol"
                 and second_result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(second_result.output, body=body)
-                and second_result.output.get("schema_version")
-                == "source-message-classification-v2"
+                and second_result.output.get("schema_version") == primary_schema_version
             )
             if second_valid:
                 final_request = second_request
@@ -10956,7 +10966,9 @@ class RuntimeApplication:
                     "status": "succeeded",
                 }
             else:
-                final_output = _safe_v2_review_output()
+                final_output = _safe_v2_review_output(
+                    schema_version=request.schema_version
+                )
 
             second_attempt = ClassificationAttempt(
                 attempt_id=(
@@ -11148,8 +11160,8 @@ class RuntimeApplication:
                         continue
                     proof_request = replace(
                         final_request,
-                        prompt_version="open-match-semantic-proof-v1",
-                        schema_version="source-semantic-proof-v1",
+                        prompt_version=semantic_proof_version[0],
+                        schema_version=semantic_proof_version[1],
                         context_bundle_version="semantic-proof-context-v1",
                         context_policy_version="semantic-proof-context-v1",
                         pass_kind="semantic_proof",
@@ -11391,7 +11403,9 @@ class RuntimeApplication:
             if not isinstance(candidates, list) or len(semantic_proofs) != len(
                 candidates
             ):
-                final_output = _safe_v2_review_output()
+                final_output = _safe_v2_review_output(
+                    schema_version=request.schema_version
+                )
                 semantic_proofs = []
                 semantic_proof_executions = []
 
@@ -11403,7 +11417,7 @@ class RuntimeApplication:
             "irrelevant",
             "unresolved",
         }:
-            final_output = _safe_v2_review_output()
+            final_output = _safe_v2_review_output(schema_version=request.schema_version)
             final_disposition = "needs_review"
         if resume_completed_ambiguity:
             assert completed_ambiguity_attempt is not None
@@ -11839,6 +11853,21 @@ class RuntimeApplication:
                 source_revision,
                 source_revision_history,
             ),
+            "source_transfer_qualifying_assertions": {
+                opportunity_type: assertion.isoformat()
+                for opportunity_type in (
+                    "roster_vacancy",
+                    "player_transfer_availability",
+                )
+                if (
+                    assertion := _source_transfer_qualifying_assertion_at(
+                        source_revision,
+                        source_revision_history,
+                        opportunity_type,
+                    )
+                )
+                is not None
+            },
         }
         if incoming.contract_version == 4:
             v4_output = authoritative_payload.get("output")
@@ -11980,6 +12009,7 @@ class RuntimeApplication:
                     accepted_candidate = _validated_open_match_proposal(
                         candidate_payload,
                         resolver=self.location_resolver,
+                        timezone_data=self.timezone_data,
                     )
                     if accepted_candidate is None:
                         self._record_classification_routing_outcome(
@@ -12147,6 +12177,7 @@ class RuntimeApplication:
         accepted = _validated_open_match_proposal(
             authoritative_payload,
             resolver=self.location_resolver,
+            timezone_data=self.timezone_data,
         )
         if accepted is None:
             self._record_classification_routing_outcome(
@@ -13092,6 +13123,74 @@ def _source_edit_qualifies_freshness(
     return normalize(previous_revision.body) != normalize(current_revision.body)
 
 
+def _transfer_assertion_signature(body: str, opportunity_type: str) -> tuple[str, ...]:
+    """Keep source meaning while ignoring punctuation and whitespace edits."""
+    # Location, position, payment, route, and localized wording can all
+    # change the standing assertion. Tokenize the complete source so each of
+    # those changes renews freshness while punctuation-only edits do not.
+    return (
+        opportunity_type,
+        *re.findall(r"[\w@]+", body.casefold(), flags=re.UNICODE),
+    )
+
+
+def _source_transfer_edit_qualifies_freshness(
+    current_revision: SourceMessageRevision,
+    previous_revision: SourceMessageRevision | None,
+    opportunity_type: str,
+) -> bool:
+    """Renew freshness only when the source assertion itself changed."""
+    if current_revision.body is None or not _body_establishes_transfer_opportunity(
+        current_revision.body, opportunity_type
+    ):
+        return False
+    if previous_revision is None or previous_revision.body is None:
+        return True
+    return _transfer_assertion_signature(
+        current_revision.body, opportunity_type
+    ) != _transfer_assertion_signature(previous_revision.body, opportunity_type)
+
+
+def _source_transfer_qualifying_assertion_at(
+    current_revision: SourceMessageRevision,
+    history: tuple[SourceMessageRevision, ...],
+    opportunity_type: str,
+) -> datetime | None:
+    """Return the last source revision that asserted this transfer direction."""
+    ordered = tuple(
+        sorted(
+            (
+                revision
+                for revision in history
+                if revision.revision <= current_revision.revision
+            ),
+            key=lambda revision: revision.revision,
+        )
+    )
+    qualifying: datetime | None = None
+    for revision in ordered:
+        previous = next(
+            (
+                candidate
+                for candidate in reversed(ordered)
+                if candidate.revision < revision.revision
+            ),
+            None,
+        )
+        if revision.event_kind is SourceEventKind.CREATE:
+            if revision.body is not None and _body_establishes_transfer_opportunity(
+                revision.body, opportunity_type
+            ):
+                qualifying = revision.event_time
+        elif revision.event_kind is SourceEventKind.EDIT and (
+            _source_transfer_edit_qualifies_freshness(
+                revision, previous, opportunity_type
+            )
+        ):
+            qualifying = revision.event_time
+    return qualifying
+
+
 def _classifier_bounded_metadata(
     metadata: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
@@ -13603,7 +13702,10 @@ def _classifier_proposal_has_pinned_provenance(
     revision_id: str,
     body: str,
 ) -> bool:
-    if payload.get("schema_version") == "source-message-classification-v2":
+    if payload.get("schema_version") in {
+        "source-message-classification-v2",
+        "source-message-classification-v3",
+    }:
         return _v2_classifier_proposal_has_pinned_provenance(
             payload,
             revision_id=revision_id,
@@ -13683,6 +13785,25 @@ def _classifier_proposal_has_pinned_provenance(
     )
 
 
+def _classifier_artifact_versions(
+    primary_schema_version: JsonValue,
+) -> tuple[str, str, tuple[str, str]] | None:
+    """Return the immutable prompt/schema identities for one primary version."""
+    if primary_schema_version == "source-message-classification-v2":
+        return (
+            "open-match-primary-v2",
+            "open-match-ambiguity-v1",
+            ("open-match-semantic-proof-v1", "source-semantic-proof-v1"),
+        )
+    if primary_schema_version == "source-message-classification-v3":
+        return (
+            "open-match-primary-v3",
+            "open-match-ambiguity-v2",
+            ("open-match-semantic-proof-v2", "source-semantic-proof-v2"),
+        )
+    return None
+
+
 def _v2_classifier_proposal_has_pinned_provenance(
     payload: dict[str, JsonValue],
     *,
@@ -13690,6 +13811,10 @@ def _v2_classifier_proposal_has_pinned_provenance(
     body: str,
 ) -> bool:
     """Validate v2 final-pass provenance and its deterministic input manifest."""
+    artifact_versions = _classifier_artifact_versions(payload.get("schema_version"))
+    if artifact_versions is None:
+        return False
+    primary_prompt_version, ambiguity_prompt_version, _ = artifact_versions
     pass_number = payload.get("pass_number")
     if pass_number not in {1, 2}:
         return False
@@ -13701,7 +13826,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
     ):
         return False
     prompt_version = (
-        "open-match-ambiguity-v1" if pass_number == 2 else "open-match-primary-v2"
+        ambiguity_prompt_version if pass_number == 2 else primary_prompt_version
     )
     pass_kind = "ambiguity_second_pass" if pass_number == 2 else "primary"
     adjacent_context = _classifier_adjacent_context(payload.get("adjacent_context", []))
@@ -13713,7 +13838,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
         "prompt_version": prompt_version,
-        "schema_version": "source-message-classification-v2",
+        "schema_version": payload["schema_version"],
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "classifier-context-v1",
         "routing_policy_version": "classifier-routing-v1",
@@ -13955,6 +14080,10 @@ def _v4_classifier_provenance_is_current(
     payload: dict[str, JsonValue], *, revision_id: str, body: str
 ) -> bool:
     """Require current ambiguity and distinct proof execution per candidate."""
+    artifact_versions = _classifier_artifact_versions(payload.get("schema_version"))
+    if artifact_versions is None:
+        return False
+    _, ambiguity_prompt_version, semantic_proof_version = artifact_versions
     output = payload.get("output")
     if (
         not isinstance(output, dict)
@@ -13987,8 +14116,8 @@ def _v4_classifier_provenance_is_current(
             payload=payload,
             revision_id=revision_id,
             body=body,
-            prompt_version="open-match-ambiguity-v1",
-            schema_version="source-message-classification-v2",
+            prompt_version=ambiguity_prompt_version,
+            schema_version=str(payload["schema_version"]),
             context_bundle_version="primary-classifier-context-v1",
             context_policy_version="classifier-context-v1",
             routing_policy_version="classifier-routing-v1",
@@ -14067,8 +14196,8 @@ def _v4_classifier_provenance_is_current(
                 payload=payload,
                 revision_id=revision_id,
                 body=body,
-                prompt_version="open-match-semantic-proof-v1",
-                schema_version="source-semantic-proof-v1",
+                prompt_version=semantic_proof_version[0],
+                schema_version=semantic_proof_version[1],
                 context_bundle_version="semantic-proof-context-v1",
                 context_policy_version="semantic-proof-context-v1",
                 routing_policy_version="classifier-routing-v1",
@@ -14437,10 +14566,12 @@ def _classification_routing_outcome(
     )
 
 
-def _safe_v2_review_output() -> dict[str, JsonValue]:
+def _safe_v2_review_output(
+    *, schema_version: str = "source-message-classification-v2"
+) -> dict[str, JsonValue]:
     """Create a strict, body-free review disposition after validation failure."""
     return {
-        "schema_version": "source-message-classification-v2",
+        "schema_version": schema_version,
         "disposition": "needs_review",
         "candidates": [],
         "routing": {"reason_code": "needs_review", "required_context": "none"},
@@ -15040,6 +15171,7 @@ def _validated_open_match_proposal(
     payload_value: JsonValue,
     *,
     resolver: LocationResolverAdapter,
+    timezone_data: TimezoneDataAdapter | None = None,
 ) -> dict[str, JsonValue] | None:
     """Accept only schema-, evidence-, domain-, route-, and location-valid facts."""
     if not isinstance(payload_value, dict):
@@ -15081,6 +15213,7 @@ def _validated_open_match_proposal(
             payload_value,
             candidate=candidate,
             resolver=resolver,
+            timezone_data=timezone_data,
         )
     is_opponent_request = opportunity_type == "opponent_request"
     required = {
@@ -15431,6 +15564,7 @@ def _validated_transfer_proposal(
     *,
     candidate: dict[str, JsonValue],
     resolver: LocationResolverAdapter,
+    timezone_data: TimezoneDataAdapter | None,
 ) -> dict[str, JsonValue] | None:
     """Normalize one evidence-backed long-term transfer proposal."""
     body = payload_value.get("body")
@@ -15561,10 +15695,25 @@ def _validated_transfer_proposal(
     timezone_name = places[0].iana_timezone
     if not isinstance(timezone_name, str) or not timezone_name:
         return None
-    timing = candidate.get("seasonal_timing")
-    if timing is not None and not _seasonal_timing_is_valid(timing):
+    if timezone_data is None:
         return None
-    boundary_body = _transfer_candidate_boundary_text(evidence, opportunity_type)
+    try:
+        resolved_timezone = timezone_data.resolve(timezone_name)
+    except TimezoneDataError:
+        return None
+    if (
+        resolved_timezone.iana_timezone != timezone_name
+        or not resolved_timezone.version
+    ):
+        return None
+    timezone_data_version = resolved_timezone.version
+    raw_timing = candidate.get("seasonal_timing")
+    if raw_timing is None:
+        timing = None
+    else:
+        timing = _normalize_classifier_transfer_timing(raw_timing)
+        if timing is None:
+            return None
     if (
         mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
@@ -15578,16 +15727,13 @@ def _validated_transfer_proposal(
             str(evidence["seasonal_timing"]) if "seasonal_timing" in evidence else None,
             authoritative_body=validation_body,
         )
-        or not _body_establishes_transfer_opportunity(boundary_body, opportunity_type)
-        or not _transfer_offer_is_single_player(validation_body, opportunity_type)
+        or not _body_establishes_transfer_opportunity(body, opportunity_type)
+        or not _transfer_offer_is_single_player(body, opportunity_type)
     ):
         return None
     source_posted_at = payload_value.get("source_posted_at")
     source_edited_at = payload_value.get("source_edited_at")
     validation_time = payload_value.get("validation_time")
-    source_edit_qualifies_freshness = payload_value.get(
-        "source_edit_qualifies_freshness"
-    )
     try:
         posted = datetime.fromisoformat(str(source_posted_at))
         latest_assertion = datetime.fromisoformat(
@@ -15598,25 +15744,42 @@ def _validated_transfer_proposal(
         validated_at = datetime.fromisoformat(str(validation_time))
     except ValueError:
         return None
-    if not isinstance(source_edit_qualifies_freshness, bool):
-        return None
-    qualifying_assertion = (
-        latest_assertion
-        if source_edit_qualifies_freshness and source_edited_at is not None
-        else posted
+    qualifying_assertions = payload_value.get("source_transfer_qualifying_assertions")
+    qualifying_text = (
+        qualifying_assertions.get(opportunity_type)
+        if isinstance(qualifying_assertions, dict)
+        else None
     )
+    if qualifying_text is not None and not isinstance(qualifying_text, str):
+        return None
+    try:
+        qualifying_assertion = (
+            datetime.fromisoformat(qualifying_text)
+            if isinstance(qualifying_text, str)
+            else (
+                latest_assertion
+                if payload_value.get("source_edit_qualifies_freshness")
+                and source_edited_at is not None
+                else posted
+            )
+        )
+    except ValueError:
+        return None
     if (
         posted.tzinfo is None
         or latest_assertion.tzinfo is None
+        or qualifying_assertion.tzinfo is None
         or validated_at.tzinfo is None
         or latest_assertion < posted
         or qualifying_assertion < posted
+        or qualifying_assertion > latest_assertion
         or validated_at >= qualifying_assertion + timedelta(days=30)
         or not isinstance(source_posted_at, str)
         or (source_edited_at is not None and not isinstance(source_edited_at, str))
         or not _transfer_seasonal_timing_is_current_or_future(
             timing,
             timezone_name=timezone_name,
+            timezone=resolved_timezone.timezone,
             validation_time=validated_at,
         )
     ):
@@ -15643,6 +15806,7 @@ def _validated_transfer_proposal(
             places[0].verified_disjoint_place_ids
         ),
         "iana_timezone": places[0].iana_timezone,
+        "timezone_data_version": timezone_data_version,
         **{
             f"city_display_{locale}": label
             for locale, label in city_display_labels.items()
@@ -15681,6 +15845,42 @@ def _validated_transfer_proposal(
     }
 
 
+def _normalize_classifier_transfer_timing(
+    value: JsonValue,
+) -> dict[str, JsonValue] | None:
+    """Canonicalize classifier timing before it crosses the persistence seam."""
+    if not isinstance(value, dict) or set(value) != {"kind", "value"}:
+        return None
+    kind = value.get("kind")
+    raw_value = value.get("value")
+    if kind == "ready_now":
+        return {"kind": kind, "value": None} if raw_value is None else None
+    if not isinstance(raw_value, str) or not raw_value:
+        return None
+    if kind == "start_local_date":
+        try:
+            parsed = date.fromisoformat(raw_value)
+        except ValueError:
+            return None
+        return {"kind": kind, "value": parsed.isoformat()}
+    if kind != "stated_season":
+        return None
+    normalized = raw_value.strip().casefold()
+    match = re.fullmatch(r"(20\d{2})\s*[-/]\s*(\d{2,4})", normalized)
+    if match is not None:
+        first = int(match.group(1))
+        second_text = match.group(2)
+        second = int(second_text)
+        if len(second_text) == 2:
+            second += (first // 100) * 100
+            if second <= first:
+                second += 100
+        normalized = f"{first:04d}-{second:04d}"
+    if not normalized or len(normalized) > 80:
+        return None
+    return {"kind": kind, "value": normalized}
+
+
 def _seasonal_timing_is_valid(value: JsonValue) -> bool:
     """Validate one classifier-proposed normalized Seasonal Timing object."""
     if not isinstance(value, dict) or set(value) != {"kind", "value"}:
@@ -15707,6 +15907,7 @@ def _transfer_seasonal_timing_is_current_or_future(
     value: JsonValue,
     *,
     timezone_name: str,
+    timezone: tzinfo | None = None,
     validation_time: datetime,
 ) -> bool:
     """Reject classifier-proposed local start dates that are already past."""
@@ -15717,7 +15918,7 @@ def _transfer_seasonal_timing_is_current_or_future(
         return False
     try:
         proposed_date = date.fromisoformat(raw_value)
-        timezone = ZoneInfo(timezone_name)
+        timezone = timezone or ZoneInfo(timezone_name)
     except (ValueError, ZoneInfoNotFoundError):
         return False
     if validation_time.tzinfo is None:
@@ -15813,12 +16014,22 @@ def _seasonal_timing_is_supported(
             and any(month in normalized for month in month_names.values())
         )
     first_year, separator, second_year = raw_value.partition("-")
-    return (
-        bool(separator)
+    if (
+        separator
         and first_year.isdigit()
         and second_year.isdigit()
         and first_year in evidence
         and second_year in evidence
+    ):
+        return True
+    return (
+        bool(separator)
+        and first_year.isdigit()
+        and second_year.isdigit()
+        and (
+            f"{first_year}/{second_year[-2:]}" in normalized
+            or f"{first_year}-{second_year[-2:]}" in normalized
+        )
     )
 
 
@@ -15832,15 +16043,19 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     )
     if opportunity_type == "roster_vacancy":
         long_term = re.search(
-            r"\b(?:roster|vacanc\w*|squad|season|seasonal|long[- ]term|"
-            r"набор\w*|нужн\w*\s+игрок\w*|сезон\w*|команд\w*|"
-            r"plantilla|temporad\w*|effectif|saison\w*)\b",
+            r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
+            r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
+            r"(?:the\s+)?(?:roster|squad)|join\s+(?:our\s+)?(?:roster|squad)|"
+            r"squad\s+(?:vacanc\w*|opening|spot)|season(?:al)?|long[- ]term|"
+            r"набор\w*|нужн\w*\s+игрок\w*|сезон\w*|команд\w*\s+ищ\w*|"
+            r"plantilla\s+(?:vacante|abierta)|temporad\w*|effectif\s+vacant|"
+            r"saison\w*)\b",
             normalized,
         )
     else:
         long_term = re.search(
             r"\b(?:transfer|available\s+for\s+(?:a\s+)?move|looking\s+for\s+"
-            r"a\s+team|seeking\s+a\s+team|long[- ]term|season|"
+            r"a\s+team|seeking\s+a\s+team|join\s+(?:a\s+)?team|long[- ]term|season|"
             r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
             r"сезон\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
             r"equip\w*|transfert|cherche\w*\s+une\s+équipe)\b",
@@ -15853,7 +16068,8 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     # Saturday's match" out of the long-term transfer publication path.
     if one_off is not None:
         explicit_long_term = re.search(
-            r"\b(?:roster|vacanc\w*|squad|season|seasonal|long[- ]term|"
+            r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
+            r"squad\s+(?:vacanc\w*|opening|spot)|season(?:al)?|long[- ]term|"
             r"transfer|transfert|переход\w*|сезон\w*|plantilla|"
             r"temporad\w*|effectif|saison\w*)\b",
             normalized,
@@ -15861,17 +16077,6 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
         if explicit_long_term is None:
             return False
     return True
-
-
-def _transfer_candidate_boundary_text(
-    evidence: dict[str, JsonValue], opportunity_type: str
-) -> str:
-    """Build the candidate-local boundary evidence for v1 proposals."""
-    return " ".join(
-        value
-        for key in ("opportunity", opportunity_type, "seasonal_timing")
-        if isinstance((value := evidence.get(key)), str)
-    )
 
 
 def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
@@ -15898,6 +16103,19 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"\b(?:один|одна)\s+\w+(?:\s+\w+){0,2}\s+и\s+(?:один|одна)\s+\w+",
         body.casefold(),
     )
+    plural_position_or_count = re.search(
+        r"\b(?:\d+|two|three|four|five|several|multiple|many|"
+        r"два|три|четыре|несколько|много|dos|tres|varios|plusieurs|deux|trois)\s+"
+        r"(?:goalkeepers?|defenders?|midfielders?|forwards?|strikers?|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"porteros?|defensas?|centrocampistas?|delanteros?|"
+        r"gardiens?|défenseurs?|milieux?|attaquants?)\b|"
+        r"\b(?:goalkeepers|defenders|midfielders|forwards|strikers|"
+        r"вратари|вратарей|защитники|защитников|полузащитники|"
+        r"полузащитников|нападающие|нападающих|porteros|defensas|"
+        r"centrocampistas|delanteros|gardiens|défenseurs|milieux|attaquants)\b",
+        body.casefold(),
+    )
     named_multiple_players = re.search(
         r"\b[A-ZА-ЯЁ][\w'’-]+\s+(?:and|&|y|et|и)\s+"
         r"[A-ZА-ЯЁ][\w'’-]+\b",
@@ -15906,6 +16124,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
     return (
         multiple_position_terms is None
         and explicit_multiple_players is None
+        and plural_position_or_count is None
         and named_multiple_players is None
         and re.search(
             r"\b(?:players|several\s+players|multiple\s+players|two\s+players|"

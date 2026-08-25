@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "source-semantic-proof-v1",
+  "$id": "source-semantic-proof-v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -8,7 +8,7 @@
     "coverage", "root", "facts", "routes", "checks", "relations"
   ],
   "properties": {
-    "contract_version": {"const": "source-semantic-proof-v1"},
+    "contract_version": {"const": "source-semantic-proof-v2"},
     "source_message_revision_reference": {"type": "string", "minLength": 1},
     "candidate_key": {"type": "string", "minLength": 1},
     "coverage": {"const": "complete_source_revision"},
@@ -64,7 +64,7 @@
       "properties": {
         "target_id": {"const": "root"},
         "domain": {"const": "football_match"},
-        "meaning": {"enum": ["open_match", "opponent_request"]},
+        "meaning": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "state": {"$ref": "#/$defs/state"},
         "span": {"$ref": "#/$defs/span"}
       }

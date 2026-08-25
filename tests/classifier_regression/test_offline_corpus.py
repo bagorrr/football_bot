@@ -270,6 +270,59 @@ def test_v2_provider_schemas_match_strict_application_evidence_contract() -> Non
             assert definition["required"] == required_fields
 
 
+def test_v3_transfer_artifacts_are_additive_and_version_bound() -> None:
+    """The transfer-capable classifier artifacts use new immutable identities."""
+    repository_root = Path(__file__).parents[2]
+    primary_provenance = json.loads(
+        (
+            repository_root / "classifier" / "open-match-primary-v3" / "provenance.json"
+        ).read_text(encoding="utf-8")
+    )
+    primary_schema = json.loads(
+        (
+            repository_root
+            / "classifier"
+            / "open-match-primary-v3"
+            / "source-message-classification-v3.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    ambiguity_schema = json.loads(
+        (
+            repository_root
+            / "classifier"
+            / "open-match-ambiguity-v2"
+            / "source-message-classification-v3.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    semantic_proof_schema = json.loads(
+        (
+            repository_root
+            / "classifier"
+            / "open-match-semantic-proof-v2"
+            / "source-semantic-proof-v2.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert primary_provenance["prompt_version"] == "open-match-primary-v3"
+    assert primary_provenance["schema_version"] == "source-message-classification-v3"
+    assert primary_schema["$id"] == "source-message-classification-v3"
+    assert ambiguity_schema["$id"] == "source-message-classification-v3"
+    assert semantic_proof_schema["$id"] == "source-semantic-proof-v2"
+    assert {
+        "roster_vacancy",
+        "player_transfer_availability",
+    }.issubset(
+        set(
+            primary_schema["$defs"]["acceptedCandidate"]["properties"][
+                "opportunity_type"
+            ]["enum"]
+        )
+    )
+    assert "long-term" in (
+        repository_root / "classifier" / "open-match-primary-v3" / "prompt.md"
+    ).read_text(encoding="utf-8")
+
+
 def test_offline_corpus_rejects_unrelated_numeric_date_cooccurrence() -> None:
     """A wrong normalized day cannot borrow another fact's numeric token."""
     assert not _event_time_is_supported(

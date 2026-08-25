@@ -137,6 +137,8 @@ def _candidate_field_sets(
 
 PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
+SEMANTIC_PROOF_V2_VERSION = "source-semantic-proof-v2"
+_SEMANTIC_PROOF_VERSIONS = {SEMANTIC_PROOF_VERSION, SEMANTIC_PROOF_V2_VERSION}
 _PROPOSITION_DOMAINS = {"football_match"}
 _PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
 _PROPOSITION_CURRENTNESS = {"current", "superseded", "withdrawn", "unknown"}
@@ -158,7 +160,10 @@ def classifier_output_is_schema_valid(
     output: dict[str, JsonValue], *, body: str
 ) -> bool:
     """Validate strict structure and exact evidence before normalization."""
-    if output.get("schema_version") == "source-message-classification-v2":
+    if output.get("schema_version") in {
+        "source-message-classification-v2",
+        "source-message-classification-v3",
+    }:
         return _classifier_output_v2_is_schema_valid(output, body=body)
     if (
         set(output) != {"schema_version", "disposition", "candidates"}
@@ -838,7 +843,7 @@ def semantic_proof_is_schema_valid(
             "checks",
             "relations",
         }
-        or value.get("contract_version") != SEMANTIC_PROOF_VERSION
+        or value.get("contract_version") not in _SEMANTIC_PROOF_VERSIONS
         or value.get("coverage") != "complete_source_revision"
         or not body
         or value.get("source_message_revision_reference")

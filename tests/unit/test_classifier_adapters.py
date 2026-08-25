@@ -507,6 +507,45 @@ def test_classifier_adapters_bind_the_exact_prompt_artifact_for_each_pass(
             )
 
 
+@pytest.mark.parametrize("adapter_kind", ("codex_cli", "responses_api"))
+def test_classifier_adapters_select_the_newest_complete_transfer_artifact_set(
+    adapter_kind: str, tmp_path: Path
+) -> None:
+    prompt_paths = {
+        "open-match-primary-v2": tmp_path / "primary-v2.prompt.md",
+        "open-match-primary-v3": tmp_path / "primary-v3.prompt.md",
+    }
+    schema_paths = {
+        "source-message-classification-v2": tmp_path / "classification-v2.json",
+        "source-message-classification-v3": tmp_path / "classification-v3.json",
+    }
+    for path in (*prompt_paths.values(), *schema_paths.values()):
+        path.write_text("{}", encoding="utf-8")
+
+    if adapter_kind == "codex_cli":
+        adapter: CodexCliClassifierAdapter | ResponsesClassifierAdapter = (
+            CodexCliClassifierAdapter(
+                codex_executable=Path("/opt/classifier/bin/codex"),
+                codex_home=tmp_path / "codex-home",
+                workspace=tmp_path / "workspace",
+                schema_paths=schema_paths,
+                prompt_paths=prompt_paths,
+                runner=PromptRecordingProcessRunner(),
+                codex_version="codex-test-version",
+                adapter_version="codex-classifier-v1",
+            )
+        )
+    else:
+        adapter = ResponsesClassifierAdapter(
+            transport=RecordingResponsesTransport(),
+            schemas={version: {} for version in schema_paths},
+            prompt_paths=prompt_paths,
+            adapter_version="responses-classifier-v1",
+        )
+
+    assert adapter.primary_schema_version == "source-message-classification-v3"
+
+
 @dataclass(slots=True)
 class TimeoutResponsesTransport:
     timeout_seconds: int | None = None

@@ -1538,8 +1538,8 @@ def _validate_classification_proposal(
             raise TypeError(
                 f"ClassificationProposal requires non-negative {field_name}"
             )
-    pinned = (
-        {
+    if envelope.contract_version < 4:
+        pinned = {
             "requested_model": "gpt-5.6-sol",
             "effective_model": "gpt-5.6-sol",
             "requested_reasoning_effort": "high",
@@ -1551,24 +1551,38 @@ def _validate_classification_proposal(
             "routing_policy_version": "classifier-routing-v1",
             "context_bundle_version": "primary-classifier-context-v1",
         }
-        if envelope.contract_version < 4
-        else {
+    else:
+        schema_version = payload.get("schema_version")
+        if not isinstance(schema_version, str):
+            raise ValueError("ClassificationProposal primary schema is invalid")
+        active_artifacts = {
+            "source-message-classification-v2": (
+                "open-match-primary-v2",
+                "open-match-ambiguity-v1",
+            ),
+            "source-message-classification-v3": (
+                "open-match-primary-v3",
+                "open-match-ambiguity-v2",
+            ),
+        }.get(schema_version)
+        if active_artifacts is None:
+            raise ValueError("ClassificationProposal primary artifact is unsupported")
+        pinned = {
             "requested_model": "gpt-5.6-sol",
             "effective_model": "gpt-5.6-sol",
             "requested_reasoning_effort": "high",
             "effective_reasoning_effort": "high",
             "prompt_version": (
-                "open-match-ambiguity-v1"
+                active_artifacts[1]
                 if payload["pass_number"] == 2
-                else "open-match-primary-v2"
+                else active_artifacts[0]
             ),
-            "schema_version": "source-message-classification-v2",
+            "schema_version": schema_version,
             "glossary_version": "football-opportunity-glossary-v1",
             "context_policy_version": "classifier-context-v1",
             "routing_policy_version": "classifier-routing-v1",
             "context_bundle_version": "primary-classifier-context-v1",
         }
-    )
     if any(payload[field_name] != value for field_name, value in pinned.items()):
         raise ValueError("ClassificationProposal provenance version is unsupported")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
@@ -1760,10 +1774,20 @@ def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
         _required_text(value, field_name)
     if value["status"] != "succeeded":
         raise ValueError("ambiguity-pass execution status is invalid")
-    if value["prompt_version"] != "open-match-ambiguity-v1":
+    if value["prompt_version"] not in {
+        "open-match-ambiguity-v1",
+        "open-match-ambiguity-v2",
+    }:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
-    if value["schema_version"] != "source-message-classification-v2":
+    if value["schema_version"] not in {
+        "source-message-classification-v2",
+        "source-message-classification-v3",
+    }:
         raise ValueError("ambiguity-pass schema provenance is invalid")
+    if (value["prompt_version"] == "open-match-ambiguity-v1") != (
+        value["schema_version"] == "source-message-classification-v2"
+    ):
+        raise ValueError("ambiguity-pass prompt and schema versions disagree")
     if value["context_bundle_version"] != "primary-classifier-context-v1":
         raise ValueError("ambiguity-pass context provenance is invalid")
     if (
@@ -1858,13 +1882,22 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         "effective_model": "gpt-5.6-sol",
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
-        "prompt_version": "open-match-semantic-proof-v1",
-        "schema_version": "source-semantic-proof-v1",
+        "prompt_version": (
+            "open-match-semantic-proof-v2"
+            if value["schema_version"] == "source-semantic-proof-v2"
+            else "open-match-semantic-proof-v1"
+        ),
+        "schema_version": value["schema_version"],
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "semantic-proof-context-v1",
         "routing_policy_version": "classifier-routing-v1",
         "context_bundle_version": "semantic-proof-context-v1",
     }
+    if value["schema_version"] not in {
+        "source-semantic-proof-v1",
+        "source-semantic-proof-v2",
+    }:
+        raise ValueError("semantic-proof schema provenance is unsupported")
     if any(value[field_name] != expected for field_name, expected in pinned.items()):
         raise ValueError("semantic-proof execution provenance is not pinned")
     if re.fullmatch(r"[0-9a-f]{64}", str(value["input_manifest_hash"])) is None:
@@ -2408,6 +2441,7 @@ def _validate_transfer_accepted_facts(
         "location_parent_ids",
         "location_verified_disjoint_place_ids",
         "iana_timezone",
+        "timezone_data_version",
         "city_display_en",
         "city_display_ru",
         "city_display_es",
@@ -2445,6 +2479,7 @@ def _validate_transfer_accepted_facts(
         "place_display_es",
         "place_display_fr",
         "iana_timezone",
+        "timezone_data_version",
     ):
         _required_text(facts, field_name)
     if _required_text(facts, "location_geographic_type") not in {

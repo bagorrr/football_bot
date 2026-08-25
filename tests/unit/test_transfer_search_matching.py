@@ -9,6 +9,7 @@ import pytest
 from modules.application import (
     _body_establishes_transfer_opportunity,
     _source_edit_qualifies_freshness,
+    _source_transfer_qualifying_assertion_at,
     _transfer_offer_is_single_player,
     _transfer_seasonal_timing_is_current_or_future,
 )
@@ -123,6 +124,13 @@ def test_seasonal_timing_requires_exact_normalized_equality() -> None:
         is MatchState.CONFLICT
     )
     assert match_seasonal_timing(("ready_now",), None) is MatchState.UNKNOWN
+    assert (
+        match_seasonal_timing(
+            ("stated_season:2026-2027",),
+            {"kind": "stated_season", "value": "2026/27"},
+        )
+        is MatchState.CONFIRMED
+    )
 
 
 def test_transfer_searches_are_directional_and_exclude_one_off_opportunities() -> None:
@@ -250,6 +258,86 @@ def test_transfer_edit_freshness_ignores_cosmetic_but_accepts_actionable_changes
     assert _source_edit_qualifies_freshness(actionable, (created, actionable)) is True
 
 
+def test_transfer_freshness_keeps_last_qualifying_assertion_across_cosmetic_edit() -> (
+    None
+):
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body="Long-term roster vacancy in Saint Petersburg.",
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+    )
+    material = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body="Long-term roster vacancy for a goalkeeper in Saint Petersburg.",
+        event_time=datetime(2026, 8, 1, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 1, 8, tzinfo=UTC),
+    )
+    cosmetic = SourceMessageRevision(
+        source_message_revision_id="source:revision:3",
+        source_message_id="source",
+        source_event_id="event:3",
+        revision=3,
+        event_kind=SourceEventKind.EDIT,
+        body=" Long-term roster vacancy for a goalkeeper in Saint Petersburg! ",
+        event_time=datetime(2026, 8, 2, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 2, 8, tzinfo=UTC),
+    )
+    assert (
+        _source_transfer_qualifying_assertion_at(
+            cosmetic,
+            (created, material, cosmetic),
+            "roster_vacancy",
+        )
+        == material.event_time
+    )
+
+
+def test_transfer_route_only_edit_renews_source_assertion() -> None:
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body=(
+            "Long-term player transfer: goalkeeper for the 2026-2027 season. "
+            "Message @old_contact"
+        ),
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+    )
+    edited = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body=(
+            "Long-term player transfer: goalkeeper for the 2026-2027 season. "
+            "Message @new_contact"
+        ),
+        event_time=datetime(2026, 8, 2, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 2, 8, tzinfo=UTC),
+    )
+    assert (
+        _source_transfer_qualifying_assertion_at(
+            edited,
+            (created, edited),
+            "player_transfer_availability",
+        )
+        == edited.event_time
+    )
+
+
 @pytest.mark.parametrize(
     ("timing", "expected"),
     (
@@ -318,6 +406,13 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
     (
         ("A player is available for a long-term transfer.", True),
         ("Two players are available for a long-term transfer.", False),
+        ("Two goalkeepers are available for a long-term transfer.", False),
+        ("2 goalkeepers are available for a long-term transfer.", False),
+        ("Goalkeepers are available for a long-term transfer.", False),
+        ("Deux gardiens sont disponibles pour un transfert durable.", False),
+        ("2 gardiens sont disponibles pour un transfert durable.", False),
+        ("Dos porteros están disponibles para un traspaso de temporada.", False),
+        ("2 porteros están disponibles para un traspaso de temporada.", False),
         ("Alex and Ben are available for a long-term transfer.", False),
         ("A goalkeeper and a defender are available for a transfer.", False),
         ("A goalkeeper and defender are available for a transfer.", False),

@@ -97,6 +97,7 @@ class CodexCliClassifierAdapter:
         codex_version: str,
         adapter_version: str,
         smoke_test: Callable[[], bool] | None = None,
+        primary_schema_version: str | None = None,
     ) -> None:
         self._codex_executable = codex_executable
         self._codex_home = codex_home
@@ -106,6 +107,17 @@ class CodexCliClassifierAdapter:
         self._runner = runner
         self._codex_version = codex_version
         self._adapter_version = adapter_version
+        self._primary_schema_version = primary_schema_version or (
+            "source-message-classification-v3"
+            if "source-message-classification-v3" in self._schema_paths
+            and "open-match-primary-v3" in self._prompt_paths
+            else "source-message-classification-v2"
+        )
+        if self._primary_schema_version not in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise ValueError("unsupported primary classifier schema version")
         self._smoke_test = smoke_test
 
     @property
@@ -114,7 +126,7 @@ class CodexCliClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
-        return "source-message-classification-v2"
+        return self._primary_schema_version
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False

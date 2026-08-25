@@ -1039,9 +1039,25 @@ def _seasonal_timing_parts(value: Any) -> tuple[str, str | None] | None:
         except ValueError:
             return None
     if kind == "stated_season":
-        normalized = raw_value.strip().casefold()
+        normalized = _normalize_stated_season(raw_value)
         return (kind, normalized) if normalized else None
     return None
+
+
+def _normalize_stated_season(value: str) -> str:
+    """Normalize equivalent named-season spellings without adjacent inference."""
+    normalized = value.strip().casefold()
+    match = re.fullmatch(r"(20\d{2})\s*[-/]\s*(\d{2,4})", normalized)
+    if match is None:
+        return normalized
+    first = int(match.group(1))
+    second_text = match.group(2)
+    second = int(second_text)
+    if len(second_text) == 2:
+        second += (first // 100) * 100
+        if second <= first:
+            second += 100
+    return f"{first:04d}-{second:04d}"
 
 
 def match_seasonal_timing(
@@ -1329,6 +1345,7 @@ def evaluate_transfer_search(
             "start_local_date": sort_local_date,
             "end_local_date": sort_local_date,
             "iana_timezone": str(facts.get("iana_timezone", "UTC")),
+            "timezone_data_version": str(facts.get("timezone_data_version", "")),
             "source_posted_at": source_posted_at_text,
             "source_qualifying_assertion_at": source_assertion_at,
             "response_route_kind": str(route["kind"]),

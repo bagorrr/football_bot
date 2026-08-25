@@ -38,11 +38,23 @@ class ResponsesClassifierAdapter:
         prompt_paths: Mapping[str, Path],
         adapter_version: str,
         smoke_test: Callable[[], bool] | None = None,
+        primary_schema_version: str | None = None,
     ) -> None:
         self._transport = transport
         self._schemas = dict(schemas)
         self._prompt_paths = dict(prompt_paths)
         self._adapter_version = adapter_version
+        self._primary_schema_version = primary_schema_version or (
+            "source-message-classification-v3"
+            if "source-message-classification-v3" in self._schemas
+            and "open-match-primary-v3" in self._prompt_paths
+            else "source-message-classification-v2"
+        )
+        if self._primary_schema_version not in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise ValueError("unsupported primary classifier schema version")
         self._smoke_test = smoke_test
 
     @property
@@ -51,7 +63,7 @@ class ResponsesClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
-        return "source-message-classification-v2"
+        return self._primary_schema_version
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False
