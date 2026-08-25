@@ -6669,29 +6669,61 @@ def _tournament_result_message(
     labels = {
         "en": {
             "title": "Tournament",
+            "matches": "Matches",
+            "needs_clarification": "Needs clarification",
             "posted": "Posted",
             "contact": "Contact",
+            "posted_joiner": "at",
+            "date_and_city": "date and city",
+            "questions": (
+                "Questions? Message me. I can explain the card "
+                "or help refine your search."
+            ),
             "additional": "Additional",
             "possible": "No exact match was found.",
         },
         "ru": {
             "title": "Турнир",
+            "matches": "Подходит",
+            "needs_clarification": "Нужно уточнить",
             "posted": "Пост",
             "contact": "Контакт",
+            "posted_joiner": "в",
+            "date_and_city": "дата и город",
+            "questions": (
+                "💬 Остались вопросы? Напишите, я объясню карточку "
+                "или помогу уточнить поиск."
+            ),
             "additional": "Дополнительно",
             "possible": "Точного совпадения не найдено.",
         },
         "es": {
             "title": "Torneo",
+            "matches": "Coincide",
+            "needs_clarification": "Falta confirmar",
             "posted": "Publicado",
             "contact": "Contacto",
+            "posted_joiner": "a las",
+            "date_and_city": "fecha y ciudad",
+            "questions": (
+                "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha "
+                "o le ayudaré a ajustar la búsqueda."
+            ),
             "additional": "Información adicional",
             "possible": "No se encontró una coincidencia exacta.",
         },
         "fr": {
             "title": "Tournoi",
+            "matches": "Correspond",
+            "needs_clarification": "À préciser",
             "posted": "Publié",
             "contact": "Contact",
+            "posted_joiner": "à",
+            "date_and_city": "date et ville",
+            "questions": (
+                "Une question ? Écrivez-moi. Je peux expliquer la fiche "
+                "ou vous aider à affiner votre recherche."
+            ),
             "additional": "Informations complémentaires",
             "possible": "Aucune correspondance exacte n’a été trouvée.",
         },
@@ -6702,11 +6734,51 @@ def _tournament_result_message(
     )
     if event_date == end_date:
         date_copy = f"{event_date.day} {months[event_date.month - 1]} {event_date.year}"
+    elif event_date.year == end_date.year and event_date.month == end_date.month:
+        date_copy = (
+            f"{event_date.day}–{end_date.day} "
+            f"{months[event_date.month - 1]} {event_date.year}"
+        )
+    elif event_date.year == end_date.year:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]}–"
+            f"{end_date.day} {months[end_date.month - 1]} {event_date.year}"
+        )
     else:
         date_copy = (
             f"{event_date.day} {months[event_date.month - 1]} {event_date.year}–"
             f"{end_date.day} {months[end_date.month - 1]} {end_date.year}"
         )
+    day_part_copy = {
+        "en": {
+            "morning": "morning",
+            "daytime": "daytime",
+            "evening": "evening",
+            "night": "night",
+        },
+        "ru": {
+            "morning": "утром",
+            "daytime": "днём",
+            "evening": "вечером",
+            "night": "ночью",
+        },
+        "es": {
+            "morning": "por la mañana",
+            "daytime": "de día",
+            "evening": "por la tarde",
+            "night": "por la noche",
+        },
+        "fr": {
+            "morning": "le matin",
+            "daytime": "l’après-midi",
+            "evening": "le soir",
+            "night": "la nuit",
+        },
+    }[copy_locale]
+    accepted_time = facts.get("exact_local_time")
+    if accepted_time is None and facts.get("day_part") is not None:
+        accepted_time = day_part_copy[facts["day_part"]]
+    when = date_copy + (f", {accepted_time}" if accepted_time is not None else "")
     where = facts[f"city_display_{copy_locale}"]
     if int(facts.get("location_specificity", "0")) > 1:
         where += f", {facts[f'place_display_{copy_locale}']}"
@@ -6782,24 +6854,128 @@ def _tournament_result_message(
             "prizes": "Prix",
         },
     }[copy_locale]
-    lines = [f"⚽ {labels['title']}", date_copy, where]
-    for key in (
-        "team_formats",
-        "playing_levels",
-        "venue_settings",
-        "playing_surfaces",
-        "payment",
-        "schedule",
-        "registration_deadline",
-        "structure",
-        "capacity",
-        "prizes",
-    ):
-        value = fact_value(key)
-        if value:
-            lines.append(f"{field_labels[key]}: {value}")
+    match_states = json.loads(facts.get("match_states", "{}"))
+    confirmed_keys = {
+        key for key, state in match_states.items() if state == "confirmed"
+    }
+    detail_names = dict(
+        zip(
+            _TOURNAMENT_SEARCH_DETAIL_OPTIONS,
+            _TOURNAMENT_SEARCH_DETAIL_NAMES[copy_locale],
+            strict=True,
+        )
+    )
+    known_values = {
+        key: value
+        for key in (
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        )
+        if (value := fact_value(key))
+    }
+    details = " · ".join(
+        known_values[key]
+        for key in _TOURNAMENT_SEARCH_DETAIL_OPTIONS
+        if key in confirmed_keys and key in known_values
+    )
+    criterion_copy = {
+        "en": {
+            "team_formats": "team format",
+            "playing_levels": "playing level",
+            "venue_settings": "venue setting",
+            "playing_surfaces": "playing surface",
+            "payment": "payment",
+            "search_area": "search area",
+        },
+        "ru": {
+            "team_formats": "формат",
+            "playing_levels": "уровень игры",
+            "venue_settings": "тип площадки",
+            "playing_surfaces": "покрытие",
+            "payment": "оплата",
+            "search_area": "район поиска",
+        },
+        "es": {
+            "team_formats": "formato",
+            "playing_levels": "nivel",
+            "venue_settings": "tipo de campo",
+            "playing_surfaces": "superficie",
+            "payment": "pago",
+            "search_area": "zona de búsqueda",
+        },
+        "fr": {
+            "team_formats": "format",
+            "playing_levels": "niveau",
+            "venue_settings": "type de terrain",
+            "playing_surfaces": "surface",
+            "payment": "paiement",
+            "search_area": "zone de recherche",
+        },
+    }[copy_locale]
+    selected_confirmed = sorted(
+        criterion_copy.get(key, key.replace("_", " "))
+        for key, state in match_states.items()
+        if state == "confirmed" and key != "search_area"
+    )
+    selected_unknown = sorted(
+        criterion_copy.get(key, key.replace("_", " "))
+        for key, state in match_states.items()
+        if state == "unknown"
+    )
+    confirmed_core = (
+        {
+            "en": "date and search area",
+            "ru": "дата и район поиска",
+            "es": "fecha y zona de búsqueda",
+            "fr": "date et zone de recherche",
+        }[copy_locale]
+        if match_states.get("search_area") == "confirmed"
+        else labels["date_and_city"]
+    )
+    match_lines = [
+        f"{labels['matches']}: "
+        + ", ".join((confirmed_core, *selected_confirmed))
+        + "."
+    ]
+    if selected_unknown:
+        match_lines.append(
+            f"{labels['needs_clarification']}: {', '.join(selected_unknown)}."
+        )
+    match_copy = "\n".join(match_lines)
+    additional_parts = [
+        f"{detail_names[key]}: {known_values[key]}"
+        for key in _TOURNAMENT_SEARCH_DETAIL_OPTIONS
+        if key not in confirmed_keys and key in known_values
+    ]
+    additional_parts.extend(
+        f"{field_labels[key]}: {known_values[key]}"
+        for key in (
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        )
+        if key in known_values
+    )
+    additional = " · ".join(additional_parts)
+    lines = [f"⚽ {labels['title']}", when, where]
+    if details:
+        lines.append(details)
+    lines.append("")
     if result.result_class == "possible_match":
-        lines.extend(("", labels["possible"]))
+        lines.extend((labels["possible"], ""))
+    lines.extend(match_copy.split("\n"))
+    if additional:
+        lines.extend(("", f"{labels['additional']}: {additional}"))
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts["iana_timezone"])
     )
@@ -6812,8 +6988,11 @@ def _tournament_result_message(
         (
             "",
             f"{labels['posted']}: {source_time.day} "
-            f"{months[source_time.month - 1]} {source_time.year} {source_time:%H:%M}",
+            f"{months[source_time.month - 1]} {source_time.year} "
+            f"{labels['posted_joiner']} {source_time:%H:%M}",
             f"{labels['contact']}: {route_copy}",
+            "",
+            labels["questions"],
         )
     )
     menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
@@ -14181,7 +14360,11 @@ def _tournament_open_participation_is_supported(
             r"\b(?:open|accepting|available|ongoing)\b|"
             r"\b(?:registration|participation)\s+is\s+open\b|"
             r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
-            r"\b(?:открыт\w*|ид[её]т|продолжается)\b",
+            r"\b(?:открыт\w*|ид[её]т|продолжается)\b|"
+            r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b"
+            r"[^.!?;\n]{0,35}\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b|"
+            r"\b(?:inscriptions?|participations?|entr[ée]e?s?)\b"
+            r"[^.!?;\n]{0,35}\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b",
             normalized,
         )
         is not None
@@ -14200,6 +14383,9 @@ def _tournament_optional_facts_are_supported(
     return all(
         isinstance(evidence.get(field_name), str)
         and str(evidence[field_name]) in authoritative_body
+        and _tournament_fact_value_is_source_bound(
+            candidate[field_name], str(evidence[field_name])
+        )
         for field_name in (
             "schedule",
             "registration_deadline",
@@ -14209,6 +14395,32 @@ def _tournament_optional_facts_are_supported(
         )
         if candidate.get(field_name) is not None
     )
+
+
+def _tournament_fact_value_is_source_bound(
+    value: JsonValue,
+    evidence: str,
+) -> bool:
+    """Require every normalized optional fact leaf to be represented in evidence."""
+    normalized_evidence = evidence.casefold()
+    if isinstance(value, str):
+        return value.casefold() in normalized_evidence
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return str(value).casefold() in normalized_evidence
+    if isinstance(value, list):
+        return bool(value) and all(
+            _tournament_fact_value_is_source_bound(item, evidence) for item in value
+        )
+    if isinstance(value, dict):
+        return bool(value) and all(
+            key.casefold() in normalized_evidence
+            and _tournament_fact_value_is_source_bound(item, evidence)
+            for key, item in value.items()
+            if isinstance(key, str) and key
+        )
+    return False
 
 
 def _tournament_registration_expiry(

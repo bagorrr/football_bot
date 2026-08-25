@@ -38,7 +38,12 @@
               "playing_levels": {"type": "string", "minLength": 1},
               "venue_settings": {"type": "string", "minLength": 1},
               "playing_surfaces": {"type": "string", "minLength": 1},
-              "payment": {"type": "string", "minLength": 1}
+              "payment": {"type": "string", "minLength": 1},
+              "schedule": {"type": "string", "minLength": 1},
+              "registration_deadline": {"type": "string", "minLength": 1},
+              "structure": {"type": "string", "minLength": 1},
+              "capacity": {"type": "string", "minLength": 1},
+              "prizes": {"type": "string", "minLength": 1}
             }
           },
           "location": {

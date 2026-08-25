@@ -1091,7 +1091,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
     def find_search_results(
         self,
         completed_search: CompletedSearch,
-        game_search_details: Mapping[str, tuple[str, ...]],
+        search_details: Mapping[str, tuple[str, ...]],
     ) -> tuple[SearchResult, ...]:
         """Deterministically match active Recommendation projections."""
         ...

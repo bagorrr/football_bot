@@ -1201,6 +1201,10 @@ def evaluate_tournament_search(
         for locale in ("en", "ru", "es", "fr"):
             card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
             card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("exact_local_time"):
+            card["exact_local_time"] = str(facts["exact_local_time"])
+        if facts.get("day_part"):
+            card["day_part"] = str(facts["day_part"])
         for key in (
             "team_formats",
             "playing_levels",

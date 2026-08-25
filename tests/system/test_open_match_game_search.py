@@ -325,13 +325,13 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "⚽ Tournament\n"
         "20 August 2026\n"
         "Saint Petersburg, Petrogradskaya\n"
-        "Team format: 7x7\n"
-        "Playing levels: Average\n"
-        "Venue type: Outdoor\n"
-        "Playing surface: Artificial turf\n"
-        "Payment: Free\n\n"
-        "Posted: 18 July 2026 12:06\n"
-        "Contact: @tournament_contact"
+        "\n"
+        "Matches: date and city.\n\n"
+        "Additional: Team format: 7x7 · Playing levels: Average · "
+        "Venue type: Outdoor · Playing surface: Artificial turf · Payment: Free\n\n"
+        "Posted: 18 July 2026 at 12:06\n"
+        "Contact: @tournament_contact\n\n"
+        "Questions? Message me. I can explain the card or help refine your search."
     )
     system.reset()
 

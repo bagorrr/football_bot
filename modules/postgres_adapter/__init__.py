@@ -4743,7 +4743,7 @@ class PostgresRoleStore:
     def find_search_results(
         self,
         completed_search: CompletedSearch,
-        game_search_details: Mapping[str, tuple[str, ...]],
+        search_details: Mapping[str, tuple[str, ...]],
     ) -> tuple[SearchResult, ...]:
         """Load accepted projections and delegate deterministic evaluation."""
         if self._role is not RuntimeRole.RECOMMENDATION:
@@ -4780,9 +4780,9 @@ class PostgresRoleStore:
         )
         if completed_search.user_intent is UserIntent.TOURNAMENT_SEARCH:
             return evaluate_tournament_search(
-                completed_search, game_search_details, projections
+                completed_search, search_details, projections
             )
-        return evaluate_game_search(completed_search, game_search_details, projections)
+        return evaluate_game_search(completed_search, search_details, projections)
 
     def set_search_snapshot_hook(self, hook: Callable[[], None]) -> None:
         """Install one controlled hook after candidate snapshot selection."""
