@@ -309,7 +309,11 @@ def transfer_search_result_sort_key(
 ) -> tuple[int, int, float, int, str]:
     """Order standing transfer results by the freshest current assertion."""
     facts = dict(result.card_facts)
-    assertion_at = facts.get("source_edited_at") or facts.get("source_posted_at")
+    assertion_at = (
+        facts.get("source_qualifying_assertion_at")
+        or facts.get("source_edited_at")
+        or facts.get("source_posted_at")
+    )
     try:
         freshness = (
             datetime.fromisoformat(str(assertion_at)).astimezone(UTC).timestamp()
@@ -1268,12 +1272,21 @@ def evaluate_transfer_search(
             source_posted_at = datetime.fromisoformat(
                 str(facts.get("source_posted_at"))
             )
+            source_qualifying_assertion_at = datetime.fromisoformat(
+                str(
+                    facts.get("source_qualifying_assertion_at")
+                    or facts.get("source_posted_at")
+                )
+            )
         except ValueError:
             continue
         if (
             source_posted_at.tzinfo is None
+            or source_qualifying_assertion_at.tzinfo is None
+            or source_qualifying_assertion_at < source_posted_at
             or completed_search.completed_at.tzinfo is None
-            or completed_search.completed_at >= source_posted_at + timedelta(days=30)
+            or completed_search.completed_at
+            >= source_qualifying_assertion_at + timedelta(days=30)
         ):
             continue
         detail_state_by_key = {
@@ -1302,7 +1315,9 @@ def evaluate_transfer_search(
         route = opportunity.response_route
         source_posted_at_text = str(facts.get("source_posted_at", ""))
         source_assertion_at = str(
-            facts.get("source_edited_at") or source_posted_at_text
+            facts.get("source_qualifying_assertion_at")
+            or facts.get("source_edited_at")
+            or source_posted_at_text
         )
         sort_local_date = source_assertion_at[:10] or "9999-12-31"
         card: dict[str, str] = {
@@ -1315,6 +1330,7 @@ def evaluate_transfer_search(
             "end_local_date": sort_local_date,
             "iana_timezone": str(facts.get("iana_timezone", "UTC")),
             "source_posted_at": source_posted_at_text,
+            "source_qualifying_assertion_at": source_assertion_at,
             "response_route_kind": str(route["kind"]),
             "response_route_value": str(route["value"]),
             "unknown_criterion_count": str(

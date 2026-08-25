@@ -8,13 +8,17 @@ import pytest
 
 from modules.application import (
     _body_establishes_transfer_opportunity,
+    _source_edit_qualifies_freshness,
     _transfer_offer_is_single_player,
+    _transfer_seasonal_timing_is_current_or_future,
 )
 from modules.classifier_contract import JsonValue, classifier_output_is_schema_valid
 from modules.domain import (
     CompletedSearch,
     MatchState,
     OpportunityRevisionProjection,
+    SourceEventKind,
+    SourceMessageRevision,
     UserIntent,
     evaluate_transfer_search,
     match_seasonal_timing,
@@ -209,6 +213,65 @@ def test_transfer_search_excludes_stale_offers_even_after_cosmetic_edit() -> Non
     assert results == ()
 
 
+def test_transfer_edit_freshness_ignores_cosmetic_but_accepts_actionable_changes() -> (
+    None
+):
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body="Long-term roster vacancy in Saint Petersburg.",
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+    )
+    cosmetic = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body=" Long-term roster vacancy in Saint Petersburg! ",
+        event_time=datetime(2026, 8, 17, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 17, 8, tzinfo=UTC),
+    )
+    actionable = SourceMessageRevision(
+        source_message_revision_id="source:revision:3",
+        source_message_id="source",
+        source_event_id="event:3",
+        revision=3,
+        event_kind=SourceEventKind.EDIT,
+        body="Long-term roster vacancy for a goalkeeper in Saint Petersburg.",
+        event_time=datetime(2026, 8, 17, 9, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 17, 9, tzinfo=UTC),
+    )
+    assert _source_edit_qualifies_freshness(cosmetic, (created, cosmetic)) is False
+    assert _source_edit_qualifies_freshness(actionable, (created, actionable)) is True
+
+
+@pytest.mark.parametrize(
+    ("timing", "expected"),
+    (
+        ({"kind": "start_local_date", "value": "2026-08-25"}, False),
+        ({"kind": "start_local_date", "value": "2026-08-26"}, True),
+        ({"kind": "stated_season", "value": "2026-2027"}, True),
+        (None, True),
+    ),
+)
+def test_transfer_source_start_date_is_current_or_future_in_place_timezone(
+    timing: dict[str, str | None] | None, expected: bool
+) -> None:
+    assert (
+        _transfer_seasonal_timing_is_current_or_future(
+            cast(JsonValue, timing),
+            timezone_name="Europe/Moscow",
+            validation_time=datetime(2026, 8, 26, 0, tzinfo=UTC),
+        )
+        is expected
+    )
+
+
 @pytest.mark.parametrize(
     ("body", "opportunity_type", "expected"),
     (
@@ -233,6 +296,11 @@ def test_transfer_search_excludes_stale_offers_even_after_cosmetic_edit() -> Non
             False,
         ),
         (
+            "Looking for players in Saint Petersburg.",
+            "roster_vacancy",
+            False,
+        ),
+        (
             "Joueur disponible à Saint-Pétersbourg.",
             "player_transfer_availability",
             False,
@@ -252,6 +320,7 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
         ("Two players are available for a long-term transfer.", False),
         ("Alex and Ben are available for a long-term transfer.", False),
         ("A goalkeeper and a defender are available for a transfer.", False),
+        ("A goalkeeper and defender are available for a transfer.", False),
         ("Dos jugadores están disponibles para un traspaso de temporada.", False),
         ("Deux joueurs sont disponibles pour un transfert durable.", False),
     ),

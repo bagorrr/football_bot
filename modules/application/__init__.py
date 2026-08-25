@@ -73,6 +73,7 @@ from modules.domain import (
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceEventKind,
+    SourceMessageRevision,
     TelegramDeliveryMode,
     TelegramDifferenceFailure,
     TelegramMessage,
@@ -11834,6 +11835,10 @@ class RuntimeApplication:
             ),
             "eligible_reply_context": authoritative_reply_context,
             "validation_time": self.clock.now().isoformat(),
+            "source_edit_qualifies_freshness": _source_edit_qualifies_freshness(
+                source_revision,
+                source_revision_history,
+            ),
         }
         if incoming.contract_version == 4:
             v4_output = authoritative_payload.get("output")
@@ -13056,6 +13061,35 @@ def _opaque_classifier_reference(value: str, *, kind: str) -> str:
     """Map an authoritative identity to a stable provider-opaque reference."""
     opaque_id = uuid5(NAMESPACE_URL, f"football-bot:classifier:{kind}:{value}")
     return f"classifier-{kind}:{opaque_id}"
+
+
+def _source_edit_qualifies_freshness(
+    current_revision: SourceMessageRevision,
+    history: tuple[SourceMessageRevision, ...],
+) -> bool:
+    """Identify edits that renew a standing offer's source assertion clock."""
+    if current_revision.event_kind is SourceEventKind.CREATE:
+        return True
+    if current_revision.event_kind is not SourceEventKind.EDIT:
+        return False
+    previous_revision = max(
+        (
+            revision
+            for revision in history
+            if revision.revision < current_revision.revision
+        ),
+        key=lambda revision: revision.revision,
+        default=None,
+    )
+    if previous_revision is None or previous_revision.body is None:
+        return True
+    if current_revision.body is None:
+        return False
+
+    def normalize(body: str) -> str:
+        return re.sub(r"[\W_]+", "", body.casefold(), flags=re.UNICODE)
+
+    return normalize(previous_revision.body) != normalize(current_revision.body)
 
 
 def _classifier_bounded_metadata(
@@ -15524,14 +15558,13 @@ def _validated_transfer_proposal(
     )
     if len(places) != 1:
         return None
+    timezone_name = places[0].iana_timezone
+    if not isinstance(timezone_name, str) or not timezone_name:
+        return None
     timing = candidate.get("seasonal_timing")
     if timing is not None and not _seasonal_timing_is_valid(timing):
         return None
-    boundary_body = (
-        validation_body
-        if isinstance(source_context, str)
-        else _transfer_candidate_boundary_text(evidence, opportunity_type)
-    )
+    boundary_body = _transfer_candidate_boundary_text(evidence, opportunity_type)
     if (
         mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
@@ -15552,6 +15585,9 @@ def _validated_transfer_proposal(
     source_posted_at = payload_value.get("source_posted_at")
     source_edited_at = payload_value.get("source_edited_at")
     validation_time = payload_value.get("validation_time")
+    source_edit_qualifies_freshness = payload_value.get(
+        "source_edit_qualifies_freshness"
+    )
     try:
         posted = datetime.fromisoformat(str(source_posted_at))
         latest_assertion = datetime.fromisoformat(
@@ -15562,14 +15598,27 @@ def _validated_transfer_proposal(
         validated_at = datetime.fromisoformat(str(validation_time))
     except ValueError:
         return None
+    if not isinstance(source_edit_qualifies_freshness, bool):
+        return None
+    qualifying_assertion = (
+        latest_assertion
+        if source_edit_qualifies_freshness and source_edited_at is not None
+        else posted
+    )
     if (
         posted.tzinfo is None
         or latest_assertion.tzinfo is None
         or validated_at.tzinfo is None
         or latest_assertion < posted
-        or validated_at >= posted + timedelta(days=30)
+        or qualifying_assertion < posted
+        or validated_at >= qualifying_assertion + timedelta(days=30)
         or not isinstance(source_posted_at, str)
         or (source_edited_at is not None and not isinstance(source_edited_at, str))
+        or not _transfer_seasonal_timing_is_current_or_future(
+            timing,
+            timezone_name=timezone_name,
+            validation_time=validated_at,
+        )
     ):
         return None
     team_formats = candidate.get("team_formats")
@@ -15614,6 +15663,7 @@ def _validated_transfer_proposal(
         "payment_currency": payment_details[1] if payment_details is not None else None,
         "source_posted_at": source_posted_at,
         "source_edited_at": source_edited_at,
+        "source_qualifying_assertion_at": qualifying_assertion.isoformat(),
     }
     return {
         "opportunity_id": (
@@ -15651,6 +15701,28 @@ def _seasonal_timing_is_valid(value: JsonValue) -> bool:
         and len(raw_value) <= 80
         and raw_value == raw_value.casefold()
     )
+
+
+def _transfer_seasonal_timing_is_current_or_future(
+    value: JsonValue,
+    *,
+    timezone_name: str,
+    validation_time: datetime,
+) -> bool:
+    """Reject classifier-proposed local start dates that are already past."""
+    if not isinstance(value, dict) or value.get("kind") != "start_local_date":
+        return True
+    raw_value = value.get("value")
+    if not isinstance(raw_value, str):
+        return False
+    try:
+        proposed_date = date.fromisoformat(raw_value)
+        timezone = ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError):
+        return False
+    if validation_time.tzinfo is None:
+        return False
+    return proposed_date >= validation_time.astimezone(timezone).date()
 
 
 def _seasonal_timing_is_supported(
@@ -15761,7 +15833,6 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     if opportunity_type == "roster_vacancy":
         long_term = re.search(
             r"\b(?:roster|vacanc\w*|squad|season|seasonal|long[- ]term|"
-            r"looking\s+for\s+players|"
             r"набор\w*|нужн\w*\s+игрок\w*|сезон\w*|команд\w*|"
             r"plantilla|temporad\w*|effectif|saison\w*)\b",
             normalized,
@@ -15807,6 +15878,18 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
     """Reject plural Player Transfer Availability offers as one Player."""
     if opportunity_type != "player_transfer_availability":
         return True
+    multiple_position_terms = re.search(
+        r"\b(?:goalkeeper|defender|midfielder|forward|striker|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
+        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b"
+        r"\s+(?:and|&|y|et|и)\s+"
+        r"\b(?:goalkeeper|defender|midfielder|forward|striker|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
+        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b",
+        body.casefold(),
+    )
     explicit_multiple_players = re.search(
         r"\b(?:a|an|one)\s+\w+(?:\s+\w+){0,2}\s+and\s+"
         r"(?:a|an|one)\s+\w+|"
@@ -15821,7 +15904,8 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         body,
     )
     return (
-        explicit_multiple_players is None
+        multiple_position_terms is None
+        and explicit_multiple_players is None
         and named_multiple_players is None
         and re.search(
             r"\b(?:players|several\s+players|multiple\s+players|two\s+players|"

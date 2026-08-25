@@ -207,6 +207,7 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         country_id="country:ru",
         city_id="city:ru:saint-petersburg",
     )
+    created_at = datetime(2026, 8, 18, 9, 5, tzinfo=UTC)
     telegram_ingestion.add_channel_difference_event(
         identity=source_identity,
         from_checkpoint=TelegramChannelCheckpoint(pts=5500),
@@ -216,7 +217,7 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         revision=1,
         kind=SourceEventKind.CREATE,
         body=body,
-        event_time=datetime(2026, 8, 18, 9, 5, tzinfo=UTC),
+        event_time=created_at,
     )
     assert system.process_next_channel_telegram_difference(
         identity=source_identity,
@@ -241,6 +242,7 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         "kind": "stated_season",
         "value": "2026-2027",
     }
+    assert accepted_facts["source_qualifying_assertion_at"] == created_at.isoformat()
 
     system.start_bot_user(
         update_id=f"start:{direction}",

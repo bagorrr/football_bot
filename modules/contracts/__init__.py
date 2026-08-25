@@ -2427,6 +2427,7 @@ def _validate_transfer_accepted_facts(
         "payment_currency",
         "source_posted_at",
         "source_edited_at",
+        "source_qualifying_assertion_at",
         opportunity_type,
     }
     if set(facts) != required:
@@ -2503,12 +2504,25 @@ def _validate_transfer_accepted_facts(
         )
     ):
         raise ValueError("transfer payment details are invalid")
-    _required_iso_datetime(facts, "source_posted_at")
+    source_posted_at = _required_iso_datetime(facts, "source_posted_at")
+    source_qualifying_assertion_at = _required_iso_datetime(
+        facts, "source_qualifying_assertion_at"
+    )
+    posted = datetime.fromisoformat(source_posted_at)
+    qualifying = datetime.fromisoformat(source_qualifying_assertion_at)
+    if qualifying < posted:
+        raise ValueError("transfer qualifying assertion predates publication")
     source_edited_at = facts["source_edited_at"]
     if source_edited_at is not None:
         if not isinstance(source_edited_at, str):
             raise TypeError("transfer source_edited_at must be text or null")
-        _required_iso_datetime(facts, "source_edited_at")
+        edited = datetime.fromisoformat(
+            _required_iso_datetime(facts, "source_edited_at")
+        )
+        if qualifying > edited:
+            raise ValueError("transfer qualifying assertion is after edit")
+    elif qualifying != posted:
+        raise ValueError("transfer qualifying assertion requires an edit")
 
 
 def _validate_transfer_seasonal_timing_fact(value: JsonValue) -> None:
