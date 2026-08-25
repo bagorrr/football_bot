@@ -9,8 +9,11 @@ interpretations of the same proposition are alternatives on one `unresolved`
 candidate. Every evidence value must be an exact substring of the Source
 Message; include a `source_context` exact contiguous substring for each
 accepted candidate so independent propositions remain separately bounded.
-Classify either an `open_match` opportunity or a `player_match_availability`
-opportunity. For Player availability, extract an
+Accepted publication candidates are limited to either an `open_match`
+opportunity or a `player_match_availability` opportunity. For unresolved
+classifications, preserve the independently observed opportunity taxonomy
+from the source, even when it is not an accepted publication type. For Player
+availability, extract an
 exact `available_player_count`, a bounded
 `available_player_count_min`/`available_player_count_max`, or no count fields
 when the source is uncertain. Do not emit `open_places` for Player

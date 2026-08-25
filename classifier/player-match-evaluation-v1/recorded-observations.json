@@ -495,7 +495,7 @@
         "candidates": [
           {
             "candidate_key": "sm-010-recorded-ambiguity",
-            "opportunity_type": "open_match",
+            "opportunity_type": "opponent_request",
             "evidence": {
               "request": "Ищем соперника",
               "format": "8х8"
@@ -1326,7 +1326,7 @@
         "candidates": [
           {
             "candidate_key": "sm-026-recorded-ambiguity",
-            "opportunity_type": "open_match",
+            "opportunity_type": "referee_request",
             "evidence": {
               "request": "Нужен судья",
               "schedule": "воскресенье"

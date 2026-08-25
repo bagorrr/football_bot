@@ -100,6 +100,18 @@ _SEMANTIC_PROOF_STATES = {
 }
 _SEMANTIC_CHECK_STATES = {"none", "present", "ambiguous", "unknown"}
 _SEMANTIC_CHECKS = ("contradiction", "competition", "replacement", "closure")
+_UNRESOLVED_OPPORTUNITY_TYPES = {
+    "open_match",
+    "player_match_availability",
+    "tournament",
+    "opponent_request",
+    "roster_vacancy",
+    "player_transfer_availability",
+    "coach_availability",
+    "coach_request",
+    "referee_availability",
+    "referee_request",
+}
 
 
 def classifier_output_is_schema_valid(
@@ -331,7 +343,7 @@ def _classifier_output_v2_is_schema_valid(
         if (
             candidate.get("opportunity_type")
             not in (
-                {"open_match", "opponent_request", "player_match_availability"}
+                _UNRESOLVED_OPPORTUNITY_TYPES
                 if allow_player_match_availability
                 else {"open_match", "opponent_request"}
             )

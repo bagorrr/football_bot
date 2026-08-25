@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import cast
@@ -32,6 +34,7 @@ from modules.classifier_promotion import (
     PLAYER_REQUIRED_FAILURE_MODES,
     PLAYER_REVIEWED_CORPUS_CASE_COUNT,
     ControlledPlayerClassifierRecordingAdapter,
+    PlayerClassifierRelease,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
@@ -382,6 +385,12 @@ def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() 
     assert not player_classifier_promotion_is_approved(
         {**approval, "release_fingerprint": "0" * 64}
     )
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "release_name": "wrong-player-release"}
+    )
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "contract_version": "wrong-player-contract-version"}
+    )
 
 
 def test_player_promotion_rejects_fake_digest_and_exact_version_mismatch() -> None:
@@ -431,6 +440,123 @@ def test_player_recording_adapter_is_independent_and_replays_all_failure_modes()
     )
     assert evidence["failure_mode_case_count"] == len(PLAYER_REQUIRED_FAILURE_MODES)
     assert evidence["failed_case_ids"] == []
+
+
+def _release_with_record_mutation(
+    release: PlayerClassifierRelease,
+    *,
+    case_id: str,
+    mutate: Callable[[dict[str, JsonValue]], None],
+) -> PlayerClassifierRelease:
+    records = deepcopy(list(release.recorded_observation_cases))
+    record = next(record for record in records if record["case_id"] == case_id)
+    mutate(record)
+    return replace(release, recorded_observation_cases=tuple(records))
+
+
+def _recorded_candidate(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    output = cast(dict[str, JsonValue], record["observed_output"])
+    candidates = cast(list[JsonValue], output["candidates"])
+    return cast(dict[str, JsonValue], candidates[0])
+
+
+def _recorded_facts(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    return cast(dict[str, JsonValue], record["observed_facts"])
+
+
+def _expected_facts(case: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    expected = cast(dict[str, JsonValue], case["expected"])
+    return cast(dict[str, JsonValue], expected["facts"])
+
+
+def test_player_promotion_validates_candidate_type_and_every_recorded_fact() -> None:
+    release = describe_player_classifier_release()
+    expected_types = {"sm-010": "opponent_request", "sm-026": "referee_request"}
+
+    for case_id, expected_type in expected_types.items():
+        expected = next(
+            case for case in release.reviewed_corpus_cases if case["case_id"] == case_id
+        )
+        record = next(
+            record
+            for record in release.recorded_observation_cases
+            if record["case_id"] == case_id
+        )
+        candidate = _recorded_candidate(record)
+        facts = _recorded_facts(record)
+        expected_facts = _expected_facts(expected)
+        assert candidate["opportunity_type"] == expected_type
+        assert facts["opportunity_types"] == [expected_type]
+        assert facts["source_evidence"] == expected_facts["source_evidence"]
+        assert facts["normalized"] == expected_facts["normalized"]
+
+    def change_type(record: dict[str, JsonValue]) -> None:
+        _recorded_candidate(record)["opportunity_type"] = "open_match"
+
+    def change_normalized_facts(record: dict[str, JsonValue]) -> None:
+        normalized = cast(dict[str, JsonValue], _recorded_facts(record)["normalized"])
+        normalized["weekday"] = "monday"
+
+    def change_candidate_evidence(record: dict[str, JsonValue]) -> None:
+        evidence = cast(dict[str, JsonValue], _recorded_candidate(record)["evidence"])
+        evidence["request"] = "Ищем соперника для"
+
+    type_mismatch = _release_with_record_mutation(
+        release,
+        case_id="sm-010",
+        mutate=change_type,
+    )
+    type_gate = run_player_classifier_promotion_gate(type_mismatch)
+    assert "sm-010:candidate-opportunity-type" in type_gate.failed_case_ids
+
+    fact_mismatch = _release_with_record_mutation(
+        release,
+        case_id="sm-026",
+        mutate=change_normalized_facts,
+    )
+    fact_gate = run_player_classifier_promotion_gate(fact_mismatch)
+    assert "sm-026:annotation" in fact_gate.failed_case_ids
+
+    evidence_mismatch = _release_with_record_mutation(
+        release,
+        case_id="sm-010",
+        mutate=change_candidate_evidence,
+    )
+    evidence_gate = run_player_classifier_promotion_gate(evidence_mismatch)
+    assert "sm-010:candidate-evidence" in evidence_gate.failed_case_ids
+
+    def remove_normalized_facts(record: dict[str, JsonValue]) -> None:
+        _recorded_facts(record).pop("normalized")
+
+    malformed_facts = _release_with_record_mutation(
+        release,
+        case_id="sm-026",
+        mutate=remove_normalized_facts,
+    )
+    malformed_gate = run_player_classifier_promotion_gate(malformed_facts)
+    assert "sm-026:malformed" in malformed_gate.failed_case_ids
+
+
+def test_player_promotion_executes_each_failure_mode_with_distinct_evidence() -> None:
+    release = describe_player_classifier_release()
+    gate = run_player_classifier_promotion_gate(release)
+
+    observations = gate.failure_mode_observations
+    assert {observation["failure_mode"] for observation in observations} == set(
+        PLAYER_REQUIRED_FAILURE_MODES
+    )
+    assert len({observation["injection_path"] for observation in observations}) == len(
+        PLAYER_REQUIRED_FAILURE_MODES
+    )
+    assert len(
+        {observation["observed_outcome"] for observation in observations}
+    ) == len(PLAYER_REQUIRED_FAILURE_MODES)
+    assert all(
+        observation["fail_closed"] is True
+        and observation["publication_state"] == "suppressed"
+        and observation["publication_effects"] == 0
+        for observation in observations
+    )
 
 
 def test_player_promotion_rejects_cross_file_annotation_mismatch(

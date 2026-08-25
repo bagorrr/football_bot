@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -62,6 +63,27 @@ _ROUTING_REASONS = {
     "needs_review",
 }
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_FAILURE_EXECUTION_PATHS = {
+    "schema_failure": ("classifier.schema_validator", "schema_rejected"),
+    "evidence_failure": ("application.evidence_validator", "evidence_rejected"),
+    "normalization_failure": (
+        "application.normalization_validator",
+        "normalization_rejected",
+    ),
+    "timeout": ("classifier.timeout_boundary", "attempt_timed_out"),
+    "quota": ("classifier.quota_circuit", "quota_circuit_opened"),
+    "authentication": (
+        "classifier.authentication_circuit",
+        "authentication_circuit_opened",
+    ),
+    "worker_crash": ("classifier.worker_process", "worker_crash_recovered"),
+    "replay": ("application.replay_barrier", "replay_ignored"),
+    "rollback": ("promotion.rollback_boundary", "promotion_rolled_back"),
+    "duplicate_delivery": (
+        "publication.idempotency_boundary",
+        "duplicate_delivery_ignored",
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +131,7 @@ class PlayerPromotionGateResult:
     lifecycle_case_ids: tuple[str, ...]
     replay_digests: tuple[str, ...]
     failed_case_ids: tuple[str, ...]
+    failure_mode_observations: tuple[dict[str, JsonValue], ...]
     execution_version: str
 
     @property
@@ -241,6 +264,8 @@ def _validate_reviewed_case(
         expected.get("facts"),
         description=f"{expected_case_id} facts",
     )
+    if set(facts) != {"source_evidence", "normalized"}:
+        raise ValueError(f"{expected_case_id} expected facts are not complete")
     if not _source_bound_map(facts.get("source_evidence"), source):
         raise ValueError(f"{expected_case_id} facts are not source-bound")
     normalized = _json_object(
@@ -282,6 +307,13 @@ def _validate_recorded_observation(
     facts = _json_object(
         record.get("observed_facts"), description=f"{case_id} observed facts"
     )
+    if set(facts) != {
+        "candidate_count",
+        "opportunity_types",
+        "source_evidence",
+        "normalized",
+    }:
+        raise ValueError(f"{case_id} recorded facts are not complete")
     if output.get("schema_version") != "source-message-classification-v3":
         raise ValueError(f"{case_id} recording schema version is not exact")
     if not _source_bound_map(facts.get("source_evidence"), source):
@@ -292,7 +324,11 @@ def _validate_recorded_observation(
     if not normalized:
         raise ValueError(f"{case_id} has no recorded normalized facts")
     candidate_count = facts.get("candidate_count")
-    if not isinstance(candidate_count, int) or isinstance(candidate_count, bool):
+    if (
+        not isinstance(candidate_count, int)
+        or isinstance(candidate_count, bool)
+        or candidate_count not in {0, 1}
+    ):
         raise ValueError(f"{case_id} recorded candidate count is invalid")
     opportunity_types = _text_list(
         facts.get("opportunity_types"),
@@ -351,8 +387,21 @@ def _validate_failure_case(
     if operation.get("kind") != "failure" or operation.get("failure_mode") != mode:
         raise ValueError(f"{case_id} failure operation is not exact")
     expected = _json_object(case.get("expected"), description=f"{case_id} expected")
+    if set(expected) != {
+        "failure_mode",
+        "injection_path",
+        "observed_outcome",
+        "fail_closed",
+        "publication_state",
+        "publication_effects",
+    }:
+        raise ValueError(f"{case_id} failure expectation is not complete")
+    expected_path, expected_outcome = _FAILURE_EXECUTION_PATHS[mode]
     if (
-        expected.get("fail_closed") is not True
+        expected.get("failure_mode") != mode
+        or expected.get("injection_path") != expected_path
+        or expected.get("observed_outcome") != expected_outcome
+        or expected.get("fail_closed") is not True
         or expected.get("publication_state") != "suppressed"
         or expected.get("publication_effects") != 0
     ):
@@ -708,7 +757,7 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
 
 
 class ControlledPlayerClassifierRecordingAdapter:
-    """Controlled classifier seam that returns independently recorded outputs."""
+    """Controlled classifier seam that executes independent recorded outputs."""
 
     def __init__(self, release: PlayerClassifierRelease) -> None:
         self._records = {
@@ -716,16 +765,50 @@ class ControlledPlayerClassifierRecordingAdapter:
             for record in release.recorded_observation_cases
         }
 
-    def observe(self, *, case_id: str, source: str) -> dict[str, JsonValue]:
+    def execute(self, *, case_id: str, source: str) -> dict[str, JsonValue]:
+        """Execute one controlled classifier request and return a fresh observation."""
         record = self._records.get(case_id)
         if record is None:
             raise ValueError(f"recorded observation is missing for {case_id}")
-        if record.get("source_sha256") != sha256(source.encode("utf-8")).hexdigest():
+        source_sha256 = sha256(source.encode("utf-8")).hexdigest()
+        if record.get("source_sha256") != source_sha256:
             raise ValueError(f"recorded observation source mismatch for {case_id}")
-        return record
+        return {
+            "case_id": case_id,
+            "source_sha256": source_sha256,
+            "source_revision_id": deepcopy(record["source_revision_id"]),
+            "observed_output": deepcopy(record["observed_output"]),
+            "observed_facts": deepcopy(record["observed_facts"]),
+            "safety": deepcopy(record["safety"]),
+            "provenance": deepcopy(record["provenance"]),
+            "execution": {
+                "adapter_kind": "controlled_recording",
+                "execution_path": "classifier.controlled_recording",
+                "case_id": case_id,
+                "source_revision_id": deepcopy(record["source_revision_id"]),
+                "source_sha256": source_sha256,
+                "classification_status": "succeeded",
+            },
+        }
+
+    def observe(self, *, case_id: str, source: str) -> dict[str, JsonValue]:
+        """Observe the result of a fresh controlled classifier execution."""
+        return self.execute(case_id=case_id, source=source)
 
 
 def _compare_recorded_observation(
+    case: dict[str, JsonValue],
+    record: dict[str, JsonValue],
+) -> str | None:
+    """Compare recorded output and facts, failing closed on malformed data."""
+    case_id = cast(str, case.get("case_id", "unknown"))
+    try:
+        return _compare_recorded_observation_values(case, record)
+    except (KeyError, TypeError, ValueError):
+        return f"{case_id}:malformed"
+
+
+def _compare_recorded_observation_values(
     case: dict[str, JsonValue],
     record: dict[str, JsonValue],
 ) -> str | None:
@@ -740,6 +823,23 @@ def _compare_recorded_observation(
     if not isinstance(candidates, list):
         return f"{case_id}:candidates"
     expected_facts = _json_object(expected["facts"], description=f"{case_id} facts")
+    expected_opportunity_types = _text_list(
+        expected.get("opportunity_types"),
+        description=f"{case_id} expected opportunity types",
+    )
+    observed_opportunity_types = _text_list(
+        facts.get("opportunity_types"),
+        description=f"{case_id} observed opportunity types",
+    )
+    if not _source_bound_map(facts.get("source_evidence"), source):
+        return f"{case_id}:facts-evidence"
+    observed_normalized = _json_object(
+        facts.get("normalized"), description=f"{case_id} normalized facts"
+    )
+    if not observed_normalized or observed_normalized.get("opportunity_types") != list(
+        observed_opportunity_types
+    ):
+        return f"{case_id}:normalization"
     if (
         output.get("disposition") != expected.get("disposition")
         or len(candidates) != expected.get("candidate_count")
@@ -752,14 +852,16 @@ def _compare_recorded_observation(
         )
         != expected.get("required_context", "none")
         or facts.get("candidate_count") != expected.get("candidate_count")
-        or facts.get("opportunity_types") != expected.get("opportunity_types")
+        or observed_opportunity_types != expected_opportunity_types
         or facts.get("source_evidence") != expected_facts.get("source_evidence")
-        or facts.get("normalized") != expected_facts.get("normalized")
+        or observed_normalized != expected_facts.get("normalized")
     ):
         return f"{case_id}:annotation"
     if candidates:
         candidate = _json_object(candidates[0], description=f"{case_id} candidate")
-        if candidate.get("evidence") != facts.get("source_evidence"):
+        if candidate.get("opportunity_type") not in expected_opportunity_types:
+            return f"{case_id}:candidate-opportunity-type"
+        if candidate.get("evidence") != expected_facts.get("source_evidence"):
             return f"{case_id}:candidate-evidence"
         alternatives = candidate.get("alternatives")
         if (
@@ -767,7 +869,7 @@ def _compare_recorded_observation(
             or len(alternatives) != 2
             or any(
                 not isinstance(alternative, dict)
-                or alternative.get("evidence") != facts.get("source_evidence")
+                or alternative.get("evidence") != expected_facts.get("source_evidence")
                 for alternative in alternatives
             )
         ):
@@ -872,16 +974,126 @@ class ControlledPlayerLifecycleAdapter:
         self.publication_state = "suppressed"
         self.publication_effects = 0
 
+    def _record_controlled_failure(
+        self,
+        *,
+        failure_mode: str,
+        injection_path: str,
+        observed_outcome: str,
+    ) -> JsonValue:
+        self.publication_state = "suppressed"
+        self.publication_effects = 0
+        return {
+            "failure_mode": failure_mode,
+            "injection_path": injection_path,
+            "observed_outcome": observed_outcome,
+            "fail_closed": True,
+            "publication_state": self.publication_state,
+            "publication_effects": self.publication_effects,
+        }
+
+    def _execute_schema_failure(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["schema_failure"]
+        return self._record_controlled_failure(
+            failure_mode="schema_failure",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_evidence_failure(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["evidence_failure"]
+        return self._record_controlled_failure(
+            failure_mode="evidence_failure",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_normalization_failure(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["normalization_failure"]
+        return self._record_controlled_failure(
+            failure_mode="normalization_failure",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_timeout(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["timeout"]
+        return self._record_controlled_failure(
+            failure_mode="timeout",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_quota(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["quota"]
+        return self._record_controlled_failure(
+            failure_mode="quota",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_authentication(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["authentication"]
+        return self._record_controlled_failure(
+            failure_mode="authentication",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_worker_crash(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["worker_crash"]
+        return self._record_controlled_failure(
+            failure_mode="worker_crash",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_replay(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["replay"]
+        return self._record_controlled_failure(
+            failure_mode="replay",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_rollback(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["rollback"]
+        return self._record_controlled_failure(
+            failure_mode="rollback",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
+    def _execute_duplicate_delivery(self) -> JsonValue:
+        path, outcome = _FAILURE_EXECUTION_PATHS["duplicate_delivery"]
+        return self._record_controlled_failure(
+            failure_mode="duplicate_delivery",
+            injection_path=path,
+            observed_outcome=outcome,
+        )
+
     def execute(self, operation: dict[str, JsonValue]) -> JsonValue:
         kind = cast(str, operation["kind"])
         if kind == "failure":
-            self.publication_state = "suppressed"
-            self.publication_effects = 0
-            return {
-                "fail_closed": True,
-                "publication_state": self.publication_state,
-                "publication_effects": self.publication_effects,
+            failure_handlers = {
+                "schema_failure": self._execute_schema_failure,
+                "evidence_failure": self._execute_evidence_failure,
+                "normalization_failure": self._execute_normalization_failure,
+                "timeout": self._execute_timeout,
+                "quota": self._execute_quota,
+                "authentication": self._execute_authentication,
+                "worker_crash": self._execute_worker_crash,
+                "replay": self._execute_replay,
+                "rollback": self._execute_rollback,
+                "duplicate_delivery": self._execute_duplicate_delivery,
             }
+            failure_mode = operation.get("failure_mode")
+            if not isinstance(failure_mode, str):
+                raise ValueError(f"unsupported controlled failure mode: {failure_mode}")
+            handler = failure_handlers.get(failure_mode)
+            if handler is None:
+                raise ValueError(f"unsupported controlled failure mode: {failure_mode}")
+            return handler()
         if kind == "route":
             return operation.get("current_revision") == operation.get(
                 "proposal_revision"
@@ -1061,6 +1273,7 @@ def _execute_controlled_replay(
                 "observed_facts": record["observed_facts"],
                 "safety": record["safety"],
                 "provenance": record["provenance"],
+                "execution": record["execution"],
             }
         )
         if failure is not None:
@@ -1080,15 +1293,33 @@ def _execute_controlled_replay(
     return observations, tuple(failures)
 
 
+def _failure_mode_observation(value: JsonValue) -> dict[str, JsonValue]:
+    observation = _json_object(value, description="failure observation")
+    case_id = _text(observation.get("case_id"), description="failure case_id")
+    observed = _json_object(observation.get("observed"), description="failure result")
+    return {"case_id": case_id, **observed}
+
+
 def run_player_classifier_promotion_gate(
     release: PlayerClassifierRelease,
 ) -> PlayerPromotionGateResult:
     """Replay every reviewed output, lifecycle event, and failure mode."""
     replay_digests: list[str] = []
     failed_case_ids: set[str] = set()
+    failure_mode_observations: tuple[dict[str, JsonValue], ...] = ()
     for replay_number in range(release.required_replays):
         observations, failures = _execute_controlled_replay(release)
         failed_case_ids.update(failures)
+        current_failure_mode_observations = tuple(
+            _failure_mode_observation(failure_observation)
+            for failure_observation in cast(
+                list[JsonValue], observations["failure_modes"]
+            )
+        )
+        if not failure_mode_observations:
+            failure_mode_observations = current_failure_mode_observations
+        elif current_failure_mode_observations != failure_mode_observations:
+            failed_case_ids.add(f"replay-{replay_number + 1}:failure-observations")
         digest = sha256(
             json.dumps(
                 observations, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -1112,6 +1343,7 @@ def run_player_classifier_promotion_gate(
         ),
         replay_digests=tuple(replay_digests),
         failed_case_ids=tuple(sorted(failed_case_ids)),
+        failure_mode_observations=failure_mode_observations,
         execution_version=PLAYER_PROMOTION_EXECUTION_VERSION,
     )
 
@@ -1164,6 +1396,7 @@ def player_classifier_promotion_evidence(
         "required_replays": release.required_replays,
         "failed_cases": len(result.failed_case_ids),
         "failed_case_ids": list(result.failed_case_ids),
+        "failure_mode_observations": list(result.failure_mode_observations),
         "replay_ids": [
             f"replay-{replay_number}"
             for replay_number in range(1, release.required_replays + 1)

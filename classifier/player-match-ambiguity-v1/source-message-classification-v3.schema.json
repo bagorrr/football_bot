@@ -227,7 +227,7 @@
       "required": ["candidate_key", "opportunity_type", "evidence", "alternatives"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "player_match_availability"]},
+        "opportunity_type": {"enum": ["open_match", "player_match_availability", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "coach_availability", "coach_request", "referee_availability", "referee_request"]},
         "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}},
         "alternatives": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["alternative_key", "evidence"], "properties": {"alternative_key": {"type": "string", "minLength": 1}, "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}}}}}
       }

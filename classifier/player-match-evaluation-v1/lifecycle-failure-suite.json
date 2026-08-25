@@ -407,61 +407,61 @@
       "case_id": "failure-schema",
       "failure_mode": "schema_failure",
       "operation": {"kind": "failure", "failure_mode": "schema_failure"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "schema_failure", "injection_path": "classifier.schema_validator", "observed_outcome": "schema_rejected", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-evidence",
       "failure_mode": "evidence_failure",
       "operation": {"kind": "failure", "failure_mode": "evidence_failure"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "evidence_failure", "injection_path": "application.evidence_validator", "observed_outcome": "evidence_rejected", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-normalization",
       "failure_mode": "normalization_failure",
       "operation": {"kind": "failure", "failure_mode": "normalization_failure"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "normalization_failure", "injection_path": "application.normalization_validator", "observed_outcome": "normalization_rejected", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-timeout",
       "failure_mode": "timeout",
       "operation": {"kind": "failure", "failure_mode": "timeout"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "timeout", "injection_path": "classifier.timeout_boundary", "observed_outcome": "attempt_timed_out", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-quota",
       "failure_mode": "quota",
       "operation": {"kind": "failure", "failure_mode": "quota"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "quota", "injection_path": "classifier.quota_circuit", "observed_outcome": "quota_circuit_opened", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-authentication",
       "failure_mode": "authentication",
       "operation": {"kind": "failure", "failure_mode": "authentication"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "authentication", "injection_path": "classifier.authentication_circuit", "observed_outcome": "authentication_circuit_opened", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-worker-crash",
       "failure_mode": "worker_crash",
       "operation": {"kind": "failure", "failure_mode": "worker_crash"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "worker_crash", "injection_path": "classifier.worker_process", "observed_outcome": "worker_crash_recovered", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-replay",
       "failure_mode": "replay",
       "operation": {"kind": "failure", "failure_mode": "replay"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "replay", "injection_path": "application.replay_barrier", "observed_outcome": "replay_ignored", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-rollback",
       "failure_mode": "rollback",
       "operation": {"kind": "failure", "failure_mode": "rollback"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "rollback", "injection_path": "promotion.rollback_boundary", "observed_outcome": "promotion_rolled_back", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     },
     {
       "case_id": "failure-duplicate-delivery",
       "failure_mode": "duplicate_delivery",
       "operation": {"kind": "failure", "failure_mode": "duplicate_delivery"},
-      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+      "expected": {"failure_mode": "duplicate_delivery", "injection_path": "publication.idempotency_boundary", "observed_outcome": "duplicate_delivery_ignored", "fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
     }
   ],
   "controlled_event_sequences": [

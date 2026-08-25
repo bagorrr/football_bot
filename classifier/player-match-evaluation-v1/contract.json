@@ -46,9 +46,9 @@
     "executes_lifecycle_failure_suite": true
   },
   "canonical_replay_digests": [
-    "d4f6c8da759d1675679c786845c224fc130df60b74260fd7deee0a7357a520f4",
-    "d4f6c8da759d1675679c786845c224fc130df60b74260fd7deee0a7357a520f4",
-    "d4f6c8da759d1675679c786845c224fc130df60b74260fd7deee0a7357a520f4"
+    "ef7808bef37350f2e825e037997f77f8748c49482df5c6d8031d7f11cc9af7ff",
+    "ef7808bef37350f2e825e037997f77f8748c49482df5c6d8031d7f11cc9af7ff",
+    "ef7808bef37350f2e825e037997f77f8748c49482df5c6d8031d7f11cc9af7ff"
   ],
   "required_case_families": [
     "routing",
