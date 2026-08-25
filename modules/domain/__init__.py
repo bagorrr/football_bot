@@ -1330,9 +1330,6 @@ def evaluate_tournament_search(
             end = date.fromisoformat(str(facts["end_local_date"]))
         except (KeyError, ValueError):
             continue
-        expiry = _tournament_search_expiry(facts, start=start, end=end)
-        if expiry is None or completed_search.completed_at >= expiry:
-            continue
         required = completed_search.required_date
         if required is not None and (
             end < required.start_local_date or start > required.end_local_date

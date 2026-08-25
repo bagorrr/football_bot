@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -407,6 +408,57 @@ def _recorded_tournament_payload(
     )
 
 
+@dataclass
+class _EvaluationPersistence:
+    """Controlled application/persistence seam for promotion side effects."""
+
+    staged: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    committed: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    started: list[str] = field(default_factory=list)
+    fail_next_commit: bool = False
+
+    def begin(self, effect_key: str) -> None:
+        self.started.append(effect_key)
+
+    def stage(self, effect_key: str, output: dict[str, JsonValue]) -> None:
+        self.staged[effect_key] = deepcopy(output)
+
+    def commit(self) -> None:
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise RuntimeError("controlled persistence commit failure")
+        self.committed.update(self.staged)
+        self.staged.clear()
+
+    def rollback(self) -> None:
+        self.staged.clear()
+
+
+def _run_recorded_evaluation(
+    adapter: ControlledModelAdapter,
+    request: ClassifierRequest,
+    *,
+    effect_key: str,
+    persistence: _EvaluationPersistence,
+) -> str:
+    """Run one proposal through controlled application and persistence effects."""
+    persistence.begin(effect_key)
+    try:
+        result = adapter.classify(request)
+        if result.output.get("disposition") != "accepted":
+            persistence.rollback()
+            return "unpublished"
+        if effect_key in persistence.committed:
+            persistence.rollback()
+            return "replayed"
+        persistence.stage(effect_key, result.output)
+        persistence.commit()
+    except BaseException:
+        persistence.rollback()
+        raise
+    return "published"
+
+
 def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     repository_root = Path(__file__).parents[2]
     source_cases = _load_reviewed_source_cases()
@@ -638,11 +690,18 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             result=_recorded_result(failure_output),
         )
         failure_adapter.raise_for(error=error)
+        failure_persistence = _EvaluationPersistence()
         try:
-            failure_adapter.classify(
-                _gate_request(case_id=name, body="failure fixture")
+            _run_recorded_evaluation(
+                failure_adapter,
+                _gate_request(case_id=name, body="failure fixture"),
+                effect_key=name,
+                persistence=failure_persistence,
             )
         except type(error):
+            assert failure_persistence.committed == {}
+            assert failure_persistence.staged == {}
+            assert failure_persistence.started == [name]
             failure_results.append(name)
         else:
             raise AssertionError(f"failure fixture did not fail closed: {name}")
@@ -654,41 +713,66 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     assert isinstance(replay_body, str)
     assert isinstance(replay_output, dict)
     replay_adapter.return_for(body=replay_body, result=_recorded_result(replay_output))
-    replay_results = [
-        replay_adapter.classify(
-            _gate_request(case_id="replay", body=replay_body)
-        ).output
-        for _ in range(2)
-    ]
-    assert replay_results[0] == replay_results[1]
+    replay_persistence = _EvaluationPersistence()
+    replay_request = _gate_request(case_id="replay", body=replay_body)
+    assert (
+        _run_recorded_evaluation(
+            replay_adapter,
+            replay_request,
+            effect_key="tournament-current-registration",
+            persistence=replay_persistence,
+        )
+        == "published"
+    )
+    assert (
+        _run_recorded_evaluation(
+            replay_adapter,
+            replay_request,
+            effect_key="tournament-current-registration",
+            persistence=replay_persistence,
+        )
+        == "replayed"
+    )
     assert len(replay_adapter.requests) == 2
-    replay_publication_keys: set[str] = set()
-    for replay_output_value in replay_results:
-        candidates = replay_output_value.get("candidates")
-        assert isinstance(candidates, list) and len(candidates) == 1
-        candidate = candidates[0]
-        assert isinstance(candidate, dict)
-        candidate_key = candidate.get("candidate_key")
-        assert isinstance(candidate_key, str)
-        replay_publication_keys.add(candidate_key)
-    assert replay_publication_keys == {"tournament-current-registration"}
+    assert set(replay_persistence.committed) == {"tournament-current-registration"}
+    assert replay_persistence.staged == {}
+    assert replay_persistence.started == [
+        "tournament-current-registration",
+        "tournament-current-registration",
+    ]
     failure_results.append("replay")
 
     rollback_adapter = ControlledModelAdapter()
-    rollback_adapter.enable_primary_v3()
     rollback_adapter.return_for(
         body=promotion_body,
         result=_recorded_result(promotion_output),
     )
-    staged = rollback_adapter.classify(
-        _gate_request(case_id="rollback", body=promotion_body)
+    rollback_persistence = _EvaluationPersistence(fail_next_commit=True)
+    rollback_request = _gate_request(case_id="rollback", body=promotion_body)
+    try:
+        _run_recorded_evaluation(
+            rollback_adapter,
+            rollback_request,
+            effect_key="tournament-current-registration",
+            persistence=rollback_persistence,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("rollback fixture committed unexpectedly")
+    assert rollback_persistence.committed == {}
+    assert rollback_persistence.staged == {}
+    assert rollback_persistence.started == ["tournament-current-registration"]
+    assert (
+        _run_recorded_evaluation(
+            rollback_adapter,
+            rollback_request,
+            effect_key="tournament-current-registration",
+            persistence=rollback_persistence,
+        )
+        == "published"
     )
-    assert staged.output["disposition"] == "accepted"
-    rollback_adapter.enable_primary_v2()
-    assert rollback_adapter.primary_schema_version == "source-message-classification-v2"
-    staged_outputs: list[ClassifierAdapterResult] = [staged]
-    staged_outputs.clear()
-    assert staged_outputs == []
+    assert set(rollback_persistence.committed) == {"tournament-current-registration"}
     failure_results.append("rollback")
     assert failure_results == corpus["failure_suite"]
     output_digest = hashlib.sha256(
