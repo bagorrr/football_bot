@@ -274,6 +274,45 @@ def test_opponent_hub_and_card_follow_the_four_language_result_contract() -> Non
         assert "venue_provision" not in card.text
 
 
+def test_edited_publication_metadata_reaches_every_localized_result_card() -> None:
+    result = evaluate_opponent_search(
+        _search(),
+        {},
+        (
+            _opportunity(
+                opportunity_id="edited-card",
+                venue="team_has_venue",
+                extra_facts={
+                    "source_edited_at": "2026-08-18T09:30:00+00:00",
+                },
+            ),
+        ),
+    )[0]
+    facts = dict(result.card_facts)
+    assert facts["source_posted_at"] == "2026-08-18T08:00:00+00:00"
+    assert facts["source_edited_at"] == "2026-08-18T09:30:00+00:00"
+
+    expected = {
+        "en": ("Posted: 18 August 2026 at 11:00", "Edited: 18 August 2026 at 12:30"),
+        "ru": ("Пост: 18 августа 2026 в 11:00", "Изменён: 18 августа 2026 в 12:30"),
+        "es": (
+            "Publicado: 18 agosto 2026 a las 11:00",
+            "Modificado: 18 agosto 2026 a las 12:30",
+        ),
+        "fr": ("Publié: 18 août 2026 à 11:00", "Modifié: 18 août 2026 à 12:30"),
+    }
+    for locale, (posted, edited) in expected.items():
+        card = _opponent_request_result_message(
+            delivery_id=f"edited:{locale}",
+            telegram_user_id=49_540,
+            locale=locale,
+            screen_revision=1,
+            result=result,
+        )
+        assert posted in card.text
+        assert edited in card.text
+
+
 def test_opponent_request_is_symmetric_and_requires_explicit_request_fact() -> None:
     results = evaluate_opponent_search(
         _search(),

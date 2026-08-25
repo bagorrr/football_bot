@@ -72,6 +72,7 @@ from modules.domain import (
     SourceChatAdmissionProvenance,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
+    SourceEventKind,
     TelegramDeliveryMode,
     TelegramDifferenceFailure,
     TelegramMessage,
@@ -2877,11 +2878,17 @@ class ConversationOnboarding:
                     raise RuntimeError("No multi-select Opponent Search detail is open")
                 if value not in _OPPONENT_SEARCH_DETAIL_OPTIONS[editing]:
                     raise ValueError("Opponent Search detail value must be canonical")
-                if value in temporary:
-                    temporary.remove(value)
+                if editing == "venue_provision":
+                    details[editing] = (value,)
+                    editing = None
+                    temporary = []
+                    target = "hub"
                 else:
-                    temporary.append(value)
-                target = "submenu"
+                    if value in temporary:
+                        temporary.remove(value)
+                    else:
+                        temporary.append(value)
+                    target = "submenu"
             elif operation == "select_value":
                 if editing != detail_key:
                     raise RuntimeError("Opponent Search detail is not open")
@@ -2920,7 +2927,11 @@ class ConversationOnboarding:
                 if editing is None or editing == "times":
                     raise RuntimeError("No multi-select Opponent Search detail is open")
                 if temporary:
-                    details[editing] = tuple(temporary)
+                    details[editing] = (
+                        (temporary[-1],)
+                        if editing == "venue_provision"
+                        else tuple(temporary)
+                    )
                 else:
                     details.pop(editing, None)
                 editing = None
@@ -6249,6 +6260,8 @@ def _opponent_search_detail_submenu_message(
             (
                 f"opponent-details:time:{value}:{screen_revision}"
                 if detail_key == "times"
+                else f"opponent-details:venue:{value}:{screen_revision}"
+                if detail_key == "venue_provision"
                 else f"opponent-details:toggle:{value}:{screen_revision}"
             ),
         )
@@ -6260,6 +6273,12 @@ def _opponent_search_detail_submenu_message(
             (button("morning"), button("daytime")),
             (button("evening"), button("night")),
             ((any_label, f"opponent-details:time:any:{screen_revision}"),),
+        )
+    elif detail_key == "venue_provision":
+        values = _OPPONENT_SEARCH_DETAIL_OPTIONS[detail_key]
+        rows = (
+            *tuple((button(value),) for value in values),
+            ((any_label, f"opponent-details:venue:any:{screen_revision}"),),
         )
     else:
         values = _OPPONENT_SEARCH_DETAIL_OPTIONS[detail_key]
@@ -10535,6 +10554,27 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
+        source_revision_history = self.store.source_message_revision_history(
+            source_revision.source_message_id
+        )
+        source_posted_revision = next(
+            (
+                revision
+                for revision in source_revision_history
+                if revision.event_kind is SourceEventKind.CREATE
+            ),
+            None,
+        )
+        source_posted_at = (
+            source_posted_revision.event_time
+            if source_posted_revision is not None
+            else source_revision.event_time
+        )
+        source_edited_at = (
+            source_revision.event_time
+            if source_revision.event_kind is SourceEventKind.EDIT
+            else None
+        )
         generation_suffix = f":generation:{source_revision.registry_generation}"
         source_message_scope = source_revision.source_message_id.rsplit(":message:", 1)[
             0
@@ -10651,6 +10691,10 @@ class RuntimeApplication:
             "body": source_revision.body,
             "source_event_time": source_revision.event_time.isoformat(),
             "source_recorded_at": source_revision.recorded_at.isoformat(),
+            "source_posted_at": source_posted_at.isoformat(),
+            "source_edited_at": (
+                source_edited_at.isoformat() if source_edited_at is not None else None
+            ),
             "source_chat_reference": source_chat_reference,
             "source_chat_timezone": source_chat.classifier_timezone,
             "source_chat_geography": {
@@ -14091,6 +14135,25 @@ def _validated_open_match_proposal(
         if payment == "paid"
         else None
     )
+    publication_posted_at = (
+        payload_value.get("source_posted_at")
+        if is_opponent_request
+        else source_event_time.isoformat()
+    )
+    publication_edited_at = (
+        payload_value.get("source_edited_at") if is_opponent_request else None
+    )
+    if (
+        not isinstance(publication_posted_at, str)
+        or not publication_posted_at
+        or (
+            publication_edited_at is not None
+            and (
+                not isinstance(publication_edited_at, str) or not publication_edited_at
+            )
+        )
+    ):
+        return None
     localized = dict(places[0].localized_display_names)
     accepted_facts: dict[str, JsonValue] = {
         "start_local_date": str(start_date),
@@ -14141,7 +14204,8 @@ def _validated_open_match_proposal(
         "payment_currency": (
             payment_details[1] if payment_details is not None else None
         ),
-        "source_posted_at": source_event_time.isoformat(),
+        "source_posted_at": publication_posted_at,
+        **({"source_edited_at": publication_edited_at} if is_opponent_request else {}),
     }
     return {
         "opportunity_id": (

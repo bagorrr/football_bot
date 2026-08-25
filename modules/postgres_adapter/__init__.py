@@ -3318,6 +3318,45 @@ class PostgresRoleStore:
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
         )
 
+    def source_message_revision_history(
+        self, source_message_id: str
+    ) -> tuple[SourceMessageRevision, ...]:
+        """Read one Source Message's immutable history through Application."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_message_revision_id, source_message_id,
+                       source_event_id, revision, event_kind, body,
+                       event_time, recorded_at, registry_generation,
+                       bounded_metadata, reply_to_telegram_message_id
+                FROM football_runtime.source_message_revisions
+                WHERE source_message_id = %s
+                ORDER BY revision
+                """,
+                (source_message_id,),
+            ).fetchall()
+        return tuple(
+            SourceMessageRevision(
+                source_message_revision_id=row["source_message_revision_id"],
+                source_message_id=row["source_message_id"],
+                source_event_id=row["source_event_id"],
+                revision=row["revision"],
+                event_kind=SourceEventKind(row["event_kind"]),
+                body=row["body"],
+                event_time=row["event_time"],
+                recorded_at=row["recorded_at"],
+                registry_generation=row["registry_generation"],
+                bounded_metadata=row["bounded_metadata"],
+                reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            )
+            for row in rows
+        )
+
     def eligible_reply_revision(
         self,
         *,

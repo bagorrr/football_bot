@@ -1123,6 +1123,8 @@ def evaluate_opponent_search(
         accepted_venue = facts.get("venue_provision")
         if accepted_venue in _VENUE_PROVISION_VALUES:
             card["venue_provision"] = str(accepted_venue)
+        if facts.get("source_edited_at"):
+            card["source_edited_at"] = str(facts["source_edited_at"])
         if facts.get("payment"):
             card["payment"] = str(facts["payment"])
         if facts.get("payment_amount") and facts.get("payment_currency"):

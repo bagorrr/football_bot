@@ -2211,6 +2211,7 @@ def _validate_opponent_request_accepted_facts(
         "payment_amount",
         "payment_currency",
         "source_posted_at",
+        "source_edited_at",
     }
     if set(facts) != required:
         raise ValueError("opponent-request accepted facts are incomplete")
@@ -2310,6 +2311,11 @@ def _validate_opponent_request_accepted_facts(
     ):
         raise ValueError("opponent-request payment details are invalid")
     _required_iso_datetime(facts, "source_posted_at")
+    source_edited_at = facts["source_edited_at"]
+    if source_edited_at is not None:
+        if not isinstance(source_edited_at, str):
+            raise TypeError("opponent-request source_edited_at must be text or null")
+        _required_iso_datetime(facts, "source_edited_at")
 
 
 def _validate_protected_content_skip(
