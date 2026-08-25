@@ -675,11 +675,11 @@ def _validate_run_search(
             "whole_city",
             "required_date",
         }
-        allowed_field_sets = (
-            required_fields,
-            required_fields | {"game_search_details"},
-        )
-        if set(payload) not in allowed_field_sets:
+        allowed_fields = required_fields | {
+            "game_search_details",
+            "number_of_players",
+        }
+        if not required_fields <= set(payload) or set(payload) - allowed_fields:
             raise ValueError("RunSearch v2 contains unsupported or missing facts")
         search_update_id = _required_text(payload, "search_update_id")
         telegram_user_id = payload["telegram_user_id"]
@@ -715,6 +715,16 @@ def _validate_run_search(
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
         raise ValueError("RunSearch requires a canonical user_intent")
+    number_of_players = payload.get("number_of_players")
+    if number_of_players is not None:
+        if user_intent != "player_search":
+            raise ValueError("Number of Players requires Player Search")
+        if (
+            not isinstance(number_of_players, int)
+            or isinstance(number_of_players, bool)
+            or number_of_players < 1
+        ):
+            raise ValueError("Number of Players must be a positive integer")
     country_id = _required_text(payload, "country_id")
     city_id = _required_text(payload, "city_id")
     area_ids = payload.get("sub_city_area_ids")
@@ -768,8 +778,10 @@ def _validate_run_search(
         )
     details = payload.get("game_search_details")
     if details is not None:
-        if user_intent != "game_search" or not isinstance(details, dict):
-            raise ValueError("RunSearch details require Game Search")
+        if user_intent not in {"game_search", "player_search"} or not isinstance(
+            details, dict
+        ):
+            raise ValueError("RunSearch details require Game Search or Player Search")
         if set(details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
             isinstance(values, list)
             and (key != "times" or len(values) <= 1)
