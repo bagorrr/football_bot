@@ -14260,7 +14260,9 @@ def _validated_tournament_proposal(
         isinstance(value, str) and value in body for value in evidence.values()
     ):
         return None
-    validation_body = source_context if isinstance(source_context, str) else body
+    # The bounded model context is useful evidence, but the complete source
+    # revision is authoritative for currentness and source-level gates.
+    validation_body = body
     route = _select_response_route(
         body=validation_body,
         proposed_routes=routes,

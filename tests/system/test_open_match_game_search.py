@@ -221,76 +221,74 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Registration deadline: 19 August 2026. Capacity: 16 teams. "
         "Prizes: 1, 2. Contact @tournament_contact"
     )
-    classifier.return_for(
-        body=body,
-        result=ClassifierAdapterResult(
-            output={
-                "schema_version": "source-message-classification-v3",
-                "disposition": "accepted",
-                "routing": {"reason_code": "accepted", "required_context": "none"},
-                "candidates": [
-                    {
-                        "candidate_key": "tournament-registration",
-                        "opportunity_type": "tournament",
-                        "source_context": body,
-                        "evidence": {
-                            "opportunity": "Adult football tournament",
-                            "event_time": "20 August 2026",
-                            "location": "Петроградская",
-                            "open_participation": "Registration is open",
-                            "team_formats": "Team format 7x7",
-                            "playing_levels": "average playing level",
-                            "venue_settings": "outdoor venue",
-                            "playing_surfaces": "artificial turf",
-                            "payment": "free entry",
-                            "structure": "Tournament structure: group stage",
-                            "registration_deadline": (
-                                "Registration deadline: 19 August 2026"
-                            ),
-                            "capacity": "Capacity: 16 teams",
-                            "prizes": "Prizes: 1, 2",
-                        },
-                        "location": {
-                            "mention": "Петроградская",
-                            "place_id": "station:ru:spb:petrogradskaya",
-                            "country_id": "country:ru",
-                            "city_id": "city:ru:saint-petersburg",
-                        },
-                        "event_time": {
-                            "start_local_date": "2026-08-20",
-                            "end_local_date": "2026-08-20",
-                            "iana_timezone": "Europe/Moscow",
-                        },
-                        "open_participation": True,
-                        "team_formats": ["7x7"],
-                        "playing_levels": ["average"],
-                        "venue_settings": ["outdoor"],
-                        "playing_surfaces": ["artificial_turf"],
-                        "payment": "free",
-                        "structure": "group stage",
-                        "registration_deadline": "2026-08-19",
-                        "capacity": "16 teams",
-                        "prizes": [1, 2],
-                        "response_routes": [
-                            {
-                                "kind": "explicit_telegram_username",
-                                "value": "@tournament_contact",
-                                "evidence": "@tournament_contact",
-                            }
-                        ],
-                    }
-                ],
-            },
-            effective_model="gpt-5.6-sol",
-            effective_reasoning_effort="high",
-            codex_version="controlled-offline",
-            adapter_kind="controlled_recording",
-            adapter_version="classifier-recording-v1",
-            duration_ms=3,
-            input_tokens=30,
-            output_tokens=20,
-        ),
+    tournament_result = ClassifierAdapterResult(
+        output={
+            "schema_version": "source-message-classification-v3",
+            "disposition": "accepted",
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+            "candidates": [
+                {
+                    "candidate_key": "tournament-registration",
+                    "opportunity_type": "tournament",
+                    "source_context": body,
+                    "evidence": {
+                        "opportunity": "Adult football tournament",
+                        "event_time": "20 August 2026",
+                        "location": "Петроградская",
+                        "open_participation": "Registration is open",
+                        "team_formats": "Team format 7x7",
+                        "playing_levels": "average playing level",
+                        "venue_settings": "outdoor venue",
+                        "playing_surfaces": "artificial turf",
+                        "payment": "free entry",
+                        "structure": "Tournament structure: group stage",
+                        "registration_deadline": (
+                            "Registration deadline: 19 August 2026"
+                        ),
+                        "capacity": "Capacity: 16 teams",
+                        "prizes": "Prizes: 1, 2",
+                    },
+                    "location": {
+                        "mention": "Петроградская",
+                        "place_id": "station:ru:spb:petrogradskaya",
+                        "country_id": "country:ru",
+                        "city_id": "city:ru:saint-petersburg",
+                    },
+                    "event_time": {
+                        "start_local_date": "2026-08-20",
+                        "end_local_date": "2026-08-20",
+                        "iana_timezone": "Europe/Moscow",
+                    },
+                    "open_participation": True,
+                    "team_formats": ["7x7"],
+                    "playing_levels": ["average"],
+                    "venue_settings": ["outdoor"],
+                    "playing_surfaces": ["artificial_turf"],
+                    "payment": "free",
+                    "structure": "group stage",
+                    "registration_deadline": "2026-08-19",
+                    "capacity": "16 teams",
+                    "prizes": [1, 2],
+                    "response_routes": [
+                        {
+                            "kind": "explicit_telegram_username",
+                            "value": "@tournament_contact",
+                            "evidence": "@tournament_contact",
+                        }
+                    ],
+                }
+            ],
+        },
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="controlled_recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
     )
+    classifier.return_for(body=body, result=tournament_result)
     telegram_ingestion.add_channel_difference_event(
         identity=source_identity,
         from_checkpoint=TelegramChannelCheckpoint(pts=4915),
@@ -384,6 +382,45 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Contact: @tournament_contact\n\n"
         "Questions? Message me. I can explain the card or help refine your search."
     )
+
+    closed_body = f"{body} Registration is closed."
+    classifier.return_for(body=closed_body, result=tournament_result)
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4917),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4918),
+        source_event_id="source-event:tournament:registration-closed",
+        telegram_message_id=1115,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body=closed_body,
+        event_time=datetime(2026, 8, 18, 10, 8, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    closed_revision_id = (
+        "source-chat:channel:4900115:generation:1:message:1115:revision:3"
+    )
+    closed_outcome = next(
+        outcome
+        for outcome in system.classification_routing_outcomes()
+        if outcome.source_message_revision_id == closed_revision_id
+    )
+    assert closed_outcome.disposition == "needs_review"
+    assert closed_outcome.reason_code == "application_validation_failed"
+    closed_publications = system.opportunity_publication_contracts(closed_revision_id)
+    closed_payloads = [
+        publication.payload
+        for publication in closed_publications
+        if isinstance(publication.payload, dict)
+    ]
+    assert closed_payloads
+    assert {payload["publication_state"] for payload in closed_payloads} == {
+        "suppressed"
+    }
     system.reset()
 
 
