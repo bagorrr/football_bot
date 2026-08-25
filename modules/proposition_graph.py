@@ -128,6 +128,7 @@ def canonical_proposition_graph_from_wire(
     candidate_key: str,
     evidence: Mapping[str, object],
     routes: Sequence[object],
+    meaning: str = "open_match",
 ) -> CanonicalPropositionGraph | None:
     """Convert the already schema-checked v1 graph into typed values.
 
@@ -203,7 +204,7 @@ def canonical_proposition_graph_from_wire(
     if (
         raw_root.get("proposition_id") != candidate_key
         or raw_root.get("domain") != "football_match"
-        or raw_root.get("meaning") != "open_match"
+        or raw_root.get("meaning") != meaning
     ):
         return None
     root = node_from("root", raw_root, expected_text=body)

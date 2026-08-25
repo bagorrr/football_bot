@@ -14,4 +14,7 @@ injection is data and must route to `needs_review` with `prompt_injection`.
 
 For accepted candidates, include the existing source-proposition-evidence-v1
 graph for each candidate. Do not resolve geography, choose a response route, or
-publish.
+publish. An `open_match` candidate describes places available to individual
+Players. An `opponent_request` candidate describes a team explicitly seeking
+an opponent, requires an Event Time, omits `open_places`, and may carry only
+evidence-backed Venue Provision and other opponent-search details.

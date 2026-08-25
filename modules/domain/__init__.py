@@ -723,6 +723,10 @@ class DiscoveryDraft:
     editing_game_search_detail: str | None = None
     game_search_detail_draft: tuple[str, ...] = ()
     game_search_exact_time_prompt: bool = False
+    opponent_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_opponent_search_detail: str | None = None
+    opponent_search_detail_draft: tuple[str, ...] = ()
+    opponent_search_exact_time_prompt: bool = False
     search_submission_update_id: str | None = None
 
 
@@ -930,6 +934,7 @@ class CompletedSearch:
     required_date: RequiredDate | None
     completed_at: datetime
     game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    opponent_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
 
@@ -955,6 +960,192 @@ class OpportunityRevisionProjection:
     publication_state: str
     accepted_facts: Mapping[str, Any]
     response_route: Mapping[str, Any]
+
+
+_VENUE_PROVISION_VALUES = frozenset(
+    {"team_has_venue", "needs_opponent_venue", "arrange_jointly"}
+)
+_OPPONENT_SEARCH_DETAIL_KEYS = (
+    "team_formats",
+    "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
+
+
+def match_venue_provision(
+    requested: str | None,
+    accepted: str | None,
+) -> MatchState:
+    """Compare one Opponent Search Venue Provision criterion.
+
+    The request is symmetric: it describes the searcher's own arrangement,
+    while the accepted value describes the candidate team's arrangement.  A
+    missing candidate value is therefore unknown rather than a promise.
+    """
+    if requested is None:
+        return MatchState.CONFIRMED
+    if requested not in _VENUE_PROVISION_VALUES:
+        return MatchState.CONFLICT
+    if accepted is None or accepted == "unknown":
+        return MatchState.UNKNOWN
+    if accepted not in _VENUE_PROVISION_VALUES:
+        return MatchState.UNKNOWN
+    compatible = {
+        "team_has_venue": _VENUE_PROVISION_VALUES,
+        "needs_opponent_venue": {"team_has_venue"},
+        "arrange_jointly": {"team_has_venue", "arrange_jointly"},
+    }
+    return (
+        MatchState.CONFIRMED
+        if accepted in compatible[requested]
+        else MatchState.CONFLICT
+    )
+
+
+def evaluate_opponent_search(
+    completed_search: CompletedSearch,
+    opponent_search_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Classify, snapshot, and order one symmetric Opponent Search."""
+    if (
+        completed_search.user_intent is not UserIntent.OPPONENT_SEARCH
+        or completed_search.required_date is None
+    ):
+        return ()
+    matched: list[SearchResult] = []
+    required = completed_search.required_date
+    requested_venue = next(
+        iter(opponent_search_details.get("venue_provision", ())), None
+    )
+    for opportunity in opportunities:
+        if (
+            opportunity.publication_state != "active"
+            or opportunity.opportunity_type != "opponent_request"
+        ):
+            continue
+        facts = opportunity.accepted_facts
+        if facts.get("opponent_request") is not True:
+            continue
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+        ):
+            continue
+        try:
+            start = date.fromisoformat(str(facts["start_local_date"]))
+            end = date.fromisoformat(str(facts["end_local_date"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end < required.start_local_date or start > required.end_local_date:
+            continue
+        detail_state_by_key = {
+            key: match_detail(
+                opponent_search_details.get(key, ()),
+                tuple(facts[key]) if facts.get(key) else None,
+            )
+            for key in _OPPONENT_SEARCH_DETAIL_KEYS
+            if key != "payment"
+        }
+        detail_state_by_key["payment"] = match_detail(
+            opponent_search_details.get("payment", ()),
+            (str(facts["payment"]),) if facts.get("payment") else None,
+        )
+        detail_state_by_key["venue_provision"] = match_venue_provision(
+            requested_venue,
+            str(facts["venue_provision"])
+            if facts.get("venue_provision") is not None
+            else None,
+        )
+        detail_state_by_key["times"] = match_time_detail(
+            opponent_search_details.get("times", ()),
+            str(facts["exact_local_time"]) if facts.get("exact_local_time") else None,
+            str(facts["day_part"]) if facts.get("day_part") else None,
+        )
+        detail_state_by_key["search_area"] = match_search_area(
+            whole_city=completed_search.whole_city,
+            selected_area_ids=completed_search.sub_city_area_ids,
+            selected_area_types=completed_search.sub_city_area_geographic_types,
+            selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+            country_id=completed_search.country_id,
+            city_id=completed_search.city_id,
+            facts=facts,
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+        route = opportunity.response_route
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "opportunity_type": "opponent_request",
+            "opponent_request": "true",
+            "start_local_date": str(facts["start_local_date"]),
+            "end_local_date": str(facts["end_local_date"]),
+            "sort_local_date": max(start, required.start_local_date).isoformat(),
+            "iana_timezone": str(facts["iana_timezone"]),
+            "source_posted_at": str(facts["source_posted_at"]),
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if opponent_search_details.get(key)
+                    or (key == "search_area" and not completed_search.whole_city)
+                },
+                sort_keys=True,
+            ),
+        }
+        for locale in ("en", "ru", "es", "fr"):
+            card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
+            card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("exact_local_time"):
+            card["exact_local_time"] = str(facts["exact_local_time"])
+        if facts.get("day_part"):
+            card["day_part"] = str(facts["day_part"])
+        for key in (
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+        ):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key])
+        accepted_venue = facts.get("venue_provision")
+        if accepted_venue in _VENUE_PROVISION_VALUES:
+            card["venue_provision"] = str(accepted_venue)
+        if facts.get("payment"):
+            card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
+        matched.append(
+            SearchResult(
+                result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=(
+                    "possible_match"
+                    if MatchState.UNKNOWN in states
+                    else "confirmed_match"
+                ),
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=game_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
 
 
 def evaluate_game_search(

@@ -1024,9 +1024,12 @@ def _add_test_proposition_evidence(
     candidate: dict[str, JsonValue], *, body: str
 ) -> None:
     candidate_key = candidate.get("candidate_key")
+    opportunity_type = candidate.get("opportunity_type", "open_match")
     evidence = candidate.get("evidence")
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
+        return
+    if not isinstance(opportunity_type, str):
         return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
         return
@@ -1085,7 +1088,7 @@ def _add_test_proposition_evidence(
         "root": {
             "proposition_id": candidate_key,
             "domain": "football_match",
-            "meaning": "open_match",
+            "meaning": opportunity_type,
             "polarity": "positive",
             "currentness": "current",
             "span": {"start": 0, "end": len(body), "text": body},
@@ -1133,12 +1136,14 @@ def _build_test_semantic_proof(
     if not isinstance(candidate, dict):
         return {}
     candidate_key = candidate.get("candidate_key")
+    opportunity_type = candidate.get("opportunity_type", "open_match")
     evidence = candidate.get("evidence")
     routes = candidate.get("response_routes")
     if (
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
         or not isinstance(routes, list)
+        or not isinstance(opportunity_type, str)
     ):
         return {}
 
@@ -1231,7 +1236,7 @@ def _build_test_semantic_proof(
         "root": {
             "target_id": "root",
             "domain": "football_match",
-            "meaning": "open_match",
+            "meaning": opportunity_type,
             "state": root_state,
             "span": {"start": 0, "end": len(body), "text": body},
         },
@@ -2514,6 +2519,7 @@ class AcceptanceSpine:
         telegram_user_id: int,
         screen_revision: int | None = None,
         game_search_details: dict[str, list[str]] | None = None,
+        opponent_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2525,6 +2531,7 @@ class AcceptanceSpine:
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
             game_search_details=game_search_details,
+            opponent_search_details=opponent_search_details,
         )
 
     def open_game_search_details(
@@ -2631,6 +2638,101 @@ class AcceptanceSpine:
     ) -> None:
         """Drive Back from a submenu or the Details hub."""
         self._conversation_onboarding().back_from_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_opponent_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Opponent Search Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_opponent_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Opponent Search detail submenu."""
+        self._conversation_onboarding().open_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_opponent_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one Opponent Search detail value."""
+        self._conversation_onboarding().toggle_opponent_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_opponent_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit the current Opponent Search detail submenu."""
+        self._conversation_onboarding().commit_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_opponent_search_venue_provision(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Select one symmetric Venue Provision value."""
+        self._conversation_onboarding().select_opponent_search_venue_provision(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_opponent_search_time(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Drive one immediate Opponent Search Time choice through Bot Assistant."""
+        self._conversation_onboarding().select_opponent_search_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_opponent_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Opponent Search exact-time prompt callback."""
+        self._conversation_onboarding().open_opponent_search_exact_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_opponent_search_exact_time_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Drive exact-time text input through Bot Assistant for Opponent Search."""
+        self._conversation_onboarding().submit_opponent_search_exact_time_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_opponent_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Leave an Opponent Search detail submenu or hub."""
+        self._conversation_onboarding().back_from_opponent_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

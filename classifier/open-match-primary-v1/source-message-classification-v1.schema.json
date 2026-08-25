@@ -15,25 +15,25 @@
         "additionalProperties": false,
         "required": [
           "candidate_key", "opportunity_type", "evidence", "location",
-          "event_time", "open_places", "response_routes"
+          "event_time", "response_routes"
         ],
         "properties": {
           "candidate_key": {"type": "string", "minLength": 1},
-          "opportunity_type": {"const": "open_match"},
+          "opportunity_type": {"enum": ["open_match", "opponent_request"]},
           "evidence": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-              "opportunity", "event_time", "location", "open_places"
-            ],
+            "required": ["opportunity", "event_time", "location"],
             "properties": {
               "opportunity": {"type": "string", "minLength": 1},
               "event_time": {"type": "string", "minLength": 1},
               "location": {"type": "string", "minLength": 1},
               "open_places": {"type": "string", "minLength": 1},
+              "opponent_request": {"type": "string", "minLength": 1},
               "team_formats": {"type": "string", "minLength": 1},
               "positions": {"type": "string", "minLength": 1},
               "playing_levels": {"type": "string", "minLength": 1},
+              "venue_provision": {"type": "string", "minLength": 1},
               "venue_settings": {"type": "string", "minLength": 1},
               "playing_surfaces": {"type": "string", "minLength": 1},
               "payment": {"type": "string", "minLength": 1}
@@ -66,9 +66,11 @@
             }
           },
           "open_places": {"type": ["integer", "null"], "minimum": 1},
+          "opponent_request": {"const": true},
           "team_formats": {"$ref": "#/$defs/team_formats"},
           "positions": {"$ref": "#/$defs/positions"},
           "playing_levels": {"$ref": "#/$defs/playing_levels"},
+          "venue_provision": {"enum": ["team_has_venue", "needs_opponent_venue", "arrange_jointly", "unknown", null]},
           "venue_settings": {"$ref": "#/$defs/venue_settings"},
           "playing_surfaces": {"$ref": "#/$defs/playing_surfaces"},
           "payment": {"enum": ["free", "paid", "unknown"]},
@@ -101,7 +103,35 @@
             }
           },
           "proposition_evidence": {"$ref": "#/$defs/proposition_evidence"}
-        }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"opportunity_type": {"const": "open_match"}}},
+            "then": {
+              "required": ["open_places"],
+              "properties": {
+                "evidence": {
+                  "required": ["open_places"],
+                  "not": {"required": ["opponent_request"]}
+                }
+              },
+              "not": {"required": ["opponent_request"]}
+            },
+            "else": {
+              "required": ["opponent_request"],
+              "properties": {
+                "evidence": {
+                  "required": ["opponent_request"],
+                  "not": {"required": ["open_places"]}
+                }
+              },
+              "allOf": [
+                {"not": {"required": ["open_places"]}},
+                {"not": {"required": ["positions"]}}
+              ]
+            }
+          }
+        ]
       }
     }
   },
@@ -139,7 +169,7 @@
       "properties": {
         "proposition_id": {"type": "string", "minLength": 1},
         "domain": {"enum": ["football_match"]},
-        "meaning": {"const": "open_match"},
+        "meaning": {"enum": ["open_match", "opponent_request"]},
         "polarity": {"enum": ["positive", "negative", "ambiguous"]},
         "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
         "span": {"$ref": "#/$defs/source_span"}

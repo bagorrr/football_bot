@@ -789,6 +789,117 @@ _GAME_SEARCH_DETAIL_OPTIONS = {
     ),
     "payment": ("free", "paid"),
 }
+_OPPONENT_SEARCH_DETAIL_OPTIONS = {
+    "times": ("morning", "daytime", "evening", "night"),
+    "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
+    "playing_levels": (
+        "novice",
+        "below_average",
+        "average",
+        "above_average",
+        "high",
+        "very_high",
+        "master",
+        "professional",
+    ),
+    "venue_provision": (
+        "team_has_venue",
+        "needs_opponent_venue",
+        "arrange_jointly",
+    ),
+    "venue_settings": ("indoor", "outdoor", "covered_outdoor"),
+    "playing_surfaces": (
+        "natural_grass",
+        "artificial_turf",
+        "hard_surface",
+        "wood_parquet",
+    ),
+    "payment": ("free", "paid"),
+}
+_OPPONENT_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Time",
+        "Team format",
+        "Playing levels",
+        "Venue provision",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Время",
+        "Формат команд",
+        "Уровни игры",
+        "Предоставление площадки",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Hora",
+        "Formato de equipos",
+        "Niveles de juego",
+        "Provisión del campo",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Heure",
+        "Format d’équipes",
+        "Niveaux de jeu",
+        "Mise à disposition du terrain",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_OPPONENT_SEARCH_VALUE_COPY = {
+    "en": {
+        "morning": "Morning",
+        "daytime": "Daytime",
+        "evening": "Evening",
+        "night": "Night",
+        "team_has_venue": "Our team has a venue",
+        "needs_opponent_venue": "We need the opponent’s venue",
+        "arrange_jointly": "Arrange jointly",
+        "free": "Free",
+        "paid": "Paid",
+    },
+    "ru": {
+        "morning": "Утро",
+        "daytime": "День",
+        "evening": "Вечер",
+        "night": "Ночь",
+        "team_has_venue": "У нашей команды есть площадка",
+        "needs_opponent_venue": "Нужна площадка соперника",
+        "arrange_jointly": "Организуем вместе",
+        "free": "Бесплатно",
+        "paid": "Платно",
+    },
+    "es": {
+        "morning": "Mañana",
+        "daytime": "Día",
+        "evening": "Tarde",
+        "night": "Noche",
+        "team_has_venue": "Nuestro equipo tiene campo",
+        "needs_opponent_venue": "Necesitamos el campo del rival",
+        "arrange_jointly": "Organizar juntos",
+        "free": "Gratis",
+        "paid": "De pago",
+    },
+    "fr": {
+        "morning": "Le matin",
+        "daytime": "L’après-midi",
+        "evening": "Le soir",
+        "night": "La nuit",
+        "team_has_venue": "Notre équipe a un terrain",
+        "needs_opponent_venue": "Nous avons besoin du terrain adverse",
+        "arrange_jointly": "Organiser ensemble",
+        "free": "Gratuit",
+        "paid": "Payant",
+    },
+}
 _GAME_SEARCH_DETAIL_NAMES = {
     "en": (
         "Time",
@@ -2322,6 +2433,7 @@ class ConversationOnboarding:
         telegram_user_id: int,
         screen_revision: int,
         game_search_details: dict[str, list[str]] | None = None,
+        opponent_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2371,11 +2483,27 @@ class ConversationOnboarding:
                 search_submission_update_id=update_id,
             )
             message_id = derive_run_search_message_id(telegram_user_id, update_id)
-            selected_details = (
-                game_search_details
-                if game_search_details is not None
-                else {key: list(values) for key, values in draft.game_search_details}
-            )
+            if game_search_details is not None and opponent_search_details is not None:
+                raise ValueError("Search cannot contain both detail families")
+            if draft.user_intent is UserIntent.OPPONENT_SEARCH:
+                selected_opponent_details = (
+                    opponent_search_details
+                    if opponent_search_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.opponent_search_details
+                    }
+                )
+                selected_game_details: dict[str, list[str]] = {}
+            else:
+                selected_game_details = (
+                    game_search_details
+                    if game_search_details is not None
+                    else {
+                        key: list(values) for key, values in draft.game_search_details
+                    }
+                )
+                selected_opponent_details = {}
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
                 contract_version=2,
@@ -2408,8 +2536,14 @@ class ConversationOnboarding:
                     "whole_city": draft.whole_city,
                     "required_date": _required_date_payload(draft.required_date),
                     **(
-                        {"game_search_details": cast(JsonValue, selected_details)}
-                        if selected_details
+                        {"game_search_details": cast(JsonValue, selected_game_details)}
+                        if selected_game_details
+                        else {
+                            "opponent_search_details": cast(
+                                JsonValue, selected_opponent_details
+                            )
+                        }
+                        if selected_opponent_details
                         else {}
                     ),
                 },
@@ -2552,6 +2686,324 @@ class ConversationOnboarding:
             screen_revision=screen_revision,
             operation="back",
         )
+
+    def open_opponent_search_details(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the durable symmetric Opponent Search Details hub."""
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+        )
+
+    def open_opponent_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one Opponent Search detail submenu."""
+        if detail_key not in _OPPONENT_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Opponent Search detail key must be canonical")
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+        )
+
+    def toggle_opponent_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one Opponent Search detail in its temporary draft."""
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+        )
+
+    def commit_opponent_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit one Opponent Search detail submenu."""
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+        )
+
+    def select_opponent_search_venue_provision(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str | None,
+    ) -> None:
+        """Commit one symmetric Venue Provision value, or clear it."""
+        if (
+            value is not None
+            and value not in _OPPONENT_SEARCH_DETAIL_OPTIONS["venue_provision"]
+        ):
+            raise ValueError("Opponent Search Venue Provision must be canonical")
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_value",
+            detail_key="venue_provision",
+            value=value,
+        )
+
+    def select_opponent_search_time(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str | None,
+    ) -> None:
+        """Commit one Opponent Search time/day part immediately, or clear it."""
+        if value is not None and not _canonical_game_search_time(value):
+            raise ValueError("Opponent Search Time must be canonical")
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_time",
+            value=value,
+        )
+
+    def open_opponent_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the exact-time text prompt from the Opponent Search time submenu."""
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="exact_time_prompt",
+        )
+
+    def submit_opponent_search_exact_time_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and commit one exact local Opponent Search time."""
+        if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text) is None:
+            raise ValueError("Opponent Search exact time must be HH:MM")
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_exact_time",
+            value=text,
+        )
+
+    def back_from_opponent_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard submenu edits, or leave the Opponent Search Details hub."""
+        self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+        )
+
+    def _change_opponent_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        operation: str,
+        detail_key: str | None = None,
+        value: str | None = None,
+    ) -> None:
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.user_intent is not UserIntent.OPPONENT_SEARCH
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            details = dict(draft.opponent_search_details)
+            editing = draft.editing_opponent_search_detail
+            temporary = list(draft.opponent_search_detail_draft)
+            exact_time_prompt = draft.opponent_search_exact_time_prompt
+            target = "hub"
+            if operation == "open_hub":
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "open_detail":
+                if detail_key is None:
+                    raise RuntimeError("Opponent Search detail key is missing")
+                editing = detail_key
+                temporary = list(details.get(detail_key, ()))
+                exact_time_prompt = False
+                target = "submenu"
+            elif operation == "toggle":
+                if editing is None or editing == "times":
+                    raise RuntimeError("No multi-select Opponent Search detail is open")
+                if value not in _OPPONENT_SEARCH_DETAIL_OPTIONS[editing]:
+                    raise ValueError("Opponent Search detail value must be canonical")
+                if value in temporary:
+                    temporary.remove(value)
+                else:
+                    temporary.append(value)
+                target = "submenu"
+            elif operation == "select_value":
+                if editing != detail_key:
+                    raise RuntimeError("Opponent Search detail is not open")
+                if value is None:
+                    details.pop(detail_key or "venue_provision", None)
+                else:
+                    details[detail_key or "venue_provision"] = (value,)
+                editing = None
+                temporary = []
+                target = "hub"
+            elif operation == "select_time":
+                if editing != "times":
+                    raise RuntimeError("Opponent Search Time detail is not open")
+                if value is None:
+                    details.pop("times", None)
+                else:
+                    details["times"] = (value,)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "submit_exact_time":
+                if editing != "times" or not exact_time_prompt:
+                    raise RuntimeError("Opponent Search exact-time prompt is not open")
+                if value is None or not _canonical_game_search_time(value):
+                    raise ValueError("Opponent Search exact time must be canonical")
+                details["times"] = (value,)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "exact_time_prompt":
+                if editing != "times":
+                    raise RuntimeError("Opponent Search Time detail is not open")
+                exact_time_prompt = True
+                target = "exact_time_prompt"
+            elif operation == "commit":
+                if editing is None or editing == "times":
+                    raise RuntimeError("No multi-select Opponent Search detail is open")
+                if temporary:
+                    details[editing] = tuple(temporary)
+                else:
+                    details.pop(editing, None)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+                target = "hub"
+            elif operation == "back":
+                if exact_time_prompt and editing == "times":
+                    exact_time_prompt = False
+                    target = "submenu"
+                elif editing is None:
+                    target = "post_core"
+                else:
+                    editing = None
+                    temporary = []
+                    exact_time_prompt = False
+                    target = "hub"
+            else:
+                raise RuntimeError("Unknown Opponent Search detail operation")
+            now = self._clock.now()
+            state = replace(
+                current,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                opponent_search_details=tuple(sorted(details.items())),
+                editing_opponent_search_detail=editing,
+                opponent_search_detail_draft=tuple(temporary),
+                opponent_search_exact_time_prompt=exact_time_prompt,
+            )
+            if target == "post_core":
+                if draft.country is None or draft.city is None:
+                    raise RuntimeError("Opponent Search Details lost its Search Area")
+                message = _post_core_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
+                    user_intent=draft.user_intent,
+                )
+            elif target == "submenu":
+                assert editing is not None
+                message = _opponent_search_detail_submenu_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    detail_key=editing,
+                    temporary=tuple(temporary),
+                )
+            elif target == "exact_time_prompt":
+                message = _game_search_exact_time_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                )
+            else:
+                message = _opponent_search_details_hub_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    details=details,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                draft=changed_draft,
+                state=state,
+                message=message,
+                recorded_at=now,
+            )
+        self.deliver_pending()
 
     def _change_game_search_details(
         self,
@@ -2697,6 +3149,7 @@ class ConversationOnboarding:
                     city=draft.city,
                     areas=draft.sub_city_areas,
                     whole_city=draft.whole_city,
+                    user_intent=draft.user_intent,
                 )
             else:
                 message = _game_search_details_hub_message(
@@ -2785,7 +3238,13 @@ class ConversationOnboarding:
                 selection=self._language_rendering(current.locale or "en"),
             )
         else:
-            message = _open_match_result_message(
+            renderer = (
+                _opponent_request_result_message
+                if dict(current_result.card_facts).get("opportunity_type")
+                == "opponent_request"
+                else _open_match_result_message
+            )
+            message = renderer(
                 delivery_id=f"search-result:{completed_search_id}",
                 telegram_user_id=telegram_user_id,
                 locale=current.locale or "en",
@@ -3502,6 +3961,7 @@ class ConversationOnboarding:
             city=draft.city,
             areas=draft.sub_city_areas,
             whole_city=draft.whole_city,
+            user_intent=draft.user_intent,
         )
         self._store.commit_conversation_update(
             update_id=update_id,
@@ -4030,6 +4490,7 @@ class ConversationOnboarding:
                 city=draft.city,
                 areas=accepted_areas,
                 whole_city=interpretation.whole_city,
+                user_intent=draft.user_intent,
             )
         self._store.commit_conversation_update(
             update_id=update_id,
@@ -5291,6 +5752,7 @@ def _discovery_message(
             city=draft.city,
             areas=draft.sub_city_areas,
             whole_city=draft.whole_city,
+            user_intent=draft.user_intent,
         )
     if draft.stage is ConversationStage.SUBMITTING:
         return _submitting_message(
@@ -5517,6 +5979,7 @@ def _post_core_message(
     city: AcceptedLocation,
     areas: tuple[AcceptedLocation, ...],
     whole_city: bool,
+    user_intent: UserIntent | None = None,
 ) -> TelegramMessage:
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     body, details_label, search_label = _POST_CORE_COPY[copy_locale]
@@ -5530,6 +5993,11 @@ def _post_core_message(
         locale=copy_locale,
         whole_city_label=whole_city_label,
     )
+    details_callback = (
+        "opponent-details:hub"
+        if user_intent is UserIntent.OPPONENT_SEARCH
+        else "details:open"
+    )
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -5538,7 +6006,7 @@ def _post_core_message(
         text=f"✅ {heading}: **{scope}**.\n\n{body}",
         button_rows=(
             ((back_label, f"direction:back:{screen_revision}"),),
-            ((details_label, f"details:open:{screen_revision}"),),
+            ((details_label, f"{details_callback}:{screen_revision}"),),
             ((search_label, f"search:submit:{screen_revision}"),),
         ),
     )
@@ -5702,6 +6170,109 @@ def _game_search_exact_time_message(
     )
 
 
+def _opponent_search_details_hub_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    details: dict[str, tuple[str, ...]],
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    names = _OPPONENT_SEARCH_DETAIL_NAMES[copy_locale]
+    not_set, back_label, search_label = {
+        "en": ("not set", "Back", "Search"),
+        "ru": ("не задано", "Назад", "Поиск"),
+        "es": ("sin definir", "Atrás", "Buscar"),
+        "fr": ("non défini", "Retour", "Rechercher"),
+    }[copy_locale]
+    keys = tuple(_OPPONENT_SEARCH_DETAIL_OPTIONS)
+    summaries = tuple(
+        ", ".join(
+            _OPPONENT_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+            for value in details.get(key, ())
+        )
+        or not_set
+        for key in keys
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="You can choose the following Opponent Search settings:\n\n"
+        + "\n".join(f"- {name}" for name in names),
+        button_rows=(
+            *tuple(
+                (
+                    (
+                        f"{name}: {summary} ▸",
+                        f"opponent-details:open:{key}:{screen_revision}",
+                    ),
+                )
+                for key, name, summary in zip(keys, names, summaries, strict=True)
+            ),
+            ((back_label, f"details:back:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _opponent_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    keys = tuple(_OPPONENT_SEARCH_DETAIL_OPTIONS)
+    heading = _OPPONENT_SEARCH_DETAIL_NAMES[copy_locale][keys.index(detail_key)]
+    done_label, any_label, back_label, exact_label = {
+        "en": ("Done", "Any", "Back", "Enter exact time"),
+        "ru": ("Готово", "Неважно", "Назад", "Указать точное время"),
+        "es": ("Listo", "Cualquiera", "Atrás", "Indicar hora exacta"),
+        "fr": ("Valider", "Peu importe", "Retour", "Indiquer l’heure exacte"),
+    }[copy_locale]
+
+    def button(value: str) -> tuple[str, str]:
+        return (
+            f"{'✓ ' if value in temporary else ''}"
+            f"{_OPPONENT_SEARCH_VALUE_COPY[copy_locale].get(value, value)}",
+            (
+                f"opponent-details:time:{value}:{screen_revision}"
+                if detail_key == "times"
+                else f"opponent-details:toggle:{value}:{screen_revision}"
+            ),
+        )
+
+    rows: tuple[tuple[tuple[str, str], ...], ...]
+    if detail_key == "times":
+        rows = (
+            ((exact_label, f"opponent-details:time:exact:{screen_revision}"),),
+            (button("morning"), button("daytime")),
+            (button("evening"), button("night")),
+            ((any_label, f"opponent-details:time:any:{screen_revision}"),),
+        )
+    else:
+        values = _OPPONENT_SEARCH_DETAIL_OPTIONS[detail_key]
+        rows = tuple((button(value),) for value in values)
+        rows = (*rows, ((done_label, f"opponent-details:done:{screen_revision}"),))
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"{heading}.",
+        button_rows=(
+            *rows,
+            ((back_label, f"opponent-details:back:{screen_revision}"),),
+        ),
+    )
+
+
 def _zero_result_message(
     *,
     delivery_id: str,
@@ -5725,6 +6296,167 @@ def _zero_result_message(
         screen_revision=screen_revision,
         text=text,
         button_rows=(((new_search_label, f"menu:new-search:{screen_revision}"),),),
+        reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _opponent_request_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+) -> TelegramMessage:
+    """Render an Opponent Request card from accepted facts and match evidence."""
+    facts = dict(result.card_facts)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    labels = {
+        "en": {
+            "title": "Opponent Request",
+            "possible": "Possible match: some requested details need clarification.",
+            "match": "Matching evidence",
+            "confirmed": "confirmed",
+            "unknown": "needs clarification",
+            "posted": "Posted",
+            "contact": "Contact",
+            "venue": "Venue provision",
+            "details": "Accepted details",
+        },
+        "ru": {
+            "title": "Запрос соперника",
+            "possible": "Возможное совпадение: некоторые детали нужно уточнить.",
+            "match": "Свидетельства совпадения",
+            "confirmed": "подтверждено",
+            "unknown": "нужно уточнить",
+            "posted": "Пост",
+            "contact": "Контакт",
+            "venue": "Организация площадки",
+            "details": "Подтверждённые детали",
+        },
+        "es": {
+            "title": "Solicitud de rival",
+            "possible": "Coincidencia posible: hay detalles que aclarar.",
+            "match": "Evidencia de coincidencia",
+            "confirmed": "confirmado",
+            "unknown": "necesita aclaración",
+            "posted": "Publicado",
+            "contact": "Contacto",
+            "venue": "Organización del campo",
+            "details": "Detalles aceptados",
+        },
+        "fr": {
+            "title": "Demande d’adversaire",
+            "possible": (
+                "Correspondance possible : certains détails doivent être précisés."
+            ),
+            "match": "Preuves de correspondance",
+            "confirmed": "confirmé",
+            "unknown": "à préciser",
+            "posted": "Publié",
+            "contact": "Contact",
+            "venue": "Organisation du terrain",
+            "details": "Détails acceptés",
+        },
+    }[copy_locale]
+    start = date.fromisoformat(facts["start_local_date"])
+    end = date.fromisoformat(facts.get("end_local_date", facts["start_local_date"]))
+    when = (
+        start.isoformat()
+        if start == end
+        else f"{start.isoformat()} – {end.isoformat()}"
+    )
+    exact_time = facts.get("exact_local_time") or facts.get("day_part")
+    if exact_time:
+        when += f", {exact_time}"
+    where = facts[f"city_display_{copy_locale}"]
+    if int(facts.get("location_specificity", "0")) > 1:
+        where += f", {facts[f'place_display_{copy_locale}']}"
+    value_copy = {
+        "team_has_venue": {
+            "en": "Team has venue",
+            "ru": "У команды есть площадка",
+            "es": "El equipo tiene campo",
+            "fr": "L’équipe dispose d’un terrain",
+        },
+        "needs_opponent_venue": {
+            "en": "Needs opponent venue",
+            "ru": "Нужна площадка соперника",
+            "es": "Necesita el campo del rival",
+            "fr": "Besoin du terrain de l’adversaire",
+        },
+        "arrange_jointly": {
+            "en": "Arrange jointly",
+            "ru": "Организовать вместе",
+            "es": "Organizar juntos",
+            "fr": "À organiser ensemble",
+        },
+    }
+    details: list[str] = []
+    for key in (
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+    ):
+        raw = facts.get(key)
+        if raw:
+            values = json.loads(raw)
+            if isinstance(values, list) and values:
+                details.append(
+                    ", ".join(str(value).replace("_", " ") for value in values)
+                )
+    if facts.get("venue_provision") in value_copy:
+        details.append(
+            f"{labels['venue']}: {value_copy[facts['venue_provision']][copy_locale]}"
+        )
+    if facts.get("payment"):
+        payment = facts["payment"]
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            payment += f" ({facts['payment_amount']} {facts['payment_currency']})"
+        details.append(payment)
+    match_states = json.loads(facts.get("match_states", "{}"))
+    confirmed = sorted(
+        key.replace("_", " ")
+        for key, state in match_states.items()
+        if state == "confirmed"
+    )
+    unknown = sorted(
+        key.replace("_", " ")
+        for key, state in match_states.items()
+        if state == "unknown"
+    )
+    evidence_parts = [f"{key}: {labels['confirmed']}" for key in confirmed] + [
+        f"{key}: {labels['unknown']}" for key in unknown
+    ]
+    match_copy = f"{labels['match']}: " + (
+        "; ".join(evidence_parts) or labels["confirmed"]
+    )
+    source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
+        ZoneInfo(facts["iana_timezone"])
+    )
+    posted = f"{source_time.date().isoformat()} {source_time:%H:%M}"
+    route_copy = render_response_route(
+        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    )
+    possible_copy = (
+        f"\n{labels['possible']}\n" if result.result_class == "possible_match" else ""
+    )
+    details_copy = f"{labels['details']}: {' · '.join(details)}\n" if details else ""
+    text = (
+        f"⚽ {labels['title']}\n{when}\n{where}\n"
+        f"{details_copy}{possible_copy}{match_copy}\n"
+        f"{labels['posted']}: {posted}\n{labels['contact']}: {route_copy}"
+    )
+    menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(),
         reply_button=menu_label,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -8119,6 +8851,11 @@ class RuntimeApplication:
                 candidate_key=proof_candidate_key,
                 evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
                 routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+                meaning=(
+                    cast(str, proof_candidate["opportunity_type"])
+                    if isinstance(proof_candidate.get("opportunity_type"), str)
+                    else "open_match"
+                ),
             )
             semantic_proof_attempt = _classification_attempt_from_result(
                 semantic_proof_recorded_result,
@@ -9130,6 +9867,11 @@ class RuntimeApplication:
                             candidate_key=candidate_key,
                             evidence=evidence,
                             routes=routes,
+                            meaning=(
+                                cast(str, candidate["opportunity_type"])
+                                if isinstance(candidate.get("opportunity_type"), str)
+                                else "open_match"
+                            ),
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -9882,7 +10624,7 @@ class RuntimeApplication:
                         {
                             "opportunity_id": opportunity_id,
                             "opportunity_revision_id": opportunity_revision_id,
-                            "opportunity_type": "open_match",
+                            "opportunity_type": accepted_candidate["opportunity_type"],
                             "accepted_facts": accepted_candidate["accepted_facts"],
                             "response_route": accepted_candidate["response_route"],
                         }
@@ -10066,7 +10808,7 @@ class RuntimeApplication:
                 "opportunity_revision_id": opportunity_revision_id,
                 "source_message_revision_id": revision_id,
                 "publication_state": "active",
-                "opportunity_type": "open_match",
+                "opportunity_type": accepted["opportunity_type"],
                 "accepted_facts": accepted["accepted_facts"],
                 "response_route": accepted["response_route"],
             },
@@ -10732,6 +11474,9 @@ class RuntimeApplication:
         game_search_details = _runtime_game_search_details(
             payload.get("game_search_details")
         )
+        opponent_search_details = _runtime_opponent_search_details(
+            payload.get("opponent_search_details")
+        )
         completed_search = CompletedSearch(
             completed_search_id=completed_search_id,
             telegram_user_id=telegram_user_id,
@@ -10744,6 +11489,7 @@ class RuntimeApplication:
             required_date=_runtime_required_date(payload.get("required_date")),
             completed_at=self.clock.now(),
             game_search_details=tuple(sorted(game_search_details.items())),
+            opponent_search_details=tuple(sorted(opponent_search_details.items())),
             sub_city_area_geographic_types=tuple(
                 value for value in area_types if isinstance(value, str)
             ),
@@ -12021,6 +12767,7 @@ def _proposition_evidence_is_authoritative(
     routes: list[JsonValue],
     semantic_proof: JsonValue | None = None,
     source_message_revision_reference: str | None = None,
+    meaning: str = "open_match",
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
@@ -12030,6 +12777,7 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -12038,6 +12786,7 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -12046,13 +12795,16 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     )
     if (
         graph is None
         or not graph.is_current_positive()
         or not graph.has_complete_support_topology()
         or not graph.has_exact_support_spans()
-        or not _proposition_graph_has_closed_target_set(graph, evidence, routes)
+        or not _proposition_graph_has_closed_target_set(
+            graph, evidence, routes, meaning=meaning
+        )
     ):
         return False
     contract = cast(dict[str, JsonValue], value)
@@ -12063,7 +12815,7 @@ def _proposition_evidence_is_authoritative(
     if (
         not isinstance(root, dict)
         or root.get("domain") != "football_match"
-        or root.get("meaning") != "open_match"
+        or root.get("meaning") != meaning
         or root.get("polarity") != "positive"
         or root.get("currentness") != "current"
         or not isinstance(facts, dict)
@@ -12131,6 +12883,19 @@ _OPTIONAL_OPEN_MATCH_FACTS = frozenset(
         "team_formats",
         "positions",
         "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+)
+_MANDATORY_OPPONENT_REQUEST_FACTS = frozenset(
+    {"opportunity", "event_time", "location", "opponent_request"}
+)
+_OPTIONAL_OPPONENT_REQUEST_FACTS = frozenset(
+    {
+        "team_formats",
+        "playing_levels",
+        "venue_provision",
         "venue_settings",
         "playing_surfaces",
         "payment",
@@ -12304,6 +13069,14 @@ def _proposition_lineage_features(
         features[f"evidence:{key}"] = (
             evidence_value if isinstance(evidence_value, str) else None
         )
+    if value.get("opportunity_type") == "opponent_request":
+        features["fact:opponent_request"] = accepted_facts.get("opponent_request")
+        features["fact:venue_provision"] = accepted_facts.get("venue_provision")
+        for key in ("opponent_request", "venue_provision"):
+            evidence_value = evidence.get(key)
+            features[f"evidence:{key}"] = (
+                evidence_value if isinstance(evidence_value, str) else None
+            )
     features["route:kind"] = response_route.get("kind")
     features["route:value"] = response_route.get("value")
     return features
@@ -12327,18 +13100,25 @@ def _proposition_lineage_slot(anchor: str) -> int:
     return int(anchor[:7], 16) + 1
 
 
-def _proposition_opportunity_id(source_message_id: str, anchor: str) -> str:
+def _proposition_opportunity_id(
+    source_message_id: str,
+    anchor: str,
+    opportunity_type: str = "open_match",
+) -> str:
     """Return the stable Application-owned identity for one proposition lineage."""
-    return f"opportunity:{source_message_id}:open_match:proposition:{anchor[:16]}"
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:proposition:{anchor[:16]}"
+    )
 
 
 def _legacy_candidate_alias_for_canonical(
     *,
     source_message_id: str,
     opportunity_id: str,
+    opportunity_type: str = "open_match",
 ) -> str | None:
     """Return the exact historical candidate alias for one proposition id."""
-    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
+    prefix = f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
     if not opportunity_id.startswith(prefix):
         return None
     candidate_hash = opportunity_id.removeprefix(prefix)
@@ -12346,7 +13126,9 @@ def _legacy_candidate_alias_for_canonical(
         character not in "0123456789abcdef" for character in candidate_hash
     ):
         return None
-    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:candidate:{candidate_hash}"
+    )
 
 
 def _canonicalize_legacy_proposition_records(
@@ -12362,7 +13144,13 @@ def _canonicalize_legacy_proposition_records(
         if not isinstance(opportunity_id, str) or not opportunity_id:
             canonical_records.append(dict(record))
             continue
-        legacy_prefix = f"opportunity:{source_message_id}:open_match:candidate:"
+        record_type = record.get("opportunity_type", "open_match")
+        if not isinstance(record_type, str) or record_type not in {
+            "open_match",
+            "opponent_request",
+        }:
+            return None
+        legacy_prefix = f"opportunity:{source_message_id}:{record_type}:candidate:"
         if ":candidate:" in opportunity_id:
             if not opportunity_id.startswith(legacy_prefix):
                 return None
@@ -12372,11 +13160,11 @@ def _canonicalize_legacy_proposition_records(
             ):
                 return None
             opportunity_id = (
-                f"opportunity:{source_message_id}:open_match:proposition:"
+                f"opportunity:{source_message_id}:{record_type}:proposition:"
                 f"{candidate_hash}"
             )
         elif ":proposition:" in opportunity_id and not opportunity_id.startswith(
-            f"opportunity:{source_message_id}:open_match:proposition:"
+            f"opportunity:{source_message_id}:{record_type}:proposition:"
         ):
             return None
         if opportunity_id in seen_opportunity_ids:
@@ -12578,7 +13366,14 @@ def _reconcile_proposition_lineages(
         if assignments[candidate_index] is not None:
             continue
         slot = _proposition_lineage_slot(anchor)
-        opportunity_id = _proposition_opportunity_id(source_message_id, anchor)
+        opportunity_type = candidates[candidate_index].get(
+            "opportunity_type", "open_match"
+        )
+        if not isinstance(opportunity_type, str):
+            return None
+        opportunity_id = _proposition_opportunity_id(
+            source_message_id, anchor, opportunity_type
+        )
         if not assign(
             candidate_index,
             slot=slot,
@@ -12679,6 +13474,8 @@ def _proposition_graph_has_closed_target_set(
     graph: CanonicalPropositionGraph,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    *,
+    meaning: str = "open_match",
 ) -> bool:
     """Bind v1 nodes to the closed Application target set.
 
@@ -12690,11 +13487,14 @@ def _proposition_graph_has_closed_target_set(
     """
     fact_ids = {node.node_id for node in graph.facts}
     evidence_ids = set(evidence)
+    mandatory_facts, optional_facts = (
+        (_MANDATORY_OPPONENT_REQUEST_FACTS, _OPTIONAL_OPPONENT_REQUEST_FACTS)
+        if meaning == "opponent_request"
+        else (_MANDATORY_OPEN_MATCH_FACTS, _OPTIONAL_OPEN_MATCH_FACTS)
+    )
     if (
-        not _MANDATORY_OPEN_MATCH_FACTS.issubset(evidence_ids)
-        or not evidence_ids.issubset(
-            _MANDATORY_OPEN_MATCH_FACTS | _OPTIONAL_OPEN_MATCH_FACTS
-        )
+        not mandatory_facts.issubset(evidence_ids)
+        or not evidence_ids.issubset(mandatory_facts | optional_facts)
         or fact_ids != evidence_ids
     ):
         return False
@@ -12795,28 +13595,34 @@ def _validated_open_match_proposal(
     candidate = candidates[0]
     if not isinstance(candidate, dict):
         return None
+    opportunity_type = candidate.get("opportunity_type")
+    if not isinstance(opportunity_type, str) or opportunity_type not in {
+        "open_match",
+        "opponent_request",
+    }:
+        return None
+    is_opponent_request = opportunity_type == "opponent_request"
     required = {
         "candidate_key",
         "opportunity_type",
         "evidence",
         "location",
         "event_time",
-        "open_places",
         "response_routes",
     }
+    required.add("opponent_request" if is_opponent_request else "open_places")
     optional = {
         "team_formats",
-        "positions",
         "playing_levels",
         "venue_settings",
         "playing_surfaces",
         "payment",
     }
+    optional.add("venue_provision" if is_opponent_request else "positions")
     structured = {"proposition_evidence", "source_context"}
     if (
         not required.issubset(candidate)
         or set(candidate) - required - optional - structured
-        or candidate.get("opportunity_type") != "open_match"
     ):
         return None
     candidate_key = candidate.get("candidate_key")
@@ -12825,12 +13631,15 @@ def _validated_open_match_proposal(
     event_time = candidate.get("event_time")
     routes = candidate.get("response_routes")
     source_context = candidate.get("source_context")
+    expected_evidence = (
+        {"opportunity", "event_time", "location", "opponent_request"}
+        if is_opponent_request
+        else {"opportunity", "event_time", "location", "open_places"}
+    ) | (set(candidate) & optional)
     if (
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
-        or set(evidence)
-        != {"opportunity", "event_time", "location", "open_places"}
-        | (set(candidate) & optional)
+        or set(evidence) != expected_evidence
         or not all(
             isinstance(value, str) and value in body for value in evidence.values()
         )
@@ -12843,6 +13652,8 @@ def _validated_open_match_proposal(
         )
         or (isinstance(source_context, str) and source_context not in body)
     ):
+        return None
+    if is_opponent_request and candidate.get("opponent_request") is not True:
         return None
     validation_body = source_context if isinstance(source_context, str) else body
     route = _select_response_route(
@@ -12861,6 +13672,7 @@ def _validated_open_match_proposal(
         source_message_revision_reference=_opaque_classifier_reference(
             revision_id, kind="revision"
         ),
+        meaning=opportunity_type,
     ):
         return None
     if route is None:
@@ -12912,10 +13724,11 @@ def _validated_open_match_proposal(
     )
     if len(places) != 1:
         return None
-    open_places = candidate.get("open_places")
+    open_places = None if is_opponent_request else candidate.get("open_places")
     team_formats = candidate.get("team_formats")
     positions = candidate.get("positions")
     levels = candidate.get("playing_levels")
+    venue_provision = candidate.get("venue_provision")
     settings = candidate.get("venue_settings")
     surfaces = candidate.get("playing_surfaces")
     payment = candidate.get("payment")
@@ -12932,8 +13745,23 @@ def _validated_open_match_proposal(
             team_formats,
             {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
         )
-        or not _optional_canonical_list(
-            positions, {"goalkeeper", "defender", "midfielder", "forward"}
+        or (
+            not is_opponent_request
+            and not _optional_canonical_list(
+                positions, {"goalkeeper", "defender", "midfielder", "forward"}
+            )
+        )
+        or (is_opponent_request and positions is not None)
+        or (
+            is_opponent_request
+            and venue_provision
+            not in {
+                None,
+                "unknown",
+                "team_has_venue",
+                "needs_opponent_venue",
+                "arrange_jointly",
+            }
         )
         or not _optional_canonical_list(
             levels,
@@ -13001,10 +13829,13 @@ def _validated_open_match_proposal(
         )
         or mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
-        or not _open_places_are_supported(
-            open_places,
-            f"{evidence['opportunity']}. {evidence['open_places']}",
-            authoritative_body=validation_body,
+        or (
+            not is_opponent_request
+            and not _open_places_are_supported(
+                open_places,
+                f"{evidence['opportunity']}. {evidence['open_places']}",
+                authoritative_body=validation_body,
+            )
         )
         or not _optional_values_are_supported(
             candidate,
@@ -13049,13 +13880,29 @@ def _validated_open_match_proposal(
             f"place_display_{locale}": localized.get(locale, places[0].display_name)
             for locale in ("en", "ru", "es", "fr")
         },
-        "open_places": open_places,
-        "team_formats": team_formats,
-        "positions": positions,
-        "playing_levels": levels,
-        "venue_settings": settings,
-        "playing_surfaces": surfaces,
-        "payment": None if payment == "unknown" else payment,
+        **(
+            {
+                "open_places": open_places,
+                "team_formats": team_formats,
+                "positions": positions,
+                "playing_levels": levels,
+                "venue_settings": settings,
+                "playing_surfaces": surfaces,
+                "payment": None if payment == "unknown" else payment,
+            }
+            if not is_opponent_request
+            else {
+                "opponent_request": True,
+                "team_formats": team_formats,
+                "playing_levels": levels,
+                "venue_provision": (
+                    None if venue_provision in {None, "unknown"} else venue_provision
+                ),
+                "venue_settings": settings,
+                "playing_surfaces": surfaces,
+                "payment": None if payment == "unknown" else payment,
+            }
+        ),
         "payment_amount": payment_details[0] if payment_details is not None else None,
         "payment_currency": (
             payment_details[1] if payment_details is not None else None
@@ -13064,10 +13911,10 @@ def _validated_open_match_proposal(
     }
     return {
         "opportunity_id": (
-            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:open_match"
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:{opportunity_type}"
         ),
         "source_message_revision_id": revision_id,
-        "opportunity_type": "open_match",
+        "opportunity_type": opportunity_type,
         "publication_state": "active",
         "accepted_facts": accepted_facts,
         "evidence": {
@@ -15074,6 +15921,7 @@ def _optional_values_are_supported(
                 "team_formats",
                 "positions",
                 "playing_levels",
+                "venue_provision",
                 "venue_settings",
                 "playing_surfaces",
                 "payment",
@@ -15268,6 +16116,45 @@ def _optional_values_are_supported(
                 field_name=field_name,
             ):
                 return False
+    venue_provision = candidate.get("venue_provision")
+    if venue_provision is not None:
+        venue_evidence = evidence.get("venue_provision")
+        venue_patterns = {
+            "team_has_venue": (
+                r"\b(?:we|our|the\s+team)\s+(?:have|has|got|provide|provides)\b"
+                r"[^.!?;\n]{0,40}\b(?:venue|field|pitch|location|place)\b",
+                r"\b(?:venue|field|pitch|location|place)\b[^.!?;\n]{0,40}"
+                r"\b(?:we|our|the\s+team)\s+(?:have|has|got)\b",
+            ),
+            "needs_opponent_venue": (
+                r"\b(?:need|needs|looking\s+for|require|requires)\b[^.!?;\n]{0,40}"
+                r"\b(?:opponent['’]?s?\s+)?(?:venue|field|pitch|location|place)\b",
+                r"\b(?:opponent|other\s+team)\b[^.!?;\n]{0,40}"
+                r"\b(?:provide|provides|arrange|organize)\b[^.!?;\n]{0,30}"
+                r"\b(?:venue|field|pitch|location|place)\b",
+            ),
+            "arrange_jointly": (
+                r"\b(?:arrange|organize|decide|choose)\b[^.!?;\n]{0,40}"
+                r"\b(?:together|jointly|between\s+both\s+teams)\b",
+                r"\b(?:venue|field|pitch|location|place)\b[^.!?;\n]{0,40}"
+                r"\b(?:together|jointly|between\s+both\s+teams)\b",
+            ),
+            "unknown": (
+                r"\b(?:venue|field|pitch|location|place)\b[^.!?;\n]{0,30}"
+                r"\b(?:unknown|unspecified|not\s+specified|not\s+stated)\b",
+                r"\b(?:unknown|unspecified|not\s+specified|not\s+stated)\b[^.!?;\n]{0,30}"
+                r"\b(?:venue|field|pitch|location|place)\b",
+            ),
+        }
+        if (
+            not isinstance(venue_provision, str)
+            or not isinstance(venue_evidence, str)
+            or venue_provision not in venue_patterns
+            or not _patterns_have_affirmative_clause_support(
+                venue_evidence.casefold(), venue_patterns[venue_provision]
+            )
+        ):
+            return False
     payment = candidate.get("payment")
     if payment is not None:
         payment_evidence = evidence.get("payment")
@@ -15526,6 +16413,44 @@ def _runtime_game_search_details(
         ):
             raise TypeError("RunSearch Game Search details must be string lists")
         details[key] = tuple(item for item in raw if isinstance(item, str))
+    return details
+
+
+def _runtime_opponent_search_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical optional Opponent Search criteria."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch opponent_search_details must be an object")
+    allowed = set(_OPPONENT_SEARCH_DETAIL_OPTIONS) | {"times"}
+    if set(value) - allowed:
+        raise ValueError("RunSearch opponent search details have unsupported keys")
+    details: dict[str, tuple[str, ...]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise TypeError("RunSearch Opponent Search details must be string lists")
+        typed_raw = cast(list[str], raw)
+        if key == "times":
+            valid = all(
+                item in _OPPONENT_SEARCH_DETAIL_OPTIONS["times"]
+                or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", item) is not None
+                for item in typed_raw
+            )
+        else:
+            valid = all(
+                item in _OPPONENT_SEARCH_DETAIL_OPTIONS[key] for item in typed_raw
+            )
+        if (
+            not valid
+            or len(typed_raw) != len(set(typed_raw))
+            or (key in {"times", "venue_provision"} and len(raw) > 1)
+        ):
+            raise ValueError("RunSearch Opponent Search details have invalid values")
+        details[key] = tuple(typed_raw)
     return details
 
 
