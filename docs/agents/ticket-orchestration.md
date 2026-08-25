@@ -4,6 +4,9 @@ This document is the normative operating policy for coordinating implementation
 tickets. GitHub remains the durable source of truth for specifications, native
 dependencies, tickets, pull requests, checks, reviews, and transition records.
 Codex callbacks wake a coordinator; they never replace GitHub reconciliation.
+The per-ticket lifecycle is callback-driven rather than monitor-driven: after
+dispatching one subordinate task, the coordinator suspends until that exact
+task reports one terminal outcome.
 
 ## Ownership and activation
 
@@ -12,6 +15,11 @@ coordinator must not own a second ticket, and no ticket may have two
 coordinators. Multiple live frontiers may have separate coordinators only when
 the current native dependency graph permits those frontiers to proceed in
 parallel.
+
+Within one ticket, subordinate implementation, review, and fix tasks are
+strictly sequential. The coordinator may have at most one such task active at
+a time. Every stage uses a fresh task with a self-contained handoff; a prior
+task is never reused for the next stage.
 
 A coordinator that completes a ticket is a candidate to create coordinators
 for newly permitted frontiers and creates only those for which the election
@@ -51,6 +59,14 @@ the creation mechanism. Every non-elected completing coordinator must instead
 reconcile and confirm the elected coordinator's active task or durable creation
 record; it must never self-promote or create a fallback coordinator.
 
+Every fresh ticket coordinator is created explicitly with `gpt-5.6-luna` and
+reasoning effort `max` through the supported task-creation controls. Never rely
+on a workspace, account, application, or parent-task default. These settings
+govern Codex ticket coordination only; they do not change any model selected by
+the football-bot application at runtime. The creation response or durable
+creation record must capture the requested and effective coordinator model and
+reasoning effort.
+
 The elected coordinator does not terminate until every creation it owns is
 confirmed or a genuine creation failure is durably reported. Absence of a task
 during one reconciliation is not a failure: a genuine failure requires the
@@ -61,13 +77,40 @@ creation. On success, the final `Next handoff` block identifies every created
 coordinator and keeps paste-ready prompts as fallback documentation only; the
 product owner is not asked to relay them. On genuine failure, it identifies
 each affected frontier and provides its exact prompt for manual recovery.
+Confirmation here means confirming creation through the task-creation response
+or durable creation record; it never means monitoring the newly created
+coordinator's later work.
 
-A new coordinator initially has read-only readiness authority. It reconciles
-routing, exact `main`, the live frontier, required credentials and services,
-the applicability of any standing authorization, GitHub transition records,
-branches and pull requests, and active Codex tasks. It then stops and waits for
-an unambiguous product-owner start approval that either names the ticket or is
-exactly `Согласен` or `Утверждаю`.
+A new coordinator initially has read-only readiness authority. In its first
+response after the initial handoff, it must verify and report whether
+`gpt-5.6-luna` with reasoning effort `max` remains both available and suitable
+for this ticket. The check must use current official OpenAI model documentation,
+the model-and-effort combinations supported by the target Codex App creation
+mechanism, and the ticket's scope, uncertainty, integration breadth, risk, and
+verification demands. It must not treat a higher reasoning effort as proof that
+one model is equivalent to another. The coordinator also reconciles routing,
+exact `main`, the live frontier, required credentials and services, the
+applicability of any standing authorization, GitHub transition records,
+branches and pull requests, and active Codex tasks.
+
+The first response must show the model-freshness result and explicitly ask the
+product owner to confirm or revise the model and reasoning effort together with
+the ticket's start approval. If the check reports no blocker, one subsequent
+approval that names the ticket or is exactly `Согласен` or `Утверждаю` confirms
+both the reported `gpt-5.6-luna`/`max` selection and the start. If the model or
+effort is unavailable, deprecated, unsupported by the target mechanism, or
+materially unsuitable, the coordinator stops and requests an explicit
+product-owner policy amendment; a generic approval does not override that
+result. The coordinator must never silently substitute another model or effort.
+
+Do not assume that creation settings are immutable or inherited by later
+programmatic messages. Every supported creation or automated resume operation
+that accepts model controls must explicitly select `gpt-5.6-luna` and `max`.
+Before dispatch or mutation, reconcile the effective task settings. If they do
+not match, suspend safely and resolve the mismatch through a supported override
+or an explicit product-owner policy amendment; never create a duplicate task
+merely to retarget it. Any in-flight exception must be durably recorded and
+reconciled before the next transition.
 
 Before that approval, the coordinator must not:
 
@@ -87,20 +130,28 @@ One valid start approval authorizes the coordinator to drive the following
 ticket lifecycle without asking the product owner to relay handoffs or approve
 ordinary transitions:
 
-1. Reconcile durable state and claim the ticket.
-2. Create a fresh implementation task and worktree using `gpt-5.6-sol` with
-   reasoning effort `high`; require one dedicated `codex/` branch and one
+1. Reconcile durable state, claim the ticket, and publish the confirmed model,
+   reasoning effort, freshness-check basis, and effective coordinator settings
+   in the ticket activation record.
+2. Create a fresh implementation task and worktree using `gpt-5.6-luna` with
+   reasoning effort `max`; require one dedicated `codex/` branch and one
    non-draft implementation pull request containing `Closes #<ticket>`.
-3. Receive the implementation task's terminal callback only after its durable
-   GitHub status is published.
-4. Reconcile the callback against GitHub, the native graph, durable transition
-   comments, branches and pull requests, and active Codex tasks.
-5. After successful exact-head CI, dispatch a fresh independent review that
-   evaluates Standards and specification fidelity separately.
-6. If a blocking finding exists, dispatch a separate fresh fix task scoped to
-   the published finding. After every fix commit, require exact-head CI and a
-   fresh independent Standards and Spec review of the complete pull-request
-   diff. Repeat until no blocking finding remains or a stop condition applies.
+3. Immediately after a successful dispatch, end the coordinator's active turn.
+   Do not inspect, poll, wait on, or send progress requests to the subordinate
+   task. Its terminal callback is the only automatic wake-up source for that
+   stage.
+4. Resume only after the expected task's terminal callback, then reconcile the
+   callback against GitHub, the native graph, durable transition comments,
+   branches and pull requests, and active Codex tasks.
+5. After a successful implementation outcome and successful exact-head CI,
+   dispatch a fresh independent review that evaluates Standards and
+   specification fidelity separately, then suspend again under steps 3-4.
+6. After the review callback, if a blocking finding exists, dispatch a separate
+   fresh fix task scoped to the published finding and suspend again. After the
+   fix callback and successful exact-head CI, dispatch a fresh independent
+   Standards and Spec review of the complete pull-request diff. Repeat this
+   callback-driven fix/re-review loop until no blocking finding remains or a
+   stop condition applies.
 7. Immediately before merge, revalidate every gate for the exact current head,
    including the applicable product-owner merge authorization. Merge only
    when all exact-head gates are valid.
@@ -112,10 +163,10 @@ ordinary transitions:
    confirm the elected result for every other newly permitted frontier. Report
    all results in the final `Next handoff` block.
 
-Every implementation, independent-review, and fix task is fresh and uses
-`gpt-5.6-sol` with reasoning effort `high`. Review and fix tasks receive only
-the branch and mutation authority required by their stage; an independent
-review remains read-only.
+Every implementation, independent-review, and fix task is fresh and is created
+explicitly with `gpt-5.6-luna` and reasoning effort `max`. Never inherit task
+defaults. Review and fix tasks receive only the branch and mutation authority
+required by their stage; an independent review remains read-only.
 
 Every new commit invalidates prior exact-head CI, mergeability, review-thread
 counts, Standards review, Spec review, and merge-authorization revalidation.
@@ -147,10 +198,12 @@ Before every dispatch or mutation, the coordinator must reconcile:
 - active Codex tasks and their ownership.
 
 If the intended transition is already durable or its task is already active,
-the coordinator exits that transition without duplicating it. A callback is a
-wake-up signal, not evidence that the reported transition is still current.
-Creator election decides who may attempt a missing transition; the idempotency
-key and reconciliation detect an already attempted one. Neither is an atomic
+the coordinator exits that transition without duplicating it. If the expected
+subordinate task is active, the coordinator remains suspended and must not
+inspect its progress or dispatch a replacement. A callback is a wake-up signal,
+not evidence that the reported transition is still current. Creator election
+decides who may attempt a missing transition; the idempotency key and
+reconciliation detect an already attempted one. Neither is an atomic
 reservation, so the policy does not assume a platform guarantee that the
 supported task-creation mechanism does not provide.
 
@@ -162,13 +215,24 @@ sequence:
 1. Publish its terminal status to the canonical GitHub issue or pull request.
 2. Send exactly one `codex_app__send_message_to_thread` callback to the dynamic
    `<COORDINATOR_THREAD_ID>` and `<COORDINATOR_HOST_ID>` supplied in its
-   handoff.
+   handoff, explicitly selecting destination model `gpt-5.6-luna` and reasoning
+   effort `max` so the resumed coordinator does not inherit different defaults.
 3. End without a progress callback, a retry after a successful send, or a
    request that the product owner relay the result.
 
+Implementation and fix tasks send their callback only after the required
+exact-head checks have reached a terminal outcome, or after they have published
+a durable blocked or failed outcome. A failed callback send may be retried only
+until one delivery succeeds; after one successful terminal callback, no retry
+is permitted. If callback delivery remains unavailable, the task publishes a
+durable callback-delivery failure and ends; the coordinator does not poll the
+task to infer completion.
+
 The callback must include:
 
+- the subordinate task identity and transition idempotency key;
 - task kind and terminal status;
+- requested and effective model and reasoning effort;
 - specification, ticket, and pull request;
 - fixed base and exact head;
 - commit list;
@@ -184,17 +248,25 @@ The callback must include:
 GitHub is authoritative if a callback and durable state disagree. The
 coordinator must not accept progress callbacks, hard-coded coordinator IDs in
 repository documentation, duplicate terminal callbacks, or product-owner
-relay as substitutes for this protocol.
+relay as substitutes for this protocol. A late, duplicate, or unexpected-task
+callback causes read-only reconciliation and never authorizes a duplicate or
+out-of-order dispatch.
 
-## One-shot heartbeat
+## Callback-driven suspension and external-state heartbeat
 
-One idempotent coordinator heartbeat is permitted only when the active turn
-cannot keep waiting and a terminal callback cannot continue the lifecycle. It
-must use a supported platform mechanism, reconcile durable state before any
-action, use the transition idempotency key, and exit when no transition is
-needed.
+While a subordinate implementation, review, or fix task is active, no
+coordinator heartbeat, progress wait, task read, polling loop, or recurring
+monitor is permitted. The coordinator ends its active turn after dispatch and
+the expected terminal callback is the only automatic mechanism that resumes
+that subordinate stage.
 
-The heartbeat is one-shot. It must never become a cron job, recurring reminder,
+A one-shot idempotent heartbeat is permitted only when no subordinate task is
+active and the coordinator is waiting for a non-Codex durable external-state
+transition that cannot send a task callback, such as post-merge `quality` or
+frontier-creation reconciliation. It must use a supported platform mechanism,
+reconcile durable state before any action, use the transition idempotency key,
+and exit when no transition is needed. It must never be used to recover a
+missing subordinate callback or become a cron job, recurring reminder,
 repository automation, Git hook, scheduler, daemon, state file, or duplicate
 Codex task.
 
