@@ -112,6 +112,29 @@ def test_tournament_matching_requires_active_open_participation_tournaments() ->
     assert dict(results[0].card_facts)["opportunity_type"] == "tournament"
 
 
+def test_tournament_matching_expires_at_registration_deadline() -> None:
+    valid = _tournament()
+    still_open = evaluate_tournament_search(
+        replace(
+            _completed_search(),
+            completed_at=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+        ),
+        {},
+        (valid,),
+    )
+    expired = evaluate_tournament_search(
+        replace(
+            _completed_search(),
+            completed_at=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+        ),
+        {},
+        (valid,),
+    )
+
+    assert len(still_open) == 1
+    assert expired == ()
+
+
 def test_tournament_details_use_or_within_a_field_and_and_across_fields() -> None:
     valid = _tournament()
     incomplete = replace(

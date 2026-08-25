@@ -220,6 +220,13 @@ SUPPORTED_CONTRACTS = (
         "proposal_id",
     ),
     ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        5,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
         1,
         RuntimeRole.APPLICATION,
@@ -472,7 +479,7 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_classify_source_message_revision(self, self.payload)
         elif (
             self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and self.contract_version in {2, 3, 4}
+            and self.contract_version in {2, 3, 4, 5}
         ):
             _validate_classification_proposal(self, self.payload)
         elif (
@@ -956,7 +963,7 @@ def _validate_source_event_recorded(
         canonical_source_message_id(
             source_chat_key, registry_generation, telegram_message_id
         )
-        if envelope.contract_version == 4
+        if envelope.contract_version in {4, 5}
         else f"{source_chat_key}:message:{telegram_message_id}"
     )
     if envelope.subject_id != expected_subject:
@@ -1354,19 +1361,19 @@ def _validate_classification_proposal(
             "semantic_proof_executions",
             "ambiguity_pass_execution",
         }
-        if envelope.contract_version == 4
+        if envelope.contract_version in {4, 5}
         else set()
     )
     proposal_context_fields = (
         context_fields | {"adjacent_context"}
-        if envelope.contract_version == 4
+        if envelope.contract_version in {4, 5}
         else context_fields
     )
     allowed = (
         {"proposal_id", "source_message_revision_id", "body"}
         | proposal_context_fields
         | provenance_fields
-        | (semantic_fields if envelope.contract_version in {3, 4} else set())
+        | (semantic_fields if envelope.contract_version in {3, 4, 5} else set())
     )
     if set(payload) != allowed:
         raise ValueError("ClassificationProposal has incomplete semantics")
@@ -1438,7 +1445,7 @@ def _validate_classification_proposal(
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
-    if envelope.contract_version == 4:
+    if envelope.contract_version in {4, 5}:
         _validate_adjacent_context(
             payload["adjacent_context"],
             source_chat_reference=_required_text(payload, "source_chat_reference"),
@@ -1450,7 +1457,25 @@ def _validate_classification_proposal(
             ),
             current_event_time=_required_iso_datetime(payload, "source_event_time"),
         )
-        _validate_classification_proposal_v4(payload, body=body)
+        _validate_classification_proposal_v4(
+            payload,
+            body=body,
+            semantic_proof_version=(
+                "source-semantic-proof-v2"
+                if envelope.contract_version == 5
+                else "source-semantic-proof-v1"
+            ),
+            ambiguity_prompt_version=(
+                "open-match-ambiguity-v2"
+                if envelope.contract_version == 5
+                else "open-match-ambiguity-v1"
+            ),
+            ambiguity_schema_version=(
+                "source-message-classification-v3"
+                if envelope.contract_version == 5
+                else "source-message-classification-v2"
+            ),
+        )
     for field_name in ("pass_number", "attempt_number"):
         metric = payload[field_name]
         if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
@@ -1492,6 +1517,23 @@ def _validate_classification_proposal(
             "context_bundle_version": "primary-classifier-context-v1",
         }
     )
+    if envelope.contract_version == 5:
+        pinned = {
+            "requested_model": "gpt-5.6-sol",
+            "effective_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "high",
+            "effective_reasoning_effort": "high",
+            "prompt_version": (
+                "open-match-ambiguity-v2"
+                if payload["pass_number"] == 2
+                else "open-match-primary-v3"
+            ),
+            "schema_version": "source-message-classification-v3",
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": "classifier-context-v1",
+            "routing_policy_version": "classifier-routing-v1",
+            "context_bundle_version": "primary-classifier-context-v1",
+        }
     if any(payload[field_name] != value for field_name, value in pinned.items()):
         raise ValueError("ClassificationProposal provenance version is unsupported")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
@@ -1526,7 +1568,12 @@ def _validate_classification_proposal(
 
 
 def _validate_classification_proposal_v4(
-    payload: dict[str, JsonValue], *, body: str
+    payload: dict[str, JsonValue],
+    *,
+    body: str,
+    semantic_proof_version: str = "source-semantic-proof-v1",
+    ambiguity_prompt_version: str = "open-match-ambiguity-v1",
+    ambiguity_schema_version: str = "source-message-classification-v2",
 ) -> None:
     """Validate multi-candidate proof and one-way ambiguity-pass provenance."""
     output = payload["output"]
@@ -1588,6 +1635,7 @@ def _validate_classification_proposal_v4(
             evidence=evidence,
             routes=routes,
             opportunity_type=cast(str, candidate.get("opportunity_type", "open_match")),
+            semantic_proof_version=semantic_proof_version,
         ):
             raise ValueError("ClassificationProposal v4 semantic proof is invalid")
         proof_keys.add(candidate_key)
@@ -1611,7 +1659,15 @@ def _validate_classification_proposal_v4(
             or "candidate_target_manifest_hash" not in execution
         ):
             raise ValueError("ClassificationProposal v4 target manifest is incomplete")
-        _validate_semantic_proof_execution(execution)
+        _validate_semantic_proof_execution(
+            execution,
+            prompt_version=(
+                "open-match-semantic-proof-v2"
+                if semantic_proof_version == "source-semantic-proof-v2"
+                else "open-match-semantic-proof-v1"
+            ),
+            schema_version=semantic_proof_version,
+        )
         execution_keys.add(candidate_key)
     if output.get("disposition") == "accepted" and (
         proof_keys != execution_keys or proof_keys != set(candidate_by_key)
@@ -1631,10 +1687,19 @@ def _validate_classification_proposal_v4(
     ):
         raise ValueError("v4 pass 1 cannot carry ambiguity-pass provenance")
     if ambiguity_execution is not None:
-        _validate_ambiguity_pass_execution(ambiguity_execution)
+        _validate_ambiguity_pass_execution(
+            ambiguity_execution,
+            prompt_version=ambiguity_prompt_version,
+            schema_version=ambiguity_schema_version,
+        )
 
 
-def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
+def _validate_ambiguity_pass_execution(
+    value: JsonValue,
+    *,
+    prompt_version: str = "open-match-ambiguity-v1",
+    schema_version: str = "source-message-classification-v2",
+) -> None:
     """Validate the one allowed semantic ambiguity-pass execution."""
     fields = {
         "requested_model",
@@ -1679,9 +1744,9 @@ def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
         _required_text(value, field_name)
     if value["status"] != "succeeded":
         raise ValueError("ambiguity-pass execution status is invalid")
-    if value["prompt_version"] != "open-match-ambiguity-v1":
+    if value["prompt_version"] != prompt_version:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
-    if value["schema_version"] != "source-message-classification-v2":
+    if value["schema_version"] != schema_version:
         raise ValueError("ambiguity-pass schema provenance is invalid")
     if value["context_bundle_version"] != "primary-classifier-context-v1":
         raise ValueError("ambiguity-pass context provenance is invalid")
@@ -1713,7 +1778,12 @@ def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
         raise ValueError("ambiguity-pass manifest hash is invalid")
 
 
-def _validate_semantic_proof_execution(value: JsonValue) -> None:
+def _validate_semantic_proof_execution(
+    value: JsonValue,
+    *,
+    prompt_version: str = "open-match-semantic-proof-v1",
+    schema_version: str = "source-semantic-proof-v1",
+) -> None:
     """Validate the pinned bounded semantic-proof pass provenance."""
     fields = {
         "requested_model",
@@ -1777,8 +1847,8 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         "effective_model": "gpt-5.6-sol",
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
-        "prompt_version": "open-match-semantic-proof-v1",
-        "schema_version": "source-semantic-proof-v1",
+        "prompt_version": prompt_version,
+        "schema_version": schema_version,
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "semantic-proof-context-v1",
         "routing_policy_version": "classifier-routing-v1",

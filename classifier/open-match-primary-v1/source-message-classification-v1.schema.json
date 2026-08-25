@@ -15,35 +15,28 @@
         "additionalProperties": false,
         "required": [
           "candidate_key", "opportunity_type", "evidence", "location",
-          "event_time", "response_routes"
+          "event_time", "open_places", "response_routes"
         ],
         "properties": {
           "candidate_key": {"type": "string", "minLength": 1},
-          "opportunity_type": {"enum": ["open_match", "tournament"]},
+          "opportunity_type": {"const": "open_match"},
           "evidence": {
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "opportunity", "event_time", "location"
+              "opportunity", "event_time", "location", "open_places"
             ],
             "properties": {
               "opportunity": {"type": "string", "minLength": 1},
               "event_time": {"type": "string", "minLength": 1},
               "location": {"type": "string", "minLength": 1},
               "open_places": {"type": "string", "minLength": 1},
-              "open_participation": {"type": "string", "minLength": 1},
-              "registration_open": {"type": "string", "minLength": 1},
               "team_formats": {"type": "string", "minLength": 1},
               "positions": {"type": "string", "minLength": 1},
               "playing_levels": {"type": "string", "minLength": 1},
               "venue_settings": {"type": "string", "minLength": 1},
               "playing_surfaces": {"type": "string", "minLength": 1},
-              "payment": {"type": "string", "minLength": 1},
-              "schedule": {"type": "string", "minLength": 1},
-              "registration_deadline": {"type": "string", "minLength": 1},
-              "structure": {"type": "string", "minLength": 1},
-              "capacity": {"type": "string", "minLength": 1},
-              "prizes": {"type": "string", "minLength": 1}
+              "payment": {"type": "string", "minLength": 1}
             }
           },
           "location": {
@@ -73,19 +66,12 @@
             }
           },
           "open_places": {"type": ["integer", "null"], "minimum": 1},
-          "open_participation": {"const": true},
-          "registration_open": {"const": true},
           "team_formats": {"$ref": "#/$defs/team_formats"},
           "positions": {"$ref": "#/$defs/positions"},
           "playing_levels": {"$ref": "#/$defs/playing_levels"},
           "venue_settings": {"$ref": "#/$defs/venue_settings"},
           "playing_surfaces": {"$ref": "#/$defs/playing_surfaces"},
           "payment": {"enum": ["free", "paid", "unknown"]},
-          "schedule": {"$ref": "#/$defs/tournament_fact"},
-          "registration_deadline": {"$ref": "#/$defs/tournament_fact"},
-          "structure": {"$ref": "#/$defs/tournament_fact"},
-          "capacity": {"$ref": "#/$defs/tournament_fact"},
-          "prizes": {"$ref": "#/$defs/tournament_fact"},
           "response_routes": {
             "type": "array",
             "maxItems": 8,
@@ -115,33 +101,7 @@
             }
           },
           "proposition_evidence": {"$ref": "#/$defs/proposition_evidence"}
-        },
-        "allOf": [
-          {
-            "if": {"properties": {"opportunity_type": {"const": "open_match"}}},
-            "then": {
-              "required": ["open_places"],
-              "properties": {"evidence": {"required": ["open_places"]}}
-            }
-          },
-          {
-            "if": {"properties": {"opportunity_type": {"const": "tournament"}}},
-            "then": {
-              "oneOf": [
-                {"required": ["open_participation"]},
-                {"required": ["registration_open"]}
-              ],
-              "properties": {
-                "evidence": {
-                  "oneOf": [
-                    {"required": ["open_participation"]},
-                    {"required": ["registration_open"]}
-                  ]
-                }
-              }
-            }
-          }
-        ]
+        }
       }
     }
   },
@@ -151,12 +111,6 @@
     "playing_levels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["novice", "below_average", "average", "above_average", "high", "very_high", "master", "professional"]}},
     "venue_settings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["indoor", "outdoor", "covered_outdoor"]}},
     "playing_surfaces": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["natural_grass", "artificial_turf", "hard_surface", "wood_parquet"]}},
-    "tournament_fact": {
-      "type": ["string", "number", "array", "object"],
-      "minLength": 1,
-      "minItems": 1,
-      "minProperties": 1
-    },
     "source_span": {
       "type": "object",
       "additionalProperties": false,
@@ -185,7 +139,7 @@
       "properties": {
         "proposition_id": {"type": "string", "minLength": 1},
         "domain": {"enum": ["football_match"]},
-        "meaning": {"enum": ["open_match", "tournament"]},
+        "meaning": {"const": "open_match"},
         "polarity": {"enum": ["positive", "negative", "ambiguous"]},
         "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
         "span": {"$ref": "#/$defs/source_span"}

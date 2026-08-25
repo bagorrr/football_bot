@@ -934,6 +934,10 @@ class ControlledModelAdapter:
         """Opt the controlled model boundary into the additive v2 output."""
         self.primary_schema_version = "source-message-classification-v2"
 
+    def enable_primary_v3(self) -> None:
+        """Opt the controlled model boundary into the tournament-capable v3 output."""
+        self.primary_schema_version = "source-message-classification-v3"
+
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
         self._classify_failures.setdefault(pass_kind, []).append(error)
@@ -1013,15 +1017,27 @@ def _ensure_test_proposition_evidence(
     candidates = enriched.get("candidates")
     if not isinstance(candidates, list):
         return enriched
+    proposition_version = (
+        "source-proposition-evidence-v2"
+        if enriched.get("schema_version") == "source-message-classification-v3"
+        else "source-proposition-evidence-v1"
+    )
     for candidate in candidates:
         if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
             continue
-        _add_test_proposition_evidence(candidate, body=body)
+        _add_test_proposition_evidence(
+            candidate,
+            body=body,
+            proposition_version=proposition_version,
+        )
     return enriched
 
 
 def _add_test_proposition_evidence(
-    candidate: dict[str, JsonValue], *, body: str
+    candidate: dict[str, JsonValue],
+    *,
+    body: str,
+    proposition_version: str = "source-proposition-evidence-v1",
 ) -> None:
     candidate_key = candidate.get("candidate_key")
     opportunity_type = candidate.get("opportunity_type", "open_match")
@@ -1083,7 +1099,7 @@ def _add_test_proposition_evidence(
             }
         )
     candidate["proposition_evidence"] = {
-        "contract_version": "source-proposition-evidence-v1",
+        "contract_version": proposition_version,
         "coverage": "complete_source_revision",
         "root": {
             "proposition_id": candidate_key,
@@ -1228,8 +1244,13 @@ def _build_test_semantic_proof(
                 "span": {"start": 0, "end": len(body), "text": body},
             }
         )
+    semantic_proof_version = (
+        "source-semantic-proof-v2"
+        if output.get("schema_version") == "source-message-classification-v3"
+        else "source-semantic-proof-v1"
+    )
     return {
-        "contract_version": "source-semantic-proof-v1",
+        "contract_version": semantic_proof_version,
         "source_message_revision_reference": source_message_revision_reference,
         "candidate_key": candidate_key,
         "coverage": "complete_source_revision",

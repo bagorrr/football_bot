@@ -137,6 +137,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
     """Publish a Tournament only after both required facts are accepted."""
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
+    classifier.enable_primary_v3()
     resolver = ControlledLocationResolverAdapter()
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     dates = ControlledDateInterpretationAdapter()
@@ -224,12 +225,14 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         body=body,
         result=ClassifierAdapterResult(
             output={
-                "schema_version": "source-message-classification-v1",
+                "schema_version": "source-message-classification-v3",
                 "disposition": "accepted",
+                "routing": {"reason_code": "accepted", "required_context": "none"},
                 "candidates": [
                     {
                         "candidate_key": "tournament-registration",
                         "opportunity_type": "tournament",
+                        "source_context": body,
                         "evidence": {
                             "opportunity": "Adult football tournament",
                             "event_time": "20 August 2026",

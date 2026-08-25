@@ -19,6 +19,7 @@ from modules.application import (
     _resolve_source_location_across_supported_locales,
     _select_response_route,
     _stated_payment_amount_and_currency,
+    _tournament_fact_value_is_source_bound,
     _tournament_open_participation_is_supported,
 )
 from modules.contracts import JsonValue
@@ -47,6 +48,55 @@ def test_tournament_open_participation_accepts_supported_word_orders(
         evidence,
         authoritative_body=evidence,
     )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Осталось последнее место для команды",
+        "Идёт донабор команд",
+    ),
+)
+def test_tournament_open_participation_accepts_remaining_team_places(
+    evidence: str,
+) -> None:
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Registration is not open",
+        "Registration was open last year",
+        "Регистрация закрыта",
+    ),
+)
+def test_tournament_open_participation_rejects_negative_or_historical_evidence(
+    evidence: str,
+) -> None:
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "evidence", "expected"),
+    (
+        (1, "Registration deadline: 19 August 2026", False),
+        (1, "Capacity: 1 team", True),
+        ([1, 2], "Prizes: 1, 2", True),
+    ),
+)
+def test_tournament_numeric_optional_facts_require_exact_source_tokens(
+    value: JsonValue,
+    evidence: str,
+    expected: bool,
+) -> None:
+    assert _tournament_fact_value_is_source_bound(value, evidence) is expected
 
 
 class _LocalizedLocationResolver:

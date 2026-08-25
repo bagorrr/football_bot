@@ -74,7 +74,9 @@ _CANONICAL_LISTS = {
 }
 
 PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
+PROPOSITION_EVIDENCE_V2_VERSION = "source-proposition-evidence-v2"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
+SEMANTIC_PROOF_V2_VERSION = "source-semantic-proof-v2"
 _PROPOSITION_DOMAINS = {"football_match"}
 _PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
 _PROPOSITION_CURRENTNESS = {"current", "superseded", "withdrawn", "unknown"}
@@ -96,6 +98,12 @@ def classifier_output_is_schema_valid(
     output: dict[str, JsonValue], *, body: str
 ) -> bool:
     """Validate strict structure and exact evidence before normalization."""
+    if output.get("schema_version") == "source-message-classification-v3":
+        return _classifier_output_v2_is_schema_valid(
+            output,
+            body=body,
+            allow_tournament=True,
+        )
     if output.get("schema_version") == "source-message-classification-v2":
         return _classifier_output_v2_is_schema_valid(output, body=body)
     if (
@@ -113,12 +121,6 @@ def classifier_output_is_schema_valid(
     if len(candidates) != 1 or not isinstance(candidates[0], dict):
         return False
     candidate = candidates[0]
-    if candidate.get("opportunity_type") == "tournament":
-        return _tournament_candidate_is_schema_valid(
-            candidate,
-            body=body,
-            require_source_context=False,
-        )
     if (
         not _REQUIRED_CANDIDATE_FIELDS.issubset(candidate)
         or set(candidate)
@@ -228,12 +230,11 @@ def classifier_output_is_schema_valid(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
-        opportunity_type="open_match",
     )
 
 
 def _classifier_output_v2_is_schema_valid(
-    output: dict[str, JsonValue], *, body: str
+    output: dict[str, JsonValue], *, body: str, allow_tournament: bool = False
 ) -> bool:
     """Validate the additive multi-candidate and alternatives contract."""
     if set(output) != {"schema_version", "disposition", "candidates", "routing"}:
@@ -274,7 +275,11 @@ def _classifier_output_v2_is_schema_valid(
             return False
         return all(
             isinstance(candidate, dict)
-            and _accepted_candidate_is_schema_valid(candidate, body=body)
+            and (
+                _accepted_candidate_v3_is_schema_valid(candidate, body=body)
+                if allow_tournament
+                else _accepted_candidate_is_schema_valid(candidate, body=body)
+            )
             for candidate in candidates
         )
     if disposition == "unresolved":
@@ -289,7 +294,10 @@ def _classifier_output_v2_is_schema_valid(
         }:
             return False
         if (
-            candidate.get("opportunity_type") not in {"open_match", "tournament"}
+            candidate.get("opportunity_type")
+            not in (
+                {"open_match", "tournament"} if allow_tournament else {"open_match"}
+            )
             or not isinstance(candidate.get("candidate_key"), str)
             or not candidate["candidate_key"]
             or not _source_bound_text_map(candidate.get("evidence"), body)
@@ -339,15 +347,12 @@ def _source_bound_text_map(value: JsonValue, body: str) -> bool:
 
 
 def _accepted_candidate_is_schema_valid(
-    candidate: dict[str, JsonValue], *, body: str
+    candidate: dict[str, JsonValue],
+    *,
+    body: str,
+    proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
-    if candidate.get("opportunity_type") == "tournament":
-        return _tournament_candidate_is_schema_valid(
-            candidate,
-            body=body,
-            require_source_context=True,
-        )
     if (
         not _REQUIRED_V2_CANDIDATE_FIELDS.issubset(candidate)
         or set(candidate)
@@ -453,7 +458,24 @@ def _accepted_candidate_is_schema_valid(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
-        opportunity_type="open_match",
+        proposition_version=proposition_version,
+    )
+
+
+def _accepted_candidate_v3_is_schema_valid(
+    candidate: dict[str, JsonValue], *, body: str
+) -> bool:
+    """Validate one v3 candidate while retaining the v2 open-match contract."""
+    if candidate.get("opportunity_type") == "tournament":
+        return _tournament_candidate_is_schema_valid(
+            candidate,
+            body=body,
+            require_source_context=True,
+        )
+    return _accepted_candidate_is_schema_valid(
+        candidate,
+        body=body,
+        proposition_version=PROPOSITION_EVIDENCE_V2_VERSION,
     )
 
 
@@ -463,7 +485,7 @@ def _tournament_candidate_is_schema_valid(
     body: str,
     require_source_context: bool,
 ) -> bool:
-    """Validate a Tournament candidate with explicit participation evidence."""
+    """Validate a v3 Tournament candidate with source-bound facts."""
     structured_fields = (
         _V2_STRUCTURED_CANDIDATE_FIELDS
         if require_source_context
@@ -590,6 +612,7 @@ def _tournament_candidate_is_schema_valid(
         evidence=evidence,
         routes=routes,
         opportunity_type="tournament",
+        proposition_version=PROPOSITION_EVIDENCE_V2_VERSION,
     )
 
 
@@ -619,6 +642,7 @@ def proposition_evidence_is_schema_valid(
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
     opportunity_type: str = "open_match",
+    proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
 ) -> bool:
     """Validate the versioned source-proposition/evidence wire contract.
 
@@ -637,7 +661,7 @@ def proposition_evidence_is_schema_valid(
     }:
         return False
     if (
-        value.get("contract_version") != PROPOSITION_EVIDENCE_VERSION
+        value.get("contract_version") != proposition_version
         or value.get("coverage") != "complete_source_revision"
         or not body
     ):
@@ -769,6 +793,7 @@ def semantic_proof_is_schema_valid(
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
     opportunity_type: str = "open_match",
+    semantic_proof_version: str = SEMANTIC_PROOF_VERSION,
 ) -> bool:
     """Validate the strict, source-bound semantic-proof representation.
 
@@ -791,7 +816,7 @@ def semantic_proof_is_schema_valid(
             "checks",
             "relations",
         }
-        or value.get("contract_version") != SEMANTIC_PROOF_VERSION
+        or value.get("contract_version") != semantic_proof_version
         or value.get("coverage") != "complete_source_revision"
         or not body
         or value.get("source_message_revision_reference")
@@ -987,6 +1012,7 @@ def semantic_proof_is_authoritative(
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
     opportunity_type: str = "open_match",
+    semantic_proof_version: str = SEMANTIC_PROOF_VERSION,
 ) -> bool:
     """Accept only a complete current-positive proof with clean coverage."""
     if not semantic_proof_is_schema_valid(
@@ -997,6 +1023,7 @@ def semantic_proof_is_authoritative(
         evidence=evidence,
         routes=routes,
         opportunity_type=opportunity_type,
+        semantic_proof_version=semantic_proof_version,
     ):
         return False
     assert isinstance(value, dict)

@@ -6,10 +6,11 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class LocaleSource(StrEnum):
@@ -1132,6 +1133,9 @@ def evaluate_tournament_search(
             end = date.fromisoformat(str(facts["end_local_date"]))
         except (KeyError, ValueError):
             continue
+        expiry = _tournament_search_expiry(facts, start=start, end=end)
+        if expiry is None or completed_search.completed_at >= expiry:
+            continue
         required = completed_search.required_date
         if required is not None and (
             end < required.start_local_date or start > required.end_local_date
@@ -1248,6 +1252,64 @@ def evaluate_tournament_search(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)
     )
+
+
+def _tournament_search_expiry(
+    facts: Mapping[str, Any],
+    *,
+    start: date,
+    end: date,
+) -> datetime | None:
+    """Return the earlier local cutoff for event time and registration."""
+    try:
+        timezone = ZoneInfo(str(facts["iana_timezone"]))
+    except (KeyError, ZoneInfoNotFoundError):
+        return None
+    exact_time = facts.get("exact_local_time")
+    if isinstance(exact_time, str) and start == end:
+        try:
+            event_expiry = datetime.combine(
+                start,
+                datetime.strptime(exact_time, "%H:%M").time(),
+                tzinfo=timezone,
+            )
+        except ValueError:
+            return None
+    else:
+        event_expiry = datetime.combine(
+            end + timedelta(days=1),
+            time.min,
+            tzinfo=timezone,
+        )
+    registration_expiry = _tournament_registration_expiry(
+        facts.get("registration_deadline"),
+        timezone,
+    )
+    return (
+        min(event_expiry, registration_expiry) if registration_expiry else event_expiry
+    )
+
+
+def _tournament_registration_expiry(
+    value: Any,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    """Normalize a date-only deadline as inclusive through its local day."""
+    if isinstance(value, str):
+        try:
+            deadline = date.fromisoformat(value)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed.replace(tzinfo=timezone) if parsed.tzinfo is None else parsed
+        return datetime.combine(deadline + timedelta(days=1), time.min, tzinfo=timezone)
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            if key in value:
+                return _tournament_registration_expiry(value[key], timezone)
+    return None
 
 
 def replace_result_position(result: SearchResult, position: int) -> SearchResult:

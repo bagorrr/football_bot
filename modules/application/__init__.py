@@ -18,6 +18,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.classifier_contract import (
+    PROPOSITION_EVIDENCE_V2_VERSION,
+    SEMANTIC_PROOF_V2_VERSION,
     classifier_output_is_schema_valid,
     proposition_evidence_is_schema_valid,
     semantic_proof_is_authoritative,
@@ -7608,7 +7610,7 @@ class RuntimeApplication:
                         ContractName.CLASSIFICATION_PROPOSAL,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
-                    and definition.version in {2, 3, 4}
+                    and definition.version in {2, 3, 4, 5}
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -8225,7 +8227,7 @@ class RuntimeApplication:
                 if (
                     self.role is RuntimeRole.APPLICATION
                     and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-                    and incoming.contract_version == 4
+                    and incoming.contract_version in {4, 5}
                 ):
                     invalid_payload = (
                         incoming.payload if isinstance(incoming.payload, dict) else {}
@@ -8439,7 +8441,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and incoming.contract_version in {2, 3, 4}
+            and incoming.contract_version in {2, 3, 4, 5}
             and supported_incoming is not None
         ):
             self._accept_classification_proposal(supported_incoming)
@@ -8588,8 +8590,19 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
-        if self.model.primary_schema_version == "source-message-classification-v2":
-            self._classify_source_message_v2(incoming)
+        if self.model.primary_schema_version in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            self._classify_source_message_v2(
+                incoming,
+                artifact_version=(
+                    "v3"
+                    if self.model.primary_schema_version
+                    == "source-message-classification-v3"
+                    else "v2"
+                ),
+            )
             return
         if self.model.primary_schema_version != "source-message-classification-v1":
             raise RuntimeError(
@@ -9188,10 +9201,33 @@ class RuntimeApplication:
             clear_proof_work=True,
         )
 
-    def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
-        """Run the additive multi-candidate classifier and one-way ambiguity pass."""
+    def _classify_source_message_v2(
+        self, incoming: ContractEnvelope, *, artifact_version: str = "v2"
+    ) -> None:
+        """Run the additive classifier and one-way ambiguity pass."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
-            raise RuntimeError("only Classification executes the v2 classifier")
+            raise RuntimeError("only Classification executes the additive classifier")
+        if artifact_version not in {"v2", "v3"}:
+            raise RuntimeError("unsupported additive classifier artifact version")
+        is_v3 = artifact_version == "v3"
+        primary_prompt_version = (
+            "open-match-primary-v3" if is_v3 else "open-match-primary-v2"
+        )
+        classification_schema_version = (
+            "source-message-classification-v3"
+            if is_v3
+            else "source-message-classification-v2"
+        )
+        ambiguity_prompt_version = (
+            "open-match-ambiguity-v2" if is_v3 else "open-match-ambiguity-v1"
+        )
+        semantic_proof_prompt_version = (
+            "open-match-semantic-proof-v2" if is_v3 else "open-match-semantic-proof-v1"
+        )
+        semantic_proof_schema_version = (
+            "source-semantic-proof-v2" if is_v3 else "source-semantic-proof-v1"
+        )
+        proposal_contract_version = 5 if is_v3 else 4
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -9226,8 +9262,8 @@ class RuntimeApplication:
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
-            prompt_version="open-match-primary-v2",
-            schema_version="source-message-classification-v2",
+            prompt_version=primary_prompt_version,
+            schema_version=classification_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
             routing_policy_version="classifier-routing-v1",
@@ -9287,8 +9323,7 @@ class RuntimeApplication:
                 and result.effective_model == "gpt-5.6-sol"
                 and result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(result.output, body=body)
-                and result.output.get("schema_version")
-                == "source-message-classification-v2"
+                and result.output.get("schema_version") == classification_schema_version
             )
 
         prior_attempts = self.store.classification_attempts_for_revision(revision_id)
@@ -9474,7 +9509,7 @@ class RuntimeApplication:
             assert prior_proof_work is not None
             final_request = replace(
                 request,
-                prompt_version="open-match-ambiguity-v1",
+                prompt_version=ambiguity_prompt_version,
                 pass_kind="ambiguity_second_pass",
                 adjacent_context=prior_proof_work.ambiguity_adjacent_context,
             )
@@ -9542,7 +9577,7 @@ class RuntimeApplication:
             )
             second_request = replace(
                 request,
-                prompt_version="open-match-ambiguity-v1",
+                prompt_version=ambiguity_prompt_version,
                 pass_kind="ambiguity_second_pass",
                 adjacent_context=second_pass_adjacent_context,
             )
@@ -9667,7 +9702,7 @@ class RuntimeApplication:
                 and second_result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(second_result.output, body=body)
                 and second_result.output.get("schema_version")
-                == "source-message-classification-v2"
+                == classification_schema_version
             )
             if second_valid:
                 final_request = second_request
@@ -9711,7 +9746,9 @@ class RuntimeApplication:
                     "status": "succeeded",
                 }
             else:
-                final_output = _safe_v2_review_output()
+                final_output = _safe_v2_review_output(
+                    schema_version=classification_schema_version
+                )
 
             second_attempt = ClassificationAttempt(
                 attempt_id=(
@@ -9903,8 +9940,8 @@ class RuntimeApplication:
                         continue
                     proof_request = replace(
                         final_request,
-                        prompt_version="open-match-semantic-proof-v1",
-                        schema_version="source-semantic-proof-v1",
+                        prompt_version=semantic_proof_prompt_version,
+                        schema_version=semantic_proof_schema_version,
                         context_bundle_version="semantic-proof-context-v1",
                         context_policy_version="semantic-proof-context-v1",
                         pass_kind="semantic_proof",
@@ -10005,6 +10042,7 @@ class RuntimeApplication:
                             opportunity_type=cast(
                                 str, candidate.get("opportunity_type", "open_match")
                             ),
+                            semantic_proof_version=semantic_proof_schema_version,
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -10144,7 +10182,9 @@ class RuntimeApplication:
             if not isinstance(candidates, list) or len(semantic_proofs) != len(
                 candidates
             ):
-                final_output = _safe_v2_review_output()
+                final_output = _safe_v2_review_output(
+                    schema_version=classification_schema_version
+                )
                 semantic_proofs = []
                 semantic_proof_executions = []
 
@@ -10156,7 +10196,9 @@ class RuntimeApplication:
             "irrelevant",
             "unresolved",
         }:
-            final_output = _safe_v2_review_output()
+            final_output = _safe_v2_review_output(
+                schema_version=classification_schema_version
+            )
             final_disposition = "needs_review"
         if resume_completed_ambiguity:
             assert completed_ambiguity_attempt is not None
@@ -10254,7 +10296,7 @@ class RuntimeApplication:
         if _classifier_adapter_result_has_complete_provenance(final_metrics):
             outgoing = ContractEnvelope(
                 contract_name=ContractName.CLASSIFICATION_PROPOSAL,
-                contract_version=4,
+                contract_version=proposal_contract_version,
                 message_id=derive_contract_message_id(
                     incoming.message_id, ContractName.CLASSIFICATION_PROPOSAL
                 ),
@@ -10511,7 +10553,7 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
-        if incoming.contract_version == 4:
+        if incoming.contract_version in {4, 5}:
             adjacent_context = payload.get("adjacent_context")
             output = payload.get("output")
             routing = output.get("routing") if isinstance(output, dict) else None
@@ -10583,7 +10625,7 @@ class RuntimeApplication:
                 ),
             }
         )
-        if incoming.contract_version == 4:
+        if incoming.contract_version in {4, 5}:
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
             if not isinstance(v4_output, dict):
@@ -10648,6 +10690,7 @@ class RuntimeApplication:
                 authoritative_payload,
                 revision_id=revision_id,
                 body=source_revision.body,
+                artifact_version=("v3" if incoming.contract_version == 5 else "v2"),
             ):
                 self._record_classification_routing_outcome(
                     incoming=incoming,
@@ -12313,11 +12356,19 @@ def _classifier_proposal_has_pinned_provenance(
     revision_id: str,
     body: str,
 ) -> bool:
-    if payload.get("schema_version") == "source-message-classification-v2":
+    if payload.get("schema_version") in {
+        "source-message-classification-v2",
+        "source-message-classification-v3",
+    }:
         return _v2_classifier_proposal_has_pinned_provenance(
             payload,
             revision_id=revision_id,
             body=body,
+            artifact_version=(
+                "v3"
+                if payload.get("schema_version") == "source-message-classification-v3"
+                else "v2"
+            ),
         )
     attempt_number = payload.get("attempt_number")
     if (
@@ -12398,6 +12449,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
     *,
     revision_id: str,
     body: str,
+    artifact_version: str = "v2",
 ) -> bool:
     """Validate v2 final-pass provenance and its deterministic input manifest."""
     pass_number = payload.get("pass_number")
@@ -12411,7 +12463,17 @@ def _v2_classifier_proposal_has_pinned_provenance(
     ):
         return False
     prompt_version = (
-        "open-match-ambiguity-v1" if pass_number == 2 else "open-match-primary-v2"
+        (
+            "open-match-ambiguity-v2"
+            if artifact_version == "v3"
+            else "open-match-ambiguity-v1"
+        )
+        if pass_number == 2
+        else (
+            "open-match-primary-v3"
+            if artifact_version == "v3"
+            else "open-match-primary-v2"
+        )
     )
     pass_kind = "ambiguity_second_pass" if pass_number == 2 else "primary"
     adjacent_context = _classifier_adjacent_context(payload.get("adjacent_context", []))
@@ -12423,7 +12485,11 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
         "prompt_version": prompt_version,
-        "schema_version": "source-message-classification-v2",
+        "schema_version": (
+            "source-message-classification-v3"
+            if artifact_version == "v3"
+            else "source-message-classification-v2"
+        ),
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "classifier-context-v1",
         "routing_policy_version": "classifier-routing-v1",
@@ -12662,7 +12728,11 @@ def _classifier_execution_metadata_is_current(
 
 
 def _v4_classifier_provenance_is_current(
-    payload: dict[str, JsonValue], *, revision_id: str, body: str
+    payload: dict[str, JsonValue],
+    *,
+    revision_id: str,
+    body: str,
+    artifact_version: str = "v2",
 ) -> bool:
     """Require current ambiguity and distinct proof execution per candidate."""
     output = payload.get("output")
@@ -12673,6 +12743,7 @@ def _v4_classifier_provenance_is_current(
             payload,
             revision_id=revision_id,
             body=body,
+            artifact_version=artifact_version,
         )
     ):
         return False
@@ -12697,8 +12768,16 @@ def _v4_classifier_provenance_is_current(
             payload=payload,
             revision_id=revision_id,
             body=body,
-            prompt_version="open-match-ambiguity-v1",
-            schema_version="source-message-classification-v2",
+            prompt_version=(
+                "open-match-ambiguity-v2"
+                if artifact_version == "v3"
+                else "open-match-ambiguity-v1"
+            ),
+            schema_version=(
+                "source-message-classification-v3"
+                if artifact_version == "v3"
+                else "source-message-classification-v2"
+            ),
             context_bundle_version="primary-classifier-context-v1",
             context_policy_version="classifier-context-v1",
             routing_policy_version="classifier-routing-v1",
@@ -12777,8 +12856,16 @@ def _v4_classifier_provenance_is_current(
                 payload=payload,
                 revision_id=revision_id,
                 body=body,
-                prompt_version="open-match-semantic-proof-v1",
-                schema_version="source-semantic-proof-v1",
+                prompt_version=(
+                    "open-match-semantic-proof-v2"
+                    if artifact_version == "v3"
+                    else "open-match-semantic-proof-v1"
+                ),
+                schema_version=(
+                    "source-semantic-proof-v2"
+                    if artifact_version == "v3"
+                    else "source-semantic-proof-v1"
+                ),
                 context_bundle_version="semantic-proof-context-v1",
                 context_policy_version="semantic-proof-context-v1",
                 routing_policy_version="classifier-routing-v1",
@@ -12922,6 +13009,18 @@ def _proposition_evidence_is_authoritative(
     opportunity_type: str = "open_match",
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
+    semantic_proof_version = (
+        SEMANTIC_PROOF_V2_VERSION
+        if isinstance(semantic_proof, dict)
+        and semantic_proof.get("contract_version") == SEMANTIC_PROOF_V2_VERSION
+        else "source-semantic-proof-v1"
+    )
+    proposition_version = (
+        PROPOSITION_EVIDENCE_V2_VERSION
+        if isinstance(value, dict)
+        and value.get("contract_version") == PROPOSITION_EVIDENCE_V2_VERSION
+        else "source-proposition-evidence-v1"
+    )
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
         semantic_proof,
         body=body,
@@ -12930,6 +13029,7 @@ def _proposition_evidence_is_authoritative(
         evidence=evidence,
         routes=routes,
         opportunity_type=opportunity_type,
+        semantic_proof_version=semantic_proof_version,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -12939,6 +13039,7 @@ def _proposition_evidence_is_authoritative(
         evidence=evidence,
         routes=routes,
         opportunity_type=opportunity_type,
+        proposition_version=proposition_version,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -12948,6 +13049,7 @@ def _proposition_evidence_is_authoritative(
         evidence=evidence,
         routes=routes,
         opportunity_type=opportunity_type,
+        proposition_version=proposition_version,
     )
     if (
         graph is None
@@ -13139,10 +13241,12 @@ def _classification_routing_outcome(
     )
 
 
-def _safe_v2_review_output() -> dict[str, JsonValue]:
+def _safe_v2_review_output(
+    *, schema_version: str = "source-message-classification-v2"
+) -> dict[str, JsonValue]:
     """Create a strict, body-free review disposition after validation failure."""
     return {
-        "schema_version": "source-message-classification-v2",
+        "schema_version": schema_version,
         "disposition": "needs_review",
         "candidates": [],
         "routing": {"reason_code": "needs_review", "required_context": "none"},
@@ -14292,6 +14396,9 @@ def _validated_tournament_proposal(
         candidate.get("registration_deadline"),
         event_timezone,
     )
+    registration_deadline_date = _tournament_registration_deadline_date(
+        candidate.get("registration_deadline")
+    )
     if (
         parsed_end < parsed_start
         or not isinstance(timezone, str)
@@ -14314,7 +14421,9 @@ def _validated_tournament_proposal(
             ),
             authoritative_body=validation_body,
             allowed_additional_dates=(
-                (registration_expiry.date(),) if registration_expiry is not None else ()
+                (registration_deadline_date,)
+                if registration_deadline_date is not None
+                else ()
             ),
         )
         or mention not in str(evidence["location"])
@@ -14431,36 +14540,68 @@ def _tournament_open_participation_is_supported(
 ) -> bool:
     """Require an affirmative, current registration or participation opening."""
     normalized = evidence.casefold()
-    if _body_has_terminal_retraction(authoritative_body) or re.search(
-        r"\b(?:registration|participation|entry)\b[^.!?;\n]{0,40}"
-        r"\b(?:closed|full|filled|ended|over|no longer)\b|"
-        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,40}"
-        r"\b(?:закрыт\w*|завершен\w*|заполнен\w*)\b",
+    if _body_has_terminal_retraction(authoritative_body):
+        return False
+    participation_words = (
+        r"(?:(?:registration|registrations|participation|entry|entries)"
+        r"|(?:регистрац\w*|набор\w*|участ\w*)"
+        r"|(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)"
+        r"|(?:inscriptions?|participations?|entr[ée]e?s?))"
+    )
+    closed_words = (
+        r"closed|full|filled|ended|over|no\s+longer\s+available"
+        r"|закрыт\w*|завершен\w*|заполнен\w*"
+        r"|cerrad\w*|complet\w*|terminad\w*"
+        r"|ferm[ée]e?s?|complet\w*|termin[ée]e?s?"
+    )
+    if re.search(
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        rf"\b(?:{closed_words})\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:is|are|was|were|has\s+been|had\s+been|used\s+to\s+be)?\s*"
+        r"(?:not|never|no\s+longer)\s+"
+        r"(?:open|available|accepting|ongoing)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:was|were|had\s+been|used\s+to\s+be)\b[^.!?;\n]{0,35}"
+        r"\b(?:open|available|accepting|ongoing)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:не|был\w*|была|были|раньше|уже\s+не)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|доступ\w*|ид[её]т|продолжа\w*)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:no|nunca|ya\s+no|era|estaba|estuvo)\b[^.!?;\n]{0,35}"
+        r"\b(?:abiert\w*|disponible|acept\w*|en\s+curso)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:n['’]est\w*|était|etait|ét[ée]|n['’]est\s+plus)\b"
+        r"[^.!?;\n]{0,35}\b(?:ouvert\w*|disponible|accept[ée]e?s?|en\s+cours)\b",
         normalized,
     ):
         return False
-    return (
-        re.search(
-            r"\b(?:open|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
-            r"\b(?:registration|registrations|participation|entries?)\b|"
-            r"\b(?:registration|registrations|participation|entries?)\b[^.!?;\n]{0,35}"
-            r"\b(?:open|accepting|available|ongoing)\b|"
-            r"\b(?:registration|participation)\s+is\s+open\b|"
-            r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
-            r"\b(?:открыт\w*|ид[её]т|продолжается)\b|"
-            r"\b(?:открыт\w*|ид[её]т|продолжается)\b[^.!?;\n]{0,35}"
-            r"\b(?:регистрац\w*|набор\w*|участ\w*)\b|"
-            r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b"
-            r"[^.!?;\n]{0,35}\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b|"
-            r"\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b[^.!?;\n]{0,35}"
-            r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b|"
-            r"\b(?:inscriptions?|participations?|entr[ée]e?s?)\b"
-            r"[^.!?;\n]{0,35}\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b|"
-            r"\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b"
-            r"[^.!?;\n]{0,35}\b(?:inscriptions?|participations?|entr[ée]e?s?)\b",
-            normalized,
-        )
-        is not None
+    positive_patterns = (
+        r"\b(?:open|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
+        rf"\b{participation_words}\b",
+        rf"\b{participation_words}\b[^.!?;\n]{{0,35}}"
+        r"\b(?:open|accepting|available|ongoing)\b",
+        r"\b(?:registration|participation)\s+is\s+open\b",
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|ид[её]т|продолжа\w*)\b",
+        r"\b(?:открыт\w*|ид[её]т|продолжа\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b",
+        r"\b(?:остал\w*)\b[^.!?;\n]{0,35}\bмест\w*\b"
+        r"[^.!?;\n]{0,20}\bкоманд\w*\b",
+        r"\b(?:ид[её]т|продолжа\w*)\s+донабор\w*\b"
+        r"(?:[^.!?;\n]{0,20}\bкоманд\w*\b)?",
+        r"\bдонабор\w*\b[^.!?;\n]{0,35}\bкоманд\w*\b",
+        r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b"
+        r"[^.!?;\n]{0,35}\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b",
+        r"\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b"
+        r"[^.!?;\n]{0,35}\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b",
+        r"\b(?:inscriptions?|participations?|entr[ée]e?s?)\b"
+        r"[^.!?;\n]{0,35}\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b",
+        r"\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b"
+        r"[^.!?;\n]{0,35}\b(?:inscriptions?|participations?|entr[ée]e?s?)\b",
+    )
+    return any(
+        re.search(pattern, normalized) is not None for pattern in positive_patterns
     )
 
 
@@ -14619,7 +14760,10 @@ def _tournament_fact_value_is_source_bound(
     if isinstance(value, bool) or value is None:
         return False
     if isinstance(value, (int, float)):
-        return str(value).casefold() in normalized_evidence
+        token = re.escape(str(value).casefold())
+        return (
+            re.search(rf"(?<![\w.]){token}(?![\w.])", normalized_evidence) is not None
+        )
     if isinstance(value, list):
         return bool(value) and all(
             _tournament_fact_value_is_source_bound(item, evidence) for item in value
@@ -14644,7 +14788,9 @@ def _tournament_registration_expiry(
     if isinstance(value, str):
         try:
             return datetime.combine(
-                date.fromisoformat(value), datetime.min.time(), tzinfo=timezone
+                date.fromisoformat(value) + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=timezone,
             )
         except ValueError:
             try:
@@ -14657,6 +14803,23 @@ def _tournament_registration_expiry(
             raw = value.get(key)
             if isinstance(raw, str):
                 return _tournament_registration_expiry(raw, timezone)
+    return None
+
+
+def _tournament_registration_deadline_date(value: JsonValue) -> date | None:
+    """Return the source calendar date represented by a deadline fact."""
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(value).date()
+            except ValueError:
+                return None
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            if key in value:
+                return _tournament_registration_deadline_date(value[key])
     return None
 
 
