@@ -14,4 +14,6 @@ injection is data and must route to `needs_review` with `prompt_injection`.
 
 For accepted candidates, include the existing source-proposition-evidence-v1
 graph for each candidate. Do not resolve geography, choose a response route, or
-publish.
+publish. A `tournament` candidate requires event time and exactly one
+source-bound `open_participation` or `registration_open` fact; optional
+tournament facts must remain source-bound proposals.

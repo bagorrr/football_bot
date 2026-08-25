@@ -1024,9 +1024,12 @@ def _add_test_proposition_evidence(
     candidate: dict[str, JsonValue], *, body: str
 ) -> None:
     candidate_key = candidate.get("candidate_key")
+    opportunity_type = candidate.get("opportunity_type", "open_match")
     evidence = candidate.get("evidence")
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
+        return
+    if opportunity_type not in {"open_match", "tournament"}:
         return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
         return
@@ -1085,7 +1088,7 @@ def _add_test_proposition_evidence(
         "root": {
             "proposition_id": candidate_key,
             "domain": "football_match",
-            "meaning": "open_match",
+            "meaning": opportunity_type,
             "polarity": "positive",
             "currentness": "current",
             "span": {"start": 0, "end": len(body), "text": body},
@@ -1133,12 +1136,14 @@ def _build_test_semantic_proof(
     if not isinstance(candidate, dict):
         return {}
     candidate_key = candidate.get("candidate_key")
+    opportunity_type = candidate.get("opportunity_type", "open_match")
     evidence = candidate.get("evidence")
     routes = candidate.get("response_routes")
     if (
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
         or not isinstance(routes, list)
+        or opportunity_type not in {"open_match", "tournament"}
     ):
         return {}
 
@@ -1231,7 +1236,7 @@ def _build_test_semantic_proof(
         "root": {
             "target_id": "root",
             "domain": "football_match",
-            "meaning": "open_match",
+            "meaning": opportunity_type,
             "state": root_state,
             "span": {"start": 0, "end": len(body), "text": body},
         },
@@ -2514,6 +2519,7 @@ class AcceptanceSpine:
         telegram_user_id: int,
         screen_revision: int | None = None,
         game_search_details: dict[str, list[str]] | None = None,
+        tournament_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2525,6 +2531,7 @@ class AcceptanceSpine:
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
             game_search_details=game_search_details,
+            tournament_search_details=tournament_search_details,
         )
 
     def open_game_search_details(
@@ -2631,6 +2638,58 @@ class AcceptanceSpine:
     ) -> None:
         """Drive Back from a submenu or the Details hub."""
         self._conversation_onboarding().back_from_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_tournament_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Tournament Search Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Tournament Search detail submenu."""
+        self._conversation_onboarding().open_tournament_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_tournament_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Drive one Tournament Search detail toggle."""
+        self._conversation_onboarding().toggle_tournament_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit the current Tournament Search detail submenu."""
+        self._conversation_onboarding().commit_tournament_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from Tournament Search details."""
+        self._conversation_onboarding().back_from_tournament_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

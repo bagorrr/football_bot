@@ -678,6 +678,7 @@ def _validate_run_search(
         allowed_field_sets = (
             required_fields,
             required_fields | {"game_search_details"},
+            required_fields | {"tournament_search_details"},
         )
         if set(payload) not in allowed_field_sets:
             raise ValueError("RunSearch v2 contains unsupported or missing facts")
@@ -766,11 +767,14 @@ def _validate_run_search(
             required_date,
             exact_fields=contract_version >= 2,
         )
-    details = payload.get("game_search_details")
-    if details is not None:
-        if user_intent != "game_search" or not isinstance(details, dict):
-            raise ValueError("RunSearch details require Game Search")
-        if set(details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
+    game_details = payload.get("game_search_details")
+    tournament_details = payload.get("tournament_search_details")
+    if game_details is not None and tournament_details is not None:
+        raise ValueError("RunSearch cannot contain both Search detail sets")
+    if game_details is not None:
+        if user_intent != "game_search" or not isinstance(game_details, dict):
+            raise ValueError("RunSearch game details require Game Search")
+        if set(game_details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
             isinstance(values, list)
             and (key != "times" or len(values) <= 1)
             and len(values)
@@ -790,9 +794,33 @@ def _validate_run_search(
                 )
                 for value in values
             )
-            for key, values in details.items()
+            for key, values in game_details.items()
         ):
             raise ValueError("RunSearch has invalid Game Search details")
+    if tournament_details is not None:
+        if user_intent != "tournament_search" or not isinstance(
+            tournament_details, dict
+        ):
+            raise ValueError("RunSearch tournament details require Tournament Search")
+        allowed = {
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+        }
+        if set(tournament_details) - allowed or not all(
+            isinstance(values, list)
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and value in _GAME_SEARCH_DETAIL_VALUES.get(key, ())
+                for value in values
+            )
+            for key, values in tournament_details.items()
+        ):
+            raise ValueError("RunSearch has invalid Tournament Search details")
 
 
 def _validate_required_date(value: JsonValue, *, exact_fields: bool) -> None:
@@ -1406,6 +1434,7 @@ def _validate_classification_proposal(
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
+            opportunity_type=cast(str, candidate.get("opportunity_type", "open_match")),
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
@@ -1558,6 +1587,7 @@ def _validate_classification_proposal_v4(
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
+            opportunity_type=cast(str, candidate.get("opportunity_type", "open_match")),
         ):
             raise ValueError("ClassificationProposal v4 semantic proof is invalid")
         proof_keys.add(candidate_key)
@@ -1786,13 +1816,17 @@ def _validate_opportunity_publication_changed(
         raise ValueError("OpportunityPublicationChanged subject is inconsistent")
     source_revision_id = _required_text(payload, "source_message_revision_id")
     source_scope = source_revision_id.rsplit(":revision:", 1)[0]
-    legacy_identity = f"opportunity:{source_scope}:open_match"
+    opportunity_type = payload["opportunity_type"]
+    if opportunity_type not in {"open_match", "tournament"}:
+        raise ValueError("Opportunity type is invalid")
+    assert isinstance(opportunity_type, str)
+    legacy_identity = f"opportunity:{source_scope}:{opportunity_type}"
     candidate_identity = re.fullmatch(
-        rf"opportunity:{re.escape(source_scope)}:open_match:candidate:[0-9a-f]{{16}}",
+        rf"opportunity:{re.escape(source_scope)}:{opportunity_type}:candidate:[0-9a-f]{{16}}",
         opportunity_id,
     )
     lineage_identity = re.fullmatch(
-        rf"opportunity:{re.escape(source_scope)}:open_match:proposition:[0-9a-f]{{16}}",
+        rf"opportunity:{re.escape(source_scope)}:{opportunity_type}:proposition:[0-9a-f]{{16}}",
         opportunity_id,
     )
     if (
@@ -1816,12 +1850,13 @@ def _validate_opportunity_publication_changed(
         "expired",
     }:
         raise ValueError("Opportunity publication state is invalid")
-    if payload["opportunity_type"] != "open_match":
-        raise ValueError("Opportunity type is invalid")
     accepted_facts = payload["accepted_facts"]
     if not isinstance(accepted_facts, dict):
         raise TypeError("accepted_facts must be an object")
-    _validate_open_match_accepted_facts(accepted_facts)
+    if opportunity_type == "open_match":
+        _validate_open_match_accepted_facts(accepted_facts)
+    else:
+        _validate_tournament_accepted_facts(accepted_facts)
     route = payload["response_route"]
     if not isinstance(route, dict) or set(route) != {"kind", "value"}:
         raise TypeError("response_route must contain kind and value")
@@ -1905,14 +1940,11 @@ def _validate_opportunity_publication_batch_changed(
         }:
             raise ValueError("OpportunityPublicationChanged v3 item is incomplete")
         opportunity_id = _required_text(opportunity, "opportunity_id")
-        if (
-            re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:open_match:(?:candidate|proposition):[0-9a-f]{{16}}",
-                opportunity_id,
-            )
-            is None
-            or opportunity_id in opportunity_ids
-        ):
+        identity_match = re.fullmatch(
+            rf"opportunity:{re.escape(source_scope)}:(open_match|tournament):(?:candidate|proposition):[0-9a-f]{{16}}",
+            opportunity_id,
+        )
+        if identity_match is None or opportunity_id in opportunity_ids:
             raise ValueError(
                 "OpportunityPublicationChanged v3 item identity is invalid"
             )
@@ -1923,12 +1955,16 @@ def _validate_opportunity_publication_batch_changed(
             != f"{opportunity_id}:revision:{envelope.subject_revision}"
         ):
             raise ValueError("OpportunityPublicationChanged v3 revision is invalid")
-        if opportunity["opportunity_type"] != "open_match":
+        opportunity_type = identity_match.group(1)
+        if opportunity["opportunity_type"] != opportunity_type:
             raise ValueError("OpportunityPublicationChanged v3 type is invalid")
         accepted_facts = opportunity["accepted_facts"]
         if not isinstance(accepted_facts, dict):
             raise TypeError("OpportunityPublicationChanged v3 facts must be an object")
-        _validate_open_match_accepted_facts(accepted_facts)
+        if opportunity_type == "open_match":
+            _validate_open_match_accepted_facts(accepted_facts)
+        else:
+            _validate_tournament_accepted_facts(accepted_facts)
         route = opportunity["response_route"]
         if not isinstance(route, dict) or set(route) != {"kind", "value"}:
             raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
@@ -2116,6 +2152,78 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
     ):
         raise ValueError("open-match payment details are invalid")
     _required_iso_datetime(facts, "source_posted_at")
+
+
+def _validate_tournament_accepted_facts(facts: dict[str, JsonValue]) -> None:
+    """Validate the canonical accepted facts for one published Tournament."""
+    base_required = {
+        "start_local_date",
+        "end_local_date",
+        "exact_local_time",
+        "day_part",
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "location_verified_disjoint_place_ids",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "payment_amount",
+        "payment_currency",
+        "source_posted_at",
+        "open_participation",
+    }
+    optional = {
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
+    }
+    if set(facts) - base_required - optional or not base_required.issubset(facts):
+        raise ValueError("tournament accepted facts are incomplete")
+    if facts["open_participation"] is not True:
+        raise ValueError("tournament open participation must be true")
+    base_facts = {
+        key: facts[key] for key in base_required if key != "open_participation"
+    }
+    base_facts["open_places"] = None
+    base_facts["positions"] = None
+    _validate_open_match_accepted_facts(base_facts)
+    for field_name in optional:
+        if field_name in facts and not _valid_tournament_json_fact(facts[field_name]):
+            raise ValueError(f"tournament {field_name} is invalid")
+
+
+def _valid_tournament_json_fact(value: JsonValue) -> bool:
+    """Accept bounded non-empty JSON values for source-bound optional facts."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, list):
+        return bool(value) and all(_valid_tournament_json_fact(item) for item in value)
+    if isinstance(value, dict):
+        return bool(value) and all(
+            isinstance(key, str) and bool(key) and _valid_tournament_json_fact(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _validate_protected_content_skip(

@@ -789,6 +789,87 @@ _GAME_SEARCH_DETAIL_OPTIONS = {
     ),
     "payment": ("free", "paid"),
 }
+_TOURNAMENT_SEARCH_DETAIL_OPTIONS = {
+    "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
+    "playing_levels": (
+        "novice",
+        "below_average",
+        "average",
+        "above_average",
+        "high",
+        "very_high",
+        "master",
+        "professional",
+    ),
+    "venue_settings": ("indoor", "outdoor", "covered_outdoor"),
+    "playing_surfaces": (
+        "natural_grass",
+        "artificial_turf",
+        "hard_surface",
+        "wood_parquet",
+    ),
+    "payment": ("free", "paid"),
+}
+_TOURNAMENT_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Team format",
+        "Playing levels",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Формат команд",
+        "Уровни игры",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Formato de equipos",
+        "Niveles de juego",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Format des équipes",
+        "Niveaux de jeu",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_TOURNAMENT_SEARCH_DETAIL_HEADINGS = {
+    "en": (
+        "👥 Select team formats.",
+        "⚽ Select playing levels.",
+        "🏟 Select the venue type.",
+        "🌱 Select the playing surface.",
+        "💳 Select the payment type.",
+    ),
+    "ru": (
+        "👥 Выберите форматы команд.",
+        "⚽ Выберите уровни игры.",
+        "🏟 Выберите тип площадки.",
+        "🌱 Выберите покрытие.",
+        "💳 Выберите тип оплаты.",
+    ),
+    "es": (
+        "👥 Selecciona los formatos de equipos.",
+        "⚽ Selecciona los niveles de juego.",
+        "🏟 Selecciona el tipo de recinto.",
+        "🌱 Selecciona la superficie de juego.",
+        "💳 Selecciona el tipo de pago.",
+    ),
+    "fr": (
+        "👥 Sélectionnez les formats d’équipes.",
+        "⚽ Sélectionnez les niveaux de jeu.",
+        "🏟 Sélectionnez le type de terrain.",
+        "🌱 Sélectionnez le revêtement.",
+        "💳 Sélectionnez le type de paiement.",
+    ),
+}
 _GAME_SEARCH_DETAIL_NAMES = {
     "en": (
         "Time",
@@ -2322,6 +2403,7 @@ class ConversationOnboarding:
         telegram_user_id: int,
         screen_revision: int,
         game_search_details: dict[str, list[str]] | None = None,
+        tournament_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2371,11 +2453,25 @@ class ConversationOnboarding:
                 search_submission_update_id=update_id,
             )
             message_id = derive_run_search_message_id(telegram_user_id, update_id)
-            selected_details = (
-                game_search_details
-                if game_search_details is not None
-                else {key: list(values) for key, values in draft.game_search_details}
-            )
+            if draft.user_intent is UserIntent.TOURNAMENT_SEARCH:
+                selected_details = (
+                    tournament_search_details
+                    if tournament_search_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.tournament_search_details
+                    }
+                )
+                details_payload_key = "tournament_search_details"
+            else:
+                selected_details = (
+                    game_search_details
+                    if game_search_details is not None
+                    else {
+                        key: list(values) for key, values in draft.game_search_details
+                    }
+                )
+                details_payload_key = "game_search_details"
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
                 contract_version=2,
@@ -2408,7 +2504,7 @@ class ConversationOnboarding:
                     "whole_city": draft.whole_city,
                     "required_date": _required_date_payload(draft.required_date),
                     **(
-                        {"game_search_details": cast(JsonValue, selected_details)}
+                        {details_payload_key: cast(JsonValue, selected_details)}
                         if selected_details
                         else {}
                     ),
@@ -2552,6 +2648,202 @@ class ConversationOnboarding:
             screen_revision=screen_revision,
             operation="back",
         )
+
+    def open_tournament_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Open the durable Tournament Search Details hub."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+        )
+
+    def open_tournament_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one Tournament Search detail submenu."""
+        if detail_key not in _TOURNAMENT_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Tournament Search detail key must be canonical")
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+        )
+
+    def toggle_tournament_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one canonical Tournament Search detail value."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+        )
+
+    def commit_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit a Tournament Search detail submenu."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+        )
+
+    def back_from_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard submenu edits or leave the Tournament Search Details hub."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+        )
+
+    def _change_tournament_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        operation: str,
+        detail_key: str | None = None,
+        value: str | None = None,
+    ) -> None:
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.user_intent is not UserIntent.TOURNAMENT_SEARCH
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            details = dict(draft.tournament_search_details)
+            editing = draft.editing_tournament_search_detail
+            temporary = list(draft.tournament_search_detail_draft)
+            target = "hub"
+            if operation == "open_detail":
+                assert detail_key is not None
+                editing = detail_key
+                temporary = list(details.get(detail_key, ()))
+                target = "submenu"
+            elif operation == "toggle":
+                if editing is None:
+                    raise RuntimeError("No Tournament Search detail is open")
+                if value not in _TOURNAMENT_SEARCH_DETAIL_OPTIONS[editing]:
+                    raise ValueError("Tournament Search detail value must be canonical")
+                if value in temporary:
+                    temporary.remove(value)
+                else:
+                    temporary.append(value)
+                target = "submenu"
+            elif operation == "commit":
+                if editing is None:
+                    raise RuntimeError("No Tournament Search detail is open")
+                if temporary:
+                    details[editing] = tuple(temporary)
+                else:
+                    details.pop(editing, None)
+                editing = None
+                temporary = []
+            elif operation == "back":
+                if editing is None:
+                    target = "post_core"
+                else:
+                    editing = None
+                    temporary = []
+            elif operation == "open_hub":
+                editing = None
+                temporary = []
+            else:
+                raise RuntimeError("Unknown Tournament Search detail operation")
+            now = self._clock.now()
+            state = replace(
+                current,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                tournament_search_details=tuple(sorted(details.items())),
+                editing_tournament_search_detail=editing,
+                tournament_search_detail_draft=tuple(temporary),
+            )
+            if target == "submenu":
+                assert editing is not None
+                message = _tournament_search_detail_submenu_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    detail_key=editing,
+                    temporary=tuple(temporary),
+                )
+            elif target == "post_core":
+                if draft.country is None or draft.city is None:
+                    raise RuntimeError("Tournament Search Details lost its Search Area")
+                message = _post_core_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
+                )
+            else:
+                message = _tournament_search_details_hub_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    details=details,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                draft=changed_draft,
+                message=message,
+                recorded_at=now,
+            )
+        self.deliver_pending()
 
     def _change_game_search_details(
         self,
@@ -5672,6 +5964,122 @@ def _game_search_detail_submenu_message(
     )
 
 
+def _tournament_search_details_hub_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    details: dict[str, tuple[str, ...]],
+) -> TelegramMessage:
+    """Render the Tournament Search Details hub in the fixed field order."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    introduction, not_set, back_label, search_label = {
+        "en": ("You can choose the following settings:", "not set", "Back", "Search"),
+        "ru": ("Можно выбрать следующие настройки:", "не задано", "Назад", "Поиск"),
+        "es": (
+            "Puedes elegir las siguientes opciones:",
+            "sin definir",
+            "Atrás",
+            "Buscar",
+        ),
+        "fr": (
+            "Vous pouvez choisir les paramètres suivants :",
+            "non défini",
+            "Retour",
+            "Rechercher",
+        ),
+    }[copy_locale]
+    keys = tuple(_TOURNAMENT_SEARCH_DETAIL_OPTIONS)
+    names = _TOURNAMENT_SEARCH_DETAIL_NAMES[copy_locale]
+    summaries = tuple(
+        ", ".join(
+            _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+            for value in details.get(key, ())
+        )
+        or not_set
+        for key in keys
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=introduction + "\n\n" + "\n".join(f"- {name}" for name in names),
+        button_rows=(
+            *tuple(
+                (
+                    (
+                        f"{name}: {summary} ▸",
+                        f"details:open:{key}:{screen_revision}",
+                    ),
+                )
+                for key, name, summary in zip(keys, names, summaries, strict=True)
+            ),
+            ((back_label, f"details:back:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _tournament_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    """Render one Tournament Search multi-select detail submenu."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    keys = tuple(_TOURNAMENT_SEARCH_DETAIL_OPTIONS)
+    heading = _TOURNAMENT_SEARCH_DETAIL_HEADINGS[copy_locale][keys.index(detail_key)]
+    done_label, back_label = {
+        "en": ("Done", "⬅️ Back"),
+        "ru": ("Готово", "⬅️ Назад"),
+        "es": ("Listo", "⬅️ Atrás"),
+        "fr": ("Valider", "⬅️ Retour"),
+    }[copy_locale]
+
+    def button(value: str) -> tuple[str, str]:
+        return (
+            f"{'✓ ' if value in temporary else ''}"
+            f"{_GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)}",
+            f"details:toggle:{value}:{screen_revision}",
+        )
+
+    options = _TOURNAMENT_SEARCH_DETAIL_OPTIONS[detail_key]
+    grouped_options: tuple[tuple[str, ...], ...] = {
+        "team_formats": (options[:3], options[3:6], options[6:]),
+        "playing_levels": (
+            options[:2],
+            options[2:4],
+            options[4:6],
+            options[6:],
+        ),
+        "venue_settings": tuple((value,) for value in options),
+        "playing_surfaces": tuple((value,) for value in options),
+        "payment": (options,),
+    }[detail_key]
+    rows = tuple(tuple(button(value) for value in row) for row in grouped_options)
+    if detail_key == "team_formats":
+        rows = (
+            *rows[:-1],
+            (*rows[-1], (done_label, f"details:done:{screen_revision}")),
+        )
+    else:
+        rows = (*rows, ((done_label, f"details:done:{screen_revision}"),))
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=heading,
+        button_rows=(*rows, ((back_label, f"details:back:{screen_revision}"),)),
+    )
+
+
 def _game_search_exact_time_message(
     *,
     update_id: str,
@@ -5740,6 +6148,14 @@ def _open_match_result_message(
 ) -> TelegramMessage:
     """Render one Result Card only from its immutable accepted-fact snapshot."""
     facts = dict(result.card_facts)
+    if facts.get("opportunity_type") == "tournament":
+        return _tournament_result_message(
+            delivery_id=delivery_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            result=result,
+        )
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     event_date = date.fromisoformat(facts["start_local_date"])
     event_end_date = date.fromisoformat(
@@ -6175,6 +6591,238 @@ def _open_match_result_message(
         display_locale=locale,
         screen_revision=screen_revision,
         text=text,
+        button_rows=(),
+        reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _tournament_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+) -> TelegramMessage:
+    """Render a Tournament Result Card in the specification field order."""
+    facts = dict(result.card_facts)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    months = {
+        "en": (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }[copy_locale]
+    labels = {
+        "en": {
+            "title": "Tournament",
+            "posted": "Posted",
+            "contact": "Contact",
+            "additional": "Additional",
+            "possible": "No exact match was found.",
+        },
+        "ru": {
+            "title": "Турнир",
+            "posted": "Пост",
+            "contact": "Контакт",
+            "additional": "Дополнительно",
+            "possible": "Точного совпадения не найдено.",
+        },
+        "es": {
+            "title": "Torneo",
+            "posted": "Publicado",
+            "contact": "Contacto",
+            "additional": "Información adicional",
+            "possible": "No se encontró una coincidencia exacta.",
+        },
+        "fr": {
+            "title": "Tournoi",
+            "posted": "Publié",
+            "contact": "Contact",
+            "additional": "Informations complémentaires",
+            "possible": "Aucune correspondance exacte n’a été trouvée.",
+        },
+    }[copy_locale]
+    event_date = date.fromisoformat(facts["start_local_date"])
+    end_date = date.fromisoformat(
+        facts.get("end_local_date", facts["start_local_date"])
+    )
+    if event_date == end_date:
+        date_copy = f"{event_date.day} {months[event_date.month - 1]} {event_date.year}"
+    else:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]} {event_date.year}–"
+            f"{end_date.day} {months[end_date.month - 1]} {end_date.year}"
+        )
+    where = facts[f"city_display_{copy_locale}"]
+    if int(facts.get("location_specificity", "0")) > 1:
+        where += f", {facts[f'place_display_{copy_locale}']}"
+    value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
+
+    def fact_value(key: str) -> str | None:
+        raw = facts.get(key)
+        if raw is None:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            decoded = raw
+        if isinstance(decoded, list):
+            return ", ".join(
+                value_copy.get(item, item.replace("_", " ").capitalize())
+                for item in decoded
+                if isinstance(item, str)
+            )
+        if isinstance(decoded, dict):
+            return json.dumps(decoded, ensure_ascii=False, sort_keys=True)
+        if isinstance(decoded, str):
+            return value_copy.get(decoded, decoded)
+        return str(decoded)
+
+    field_labels = {
+        "en": {
+            "team_formats": "Team format",
+            "playing_levels": "Playing levels",
+            "venue_settings": "Venue type",
+            "playing_surfaces": "Playing surface",
+            "payment": "Payment",
+            "schedule": "Schedule",
+            "registration_deadline": "Registration deadline",
+            "structure": "Structure",
+            "capacity": "Capacity",
+            "prizes": "Prizes",
+        },
+        "ru": {
+            "team_formats": "Формат команд",
+            "playing_levels": "Уровни игры",
+            "venue_settings": "Тип площадки",
+            "playing_surfaces": "Покрытие",
+            "payment": "Оплата",
+            "schedule": "Расписание",
+            "registration_deadline": "Дедлайн регистрации",
+            "structure": "Структура",
+            "capacity": "Вместимость",
+            "prizes": "Призы",
+        },
+        "es": {
+            "team_formats": "Formato de equipos",
+            "playing_levels": "Niveles de juego",
+            "venue_settings": "Tipo de recinto",
+            "playing_surfaces": "Superficie de juego",
+            "payment": "Pago",
+            "schedule": "Programa",
+            "registration_deadline": "Fecha límite de inscripción",
+            "structure": "Estructura",
+            "capacity": "Capacidad",
+            "prizes": "Premios",
+        },
+        "fr": {
+            "team_formats": "Format des équipes",
+            "playing_levels": "Niveaux de jeu",
+            "venue_settings": "Type de terrain",
+            "playing_surfaces": "Revêtement",
+            "payment": "Paiement",
+            "schedule": "Programme",
+            "registration_deadline": "Date limite d’inscription",
+            "structure": "Structure",
+            "capacity": "Capacité",
+            "prizes": "Prix",
+        },
+    }[copy_locale]
+    lines = [f"⚽ {labels['title']}", date_copy, where]
+    for key in (
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
+    ):
+        value = fact_value(key)
+        if value:
+            lines.append(f"{field_labels[key]}: {value}")
+    if result.result_class == "possible_match":
+        lines.extend(("", labels["possible"]))
+    source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
+        ZoneInfo(facts["iana_timezone"])
+    )
+    route_copy = render_response_route(
+        facts["response_route_kind"],
+        facts["response_route_value"],
+        copy_locale,
+    )
+    lines.extend(
+        (
+            "",
+            f"{labels['posted']}: {source_time.day} "
+            f"{months[source_time.month - 1]} {source_time.year} {source_time:%H:%M}",
+            f"{labels['contact']}: {route_copy}",
+        )
+    )
+    menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n".join(lines),
         button_rows=(),
         reply_button=menu_label,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
@@ -8119,6 +8767,9 @@ class RuntimeApplication:
                 candidate_key=proof_candidate_key,
                 evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
                 routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+                opportunity_type=cast(
+                    str, proof_candidate.get("opportunity_type", "open_match")
+                ),
             )
             semantic_proof_attempt = _classification_attempt_from_result(
                 semantic_proof_recorded_result,
@@ -9130,6 +9781,9 @@ class RuntimeApplication:
                             candidate_key=candidate_key,
                             evidence=evidence,
                             routes=routes,
+                            opportunity_type=cast(
+                                str, candidate.get("opportunity_type", "open_match")
+                            ),
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -9882,7 +10536,7 @@ class RuntimeApplication:
                         {
                             "opportunity_id": opportunity_id,
                             "opportunity_revision_id": opportunity_revision_id,
-                            "opportunity_type": "open_match",
+                            "opportunity_type": accepted_candidate["opportunity_type"],
                             "accepted_facts": accepted_candidate["accepted_facts"],
                             "response_route": accepted_candidate["response_route"],
                         }
@@ -10066,7 +10720,7 @@ class RuntimeApplication:
                 "opportunity_revision_id": opportunity_revision_id,
                 "source_message_revision_id": revision_id,
                 "publication_state": "active",
-                "opportunity_type": "open_match",
+                "opportunity_type": accepted["opportunity_type"],
                 "accepted_facts": accepted["accepted_facts"],
                 "response_route": accepted["response_route"],
             },
@@ -10732,6 +11386,9 @@ class RuntimeApplication:
         game_search_details = _runtime_game_search_details(
             payload.get("game_search_details")
         )
+        tournament_search_details = _runtime_tournament_search_details(
+            payload.get("tournament_search_details")
+        )
         completed_search = CompletedSearch(
             completed_search_id=completed_search_id,
             telegram_user_id=telegram_user_id,
@@ -10744,6 +11401,7 @@ class RuntimeApplication:
             required_date=_runtime_required_date(payload.get("required_date")),
             completed_at=self.clock.now(),
             game_search_details=tuple(sorted(game_search_details.items())),
+            tournament_search_details=tuple(sorted(tournament_search_details.items())),
             sub_city_area_geographic_types=tuple(
                 value for value in area_types if isinstance(value, str)
             ),
@@ -12021,6 +12679,7 @@ def _proposition_evidence_is_authoritative(
     routes: list[JsonValue],
     semantic_proof: JsonValue | None = None,
     source_message_revision_reference: str | None = None,
+    opportunity_type: str = "open_match",
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
@@ -12030,6 +12689,7 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        opportunity_type=opportunity_type,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -12038,6 +12698,7 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        opportunity_type=opportunity_type,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -12046,13 +12707,16 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        opportunity_type=opportunity_type,
     )
     if (
         graph is None
         or not graph.is_current_positive()
         or not graph.has_complete_support_topology()
         or not graph.has_exact_support_spans()
-        or not _proposition_graph_has_closed_target_set(graph, evidence, routes)
+        or not _proposition_graph_has_closed_target_set(
+            graph, evidence, routes, opportunity_type
+        )
     ):
         return False
     contract = cast(dict[str, JsonValue], value)
@@ -12063,7 +12727,7 @@ def _proposition_evidence_is_authoritative(
     if (
         not isinstance(root, dict)
         or root.get("domain") != "football_match"
-        or root.get("meaning") != "open_match"
+        or root.get("meaning") != opportunity_type
         or root.get("polarity") != "positive"
         or root.get("currentness") != "current"
         or not isinstance(facts, dict)
@@ -12134,6 +12798,23 @@ _OPTIONAL_OPEN_MATCH_FACTS = frozenset(
         "venue_settings",
         "playing_surfaces",
         "payment",
+    }
+)
+_MANDATORY_TOURNAMENT_FACTS = frozenset({"opportunity", "event_time", "location"})
+_OPTIONAL_TOURNAMENT_FACTS = frozenset(
+    {
+        "open_participation",
+        "registration_open",
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
     }
 )
 
@@ -12266,6 +12947,13 @@ _PROPOSITION_LINEAGE_FACT_KEYS = (
     "payment",
     "payment_amount",
     "payment_currency",
+    "open_participation",
+    "registration_open",
+    "schedule",
+    "registration_deadline",
+    "structure",
+    "capacity",
+    "prizes",
 )
 _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "opportunity",
@@ -12278,6 +12966,13 @@ _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "venue_settings",
     "playing_surfaces",
     "payment",
+    "open_participation",
+    "registration_open",
+    "schedule",
+    "registration_deadline",
+    "structure",
+    "capacity",
+    "prizes",
 )
 
 
@@ -12327,9 +13022,17 @@ def _proposition_lineage_slot(anchor: str) -> int:
     return int(anchor[:7], 16) + 1
 
 
-def _proposition_opportunity_id(source_message_id: str, anchor: str) -> str:
+def _proposition_opportunity_id(
+    source_message_id: str,
+    anchor: str,
+    opportunity_type: str,
+) -> str:
     """Return the stable Application-owned identity for one proposition lineage."""
-    return f"opportunity:{source_message_id}:open_match:proposition:{anchor[:16]}"
+    if opportunity_type not in {"open_match", "tournament"}:
+        raise ValueError("unsupported proposition opportunity type")
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:proposition:{anchor[:16]}"
+    )
 
 
 def _legacy_candidate_alias_for_canonical(
@@ -12338,15 +13041,25 @@ def _legacy_candidate_alias_for_canonical(
     opportunity_id: str,
 ) -> str | None:
     """Return the exact historical candidate alias for one proposition id."""
-    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
-    if not opportunity_id.startswith(prefix):
+    prefix = None
+    for opportunity_type in ("open_match", "tournament"):
+        candidate_prefix = (
+            f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
+        )
+        if opportunity_id.startswith(candidate_prefix):
+            prefix = candidate_prefix
+            break
+    if prefix is None:
         return None
     candidate_hash = opportunity_id.removeprefix(prefix)
     if len(candidate_hash) != 16 or any(
         character not in "0123456789abcdef" for character in candidate_hash
     ):
         return None
-    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
+    opportunity_type = prefix.split(":")[-3]
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:candidate:{candidate_hash}"
+    )
 
 
 def _canonicalize_legacy_proposition_records(
@@ -12362,21 +13075,33 @@ def _canonicalize_legacy_proposition_records(
         if not isinstance(opportunity_id, str) or not opportunity_id:
             canonical_records.append(dict(record))
             continue
-        legacy_prefix = f"opportunity:{source_message_id}:open_match:candidate:"
         if ":candidate:" in opportunity_id:
-            if not opportunity_id.startswith(legacy_prefix):
+            candidate_prefix = next(
+                (
+                    f"opportunity:{source_message_id}:{opportunity_type}:candidate:"
+                    for opportunity_type in ("open_match", "tournament")
+                    if opportunity_id.startswith(
+                        f"opportunity:{source_message_id}:{opportunity_type}:candidate:"
+                    )
+                ),
+                None,
+            )
+            if candidate_prefix is None:
                 return None
-            candidate_hash = opportunity_id.removeprefix(legacy_prefix)
+            candidate_hash = opportunity_id.removeprefix(candidate_prefix)
             if len(candidate_hash) != 16 or any(
                 character not in "0123456789abcdef" for character in candidate_hash
             ):
                 return None
             opportunity_id = (
-                f"opportunity:{source_message_id}:open_match:proposition:"
-                f"{candidate_hash}"
+                candidate_prefix.replace(":candidate:", ":proposition:")
+                + candidate_hash
             )
-        elif ":proposition:" in opportunity_id and not opportunity_id.startswith(
-            f"opportunity:{source_message_id}:open_match:proposition:"
+        elif ":proposition:" in opportunity_id and not any(
+            opportunity_id.startswith(
+                f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
+            )
+            for opportunity_type in ("open_match", "tournament")
         ):
             return None
         if opportunity_id in seen_opportunity_ids:
@@ -12482,6 +13207,10 @@ def _reconcile_proposition_lineages(
     def score(candidate_index: int, record_index: int) -> int:
         candidate_values = candidate_features[candidate_index]
         record_values = record_features[record_index]
+        if candidate_values.get("opportunity_type") != record_values.get(
+            "opportunity_type"
+        ):
+            return -1
         return sum(
             candidate_values[key] == record_values[key]
             for key in candidate_values.keys() & record_values.keys()
@@ -12578,7 +13307,12 @@ def _reconcile_proposition_lineages(
         if assignments[candidate_index] is not None:
             continue
         slot = _proposition_lineage_slot(anchor)
-        opportunity_id = _proposition_opportunity_id(source_message_id, anchor)
+        candidate_type = candidates[candidate_index].get("opportunity_type")
+        if not isinstance(candidate_type, str):
+            return None
+        opportunity_id = _proposition_opportunity_id(
+            source_message_id, anchor, candidate_type
+        )
         if not assign(
             candidate_index,
             slot=slot,
@@ -12619,6 +13353,13 @@ def _candidate_target_manifest_hash(
             "venue_settings",
             "playing_surfaces",
             "payment",
+            "open_participation",
+            "registration_open",
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
             "response_routes",
             "proposition_evidence",
             "source_context",
@@ -12679,6 +13420,7 @@ def _proposition_graph_has_closed_target_set(
     graph: CanonicalPropositionGraph,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    opportunity_type: str = "open_match",
 ) -> bool:
     """Bind v1 nodes to the closed Application target set.
 
@@ -12690,11 +13432,19 @@ def _proposition_graph_has_closed_target_set(
     """
     fact_ids = {node.node_id for node in graph.facts}
     evidence_ids = set(evidence)
-    if (
-        not _MANDATORY_OPEN_MATCH_FACTS.issubset(evidence_ids)
-        or not evidence_ids.issubset(
-            _MANDATORY_OPEN_MATCH_FACTS | _OPTIONAL_OPEN_MATCH_FACTS
+    if opportunity_type == "tournament":
+        participation_ids = evidence_ids.intersection(
+            {"open_participation", "registration_open"}
         )
+        expected_mandatory = _MANDATORY_TOURNAMENT_FACTS | participation_ids
+        allowed_facts = _MANDATORY_TOURNAMENT_FACTS | _OPTIONAL_TOURNAMENT_FACTS
+    else:
+        expected_mandatory = _MANDATORY_OPEN_MATCH_FACTS
+        allowed_facts = _MANDATORY_OPEN_MATCH_FACTS | _OPTIONAL_OPEN_MATCH_FACTS
+    if (
+        not expected_mandatory.issubset(evidence_ids)
+        or (opportunity_type == "tournament" and len(participation_ids) != 1)
+        or not evidence_ids.issubset(allowed_facts)
         or fact_ids != evidence_ids
     ):
         return False
@@ -12795,6 +13545,11 @@ def _validated_open_match_proposal(
     candidate = candidates[0]
     if not isinstance(candidate, dict):
         return None
+    if candidate.get("opportunity_type") == "tournament":
+        return _validated_tournament_proposal(
+            payload_value,
+            resolver=resolver,
+        )
     required = {
         "candidate_key",
         "opportunity_type",
@@ -13076,6 +13831,410 @@ def _validated_open_match_proposal(
         },
         "response_route": {"kind": route["kind"], "value": route_value},
     }
+
+
+def _validated_tournament_proposal(
+    payload_value: JsonValue,
+    *,
+    resolver: LocationResolverAdapter,
+) -> dict[str, JsonValue] | None:
+    """Validate a Tournament proposal without borrowing Open Match gates."""
+    if not isinstance(payload_value, dict):
+        return None
+    body = payload_value.get("body")
+    revision_id = payload_value.get("source_message_revision_id")
+    output = payload_value.get("output")
+    semantic_proof = payload_value.get("semantic_proof")
+    if (
+        not isinstance(body, str)
+        or not isinstance(revision_id, str)
+        or _is_explicit_children_only_game(body)
+        or not _classifier_proposal_has_pinned_provenance(
+            payload_value,
+            revision_id=revision_id,
+            body=body,
+        )
+        or not isinstance(output, dict)
+        or not classifier_output_is_schema_valid(output, body=body)
+        or output.get("disposition") != "accepted"
+    ):
+        return None
+    candidates = output.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("opportunity_type") != "tournament"
+    ):
+        return None
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    location = candidate.get("location")
+    event_time = candidate.get("event_time")
+    routes = candidate.get("response_routes")
+    source_context = candidate.get("source_context")
+    participation_fields = set(candidate).intersection(
+        {"open_participation", "registration_open"}
+    )
+    if (
+        not isinstance(candidate_key, str)
+        or not isinstance(evidence, dict)
+        or not isinstance(location, dict)
+        or not isinstance(event_time, dict)
+        or not isinstance(routes, list)
+        or len(participation_fields) != 1
+        or candidate.get(next(iter(participation_fields), "")) is not True
+        or (
+            source_context is not None
+            and (not isinstance(source_context, str) or not source_context)
+        )
+        or (isinstance(source_context, str) and source_context not in body)
+    ):
+        return None
+    participation_field = next(iter(participation_fields))
+    if set(evidence) != {
+        "opportunity",
+        "event_time",
+        "location",
+        participation_field,
+    } | (
+        set(candidate)
+        & {
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        }
+    ) or not all(
+        isinstance(value, str) and value in body for value in evidence.values()
+    ):
+        return None
+    validation_body = source_context if isinstance(source_context, str) else body
+    route = _select_response_route(
+        body=validation_body,
+        proposed_routes=routes,
+        bounded_metadata=payload_value.get("bounded_metadata"),
+    )
+    if (
+        not _proposition_evidence_is_authoritative(
+            candidate.get("proposition_evidence"),
+            body=body,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+            semantic_proof=semantic_proof,
+            source_message_revision_reference=_opaque_classifier_reference(
+                revision_id, kind="revision"
+            ),
+            opportunity_type="tournament",
+        )
+        or route is None
+    ):
+        return None
+    mention = location.get("mention")
+    country_id = location.get("country_id")
+    city_id = location.get("city_id")
+    place_id = location.get("place_id")
+    if not all(
+        isinstance(value, str) and value
+        for value in (mention, country_id, city_id, place_id)
+    ):
+        return None
+    assert isinstance(mention, str)
+    assert isinstance(country_id, str)
+    assert isinstance(city_id, str)
+    assert isinstance(place_id, str)
+    resolved_location = _resolve_source_location_across_supported_locales(
+        resolver,
+        mention=mention,
+        country_id=country_id,
+        city_id=city_id,
+    )
+    if resolved_location is None:
+        return None
+    resolved_place, city_display_labels = resolved_location
+    places = tuple(
+        place
+        for place in (resolved_place,)
+        if place.place_id == place_id
+        and place.country_id == country_id
+        and place.city_id == city_id
+        and country_id in place.verified_parent_ids
+        and _valid_location_disjointness(place)
+        and bool(place.resolver_version)
+        and bool(place.glossary_version)
+        and len(place.verified_parent_ids) == len(place.parent_display_names)
+        and all(place.parent_display_names)
+        and (
+            city_id in place.verified_parent_ids
+            or (
+                place.geographic_type is GeographicType.CITY
+                and place.place_id == city_id
+            )
+        )
+    )
+    if len(places) != 1:
+        return None
+    team_formats = candidate.get("team_formats")
+    levels = candidate.get("playing_levels")
+    settings = candidate.get("venue_settings")
+    surfaces = candidate.get("playing_surfaces")
+    payment = candidate.get("payment")
+    if (
+        not _optional_canonical_list(
+            team_formats,
+            {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
+        )
+        or not _optional_canonical_list(
+            levels,
+            {
+                "novice",
+                "below_average",
+                "average",
+                "above_average",
+                "high",
+                "very_high",
+                "master",
+                "professional",
+            },
+        )
+        or not _optional_canonical_list(
+            settings, {"indoor", "outdoor", "covered_outdoor"}
+        )
+        or not _optional_canonical_list(
+            surfaces,
+            {"natural_grass", "artificial_turf", "hard_surface", "wood_parquet"},
+        )
+        or payment not in {None, "free", "paid", "unknown"}
+        or not _tournament_open_participation_is_supported(
+            str(evidence[participation_field]),
+            authoritative_body=validation_body,
+        )
+        or not _optional_values_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=validation_body,
+        )
+        or not _tournament_optional_facts_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=validation_body,
+        )
+    ):
+        return None
+    start_date = event_time.get("start_local_date")
+    end_date = event_time.get("end_local_date")
+    exact_time = event_time.get("exact_local_time")
+    day_part = event_time.get("day_part")
+    timezone = event_time.get("iana_timezone")
+    try:
+        parsed_start = date.fromisoformat(str(start_date))
+        parsed_end = date.fromisoformat(str(end_date))
+        if exact_time is not None:
+            datetime.strptime(str(exact_time), "%H:%M")
+        source_event_time = datetime.fromisoformat(
+            str(payload_value.get("source_event_time"))
+        )
+        validation_time = datetime.fromisoformat(
+            str(payload_value.get("validation_time"))
+        )
+        event_timezone = ZoneInfo(str(timezone))
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    if (
+        parsed_end < parsed_start
+        or not isinstance(timezone, str)
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
+        or places[0].iana_timezone != timezone
+        or source_event_time.tzinfo is None
+        or validation_time.tzinfo is None
+        or not _event_time_is_supported(
+            parsed_start,
+            parsed_end,
+            exact_time if isinstance(exact_time, str) else None,
+            str(evidence["event_time"]),
+            day_part=day_part if isinstance(day_part, str) else None,
+            source_event_time=source_event_time,
+            source_timezone=(
+                str(payload_value.get("source_chat_timezone"))
+                if payload_value.get("source_chat_timezone") is not None
+                else None
+            ),
+            authoritative_body=validation_body,
+        )
+        or mention not in str(evidence["location"])
+        or not _location_mention_is_authoritative(validation_body, mention)
+    ):
+        return None
+    registration_expiry = _tournament_registration_expiry(
+        candidate.get("registration_deadline"),
+        event_timezone,
+    )
+    if (
+        candidate.get("registration_deadline") is not None
+        and registration_expiry is None
+    ):
+        return None
+    expiry = _open_match_expiry(
+        parsed_start,
+        parsed_end,
+        exact_time if isinstance(exact_time, str) else None,
+        event_timezone,
+    )
+    if registration_expiry is not None:
+        expiry = min(expiry, registration_expiry)
+    if validation_time.astimezone(event_timezone) >= expiry:
+        return None
+    payment_details = (
+        _stated_payment_amount_and_currency(str(evidence["payment"]))
+        if payment == "paid"
+        else None
+    )
+    localized = dict(places[0].localized_display_names)
+    accepted_facts: dict[str, JsonValue] = {
+        "start_local_date": str(start_date),
+        "end_local_date": str(end_date),
+        "exact_local_time": exact_time,
+        "day_part": day_part,
+        "iana_timezone": timezone,
+        "country_id": country_id,
+        "city_id": city_id,
+        "place_id": place_id,
+        "location_geographic_type": places[0].geographic_type.value,
+        "location_parent_ids": list(places[0].verified_parent_ids),
+        "location_verified_disjoint_place_ids": list(
+            places[0].verified_disjoint_place_ids
+        ),
+        **{
+            f"city_display_{locale}": label
+            for locale, label in city_display_labels.items()
+        },
+        **{
+            f"place_display_{locale}": localized.get(locale, places[0].display_name)
+            for locale in ("en", "ru", "es", "fr")
+        },
+        "open_participation": True,
+        "team_formats": team_formats,
+        "playing_levels": levels,
+        "venue_settings": settings,
+        "playing_surfaces": surfaces,
+        "payment": None if payment == "unknown" else payment,
+        "payment_amount": payment_details[0] if payment_details is not None else None,
+        "payment_currency": (
+            payment_details[1] if payment_details is not None else None
+        ),
+        "source_posted_at": source_event_time.isoformat(),
+    }
+    for field_name in (
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
+    ):
+        if candidate.get(field_name) is not None:
+            accepted_facts[field_name] = candidate[field_name]
+    return {
+        "opportunity_id": (
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:tournament"
+        ),
+        "source_message_revision_id": revision_id,
+        "opportunity_type": "tournament",
+        "publication_state": "active",
+        "accepted_facts": accepted_facts,
+        "evidence": {
+            **evidence,
+            "proposition_evidence": candidate.get("proposition_evidence"),
+        },
+        "response_route": {"kind": route["kind"], "value": route["value"]},
+    }
+
+
+def _tournament_open_participation_is_supported(
+    evidence: str,
+    *,
+    authoritative_body: str,
+) -> bool:
+    """Require an affirmative, current registration or participation opening."""
+    normalized = evidence.casefold()
+    if _body_has_terminal_retraction(authoritative_body) or re.search(
+        r"\b(?:registration|participation|entry)\b[^.!?;\n]{0,40}"
+        r"\b(?:closed|full|filled|ended|over|no longer)\b|"
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,40}"
+        r"\b(?:закрыт\w*|завершен\w*|заполнен\w*)\b",
+        normalized,
+    ):
+        return False
+    return (
+        re.search(
+            r"\b(?:open|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
+            r"\b(?:registration|registrations|participation|entries?)\b|"
+            r"\b(?:registration|registrations|participation|entries?)\b[^.!?;\n]{0,35}"
+            r"\b(?:open|accepting|available|ongoing)\b|"
+            r"\b(?:registration|participation)\s+is\s+open\b|"
+            r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
+            r"\b(?:открыт\w*|ид[её]т|продолжается)\b",
+            normalized,
+        )
+        is not None
+    )
+
+
+def _tournament_optional_facts_are_supported(
+    candidate: dict[str, JsonValue],
+    evidence: dict[str, JsonValue],
+    *,
+    authoritative_body: str,
+) -> bool:
+    """Keep tournament-only facts source-bound and current."""
+    if _body_has_terminal_retraction(authoritative_body):
+        return False
+    return all(
+        isinstance(evidence.get(field_name), str)
+        and str(evidence[field_name]) in authoritative_body
+        for field_name in (
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        )
+        if candidate.get(field_name) is not None
+    )
+
+
+def _tournament_registration_expiry(
+    value: JsonValue,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    """Normalize the supported explicit registration deadline forms."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return datetime.combine(
+                date.fromisoformat(value), datetime.min.time(), tzinfo=timezone
+            )
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed.replace(tzinfo=timezone) if parsed.tzinfo is None else parsed
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            raw = value.get(key)
+            if isinstance(raw, str):
+                return _tournament_registration_expiry(raw, timezone)
+    return None
 
 
 def _body_establishes_current_open_match(body: str) -> bool:
@@ -15525,6 +16684,33 @@ def _runtime_game_search_details(
             isinstance(item, str) and item for item in raw
         ):
             raise TypeError("RunSearch Game Search details must be string lists")
+        details[key] = tuple(item for item in raw if isinstance(item, str))
+    return details
+
+
+def _runtime_tournament_search_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical Tournament Search detail criteria."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch tournament_search_details must be an object")
+    allowed = {
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+    if set(value) - allowed:
+        raise ValueError("RunSearch tournament_search_details has unsupported keys")
+    details: dict[str, tuple[str, ...]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise TypeError("RunSearch Tournament Search details must be string lists")
         details[key] = tuple(item for item in raw if isinstance(item, str))
     return details
 
