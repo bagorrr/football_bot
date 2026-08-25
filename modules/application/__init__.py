@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -3524,6 +3524,7 @@ class ConversationOnboarding:
                     screen_revision=state.screen_revision,
                     detail_key=editing,
                     temporary=tuple(temporary),
+                    user_intent=draft.user_intent,
                 )
             elif target == "timing_prompt":
                 assert timing_prompt is not None
@@ -6913,10 +6914,18 @@ def _transfer_search_detail_submenu_message(
     screen_revision: int,
     detail_key: str,
     temporary: tuple[str, ...],
+    user_intent: UserIntent | None = None,
 ) -> TelegramMessage:
     """Render transfer detail edits with explicit Done and Back controls."""
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     names = list(_TRANSFER_SEARCH_DETAIL_NAMES[copy_locale])
+    if user_intent is UserIntent.NEW_TEAM_SEARCH:
+        names[1] = {
+            "en": "Team playing level",
+            "ru": "Уровень команды",
+            "es": "Nivel del equipo",
+            "fr": "Niveau de l’équipe",
+        }[copy_locale]
     heading = names[tuple(_TRANSFER_SEARCH_DETAIL_OPTIONS).index(detail_key)]
     done_label, any_label, back_label = {
         "en": ("Done", "Any", "Back"),
@@ -7253,10 +7262,10 @@ def _transfer_search_result_message(
             "fr": "postes",
         },
         "playing_levels": {
-            "en": "playing level",
-            "ru": "уровень игры",
-            "es": "nivel de juego",
-            "fr": "niveau de jeu",
+            "en": "team playing level" if is_roster else "player playing level",
+            "ru": "уровень команды" if is_roster else "уровень игрока",
+            "es": "nivel del equipo" if is_roster else "nivel del jugador",
+            "fr": "niveau de l’équipe" if is_roster else "niveau du joueur",
         },
         "team_formats": {
             "en": "team format",
@@ -13123,14 +13132,44 @@ def _source_edit_qualifies_freshness(
     return normalize(previous_revision.body) != normalize(current_revision.body)
 
 
-def _transfer_assertion_signature(body: str, opportunity_type: str) -> tuple[str, ...]:
-    """Keep source meaning while ignoring punctuation and whitespace edits."""
-    # Location, position, payment, route, and localized wording can all
-    # change the standing assertion. Tokenize the complete source so each of
-    # those changes renews freshness while punctuation-only edits do not.
+def _transfer_assertion_signature(
+    body: str,
+    opportunity_type: str,
+    bounded_metadata: Mapping[str, object] | None = None,
+) -> tuple[str, ...]:
+    """Keep transfer assertion clauses and usable metadata routes."""
+    marker = re.compile(
+        r"(?:roster|squad|vacanc\w*|opening|spot|position|transfer|transfert|"
+        r"переход\w*|long[- ]term|season\w*|temporad\w*|saison\w*|"
+        r"goalkeeper\w*|defender\w*|midfielder\w*|forward\w*|striker\w*|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"portero\w*|defensa\w*|centrocampista\w*|delantero\w*|"
+        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*|"
+        r"available|seeking|looking|need\w*|join\w*|team|команд\w*|"
+        r"доступ\w*|ищ\w*|нужн\w*|message|contact|reply|email|phone|"
+        r"whatsapp|telegram|@[a-z0-9_]{3,}|https?://)",
+        re.IGNORECASE,
+    )
+    clauses = tuple(
+        clause
+        for clause in re.split(r"[.!?;\n]+", body.casefold())
+        if marker.search(clause)
+    ) or (body.casefold(),)
+    metadata_tokens: list[str] = []
+    if bounded_metadata is not None:
+        for key in (
+            "source_author_dm_url",
+            "reply_route_url",
+            "source_message_url",
+            "source_message_reply_capable",
+        ):
+            value = bounded_metadata.get(key)
+            if isinstance(value, (str, bool)):
+                metadata_tokens.extend((key, str(value).casefold()))
     return (
         opportunity_type,
-        *re.findall(r"[\w@]+", body.casefold(), flags=re.UNICODE),
+        *re.findall(r"[\w@]+", " ".join(clauses), flags=re.UNICODE),
+        *metadata_tokens,
     )
 
 
@@ -13147,8 +13186,14 @@ def _source_transfer_edit_qualifies_freshness(
     if previous_revision is None or previous_revision.body is None:
         return True
     return _transfer_assertion_signature(
-        current_revision.body, opportunity_type
-    ) != _transfer_assertion_signature(previous_revision.body, opportunity_type)
+        current_revision.body,
+        opportunity_type,
+        current_revision.bounded_metadata,
+    ) != _transfer_assertion_signature(
+        previous_revision.body,
+        opportunity_type,
+        previous_revision.bounded_metadata,
+    )
 
 
 def _source_transfer_qualifying_assertion_at(
@@ -15727,8 +15772,8 @@ def _validated_transfer_proposal(
             str(evidence["seasonal_timing"]) if "seasonal_timing" in evidence else None,
             authoritative_body=validation_body,
         )
-        or not _body_establishes_transfer_opportunity(body, opportunity_type)
-        or not _transfer_offer_is_single_player(body, opportunity_type)
+        or not _body_establishes_transfer_opportunity(validation_body, opportunity_type)
+        or not _transfer_offer_is_single_player(validation_body, opportunity_type)
     ):
         return None
     source_posted_at = payload_value.get("source_posted_at")
@@ -16064,14 +16109,23 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     if long_term is None:
         return False
     # A one-off game mention is allowed only when the same source also makes
-    # the long-term or seasonal nature explicit. This keeps "need a player for
-    # Saturday's match" out of the long-term transfer publication path.
+    # the long-term or seasonal nature explicit. A bare "season" in a phrase
+    # such as "this season's Saturday match" is not enough.
     if one_off is not None:
         explicit_long_term = re.search(
             r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
-            r"squad\s+(?:vacanc\w*|opening|spot)|season(?:al)?|long[- ]term|"
-            r"transfer|transfert|переход\w*|сезон\w*|plantilla|"
-            r"temporad\w*|effectif|saison\w*)\b",
+            r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
+            r"(?:the\s+)?(?:roster|squad)|squad\s+(?:vacanc\w*|opening|spot)|"
+            r"(?:season(?:al)?|temporad\w*|saison\w*)\s+(?:roster|squad|"
+            r"vacanc\w*|transfer|move|availability)|"
+            r"long[- ]term|transfer|available\s+for\s+(?:a\s+)?move|"
+            r"looking\s+for\s+a\s+team|seeking\s+a\s+team|"
+            r"join\s+(?:a\s+)?team|vacanc\w*|"
+            r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
+            r"сезон\w*\s+(?:набор\w*|ваканси\w*|переход\w*)|"
+            r"disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+equip\w*|"
+            r"plantilla\s+(?:vacante|abierta)|transfert|cherche\w*\s+une\s+"
+            r"équipe|effectif\s+vacant)\b",
             normalized,
         )
         if explicit_long_term is None:
@@ -16088,7 +16142,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
         r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
         r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b"
-        r"\s+(?:and|&|y|et|и)\s+"
+        r"\s+(?:and|&|y|et|и|plus|más)\s+"
         r"\b(?:goalkeeper|defender|midfielder|forward|striker|"
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
         r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
@@ -16096,11 +16150,15 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         body.casefold(),
     )
     explicit_multiple_players = re.search(
-        r"\b(?:a|an|one)\s+\w+(?:\s+\w+){0,2}\s+and\s+"
+        r"\b(?:a|an|one)\s+\w+(?:\s+\w+){0,2}\s+(?:and|plus)\s+"
         r"(?:a|an|one)\s+\w+|"
         r"\b(?:un|una)\s+\w+(?:\s+\w+){0,2}\s+y\s+(?:un|una)\s+\w+|"
         r"\b(?:un|une)\s+\w+(?:\s+\w+){0,2}\s+et\s+(?:un|une)\s+\w+|"
-        r"\b(?:один|одна)\s+\w+(?:\s+\w+){0,2}\s+и\s+(?:один|одна)\s+\w+",
+        r"\b(?:один|одна)\s+\w+(?:\s+\w+){0,2}\s+и\s+(?:один|одна)\s+\w+|"
+        r"\b(?:a|an|one|un|una|un|une|один|одна)\s+\w+(?:\s+\w+){0,2},\s*"
+        r"(?:a|an|one|un|una|un|une|один|одна)\s+\w+|"
+        r"\b(?:another|otro|otra|un\s+autre|une\s+autre|ещё\s+один|"
+        r"еще\s+один)\s+\w+",
         body.casefold(),
     )
     plural_position_or_count = re.search(

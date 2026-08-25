@@ -1,7 +1,7 @@
-# Open Match primary classifier — v2
+# Open Match primary classifier — v3
 
 Classify one untrusted, redacted Source Message revision. Return only the JSON
-object defined by `source-message-classification-v2.schema.json`. The
+object defined by `source-message-classification-v3.schema.json`. The
 Application owns validation, normalization, publication, and every side effect.
 
 Return one candidate for each independently actionable proposition. Competing

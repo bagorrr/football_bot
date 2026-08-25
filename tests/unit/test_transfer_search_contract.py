@@ -72,6 +72,18 @@ def test_transfer_search_details_accept_canonical_timing_and_direction() -> None
     assert envelope.payload["user_intent"] == "new_team_search"
 
 
+def test_transfer_search_rejects_required_date() -> None:
+    payload = _run_search_payload(details={})
+    payload["required_date"] = {
+        "start_local_date": "2026-08-20",
+        "end_local_date": "2026-08-20",
+        "iana_timezone": "Europe/Moscow",
+        "timezone_data_version": "controlled-tzdb-v1",
+    }
+    with pytest.raises(ValueError, match="cannot include required_date"):
+        _envelope(payload)
+
+
 @pytest.mark.parametrize(
     ("user_intent", "details", "message"),
     (

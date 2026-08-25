@@ -44,12 +44,28 @@ class ResponsesClassifierAdapter:
         self._schemas = dict(schemas)
         self._prompt_paths = dict(prompt_paths)
         self._adapter_version = adapter_version
-        self._primary_schema_version = primary_schema_version or (
-            "source-message-classification-v3"
-            if "source-message-classification-v3" in self._schemas
+        v3_artifacts_complete = (
+            "source-message-classification-v3" in self._schemas
             and "open-match-primary-v3" in self._prompt_paths
-            else "source-message-classification-v2"
+            and "open-match-ambiguity-v2" in self._prompt_paths
+            and "source-semantic-proof-v2" in self._schemas
+            and "open-match-semantic-proof-v2" in self._prompt_paths
         )
+        if primary_schema_version is None:
+            if v3_artifacts_complete:
+                primary_schema_version = "source-message-classification-v3"
+            elif (
+                "source-message-classification-v2" in self._schemas
+                and "open-match-primary-v2" in self._prompt_paths
+            ):
+                primary_schema_version = "source-message-classification-v2"
+            else:
+                raise ValueError("no complete primary classifier artifact set")
+        if primary_schema_version == "source-message-classification-v3" and not (
+            v3_artifacts_complete
+        ):
+            raise ValueError("incomplete v3 classifier artifact set")
+        self._primary_schema_version = primary_schema_version
         if self._primary_schema_version not in {
             "source-message-classification-v2",
             "source-message-classification-v3",

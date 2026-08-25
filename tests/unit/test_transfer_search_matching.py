@@ -338,6 +338,70 @@ def test_transfer_route_only_edit_renews_source_assertion() -> None:
     )
 
 
+def test_transfer_metadata_route_edit_renews_source_assertion() -> None:
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body="Long-term roster vacancy for a goalkeeper in Saint Petersburg.",
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        bounded_metadata={"source_author_dm_url": "https://t.me/old"},
+    )
+    edited = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body=created.body,
+        event_time=datetime(2026, 8, 2, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 2, 8, tzinfo=UTC),
+        bounded_metadata={"source_author_dm_url": "https://t.me/new"},
+    )
+    assert (
+        _source_transfer_qualifying_assertion_at(
+            edited,
+            (created, edited),
+            "roster_vacancy",
+        )
+        == edited.event_time
+    )
+
+
+def test_transfer_unrelated_prose_edit_does_not_renew_source_assertion() -> None:
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body="Long-term roster vacancy for a goalkeeper in Saint Petersburg.",
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+    )
+    edited = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body=f"{created.body} Unrelated note.",
+        event_time=datetime(2026, 8, 2, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 2, 8, tzinfo=UTC),
+    )
+    assert (
+        _source_transfer_qualifying_assertion_at(
+            edited,
+            (created, edited),
+            "roster_vacancy",
+        )
+        == created.event_time
+    )
+
+
 @pytest.mark.parametrize(
     ("timing", "expected"),
     (
@@ -366,6 +430,16 @@ def test_transfer_source_start_date_is_current_or_future_in_place_timezone(
         (
             "Need a goalkeeper for Saturday's match in Saint Petersburg.",
             "roster_vacancy",
+            False,
+        ),
+        (
+            "Need a goalkeeper for this season's Saturday match.",
+            "roster_vacancy",
+            False,
+        ),
+        (
+            "Need a goalkeeper for this season's Saturday match.",
+            "player_transfer_availability",
             False,
         ),
         (
@@ -416,6 +490,9 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
         ("Alex and Ben are available for a long-term transfer.", False),
         ("A goalkeeper and a defender are available for a transfer.", False),
         ("A goalkeeper and defender are available for a transfer.", False),
+        ("One goalkeeper plus one defender are available for a transfer.", False),
+        ("A goalkeeper, a defender are available for a transfer.", False),
+        ("Another goalkeeper is available for a transfer.", False),
         ("Dos jugadores están disponibles para un traspaso de temporada.", False),
         ("Deux joueurs sont disponibles pour un transfert durable.", False),
     ),

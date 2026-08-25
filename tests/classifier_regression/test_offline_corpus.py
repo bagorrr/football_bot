@@ -308,6 +308,27 @@ def test_v3_transfer_artifacts_are_additive_and_version_bound() -> None:
     assert primary_schema["$id"] == "source-message-classification-v3"
     assert ambiguity_schema["$id"] == "source-message-classification-v3"
     assert semantic_proof_schema["$id"] == "source-semantic-proof-v2"
+    assert "# Open Match primary classifier — v3\n" in (
+        repository_root / "classifier" / "open-match-primary-v3" / "prompt.md"
+    ).read_text(encoding="utf-8")
+    assert "source-message-classification-v3.schema.json" in (
+        repository_root / "classifier" / "open-match-primary-v3" / "prompt.md"
+    ).read_text(encoding="utf-8")
+    assert "# Open Match ambiguity second pass — v2\n" in (
+        repository_root / "classifier" / "open-match-ambiguity-v2" / "prompt.md"
+    ).read_text(encoding="utf-8")
+    assert "source-message-classification-v3" in (
+        repository_root / "classifier" / "open-match-ambiguity-v2" / "prompt.md"
+    ).read_text(encoding="utf-8")
+    assert "# Open Match semantic-proof pass — v2\n" in (
+        repository_root / "classifier" / "open-match-semantic-proof-v2" / "prompt.md"
+    ).read_text(encoding="utf-8")
+    assert "source-semantic-proof-v2.schema.json" in (
+        repository_root / "classifier" / "open-match-semantic-proof-v2" / "prompt.md"
+    ).read_text(encoding="utf-8")
+    assert "Player\nTransfer Availability" in (
+        repository_root / "classifier" / "open-match-semantic-proof-v2" / "prompt.md"
+    ).read_text(encoding="utf-8")
     assert {
         "roster_vacancy",
         "player_transfer_availability",

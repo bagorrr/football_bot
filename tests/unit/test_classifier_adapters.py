@@ -514,10 +514,13 @@ def test_classifier_adapters_select_the_newest_complete_transfer_artifact_set(
     prompt_paths = {
         "open-match-primary-v2": tmp_path / "primary-v2.prompt.md",
         "open-match-primary-v3": tmp_path / "primary-v3.prompt.md",
+        "open-match-ambiguity-v2": tmp_path / "ambiguity-v2.prompt.md",
+        "open-match-semantic-proof-v2": tmp_path / "semantic-proof-v2.prompt.md",
     }
     schema_paths = {
         "source-message-classification-v2": tmp_path / "classification-v2.json",
         "source-message-classification-v3": tmp_path / "classification-v3.json",
+        "source-semantic-proof-v2": tmp_path / "semantic-proof-v2.json",
     }
     for path in (*prompt_paths.values(), *schema_paths.values()):
         path.write_text("{}", encoding="utf-8")

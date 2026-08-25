@@ -13,7 +13,7 @@ from modules.application import (
     _transfer_search_detail_submenu_message,
     _transfer_search_result_message,
 )
-from modules.domain import SearchResult
+from modules.domain import SearchResult, UserIntent
 
 
 @pytest.mark.parametrize(
@@ -50,6 +50,30 @@ def test_transfer_seasonal_timing_menu_has_mutually_exclusive_answers(
     assert sum("timing:" in callback for callback in callbacks) == 4
     assert callbacks[-2].startswith("transfer-details:done:")
     assert callbacks[-1].startswith("transfer-details:back:")
+
+
+@pytest.mark.parametrize(
+    ("locale", "expected"),
+    (
+        ("en", "Team playing level"),
+        ("ru", "Уровень команды"),
+        ("es", "Nivel del equipo"),
+        ("fr", "Niveau de l’équipe"),
+    ),
+)
+def test_new_team_transfer_submenu_localizes_team_playing_level(
+    locale: str, expected: str
+) -> None:
+    message = _transfer_search_detail_submenu_message(
+        update_id=f"level:{locale}",
+        telegram_user_id=55_101,
+        locale=locale,
+        screen_revision=10,
+        detail_key="playing_levels",
+        temporary=(),
+        user_intent=UserIntent.NEW_TEAM_SEARCH,
+    )
+    assert message.text == f"{expected}."
 
 
 @pytest.mark.parametrize(

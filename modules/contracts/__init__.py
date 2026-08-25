@@ -781,6 +781,10 @@ def _validate_run_search(
     if whole_city == bool(area_ids):
         raise ValueError("RunSearch requires exactly one Search Area mode")
     required_date = payload.get("required_date")
+    if user_intent in {"new_team_search", "transfer_player_search"} and (
+        required_date is not None
+    ):
+        raise ValueError("RunSearch transfer Search cannot include required_date")
     if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
         _validate_required_date(
             required_date,
