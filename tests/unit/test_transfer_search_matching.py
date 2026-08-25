@@ -21,7 +21,12 @@ from modules.domain import (
 )
 
 
-def _search(intent: UserIntent, *, timing: str | None = None) -> CompletedSearch:
+def _search(
+    intent: UserIntent,
+    *,
+    timing: str | None = None,
+    completed_at: datetime | None = None,
+) -> CompletedSearch:
     details = ("seasonal_timing", (timing,)) if timing is not None else None
     return CompletedSearch(
         completed_search_id="completed-search:transfer",
@@ -33,7 +38,7 @@ def _search(intent: UserIntent, *, timing: str | None = None) -> CompletedSearch
         sub_city_area_ids=(),
         whole_city=True,
         required_date=None,
-        completed_at=datetime(2026, 8, 18, 9, tzinfo=UTC),
+        completed_at=completed_at or datetime(2026, 8, 18, 9, tzinfo=UTC),
         transfer_search_details=(details,) if details is not None else (),
     )
 
@@ -186,6 +191,24 @@ def test_transfer_search_orders_by_freshest_current_source_assertion() -> None:
     ]
 
 
+def test_transfer_search_excludes_stale_offers_even_after_cosmetic_edit() -> None:
+    results = evaluate_transfer_search(
+        _search(
+            UserIntent.NEW_TEAM_SEARCH,
+            completed_at=datetime(2026, 8, 18, 9, tzinfo=UTC),
+        ),
+        {},
+        (
+            _opportunity(
+                "roster_vacancy",
+                source_posted_at="2026-07-18T08:00:00+00:00",
+                source_edited_at="2026-08-17T08:00:00+00:00",
+            ),
+        ),
+    )
+    assert results == ()
+
+
 @pytest.mark.parametrize(
     ("body", "opportunity_type", "expected"),
     (
@@ -204,6 +227,16 @@ def test_transfer_search_orders_by_freshest_current_source_assertion() -> None:
             "player_transfer_availability",
             True,
         ),
+        (
+            "Need a player in Saint Petersburg.",
+            "roster_vacancy",
+            False,
+        ),
+        (
+            "Joueur disponible à Saint-Pétersbourg.",
+            "player_transfer_availability",
+            False,
+        ),
     ),
 )
 def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
@@ -217,6 +250,8 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
     (
         ("A player is available for a long-term transfer.", True),
         ("Two players are available for a long-term transfer.", False),
+        ("Alex and Ben are available for a long-term transfer.", False),
+        ("A goalkeeper and a defender are available for a transfer.", False),
         ("Dos jugadores están disponibles para un traspaso de temporada.", False),
         ("Deux joueurs sont disponibles pour un transfert durable.", False),
     ),

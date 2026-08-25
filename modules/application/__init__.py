@@ -7068,6 +7068,14 @@ def _normalize_transfer_timing_text(text: str, *, kind: str) -> str | None:
                     )
         return f"start_local_date:{parsed.isoformat()}" if parsed is not None else None
     if kind == "stated_season":
+        normalized = re.sub(
+            r"^(?:(?:for|para|pour)\s+)?(?:the\s+|el\s+|la\s+)?"
+            r"(?:season|сезон|temporada|saison)\s*[:\-]?\s*",
+            "",
+            normalized,
+        )
+        normalized = re.sub(r"\s+(?:season|сезон|temporada|saison)$", "", normalized)
+        normalized = re.sub(r"^(?:for|para|pour)\s+(?:the|el|la)\s+", "", normalized)
         match = re.fullmatch(r"(20\d{2})\s*[-/]\s*(\d{2,4})", normalized)
         if match is not None:
             first = int(match.group(1))
@@ -15559,7 +15567,7 @@ def _validated_transfer_proposal(
         or latest_assertion.tzinfo is None
         or validated_at.tzinfo is None
         or latest_assertion < posted
-        or validated_at >= latest_assertion + timedelta(days=30)
+        or validated_at >= posted + timedelta(days=30)
         or not isinstance(source_posted_at, str)
         or (source_edited_at is not None and not isinstance(source_edited_at, str))
     ):
@@ -15753,9 +15761,9 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     if opportunity_type == "roster_vacancy":
         long_term = re.search(
             r"\b(?:roster|vacanc\w*|squad|season|seasonal|long[- ]term|"
-            r"need\w*\s+(?:a\s+)?player|looking\s+for\s+players|"
+            r"looking\s+for\s+players|"
             r"набор\w*|нужн\w*\s+игрок\w*|сезон\w*|команд\w*|"
-            r"plantilla|jugador\w*|temporad\w*|effectif|joueur\w*|saison\w*)\b",
+            r"plantilla|temporad\w*|effectif|saison\w*)\b",
             normalized,
         )
     else:
@@ -15764,7 +15772,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"a\s+team|seeking\s+a\s+team|long[- ]term|season|"
             r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
             r"сезон\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
-            r"equip\w*|transfert|cherche\w*\s+une\s+équipe|joueur\w*)\b",
+            r"equip\w*|transfert|cherche\w*\s+une\s+équipe)\b",
             normalized,
         )
     if long_term is None:
@@ -15799,8 +15807,23 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
     """Reject plural Player Transfer Availability offers as one Player."""
     if opportunity_type != "player_transfer_availability":
         return True
+    explicit_multiple_players = re.search(
+        r"\b(?:a|an|one)\s+\w+(?:\s+\w+){0,2}\s+and\s+"
+        r"(?:a|an|one)\s+\w+|"
+        r"\b(?:un|una)\s+\w+(?:\s+\w+){0,2}\s+y\s+(?:un|una)\s+\w+|"
+        r"\b(?:un|une)\s+\w+(?:\s+\w+){0,2}\s+et\s+(?:un|une)\s+\w+|"
+        r"\b(?:один|одна)\s+\w+(?:\s+\w+){0,2}\s+и\s+(?:один|одна)\s+\w+",
+        body.casefold(),
+    )
+    named_multiple_players = re.search(
+        r"\b[A-ZА-ЯЁ][\w'’-]+\s+(?:and|&|y|et|и)\s+"
+        r"[A-ZА-ЯЁ][\w'’-]+\b",
+        body,
+    )
     return (
-        re.search(
+        explicit_multiple_players is None
+        and named_multiple_players is None
+        and re.search(
             r"\b(?:players|several\s+players|multiple\s+players|two\s+players|"
             r"three\s+players|four\s+players|pair\s+of\s+players|"
             r"group\s+of\s+players|игроки|игроков|игроками|несколько\s+игрок\w*|"

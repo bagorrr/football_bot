@@ -20,6 +20,10 @@ from modules.domain import SearchResult
     ("text", "kind", "expected"),
     (
         ("2026/27", "stated_season", "stated_season:2026-2027"),
+        ("season 2026/27", "stated_season", "stated_season:2026-2027"),
+        ("сезон 2026/27", "stated_season", "stated_season:2026-2027"),
+        ("temporada 2026/27", "stated_season", "stated_season:2026-2027"),
+        ("saison 2026/27", "stated_season", "stated_season:2026-2027"),
         ("01.09.2026", "start_local_date", "start_local_date:2026-09-01"),
         ("ready_now", "ready_now", "ready_now"),
     ),
