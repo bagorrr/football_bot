@@ -1,9 +1,14 @@
 """Deterministic Opponent Search matching."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual interface copy is intentional.
+
 from datetime import UTC, date, datetime
 from typing import cast
 
-from modules.application import _opponent_request_result_message
+from modules.application import (
+    _opponent_request_result_message,
+    _opponent_search_details_hub_message,
+)
 from modules.classifier_contract import (
     JsonValue as ClassifierJsonValue,
 )
@@ -21,7 +26,11 @@ from modules.domain import (
 )
 
 
-def _search(*, venue: str | None = None) -> CompletedSearch:
+def _search(
+    *,
+    venue: str | None = None,
+    details: tuple[tuple[str, tuple[str, ...]], ...] | None = None,
+) -> CompletedSearch:
     return CompletedSearch(
         completed_search_id="completed-search:opponent",
         telegram_user_id=49_540,
@@ -39,7 +48,11 @@ def _search(*, venue: str | None = None) -> CompletedSearch:
         ),
         completed_at=datetime(2026, 8, 18, 9, tzinfo=UTC),
         opponent_search_details=(
-            (("venue_provision", (venue,)),) if venue is not None else ()
+            details
+            if details is not None
+            else (("venue_provision", (venue,)),)
+            if venue is not None
+            else ()
         ),
     )
 
@@ -50,6 +63,7 @@ def _opportunity(
     venue: str | None,
     opportunity_type: str = "opponent_request",
     explicit_request: bool = True,
+    extra_facts: dict[str, object] | None = None,
 ) -> OpportunityRevisionProjection:
     facts: dict[str, object] = {
         "start_local_date": "2026-08-20",
@@ -76,6 +90,8 @@ def _opportunity(
         facts[f"place_display_{locale}"] = display_name
     if venue is not None:
         facts["venue_provision"] = venue
+    if extra_facts is not None:
+        facts.update(extra_facts)
     return OpportunityRevisionProjection(
         opportunity_id=opportunity_id,
         opportunity_revision_id=f"{opportunity_id}:revision:1",
@@ -142,7 +158,120 @@ def test_unknown_opportunity_venue_is_possible_but_conflict_is_excluded() -> Non
         result=results[0],
     )
     assert "Our team has a venue" not in message.text
-    assert "needs clarification" in message.text
+    assert "Needs clarification" in message.text
+
+
+def test_opponent_hub_and_card_follow_the_four_language_result_contract() -> None:
+    details = (
+        ("team_formats", ("7x7",)),
+        ("playing_levels", ("average",)),
+        ("venue_provision", ("team_has_venue",)),
+        ("venue_settings", ("outdoor",)),
+        ("playing_surfaces", ("artificial_turf",)),
+        ("payment", ("free",)),
+    )
+    result = evaluate_opponent_search(
+        _search(details=details),
+        dict(details),
+        (
+            _opportunity(
+                opportunity_id="localized-card",
+                venue="team_has_venue",
+                extra_facts={
+                    "exact_local_time": "19:00",
+                    "team_formats": ["7x7"],
+                    "playing_levels": ["average"],
+                    "venue_settings": ["outdoor"],
+                    "playing_surfaces": ["artificial_turf"],
+                    "payment": "free",
+                },
+            ),
+        ),
+    )[0]
+    expected = {
+        "en": {
+            "hub": "You can choose the following settings:",
+            "date": "20 August 2026, 19:00",
+            "venue": "We have a venue",
+            "criterion": "venue provision",
+            "level": "Average",
+            "label": "Matches",
+            "posted": "Posted: 18 August 2026 at 11:00",
+            "contact": "Contact:",
+            "invitation": (
+                "Questions? Message me. I can explain the card or help refine "
+                "your search."
+            ),
+        },
+        "ru": {
+            "hub": "Можно выбрать следующие настройки:",
+            "date": "20 августа 2026, 19:00",
+            "venue": "Площадка у нас есть",
+            "criterion": "предоставление площадки",
+            "level": "Средний",
+            "label": "Подходит",
+            "posted": "Пост: 18 августа 2026 в 11:00",
+            "contact": "Контакт:",
+            "invitation": (
+                "💬 Остались вопросы? Напишите, я объясню карточку "
+                "или помогу уточнить поиск."
+            ),
+        },
+        "es": {
+            "hub": "Puedes elegir las siguientes opciones:",
+            "date": "20 agosto 2026, 19:00",
+            "venue": "Tenemos campo",
+            "criterion": "provisión del campo",
+            "level": "Medio",
+            "label": "Coincide",
+            "posted": "Publicado: 18 agosto 2026 a las 11:00",
+            "contact": "Contacto:",
+            "invitation": (
+                "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha "
+                "o le ayudaré a ajustar la búsqueda."
+            ),
+        },
+        "fr": {
+            "hub": "Vous pouvez choisir les paramètres suivants :",
+            "date": "20 août 2026, 19:00",
+            "venue": "Nous avons un terrain",
+            "criterion": "mise à disposition du terrain",
+            "level": "Moyen",
+            "label": "Correspond",
+            "posted": "Publié: 18 août 2026 à 11:00",
+            "contact": "Contact:",
+            "invitation": (
+                "Une question ? Écrivez-moi. Je peux expliquer la fiche "
+                "ou vous aider à affiner votre recherche."
+            ),
+        },
+    }
+    for locale, copy in expected.items():
+        hub = _opponent_search_details_hub_message(
+            update_id="hub",
+            telegram_user_id=49_540,
+            locale=locale,
+            screen_revision=1,
+            details={},
+        )
+        assert hub.text.startswith(copy["hub"])
+        card = _opponent_request_result_message(
+            delivery_id="result",
+            telegram_user_id=49_540,
+            locale=locale,
+            screen_revision=1,
+            result=result,
+        )
+        assert copy["date"] in card.text
+        assert copy["venue"] in card.text
+        assert copy["criterion"] in card.text
+        assert copy["level"] in card.text
+        assert copy["label"] in card.text
+        assert copy["posted"] in card.text
+        assert copy["contact"] in card.text
+        assert copy["invitation"] in card.text
+        assert "2026-08-20" not in card.text
+        assert "venue_provision" not in card.text
 
 
 def test_opponent_request_is_symmetric_and_requires_explicit_request_fact() -> None:

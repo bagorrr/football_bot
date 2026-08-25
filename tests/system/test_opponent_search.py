@@ -1,5 +1,7 @@
 """Opponent Search through the approved PostgreSQL-backed system seam."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual evidence is intentional.
+
 from __future__ import annotations
 
 import json
@@ -278,6 +280,191 @@ def test_opponent_request_search_matches_published_request_end_to_end() -> None:
     assert persisted_facts["venue_provision"] == "team_has_venue"
     card = telegram_delivery.messages[-1]
     assert card.text.startswith("⚽ Opponent Request\n")
-    assert "Team has venue" in card.text
+    assert "We have a venue" in card.text
     assert "Our team has a venue" not in card.text
     assert "needs clarification" not in card.text
+
+
+def test_multilingual_venue_provision_evidence_reaches_publication() -> None:
+    """Accept explicit supported-language venue facts and reject ambiguity."""
+    telegram_ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 54_101
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=5_410_100,
+    )
+    telegram_ingestion.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:5410",
+    )
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="на Петроградской",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    places=(
+                        LocationCandidate(
+                            place_id="station:ru:spb:petrogradskaya",
+                            display_name="Петроградская",
+                            geographic_type=GeographicType.STATION,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=(
+                                "country:ru",
+                                "city:ru:saint-petersburg",
+                            ),
+                            parent_display_names=("Россия", "Saint Petersburg"),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Petrogradskaya"),
+                                ("ru", "Петроградская"),
+                                ("es", "Petrogradskaya"),
+                                ("fr", "Petrogradskaya"),
+                            ),
+                        ),
+                    ),
+                    glossary_version="location-glossary-v1",
+                ),
+            ),
+        ),
+    )
+    timezones.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    localized_facts = (
+        ("ru", "У команды есть площадка", "team_has_venue"),
+        ("es", "Necesitamos el campo del rival", "needs_opponent_venue"),
+        ("fr", "Nous trouverons un terrain ensemble", "arrange_jointly"),
+    )
+    rejected_facts = (
+        ("missing", None, None),
+        ("absent", None, "team_has_venue"),
+        (
+            "ambiguous",
+            "У команды есть площадка или нужна площадка соперника",
+            "team_has_venue",
+        ),
+    )
+
+    def configure_result(
+        *, body: str, candidate_key: str, venue_evidence: str | None, venue: str | None
+    ) -> None:
+        result = _minimal_classifier_result(
+            candidate_key=candidate_key,
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": f"@opponent_{candidate_key.replace('-', '')}",
+                    "evidence": f"Пишите @opponent_{candidate_key.replace('-', '')}",
+                }
+            ],
+            event_time_evidence="20 августа 2026 в 19:00",
+            exact_local_time="19:00",
+            opportunity_evidence="наша команда ищет соперника",
+        )
+        candidates = result.output["candidates"]
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        candidate["opportunity_type"] = "opponent_request"
+        candidate.pop("open_places", None)
+        candidate["opponent_request"] = True
+        evidence.pop("open_places", None)
+        evidence["opponent_request"] = "наша команда ищет соперника"
+        if venue is not None:
+            candidate["venue_provision"] = venue
+            if venue_evidence is not None:
+                evidence["venue_provision"] = venue_evidence
+        classifier.return_for(body=body, result=result)
+
+    records = tuple(localized_facts) + rejected_facts
+    for index, (language, venue_evidence, venue) in enumerate(records, start=1):
+        candidate_key = f"opponent-{language}"
+        contact = f"@opponent_{candidate_key.replace('-', '')}"
+        body = (
+            "20 августа 2026 в 19:00 наша команда ищет соперника на Петроградской. "
+            f"{venue_evidence + '. ' if venue_evidence else ''}"
+            f"Пишите {contact}"
+        )
+        configure_result(
+            body=body,
+            candidate_key=candidate_key,
+            venue_evidence=venue_evidence,
+            venue=venue,
+        )
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=5410 + index - 1),
+            to_checkpoint=TelegramChannelCheckpoint(pts=5410 + index),
+            source_event_id=f"source-event:multilingual-opponent:{language}",
+            telegram_message_id=5410 + index,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=body,
+            event_time=datetime(2026, 8, 18, 9, index, tzinfo=UTC),
+        )
+
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    for _ in records:
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+    system.process_opportunities_until_idle()
+
+    opportunities = system.opportunities()
+    assert len(opportunities) == 4
+    assert {opportunity.opportunity_type for opportunity in opportunities} == {
+        "opponent_request"
+    }
+    accepted_venues: set[object] = set()
+    for opportunity in opportunities:
+        publications = system.opportunity_publication_contracts(
+            opportunity.source_message_revision_id
+        )
+        assert len(publications) == 1
+        payload = publications[0].payload
+        assert isinstance(payload, dict)
+        accepted_facts = payload["accepted_facts"]
+        assert isinstance(accepted_facts, dict)
+        accepted_venues.add(accepted_facts.get("venue_provision"))
+    assert accepted_venues == {
+        "team_has_venue",
+        "needs_opponent_venue",
+        "arrange_jointly",
+        None,
+    }

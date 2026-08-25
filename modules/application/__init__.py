@@ -6186,6 +6186,12 @@ def _opponent_search_details_hub_message(
         "es": ("sin definir", "Atrás", "Buscar"),
         "fr": ("non défini", "Retour", "Rechercher"),
     }[copy_locale]
+    intro = {
+        "en": "You can choose the following settings:",
+        "ru": "Можно выбрать следующие настройки:",
+        "es": "Puedes elegir las siguientes opciones:",
+        "fr": "Vous pouvez choisir les paramètres suivants :",
+    }[copy_locale]
     keys = tuple(_OPPONENT_SEARCH_DETAIL_OPTIONS)
     summaries = tuple(
         ", ".join(
@@ -6200,8 +6206,7 @@ def _opponent_search_details_hub_message(
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
-        text="You can choose the following Opponent Search settings:\n\n"
-        + "\n".join(f"- {name}" for name in names),
+        text=f"{intro}\n\n" + "\n".join(f"- {name}" for name in names),
         button_rows=(
             *tuple(
                 (
@@ -6315,139 +6320,368 @@ def _opponent_request_result_message(
     labels = {
         "en": {
             "title": "Opponent Request",
-            "possible": "Possible match: some requested details need clarification.",
-            "match": "Matching evidence",
-            "confirmed": "confirmed",
-            "unknown": "needs clarification",
+            "matches": "Matches",
+            "needs": "Needs clarification",
+            "additional": "Additional",
             "posted": "Posted",
+            "edited": "Edited",
             "contact": "Contact",
-            "venue": "Venue provision",
-            "details": "Accepted details",
+            "at": "at",
+            "date_city": "date and city",
+            "invitation": (
+                "Questions? Message me. I can explain the card or help refine "
+                "your search."
+            ),
+            "no_exact": "No exact match was found.",
         },
         "ru": {
             "title": "Запрос соперника",
-            "possible": "Возможное совпадение: некоторые детали нужно уточнить.",
-            "match": "Свидетельства совпадения",
-            "confirmed": "подтверждено",
-            "unknown": "нужно уточнить",
+            "matches": "Подходит",
+            "needs": "Нужно уточнить",
+            "additional": "Дополнительно",
             "posted": "Пост",
+            "edited": "Изменён",
             "contact": "Контакт",
-            "venue": "Организация площадки",
-            "details": "Подтверждённые детали",
+            "at": "в",
+            "date_city": "дата и город",
+            "invitation": (
+                "💬 Остались вопросы? Напишите, я объясню карточку "
+                "или помогу уточнить поиск."
+            ),
+            "no_exact": "Точного совпадения не найдено.",
         },
         "es": {
             "title": "Solicitud de rival",
-            "possible": "Coincidencia posible: hay detalles que aclarar.",
-            "match": "Evidencia de coincidencia",
-            "confirmed": "confirmado",
-            "unknown": "necesita aclaración",
+            "matches": "Coincide",
+            "needs": "Falta confirmar",
+            "additional": "Información adicional",
             "posted": "Publicado",
+            "edited": "Modificado",
             "contact": "Contacto",
-            "venue": "Organización del campo",
-            "details": "Detalles aceptados",
+            "at": "a las",
+            "date_city": "fecha y ciudad",
+            "invitation": (
+                "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha "
+                "o le ayudaré a ajustar la búsqueda."
+            ),
+            "no_exact": "No se encontró una coincidencia exacta.",
         },
         "fr": {
             "title": "Demande d’adversaire",
-            "possible": (
-                "Correspondance possible : certains détails doivent être précisés."
-            ),
-            "match": "Preuves de correspondance",
-            "confirmed": "confirmé",
-            "unknown": "à préciser",
+            "matches": "Correspond",
+            "needs": "À préciser",
+            "additional": "Informations complémentaires",
             "posted": "Publié",
+            "edited": "Modifié",
             "contact": "Contact",
-            "venue": "Organisation du terrain",
-            "details": "Détails acceptés",
+            "at": "à",
+            "date_city": "date et ville",
+            "invitation": (
+                "Une question ? Écrivez-moi. Je peux expliquer la fiche "
+                "ou vous aider à affiner votre recherche."
+            ),
+            "no_exact": "Aucune correspondance exacte n’a été trouvée.",
         },
     }[copy_locale]
-    start = date.fromisoformat(facts["start_local_date"])
-    end = date.fromisoformat(facts.get("end_local_date", facts["start_local_date"]))
-    when = (
-        start.isoformat()
-        if start == end
-        else f"{start.isoformat()} – {end.isoformat()}"
+    event_date = date.fromisoformat(facts["start_local_date"])
+    event_end_date = date.fromisoformat(
+        facts.get("end_local_date", facts["start_local_date"])
     )
-    exact_time = facts.get("exact_local_time") or facts.get("day_part")
-    if exact_time:
-        when += f", {exact_time}"
+    months = {
+        "en": (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }[copy_locale]
+    if event_date == event_end_date:
+        date_copy = f"{event_date.day} {months[event_date.month - 1]} {event_date.year}"
+    elif (
+        event_date.year == event_end_date.year
+        and event_date.month == event_end_date.month
+    ):
+        date_copy = (
+            f"{event_date.day}–{event_end_date.day} "
+            f"{months[event_date.month - 1]} {event_date.year}"
+        )
+    elif event_date.year == event_end_date.year:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]}–"
+            f"{event_end_date.day} {months[event_end_date.month - 1]} "
+            f"{event_date.year}"
+        )
+    else:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]} {event_date.year}–"
+            f"{event_end_date.day} {months[event_end_date.month - 1]} "
+            f"{event_end_date.year}"
+        )
+    day_part_copy = {
+        "en": {
+            "morning": "morning",
+            "daytime": "daytime",
+            "evening": "evening",
+            "night": "night",
+        },
+        "ru": {
+            "morning": "утром",
+            "daytime": "днём",
+            "evening": "вечером",
+            "night": "ночью",
+        },
+        "es": {
+            "morning": "por la mañana",
+            "daytime": "de día",
+            "evening": "por la tarde",
+            "night": "por la noche",
+        },
+        "fr": {
+            "morning": "le matin",
+            "daytime": "l’après-midi",
+            "evening": "le soir",
+            "night": "la nuit",
+        },
+    }[copy_locale]
+    accepted_time = facts.get("exact_local_time")
+    if accepted_time is None and facts.get("day_part") is not None:
+        accepted_time = day_part_copy.get(facts["day_part"])
+    when = date_copy + (f", {accepted_time}" if accepted_time is not None else "")
     where = facts[f"city_display_{copy_locale}"]
     if int(facts.get("location_specificity", "0")) > 1:
         where += f", {facts[f'place_display_{copy_locale}']}"
-    value_copy = {
+
+    def json_values(key: str) -> tuple[str, ...]:
+        raw = facts.get(key)
+        if not raw:
+            return ()
+        try:
+            values = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return ()
+        return tuple(value for value in values if isinstance(value, str))
+
+    value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
+    venue_value_copy = {
         "team_has_venue": {
-            "en": "Team has venue",
-            "ru": "У команды есть площадка",
-            "es": "El equipo tiene campo",
-            "fr": "L’équipe dispose d’un terrain",
+            "en": "We have a venue",
+            "ru": "Площадка у нас есть",
+            "es": "Tenemos campo",
+            "fr": "Nous avons un terrain",
         },
         "needs_opponent_venue": {
-            "en": "Needs opponent venue",
+            "en": "Need the opponent’s venue",
             "ru": "Нужна площадка соперника",
-            "es": "Necesita el campo del rival",
-            "fr": "Besoin du terrain de l’adversaire",
+            "es": "Necesitamos el campo del rival",
+            "fr": "Besoin du terrain adverse",
         },
         "arrange_jointly": {
-            "en": "Arrange jointly",
-            "ru": "Организовать вместе",
-            "es": "Organizar juntos",
-            "fr": "À organiser ensemble",
+            "en": "We’ll find a venue together",
+            "ru": "Найдём площадку вместе",
+            "es": "Buscaremos un campo juntos",
+            "fr": "Nous trouverons un terrain ensemble",
         },
     }
-    details: list[str] = []
-    for key in (
+    detail_order = (
         "team_formats",
         "playing_levels",
+        "venue_provision",
         "venue_settings",
         "playing_surfaces",
-    ):
-        raw = facts.get(key)
-        if raw:
-            values = json.loads(raw)
-            if isinstance(values, list) and values:
-                details.append(
-                    ", ".join(str(value).replace("_", " ") for value in values)
-                )
-    if facts.get("venue_provision") in value_copy:
-        details.append(
-            f"{labels['venue']}: {value_copy[facts['venue_provision']][copy_locale]}"
-        )
-    if facts.get("payment"):
-        payment = facts["payment"]
+        "payment",
+    )
+    known_values: dict[str, str] = {}
+    team_formats = json_values("team_formats")
+    if team_formats:
+        known_values["team_formats"] = ", ".join(team_formats)
+    for key in ("playing_levels", "venue_settings", "playing_surfaces"):
+        values = json_values(key)
+        if values:
+            known_values[key] = ", ".join(
+                value_copy.get(value, value.replace("_", " ").capitalize())
+                for value in values
+            )
+    venue = facts.get("venue_provision")
+    if venue in venue_value_copy:
+        known_values["venue_provision"] = venue_value_copy[venue][copy_locale]
+    payment = facts.get("payment")
+    if payment in value_copy:
+        payment_copy = value_copy[payment]
         if facts.get("payment_amount") and facts.get("payment_currency"):
-            payment += f" ({facts['payment_amount']} {facts['payment_currency']})"
-        details.append(payment)
+            payment_copy += f" ({facts['payment_amount']} {facts['payment_currency']})"
+        known_values["payment"] = payment_copy
+
     match_states = json.loads(facts.get("match_states", "{}"))
-    confirmed = sorted(
-        key.replace("_", " ")
-        for key, state in match_states.items()
-        if state == "confirmed"
+    confirmed_keys = {
+        key for key, state in match_states.items() if state == "confirmed"
+    }
+    details = " · ".join(
+        known_values[key]
+        for key in detail_order
+        if key in confirmed_keys and key in known_values
     )
-    unknown = sorted(
-        key.replace("_", " ")
-        for key, state in match_states.items()
-        if state == "unknown"
+    detail_names = dict(
+        zip(
+            _OPPONENT_SEARCH_DETAIL_OPTIONS,
+            _OPPONENT_SEARCH_DETAIL_NAMES[copy_locale],
+            strict=True,
+        )
     )
-    evidence_parts = [f"{key}: {labels['confirmed']}" for key in confirmed] + [
-        f"{key}: {labels['unknown']}" for key in unknown
+    additional = " · ".join(
+        f"{detail_names[key]}: {known_values[key]}"
+        for key in detail_order
+        if key not in confirmed_keys and key in known_values
+    )
+    criterion_copy = {
+        "en": {
+            "times": "time",
+            "team_formats": "team format",
+            "playing_levels": "playing level",
+            "venue_provision": "venue provision",
+            "venue_settings": "venue setting",
+            "playing_surfaces": "playing surface",
+            "payment": "payment",
+            "search_area": "search area",
+        },
+        "ru": {
+            "times": "время",
+            "team_formats": "формат команд",
+            "playing_levels": "уровень игры",
+            "venue_provision": "предоставление площадки",
+            "venue_settings": "тип площадки",
+            "playing_surfaces": "покрытие",
+            "payment": "оплата",
+            "search_area": "район поиска",
+        },
+        "es": {
+            "times": "hora",
+            "team_formats": "formato de equipos",
+            "playing_levels": "nivel de juego",
+            "venue_provision": "provisión del campo",
+            "venue_settings": "tipo de recinto",
+            "playing_surfaces": "superficie de juego",
+            "payment": "pago",
+            "search_area": "zona de búsqueda",
+        },
+        "fr": {
+            "times": "heure",
+            "team_formats": "format d’équipes",
+            "playing_levels": "niveau de jeu",
+            "venue_provision": "mise à disposition du terrain",
+            "venue_settings": "type de terrain",
+            "playing_surfaces": "revêtement",
+            "payment": "paiement",
+            "search_area": "zone de recherche",
+        },
+    }[copy_locale]
+    selected_confirmed = sorted(
+        criterion_copy[key]
+        for key, state in match_states.items()
+        if state == "confirmed" and key != "search_area" and key in criterion_copy
+    )
+    selected_unknown = sorted(
+        criterion_copy[key]
+        for key, state in match_states.items()
+        if state == "unknown" and key in criterion_copy
+    )
+    confirmed_core = (
+        {
+            "en": "date and search area",
+            "ru": "дата и район поиска",
+            "es": "fecha y zona de búsqueda",
+            "fr": "date et zone de recherche",
+        }[copy_locale]
+        if match_states.get("search_area") == "confirmed"
+        else labels["date_city"]
+    )
+    match_lines = [
+        f"{labels['matches']}: "
+        + ", ".join((confirmed_core, *selected_confirmed))
+        + "."
     ]
-    match_copy = f"{labels['match']}: " + (
-        "; ".join(evidence_parts) or labels["confirmed"]
+    if selected_unknown:
+        match_lines.append(f"{labels['needs']}: {', '.join(selected_unknown)}.")
+    match_copy = "\n".join(match_lines)
+    possible_copy = (
+        f"{labels['no_exact']}\n\n" if result.result_class == "possible_match" else ""
     )
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts["iana_timezone"])
     )
-    posted = f"{source_time.date().isoformat()} {source_time:%H:%M}"
+    posted = (
+        f"{source_time.day} {months[source_time.month - 1]} {source_time.year} "
+        f"{labels['at']} {source_time:%H:%M}"
+    )
+    edited = ""
+    if facts.get("source_edited_at"):
+        edited_time = datetime.fromisoformat(facts["source_edited_at"]).astimezone(
+            ZoneInfo(facts["iana_timezone"])
+        )
+        edited = (
+            f"{labels['edited']}: {edited_time.day} "
+            f"{months[edited_time.month - 1]} {edited_time.year} "
+            f"{labels['at']} {edited_time:%H:%M}\n"
+        )
     route_copy = render_response_route(
         facts["response_route_kind"], facts["response_route_value"], copy_locale
     )
-    possible_copy = (
-        f"\n{labels['possible']}\n" if result.result_class == "possible_match" else ""
-    )
-    details_copy = f"{labels['details']}: {' · '.join(details)}\n" if details else ""
+    details_copy = f"{details}\n\n" if details else ""
+    additional_copy = f"\n{labels['additional']}: {additional}\n" if additional else ""
     text = (
         f"⚽ {labels['title']}\n{when}\n{where}\n"
         f"{details_copy}{possible_copy}{match_copy}\n"
-        f"{labels['posted']}: {posted}\n{labels['contact']}: {route_copy}"
+        f"{additional_copy}{labels['posted']}: {posted}\n{edited}"
+        f"{labels['contact']}: {route_copy}\n\n{labels['invitation']}"
     )
     menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
     return TelegramMessage(
@@ -16125,6 +16359,23 @@ def _optional_values_are_supported(
                 r"[^.!?;\n]{0,40}\b(?:venue|field|pitch|location|place)\b",
                 r"\b(?:venue|field|pitch|location|place)\b[^.!?;\n]{0,40}"
                 r"\b(?:we|our|the\s+team)\s+(?:have|has|got)\b",
+                r"\b(?:у\s+нас|у\s+нашей\s+команды|у\s+команды)\s+"
+                r"(?:есть|имеет|имеется)\b[^.!?;\n]{0,40}"
+                r"\b(?:площадк\w*|пол\w*|стадион\w*|мест\w*)\b",
+                r"\b(?:площадк\w*|пол\w*|стадион\w*|мест\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:у\s+нас|у\s+нашей\s+команды|у\s+команды)\b",
+                r"\b(?:tenemos|nuestro\s+equipo\s+tiene|el\s+equipo\s+tiene)\b"
+                r"[^.!?;\n]{0,40}\b(?:campo\w*|cancha\w*|terreno\w*|"
+                r"sede\w*|instalaci[oó]n\w*)\b",
+                r"\b(?:campo\w*|cancha\w*|terreno\w*|sede\w*|instalaci[oó]n\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:tenemos|nuestro\s+equipo\s+tiene|"
+                r"el\s+equipo\s+tiene)\b",
+                r"\b(?:nous\s+avons|notre\s+[ée]quipe\s+a|"
+                r"l[’']?[ée]quipe\s+a)\b[^.!?;\n]{0,40}\b"
+                r"(?:terrain\w*|stade\w*|lieu\w*|installation\w*)\b",
+                r"\b(?:terrain\w*|stade\w*|lieu\w*|installation\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:nous\s+avons|notre\s+[ée]quipe\s+a|"
+                r"l[’']?[ée]quipe\s+a)\b",
             ),
             "needs_opponent_venue": (
                 r"\b(?:need|needs|looking\s+for|require|requires)\b[^.!?;\n]{0,40}"
@@ -16132,12 +16383,47 @@ def _optional_values_are_supported(
                 r"\b(?:opponent|other\s+team)\b[^.!?;\n]{0,40}"
                 r"\b(?:provide|provides|arrange|organize)\b[^.!?;\n]{0,30}"
                 r"\b(?:venue|field|pitch|location|place)\b",
+                r"\b(?:нужн\w*|требу\w*|ищ\w*)\b[^.!?;\n]{0,40}"
+                r"\b(?:площадк\w*|пол\w*|стадион\w*|мест\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:соперник\w*|друг\w*\s+команд\w*)\b",
+                r"\b(?:площадк\w*|пол\w*|стадион\w*|мест\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:соперник\w*|друг\w*\s+команд\w*)\b",
+                r"\b(?:necesit\w*|busc\w*|hace\s+falta)\b[^.!?;\n]{0,40}"
+                r"\b(?:campo\w*|cancha\w*|terreno\w*|sede\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:rival\w*|oponente\w*|otro\s+equipo)\b",
+                r"\b(?:campo\w*|cancha\w*|terreno\w*|sede\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:del\s+rival|del\s+oponente|"
+                r"del\s+otro\s+equipo)\b",
+                r"\b(?:nous\s+avons\s+besoin|il\s+nous\s+faut|"
+                r"cherchons)\b[^.!?;\n]{0,40}\b(?:terrain\w*|stade\w*|"
+                r"lieu\w*)\b[^.!?;\n]{0,40}\b(?:adversaire\w*|"
+                r"autre\s+équipe)\b",
+                r"\b(?:terrain\w*|stade\w*|lieu\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:adversaire\w*|autre\s+équipe)\b",
+                r"\b(?:besoin|nécessit\w*)\b[^.!?;\n]{0,40}\b"
+                r"(?:terrain\w*|stade\w*|lieu\w*)\b[^.!?;\n]{0,40}\b"
+                r"(?:advers\w*|autre\s+équipe)\b",
             ),
             "arrange_jointly": (
                 r"\b(?:arrange|organize|decide|choose)\b[^.!?;\n]{0,40}"
                 r"\b(?:together|jointly|between\s+both\s+teams)\b",
                 r"\b(?:venue|field|pitch|location|place)\b[^.!?;\n]{0,40}"
                 r"\b(?:together|jointly|between\s+both\s+teams)\b",
+                r"\b(?:найд[её]м|организу\w*|реш\w*|выбер\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:вместе|совместно|обеими\s+командами)\b",
+                r"\b(?:площадк\w*|пол\w*|стадион\w*|мест\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:вместе|совместно|обеими\s+командами)\b",
+                r"\b(?:buscarem\w*|encontrarem\w*|organizarem\w*|"
+                r"decidirem\w*|elegirem\w*)\b[^.!?;\n]{0,40}\b"
+                r"(?:juntos|conjuntamente|entre\s+ambos\s+equipos)\b",
+                r"\b(?:campo\w*|cancha\w*|terreno\w*|sede\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:juntos|conjuntamente|entre\s+ambos\s+equipos)\b",
+                r"\b(?:nous\s+trouverons|organiserons|d[ée]ciderons|"
+                r"choisirons|organisons)\b[^.!?;\n]{0,40}\b"
+                r"(?:ensemble|conjointement|entre\s+les\s+deux\s+équipes)\b",
+                r"\b(?:terrain\w*|stade\w*|lieu\w*)\b"
+                r"[^.!?;\n]{0,40}\b(?:ensemble|conjointement|"
+                r"entre\s+les\s+deux\s+équipes)\b",
             ),
             "unknown": (
                 r"\b(?:venue|field|pitch|location|place)\b[^.!?;\n]{0,30}"
@@ -16150,10 +16436,19 @@ def _optional_values_are_supported(
             not isinstance(venue_provision, str)
             or not isinstance(venue_evidence, str)
             or venue_provision not in venue_patterns
-            or not _patterns_have_affirmative_clause_support(
-                venue_evidence.casefold(), venue_patterns[venue_provision]
-            )
+            or re.search(r"\b(?:or|или|либо|o|ou)\b", venue_evidence.casefold())
+            is not None
         ):
+            return False
+        normalized_venue_evidence = venue_evidence.casefold()
+        supported_venue_values = tuple(
+            value
+            for value, patterns in venue_patterns.items()
+            if _patterns_have_affirmative_clause_support(
+                normalized_venue_evidence, patterns
+            )
+        )
+        if supported_venue_values != (venue_provision,):
             return False
     payment = candidate.get("payment")
     if payment is not None:
