@@ -15991,12 +15991,12 @@ def _tournament_explicit_opening_date(
     opening_words = re.compile(
         r"(?:open\w*|accept\w*|available|ongoing|register\w*|"
         r"откры\w*|запис\w*|приним\w*|abiert\w*|acept\w*|"
-        r"inscrib\w*|ouvr\w*|accept\w*)"
+        r"inscrib\w*|ouvr\w*|ouvert\w*|accept\w*)"
     )
     participation_words = re.compile(
         r"(?:registration|registrations|participation|entry|entries|register\w*|"
         r"регистрац\w*|набор\w*|участ\w*|inscripci\w*|participaci\w*|"
-        r"inscription\w*|participation\w*)"
+        r"entrad\w*|inscription\w*|participation\w*)"
     )
     for pattern in date_patterns:
         for match in re.finditer(pattern, normalized_evidence):

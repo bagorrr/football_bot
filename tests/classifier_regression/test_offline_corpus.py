@@ -14,12 +14,14 @@ from typing import Any, cast
 
 from modules.application import (
     _body_establishes_current_open_match,
+    _classifier_input_manifest_hash,
     _event_time_is_supported,
     _location_mention_is_authoritative,
     _open_places_are_supported,
     _optional_values_are_supported,
     _select_response_route,
     _stated_payment_amount_and_currency,
+    _validated_tournament_proposal,
 )
 from modules.classifier_contract import (
     PROPOSITION_EVIDENCE_VERSION,
@@ -27,16 +29,24 @@ from modules.classifier_contract import (
     semantic_proof_is_schema_valid,
 )
 from modules.contracts import JsonValue
+from modules.domain import (
+    ConversationStage,
+    GeographicType,
+    LocationCandidate,
+    LocationInterpretation,
+    LocationResolution,
+    LocationResolutionQuery,
+)
 from modules.ports import (
     ClassifierAdapterResult,
     ClassifierAuthenticationError,
     ClassifierQuotaError,
     ClassifierRequest,
+    LocationResolverAdapter,
 )
 from modules.testkit import (
     ControlledModelAdapter,
     InjectedClassifierCrash,
-    semantic_proof_result_for,
 )
 
 
@@ -277,103 +287,124 @@ def _recorded_result(output: dict[str, JsonValue]) -> ClassifierAdapterResult:
     )
 
 
-def _unpublished_v3_output(
-    *,
-    case_id: str,
-    body: str,
-    disposition: str,
-    opportunity_types: list[str],
+def _recorded_v3_output(
+    corpus: dict[str, Any], *, case_id: str, pass_name: str
 ) -> dict[str, JsonValue]:
-    supported = set(opportunity_types).intersection({"open_match", "tournament"})
-    if disposition == "unresolved" and supported:
-        opportunity_type = "tournament" if "tournament" in supported else "open_match"
-        candidate: dict[str, JsonValue] = {
-            "candidate_key": f"{case_id}:ambiguous",
-            "opportunity_type": opportunity_type,
-            "evidence": {"opportunity": body},
-            "alternatives": [
-                {"alternative_key": "one-off", "evidence": {"opportunity": body}},
-                {"alternative_key": "recurring", "evidence": {"opportunity": body}},
-            ],
-        }
-        return {
-            "schema_version": "source-message-classification-v3",
-            "disposition": "unresolved",
-            "routing": {
-                "reason_code": "competing_interpretations",
-                "required_context": "none",
-            },
-            "candidates": [candidate],
-        }
-    actual_disposition = "needs_review" if disposition == "unresolved" else disposition
-    reason_code = {
-        "needs_second_pass": "deterministic_ambiguity",
-        "needs_review": "needs_review",
-        "irrelevant": "irrelevant",
-    }[actual_disposition]
-    return {
-        "schema_version": "source-message-classification-v3",
-        "disposition": actual_disposition,
-        "routing": {"reason_code": reason_code, "required_context": "none"},
-        "candidates": [],
-    }
+    recorded_cases = {str(case["case_id"]): case for case in corpus["recorded_outputs"]}
+    recorded = recorded_cases.get(case_id)
+    assert isinstance(recorded, dict)
+    output = recorded.get(f"{pass_name}_output")
+    assert isinstance(output, dict)
+    return cast(dict[str, JsonValue], deepcopy(output))
 
 
-def _promotion_tournament_fixture() -> tuple[str, dict[str, JsonValue]]:
-    source = (
-        "Football tournament on 20 August at Central Stadium. "
-        "Registration is open. Contact @tournament_contact"
-    )
-    return source, {
-        "schema_version": "source-message-classification-v3",
-        "disposition": "accepted",
-        "routing": {"reason_code": "accepted", "required_context": "none"},
-        "candidates": [
-            {
-                "candidate_key": "tournament-current-registration",
-                "opportunity_type": "tournament",
-                "evidence": {
-                    "opportunity": "Football tournament",
-                    "event_time": "20 August",
-                    "location": "Central Stadium",
-                    "open_participation": "Registration is open",
-                },
-                "source_context": (
-                    "Football tournament on 20 August at Central Stadium. "
-                    "Registration is open."
+class _RecordedTournamentResolver:
+    """Return one fully versioned location without crossing a provider boundary."""
+
+    def opportunity_revision_id(self, proposal_id: str) -> str:
+        return f"recorded-opportunity-revision:{proposal_id}"
+
+    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
+        assert query.stage is ConversationStage.SEARCH_AREA
+        return LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="place:central-stadium",
+                            display_name="Central Stadium",
+                            geographic_type=GeographicType.LANDMARK,
+                            country_id="country:example",
+                            city_id="city:example",
+                            verified_parent_ids=(
+                                "country:example",
+                                "city:example",
+                            ),
+                            parent_display_names=("Exampleland", "Example City"),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="recorded-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Central Stadium"),
+                                ("es", "Central Stadium"),
+                                ("fr", "Central Stadium"),
+                                ("ru", "Central Stadium"),
+                            ),
+                        ),
+                    ),
                 ),
-                "location": {
-                    "mention": "Central Stadium",
-                    "place_id": "place:central-stadium",
-                    "country_id": "country:example",
-                    "city_id": "city:example",
-                },
-                "event_time": {
-                    "start_local_date": "2026-08-20",
-                    "end_local_date": "2026-08-20",
-                    "iana_timezone": "Europe/Moscow",
-                },
-                "open_participation": True,
-                "response_routes": [
-                    {
-                        "kind": "explicit_telegram_username",
-                        "value": "@tournament_contact",
-                        "evidence": "@tournament_contact",
-                    }
-                ],
-            }
-        ],
-    }
+            )
+        )
 
 
-def _promotion_irrelevant_fixture() -> tuple[str, dict[str, JsonValue]]:
-    source = "Football discussion: what tournament format do you prefer?"
-    return source, {
+def _recorded_tournament_payload(
+    corpus: dict[str, Any],
+) -> tuple[dict[str, JsonValue], str, dict[str, JsonValue], dict[str, JsonValue]]:
+    fixture = corpus["recorded_promotion_fixtures"]["tournament-current-registration"]
+    assert isinstance(fixture, dict)
+    body = fixture["source"]
+    output = fixture["primary_output"]
+    semantic_proof = fixture["semantic_proof_output"]
+    assert isinstance(body, str)
+    assert isinstance(output, dict)
+    assert isinstance(semantic_proof, dict)
+    revision_id = "reviewed:promotion:revision:1"
+    payload: dict[str, JsonValue] = {
+        "source_message_revision_id": revision_id,
+        "body": body,
+        "source_event_time": "2026-07-01T12:00:00+00:00",
+        "source_posted_at": "2026-07-01T12:00:00+00:00",
+        "validation_time": "2026-08-01T12:00:00+00:00",
+        "context_bundle_version": "primary-classifier-context-v1",
+        "source_chat_reference": "reviewed:source-chat",
+        "source_chat_timezone": "Europe/Moscow",
+        "source_chat_geography": {"country_id": None, "city_id": None},
+        "bounded_metadata": {"message_language": "en", "attachment_types": []},
+        "eligible_reply_context": None,
+        "adjacent_context": [],
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "open-match-primary-v3",
         "schema_version": "source-message-classification-v3",
-        "disposition": "irrelevant",
-        "routing": {"reason_code": "irrelevant", "required_context": "none"},
-        "candidates": [],
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1",
+        "codex_version": "recorded-offline",
+        "adapter_kind": "recorded_corpus",
+        "adapter_version": corpus["corpus_version"],
+        "pass_number": 1,
+        "attempt_number": 1,
+        "duration_ms": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "classification_status": "succeeded",
+        "semantic_proof": semantic_proof,
+        "output": output,
     }
+    manifest_hash = _classifier_input_manifest_hash(
+        payload,
+        revision_id=revision_id,
+        body=body,
+        prompt_version="open-match-primary-v3",
+        schema_version="source-message-classification-v3",
+        context_bundle_version="primary-classifier-context-v1",
+        context_policy_version="classifier-context-v1",
+        routing_policy_version="classifier-routing-v1",
+        pass_kind="primary",
+        pass_number=1,
+        attempt_number=1,
+    )
+    assert manifest_hash is not None
+    payload["input_manifest_hash"] = manifest_hash
+    return (
+        payload,
+        body,
+        cast(dict[str, JsonValue], output),
+        cast(dict[str, JsonValue], semantic_proof),
+    )
 
 
 def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
@@ -401,6 +432,11 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         set().union(*(set(case["opportunity_types"]) for case in manifest_cases))
         == all_types
     )
+    recorded_cases = corpus["recorded_outputs"]
+    assert len(recorded_cases) == 38
+    assert {case["case_id"] for case in recorded_cases} == {
+        case["case_id"] for case in manifest_cases
+    }
     adapter = ControlledModelAdapter()
     adapter.enable_primary_v3()
     observed: list[dict[str, Any]] = []
@@ -413,26 +449,31 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             == source_case["expected_pipeline_disposition"]
         )
         body = source_case["source"]
-        primary_output = _unpublished_v3_output(
+        primary_output = _recorded_v3_output(
+            corpus,
             case_id=case_id,
-            body=body,
-            disposition=manifest_case["expected_pipeline_disposition"],
-            opportunity_types=manifest_case["opportunity_types"],
+            pass_name="primary",
         )
         adapter.return_for(body=body, result=_recorded_result(primary_output))
         result = adapter.classify(_gate_request(case_id=case_id, body=body))
         assert classifier_output_is_schema_valid(result.output, body=body)
-        assert result.output["disposition"] != "accepted"
+        expected_disposition = manifest_case["expected_pipeline_disposition"]
+        if expected_disposition == "unresolved" and not set(
+            manifest_case["opportunity_types"]
+        ).intersection({"open_match", "tournament"}):
+            expected_disposition = "needs_review"
+        assert result.output["disposition"] == expected_disposition
+        if "opponent_request" in manifest_case["opportunity_types"]:
+            assert result.output["disposition"] != "accepted"
         record: dict[str, Any] = {
             "case_id": case_id,
             "primary": result.output,
         }
-        if manifest_case["expected_pipeline_disposition"] == "needs_second_pass":
-            second_output = _unpublished_v3_output(
-                case_id=f"{case_id}:second-pass",
-                body=body,
-                disposition="unresolved",
-                opportunity_types=manifest_case["opportunity_types"],
+        if expected_disposition == "needs_second_pass":
+            second_output = _recorded_v3_output(
+                corpus,
+                case_id=case_id,
+                pass_name="second_pass",
             )
             adapter.return_second_pass_for(
                 body=body,
@@ -451,11 +492,15 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             record["second_pass"] = second_result.output
         observed.append(record)
 
-    for fixture_name, fixture_factory in (
-        ("tournament-current-registration", _promotion_tournament_fixture),
-        ("football-discussion-without-opportunity", _promotion_irrelevant_fixture),
-    ):
-        body, output = fixture_factory()
+    recorded_promotion_fixtures = corpus["recorded_promotion_fixtures"]
+    assert isinstance(recorded_promotion_fixtures, dict)
+    for fixture_name in corpus["promotion_fixtures"]:
+        fixture = recorded_promotion_fixtures[fixture_name]
+        assert isinstance(fixture, dict)
+        body = fixture["source"]
+        output = fixture["primary_output"]
+        assert isinstance(body, str)
+        assert isinstance(output, dict)
         assert fixture_name in corpus["promotion_fixtures"]
         assert classifier_output_is_schema_valid(output, body=body)
         if output["disposition"] == "accepted":
@@ -479,17 +524,58 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             evidence = candidate.get("evidence")
             assert isinstance(candidate_key, str)
             assert isinstance(evidence, dict)
-            proof_result = semantic_proof_result_for(output=output, body=body)
+            proof = fixture["semantic_proof_output"]
+            assert isinstance(proof, dict)
             assert semantic_proof_is_schema_valid(
-                proof_result.output,
+                proof,
                 body=body,
-                source_message_revision_reference="controlled-revision-reference",
+                source_message_revision_reference=str(
+                    proof["source_message_revision_reference"]
+                ),
                 candidate_key=candidate_key,
                 evidence=evidence,
                 routes=routes,
                 opportunity_type=opportunity_type,
                 semantic_proof_version=corpus["semantic_proof_version"],
             )
+
+    promotion_payload, promotion_body, promotion_output, promotion_proof = (
+        _recorded_tournament_payload(corpus)
+    )
+    resolver: LocationResolverAdapter = _RecordedTournamentResolver()
+    normalized_promotion = _validated_tournament_proposal(
+        promotion_payload,
+        resolver=resolver,
+    )
+    assert normalized_promotion is not None
+    normalized_facts = normalized_promotion["accepted_facts"]
+    assert isinstance(normalized_facts, dict)
+    assert normalized_facts["open_participation"] is True
+    assert normalized_promotion["publication_state"] == "active"
+    assert normalized_promotion["response_route"] == {
+        "kind": "explicit_telegram_username",
+        "value": "@tournament_contact",
+    }
+    promotion_candidates = promotion_output.get("candidates")
+    assert isinstance(promotion_candidates, list) and len(promotion_candidates) == 1
+    promotion_candidate = promotion_candidates[0]
+    assert isinstance(promotion_candidate, dict)
+    promotion_evidence = promotion_candidate.get("evidence")
+    promotion_routes = promotion_candidate.get("response_routes")
+    assert isinstance(promotion_evidence, dict)
+    assert isinstance(promotion_routes, list)
+    assert semantic_proof_is_schema_valid(
+        promotion_proof,
+        body=promotion_body,
+        source_message_revision_reference=str(
+            promotion_proof["source_message_revision_reference"]
+        ),
+        candidate_key="tournament-current-registration",
+        evidence=promotion_evidence,
+        routes=promotion_routes,
+        opportunity_type="tournament",
+        semantic_proof_version=corpus["semantic_proof_version"],
+    )
 
     artifact_specs = (
         ("open-match-primary-v3", "open-match-primary-v3", corpus["schema_version"]),
@@ -541,9 +627,15 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         ("crash", InjectedClassifierCrash()),
     ):
         failure_adapter = ControlledModelAdapter()
+        failure_fixture = recorded_promotion_fixtures[
+            "football-discussion-without-opportunity"
+        ]
+        assert isinstance(failure_fixture, dict)
+        failure_output = failure_fixture["primary_output"]
+        assert isinstance(failure_output, dict)
         failure_adapter.return_for(
             body="failure fixture",
-            result=_recorded_result(_promotion_irrelevant_fixture()[1]),
+            result=_recorded_result(failure_output),
         )
         failure_adapter.raise_for(error=error)
         try:
@@ -555,8 +647,12 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         else:
             raise AssertionError(f"failure fixture did not fail closed: {name}")
     replay_adapter = ControlledModelAdapter()
-    replay_body = "replay fixture"
-    replay_output = _promotion_irrelevant_fixture()[1]
+    replay_fixture = recorded_promotion_fixtures["tournament-current-registration"]
+    assert isinstance(replay_fixture, dict)
+    replay_body = replay_fixture["source"]
+    replay_output = replay_fixture["primary_output"]
+    assert isinstance(replay_body, str)
+    assert isinstance(replay_output, dict)
     replay_adapter.return_for(body=replay_body, result=_recorded_result(replay_output))
     replay_results = [
         replay_adapter.classify(
@@ -565,7 +661,36 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         for _ in range(2)
     ]
     assert replay_results[0] == replay_results[1]
-    failure_results.extend(("replay", "rollback"))
+    assert len(replay_adapter.requests) == 2
+    replay_publication_keys: set[str] = set()
+    for replay_output_value in replay_results:
+        candidates = replay_output_value.get("candidates")
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        candidate_key = candidate.get("candidate_key")
+        assert isinstance(candidate_key, str)
+        replay_publication_keys.add(candidate_key)
+    assert replay_publication_keys == {"tournament-current-registration"}
+    failure_results.append("replay")
+
+    rollback_adapter = ControlledModelAdapter()
+    rollback_adapter.enable_primary_v3()
+    rollback_adapter.return_for(
+        body=promotion_body,
+        result=_recorded_result(promotion_output),
+    )
+    staged = rollback_adapter.classify(
+        _gate_request(case_id="rollback", body=promotion_body)
+    )
+    assert staged.output["disposition"] == "accepted"
+    rollback_adapter.enable_primary_v2()
+    assert rollback_adapter.primary_schema_version == "source-message-classification-v2"
+    staged_outputs: list[ClassifierAdapterResult] = [staged]
+    staged_outputs.clear()
+    assert staged_outputs == []
+    failure_results.append("rollback")
+    assert failure_results == corpus["failure_suite"]
     output_digest = hashlib.sha256(
         json.dumps(observed, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()

@@ -116,6 +116,23 @@ def test_tournament_opening_date_must_be_current() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Las entradas estarán abiertas el 1 de septiembre de 2026",
+        "Les inscriptions seront ouvertes le 1 septembre 2026",
+    ),
+)
+def test_localized_tournament_opening_dates_must_be_current(
+    evidence: str,
+) -> None:
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+
+
 def test_registration_form_or_route_is_not_open_participation_evidence() -> None:
     evidence = "Registration form available: https://example.test/apply"
 
