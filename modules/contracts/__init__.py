@@ -1411,6 +1411,9 @@ def _validate_classification_proposal(
         proof_reference = proof.get("source_message_revision_reference")
         if not isinstance(proof_reference, str) or not proof_reference:
             raise ValueError("ClassificationProposal v3 proof reference is invalid")
+        meaning = candidate.get("opportunity_type")
+        if not isinstance(meaning, str):
+            meaning = "open_match"
         if not semantic_proof_is_schema_valid(
             proof,
             body=body,
@@ -1418,6 +1421,7 @@ def _validate_classification_proposal(
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
+            meaning=meaning,
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
@@ -1563,6 +1567,9 @@ def _validate_classification_proposal_v4(
         proof_reference = proof.get("source_message_revision_reference")
         if not isinstance(proof_reference, str):
             raise ValueError("ClassificationProposal v4 proof reference is invalid")
+        meaning = candidate.get("opportunity_type")
+        if not isinstance(meaning, str):
+            meaning = "open_match"
         if not semantic_proof_is_schema_valid(
             proof,
             body=body,
@@ -1570,6 +1577,7 @@ def _validate_classification_proposal_v4(
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
+            meaning=meaning,
         ):
             raise ValueError("ClassificationProposal v4 semantic proof is invalid")
         proof_keys.add(candidate_key)
@@ -1798,13 +1806,17 @@ def _validate_opportunity_publication_changed(
         raise ValueError("OpportunityPublicationChanged subject is inconsistent")
     source_revision_id = _required_text(payload, "source_message_revision_id")
     source_scope = source_revision_id.rsplit(":revision:", 1)[0]
-    legacy_identity = f"opportunity:{source_scope}:open_match"
+    opportunity_type = payload["opportunity_type"]
+    if opportunity_type not in {"open_match", "player_match_availability"}:
+        raise ValueError("Opportunity type is invalid")
+    identity_type = str(opportunity_type)
+    legacy_identity = f"opportunity:{source_scope}:{identity_type}"
     candidate_identity = re.fullmatch(
-        rf"opportunity:{re.escape(source_scope)}:open_match:candidate:[0-9a-f]{{16}}",
+        rf"opportunity:{re.escape(source_scope)}:{re.escape(identity_type)}:candidate:[0-9a-f]{{16}}",
         opportunity_id,
     )
     lineage_identity = re.fullmatch(
-        rf"opportunity:{re.escape(source_scope)}:open_match:proposition:[0-9a-f]{{16}}",
+        rf"opportunity:{re.escape(source_scope)}:{re.escape(identity_type)}:proposition:[0-9a-f]{{16}}",
         opportunity_id,
     )
     if (
@@ -1828,12 +1840,10 @@ def _validate_opportunity_publication_changed(
         "expired",
     }:
         raise ValueError("Opportunity publication state is invalid")
-    if payload["opportunity_type"] != "open_match":
-        raise ValueError("Opportunity type is invalid")
     accepted_facts = payload["accepted_facts"]
     if not isinstance(accepted_facts, dict):
         raise TypeError("accepted_facts must be an object")
-    _validate_open_match_accepted_facts(accepted_facts)
+    _validate_accepted_opportunity_facts(accepted_facts, opportunity_type)
     route = payload["response_route"]
     if not isinstance(route, dict) or set(route) != {"kind", "value"}:
         raise TypeError("response_route must contain kind and value")
@@ -1919,7 +1929,7 @@ def _validate_opportunity_publication_batch_changed(
         opportunity_id = _required_text(opportunity, "opportunity_id")
         if (
             re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:open_match:(?:candidate|proposition):[0-9a-f]{{16}}",
+                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability):(?:candidate|proposition):[0-9a-f]{{16}}",
                 opportunity_id,
             )
             is None
@@ -1935,12 +1945,18 @@ def _validate_opportunity_publication_batch_changed(
             != f"{opportunity_id}:revision:{envelope.subject_revision}"
         ):
             raise ValueError("OpportunityPublicationChanged v3 revision is invalid")
-        if opportunity["opportunity_type"] != "open_match":
+        if opportunity["opportunity_type"] not in {
+            "open_match",
+            "player_match_availability",
+        }:
             raise ValueError("OpportunityPublicationChanged v3 type is invalid")
         accepted_facts = opportunity["accepted_facts"]
         if not isinstance(accepted_facts, dict):
             raise TypeError("OpportunityPublicationChanged v3 facts must be an object")
-        _validate_open_match_accepted_facts(accepted_facts)
+        _validate_accepted_opportunity_facts(
+            accepted_facts,
+            str(opportunity["opportunity_type"]),
+        )
         route = opportunity["response_route"]
         if not isinstance(route, dict) or set(route) != {"kind", "value"}:
             raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
@@ -1983,7 +1999,18 @@ def _validate_publication_response_route(route: dict[str, JsonValue]) -> None:
         raise ValueError("response_route is invalid")
 
 
-def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
+def _validate_accepted_opportunity_facts(
+    facts: dict[str, JsonValue], opportunity_type: str
+) -> None:
+    if opportunity_type not in {"open_match", "player_match_availability"}:
+        raise ValueError("opportunity type is invalid")
+    _validate_open_match_accepted_facts(facts, opportunity_type)
+
+
+def _validate_open_match_accepted_facts(
+    facts: dict[str, JsonValue], opportunity_type: str = "open_match"
+) -> None:
+    player_match = opportunity_type == "player_match_availability"
     required = {
         "start_local_date",
         "end_local_date",
@@ -2004,7 +2031,6 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         "place_display_ru",
         "place_display_es",
         "place_display_fr",
-        "open_places",
         "team_formats",
         "positions",
         "playing_levels",
@@ -2015,15 +2041,24 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         "payment_currency",
         "source_posted_at",
     }
+    required.update(
+        {
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        }
+        if player_match
+        else {"open_places"}
+    )
     if set(facts) != required:
-        raise ValueError("open-match accepted facts are incomplete")
+        raise ValueError(f"{opportunity_type} accepted facts are incomplete")
     try:
         start = date.fromisoformat(_required_text(facts, "start_local_date"))
         end = date.fromisoformat(_required_text(facts, "end_local_date"))
     except ValueError as error:
-        raise ValueError("open-match dates must be ISO local dates") from error
+        raise ValueError(f"{opportunity_type} dates must be ISO local dates") from error
     if end < start:
-        raise ValueError("open-match date range must be ordered")
+        raise ValueError(f"{opportunity_type} date range must be ordered")
     for field_name in (
         "iana_timezone",
         "country_id",
@@ -2044,14 +2079,16 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         "city",
         *SUB_CITY_GEOGRAPHIC_TYPES,
     }:
-        raise ValueError("open-match geographic type is invalid")
+        raise ValueError(f"{opportunity_type} geographic type is invalid")
     parent_ids = facts["location_parent_ids"]
     if (
         not isinstance(parent_ids, list)
         or not parent_ids
         or not all(isinstance(value, str) and value for value in parent_ids)
     ):
-        raise TypeError("open-match location parents must be a non-empty text list")
+        raise TypeError(
+            f"{opportunity_type} location parents must be a non-empty text list"
+        )
     disjoint_ids = facts["location_verified_disjoint_place_ids"]
     if (
         not isinstance(disjoint_ids, list)
@@ -2062,26 +2099,55 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
         or bool(set(parent_ids).intersection(disjoint_ids))
     ):
         raise TypeError(
-            "open-match location disjoint proof must be a bounded identity list"
+            f"{opportunity_type} location disjoint proof must be a bounded "
+            "identity list"
         )
     exact_time = facts["exact_local_time"]
     if exact_time is not None and (
         not isinstance(exact_time, str)
         or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
     ):
-        raise ValueError("open-match exact time is invalid")
+        raise ValueError(f"{opportunity_type} exact time is invalid")
     day_part = facts["day_part"]
     if day_part not in {None, "morning", "daytime", "evening", "night"}:
-        raise ValueError("open-match day part is invalid")
+        raise ValueError(f"{opportunity_type} day part is invalid")
     if exact_time is not None and day_part is not None:
-        raise ValueError("open-match exact time and day part are mutually exclusive")
-    open_places = facts["open_places"]
-    if open_places is not None and (
-        not isinstance(open_places, int)
-        or isinstance(open_places, bool)
-        or open_places < 1
-    ):
-        raise TypeError("open-match open_places must be positive or null")
+        raise ValueError(
+            f"{opportunity_type} exact time and day part are mutually exclusive"
+        )
+    if player_match:
+        exact_count = facts["available_player_count"]
+        minimum_count = facts["available_player_count_min"]
+        maximum_count = facts["available_player_count_max"]
+        if exact_count is not None and (
+            not isinstance(exact_count, int)
+            or isinstance(exact_count, bool)
+            or exact_count < 1
+            or minimum_count is not None
+            or maximum_count is not None
+        ):
+            raise TypeError(f"{opportunity_type} exact player count is invalid")
+        if (
+            exact_count is None
+            and (minimum_count is not None or maximum_count is not None)
+            and (
+                not isinstance(minimum_count, int)
+                or isinstance(minimum_count, bool)
+                or minimum_count < 1
+                or not isinstance(maximum_count, int)
+                or isinstance(maximum_count, bool)
+                or maximum_count < minimum_count
+            )
+        ):
+            raise TypeError(f"{opportunity_type} player count range is invalid")
+    else:
+        open_places = facts["open_places"]
+        if open_places is not None and (
+            not isinstance(open_places, int)
+            or isinstance(open_places, bool)
+            or open_places < 1
+        ):
+            raise TypeError("open-match open_places must be positive or null")
     list_allowlists = {
         "team_formats": {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
         "positions": {"goalkeeper", "defender", "midfielder", "forward"},
@@ -2111,9 +2177,9 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
             or len(values) != len(set(cast(list[str], values)))
             or not all(isinstance(value, str) and value in allowed for value in values)
         ):
-            raise ValueError(f"open-match {field_name} is invalid")
+            raise ValueError(f"{opportunity_type} {field_name} is invalid")
     if facts["payment"] not in {None, "free", "paid"}:
-        raise ValueError("open-match payment is invalid")
+        raise ValueError(f"{opportunity_type} payment is invalid")
     payment_amount = facts["payment_amount"]
     payment_currency = facts["payment_currency"]
     if (payment_amount is None) != (payment_currency is None) or (
@@ -2126,7 +2192,7 @@ def _validate_open_match_accepted_facts(facts: dict[str, JsonValue]) -> None:
             or not payment_currency
         )
     ):
-        raise ValueError("open-match payment details are invalid")
+        raise ValueError(f"{opportunity_type} payment details are invalid")
     _required_iso_datetime(facts, "source_posted_at")
 
 

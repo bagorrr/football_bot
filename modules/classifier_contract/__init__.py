@@ -35,6 +35,9 @@ _OPTIONAL_CANDIDATE_FIELDS = {
     "venue_settings",
     "playing_surfaces",
     "payment",
+    "available_player_count",
+    "available_player_count_min",
+    "available_player_count_max",
 }
 _STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence"}
 _V2_STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence", "source_context"}
@@ -100,13 +103,20 @@ def classifier_output_is_schema_valid(
     if len(candidates) != 1 or not isinstance(candidates[0], dict):
         return False
     candidate = candidates[0]
+    opportunity_type = candidate.get("opportunity_type")
+    player_candidate = opportunity_type == "player_match_availability"
+    required_fields = (
+        _REQUIRED_CANDIDATE_FIELDS - {"open_places"}
+        if player_candidate
+        else _REQUIRED_CANDIDATE_FIELDS
+    )
     if (
-        not _REQUIRED_CANDIDATE_FIELDS.issubset(candidate)
+        not required_fields.issubset(candidate)
         or set(candidate)
-        - _REQUIRED_CANDIDATE_FIELDS
+        - required_fields
         - _OPTIONAL_CANDIDATE_FIELDS
         - _STRUCTURED_CANDIDATE_FIELDS
-        or candidate.get("opportunity_type") != "open_match"
+        or opportunity_type not in {"open_match", "player_match_availability"}
         or not isinstance(candidate.get("candidate_key"), str)
         or not candidate["candidate_key"]
     ):
@@ -115,12 +125,10 @@ def classifier_output_is_schema_valid(
     if not isinstance(candidate_key, str) or not candidate_key:
         return False
     evidence = candidate.get("evidence")
-    expected_evidence = {
-        "opportunity",
-        "event_time",
-        "location",
-        "open_places",
-    } | (set(candidate) & _OPTIONAL_CANDIDATE_FIELDS)
+    expected_evidence = {"opportunity", "event_time", "location"}
+    if not player_candidate:
+        expected_evidence.add("open_places")
+    expected_evidence |= set(candidate) & _OPTIONAL_CANDIDATE_FIELDS
     if not (
         isinstance(evidence, dict)
         and set(evidence) == expected_evidence
@@ -132,7 +140,6 @@ def classifier_output_is_schema_valid(
         return False
     location = candidate.get("location")
     event_time = candidate.get("event_time")
-    open_places = candidate.get("open_places")
     routes = candidate.get("response_routes")
     if (
         not isinstance(location, dict)
@@ -155,14 +162,7 @@ def classifier_output_is_schema_valid(
                 "iana_timezone",
             },
         )
-        or (
-            open_places is not None
-            and (
-                not isinstance(open_places, int)
-                or isinstance(open_places, bool)
-                or open_places < 1
-            )
-        )
+        or not _player_count_fields_are_valid(candidate, player_candidate)
         or not isinstance(routes, list)
         or len(routes) > 8
     ):
@@ -209,6 +209,7 @@ def classifier_output_is_schema_valid(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=str(opportunity_type),
     )
 
 
@@ -269,7 +270,8 @@ def _classifier_output_v2_is_schema_valid(
         }:
             return False
         if (
-            candidate.get("opportunity_type") != "open_match"
+            candidate.get("opportunity_type")
+            not in {"open_match", "player_match_availability"}
             or not isinstance(candidate.get("candidate_key"), str)
             or not candidate["candidate_key"]
             or not _source_bound_text_map(candidate.get("evidence"), body)
@@ -318,17 +320,70 @@ def _source_bound_text_map(value: JsonValue, body: str) -> bool:
     )
 
 
+def _player_count_fields_are_valid(
+    candidate: dict[str, JsonValue], player_candidate: bool
+) -> bool:
+    """Validate an optional exact or bounded Player availability count."""
+    if not player_candidate:
+        open_places = candidate.get("open_places")
+        return not any(
+            key in candidate
+            for key in (
+                "available_player_count",
+                "available_player_count_min",
+                "available_player_count_max",
+            )
+        ) and (
+            open_places is None
+            or (
+                isinstance(open_places, int)
+                and not isinstance(open_places, bool)
+                and open_places > 0
+            )
+        )
+    if "open_places" in candidate:
+        return False
+    exact = candidate.get("available_player_count")
+    minimum = candidate.get("available_player_count_min")
+    maximum = candidate.get("available_player_count_max")
+    if exact is not None:
+        return (
+            isinstance(exact, int)
+            and not isinstance(exact, bool)
+            and exact > 0
+            and minimum is None
+            and maximum is None
+        )
+    if minimum is None and maximum is None:
+        return True
+    return (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and maximum >= minimum
+    )
+
+
 def _accepted_candidate_is_schema_valid(
     candidate: dict[str, JsonValue], *, body: str
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
+    opportunity_type = candidate.get("opportunity_type")
+    player_candidate = opportunity_type == "player_match_availability"
+    required_fields = (
+        _REQUIRED_V2_CANDIDATE_FIELDS - {"open_places"}
+        if player_candidate
+        else _REQUIRED_V2_CANDIDATE_FIELDS
+    )
     if (
-        not _REQUIRED_V2_CANDIDATE_FIELDS.issubset(candidate)
+        not required_fields.issubset(candidate)
         or set(candidate)
-        - _REQUIRED_CANDIDATE_FIELDS
+        - required_fields
         - _OPTIONAL_CANDIDATE_FIELDS
         - _V2_STRUCTURED_CANDIDATE_FIELDS
-        or candidate.get("opportunity_type") != "open_match"
+        or opportunity_type not in {"open_match", "player_match_availability"}
         or not isinstance(candidate.get("candidate_key"), str)
         or not candidate["candidate_key"]
     ):
@@ -336,12 +391,10 @@ def _accepted_candidate_is_schema_valid(
     candidate_key = candidate["candidate_key"]
     assert isinstance(candidate_key, str)
     evidence = candidate.get("evidence")
-    expected_evidence = {
-        "opportunity",
-        "event_time",
-        "location",
-        "open_places",
-    } | (set(candidate) & _OPTIONAL_CANDIDATE_FIELDS)
+    expected_evidence = {"opportunity", "event_time", "location"}
+    if not player_candidate:
+        expected_evidence.add("open_places")
+    expected_evidence |= set(candidate) & _OPTIONAL_CANDIDATE_FIELDS
     if (
         not isinstance(evidence, dict)
         or set(evidence) != expected_evidence
@@ -353,7 +406,6 @@ def _accepted_candidate_is_schema_valid(
         return False
     location = candidate.get("location")
     event_time = candidate.get("event_time")
-    open_places = candidate.get("open_places")
     routes = candidate.get("response_routes")
     if (
         not isinstance(location, dict)
@@ -366,14 +418,7 @@ def _accepted_candidate_is_schema_valid(
             {"start_local_date", "end_local_date", "exact_local_time", "iana_timezone"},
             {"start_local_date", "end_local_date", "day_part", "iana_timezone"},
         )
-        or (
-            open_places is not None
-            and (
-                not isinstance(open_places, int)
-                or isinstance(open_places, bool)
-                or open_places < 1
-            )
-        )
+        or not _player_count_fields_are_valid(candidate, player_candidate)
         or not isinstance(routes, list)
         or len(routes) > 8
     ):
@@ -427,6 +472,7 @@ def _accepted_candidate_is_schema_valid(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=str(opportunity_type),
     )
 
 
@@ -437,6 +483,7 @@ def proposition_evidence_is_schema_valid(
     candidate_key: str,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    meaning: str = "open_match",
 ) -> bool:
     """Validate the versioned source-proposition/evidence wire contract.
 
@@ -473,7 +520,7 @@ def proposition_evidence_is_schema_valid(
     if (
         root.get("proposition_id") != candidate_key
         or root.get("domain") not in _PROPOSITION_DOMAINS
-        or root.get("meaning") != "open_match"
+        or root.get("meaning") != meaning
         or root.get("polarity") not in _PROPOSITION_POLARITIES
         or root.get("currentness") not in _PROPOSITION_CURRENTNESS
         or not _valid_source_span(root.get("span"), body, expected_text=body)
@@ -586,6 +633,7 @@ def semantic_proof_is_schema_valid(
     candidate_key: str,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    meaning: str = "open_match",
 ) -> bool:
     """Validate the strict, source-bound semantic-proof representation.
 
@@ -630,7 +678,7 @@ def semantic_proof_is_schema_valid(
     if (
         root.get("target_id") != "root"
         or root.get("domain") != "football_match"
-        or root.get("meaning") != "open_match"
+        or root.get("meaning") != meaning
         or root.get("state") not in _SEMANTIC_PROOF_STATES
         or not _valid_source_span(root.get("span"), body, expected_text=body)
     ):
@@ -803,6 +851,7 @@ def semantic_proof_is_authoritative(
     candidate_key: str,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    meaning: str = "open_match",
 ) -> bool:
     """Accept only a complete current-positive proof with clean coverage."""
     if not semantic_proof_is_schema_valid(
@@ -812,6 +861,7 @@ def semantic_proof_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     ):
         return False
     assert isinstance(value, dict)

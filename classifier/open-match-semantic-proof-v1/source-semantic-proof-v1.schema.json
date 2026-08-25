@@ -64,7 +64,7 @@
       "properties": {
         "target_id": {"const": "root"},
         "domain": {"const": "football_match"},
-        "meaning": {"const": "open_match"},
+        "meaning": {"enum": ["open_match", "player_match_availability"]},
         "state": {"$ref": "#/$defs/state"},
         "span": {"$ref": "#/$defs/span"}
       }

@@ -61,6 +61,7 @@ def _envelope(payload: dict[str, object]) -> ContractEnvelope:
 
 def test_player_search_accepts_optional_number_and_shared_details() -> None:
     envelope = _envelope(_payload())
+    assert isinstance(envelope.payload, dict)
 
     assert envelope.payload["user_intent"] == "player_search"
     assert envelope.payload["number_of_players"] == 3
@@ -68,6 +69,7 @@ def test_player_search_accepts_optional_number_and_shared_details() -> None:
 
 def test_player_search_can_clear_number_of_players() -> None:
     envelope = _envelope(_payload(number_of_players=None))
+    assert isinstance(envelope.payload, dict)
 
     assert "number_of_players" not in envelope.payload
 

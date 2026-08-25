@@ -865,6 +865,72 @@ _GAME_SEARCH_DETAIL_HEADINGS = {
         "💳 Sélectionnez le type de paiement.",
     ),
 }
+_PLAYER_SEARCH_DETAIL_KEYS = (
+    "times",
+    "number_of_players",
+    "team_formats",
+    "positions",
+    "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
+_PLAYER_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Time",
+        "Number of players",
+        "Team format",
+        "Positions",
+        "Playing levels",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Время",
+        "Количество игроков",
+        "Формат команд",
+        "Позиции",
+        "Уровни игры",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Hora",
+        "Número de jugadores",
+        "Formato de equipos",
+        "Posiciones",
+        "Niveles de juego",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Heure",
+        "Nombre de joueurs",
+        "Format des équipes",
+        "Postes",
+        "Niveaux de jeu",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_PLAYER_SEARCH_DETAIL_HEADINGS = {
+    "en": {
+        "number_of_players": "👥 How many players?",
+    },
+    "ru": {
+        "number_of_players": "👥 Сколько игроков?",
+    },
+    "es": {
+        "number_of_players": "👥 ¿Cuántos jugadores?",
+    },
+    "fr": {
+        "number_of_players": "👥 Combien de joueurs ?",
+    },
+}
 _GAME_SEARCH_VALUE_COPY = {
     "en": {
         "morning": "Morning",
@@ -2322,6 +2388,7 @@ class ConversationOnboarding:
         telegram_user_id: int,
         screen_revision: int,
         game_search_details: dict[str, list[str]] | None = None,
+        number_of_players: int | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2376,6 +2443,22 @@ class ConversationOnboarding:
                 if game_search_details is not None
                 else {key: list(values) for key, values in draft.game_search_details}
             )
+            selected_number_of_players = (
+                number_of_players
+                if number_of_players is not None
+                else draft.number_of_players
+            )
+            if selected_number_of_players is not None and (
+                draft.user_intent is not UserIntent.PLAYER_SEARCH
+                or isinstance(selected_number_of_players, bool)
+                or not isinstance(selected_number_of_players, int)
+                or selected_number_of_players < 1
+            ):
+                raise ValueError("Number of Players must be a positive integer")
+            changed_draft = replace(
+                changed_draft,
+                number_of_players=selected_number_of_players,
+            )
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
                 contract_version=2,
@@ -2410,6 +2493,11 @@ class ConversationOnboarding:
                     **(
                         {"game_search_details": cast(JsonValue, selected_details)}
                         if selected_details
+                        else {}
+                    ),
+                    **(
+                        {"number_of_players": selected_number_of_players}
+                        if selected_number_of_players is not None
                         else {}
                     ),
                 },
@@ -2553,6 +2641,78 @@ class ConversationOnboarding:
             operation="back",
         )
 
+    def open_player_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Open the durable Player Search details hub."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
+    def open_player_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one Player Search detail submenu."""
+        if detail_key not in _PLAYER_SEARCH_DETAIL_KEYS:
+            raise ValueError("Player Search detail key must be canonical")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
+    def submit_player_search_number_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and commit one positive whole-player count."""
+        if re.fullmatch(r"[1-9][0-9]*", text) is None:
+            raise ValueError("Number of Players must be a positive integer")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_number",
+            value=text,
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
+    def clear_player_search_number(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Clear the optional Player Search quantity criterion."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_number",
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
     def _change_game_search_details(
         self,
         *,
@@ -2562,6 +2722,7 @@ class ConversationOnboarding:
         operation: str,
         detail_key: str | None = None,
         value: str | None = None,
+        user_intent: UserIntent = UserIntent.GAME_SEARCH,
     ) -> None:
         with self._store.serialize_conversation_update(
             update_id=update_id,
@@ -2576,7 +2737,7 @@ class ConversationOnboarding:
             if (
                 current.stage is not ConversationStage.POST_CORE
                 or draft.stage is not ConversationStage.POST_CORE
-                or draft.user_intent is not UserIntent.GAME_SEARCH
+                or draft.user_intent is not user_intent
                 or draft.screen_revision != screen_revision
             ):
                 self._queue_current_view(update_id=update_id, state=current)
@@ -2585,13 +2746,27 @@ class ConversationOnboarding:
             editing = draft.editing_game_search_detail
             temporary = list(draft.game_search_detail_draft)
             exact_time_prompt = draft.game_search_exact_time_prompt
+            number_prompt = draft.player_search_number_prompt
+            draft_number = draft.number_of_players
             target = "hub"
+            detail_keys = (
+                _PLAYER_SEARCH_DETAIL_KEYS
+                if user_intent is UserIntent.PLAYER_SEARCH
+                else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+            )
             if operation == "open_detail":
                 assert detail_key is not None
+                if detail_key not in detail_keys:
+                    raise ValueError("Search detail key must be canonical")
                 editing = detail_key
-                temporary = list(details.get(detail_key, ()))
+                temporary = (
+                    []
+                    if detail_key == "number_of_players"
+                    else list(details.get(detail_key, ()))
+                )
                 exact_time_prompt = False
-                target = "submenu"
+                number_prompt = detail_key == "number_of_players"
+                target = "number_prompt" if number_prompt else "submenu"
             elif operation == "toggle":
                 if editing is None or editing == "times":
                     raise RuntimeError("No multi-select Game Search detail is open")
@@ -2622,6 +2797,23 @@ class ConversationOnboarding:
                 editing = None
                 temporary = []
                 exact_time_prompt = False
+            elif operation == "submit_number":
+                if user_intent is not UserIntent.PLAYER_SEARCH or not number_prompt:
+                    raise RuntimeError("Player Search number prompt is not open")
+                if value is None or re.fullmatch(r"[1-9][0-9]*", value) is None:
+                    raise ValueError("Number of Players must be a positive integer")
+                draft_number = int(value)
+                editing = None
+                temporary = []
+                number_prompt = False
+                target = "hub"
+            elif operation == "select_number":
+                if user_intent is not UserIntent.PLAYER_SEARCH:
+                    raise RuntimeError("Number of Players requires Player Search")
+                draft_number = None
+                editing = None
+                temporary = []
+                number_prompt = False
             elif operation == "submit_exact_time":
                 if editing != "times" or not exact_time_prompt:
                     raise RuntimeError("Game Search exact-time prompt is not open")
@@ -2637,7 +2829,11 @@ class ConversationOnboarding:
                 exact_time_prompt = True
                 target = "exact_time_prompt"
             elif operation == "back":
-                if exact_time_prompt and editing == "times":
+                if number_prompt and editing == "number_of_players":
+                    number_prompt = False
+                    editing = None
+                    target = "hub"
+                elif exact_time_prompt and editing == "times":
                     exact_time_prompt = False
                     target = "submenu"
                 elif editing is None:
@@ -2664,9 +2860,15 @@ class ConversationOnboarding:
                 revision=draft.revision + 1,
                 last_activity_at=now,
                 game_search_details=tuple(sorted(details.items())),
+                number_of_players=(
+                    draft_number
+                    if operation in {"submit_number", "select_number"}
+                    else draft.number_of_players
+                ),
                 editing_game_search_detail=editing,
                 game_search_detail_draft=tuple(temporary),
                 game_search_exact_time_prompt=exact_time_prompt,
+                player_search_number_prompt=number_prompt,
             )
             if target == "submenu":
                 assert editing is not None
@@ -2680,6 +2882,13 @@ class ConversationOnboarding:
                 )
             elif target == "exact_time_prompt":
                 message = _game_search_exact_time_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                )
+            elif target == "number_prompt":
+                message = _player_search_number_message(
                     update_id=update_id,
                     telegram_user_id=telegram_user_id,
                     locale=current.locale or "en",
@@ -2705,6 +2914,8 @@ class ConversationOnboarding:
                     locale=current.locale or "en",
                     screen_revision=state.screen_revision,
                     details=details,
+                    user_intent=user_intent,
+                    number_of_players=changed_draft.number_of_players,
                 )
             self._store.commit_conversation_update(
                 update_id=update_id,
@@ -5291,6 +5502,7 @@ def _discovery_message(
             city=draft.city,
             areas=draft.sub_city_areas,
             whole_city=draft.whole_city,
+            user_intent=draft.user_intent,
         )
     if draft.stage is ConversationStage.SUBMITTING:
         return _submitting_message(
@@ -5517,6 +5729,7 @@ def _post_core_message(
     city: AcceptedLocation,
     areas: tuple[AcceptedLocation, ...],
     whole_city: bool,
+    user_intent: UserIntent | None = None,
 ) -> TelegramMessage:
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     body, details_label, search_label = _POST_CORE_COPY[copy_locale]
@@ -5551,6 +5764,8 @@ def _game_search_details_hub_message(
     locale: str,
     screen_revision: int,
     details: dict[str, tuple[str, ...]],
+    user_intent: UserIntent = UserIntent.GAME_SEARCH,
+    number_of_players: int | None = None,
 ) -> TelegramMessage:
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     introduction, not_set, back_label, search_label = {
@@ -5569,12 +5784,25 @@ def _game_search_details_hub_message(
             "Rechercher",
         ),
     }[copy_locale]
-    keys = tuple(_GAME_SEARCH_DETAIL_OPTIONS)
-    names = _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+    player_search = user_intent is UserIntent.PLAYER_SEARCH
+    keys = (
+        _PLAYER_SEARCH_DETAIL_KEYS
+        if player_search
+        else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+    )
+    names = (
+        _PLAYER_SEARCH_DETAIL_NAMES[copy_locale]
+        if player_search
+        else _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+    )
     summaries = tuple(
-        ", ".join(
-            _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
-            for value in details.get(key, ())
+        (
+            str(number_of_players)
+            if key == "number_of_players" and number_of_players is not None
+            else ", ".join(
+                _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+                for value in details.get(key, ())
+            )
         )
         or not_set
         for key in keys
@@ -5702,6 +5930,30 @@ def _game_search_exact_time_message(
     )
 
 
+def _player_search_number_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    prompt, back_label = {
+        "en": ("Send one whole number greater than zero.", "⬅️ Back"),
+        "ru": ("Отправьте одно целое число больше нуля.", "⬅️ Назад"),
+        "es": ("Envía un número entero mayor que cero.", "⬅️ Atrás"),
+        "fr": ("Envoyez un nombre entier supérieur à zéro.", "⬅️ Retour"),
+    }[copy_locale]
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"{_PLAYER_SEARCH_DETAIL_HEADINGS[copy_locale]['number_of_players']}\n\n{prompt}",
+        button_rows=(((back_label, f"details:back:{screen_revision}"),),),
+    )
+
+
 def _zero_result_message(
     *,
     delivery_id: str,
@@ -5740,6 +5992,7 @@ def _open_match_result_message(
 ) -> TelegramMessage:
     """Render one Result Card only from its immutable accepted-fact snapshot."""
     facts = dict(result.card_facts)
+    player_result = facts.get("opportunity_type") == "player_match_availability"
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     event_date = date.fromisoformat(facts["start_local_date"])
     event_end_date = date.fromisoformat(
@@ -5808,7 +6061,7 @@ def _open_match_result_message(
     }[copy_locale]
     labels = {
         "en": (
-            "Open Match",
+            "Player Match Availability" if player_result else "Open Match",
             "Matches",
             "Needs clarification",
             "Posted",
@@ -5818,9 +6071,10 @@ def _open_match_result_message(
             "Questions? Message me. I can explain the card or help refine your search.",
             "Additional",
             "No exact match was found.",
+            "Partially matches",
         ),
         "ru": (
-            "Открытая игра",
+            "Наличие игроков для матча" if player_result else "Открытая игра",
             "Подходит",
             "Нужно уточнить",
             "Пост",
@@ -5831,9 +6085,10 @@ def _open_match_result_message(
             "или помогу уточнить поиск.",
             "Дополнительно",
             "Точного совпадения не найдено.",
+            "Частично подходит",
         ),
         "es": (
-            "Partido abierto",
+            "Disponibilidad de jugadores" if player_result else "Partido abierto",
             "Coincide",
             "Falta confirmar",
             "Publicado",
@@ -5844,9 +6099,10 @@ def _open_match_result_message(
             "o le ayudaré a ajustar la búsqueda.",
             "Información adicional",
             "No se encontró una coincidencia exacta.",
+            "Coincide parcialmente",
         ),
         "fr": (
-            "Match ouvert",
+            "Disponibilité de joueurs" if player_result else "Match ouvert",
             "Correspond",
             "À préciser",
             "Publié",
@@ -5857,6 +6113,7 @@ def _open_match_result_message(
             "ou vous aider à affiner votre recherche.",
             "Informations complémentaires",
             "Aucune correspondance exacte n’a été trouvée.",
+            "Correspond partiellement",
         ),
     }[copy_locale]
     match_states = json.loads(facts.get("match_states", "{}"))
@@ -5866,7 +6123,7 @@ def _open_match_result_message(
     team_formats = json.loads(facts.get("team_formats", "[]"))
     title = f"⚽ {labels[0]}" + (
         f" {', '.join(team_formats)}"
-        if team_formats and "team_formats" in confirmed_keys
+        if team_formats and "team_formats" in confirmed_keys and not player_result
         else ""
     )
     if event_date == event_end_date:
@@ -5940,6 +6197,34 @@ def _open_match_result_message(
             + " libre"
             + ("s" if open_places != 1 else ""),
         }[copy_locale]
+    available_player_copy = None
+    if player_result:
+        exact_count = facts.get("available_player_count")
+        minimum_count = facts.get("available_player_count_min")
+        maximum_count = facts.get("available_player_count_max")
+        if exact_count is not None:
+            count_copy = str(exact_count)
+            available_player_copy = {
+                "en": f"{count_copy} player"
+                + ("" if count_copy == "1" else "s")
+                + " available",
+                "ru": f"Игроков доступно: {count_copy}",
+                "es": f"{count_copy} jugador"
+                + ("" if count_copy == "1" else "es")
+                + " disponible"
+                + ("" if count_copy == "1" else "s"),
+                "fr": f"{count_copy} joueur"
+                + ("" if count_copy == "1" else "s")
+                + " disponible"
+                + ("" if count_copy == "1" else "s"),
+            }[copy_locale]
+        elif minimum_count is not None and maximum_count is not None:
+            available_player_copy = {
+                "en": f"{minimum_count}–{maximum_count} players available",
+                "ru": f"Игроков доступно: {minimum_count}–{maximum_count}",
+                "es": f"{minimum_count}–{maximum_count} jugadores disponibles",
+                "fr": f"{minimum_count}–{maximum_count} joueurs disponibles",
+            }[copy_locale]
     value_copy = {
         "en": {
             "goalkeeper": "Goalkeeper",
@@ -6037,8 +6322,16 @@ def _open_match_result_message(
     value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
     detail_names = dict(
         zip(
-            _GAME_SEARCH_DETAIL_OPTIONS,
-            _GAME_SEARCH_DETAIL_NAMES[copy_locale],
+            (
+                _PLAYER_SEARCH_DETAIL_KEYS
+                if player_result
+                else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+            ),
+            (
+                _PLAYER_SEARCH_DETAIL_NAMES[copy_locale]
+                if player_result
+                else _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+            ),
             strict=True,
         )
     )
@@ -6062,7 +6355,13 @@ def _open_match_result_message(
         if "payment_amount" in facts and "payment_currency" in facts:
             payment_copy += f" ({facts['payment_amount']} {facts['payment_currency']})"
         known_values["payment"] = payment_copy
-    detail_values = [open_place_copy] if open_place_copy is not None else []
+    detail_values = (
+        ([available_player_copy] if available_player_copy is not None else [])
+        if player_result
+        else ([open_place_copy] if open_place_copy is not None else [])
+    )
+    if player_result and "team_formats" in facts and facts.get("team_formats"):
+        detail_values.append(known_values["team_formats"])
     detail_values.extend(
         known_values[key]
         for key in (
@@ -6089,6 +6388,7 @@ def _open_match_result_message(
             "playing_surfaces": "playing surface",
             "payment": "payment",
             "search_area": "search area",
+            "number_of_players": "number of players",
         },
         "ru": {
             "times": "время",
@@ -6099,6 +6399,7 @@ def _open_match_result_message(
             "playing_surfaces": "покрытие",
             "payment": "оплата",
             "search_area": "район поиска",
+            "number_of_players": "количество игроков",
         },
         "es": {
             "times": "hora",
@@ -6109,6 +6410,7 @@ def _open_match_result_message(
             "playing_surfaces": "superficie",
             "payment": "pago",
             "search_area": "zona de búsqueda",
+            "number_of_players": "número de jugadores",
         },
         "fr": {
             "times": "heure",
@@ -6119,17 +6421,18 @@ def _open_match_result_message(
             "playing_surfaces": "surface",
             "payment": "paiement",
             "search_area": "zone de recherche",
+            "number_of_players": "nombre de joueurs",
         },
     }[copy_locale]
     selected_confirmed = sorted(
         criterion_copy.get(key, key.replace("_", " "))
         for key, state in match_states.items()
-        if state == "confirmed" and key != "search_area"
+        if state == "confirmed" and key not in {"search_area", "number_of_players"}
     )
     selected_unknown = sorted(
         criterion_copy.get(key, key.replace("_", " "))
         for key, state in match_states.items()
-        if state == "unknown"
+        if state == "unknown" and (not player_result or key != "number_of_players")
     )
     confirmed_core = (
         {
@@ -6141,9 +6444,23 @@ def _open_match_result_message(
         if match_states.get("search_area") == "confirmed"
         else labels[6]
     )
-    match_lines = [
-        f"{labels[1]}: " + ", ".join((confirmed_core, *selected_confirmed)) + "."
-    ]
+    if player_result and result.result_class == "partial_result":
+        contribution = facts.get("available_player_contribution", "")
+        if "/" in contribution:
+            provided, requested = contribution.split("/", 1)
+            contribution_copy = {
+                "en": f"{provided} of {requested} players",
+                "ru": f"{provided} из {requested} игроков",
+                "es": f"{provided} de {requested} jugadores",
+                "fr": f"{provided} sur {requested} joueurs",
+            }[copy_locale]
+        else:
+            contribution_copy = contribution
+        match_lines = [f"{labels[10]}: {contribution_copy}."]
+    else:
+        match_lines = [
+            f"{labels[1]}: " + ", ".join((confirmed_core, *selected_confirmed)) + "."
+        ]
     if selected_unknown:
         match_lines.append(f"{labels[2]}: {', '.join(selected_unknown)}.")
     match_copy = "\n".join(match_lines)
@@ -6152,7 +6469,11 @@ def _open_match_result_message(
     )
     additional = " · ".join(
         f"{detail_names[key]}: {known_values[key]}"
-        for key in _GAME_SEARCH_DETAIL_OPTIONS
+        for key in (
+            _PLAYER_SEARCH_DETAIL_KEYS
+            if player_result
+            else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+        )
         if key not in confirmed_keys and known_values.get(key)
     )
     additional_copy = f"\n{labels[8]}: {additional}\n" if additional else ""
@@ -7965,6 +8286,9 @@ class RuntimeApplication:
             ):
                 raise RuntimeError("accepted v1 output has no proof-bound candidate")
             proof_candidate_key = cast(str, proof_candidate["candidate_key"])
+            proof_meaning = proof_candidate.get("opportunity_type")
+            if not isinstance(proof_meaning, str):
+                proof_meaning = "open_match"
             semantic_proof_request = replace(
                 request,
                 context_bundle_version="semantic-proof-context-v1",
@@ -8119,6 +8443,7 @@ class RuntimeApplication:
                 candidate_key=proof_candidate_key,
                 evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
                 routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+                meaning=proof_meaning,
             )
             semantic_proof_attempt = _classification_attempt_from_result(
                 semantic_proof_recorded_result,
@@ -9027,6 +9352,9 @@ class RuntimeApplication:
                         or not isinstance(routes, list)
                     ):
                         continue
+                    proof_meaning = candidate.get("opportunity_type")
+                    if not isinstance(proof_meaning, str):
+                        proof_meaning = "open_match"
                     if candidate_key in stored_proof_keys:
                         continue
                     proof_request = replace(
@@ -9130,6 +9458,7 @@ class RuntimeApplication:
                             candidate_key=candidate_key,
                             evidence=evidence,
                             routes=routes,
+                            meaning=proof_meaning,
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -9826,7 +10155,7 @@ class RuntimeApplication:
                         candidate=candidate,
                         proof=proof,
                     )
-                    accepted_candidate = _validated_open_match_proposal(
+                    accepted_candidate = _validated_opportunity_proposal(
                         candidate_payload,
                         resolver=self.location_resolver,
                     )
@@ -9882,7 +10211,7 @@ class RuntimeApplication:
                         {
                             "opportunity_id": opportunity_id,
                             "opportunity_revision_id": opportunity_revision_id,
-                            "opportunity_type": "open_match",
+                            "opportunity_type": accepted_candidate["opportunity_type"],
                             "accepted_facts": accepted_candidate["accepted_facts"],
                             "response_route": accepted_candidate["response_route"],
                         }
@@ -9993,7 +10322,7 @@ class RuntimeApplication:
                 candidate=candidate,
                 proof=proof,
             )
-        accepted = _validated_open_match_proposal(
+        accepted = _validated_opportunity_proposal(
             authoritative_payload,
             resolver=self.location_resolver,
         )
@@ -10066,7 +10395,7 @@ class RuntimeApplication:
                 "opportunity_revision_id": opportunity_revision_id,
                 "source_message_revision_id": revision_id,
                 "publication_state": "active",
-                "opportunity_type": "open_match",
+                "opportunity_type": accepted["opportunity_type"],
                 "accepted_facts": accepted["accepted_facts"],
                 "response_route": accepted["response_route"],
             },
@@ -10648,12 +10977,20 @@ class RuntimeApplication:
         area_types = payload.get("sub_city_area_geographic_types", [])
         area_parent_ids = payload.get("sub_city_area_verified_parent_ids", [])
         whole_city = payload.get("whole_city")
+        number_of_players = payload.get("number_of_players")
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("RunSearch requires telegram_user_id")
         if not isinstance(search_update_id, str) or not search_update_id:
             raise ValueError("RunSearch requires search_update_id")
         if not isinstance(user_intent, str):
             raise TypeError("RunSearch requires user_intent")
+        if number_of_players is not None and (
+            user_intent != UserIntent.PLAYER_SEARCH.value
+            or not isinstance(number_of_players, int)
+            or isinstance(number_of_players, bool)
+            or number_of_players < 1
+        ):
+            raise ValueError("Number of Players must be a positive integer")
         if not isinstance(country_id, str) or not country_id:
             raise ValueError("RunSearch requires country_id")
         if not isinstance(city_id, str) or not city_id:
@@ -10751,6 +11088,7 @@ class RuntimeApplication:
                 tuple(value for value in parent_ids if isinstance(value, str))
                 for parent_ids in typed_area_parent_ids
             ),
+            number_of_players=number_of_players,
         )
         outgoing = ContractEnvelope(
             contract_name=ContractName.SEARCH_COMPLETED,
@@ -12021,6 +12359,7 @@ def _proposition_evidence_is_authoritative(
     routes: list[JsonValue],
     semantic_proof: JsonValue | None = None,
     source_message_revision_reference: str | None = None,
+    meaning: str = "open_match",
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
@@ -12030,6 +12369,7 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -12038,6 +12378,7 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -12046,13 +12387,16 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=meaning,
     )
     if (
         graph is None
         or not graph.is_current_positive()
         or not graph.has_complete_support_topology()
         or not graph.has_exact_support_spans()
-        or not _proposition_graph_has_closed_target_set(graph, evidence, routes)
+        or not _proposition_graph_has_closed_target_set(
+            graph, evidence, routes, meaning=meaning
+        )
     ):
         return False
     contract = cast(dict[str, JsonValue], value)
@@ -12063,7 +12407,7 @@ def _proposition_evidence_is_authoritative(
     if (
         not isinstance(root, dict)
         or root.get("domain") != "football_match"
-        or root.get("meaning") != "open_match"
+        or root.get("meaning") != meaning
         or root.get("polarity") != "positive"
         or root.get("currentness") != "current"
         or not isinstance(facts, dict)
@@ -12126,8 +12470,22 @@ def _proposition_evidence_is_authoritative(
 _MANDATORY_OPEN_MATCH_FACTS = frozenset(
     {"opportunity", "event_time", "location", "open_places"}
 )
+_MANDATORY_PLAYER_MATCH_FACTS = frozenset({"opportunity", "event_time", "location"})
 _OPTIONAL_OPEN_MATCH_FACTS = frozenset(
     {
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+)
+_OPTIONAL_PLAYER_MATCH_FACTS = frozenset(
+    {
+        "available_player_count",
+        "available_player_count_min",
+        "available_player_count_max",
         "team_formats",
         "positions",
         "playing_levels",
@@ -12267,6 +12625,11 @@ _PROPOSITION_LINEAGE_FACT_KEYS = (
     "payment_amount",
     "payment_currency",
 )
+_PLAYER_PROPOSITION_LINEAGE_FACT_KEYS = (
+    "available_player_count",
+    "available_player_count_min",
+    "available_player_count_max",
+)
 _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "opportunity",
     "event_time",
@@ -12278,6 +12641,11 @@ _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "venue_settings",
     "playing_surfaces",
     "payment",
+)
+_PLAYER_PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
+    "available_player_count",
+    "available_player_count_min",
+    "available_player_count_max",
 )
 
 
@@ -12299,11 +12667,20 @@ def _proposition_lineage_features(
     }
     for key in _PROPOSITION_LINEAGE_FACT_KEYS:
         features[f"fact:{key}"] = accepted_facts.get(key)
+    if value.get("opportunity_type") == "player_match_availability":
+        for key in _PLAYER_PROPOSITION_LINEAGE_FACT_KEYS:
+            features[f"fact:{key}"] = accepted_facts.get(key)
     for key in _PROPOSITION_LINEAGE_EVIDENCE_KEYS:
         evidence_value = evidence.get(key)
         features[f"evidence:{key}"] = (
             evidence_value if isinstance(evidence_value, str) else None
         )
+    if value.get("opportunity_type") == "player_match_availability":
+        for key in _PLAYER_PROPOSITION_LINEAGE_EVIDENCE_KEYS:
+            evidence_value = evidence.get(key)
+            features[f"evidence:{key}"] = (
+                evidence_value if isinstance(evidence_value, str) else None
+            )
     features["route:kind"] = response_route.get("kind")
     features["route:value"] = response_route.get("value")
     return features
@@ -12327,9 +12704,15 @@ def _proposition_lineage_slot(anchor: str) -> int:
     return int(anchor[:7], 16) + 1
 
 
-def _proposition_opportunity_id(source_message_id: str, anchor: str) -> str:
+def _proposition_opportunity_id(
+    source_message_id: str,
+    anchor: str,
+    opportunity_type: str = "open_match",
+) -> str:
     """Return the stable Application-owned identity for one proposition lineage."""
-    return f"opportunity:{source_message_id}:open_match:proposition:{anchor[:16]}"
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:proposition:{anchor[:16]}"
+    )
 
 
 def _legacy_candidate_alias_for_canonical(
@@ -12578,7 +12961,14 @@ def _reconcile_proposition_lineages(
         if assignments[candidate_index] is not None:
             continue
         slot = _proposition_lineage_slot(anchor)
-        opportunity_id = _proposition_opportunity_id(source_message_id, anchor)
+        opportunity_type = candidates[candidate_index].get("opportunity_type")
+        if not isinstance(opportunity_type, str):
+            return None
+        opportunity_id = _proposition_opportunity_id(
+            source_message_id,
+            anchor,
+            opportunity_type,
+        )
         if not assign(
             candidate_index,
             slot=slot,
@@ -12613,6 +13003,9 @@ def _candidate_target_manifest_hash(
             "location",
             "event_time",
             "open_places",
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
             "team_formats",
             "positions",
             "playing_levels",
@@ -12679,6 +13072,8 @@ def _proposition_graph_has_closed_target_set(
     graph: CanonicalPropositionGraph,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    *,
+    meaning: str = "open_match",
 ) -> bool:
     """Bind v1 nodes to the closed Application target set.
 
@@ -12690,11 +13085,19 @@ def _proposition_graph_has_closed_target_set(
     """
     fact_ids = {node.node_id for node in graph.facts}
     evidence_ids = set(evidence)
+    mandatory_facts = (
+        _MANDATORY_PLAYER_MATCH_FACTS
+        if meaning == "player_match_availability"
+        else _MANDATORY_OPEN_MATCH_FACTS
+    )
+    optional_facts = (
+        _OPTIONAL_PLAYER_MATCH_FACTS
+        if meaning == "player_match_availability"
+        else _OPTIONAL_OPEN_MATCH_FACTS
+    )
     if (
-        not _MANDATORY_OPEN_MATCH_FACTS.issubset(evidence_ids)
-        or not evidence_ids.issubset(
-            _MANDATORY_OPEN_MATCH_FACTS | _OPTIONAL_OPEN_MATCH_FACTS
-        )
+        not mandatory_facts.issubset(evidence_ids)
+        or not evidence_ids.issubset(mandatory_facts | optional_facts)
         or fact_ids != evidence_ids
     ):
         return False
@@ -12763,10 +13166,11 @@ def _source_player_participation_is_current(body: str) -> bool:
     )
 
 
-def _validated_open_match_proposal(
+def _validated_opportunity_proposal(
     payload_value: JsonValue,
     *,
     resolver: LocationResolverAdapter,
+    expected_opportunity_type: str | None = None,
 ) -> dict[str, JsonValue] | None:
     """Accept only schema-, evidence-, domain-, route-, and location-valid facts."""
     if not isinstance(payload_value, dict):
@@ -12795,15 +13199,19 @@ def _validated_open_match_proposal(
     candidate = candidates[0]
     if not isinstance(candidate, dict):
         return None
+    opportunity_type = expected_opportunity_type
     required = {
         "candidate_key",
         "opportunity_type",
         "evidence",
         "location",
         "event_time",
-        "open_places",
         "response_routes",
     }
+    candidate_type = candidate.get("opportunity_type")
+    player_candidate = candidate_type == "player_match_availability"
+    if not player_candidate:
+        required.add("open_places")
     optional = {
         "team_formats",
         "positions",
@@ -12811,12 +13219,20 @@ def _validated_open_match_proposal(
         "venue_settings",
         "playing_surfaces",
         "payment",
+        "available_player_count",
+        "available_player_count_min",
+        "available_player_count_max",
     }
     structured = {"proposition_evidence", "source_context"}
     if (
         not required.issubset(candidate)
         or set(candidate) - required - optional - structured
-        or candidate.get("opportunity_type") != "open_match"
+        or candidate.get("opportunity_type")
+        not in {"open_match", "player_match_availability"}
+        or (
+            opportunity_type is not None
+            and candidate.get("opportunity_type") != opportunity_type
+        )
     ):
         return None
     candidate_key = candidate.get("candidate_key")
@@ -12829,8 +13245,11 @@ def _validated_open_match_proposal(
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
         or set(evidence)
-        != {"opportunity", "event_time", "location", "open_places"}
-        | (set(candidate) & optional)
+        != (
+            {"opportunity", "event_time", "location"}
+            | ({"open_places"} if not player_candidate else set())
+            | (set(candidate) & optional)
+        )
         or not all(
             isinstance(value, str) and value in body for value in evidence.values()
         )
@@ -12861,6 +13280,7 @@ def _validated_open_match_proposal(
         source_message_revision_reference=_opaque_classifier_reference(
             revision_id, kind="revision"
         ),
+        meaning=str(candidate.get("opportunity_type")),
     ):
         return None
     if route is None:
@@ -12913,6 +13333,9 @@ def _validated_open_match_proposal(
     if len(places) != 1:
         return None
     open_places = candidate.get("open_places")
+    available_player_count = candidate.get("available_player_count")
+    available_player_count_min = candidate.get("available_player_count_min")
+    available_player_count_max = candidate.get("available_player_count_max")
     team_formats = candidate.get("team_formats")
     positions = candidate.get("positions")
     levels = candidate.get("playing_levels")
@@ -12921,11 +13344,23 @@ def _validated_open_match_proposal(
     payment = candidate.get("payment")
     if (
         (
-            open_places is not None
-            and (
-                not isinstance(open_places, int)
-                or isinstance(open_places, bool)
-                or open_places < 1
+            (player_candidate and open_places is not None)
+            or (
+                not player_candidate
+                and open_places is not None
+                and (
+                    not isinstance(open_places, int)
+                    or isinstance(open_places, bool)
+                    or open_places < 1
+                )
+            )
+        )
+        or (
+            player_candidate
+            and not _player_availability_count_is_valid(
+                available_player_count,
+                available_player_count_min,
+                available_player_count_max,
             )
         )
         or not _optional_canonical_list(
@@ -13001,10 +13436,29 @@ def _validated_open_match_proposal(
         )
         or mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
-        or not _open_places_are_supported(
-            open_places,
-            f"{evidence['opportunity']}. {evidence['open_places']}",
-            authoritative_body=validation_body,
+        or not (
+            _player_availability_is_supported(
+                available_player_count,
+                available_player_count_min,
+                available_player_count_max,
+                ". ".join(
+                    str(evidence[key])
+                    for key in (
+                        "opportunity",
+                        "available_player_count",
+                        "available_player_count_min",
+                        "available_player_count_max",
+                    )
+                    if key in evidence
+                ),
+                authoritative_body=validation_body,
+            )
+            if player_candidate
+            else _open_places_are_supported(
+                open_places if isinstance(open_places, int) else None,
+                f"{evidence['opportunity']}. {evidence['open_places']}",
+                authoritative_body=validation_body,
+            )
         )
         or not _optional_values_are_supported(
             candidate,
@@ -13050,6 +13504,9 @@ def _validated_open_match_proposal(
             for locale in ("en", "ru", "es", "fr")
         },
         "open_places": open_places,
+        "available_player_count": available_player_count,
+        "available_player_count_min": available_player_count_min,
+        "available_player_count_max": available_player_count_max,
         "team_formats": team_formats,
         "positions": positions,
         "playing_levels": levels,
@@ -13062,12 +13519,22 @@ def _validated_open_match_proposal(
         ),
         "source_posted_at": source_event_time.isoformat(),
     }
+    if player_candidate:
+        accepted_facts.pop("open_places", None)
+    else:
+        for count_key in (
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        ):
+            accepted_facts.pop(count_key, None)
     return {
         "opportunity_id": (
-            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:open_match"
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:"
+            f"{candidate.get('opportunity_type')}"
         ),
         "source_message_revision_id": revision_id,
-        "opportunity_type": "open_match",
+        "opportunity_type": candidate.get("opportunity_type"),
         "publication_state": "active",
         "accepted_facts": accepted_facts,
         "evidence": {
@@ -13076,6 +13543,19 @@ def _validated_open_match_proposal(
         },
         "response_route": {"kind": route["kind"], "value": route_value},
     }
+
+
+def _validated_open_match_proposal(
+    payload_value: JsonValue,
+    *,
+    resolver: LocationResolverAdapter,
+) -> dict[str, JsonValue] | None:
+    """Keep the established Open Match validation seam explicit."""
+    return _validated_opportunity_proposal(
+        payload_value,
+        resolver=resolver,
+        expected_opportunity_type="open_match",
+    )
 
 
 def _body_establishes_current_open_match(body: str) -> bool:
@@ -14708,6 +15188,92 @@ def _open_places_are_supported(
             or (has_generic_opening and not evidence_words.intersection(team_words))
         )
     )
+
+
+def _player_availability_count_is_valid(
+    exact: JsonValue,
+    minimum: JsonValue,
+    maximum: JsonValue,
+) -> bool:
+    """Validate one exact, bounded, or unknown available-player count."""
+    if exact is not None:
+        return (
+            isinstance(exact, int)
+            and not isinstance(exact, bool)
+            and exact > 0
+            and minimum is None
+            and maximum is None
+        )
+    if minimum is None and maximum is None:
+        return True
+    return (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and maximum >= minimum
+    )
+
+
+def _player_availability_is_supported(
+    exact: JsonValue,
+    minimum: JsonValue,
+    maximum: JsonValue,
+    evidence: str,
+    *,
+    authoritative_body: str | None = None,
+) -> bool:
+    """Require source-bound evidence of one jointly available Player group."""
+    if authoritative_body is not None:
+        return _player_availability_is_supported(
+            exact,
+            minimum,
+            maximum,
+            evidence,
+        ) and _player_availability_is_supported(
+            exact,
+            minimum,
+            maximum,
+            authoritative_body,
+        )
+    if not _player_availability_count_is_valid(exact, minimum, maximum):
+        return False
+    if _source_player_opening_state(evidence) is not PropositionState.CURRENT_POSITIVE:
+        return False
+    normalized = evidence.casefold()
+    player_words = (
+        r"player\w*|игрок\w*|jugador\w*|joueur\w*|"
+        r"goalkeeper\w*|defender\w*|midfielder\w*|forward\w*|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"portero\w*|defensa\w*|centrocampista\w*|delantero\w*|"
+        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*"
+    )
+    availability_words = (
+        r"available|can\s+play|free\s+to\s+play|open|need\w*|"
+        r"доступн\w*|готов\w*|мог\w*\s+играть|нуж\w*|есть|"
+        r"disponible\w*|pued\w*\s+jugar|necesit\w*|"
+        r"disponible\w*|peuvent?\s+jouer|besoin\w*|recherch\w*"
+    )
+    if (
+        re.search(player_words, normalized) is None
+        or re.search(availability_words, normalized) is None
+    ):
+        return False
+    if exact is not None:
+        if not isinstance(exact, int) or isinstance(exact, bool):
+            return False
+        return _open_places_are_supported(exact, evidence)
+    if minimum is not None and maximum is not None:
+        return (
+            re.search(
+                r"\d+\s*[-–]\s*\d+|\b(?:one|two|three|four|five|six|seven|"
+                r"один|два|три|четыре|пять|шесть|семь)\b",
+                normalized,
+            )
+            is not None
+        )
+    return True
 
 
 def _source_player_opening_state(body: str) -> PropositionState:

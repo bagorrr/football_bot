@@ -720,9 +720,11 @@ class DiscoveryDraft:
     whole_city: bool = False
     required_date: RequiredDate | None = None
     game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    number_of_players: int | None = None
     editing_game_search_detail: str | None = None
     game_search_detail_draft: tuple[str, ...] = ()
     game_search_exact_time_prompt: bool = False
+    player_search_number_prompt: bool = False
     search_submission_update_id: str | None = None
 
 
@@ -1235,7 +1237,11 @@ def evaluate_player_search(
                     else "partial_result"
                 )
             elif minimum_count is not None and maximum_count is not None:
-                quantity_state = MatchState.CONFIRMED if minimum_count >= requested_count else MatchState.UNKNOWN
+                quantity_state = (
+                    MatchState.CONFIRMED
+                    if minimum_count >= requested_count
+                    else MatchState.UNKNOWN
+                )
                 quantity_class = (
                     "confirmed_match"
                     if quantity_state is MatchState.CONFIRMED
@@ -1257,6 +1263,7 @@ def evaluate_player_search(
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "opportunity_type": opportunity.opportunity_type,
             "start_local_date": str(facts["start_local_date"]),
             "end_local_date": str(facts["end_local_date"]),
             "sort_local_date": max(start, required.start_local_date).isoformat()
@@ -1311,9 +1318,7 @@ def evaluate_player_search(
             card["payment_amount"] = str(facts["payment_amount"])
             card["payment_currency"] = str(facts["payment_currency"])
         if result_class == "partial_result" and requested_count is not None:
-            card["available_player_contribution"] = (
-                f"{exact_count}/{requested_count}"
-            )
+            card["available_player_contribution"] = f"{exact_count}/{requested_count}"
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",

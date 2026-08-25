@@ -1028,6 +1028,9 @@ def _add_test_proposition_evidence(
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
         return
+    meaning = candidate.get("opportunity_type", "open_match")
+    if meaning not in {"open_match", "player_match_availability"}:
+        return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
         return
     if not isinstance(routes, list):
@@ -1085,7 +1088,7 @@ def _add_test_proposition_evidence(
         "root": {
             "proposition_id": candidate_key,
             "domain": "football_match",
-            "meaning": "open_match",
+            "meaning": meaning,
             "polarity": "positive",
             "currentness": "current",
             "span": {"start": 0, "end": len(body), "text": body},
@@ -1140,6 +1143,9 @@ def _build_test_semantic_proof(
         or not isinstance(evidence, dict)
         or not isinstance(routes, list)
     ):
+        return {}
+    meaning = candidate.get("opportunity_type", "open_match")
+    if meaning not in {"open_match", "player_match_availability"}:
         return {}
 
     def span(text: str) -> dict[str, JsonValue]:
@@ -1231,7 +1237,7 @@ def _build_test_semantic_proof(
         "root": {
             "target_id": "root",
             "domain": "football_match",
-            "meaning": "open_match",
+            "meaning": meaning,
             "state": root_state,
             "span": {"start": 0, "end": len(body), "text": body},
         },
@@ -2514,6 +2520,7 @@ class AcceptanceSpine:
         telegram_user_id: int,
         screen_revision: int | None = None,
         game_search_details: dict[str, list[str]] | None = None,
+        number_of_players: int | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2525,6 +2532,7 @@ class AcceptanceSpine:
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
             game_search_details=game_search_details,
+            number_of_players=number_of_players,
         )
 
     def open_game_search_details(
@@ -2631,6 +2639,48 @@ class AcceptanceSpine:
     ) -> None:
         """Drive Back from a submenu or the Details hub."""
         self._conversation_onboarding().back_from_game_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_player_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Player Search Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_player_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_player_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Player Search detail submenu."""
+        self._conversation_onboarding().open_player_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_player_search_number_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Drive one Player Search quantity answer."""
+        self._conversation_onboarding().submit_player_search_number_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def clear_player_search_number(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Clear the optional Player Search quantity."""
+        self._conversation_onboarding().clear_player_search_number(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

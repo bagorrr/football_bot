@@ -15,22 +15,25 @@
         "additionalProperties": false,
         "required": [
           "candidate_key", "opportunity_type", "evidence", "location",
-          "event_time", "open_places", "response_routes"
+          "event_time", "response_routes"
         ],
         "properties": {
           "candidate_key": {"type": "string", "minLength": 1},
-          "opportunity_type": {"const": "open_match"},
+          "opportunity_type": {"enum": ["open_match", "player_match_availability"]},
           "evidence": {
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "opportunity", "event_time", "location", "open_places"
+              "opportunity", "event_time", "location"
             ],
             "properties": {
               "opportunity": {"type": "string", "minLength": 1},
               "event_time": {"type": "string", "minLength": 1},
               "location": {"type": "string", "minLength": 1},
               "open_places": {"type": "string", "minLength": 1},
+              "available_player_count": {"type": "string", "minLength": 1},
+              "available_player_count_min": {"type": "string", "minLength": 1},
+              "available_player_count_max": {"type": "string", "minLength": 1},
               "team_formats": {"type": "string", "minLength": 1},
               "positions": {"type": "string", "minLength": 1},
               "playing_levels": {"type": "string", "minLength": 1},
@@ -66,6 +69,9 @@
             }
           },
           "open_places": {"type": ["integer", "null"], "minimum": 1},
+          "available_player_count": {"type": ["integer", "null"], "minimum": 1},
+          "available_player_count_min": {"type": ["integer", "null"], "minimum": 1},
+          "available_player_count_max": {"type": ["integer", "null"], "minimum": 1},
           "team_formats": {"$ref": "#/$defs/team_formats"},
           "positions": {"$ref": "#/$defs/positions"},
           "playing_levels": {"$ref": "#/$defs/playing_levels"},
@@ -101,7 +107,28 @@
             }
           },
           "proposition_evidence": {"$ref": "#/$defs/proposition_evidence"}
-        }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"opportunity_type": {"const": "open_match"}}},
+            "then": {
+              "required": ["open_places"],
+              "properties": {"evidence": {"required": ["open_places"]}},
+              "not": {"anyOf": [
+                {"required": ["available_player_count"]},
+                {"required": ["available_player_count_min"]},
+                {"required": ["available_player_count_max"]}
+              ]}
+            }
+          },
+          {
+            "if": {"properties": {"opportunity_type": {"const": "player_match_availability"}}},
+            "then": {
+              "not": {"required": ["open_places"]},
+              "properties": {"evidence": {"not": {"required": ["open_places"]}}}
+            }
+          }
+        ]
       }
     }
   },
@@ -139,7 +166,7 @@
       "properties": {
         "proposition_id": {"type": "string", "minLength": 1},
         "domain": {"enum": ["football_match"]},
-        "meaning": {"const": "open_match"},
+        "meaning": {"enum": ["open_match", "player_match_availability"]},
         "polarity": {"enum": ["positive", "negative", "ambiguous"]},
         "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
         "span": {"$ref": "#/$defs/source_span"}

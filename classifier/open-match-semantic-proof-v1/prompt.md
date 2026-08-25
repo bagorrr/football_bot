@@ -7,7 +7,7 @@ evidence for the Application, never a publication decision.
 
 The proof must be bound to the supplied source-message revision reference and
 candidate key. Cover the complete source revision with exact source spans for
-the Open Match target, every mandatory target fact, every present optional fact
+the Open Match or Player availability target, every mandatory target fact, every present optional fact
 or payment fact, and every proposed response route. Use the target-specific
 state `current_positive` only when the source meaning currently supports that
 target. Record explicit contradiction, competition, replacement, and closure

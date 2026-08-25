@@ -87,6 +87,7 @@ from modules.domain import (
     UserIntent,
     empty_bounded_source_metadata,
     evaluate_game_search,
+    evaluate_player_search,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -122,6 +123,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0020_application_legacy_proposition_identity_compatibility.sql",
     "0021_classification_proof_work.sql",
     "0022_classifier_execution_recovery.sql",
+    "0023_player_match_availability.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -147,6 +149,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "2a151808ef6854d40f567f778212218f043eda691fec2ce21fb0e241b277f291",
     "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
     "0315157b15c682039beb369dba0523ff770900a674be50d3b449dfbc2d019747",
+    "ab973ce792e1aa331f55c1eba6e52ffd2c0a3d3aca419fa12ea46300140a5767",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1572,7 +1575,8 @@ class PostgresAcceptanceObserver:
                        user_intent, country_id, city_id, sub_city_area_ids,
                        sub_city_area_geographic_types,
                        sub_city_area_verified_parent_ids,
-                       whole_city, required_date, game_search_details, completed_at
+                       whole_city, required_date, game_search_details,
+                       number_of_players, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE telegram_user_id = %s
                 ORDER BY completed_at, completed_search_id
@@ -4744,7 +4748,10 @@ class PostgresRoleStore:
         """Load accepted projections and delegate deterministic evaluation."""
         if self._role is not RuntimeRole.RECOMMENDATION:
             raise ConversationAccessDeniedError
-        if completed_search.user_intent is not UserIntent.GAME_SEARCH:
+        if completed_search.user_intent not in {
+            UserIntent.GAME_SEARCH,
+            UserIntent.PLAYER_SEARCH,
+        }:
             return ()
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             rows = connection.execute(
@@ -4760,21 +4767,22 @@ class PostgresRoleStore:
                          opportunity_revision_id DESC
                 """
             ).fetchall()
-        return evaluate_game_search(
-            completed_search,
-            game_search_details,
-            tuple(
-                OpportunityRevisionProjection(
-                    opportunity_id=row["opportunity_id"],
-                    opportunity_revision_id=row["opportunity_revision_id"],
-                    opportunity_type=row["opportunity_type"],
-                    publication_state=row["publication_state"],
-                    accepted_facts=row["accepted_facts"],
-                    response_route=row["response_route"],
-                )
-                for row in rows
-            ),
+        projections = tuple(
+            OpportunityRevisionProjection(
+                opportunity_id=row["opportunity_id"],
+                opportunity_revision_id=row["opportunity_revision_id"],
+                opportunity_type=row["opportunity_type"],
+                publication_state=row["publication_state"],
+                accepted_facts=row["accepted_facts"],
+                response_route=row["response_route"],
+            )
+            for row in rows
         )
+        if completed_search.user_intent is UserIntent.PLAYER_SEARCH:
+            return evaluate_player_search(
+                completed_search, game_search_details, projections
+            )
+        return evaluate_game_search(completed_search, game_search_details, projections)
 
     def set_search_snapshot_hook(self, hook: Callable[[], None]) -> None:
         """Install one controlled hook after candidate snapshot selection."""
@@ -4878,21 +4886,29 @@ class PostgresRoleStore:
                 }
                 for row in opportunity_rows
             ]
-            results = evaluate_game_search(
-                completed_search,
-                dict(completed_search.game_search_details),
-                tuple(
-                    OpportunityRevisionProjection(
-                        opportunity_id=row[0],
-                        opportunity_revision_id=row[1],
-                        opportunity_type=row[2],
-                        publication_state=row[3],
-                        accepted_facts=row[4],
-                        response_route=row[5],
-                    )
-                    for row in opportunity_rows
-                ),
+            projections = tuple(
+                OpportunityRevisionProjection(
+                    opportunity_id=row[0],
+                    opportunity_revision_id=row[1],
+                    opportunity_type=row[2],
+                    publication_state=row[3],
+                    accepted_facts=row[4],
+                    response_route=row[5],
+                )
+                for row in opportunity_rows
             )
+            if completed_search.user_intent is UserIntent.PLAYER_SEARCH:
+                results = evaluate_player_search(
+                    completed_search,
+                    dict(completed_search.game_search_details),
+                    projections,
+                )
+            else:
+                results = evaluate_game_search(
+                    completed_search,
+                    dict(completed_search.game_search_details),
+                    projections,
+                )
             outgoing_payload = outgoing.payload
             if not isinstance(outgoing_payload, dict):
                 raise TypeError("SearchCompleted payload must be an object")
@@ -4908,10 +4924,11 @@ class PostgresRoleStore:
                     user_intent, country_id, city_id, sub_city_area_ids,
                     sub_city_area_geographic_types,
                     sub_city_area_verified_parent_ids, whole_city, required_date,
-                    game_search_details, opportunity_revision_inputs, completed_at
+                    game_search_details, opportunity_revision_inputs,
+                    number_of_players, completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s
+                    %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
                 )
                 """,
                 (
@@ -4928,6 +4945,7 @@ class PostgresRoleStore:
                     json.dumps(_required_date_json(completed_search.required_date)),
                     json.dumps(dict(completed_search.game_search_details)),
                     json.dumps(input_set),
+                    completed_search.number_of_players,
                     completed_search.completed_at,
                 ),
             )
@@ -5336,9 +5354,10 @@ class PostgresRoleStore:
                     SELECT telegram_user_id, stage, intent_branch, user_intent,
                            screen_revision, revision, last_activity_at,
                            country, city, sub_city_areas, whole_city, required_date,
-                           game_search_details, editing_game_search_detail,
+                           game_search_details, number_of_players,
+                           editing_game_search_detail,
                            game_search_detail_draft, game_search_exact_time_prompt,
-                           search_submission_update_id
+                           player_search_number_prompt, search_submission_update_id
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
                     """,
@@ -5371,9 +5390,11 @@ class PostgresRoleStore:
                 (key, tuple(values))
                 for key, values in sorted(row["game_search_details"].items())
             ),
+            number_of_players=row["number_of_players"],
             editing_game_search_detail=row["editing_game_search_detail"],
             game_search_detail_draft=tuple(row["game_search_detail_draft"]),
             game_search_exact_time_prompt=row["game_search_exact_time_prompt"],
+            player_search_number_prompt=row["player_search_number_prompt"],
             search_submission_update_id=row["search_submission_update_id"],
         )
 
@@ -5530,9 +5551,11 @@ class PostgresRoleStore:
                     draft.whole_city,
                     json.dumps(_required_date_json(draft.required_date)),
                     json.dumps(dict(draft.game_search_details)),
+                    draft.number_of_players,
                     draft.editing_game_search_detail,
                     json.dumps(draft.game_search_detail_draft),
                     draft.game_search_exact_time_prompt,
+                    draft.player_search_number_prompt,
                     recorded_at,
                 )
                 if draft.revision == 1:
@@ -5543,12 +5566,14 @@ class PostgresRoleStore:
                             screen_revision, revision, last_activity_at,
                             country, city, sub_city_areas, whole_city,
                             required_date, game_search_details,
+                            number_of_players,
                             editing_game_search_detail, game_search_detail_draft,
-                            game_search_exact_time_prompt, updated_at
+                            game_search_exact_time_prompt,
+                            player_search_number_prompt, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s,
                             %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb,
-                            %s::jsonb, %s, %s::jsonb, %s, %s
+                            %s::jsonb, %s, %s, %s::jsonb, %s, %s, %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -5571,9 +5596,11 @@ class PostgresRoleStore:
                             whole_city = %s,
                             required_date = %s::jsonb,
                             game_search_details = %s::jsonb,
+                            number_of_players = %s,
                             editing_game_search_detail = %s,
                             game_search_detail_draft = %s::jsonb,
                             game_search_exact_time_prompt = %s,
+                            player_search_number_prompt = %s,
                             updated_at = %s
                         WHERE telegram_user_id = %s AND revision = %s
                         RETURNING revision
@@ -6614,7 +6641,8 @@ class PostgresRoleStore:
                        user_intent, country_id, city_id, sub_city_area_ids,
                        sub_city_area_geographic_types,
                        sub_city_area_verified_parent_ids,
-                       whole_city, required_date, game_search_details, completed_at
+                       whole_city, required_date, game_search_details,
+                       number_of_players, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
                 """,
@@ -7260,6 +7288,7 @@ def _completed_search(row: dict[str, Any]) -> CompletedSearch:
             (key, tuple(values))
             for key, values in sorted(row["game_search_details"].items())
         ),
+        number_of_players=row["number_of_players"],
     )
 
 
