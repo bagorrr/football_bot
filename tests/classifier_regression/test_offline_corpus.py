@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import date, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -23,10 +24,13 @@ from modules.application import (
 from modules.classifier_contract import (
     PROPOSITION_EVIDENCE_VERSION,
     classifier_output_is_schema_valid,
+    semantic_proof_is_authoritative,
+    semantic_proof_is_schema_valid,
 )
 from modules.contracts import JsonValue
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
-from modules.testkit import ControlledModelAdapter
+from modules.responses_classification_adapter import ResponsesClassifierAdapter
+from modules.testkit import ControlledModelAdapter, semantic_proof_result_for
 
 
 def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
@@ -308,6 +312,348 @@ def test_player_release_replays_offline_with_offering_semantics() -> None:
             assert not candidates
         assert adapter.requests[-1].schema_version == "source-message-classification-v3"
         assert adapter.requests[-1].prompt_version == "player-match-primary-v1"
+
+
+def _player_evaluation_output(case: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """Materialize one reviewed fixture into the strict v3 wire contract."""
+    source = case["source"]
+    expected = cast(dict[str, JsonValue], case["expected"])
+    disposition = expected["disposition"]
+    reason_code = expected.get(
+        "reason_code",
+        "accepted" if disposition == "accepted" else disposition,
+    )
+    if disposition != "accepted":
+        return {
+            "schema_version": "source-message-classification-v3",
+            "disposition": disposition,
+            "candidates": [],
+            "routing": {
+                "reason_code": reason_code,
+                "required_context": "none",
+            },
+        }
+
+    fixture = cast(dict[str, JsonValue], case["fixture"])
+    evidence = dict(cast(dict[str, JsonValue], fixture["evidence"]))
+    candidate: dict[str, JsonValue] = {
+        "candidate_key": fixture["candidate_key"],
+        "opportunity_type": "player_match_availability",
+        "evidence": evidence,
+        "source_context": source,
+        "location": {
+            "mention": evidence["location"],
+            "place_id": "controlled:place",
+            "country_id": "controlled:country",
+            "city_id": "controlled:city",
+        },
+        "event_time": {
+            "start_local_date": evidence["event_time"],
+            "end_local_date": evidence["event_time"],
+            "iana_timezone": "Europe/Moscow",
+        },
+        "response_routes": [],
+    }
+    count = fixture.get("count")
+    if isinstance(count, dict):
+        count_kind = count.get("kind")
+        if count_kind == "exact":
+            value = count["value"]
+            candidate["available_player_count"] = value
+            evidence["available_player_count"] = f"{value} players"
+        elif count_kind == "range":
+            minimum = count["minimum"]
+            maximum = count["maximum"]
+            candidate["available_player_count_min"] = minimum
+            candidate["available_player_count_max"] = maximum
+            evidence["available_player_count_min"] = evidence["opportunity"]
+            evidence["available_player_count_max"] = evidence["opportunity"]
+        else:
+            raise AssertionError("unknown Player evaluation count kind")
+    route = fixture.get("route")
+    if isinstance(route, dict):
+        candidate["response_routes"] = [route]
+    return {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "candidates": [candidate],
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+    }
+
+
+def test_player_evaluation_contract_is_a_deterministic_promotion_gate() -> None:
+    """Replay the reviewed Player contract before any real-source promotion."""
+    contract_path = (
+        Path(__file__).parents[2]
+        / "classifier"
+        / "player-match-evaluation-v1"
+        / "contract.json"
+    )
+    contract = cast(
+        dict[str, JsonValue],
+        json.loads(contract_path.read_text(encoding="utf-8")),
+    )
+    assert contract["contract_version"] == "player-match-evaluation-v1"
+    assert contract["review_status"] == "reviewed"
+    assert contract["reviewed_on"] == "2026-08-25"
+    assert contract["reviewed_by_role"] == "product_owner_and_independent_reviewer"
+    promotion_gate = cast(dict[str, JsonValue], contract["promotion_gate"])
+    assert promotion_gate == {
+        "deterministic": True,
+        "required_replays": 3,
+        "max_failures": 0,
+        "adapter_kind": "controlled_recording",
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "proposal_only": True,
+        "real_source_publication_allowed": False,
+    }
+    required_families = set(cast(list[str], contract["required_case_families"]))
+    cases = cast(list[dict[str, JsonValue]], contract["cases"])
+    assert required_families <= {cast(str, case["family"]) for case in cases}
+    assert len({case["case_id"] for case in cases}) == len(cases)
+    assert len({case["source"] for case in cases}) == len(cases)
+
+    replay_digests: list[str] = []
+    replay_metrics: list[tuple[int, int, int]] = []
+    replay_count = cast(int, promotion_gate["required_replays"])
+    for replay_number in range(replay_count):
+        adapter = ControlledModelAdapter()
+        adapter.enable_primary_v3()
+        accepted_count = 0
+        proof_count = 0
+        case_digests: list[dict[str, JsonValue]] = []
+        for case in cases:
+            source = cast(str, case["source"])
+            output = _player_evaluation_output(case)
+            adapter.return_for(
+                body=source,
+                result=ClassifierAdapterResult(
+                    output=output,
+                    effective_model="gpt-5.6-sol",
+                    effective_reasoning_effort="high",
+                    codex_version="controlled-promotion-gate",
+                    adapter_kind="controlled_recording",
+                    adapter_version="player-match-evaluation-v1",
+                    duration_ms=0,
+                    input_tokens=0,
+                    output_tokens=0,
+                ),
+            )
+            request = ClassifierRequest(
+                source_message_revision_id=(
+                    f"player-evaluation:{replay_number}:{case['case_id']}"
+                ),
+                body=source,
+                source_event_time="2026-08-25T09:00:00+00:00",
+                context_bundle_version="primary-classifier-context-v1",
+                source_chat_reference="controlled:player-evaluation",
+                source_chat_timezone="Europe/Moscow",
+                source_chat_geography={"country_id": None, "city_id": None},
+                bounded_metadata={"message_language": None, "attachment_types": []},
+                eligible_reply_context=None,
+                requested_model="gpt-5.6-sol",
+                requested_reasoning_effort="high",
+                prompt_version="player-match-primary-v1",
+                schema_version="source-message-classification-v3",
+                glossary_version="football-opportunity-glossary-v1",
+                context_policy_version="classifier-context-v1",
+                routing_policy_version="classifier-routing-player-v1",
+            )
+            result = adapter.classify(request)
+            assert classifier_output_is_schema_valid(result.output, body=source)
+            expected = cast(dict[str, JsonValue], case["expected"])
+            candidates = result.output["candidates"]
+            assert isinstance(candidates, list)
+            assert result.output["disposition"] == expected["disposition"]
+            if expected.get("reason_code") is not None:
+                routing = cast(dict[str, JsonValue], result.output["routing"])
+                assert routing["reason_code"] == expected["reason_code"]
+            assert len(candidates) == expected["candidate_count"]
+            assert result.effective_model == "gpt-5.6-sol"
+            assert result.effective_reasoning_effort == "high"
+            if result.output["disposition"] == "accepted":
+                accepted_count += 1
+                assert len(candidates) == 1
+                candidate = cast(dict[str, JsonValue], candidates[0])
+                evidence = cast(dict[str, JsonValue], candidate["evidence"])
+                assert candidate["opportunity_type"] == "player_match_availability"
+                assert _optional_values_are_supported(candidate, evidence)
+                assert _player_availability_is_supported(
+                    candidate.get("available_player_count"),
+                    candidate.get("available_player_count_min"),
+                    candidate.get("available_player_count_max"),
+                    cast(str, evidence["opportunity"]),
+                    authoritative_body=source,
+                ) is bool(expected.get("application_supported"))
+                proof = semantic_proof_result_for(
+                    output=result.output,
+                    body=source,
+                    source_message_revision_reference=request.source_message_revision_id,
+                    proof_version="source-semantic-proof-v2",
+                ).output
+                routes = cast(list[JsonValue], candidate["response_routes"])
+                candidate_key = cast(str, candidate["candidate_key"])
+                assert semantic_proof_is_schema_valid(
+                    proof,
+                    body=source,
+                    source_message_revision_reference=request.source_message_revision_id,
+                    candidate_key=candidate_key,
+                    evidence=evidence,
+                    routes=routes,
+                    meaning="player_match_availability",
+                    proof_version="source-semantic-proof-v2",
+                )
+                assert semantic_proof_is_authoritative(
+                    proof,
+                    body=source,
+                    source_message_revision_reference=request.source_message_revision_id,
+                    candidate_key=candidate_key,
+                    evidence=evidence,
+                    routes=routes,
+                    meaning="player_match_availability",
+                    proof_version="source-semantic-proof-v2",
+                )
+                proof_count += 1
+                assert candidate["proposition_evidence"]
+            case_digests.append(result.output)
+        replay_metrics.append((accepted_count, proof_count, len(adapter.requests)))
+        replay_digests.append(
+            sha256(
+                json.dumps(
+                    case_digests,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+    assert len(set(replay_digests)) == 1
+    assert len(set(replay_metrics)) == 1
+    assert replay_metrics[0][0] >= 5
+    assert replay_metrics[0][1] == replay_metrics[0][0]
+    assert replay_metrics[0][2] == len(cases)
+
+
+def test_player_semantic_proof_provider_path_allows_unknown_quantity() -> None:
+    """The provider receives the conditional v2 schema and a 3-fact proof."""
+
+    class RecordingTransport:
+        def __init__(self, output: dict[str, JsonValue]) -> None:
+            self.output = output
+            self.payload: dict[str, object] | None = None
+
+        def create_response(
+            self, payload: dict[str, object], *, timeout_seconds: int
+        ) -> dict[str, object]:
+            self.payload = payload
+            return {
+                "output": self.output,
+                "effective_model": "gpt-5.6-sol",
+                "duration_ms": 0,
+            }
+
+    body = "We are available to play as a group in Moscow on 2026-09-17."
+    evidence: dict[str, JsonValue] = {
+        "opportunity": "We are available to play as a group",
+        "event_time": "2026-09-17",
+        "location": "Moscow",
+    }
+    primary_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "candidates": [
+            {
+                "candidate_key": "provider-unknown-player-count",
+                "opportunity_type": "player_match_availability",
+                "evidence": evidence,
+                "source_context": body,
+                "location": {
+                    "mention": "Moscow",
+                    "place_id": "controlled:place",
+                    "country_id": "controlled:country",
+                    "city_id": "controlled:city",
+                },
+                "event_time": {
+                    "start_local_date": "2026-09-17",
+                    "end_local_date": "2026-09-17",
+                    "iana_timezone": "Europe/Moscow",
+                },
+                "response_routes": [],
+            }
+        ],
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+    }
+    source_revision = "source:provider-player:revision:1"
+    proof = semantic_proof_result_for(
+        output=primary_output,
+        body=body,
+        source_message_revision_reference=source_revision,
+        proof_version="source-semantic-proof-v2",
+    ).output
+    transport = RecordingTransport(proof)
+    repository_root = Path(__file__).parents[2]
+    schema = json.loads(
+        (
+            repository_root
+            / "classifier"
+            / "player-match-semantic-proof-v1"
+            / "source-semantic-proof-v2.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    adapter = ResponsesClassifierAdapter(
+        transport=transport,
+        schemas={"source-semantic-proof-v2": schema},
+        prompt_paths={
+            "player-match-semantic-proof-v1": repository_root
+            / "classifier"
+            / "player-match-semantic-proof-v1"
+            / "prompt.md"
+        },
+        adapter_version="controlled-provider-path",
+    )
+    request = ClassifierRequest(
+        source_message_revision_id=source_revision,
+        body=body,
+        source_event_time="2026-08-25T09:00:00+00:00",
+        context_bundle_version="semantic-proof-context-v1",
+        source_chat_reference="controlled:provider-path",
+        source_chat_timezone="Europe/Moscow",
+        source_chat_geography={"country_id": None, "city_id": None},
+        bounded_metadata={"message_language": None, "attachment_types": []},
+        eligible_reply_context=None,
+        requested_model="gpt-5.6-sol",
+        requested_reasoning_effort="high",
+        prompt_version="player-match-semantic-proof-v1",
+        schema_version="source-semantic-proof-v2",
+        glossary_version="football-opportunity-glossary-v1",
+        context_policy_version="semantic-proof-context-v1",
+        routing_policy_version="classifier-routing-player-v1",
+        pass_kind="semantic_proof",
+        proof_candidate_key="provider-unknown-player-count",
+    )
+    result = adapter.semantic_proof(request)
+    assert transport.payload is not None
+    provider_schema = cast(
+        dict[str, JsonValue],
+        cast(dict[str, object], transport.payload["text"])["format"],
+    )["schema"]
+    assert isinstance(provider_schema, dict)
+    facts_schema = cast(dict[str, JsonValue], provider_schema["properties"])["facts"]
+    assert isinstance(facts_schema, dict)
+    assert facts_schema["minProperties"] == 3
+    assert facts_schema["required"] == ["opportunity", "event_time", "location"]
+    assert semantic_proof_is_schema_valid(
+        result.output,
+        body=body,
+        source_message_revision_reference=source_revision,
+        candidate_key="provider-unknown-player-count",
+        evidence=evidence,
+        routes=[],
+        meaning="player_match_availability",
+        proof_version="source-semantic-proof-v2",
+    )
 
 
 def test_v2_provider_schemas_match_strict_application_evidence_contract() -> None:

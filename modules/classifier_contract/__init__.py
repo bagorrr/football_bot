@@ -550,6 +550,17 @@ def proposition_evidence_is_schema_valid(
     facts = value.get("facts")
     if not isinstance(facts, dict) or set(facts) != set(evidence):
         return False
+    mandatory_fact_names = {"opportunity", "event_time", "location"}
+    if not mandatory_fact_names.issubset(facts):
+        return False
+    if meaning == "open_match":
+        if "open_places" not in facts or len(facts) < 4:
+            return False
+    elif meaning == "player_match_availability":
+        if "open_places" in facts or len(facts) < 3:
+            return False
+    else:
+        return False
     for fact_name, fact_value in facts.items():
         expected_text = evidence.get(fact_name)
         if not isinstance(expected_text, str) or not expected_text:

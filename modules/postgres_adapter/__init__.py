@@ -7369,40 +7369,60 @@ def runtime_database_url(
     )
 
 
+def _proposition_identity_parts(
+    *,
+    source_message_id: str,
+    opportunity_id: str,
+) -> tuple[str, str, str] | None:
+    """Parse one source-bound candidate or proposition identity."""
+    prefix = f"opportunity:{source_message_id}:"
+    if not opportunity_id.startswith(prefix):
+        return None
+    remainder = opportunity_id.removeprefix(prefix)
+    for identity_format in ("candidate", "proposition"):
+        marker = f":{identity_format}:"
+        if marker not in remainder:
+            continue
+        opportunity_type, identity_hash = remainder.split(marker, 1)
+        if opportunity_type not in {"open_match", "player_match_availability"}:
+            return None
+        if len(identity_hash) != 16 or any(
+            character not in "0123456789abcdef" for character in identity_hash
+        ):
+            return None
+        return opportunity_type, identity_format, identity_hash
+    return None
+
+
 def _legacy_candidate_opportunity_id(
     *,
     source_message_id: str,
     opportunity_id: str,
     canonical_opportunity_id: str | None = None,
 ) -> str | None:
-    """Map one legacy v4 candidate identity to its canonical proposition id."""
-    prefix = f"opportunity:{source_message_id}:"
-    if not opportunity_id.startswith(prefix) or ":candidate:" not in opportunity_id:
-        return None
-    legacy_type, candidate_hash = opportunity_id.removeprefix(prefix).split(
-        ":candidate:", 1
+    """Map one historical lineage identity to its canonical proposition id.
+
+    The identity slot is authoritative during a type reclassification.  A
+    previous canonical proposition id is therefore a valid legacy alias too;
+    it must not be rejected merely because its type marker or hash differs from
+    the newly classified target.
+    """
+    legacy_parts = _proposition_identity_parts(
+        source_message_id=source_message_id,
+        opportunity_id=opportunity_id,
     )
-    if legacy_type not in {"open_match", "player_match_availability"}:
+    if legacy_parts is None:
         return None
-    if len(candidate_hash) != 16 or any(
-        character not in "0123456789abcdef" for character in candidate_hash
-    ):
-        return None
-    canonical_type = legacy_type
+    legacy_type, _, candidate_hash = legacy_parts
     if canonical_opportunity_id is not None:
-        canonical_prefix = f"opportunity:{source_message_id}:"
-        if (
-            canonical_opportunity_id.startswith(canonical_prefix)
-            and ":proposition:" in canonical_opportunity_id
-        ):
-            canonical_type = canonical_opportunity_id.removeprefix(
-                canonical_prefix
-            ).split(":proposition:", 1)[0]
-    if canonical_type not in {"open_match", "player_match_availability"}:
-        return None
-    return (
-        f"opportunity:{source_message_id}:{canonical_type}:proposition:{candidate_hash}"
-    )
+        canonical_parts = _proposition_identity_parts(
+            source_message_id=source_message_id,
+            opportunity_id=canonical_opportunity_id,
+        )
+        if canonical_parts is None or canonical_parts[1] != "proposition":
+            return None
+        return canonical_opportunity_id
+    return f"opportunity:{source_message_id}:{legacy_type}:proposition:{candidate_hash}"
 
 
 def _ensure_application_proposition_identity_mapping(
@@ -7424,6 +7444,17 @@ def _ensure_application_proposition_identity_mapping(
         """,
         (source_message_id, proposition_slot),
     ).fetchone()
+    requested_mapping = connection.execute(
+        """
+        SELECT canonical_opportunity_id
+        FROM football_runtime.application_legacy_proposition_identity_compatibility
+        WHERE source_message_id = %s AND legacy_opportunity_id = %s
+        """,
+        (source_message_id, opportunity_id),
+    ).fetchone()
+    canonical_opportunity_id = (
+        requested_mapping[0] if requested_mapping is not None else opportunity_id
+    )
     canonical_identity = connection.execute(
         """
         SELECT source_message_id, proposition_slot
@@ -7431,7 +7462,7 @@ def _ensure_application_proposition_identity_mapping(
         WHERE opportunity_id = %s
         FOR UPDATE
         """,
-        (opportunity_id,),
+        (canonical_opportunity_id,),
     ).fetchone()
     if canonical_identity is not None and canonical_identity != (
         source_message_id,
@@ -7444,25 +7475,38 @@ def _ensure_application_proposition_identity_mapping(
         FROM football_runtime.application_legacy_proposition_identity_compatibility
         WHERE canonical_opportunity_id = %s
         """,
-        (opportunity_id,),
+        (canonical_opportunity_id,),
     ).fetchone()
-    if canonical_owner is not None:
-        expected_aliases = _legacy_candidate_aliases_for_canonical(
+    if canonical_owner is not None and (
+        not _legacy_identity_alias_is_compatible(
             source_message_id=source_message_id,
-            opportunity_id=opportunity_id,
+            legacy_opportunity_id=canonical_owner[0],
+            canonical_opportunity_id=canonical_opportunity_id,
         )
-        if canonical_owner[0] not in expected_aliases or (
-            existing is not None and canonical_owner[0] != existing[0]
-        ):
-            raise RuntimeError("Application legacy proposition identity collides")
-    if existing is not None and existing[0] != opportunity_id:
+        or (existing is not None and canonical_owner[0] != existing[0])
+    ):
+        raise RuntimeError("Application legacy proposition identity collides")
+    if existing is not None and existing[0] != canonical_opportunity_id:
         legacy_opportunity_id = existing[0]
+        existing_mapping = connection.execute(
+            """
+            SELECT canonical_opportunity_id
+            FROM football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s AND legacy_opportunity_id = %s
+            """,
+            (source_message_id, legacy_opportunity_id),
+        ).fetchone()
+        if (
+            existing_mapping is not None
+            and existing_mapping[0] != canonical_opportunity_id
+        ):
+            raise RuntimeError("Application proposition identity mapping changed")
         expected_canonical_id = _legacy_candidate_opportunity_id(
             source_message_id=source_message_id,
             opportunity_id=legacy_opportunity_id,
-            canonical_opportunity_id=opportunity_id,
+            canonical_opportunity_id=canonical_opportunity_id,
         )
-        if expected_canonical_id != opportunity_id:
+        if expected_canonical_id != canonical_opportunity_id:
             raise RuntimeError("Application proposition identity mapping changed")
         connection.execute(
             """
@@ -7476,7 +7520,7 @@ def _ensure_application_proposition_identity_mapping(
             (
                 source_message_id,
                 legacy_opportunity_id,
-                opportunity_id,
+                canonical_opportunity_id,
                 created_at,
             ),
         )
@@ -7492,7 +7536,7 @@ def _ensure_application_proposition_identity_mapping(
         (
             source_message_id,
             proposition_slot,
-            opportunity_id,
+            canonical_opportunity_id,
             proposition_discriminator,
             created_at,
         ),
@@ -7511,7 +7555,10 @@ def _ensure_application_proposition_identity_mapping(
         """,
         (source_message_id, proposition_slot),
     ).fetchone()
-    if mapped_opportunity_id is None or mapped_opportunity_id[0] != opportunity_id:
+    if (
+        mapped_opportunity_id is None
+        or mapped_opportunity_id[0] != canonical_opportunity_id
+    ):
         raise RuntimeError("Application proposition identity mapping changed")
 
 
@@ -7556,6 +7603,35 @@ def _legacy_candidate_aliases_for_canonical(
     return (
         canonical_alias,
         f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}",
+    )
+
+
+def _legacy_identity_alias_is_compatible(
+    *,
+    source_message_id: str,
+    legacy_opportunity_id: str,
+    canonical_opportunity_id: str,
+) -> bool:
+    """Accept historical candidate and cross-type proposition aliases."""
+    expected_aliases = _legacy_candidate_aliases_for_canonical(
+        source_message_id=source_message_id,
+        opportunity_id=canonical_opportunity_id,
+    )
+    if legacy_opportunity_id in expected_aliases:
+        return True
+    legacy_parts = _proposition_identity_parts(
+        source_message_id=source_message_id,
+        opportunity_id=legacy_opportunity_id,
+    )
+    canonical_parts = _proposition_identity_parts(
+        source_message_id=source_message_id,
+        opportunity_id=canonical_opportunity_id,
+    )
+    return (
+        legacy_parts is not None
+        and canonical_parts is not None
+        and legacy_parts[1] == "proposition"
+        and canonical_parts[1] == "proposition"
     )
 
 
@@ -7604,11 +7680,11 @@ def _suppress_source_event_opportunities(
     ).fetchall()
     aliases_by_canonical: dict[str, tuple[str, ...]] = {}
     for legacy_opportunity_id, canonical_opportunity_id in compatibility_rows:
-        expected_aliases = _legacy_candidate_aliases_for_canonical(
+        if not _legacy_identity_alias_is_compatible(
             source_message_id=incoming.subject_id,
-            opportunity_id=canonical_opportunity_id,
-        )
-        if legacy_opportunity_id not in expected_aliases:
+            legacy_opportunity_id=legacy_opportunity_id,
+            canonical_opportunity_id=canonical_opportunity_id,
+        ):
             raise RuntimeError("Application proposition identity mapping is ambiguous")
         existing_aliases = aliases_by_canonical.get(canonical_opportunity_id, ())
         if existing_aliases and existing_aliases != (legacy_opportunity_id,):

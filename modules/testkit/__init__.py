@@ -1269,21 +1269,24 @@ def semantic_proof_result_for(
     *,
     output: dict[str, JsonValue],
     body: str,
+    source_message_revision_reference: str = "controlled-revision-reference",
     root_state: str = "current_positive",
     fact_state: str = "current_positive",
     route_state: str = "current_positive",
     check_state: str = "none",
+    proof_version: str = "source-semantic-proof-v1",
 ) -> ClassifierAdapterResult:
     """Return a proof adapter result for adversarial controlled tests."""
     return ClassifierAdapterResult(
         output=_build_test_semantic_proof(
             output,
             body=body,
-            source_message_revision_reference="controlled-revision-reference",
+            source_message_revision_reference=source_message_revision_reference,
             root_state=root_state,
             fact_state=fact_state,
             route_state=route_state,
             check_state=check_state,
+            proof_version=proof_version,
         ),
         effective_model="gpt-5.6-sol",
         effective_reasoning_effort="high",

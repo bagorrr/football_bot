@@ -11,7 +11,11 @@ from modules.application import (
     _body_establishes_current_open_match,
     _proposition_evidence_is_authoritative,
 )
-from modules.classifier_contract import proposition_evidence_is_schema_valid
+from modules.classifier_contract import (
+    proposition_evidence_is_schema_valid,
+    semantic_proof_is_authoritative,
+    semantic_proof_is_schema_valid,
+)
 from modules.contracts import JsonValue
 from modules.testkit import semantic_proof_result_for
 
@@ -822,3 +826,50 @@ def test_application_semantic_proof_accepts_valid_counterparts() -> None:
             evidence=evidence,
             routes=routes,
         )
+
+
+def test_player_semantic_proof_accepts_three_mandatory_facts() -> None:
+    body = "We are available to play in Moscow on 2026-09-01."
+    evidence = {
+        "opportunity": "We are available to play",
+        "event_time": "2026-09-01",
+        "location": "Moscow",
+    }
+    routes: list[dict[str, str]] = []
+    output = {
+        "candidates": [
+            {
+                "candidate_key": "player-unknown",
+                "opportunity_type": "player_match_availability",
+                "evidence": cast(JsonValue, evidence),
+                "response_routes": cast(JsonValue, routes),
+            }
+        ]
+    }
+    semantic_proof = semantic_proof_result_for(
+        output=cast(dict[str, JsonValue], output),
+        body=body,
+        source_message_revision_reference="source:player:revision:1",
+        proof_version="source-semantic-proof-v2",
+    ).output
+
+    assert semantic_proof_is_schema_valid(
+        semantic_proof,
+        body=body,
+        source_message_revision_reference="source:player:revision:1",
+        candidate_key="player-unknown",
+        evidence=cast(dict[str, JsonValue], evidence),
+        routes=[],
+        meaning="player_match_availability",
+        proof_version="source-semantic-proof-v2",
+    )
+    assert semantic_proof_is_authoritative(
+        semantic_proof,
+        body=body,
+        source_message_revision_reference="source:player:revision:1",
+        candidate_key="player-unknown",
+        evidence=cast(dict[str, JsonValue], evidence),
+        routes=[],
+        meaning="player_match_availability",
+        proof_version="source-semantic-proof-v2",
+    )

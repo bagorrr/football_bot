@@ -52,6 +52,9 @@ def test_player_artifacts_are_a_distinct_versioned_release() -> None:
     provenance = json.loads(
         (root / "player-match-primary-v1" / "provenance.json").read_text()
     )
+    evaluation_contract = json.loads(
+        (root / "player-match-evaluation-v1" / "contract.json").read_text()
+    )
     assert player_schema["$id"] == "source-message-classification-v3"
     assert player_schema["$defs"]["acceptedCandidate"]["properties"][
         "opportunity_type"
@@ -59,6 +62,9 @@ def test_player_artifacts_are_a_distinct_versioned_release() -> None:
     assert provenance["requested_model"] == "gpt-5.6-sol"
     assert provenance["requested_reasoning_effort"] == "high"
     assert provenance["routing_policy_version"] == "classifier-routing-player-v1"
+    assert provenance["evaluation_contract_version"] == "player-match-evaluation-v1"
+    assert evaluation_contract["review_status"] == "reviewed"
+    assert evaluation_contract["promotion_gate"]["proposal_only"] is True
 
 
 def test_old_recorded_schema_id_does_not_replay_as_player_behavior() -> None:

@@ -23,7 +23,10 @@ from modules.domain import (
     empty_bounded_source_metadata,
 )
 from modules.ports import ClassifierAdapterResult
-from modules.postgres_adapter import PostgresAcceptanceMigrator
+from modules.postgres_adapter import (
+    PostgresAcceptanceMigrator,
+    _ensure_application_proposition_identity_mapping,
+)
 from modules.testkit import (
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
@@ -2078,3 +2081,68 @@ def test_migrate_rejects_history_without_runtime_schema(
 
     assert runtime_schema == (None,)
     assert preserved_history == expected_migrations
+
+
+def test_application_identity_mapping_is_idempotent_across_type_reclassification(
+    fresh_database_url: str,
+) -> None:
+    """A durable slot may change target type without forking its identity."""
+    PostgresAcceptanceMigrator(fresh_database_url).migrate()
+    recorded_at = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    source_message_id = "source-chat:player-reclassification:message:1"
+    open_match_id = (
+        f"opportunity:{source_message_id}:open_match:proposition:0123456789abcdef"
+    )
+    player_match_id = (
+        f"opportunity:{source_message_id}:player_match_availability:proposition:"
+        "fedcba9876543210"
+    )
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_proposition_identities (
+                source_message_id, proposition_slot, opportunity_id,
+                proposition_discriminator, created_at
+            ) VALUES (%s, 1, %s, %s, %s)
+            """,
+            (source_message_id, open_match_id, "open-lineage", recorded_at),
+        )
+
+        for requested_id in (player_match_id, player_match_id, open_match_id):
+            _ensure_application_proposition_identity_mapping(
+                connection,
+                source_message_id=source_message_id,
+                proposition_slot=1,
+                opportunity_id=requested_id,
+                proposition_discriminator="reclassified-lineage",
+                created_at=recorded_at,
+            )
+
+        mapping = connection.execute(
+            """
+            SELECT identity.opportunity_id,
+                   COALESCE(compatibility.canonical_opportunity_id,
+                            identity.opportunity_id),
+                   identity.proposition_discriminator
+            FROM football_runtime.application_proposition_identities AS identity
+            LEFT JOIN
+                football_runtime.application_legacy_proposition_identity_compatibility
+                AS compatibility
+              ON compatibility.legacy_opportunity_id = identity.opportunity_id
+            WHERE identity.source_message_id = %s
+              AND identity.proposition_slot = 1
+            """,
+            (source_message_id,),
+        ).fetchone()
+        aliases = connection.execute(
+            """
+            SELECT legacy_opportunity_id, canonical_opportunity_id
+            FROM football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s
+            """,
+            (source_message_id,),
+        ).fetchall()
+
+    assert mapping == (open_match_id, player_match_id, "reclassified-lineage")
+    assert aliases == [(open_match_id, player_match_id)]

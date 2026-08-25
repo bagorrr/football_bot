@@ -5945,11 +5945,11 @@ def _player_search_number_message(
     screen_revision: int,
 ) -> TelegramMessage:
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
-    prompt, back_label = {
-        "en": ("Send one whole number greater than zero.", "⬅️ Back"),
-        "ru": ("Отправьте одно целое число больше нуля.", "⬅️ Назад"),
-        "es": ("Envía un número entero mayor que cero.", "⬅️ Atrás"),
-        "fr": ("Envoyez un nombre entier supérieur à zéro.", "⬅️ Retour"),
+    prompt, any_label, back_label = {
+        "en": ("Send one whole number greater than zero.", "Any", "⬅️ Back"),
+        "ru": ("Отправьте одно целое число больше нуля.", "Неважно", "⬅️ Назад"),
+        "es": ("Envía un número entero mayor que cero.", "Cualquiera", "⬅️ Atrás"),
+        "fr": ("Envoyez un nombre entier supérieur à zéro.", "Peu importe", "⬅️ Retour"),
     }[copy_locale]
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
@@ -5957,7 +5957,10 @@ def _player_search_number_message(
         display_locale=locale,
         screen_revision=screen_revision,
         text=f"{_PLAYER_SEARCH_DETAIL_HEADINGS[copy_locale]['number_of_players']}\n\n{prompt}",
-        button_rows=(((back_label, f"details:back:{screen_revision}"),),),
+        button_rows=(
+            ((any_label, f"details:number:any:{screen_revision}"),),
+            ((back_label, f"details:back:{screen_revision}"),),
+        ),
     )
 
 
@@ -12749,9 +12752,10 @@ def _proposition_lineage_features(
         or not isinstance(response_route, dict)
     ):
         raise ValueError("proposition lineage target is incomplete")
-    features: dict[str, JsonValue] = {
-        "opportunity_type": value.get("opportunity_type"),
-    }
+    # Opportunity type is a publication interpretation, not a proposition
+    # identity discriminator.  A reclassification of one source proposition
+    # between Open Match and Player availability must retain its lineage.
+    features: dict[str, JsonValue] = {}
     for key in _PROPOSITION_LINEAGE_FACT_KEYS:
         features[f"fact:{key}"] = accepted_facts.get(key)
     if value.get("opportunity_type") == "player_match_availability":
@@ -12873,12 +12877,7 @@ def _canonicalize_legacy_proposition_records(
             stored_type, proposition_hash = opportunity_id.removeprefix(
                 canonical_prefix
             ).split(":proposition:", 1)
-            record_type = record.get("opportunity_type")
-            canonical_type = (
-                record_type
-                if record_type in {"open_match", "player_match_availability"}
-                else stored_type
-            )
+            canonical_type = stored_type
             if (
                 canonical_type not in {"open_match", "player_match_availability"}
                 or len(proposition_hash) != 16
@@ -13000,10 +12999,6 @@ def _reconcile_proposition_lineages(
     def score(candidate_index: int, record_index: int) -> int:
         candidate_values = candidate_features[candidate_index]
         record_values = record_features[record_index]
-        if candidate_values.get("opportunity_type") != record_values.get(
-            "opportunity_type"
-        ):
-            return -1
         return sum(
             candidate_values[key] == record_values[key]
             for key in candidate_values.keys() & record_values.keys()
@@ -15429,8 +15424,8 @@ def _player_availability_is_supported(
     )
     range_patterns = (
         re.compile(
-            r"(?<![\d-])(?P<minimum>\d{1,2})\s*[-–—]\s*"
-            r"(?P<maximum>\d{1,2})(?![\d-])"
+            r"(?<![\d-])(?P<minimum>\d+)\s*[-–—]\s*"
+            r"(?P<maximum>\d+)(?![\d-])"
         ),
         re.compile(
             r"(?<!\d)(?P<minimum>\d+)\s+(?:to|through)\s+"
@@ -15440,6 +15435,8 @@ def _player_availability_is_supported(
         re.compile(r"\bfrom\s+(?P<minimum>\d+)\s+to\s+(?P<maximum>\d+)\b"),
         re.compile(r"\bот\s+(?P<minimum>\d+)\s+до\s+(?P<maximum>\d+)\b"),
         re.compile(r"\bde\s+(?P<minimum>\d+)\s+(?:a|à)\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bentre\s+(?P<minimum>\d+)\s+y\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bentre\s+(?P<minimum>\d+)\s+et\s+(?P<maximum>\d+)\b"),
     )
     clauses = tuple(
         clause.strip()
@@ -15454,43 +15451,81 @@ def _player_availability_is_supported(
             and offering_language.search(clause) is not None
         )
 
+    quantity_clauses: list[tuple[tuple[tuple[int, int], ...], tuple[int, ...]]] = []
+    offering_clauses: list[tuple[tuple[tuple[int, int], ...], tuple[int, ...]]] = []
     for clause in clauses:
-        if not clause_offers_players(clause):
-            continue
-        ranges = list(
-            dict.fromkeys(
-                (int(match.group("minimum")), int(match.group("maximum")))
-                for pattern in range_patterns
-                for match in pattern.finditer(clause)
+        ranges_with_spans = [
+            (
+                (int(match.group("minimum")), int(match.group("maximum"))),
+                match.span(),
             )
-        )
-        if len(ranges) > 1:
-            continue
-        player_count_matches = [
+            for pattern in range_patterns
+            for match in pattern.finditer(clause)
+        ]
+        ranges = tuple(dict.fromkeys(pair for pair, _ in ranges_with_spans))
+        exact_matches = tuple(
             int(match.group(1))
             for match in re.finditer(
                 r"(?<!\d)(\d+)(?!\d)\s+"
                 r"(?:players?|игрок\w*|jugadores?|joueurs?)\b",
                 clause,
             )
-        ]
-        if exact is not None:
-            if ranges or player_count_matches != [exact]:
-                continue
-            return True
-        if minimum is not None and maximum is not None:
-            if ranges == [(minimum, maximum)]:
-                return True
-            continue
-        if not ranges and not player_count_matches:
-            return True
-    return False
+            if not any(
+                range_start < match.end() and match.start() < range_end
+                for _, (range_start, range_end) in ranges_with_spans
+            )
+        )
+        if ranges or exact_matches:
+            quantity = (ranges, exact_matches)
+            quantity_clauses.append(quantity)
+            if clause_offers_players(clause):
+                offering_clauses.append(quantity)
+
+    # A source revision may contain several football sentences, but one
+    # published Player proposition must not combine quantity claims from them.
+    # Reject contradictory exact/range evidence even when punctuation splits the
+    # claims into separate clauses.
+    if any(ranges and exact_matches for ranges, exact_matches in quantity_clauses):
+        return False
+    if len(offering_clauses) > 1:
+        return False
+
+    if exact is not None:
+        return offering_clauses == [((), (exact,))]
+    if minimum is not None and maximum is not None:
+        return offering_clauses == [(((minimum, maximum),), ())]
+    return bool(offering_clauses) or (
+        not quantity_clauses
+        and any(clause_offers_players(clause) for clause in clauses)
+    )
 
 
 def _source_player_opening_state(body: str) -> PropositionState:
     """Classify the bounded current/closed state of a player opening."""
     normalized = re.sub(r"['’]", " ", body.casefold())
     if _body_has_terminal_retraction(normalized):
+        return PropositionState.WITHDRAWN
+    negative_availability_patterns = (
+        r"\b(?:unavailable|not\s+available|not\s+free\s+to\s+play|"
+        r"not\s+ready\s+to\s+play)\b",
+        r"\b(?:no|zero)\s+(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
+        r"\b(?:available|free\s+to\s+play|ready\s+to\s+play|can\s+play)\b",
+        r"\b(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
+        r"\b(?:are|is|we\s+are|we\s+re)\s+not\s+"
+        r"(?:available|free\s+to\s+play|ready\s+to\s+play)\b",
+        r"\b(?:недоступн\w*|не\s+доступн\w*|не\s+готов\w*|"
+        r"не\s+могут\s+играть|нет\s+(?:игрок\w*|групп\w*))\b",
+        r"\b(?:indisponible\w*|no\s+(?:estamos|están|son|pueden)\s+"
+        r"disponible\w*|no\s+disponible\w*|ningún\w*\s+"
+        r"(?:jugador\w*|grupo)|no\s+hay\s+(?:jugador\w*))\b",
+        r"\b(?:indisponible\w*|ne\s+(?:sommes|sont|peuvent)\s+pas\s+"
+        r"disponible\w*|pas\s+disponible\w*|aucun\w*\s+"
+        r"(?:joueur\w*|groupe))\b",
+    )
+    if any(
+        re.search(pattern, normalized) is not None
+        for pattern in negative_availability_patterns
+    ):
         return PropositionState.WITHDRAWN
     closure_patterns = (
         r"\bvacanc(?:y|ies)\b[^.!?;\n]{0,40}"

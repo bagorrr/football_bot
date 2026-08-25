@@ -28,6 +28,23 @@ def _player_target(opportunity_id: str) -> dict[str, JsonValue]:
     }
 
 
+def _open_match_target(opportunity_id: str) -> dict[str, JsonValue]:
+    return {
+        "opportunity_id": opportunity_id,
+        "opportunity_type": "open_match",
+        "accepted_facts": {
+            "start_local_date": "2026-08-20",
+            "open_places": 1,
+        },
+        "evidence": {
+            "opportunity": "Football match on 20 August",
+            "event_time": "20 August 2026",
+            "location": "in Moscow",
+        },
+        "response_route": {"kind": "explicit_telegram_username", "value": "@players"},
+    }
+
+
 def test_legacy_player_alias_is_canonicalized_without_losing_player_type() -> None:
     legacy_id = f"opportunity:{SOURCE_MESSAGE_ID}:open_match:candidate:{LEGACY_HASH}"
     records = _canonicalize_legacy_proposition_records(
@@ -71,3 +88,50 @@ def test_player_canonical_identity_has_a_durable_legacy_alias() -> None:
         f"opportunity:{SOURCE_MESSAGE_ID}:player_match_availability:candidate:"
         f"{LEGACY_HASH}"
     )
+
+
+def test_open_match_and_player_reclassification_reuse_one_canonical_identity() -> None:
+    open_id = f"opportunity:{SOURCE_MESSAGE_ID}:open_match:proposition:aaaaaaaaaaaaaaaa"
+    player_candidate = _player_target("candidate:player-reclassified")
+    assignments = _reconcile_proposition_lineages(
+        source_message_id=SOURCE_MESSAGE_ID,
+        candidates=(player_candidate,),
+        persisted_records=(_open_match_target(open_id),),
+    )
+
+    assert assignments is not None
+    assert assignments[0][1] == open_id
+
+
+def test_player_and_open_match_replay_is_reversible_without_forking_identity() -> None:
+    player_id = (
+        f"opportunity:{SOURCE_MESSAGE_ID}:player_match_availability:proposition:"
+        "bbbbbbbbbbbbbbbb"
+    )
+    open_candidate = _open_match_target("candidate:open-reclassified")
+    assignments = _reconcile_proposition_lineages(
+        source_message_id=SOURCE_MESSAGE_ID,
+        candidates=(open_candidate,),
+        persisted_records=(_player_target(player_id),),
+    )
+
+    assert assignments is not None
+    assert assignments[0][1] == player_id
+
+
+def test_canonical_proposition_type_is_not_rewritten_from_latest_record_type() -> None:
+    canonical_open_id = (
+        f"opportunity:{SOURCE_MESSAGE_ID}:open_match:proposition:cccccccccccccccc"
+    )
+    records = _canonicalize_legacy_proposition_records(
+        source_message_id=SOURCE_MESSAGE_ID,
+        persisted_records=(
+            {
+                **_player_target(canonical_open_id),
+                "opportunity_type": "player_match_availability",
+            },
+        ),
+    )
+
+    assert records is not None
+    assert records[0]["opportunity_id"] == canonical_open_id

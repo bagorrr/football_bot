@@ -15,7 +15,8 @@
     "root": {"$ref": "#/$defs/root"},
     "facts": {
       "type": "object",
-      "minProperties": 4,
+      "minProperties": 3,
+      "required": ["opportunity", "event_time", "location"],
       "additionalProperties": {"$ref": "#/$defs/assertion"}
     },
     "routes": {
@@ -40,6 +41,47 @@
       "items": {"$ref": "#/$defs/relation"}
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "root": {
+            "properties": {
+              "meaning": {"const": "open_match"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "facts": {
+            "minProperties": 4,
+            "required": ["opportunity", "event_time", "location", "open_places"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "root": {
+            "properties": {
+              "meaning": {"const": "player_match_availability"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "facts": {
+            "minProperties": 3,
+            "required": ["opportunity", "event_time", "location"],
+            "not": {"required": ["open_places"]}
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "span": {
       "type": "object",

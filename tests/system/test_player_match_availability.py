@@ -371,6 +371,56 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
     assert "⚽ Disponibilidad de jugadores" in spanish_exact_card.text
     assert "4 jugadores disponibles" in spanish_exact_card.text
 
+    _advance_to_player_search_details(
+        system,
+        bot_user_id=49_536,
+    )
+    system.open_player_search_detail(
+        update_id="number:clear-player-user:49536",
+        telegram_user_id=49_536,
+        detail_key="number_of_players",
+    )
+    prompt_draft = system.discovery_draft(49_536)
+    assert prompt_draft is not None
+    prompt_message = telegram_delivery.messages[-1]
+    assert prompt_message.button_rows[0] == (
+        ("Any", f"details:number:any:{prompt_draft.screen_revision}"),
+    )
+
+    system.clear_player_search_number(
+        update_id="number:clear:49536",
+        telegram_user_id=49_536,
+    )
+    cleared_draft = system.discovery_draft(49_536)
+    assert cleared_draft is not None
+    assert cleared_draft.number_of_players is None
+    assert not cleared_draft.player_search_number_prompt
+
+    system.open_player_search_detail(
+        update_id="number:reopen:49536",
+        telegram_user_id=49_536,
+        detail_key="number_of_players",
+    )
+    reopened_draft = system.discovery_draft(49_536)
+    assert reopened_draft is not None
+    assert reopened_draft.player_search_number_prompt
+    assert telegram_delivery.messages[-1].button_rows[0][0][0] == "Any"
+    system.clear_player_search_number(
+        update_id="number:clear-after-reopen:49536",
+        telegram_user_id=49_536,
+    )
+    system.submit_search(
+        update_id="submit:unconstrained-player-user:49536",
+        telegram_user_id=49_536,
+    )
+    system.process_searches_until_idle()
+    unconstrained_search = system.completed_searches(49_536)[0]
+    assert unconstrained_search.number_of_players is None
+    assert all(
+        result.result_class == "confirmed_match"
+        for result in system.results(unconstrained_search.completed_search_id)
+    )
+
 
 def _register_source_chat(
     system: AcceptanceSpine,
