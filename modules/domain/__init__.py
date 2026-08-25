@@ -932,6 +932,7 @@ class CompletedSearch:
     game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
+    number_of_players: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1088,6 +1089,241 @@ def evaluate_game_search(
             )
         )
     matched.sort(key=game_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
+
+
+def player_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, int, str, int, str, int, str]:
+    """Return the complete deterministic Player Search ordering key."""
+    facts = dict(result.card_facts)
+    contribution = int(facts.get("player_contribution_count", "0"))
+    canonical_local_time = facts.get("exact_local_time")
+    time_is_unknown = canonical_local_time is None and not facts.get("day_part")
+    if canonical_local_time is None:
+        canonical_local_time = {
+            "morning": "06:00",
+            "daytime": "12:00",
+            "evening": "18:00",
+            "night": "22:00",
+        }.get(facts.get("day_part") or "", "23:59")
+    return (
+        {
+            "confirmed_match": 0,
+            "partial_result": 1,
+            "possible_match": 2,
+        }.get(result.result_class, 3),
+        -contribution,
+        int(facts.get("unknown_criterion_count", "0")),
+        facts.get("sort_local_date", facts["start_local_date"]),
+        1 if time_is_unknown else 0,
+        canonical_local_time,
+        -int(facts.get("location_specificity", "0")),
+        facts["opportunity_id"],
+    )
+
+
+def _player_count_facts(
+    facts: Mapping[str, Any],
+) -> tuple[int | None, int | None, int | None]:
+    """Read one exact or ranged accepted Player availability count."""
+    exact = facts.get("available_player_count")
+    if isinstance(exact, int) and not isinstance(exact, bool) and exact > 0:
+        return exact, None, None
+    minimum = facts.get("available_player_count_min")
+    maximum = facts.get("available_player_count_max")
+    if (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and maximum >= minimum
+    ):
+        return None, minimum, maximum
+    return None, None, None
+
+
+def evaluate_player_search(
+    completed_search: CompletedSearch,
+    player_search_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Purely classify and order one Player Search input set.
+
+    Each accepted Player Match Availability projection is evaluated as one
+    independent contribution. The matcher never allocates, combines, or
+    reserves Players from separate projections.
+    """
+    if completed_search.user_intent is not UserIntent.PLAYER_SEARCH:
+        return ()
+    matched: list[SearchResult] = []
+    for opportunity in opportunities:
+        if (
+            opportunity.publication_state != "active"
+            or opportunity.opportunity_type != "player_match_availability"
+        ):
+            continue
+        facts = opportunity.accepted_facts
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+        ):
+            continue
+        try:
+            start = date.fromisoformat(str(facts["start_local_date"]))
+            end = date.fromisoformat(str(facts["end_local_date"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        required = completed_search.required_date
+        if required is not None and (
+            end < required.start_local_date or start > required.end_local_date
+        ):
+            continue
+        detail_state_by_key = {
+            key: match_detail(
+                player_search_details.get(key, ()),
+                tuple(facts[key]) if facts.get(key) else None,
+            )
+            for key in (
+                "team_formats",
+                "positions",
+                "playing_levels",
+                "venue_settings",
+                "playing_surfaces",
+            )
+        }
+        detail_state_by_key.update(
+            payment=match_detail(
+                player_search_details.get("payment", ()),
+                (str(facts["payment"]),) if facts.get("payment") else None,
+            ),
+            times=match_time_detail(
+                player_search_details.get("times", ()),
+                str(facts["exact_local_time"])
+                if facts.get("exact_local_time")
+                else None,
+                str(facts["day_part"]) if facts.get("day_part") else None,
+            ),
+            search_area=match_search_area(
+                whole_city=completed_search.whole_city,
+                selected_area_ids=completed_search.sub_city_area_ids,
+                selected_area_types=completed_search.sub_city_area_geographic_types,
+                selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+                country_id=completed_search.country_id,
+                city_id=completed_search.city_id,
+                facts=facts,
+            ),
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+
+        exact_count, minimum_count, maximum_count = _player_count_facts(facts)
+        requested_count = completed_search.number_of_players
+        contribution_count = 0
+        if requested_count is not None:
+            if exact_count is not None:
+                contribution_count = exact_count
+                quantity_state = MatchState.CONFIRMED
+                quantity_class = (
+                    "confirmed_match"
+                    if exact_count >= requested_count
+                    else "partial_result"
+                )
+            elif minimum_count is not None and maximum_count is not None:
+                quantity_state = MatchState.CONFIRMED if minimum_count >= requested_count else MatchState.UNKNOWN
+                quantity_class = (
+                    "confirmed_match"
+                    if quantity_state is MatchState.CONFIRMED
+                    else "possible_match"
+                )
+                contribution_count = minimum_count
+            else:
+                quantity_state = MatchState.UNKNOWN
+                quantity_class = "possible_match"
+            detail_state_by_key["number_of_players"] = quantity_state
+        else:
+            quantity_class = "confirmed_match"
+        states = tuple(detail_state_by_key.values())
+        if MatchState.UNKNOWN in states:
+            result_class = "possible_match"
+        else:
+            result_class = quantity_class
+        route = opportunity.response_route
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "start_local_date": str(facts["start_local_date"]),
+            "end_local_date": str(facts["end_local_date"]),
+            "sort_local_date": max(start, required.start_local_date).isoformat()
+            if required is not None
+            else str(facts["start_local_date"]),
+            "iana_timezone": str(facts["iana_timezone"]),
+            "source_posted_at": str(facts["source_posted_at"]),
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if player_search_details.get(key)
+                    or (key == "search_area" and not completed_search.whole_city)
+                    or (key == "number_of_players" and requested_count is not None)
+                },
+                sort_keys=True,
+            ),
+            "player_contribution_count": str(contribution_count),
+        }
+        if exact_count is not None:
+            card["available_player_count"] = str(exact_count)
+        if minimum_count is not None and maximum_count is not None:
+            card["available_player_count_min"] = str(minimum_count)
+            card["available_player_count_max"] = str(maximum_count)
+        for locale in ("en", "ru", "es", "fr"):
+            card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
+            card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("exact_local_time"):
+            card["exact_local_time"] = str(facts["exact_local_time"])
+        if facts.get("day_part"):
+            card["day_part"] = str(facts["day_part"])
+        for key in (
+            "team_formats",
+            "positions",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+        ):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key])
+        if facts.get("payment"):
+            card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
+        if result_class == "partial_result" and requested_count is not None:
+            card["available_player_contribution"] = (
+                f"{exact_count}/{requested_count}"
+            )
+        matched.append(
+            SearchResult(
+                result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=result_class,
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=player_search_result_sort_key)
     return tuple(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)
