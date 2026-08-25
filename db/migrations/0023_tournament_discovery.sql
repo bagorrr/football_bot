@@ -1,12 +1,24 @@
 ALTER TABLE football_runtime.application_opportunities
     DROP CONSTRAINT IF EXISTS application_opportunities_opportunity_type_check,
     ADD CONSTRAINT application_opportunities_opportunity_type_check
-        CHECK (opportunity_type IN ('open_match', 'tournament'));
+        CHECK (
+            opportunity_type IN ('open_match', 'opponent_request', 'tournament')
+        );
 
 ALTER TABLE football_runtime.recommendation_opportunities
     DROP CONSTRAINT IF EXISTS recommendation_opportunities_opportunity_type_check,
     ADD CONSTRAINT recommendation_opportunities_opportunity_type_check
-        CHECK (opportunity_type IN ('open_match', 'tournament'));
+        CHECK (
+            opportunity_type IN ('open_match', 'opponent_request', 'tournament')
+        );
+
+GRANT SELECT ON football_runtime.recommendation_opportunities
+    TO football_bot_assistant;
+
+CREATE POLICY recommendation_opportunities_bot_assistant_read
+    ON football_runtime.recommendation_opportunities
+    FOR SELECT
+    USING (football_runtime.current_runtime_role() = 'bot_assistant');
 
 ALTER TABLE football_runtime.bot_discovery_drafts
     ADD COLUMN tournament_search_details jsonb NOT NULL DEFAULT '{}'::jsonb,

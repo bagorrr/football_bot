@@ -89,7 +89,9 @@ def test_tournament_matching_requires_active_open_participation_tournaments() ->
         {},
         (
             replace(
-                valid, opportunity_id="opportunity:inactive", publication_state="ended"
+                valid,
+                opportunity_id="opportunity:inactive",
+                publication_state="expired",
             ),
             replace(
                 valid,
@@ -109,7 +111,9 @@ def test_tournament_matching_requires_active_open_participation_tournaments() ->
     assert [dict(result.card_facts)["opportunity_id"] for result in results] == [
         valid.opportunity_id
     ]
-    assert dict(results[0].card_facts)["opportunity_type"] == "tournament"
+    card = dict(results[0].card_facts)
+    assert card["opportunity_type"] == "tournament"
+    assert card["publication_state"] == "active"
 
 
 def test_tournament_matching_expires_at_registration_deadline() -> None:

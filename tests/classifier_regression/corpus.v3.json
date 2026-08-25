@@ -1,0 +1,81 @@
+{
+  "corpus_version": "open-match-classifier-regression-v3-reviewed-v1",
+  "reviewed": true,
+  "redacted": true,
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "high",
+  "prompt_version": "open-match-primary-v3",
+  "schema_version": "source-message-classification-v3",
+  "glossary_version": "football-opportunity-glossary-v1",
+  "context_policy_version": "classifier-context-v1",
+  "routing_policy_version": "classifier-routing-v1",
+  "cases": [
+    {
+      "case_id": "tournament-current-registration",
+      "source": "Football tournament on 20 August at Central Stadium. Registration is open. Contact @tournament_contact",
+      "recorded_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "routing": {
+          "reason_code": "accepted",
+          "required_context": "none"
+        },
+        "candidates": [
+          {
+            "candidate_key": "tournament-current-registration",
+            "opportunity_type": "tournament",
+            "evidence": {
+              "opportunity": "Football tournament",
+              "event_time": "20 August",
+              "location": "Central Stadium",
+              "open_participation": "Registration is open"
+            },
+            "source_context": "Football tournament on 20 August at Central Stadium. Registration is open.",
+            "location": {
+              "mention": "Central Stadium",
+              "place_id": "place:central-stadium",
+              "country_id": "country:example",
+              "city_id": "city:example"
+            },
+            "event_time": {
+              "start_local_date": "2026-08-20",
+              "end_local_date": "2026-08-20",
+              "iana_timezone": "Europe/Moscow"
+            },
+            "open_participation": true,
+            "response_routes": [
+              {
+                "kind": "explicit_telegram_username",
+                "value": "@tournament_contact",
+                "evidence": "@tournament_contact"
+              }
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "disposition": "accepted",
+        "candidate_count": 1,
+        "opportunity_type": "tournament"
+      }
+    },
+    {
+      "case_id": "football-discussion-without-opportunity",
+      "source": "Football discussion: what tournament format do you prefer?",
+      "recorded_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        },
+        "candidates": []
+      },
+      "expected": {
+        "disposition": "irrelevant",
+        "candidate_count": 0,
+        "opportunity_type": null
+      }
+    }
+  ]
+}

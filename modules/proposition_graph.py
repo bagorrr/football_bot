@@ -128,7 +128,8 @@ def canonical_proposition_graph_from_wire(
     candidate_key: str,
     evidence: Mapping[str, object],
     routes: Sequence[object],
-    opportunity_type: str = "open_match",
+    meaning: str = "open_match",
+    opportunity_type: str | None = None,
     proposition_version: str = "source-proposition-evidence-v1",
 ) -> CanonicalPropositionGraph | None:
     """Convert the already schema-checked v1 graph into typed values.
@@ -202,10 +203,13 @@ def canonical_proposition_graph_from_wire(
     raw_root = value.get("root")
     if not isinstance(raw_root, Mapping):
         return None
+    effective_opportunity_type = (
+        meaning if opportunity_type is None else opportunity_type
+    )
     if (
         raw_root.get("proposition_id") != candidate_key
         or raw_root.get("domain") != "football_match"
-        or raw_root.get("meaning") != opportunity_type
+        or raw_root.get("meaning") != effective_opportunity_type
     ):
         return None
     root = node_from("root", raw_root, expected_text=body)

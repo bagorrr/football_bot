@@ -53,6 +53,23 @@ def test_tournament_open_participation_accepts_supported_word_orders(
 @pytest.mark.parametrize(
     "evidence",
     (
+        "Teams can register now",
+        "Register now for the tournament",
+        "Les équipes peuvent s'inscrire maintenant",
+    ),
+)
+def test_tournament_open_participation_accepts_registration_verbs(
+    evidence: str,
+) -> None:
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
         "Осталось последнее место для команды",
         "Идёт донабор команд",
     ),
@@ -71,6 +88,7 @@ def test_tournament_open_participation_accepts_remaining_team_places(
     (
         "Registration is not open",
         "Registration was open last year",
+        "Registration will be open next week",
         "Регистрация закрыта",
     ),
 )

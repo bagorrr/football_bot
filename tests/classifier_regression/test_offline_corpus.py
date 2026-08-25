@@ -170,6 +170,58 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     )
 
 
+def test_reviewed_v3_corpus_gate_covers_the_activated_classifier_artifacts() -> None:
+    """Keep v3 publication/runtime activation behind a reviewed corpus gate."""
+    repository_root = Path(__file__).parents[2]
+    corpus = json.loads(
+        (Path(__file__).with_name("corpus.v3.json")).read_text(encoding="utf-8")
+    )
+    assert corpus["corpus_version"] == (
+        "open-match-classifier-regression-v3-reviewed-v1"
+    )
+    assert corpus["reviewed"] is True
+    assert corpus["redacted"] is True
+    assert corpus["model"] == "gpt-5.6-sol"
+    assert corpus["reasoning_effort"] == "high"
+    assert corpus["prompt_version"] == "open-match-primary-v3"
+    assert corpus["schema_version"] == "source-message-classification-v3"
+    assert corpus["cases"]
+
+    for artifact_directory in ("open-match-primary-v3", "open-match-ambiguity-v2"):
+        schema_path = (
+            repository_root
+            / "classifier"
+            / artifact_directory
+            / "source-message-classification-v3.schema.json"
+        )
+        provenance_path = (
+            repository_root / "classifier" / artifact_directory / ("provenance.json")
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        assert schema["$id"] == corpus["schema_version"]
+        assert schema["additionalProperties"] is False
+        assert provenance["requested_model"] == corpus["model"]
+        assert provenance["requested_reasoning_effort"] == corpus["reasoning_effort"]
+        assert provenance["prompt_version"] in {
+            "open-match-primary-v3",
+            "open-match-ambiguity-v2",
+        }
+        assert provenance["schema_version"] == corpus["schema_version"]
+
+    for case in corpus["cases"]:
+        output = case["recorded_output"]
+        assert classifier_output_is_schema_valid(output, body=case["source"])
+        expected = case["expected"]
+        assert output["disposition"] == expected["disposition"]
+        assert len(output["candidates"]) == expected["candidate_count"]
+        if output["candidates"]:
+            assert (
+                output["candidates"][0]["opportunity_type"]
+                == expected["opportunity_type"]
+            )
+
+
 def test_v2_provider_schemas_match_strict_application_evidence_contract() -> None:
     """Both provider artifacts declare the same strict v2 wire contract."""
     repository_root = Path(__file__).parents[2]
