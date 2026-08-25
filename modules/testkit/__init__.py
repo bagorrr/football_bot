@@ -24,7 +24,6 @@ from modules.application import (
 )
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
-    controlled_player_promotion_replay_digests,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
 )
@@ -2107,18 +2106,16 @@ class AcceptanceSpine:
     ) -> None:
         """Record explicit controlled evidence for the exact Player release."""
         release = describe_player_classifier_release()
-        evidence = player_classifier_promotion_evidence(
-            release,
-            replay_digests=controlled_player_promotion_replay_digests(release),
-        )
+        if (
+            release_fingerprint is not None
+            and release_fingerprint != release.release_fingerprint
+        ):
+            raise ValueError("promotion fingerprint must match the reviewed release")
+        evidence = player_classifier_promotion_evidence(release)
         promotion: dict[str, JsonValue] = {
             "release_name": PLAYER_CLASSIFIER_RELEASE_NAME,
             "contract_version": release.contract_version,
-            "release_fingerprint": (
-                release.release_fingerprint
-                if release_fingerprint is None
-                else release_fingerprint
-            ),
+            "release_fingerprint": release.release_fingerprint,
             "state": state,
             "evidence": evidence,
         }

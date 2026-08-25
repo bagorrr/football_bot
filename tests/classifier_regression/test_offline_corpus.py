@@ -7,9 +7,10 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import date, datetime
-from hashlib import sha256
 from pathlib import Path
 from typing import cast
+
+import pytest
 
 from modules.application import (
     _body_establishes_current_open_match,
@@ -24,16 +25,15 @@ from modules.application import (
 from modules.classifier_contract import (
     PROPOSITION_EVIDENCE_VERSION,
     classifier_output_is_schema_valid,
-    semantic_proof_is_authoritative,
     semantic_proof_is_schema_valid,
 )
 from modules.classifier_promotion import (
     PLAYER_REQUIRED_CASE_FAMILIES,
     PLAYER_REVIEWED_CORPUS_CASE_COUNT,
-    controlled_player_promotion_replay_digests,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
+    run_player_classifier_promotion_gate,
 )
 from modules.contracts import JsonValue
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
@@ -322,73 +322,6 @@ def test_player_release_replays_offline_with_offering_semantics() -> None:
         assert adapter.requests[-1].prompt_version == "player-match-primary-v1"
 
 
-def _player_evaluation_output(case: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    """Materialize one reviewed fixture into the strict v3 wire contract."""
-    source = case["source"]
-    expected = cast(dict[str, JsonValue], case["expected"])
-    disposition = expected["disposition"]
-    reason_code = expected.get(
-        "reason_code",
-        "accepted" if disposition == "accepted" else disposition,
-    )
-    if disposition != "accepted":
-        return {
-            "schema_version": "source-message-classification-v3",
-            "disposition": disposition,
-            "candidates": [],
-            "routing": {
-                "reason_code": reason_code,
-                "required_context": "none",
-            },
-        }
-
-    fixture = cast(dict[str, JsonValue], case["fixture"])
-    evidence = dict(cast(dict[str, JsonValue], fixture["evidence"]))
-    candidate: dict[str, JsonValue] = {
-        "candidate_key": fixture["candidate_key"],
-        "opportunity_type": "player_match_availability",
-        "evidence": evidence,
-        "source_context": source,
-        "location": {
-            "mention": evidence["location"],
-            "place_id": "controlled:place",
-            "country_id": "controlled:country",
-            "city_id": "controlled:city",
-        },
-        "event_time": {
-            "start_local_date": evidence["event_time"],
-            "end_local_date": evidence["event_time"],
-            "iana_timezone": "Europe/Moscow",
-        },
-        "response_routes": [],
-    }
-    count = fixture.get("count")
-    if isinstance(count, dict):
-        count_kind = count.get("kind")
-        if count_kind == "exact":
-            value = count["value"]
-            candidate["available_player_count"] = value
-            evidence["available_player_count"] = evidence["opportunity"]
-        elif count_kind == "range":
-            minimum = count["minimum"]
-            maximum = count["maximum"]
-            candidate["available_player_count_min"] = minimum
-            candidate["available_player_count_max"] = maximum
-            evidence["available_player_count_min"] = evidence["opportunity"]
-            evidence["available_player_count_max"] = evidence["opportunity"]
-        else:
-            raise AssertionError("unknown Player evaluation count kind")
-    route = fixture.get("route")
-    if isinstance(route, dict):
-        candidate["response_routes"] = [route]
-    return {
-        "schema_version": "source-message-classification-v3",
-        "disposition": "accepted",
-        "candidates": [candidate],
-        "routing": {"reason_code": "accepted", "required_context": "none"},
-    }
-
-
 def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() -> None:
     release = describe_player_classifier_release()
 
@@ -404,10 +337,16 @@ def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() 
     assert release.requested_reasoning_effort == "high"
     assert release.proposal_only is True
 
-    evidence = player_classifier_promotion_evidence(
-        release,
-        replay_digests=controlled_player_promotion_replay_digests(release),
-    )
+    gate = run_player_classifier_promotion_gate(release)
+    assert gate.passed
+    assert gate.reviewed_case_count == 38
+    assert gate.reviewed_case_ids == release.reviewed_corpus_case_ids
+    assert gate.lifecycle_case_count == len(release.lifecycle_failure_suite_cases)
+    assert gate.failed_case_ids == ()
+    assert len(gate.replay_digests) == release.required_replays
+    assert len(set(gate.replay_digests)) == 1
+    evidence = player_classifier_promotion_evidence(release)
+    assert evidence["replay_digests"] == list(gate.replay_digests)
     approval: dict[str, JsonValue] = {
         "release_name": release.release_name,
         "contract_version": release.contract_version,
@@ -439,8 +378,34 @@ def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() 
     )
 
 
-def test_player_evaluation_contract_is_a_deterministic_promotion_gate() -> None:
-    """Replay the reviewed Player contract before any real-source promotion."""
+def test_player_promotion_rejects_fake_digest_and_exact_version_mismatch() -> None:
+    release = describe_player_classifier_release()
+    with pytest.raises(ValueError, match="replay digests"):
+        player_classifier_promotion_evidence(
+            release,
+            replay_digests=("0" * 64,) * release.required_replays,
+        )
+    evidence = player_classifier_promotion_evidence(release)
+    approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": evidence,
+    }
+    fake_evidence = deepcopy(evidence)
+    fake_evidence["replay_digests"] = ["0" * 64] * release.required_replays
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "evidence": fake_evidence}
+    )
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "release_fingerprint": "0" * 64}
+    )
+    assert not player_classifier_promotion_is_approved({**approval, "state": "revoked"})
+
+
+def test_player_promotion_contract_contains_executable_expected_facts() -> None:
+    """The contract stores outcomes/facts; the gate executes them, not just IDs."""
     contract_path = (
         Path(__file__).parents[2]
         / "classifier"
@@ -456,154 +421,82 @@ def test_player_evaluation_contract_is_a_deterministic_promotion_gate() -> None:
     assert contract["reviewed_on"] == "2026-08-25"
     assert contract["reviewed_by_role"] == "product_owner_and_independent_reviewer"
     promotion_gate = cast(dict[str, JsonValue], contract["promotion_gate"])
-    assert promotion_gate == {
-        "deterministic": True,
-        "required_replays": 3,
-        "max_failures": 0,
-        "adapter_kind": "controlled_recording",
-        "requested_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "high",
-        "proposal_only": True,
-        "real_source_publication_allowed": False,
-    }
-    required_families = set(cast(list[str], contract["required_case_families"]))
+    assert promotion_gate["executes_reviewed_corpus"] is True
+    assert promotion_gate["executes_lifecycle_failure_suite"] is True
     cases = cast(list[dict[str, JsonValue]], contract["cases"])
-    assert required_families <= {cast(str, case["family"]) for case in cases}
-    assert len({case["case_id"] for case in cases}) == len(cases)
-    assert len({case["source"] for case in cases}) == len(cases)
+    assert len(cases) == PLAYER_REVIEWED_CORPUS_CASE_COUNT
+    assert [case["case_id"] for case in cases] == [
+        f"sm-{number:03d}" for number in range(1, 39)
+    ]
+    for case in cases:
+        expected = cast(dict[str, JsonValue], case["expected"])
+        facts = cast(dict[str, JsonValue], expected["facts"])
+        assert expected["candidate_count"] in {0, 1}
+        assert facts["source_evidence"]
+        assert facts["normalized"]
+    suite_path = (
+        Path(__file__).parents[2]
+        / "classifier"
+        / "player-match-evaluation-v1"
+        / "lifecycle-failure-suite.json"
+    )
+    suite = cast(
+        dict[str, JsonValue], json.loads(suite_path.read_text(encoding="utf-8"))
+    )
+    suite_cases = cast(list[dict[str, JsonValue]], suite["cases"])
+    assert all(case["operations"] for case in suite_cases)
+    assert suite["controlled_event_sequences"] == [
+        {"sequence_id": "controlled-event-001", "events": ["create", "edit", "delete"]}
+    ]
 
-    replay_digests: list[str] = []
-    replay_metrics: list[tuple[int, int, int]] = []
-    replay_count = cast(int, promotion_gate["required_replays"])
-    for replay_number in range(replay_count):
-        adapter = ControlledModelAdapter()
-        adapter.enable_primary_v3()
-        accepted_count = 0
-        proof_count = 0
-        case_digests: list[dict[str, JsonValue]] = []
-        for case in cases:
-            source = cast(str, case["source"])
-            output = _player_evaluation_output(case)
-            adapter.return_for(
-                body=source,
-                result=ClassifierAdapterResult(
-                    output=output,
-                    effective_model="gpt-5.6-sol",
-                    effective_reasoning_effort="high",
-                    codex_version="controlled-promotion-gate",
-                    adapter_kind="controlled_recording",
-                    adapter_version="player-match-evaluation-v1",
-                    duration_ms=0,
-                    input_tokens=0,
-                    output_tokens=0,
-                ),
-            )
-            request = ClassifierRequest(
-                source_message_revision_id=(
-                    f"player-evaluation:{replay_number}:{case['case_id']}"
-                ),
-                body=source,
-                source_event_time="2026-08-25T09:00:00+00:00",
-                context_bundle_version="primary-classifier-context-v1",
-                source_chat_reference="controlled:player-evaluation",
-                source_chat_timezone="Europe/Moscow",
-                source_chat_geography={"country_id": None, "city_id": None},
-                bounded_metadata={"message_language": None, "attachment_types": []},
-                eligible_reply_context=None,
-                requested_model="gpt-5.6-sol",
-                requested_reasoning_effort="high",
-                prompt_version="player-match-primary-v1",
-                schema_version="source-message-classification-v3",
-                glossary_version="football-opportunity-glossary-v1",
-                context_policy_version="classifier-context-v1",
-                routing_policy_version="classifier-routing-player-v1",
-            )
-            result = adapter.classify(request)
-            assert classifier_output_is_schema_valid(result.output, body=source)
-            expected = cast(dict[str, JsonValue], case["expected"])
-            candidates = result.output["candidates"]
-            assert isinstance(candidates, list)
-            assert result.output["disposition"] == expected["disposition"]
-            if expected.get("reason_code") is not None:
-                routing = cast(dict[str, JsonValue], result.output["routing"])
-                assert routing["reason_code"] == expected["reason_code"]
-            assert len(candidates) == expected["candidate_count"]
-            assert result.effective_model == "gpt-5.6-sol"
-            assert result.effective_reasoning_effort == "high"
-            if result.output["disposition"] == "accepted":
-                accepted_count += 1
-                assert len(candidates) == 1
-                candidate = cast(dict[str, JsonValue], candidates[0])
-                evidence = cast(dict[str, JsonValue], candidate["evidence"])
-                assert candidate["opportunity_type"] == "player_match_availability"
-                assert _optional_values_are_supported(candidate, evidence)
-                assert _player_availability_is_supported(
-                    candidate.get("available_player_count"),
-                    candidate.get("available_player_count_min"),
-                    candidate.get("available_player_count_max"),
-                    cast(str, evidence["opportunity"]),
-                    authoritative_body=source,
-                ) is bool(expected.get("application_supported"))
-                proof = semantic_proof_result_for(
-                    output=result.output,
-                    body=source,
-                    source_message_revision_reference=request.source_message_revision_id,
-                    proof_version="source-semantic-proof-v2",
-                ).output
-                routes = cast(list[JsonValue], candidate["response_routes"])
-                candidate_key = cast(str, candidate["candidate_key"])
-                assert semantic_proof_is_schema_valid(
-                    proof,
-                    body=source,
-                    source_message_revision_reference=request.source_message_revision_id,
-                    candidate_key=candidate_key,
-                    evidence=evidence,
-                    routes=routes,
-                    meaning="player_match_availability",
-                    proof_version="source-semantic-proof-v2",
-                )
-                assert semantic_proof_is_authoritative(
-                    proof,
-                    body=source,
-                    source_message_revision_reference=request.source_message_revision_id,
-                    candidate_key=candidate_key,
-                    evidence=evidence,
-                    routes=routes,
-                    meaning="player_match_availability",
-                    proof_version="source-semantic-proof-v2",
-                )
-                proof_count += 1
-                assert candidate["proposition_evidence"]
-            case_digests.append(result.output)
-        replay_metrics.append((accepted_count, proof_count, len(adapter.requests)))
-        replay_digests.append(
-            sha256(
-                json.dumps(
-                    case_digests,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-        )
 
-    assert len(set(replay_digests)) == 1
-    assert len(set(replay_metrics)) == 1
-    assert replay_metrics[0][0] >= 5
-    assert replay_metrics[0][1] == replay_metrics[0][0]
-    assert replay_metrics[0][2] == len(cases)
-    release = describe_player_classifier_release()
-    approval: dict[str, JsonValue] = {
-        "release_name": release.release_name,
-        "contract_version": release.contract_version,
-        "release_fingerprint": release.release_fingerprint,
-        "state": "approved",
-        "evidence": player_classifier_promotion_evidence(
-            release,
-            replay_digests=tuple(replay_digests),
-        ),
-    }
-    assert player_classifier_promotion_is_approved(approval)
+@pytest.mark.parametrize(
+    "body",
+    [
+        "4 players available but are not able to play the match",
+        "4 players available but unable to participate in the match",
+        "4 players available, but nobody can play the match",
+        "4 players available but incapable of playing the match",
+        "4 игрока доступны, но играть не можем на матч",
+        "4 игрока доступны, но не можем участвовать в матче",
+        "4 игрока доступны, но не способны играть на матч",
+        "4 jugadores disponibles, pero nadie puede jugar el partido",
+        "4 jugadores disponibles pero no podemos participar en el partido",
+        "4 jugadores disponibles, pero son incapaces de jugar el partido",
+        "4 joueurs disponibles, mais personne ne peut jouer le match",
+        "4 joueurs disponibles mais nous ne pouvons pas participer au match",
+        "4 joueurs disponibles, mais incapables de jouer le match",
+    ],
+)
+def test_player_classifier_rejects_multilingual_negative_availability(
+    body: str,
+) -> None:
+    assert not _player_availability_is_supported(
+        4,
+        None,
+        None,
+        body,
+        authoritative_body=body,
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "4 players available and can play the match",
+        "4 игрока доступны и можем играть на матч",
+        "4 jugadores disponibles y podemos jugar el partido",
+        "4 joueurs disponibles et nous pouvons jouer le match",
+    ],
+)
+def test_player_classifier_keeps_multilingual_positive_availability(body: str) -> None:
+    assert _player_availability_is_supported(
+        4,
+        None,
+        None,
+        body,
+        authoritative_body=body,
+    )
 
 
 def test_player_semantic_proof_provider_path_allows_unknown_quantity() -> None:

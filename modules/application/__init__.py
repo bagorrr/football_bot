@@ -15559,25 +15559,53 @@ def _source_player_opening_state(body: str) -> PropositionState:
         return PropositionState.WITHDRAWN
     negative_availability_patterns = (
         r"\b(?:unavailable|not\s+available|not\s+free\s+to\s+play|"
-        r"not\s+ready\s+to\s+play)\b",
+        r"not\s+ready\s+to\s+play|unable\s+to\s+(?:play|join|"
+        r"participate)|not\s+able\s+to\s+(?:play|join|participate)|"
+        r"not\s+capable\s+of\s+(?:playing|participating)|"
+        r"incapable\s+of\s+(?:playing|participating)|"
+        r"not\s+(?:playing|participating)|cannot\s+(?:play|join|"
+        r"participate)|can\s+not\s+(?:play|join|participate))\b",
         r"\b(?:cannot|can\s+not|can\s+t|unable\s+to)\s+"
-        r"(?:play|join)\b",
+        r"(?:play|join|participate|take\s+part)\b",
         r"\b(?:no|zero)\s+(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
         r"\b(?:available|free\s+to\s+play|ready\s+to\s+play|can\s+play)\b",
         r"\b(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
         r"\b(?:are|is|we\s+are|we\s+re)\s+not\s+"
         r"(?:available|free\s+to\s+play|ready\s+to\s+play)\b",
+        r"\b(?:nobody|no\s+one|none)\s+(?:can|is\s+able\s+to)\s+"
+        r"(?:play|join|participate|take\s+part)\b",
+        r"\b(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
+        r"\b(?:cannot|can\s+not|can\s+t|are\s+unable\s+to|"
+        r"are\s+not\s+able\s+to)\s+(?:play|join|participate|"
+        r"take\s+part)\b",
         r"\b(?:недоступн\w*|не\s+доступн\w*|не\s+готов\w*|"
         r"не\s+(?:могу|можем|может|могут)\s+играть|"
         r"нет\s+(?:игрок\w*|групп\w*))\b",
+        r"\b(?:играть|участвовать|принять\s+участие)\s+не\s+"
+        r"(?:могу|можем|может|могут)|"
+        r"\bне\s+(?:могу|можем|может|могут|способ\w*)\s+"
+        r"(?:играть|участвовать|принять\s+участие)|"
+        r"\b(?:никто|ни\s+один|ни\s+одного)\s+не\s+может\s+"
+        r"(?:играть|участвовать|принять\s+участие)\b",
         r"\b(?:indisponible\w*|no\s+(?:estamos|están|son|pueden)\s+"
         r"disponible\w*|no\s+disponible\w*|ningún\w*\s+"
         r"(?:jugador\w*|grupo)|no\s+(?:podemos|pueden|puede|puedo)\s+"
         r"(?:jugar|participar)|no\s+hay\s+(?:jugador\w*))\b",
+        r"\b(?:nadie|ningún\s+jugador|ningun\s+jugador)\s+"
+        r"(?:puede|podemos|pueden)\s+(?:jugar|participar)\b|"
+        r"\b(?:no\s+(?:somos|son|es)\s+capaces\s+de|"
+        r"incapaz\w*\s+de|incapac\w*\s+de|no\s+podemos|no\s+pueden|"
+        r"no\s+puede|no\s+puedo)\s+(?:jugar|participar)\b",
         r"\b(?:indisponible\w*|ne\s+(?:sommes|sont|peuvent)\s+pas\s+"
         r"disponible\w*|ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+"
         r"pas\s+(?:jouer|participer)|pas\s+disponible\w*|"
         r"aucun\w*\s+(?:joueur\w*|groupe))\b",
+        r"\b(?:personne|aucun\s+joueur|aucune\s+équipe)\s+ne\s+"
+        r"peut\s+(?:jouer|participer)\b|"
+        r"\b(?:nous\s+ne\s+sommes\s+pas\s+capables\s+de|"
+        r"incapable\w*\s+de|impossible\s+de|"
+        r"ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+pas)\s+"
+        r"(?:jouer|participer)\b",
     )
     if any(
         re.search(pattern, normalized) is not None

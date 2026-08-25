@@ -1,11 +1,13 @@
 corpus:
   name: "Redacted Representative Source Message Corpus"
-  version: "1.0"
-  status: "confirmed"
+  version: "2.0"
+  status: "reviewed"
+  reviewed_on: "2026-08-25"
   language_distribution:
     russian: 38
   controlled_event_sequence_count: 1
-  annotation_status: "provisional_manual"
+  annotation_status: "reviewed_release_gold"
+  reviewed_evaluation_contract: "classifier/player-match-evaluation-v1/contract.json"
   provenance_record: "docs/product/source-message-corpus-provenance.md"
 
 redaction_tokens:

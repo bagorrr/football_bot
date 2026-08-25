@@ -17,6 +17,10 @@ import psycopg
 from psycopg import conninfo, sql
 from psycopg.rows import dict_row
 
+from modules.classifier_promotion import (
+    PLAYER_CLASSIFIER_RELEASE_NAME,
+    player_classifier_promotion_is_approved,
+)
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
     ContractEnvelope,
@@ -4093,6 +4097,8 @@ class PostgresRoleStore:
         """Persist explicit versioned classifier promotion evidence."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
+        if not player_classifier_promotion_is_approved(release):
+            raise ValueError("classifier release promotion evidence is not verifiable")
         release_name = release.get("release_name")
         release_fingerprint = release.get("release_fingerprint")
         if (
@@ -4160,6 +4166,29 @@ class PostgresRoleStore:
                     None,
                 ),
             )
+
+    def _ensure_player_publication_approval(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunities: Iterable[dict[str, JsonValue]],
+    ) -> None:
+        """Keep the persistence boundary fail-closed for Player publications."""
+        if not any(
+            opportunity.get("opportunity_type") == "player_match_availability"
+            for opportunity in opportunities
+        ):
+            return
+        proposal = incoming.payload
+        if not isinstance(
+            proposal, dict
+        ) or not player_classifier_promotion_is_approved(
+            self.classifier_release_promotion(
+                release_name=PLAYER_CLASSIFIER_RELEASE_NAME,
+            ),
+            proposal=proposal,
+        ):
+            raise ValueError("unapproved Player classifier release cannot publish")
 
     def proposition_opportunity_ids(
         self, source_message_id: str
@@ -4370,6 +4399,10 @@ class PostgresRoleStore:
         """Atomically retain accepted facts and emit publication state."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
+        self._ensure_player_publication_approval(
+            incoming=incoming,
+            opportunities=(opportunity,),
+        )
         with psycopg.connect(self._database_url) as connection:
             if not _begin_owned_contract(
                 connection,
@@ -4491,6 +4524,10 @@ class PostgresRoleStore:
             raise ConversationAccessDeniedError
         if not opportunities:
             raise ValueError("compound publication requires at least one opportunity")
+        self._ensure_player_publication_approval(
+            incoming=incoming,
+            opportunities=opportunities,
+        )
         with psycopg.connect(self._database_url) as connection:
             if not _begin_owned_contract(
                 connection,
