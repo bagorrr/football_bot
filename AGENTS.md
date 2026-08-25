@@ -25,6 +25,23 @@ every dispatch or mutation, reconcile GitHub, native dependencies, durable
 transition records, branches and pull requests, and active Codex tasks; never
 create a duplicate coordinator or task.
 
+Within one approved implementation ticket, a coordinator may have at most one
+active subordinate implementation, review, or fix task. After dispatching that
+fresh task with its complete handoff, the coordinator must end its active turn
+without polling or monitoring the task. The automatic lifecycle resumes only
+when the expected task sends its single terminal callback; the coordinator then
+reconciles durable state before deciding the next transition.
+
+Create every fresh implementation-ticket coordinator and every subordinate
+implementation, review, or fix task explicitly with `gpt-5.6-luna` and
+reasoning effort `max`; never rely on inherited task defaults. In its first
+response after the initial handoff, each new ticket coordinator must perform
+the read-only model-freshness check defined in
+`docs/agents/ticket-orchestration.md`, report the result, and ask the product
+owner to confirm the model and reasoning effort together with start approval.
+Every automated message that resumes a coordinator must explicitly preserve
+the same model and effort. Do not silently substitute another setting.
+
 Do not cross a fresh-thread boundary defined there. When a task reaches or
 stops at a lifecycle gate, end the final response with the required
 `Next handoff` block and a paste-ready prompt for the correct next thread. If

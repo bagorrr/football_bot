@@ -89,7 +89,7 @@ prompt for the action that actually clears the gate.
 | Product grilling / Wayfinder | One non-research decision ticket | New thread after every resolved non-research ticket | No decision, task, research result, prototype, or fog blocks a buildable specification | `$wayfinder` audit, then `$to-spec` |
 | Specification | One product specification | New thread after the Wayfinder exit gate | User approves test seams and the published specification is complete and labelled `ready-for-agent` | `$to-tickets` |
 | Ticketing | One approved specification | New thread after implementation tickets and native dependencies are published | User approves tracer-bullet granularity; at least one implementation ticket is unblocked | Create a fresh frontier coordinator |
-| Ticket readiness | One implementation ticket coordinator | Fresh coordinator for every permitted frontier after predecessor completion and exact merge-commit `main` quality | Product owner gives the required unambiguous start approval | Automatic ticket lifecycle |
+| Ticket readiness | One implementation ticket coordinator | Fresh coordinator for every permitted frontier after predecessor completion and exact merge-commit `main` quality | Product owner confirms the reported model/effort selection and gives the required unambiguous start approval | Automatic ticket lifecycle |
 | Implementation | One implementation ticket | New implementation task for every ticket | Acceptance criteria and proportional checks pass; implementation PR and terminal callback exist | Fresh independent `$code-review` |
 | Review | One implementation PR head | Fresh review after every implementation or fix commit; fixes use a separate task | No blocking standards or specification findings remain for the exact head | Authorized merge, a separate fix task, or a stop condition |
 | Release readiness | One release candidate against the approved specification | New thread after all implementation tickets and reviews are complete | CI, acceptance, operational, privacy, rollback, migration, monitoring, and support gates pass | Explicitly authorized deployment |
@@ -222,12 +222,35 @@ its paste-ready prompt is fallback documentation only. If supported creation
 is unavailable or genuinely fails, list each affected frontier and provide its
 prompt for manual recovery; a non-elected coordinator must not self-promote.
 
-The new coordinator performs only read-only readiness checks. It must stop and
-wait for a product-owner start approval that names the ticket or is exactly
-`Согласен` or `Утверждаю`. Before that approval it may not claim, dispatch,
-create branches or pull requests, change GitHub, or mutate repository or
-external state. Parallel frontiers use separate coordinators and separate
-approvals.
+Create every fresh ticket coordinator explicitly with `gpt-5.6-luna` and
+reasoning effort `max`; do not inherit task defaults. This is a Codex
+orchestration setting and is independent of the football-bot application's
+runtime model configuration. Every automated callback or other supported
+programmatic message that resumes a coordinator must explicitly preserve the
+same model and effort.
+
+The new coordinator performs only read-only readiness checks. In its first
+response after the initial handoff, it verifies the current availability and
+ticket-specific suitability of `gpt-5.6-luna` with reasoning effort `max`
+against official OpenAI model documentation, the target Codex App's supported
+model-and-effort combinations, and the ticket's demands. It reports the result
+and asks the product owner to confirm or revise that selection together with
+start approval. When the report has no blocker, an approval that names the
+ticket or is exactly `Согласен` or `Утверждаю` confirms both the selection and
+the start. A reported model blocker requires an explicit policy amendment;
+there is no silent substitution. Before valid approval the coordinator may not
+claim, dispatch, create branches or pull requests, change GitHub, or mutate
+repository or external state. Parallel frontiers use separate coordinators,
+freshness checks, and approvals.
+
+After approval, one ticket coordinator drives a strictly sequential
+callback-driven loop. A subordinate task means one fresh implementation,
+review, or fix task, not a next-frontier coordinator. At most one subordinate
+task may be active. The coordinator creates it with a complete stage-specific
+handoff, sends the instructions, and immediately ends its active turn without
+polling, progress reads, wait calls, or follow-up messages. It resumes only
+after that exact task sends its single terminal callback, reconciles durable
+state, and then decides whether to merge, stop, or create the next fresh task.
 
 Use this structured handoff when creating a next-frontier coordinator:
 
@@ -242,13 +265,20 @@ Completed predecessor artifacts: <LINKS>
 Standing-authorization applicability: <STATE AND DURABLE SOURCE>
 Required credentials/services: <STATE>
 Known scope constraints: <CONSTRAINTS>
+Coordinator model: gpt-5.6-luna
+Coordinator reasoning effort: max
 
 Perform read-only readiness checks only. Reconcile GitHub, the native graph,
 durable transition comments, branches and pull requests, and active Codex
 tasks. Do not claim, dispatch, create a branch or pull request, change GitHub,
-or mutate repository/external state. Report readiness and wait for a
-product-owner start approval naming this ticket or exactly `Согласен` or
-`Утверждаю`.
+or mutate repository/external state. In your first response after this handoff,
+verify and report whether `gpt-5.6-luna` with reasoning effort `max` remains
+available and suitable for this ticket using current official OpenAI model
+documentation, the target Codex App's supported combinations, and the ticket's
+scope and risks. Ask the product owner to confirm or revise that selection
+together with start approval. If no blocker is reported, approval may name this
+ticket or be exactly `Согласен` or `Утверждаю`. If a blocker is reported, stop
+for an explicit policy amendment and do not silently substitute settings.
 ```
 
 After approval, take one unblocked `ready-for-agent` implementation ticket:
@@ -267,19 +297,25 @@ green. Refactor during review, not within red→green. Then take the next test.
 Run proportional static, test, classifier-regression, operational, and failure
 checks required by the specification. The implementation PR must contain
 `Closes #<ticket>`. Publish concise red→green evidence without large or
-sensitive logs, then publish terminal GitHub status and send exactly one
-structured callback to the dynamic coordinator thread and host from the task
-handoff.
+sensitive logs. Wait for the required exact-head checks to reach a terminal
+outcome, or publish a durable blocked or failed outcome. Then publish terminal
+GitHub status, send exactly one successful structured callback to the dynamic
+coordinator thread and host from the task handoff, explicitly selecting
+destination model `gpt-5.6-luna` and reasoning effort `max`, and end.
 ```
 
 Do not begin another implementation ticket in the same thread.
 
 The callback is sent only after durable GitHub status. It includes task kind
-and status, specification/ticket/PR, fixed base and exact head, commits,
-local/hosted checks, mergeability, total/unresolved review threads, separate
-axis findings, artifact URL, new-commit status, scope deviations, and exact
-next action. Do not send progress callbacks, retry a successful send, or ask
-the product owner to relay the handoff. GitHub remains authoritative.
+and status, subordinate task identity, transition idempotency key,
+requested/effective model and reasoning effort, specification/ticket/PR, fixed
+base and exact head, commits, local/hosted checks, mergeability,
+total/unresolved review threads, separate axis findings, artifact URL,
+new-commit status, scope deviations, and exact next action. Do not send
+progress callbacks, retry a successful send, or ask the product owner to relay
+the handoff. GitHub remains authoritative. After dispatch, the coordinator
+does not monitor the task; only this terminal callback resumes the automatic
+subordinate stage.
 
 ## Review and fix protocol
 
@@ -295,6 +331,11 @@ Read its implementation ticket and parent specification. Review separately for
 repository standards and specification fidelity. Report blocking findings with
 evidence. Do not modify the branch unless I explicitly ask for fixes.
 
+Publish the terminal review status on the pull request, send exactly one
+structured terminal callback to the dynamic coordinator thread and host from
+the task handoff, explicitly selecting destination model `gpt-5.6-luna` and
+reasoning effort `max`, and end. Do not continue into fixes in this thread.
+
 End with the Next handoff block from docs/agents/delivery-handoffs.md.
 ```
 
@@ -304,9 +345,18 @@ review of the complete pull-request diff. Repeat this separate fix and
 re-review loop after every new commit. Non-blocking heuristic smells do not
 block and grant no change or ticket authority.
 
-Implementation, independent-review, and fix tasks are fresh and use
-`gpt-5.6-sol` with reasoning effort `high`. Independent review is read-only;
-fix authority is limited to its published blocking findings.
+Each fix task publishes its durable terminal status, waits for required
+exact-head checks to reach a terminal outcome or records a durable blocked or
+failed outcome, sends exactly one structured terminal callback that explicitly
+selects destination model `gpt-5.6-luna` and reasoning effort `max`, and ends.
+It does not start or reuse a review thread. The coordinator resumes on that
+callback, reconciles the exact head, and creates a fresh review task when the
+review entry gate is satisfied.
+
+Implementation, independent-review, and fix tasks are fresh and are created
+explicitly with `gpt-5.6-luna` and reasoning effort `max`; task defaults are
+never inherited. Independent review is read-only; fix authority is limited to
+its published blocking findings.
 
 Immediately before merge, revalidate successful exact-head `quality`, clean
 mergeability, both independent review axes, zero unresolved review threads,
@@ -337,10 +387,14 @@ graph, durable transition comments, branches and pull requests, and active
 Codex tasks. Next-frontier creation uses the target frontier ticket,
 `coordinator-create`, and the newest direct-blocker merge commit in `main`
 ancestry, so every fan-in candidate reconciles the same transition. One
-supported, one-shot, idempotent heartbeat may be used only if
-the active turn cannot keep waiting and a terminal callback cannot continue;
-it checks durable state, exits when no transition is needed, and is never a
-cron, recurring reminder, repository automation, Git hook, or duplicate task.
+supported, one-shot, idempotent heartbeat may be used only when no subordinate
+task is active and the coordinator is waiting for a non-Codex durable
+external-state transition such as post-merge `quality` or frontier-creation
+reconciliation. While a subordinate task is active, its terminal callback is
+the only automatic wake-up source: no heartbeat, task read, wait call, polling,
+or recurring monitor is permitted. A heartbeat never recovers a missing task
+callback and is never a cron, recurring reminder, repository automation, Git
+hook, or duplicate task.
 
 Stop for a product decision, unavailable required credential or service,
 repeated or unfixable gate, specification or ADR conflict, required new ticket,

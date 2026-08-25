@@ -648,6 +648,16 @@ _GAME_SEARCH_DETAIL_VALUES = {
     ),
     "payment": frozenset({"free", "paid"}),
 }
+_OPPONENT_SEARCH_DETAIL_VALUES = {
+    "team_formats": _GAME_SEARCH_DETAIL_VALUES["team_formats"],
+    "playing_levels": _GAME_SEARCH_DETAIL_VALUES["playing_levels"],
+    "venue_provision": frozenset(
+        {"team_has_venue", "needs_opponent_venue", "arrange_jointly"}
+    ),
+    "venue_settings": _GAME_SEARCH_DETAIL_VALUES["venue_settings"],
+    "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
+    "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
+}
 
 SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
     {
@@ -686,6 +696,7 @@ def _validate_run_search(
         allowed_fields = required_fields | {
             "game_search_details",
             "number_of_players",
+            "opponent_search_details",
         }
         if not required_fields <= set(payload) or set(payload) - allowed_fields:
             raise ValueError("RunSearch v2 contains unsupported or missing facts")
@@ -813,6 +824,35 @@ def _validate_run_search(
             for key, values in details.items()
         ):
             raise ValueError("RunSearch has invalid Game Search details")
+    opponent_details = payload.get("opponent_search_details")
+    if opponent_details is not None:
+        if user_intent != "opponent_search" or not isinstance(opponent_details, dict):
+            raise ValueError("RunSearch details require Opponent Search")
+        if set(opponent_details) - (
+            {"times"} | set(_OPPONENT_SEARCH_DETAIL_VALUES)
+        ) or not all(
+            isinstance(values, list)
+            and (key not in {"times", "venue_provision"} or len(values) <= 1)
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and (
+                    value in _OPPONENT_SEARCH_DETAIL_VALUES.get(key, ())
+                    or (
+                        key == "times"
+                        and (
+                            value in {"morning", "daytime", "evening", "night"}
+                            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+                            is not None
+                        )
+                    )
+                )
+                for value in values
+            )
+            for key, values in opponent_details.items()
+        ):
+            raise ValueError("RunSearch has invalid Opponent Search details")
 
 
 def _validate_required_date(value: JsonValue, *, exact_fields: bool) -> None:
@@ -1864,7 +1904,11 @@ def _validate_opportunity_publication_changed(
     source_revision_id = _required_text(payload, "source_message_revision_id")
     source_scope = source_revision_id.rsplit(":revision:", 1)[0]
     opportunity_type = payload["opportunity_type"]
-    if opportunity_type not in {"open_match", "player_match_availability"}:
+    if opportunity_type not in {
+        "open_match",
+        "player_match_availability",
+        "opponent_request",
+    }:
         raise ValueError("Opportunity type is invalid")
     identity_type = str(opportunity_type)
     legacy_identity = f"opportunity:{source_scope}:{identity_type}"
@@ -1984,9 +2028,16 @@ def _validate_opportunity_publication_batch_changed(
         }:
             raise ValueError("OpportunityPublicationChanged v3 item is incomplete")
         opportunity_id = _required_text(opportunity, "opportunity_id")
+        opportunity_type = opportunity["opportunity_type"]
+        if opportunity_type not in {
+            "open_match",
+            "player_match_availability",
+            "opponent_request",
+        }:
+            raise ValueError("OpportunityPublicationChanged v3 item type is invalid")
         if (
             re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability):(?:candidate|proposition):[0-9a-f]{{16}}",
+                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request):(?:candidate|proposition):[0-9a-f]{{16}}",
                 opportunity_id,
             )
             is None
@@ -2002,11 +2053,6 @@ def _validate_opportunity_publication_batch_changed(
             != f"{opportunity_id}:revision:{envelope.subject_revision}"
         ):
             raise ValueError("OpportunityPublicationChanged v3 revision is invalid")
-        if opportunity["opportunity_type"] not in {
-            "open_match",
-            "player_match_availability",
-        }:
-            raise ValueError("OpportunityPublicationChanged v3 type is invalid")
         accepted_facts = opportunity["accepted_facts"]
         if not isinstance(accepted_facts, dict):
             raise TypeError("OpportunityPublicationChanged v3 facts must be an object")
@@ -2059,8 +2105,15 @@ def _validate_publication_response_route(route: dict[str, JsonValue]) -> None:
 def _validate_accepted_opportunity_facts(
     facts: dict[str, JsonValue], opportunity_type: str
 ) -> None:
-    if opportunity_type not in {"open_match", "player_match_availability"}:
+    if opportunity_type not in {
+        "open_match",
+        "player_match_availability",
+        "opponent_request",
+    }:
         raise ValueError("opportunity type is invalid")
+    if opportunity_type == "opponent_request":
+        _validate_opponent_request_accepted_facts(facts)
+        return
     _validate_open_match_accepted_facts(facts, opportunity_type)
 
 
@@ -2251,6 +2304,147 @@ def _validate_open_match_accepted_facts(
     ):
         raise ValueError(f"{opportunity_type} payment details are invalid")
     _required_iso_datetime(facts, "source_posted_at")
+
+
+def _validate_opponent_request_accepted_facts(
+    facts: dict[str, JsonValue],
+) -> None:
+    """Validate the evidence-backed fact snapshot for a symmetric request."""
+    required = {
+        "start_local_date",
+        "end_local_date",
+        "exact_local_time",
+        "day_part",
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "location_verified_disjoint_place_ids",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "opponent_request",
+        "team_formats",
+        "playing_levels",
+        "venue_provision",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "payment_amount",
+        "payment_currency",
+        "source_posted_at",
+        "source_edited_at",
+    }
+    if set(facts) != required:
+        raise ValueError("opponent-request accepted facts are incomplete")
+    try:
+        start = date.fromisoformat(_required_text(facts, "start_local_date"))
+        end = date.fromisoformat(_required_text(facts, "end_local_date"))
+    except ValueError as error:
+        raise ValueError("opponent-request dates must be ISO local dates") from error
+    if end < start:
+        raise ValueError("opponent-request date range must be ordered")
+    for field_name in (
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+    ):
+        _required_text(facts, field_name)
+    if _required_text(facts, "location_geographic_type") not in {
+        "country",
+        "city",
+        *SUB_CITY_GEOGRAPHIC_TYPES,
+    }:
+        raise ValueError("opponent-request geographic type is invalid")
+    parent_ids = facts["location_parent_ids"]
+    if (
+        not isinstance(parent_ids, list)
+        or not parent_ids
+        or not all(isinstance(value, str) and value for value in parent_ids)
+    ):
+        raise TypeError("opponent-request location parents are invalid")
+    disjoint_ids = facts["location_verified_disjoint_place_ids"]
+    if (
+        not isinstance(disjoint_ids, list)
+        or len(disjoint_ids) > 128
+        or not all(isinstance(value, str) and value for value in disjoint_ids)
+        or len(disjoint_ids) != len(set(disjoint_ids))
+        or facts["place_id"] in disjoint_ids
+        or bool(set(parent_ids).intersection(disjoint_ids))
+    ):
+        raise TypeError("opponent-request location disjoint proof is invalid")
+    if facts["opponent_request"] is not True:
+        raise ValueError("opponent-request explicit request fact is required")
+    exact_time = facts["exact_local_time"]
+    if exact_time is not None and (
+        not isinstance(exact_time, str)
+        or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
+    ):
+        raise ValueError("opponent-request exact time is invalid")
+    day_part = facts["day_part"]
+    if day_part not in {None, "morning", "daytime", "evening", "night"}:
+        raise ValueError("opponent-request day part is invalid")
+    if exact_time is not None and day_part is not None:
+        raise ValueError("opponent-request time facts are mutually exclusive")
+    list_allowlists = {
+        "team_formats": set(_GAME_SEARCH_DETAIL_VALUES["team_formats"]),
+        "playing_levels": set(_GAME_SEARCH_DETAIL_VALUES["playing_levels"]),
+        "venue_settings": set(_GAME_SEARCH_DETAIL_VALUES["venue_settings"]),
+        "playing_surfaces": set(_GAME_SEARCH_DETAIL_VALUES["playing_surfaces"]),
+    }
+    for field_name, allowed in list_allowlists.items():
+        values = facts[field_name]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(cast(list[str], values)))
+            or not all(isinstance(value, str) and value in allowed for value in values)
+        ):
+            raise ValueError(f"opponent-request {field_name} is invalid")
+    venue = facts["venue_provision"]
+    if venue is not None and venue not in {
+        "team_has_venue",
+        "needs_opponent_venue",
+        "arrange_jointly",
+    }:
+        raise ValueError("opponent-request Venue Provision is invalid")
+    if facts["payment"] not in {None, "free", "paid"}:
+        raise ValueError("opponent-request payment is invalid")
+    payment_amount = facts["payment_amount"]
+    payment_currency = facts["payment_currency"]
+    if (payment_amount is None) != (payment_currency is None) or (
+        payment_amount is not None
+        and (
+            facts["payment"] != "paid"
+            or not isinstance(payment_amount, str)
+            or not payment_amount
+            or not isinstance(payment_currency, str)
+            or not payment_currency
+        )
+    ):
+        raise ValueError("opponent-request payment details are invalid")
+    _required_iso_datetime(facts, "source_posted_at")
+    source_edited_at = facts["source_edited_at"]
+    if source_edited_at is not None:
+        if not isinstance(source_edited_at, str):
+            raise TypeError("opponent-request source_edited_at must be text or null")
+        _required_iso_datetime(facts, "source_edited_at")
 
 
 def _validate_protected_content_skip(

@@ -27,11 +27,28 @@ _REQUIRED_CANDIDATE_FIELDS = {
     "open_places",
     "response_routes",
 }
+_REQUIRED_OPPONENT_CANDIDATE_FIELDS = {
+    "candidate_key",
+    "opportunity_type",
+    "evidence",
+    "location",
+    "event_time",
+    "response_routes",
+    "opponent_request",
+}
 _REQUIRED_V2_CANDIDATE_FIELDS = _REQUIRED_CANDIDATE_FIELDS | {"source_context"}
 _OPTIONAL_CANDIDATE_FIELDS = {
     "team_formats",
     "positions",
     "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+}
+_OPTIONAL_OPPONENT_CANDIDATE_FIELDS = {
+    "team_formats",
+    "playing_levels",
+    "venue_provision",
     "venue_settings",
     "playing_surfaces",
     "payment",
@@ -64,6 +81,7 @@ _CANONICAL_LISTS = {
         "wood_parquet",
     },
 }
+
 
 PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
@@ -111,13 +129,20 @@ def classifier_output_is_schema_valid(
     if len(candidates) != 1 or not isinstance(candidates[0], dict):
         return False
     candidate = candidates[0]
+    if candidate.get("opportunity_type") == "player_match_availability":
+        return False
+    field_sets = _candidate_field_sets(candidate, require_source_context=False)
+    if field_sets is None:
+        return False
+    required_fields, optional_fields, structured_fields = field_sets
+    opportunity_type = candidate.get("opportunity_type")
+    if not isinstance(opportunity_type, str):
+        return False
+    player_candidate = opportunity_type == "player_match_availability"
+    is_opponent_request = opportunity_type == "opponent_request"
     if (
-        not _REQUIRED_CANDIDATE_FIELDS.issubset(candidate)
-        or set(candidate)
-        - _REQUIRED_CANDIDATE_FIELDS
-        - _OPTIONAL_CANDIDATE_FIELDS
-        - _STRUCTURED_CANDIDATE_FIELDS
-        or candidate.get("opportunity_type") != "open_match"
+        not required_fields.issubset(candidate)
+        or set(candidate) - required_fields - optional_fields - structured_fields
         or not isinstance(candidate.get("candidate_key"), str)
         or not candidate["candidate_key"]
     ):
@@ -126,12 +151,12 @@ def classifier_output_is_schema_valid(
     if not isinstance(candidate_key, str) or not candidate_key:
         return False
     evidence = candidate.get("evidence")
-    expected_evidence = {
-        "opportunity",
-        "event_time",
-        "location",
-        "open_places",
-    } | (set(candidate) & _OPTIONAL_CANDIDATE_FIELDS)
+    expected_evidence = {"opportunity", "event_time", "location"}
+    if is_opponent_request:
+        expected_evidence.add("opponent_request")
+    elif not player_candidate:
+        expected_evidence.add("open_places")
+    expected_evidence |= set(candidate) & optional_fields
     if not (
         isinstance(evidence, dict)
         and set(evidence) == expected_evidence
@@ -143,7 +168,11 @@ def classifier_output_is_schema_valid(
         return False
     location = candidate.get("location")
     event_time = candidate.get("event_time")
-    open_places = candidate.get("open_places")
+    open_places = (
+        None
+        if is_opponent_request or player_candidate
+        else candidate.get("open_places")
+    )
     routes = candidate.get("response_routes")
     if (
         not isinstance(location, dict)
@@ -166,6 +195,7 @@ def classifier_output_is_schema_valid(
                 "iana_timezone",
             },
         )
+        or not _player_count_fields_are_valid(candidate, player_candidate)
         or (
             open_places is not None
             and (
@@ -209,6 +239,17 @@ def classifier_output_is_schema_valid(
             or not all(isinstance(item, str) and item in allowed for item in values)
         ):
             return False
+    if is_opponent_request:
+        if candidate.get("opponent_request") is not True:
+            return False
+        if candidate.get("venue_provision") not in {
+            None,
+            "unknown",
+            "team_has_venue",
+            "needs_opponent_venue",
+            "arrange_jointly",
+        }:
+            return False
     if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
         return False
     if not all(_valid_response_route(route, body=body) for route in routes):
@@ -220,6 +261,7 @@ def classifier_output_is_schema_valid(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        meaning=opportunity_type,
     )
 
 
@@ -289,9 +331,9 @@ def _classifier_output_v2_is_schema_valid(
         if (
             candidate.get("opportunity_type")
             not in (
-                {"open_match", "player_match_availability"}
+                {"open_match", "opponent_request", "player_match_availability"}
                 if allow_player_match_availability
-                else {"open_match"}
+                else {"open_match", "opponent_request"}
             )
             or not isinstance(candidate.get("candidate_key"), str)
             or not candidate["candidate_key"]
@@ -341,6 +383,58 @@ def _source_bound_text_map(value: JsonValue, body: str) -> bool:
     )
 
 
+def _candidate_field_sets(
+    candidate: dict[str, JsonValue], *, require_source_context: bool
+) -> tuple[set[str], set[str], set[str]] | None:
+    """Return strict fields for each supported candidate opportunity type."""
+    opportunity_type = candidate.get("opportunity_type")
+    if opportunity_type == "open_match":
+        required = (
+            _REQUIRED_V2_CANDIDATE_FIELDS
+            if require_source_context
+            else _REQUIRED_CANDIDATE_FIELDS
+        )
+        structured = (
+            _V2_STRUCTURED_CANDIDATE_FIELDS
+            if require_source_context
+            else _STRUCTURED_CANDIDATE_FIELDS
+        )
+        return set(required), set(_OPTIONAL_CANDIDATE_FIELDS), set(structured)
+    if opportunity_type == "player_match_availability":
+        required = (
+            _REQUIRED_V2_CANDIDATE_FIELDS - {"open_places"}
+            if require_source_context
+            else _REQUIRED_CANDIDATE_FIELDS - {"open_places"}
+        )
+        structured = (
+            _V2_STRUCTURED_CANDIDATE_FIELDS
+            if require_source_context
+            else _STRUCTURED_CANDIDATE_FIELDS
+        )
+        return (
+            set(required),
+            set(_OPTIONAL_CANDIDATE_FIELDS | _PLAYER_OPTIONAL_CANDIDATE_FIELDS),
+            set(structured),
+        )
+    if opportunity_type == "opponent_request":
+        required = {
+            "candidate_key",
+            "opportunity_type",
+            "evidence",
+            "location",
+            "event_time",
+            "response_routes",
+            "opponent_request",
+        }
+        if require_source_context:
+            required.add("source_context")
+        structured = {"proposition_evidence"}
+        if require_source_context:
+            structured.add("source_context")
+        return required, set(_OPTIONAL_OPPONENT_CANDIDATE_FIELDS), structured
+    return None
+
+
 def _player_count_fields_are_valid(
     candidate: dict[str, JsonValue], player_candidate: bool
 ) -> bool:
@@ -379,32 +473,21 @@ def _accepted_candidate_is_schema_valid(
     allow_player_match_availability: bool = False,
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
-    player_candidate = (
-        allow_player_match_availability
-        and candidate.get("opportunity_type") == "player_match_availability"
-    )
-    required_fields = (
-        _REQUIRED_V2_CANDIDATE_FIELDS - {"open_places"}
-        if player_candidate
-        else _REQUIRED_V2_CANDIDATE_FIELDS
-    )
-    optional_fields = (
-        _OPTIONAL_CANDIDATE_FIELDS | _PLAYER_OPTIONAL_CANDIDATE_FIELDS
-        if player_candidate
-        else _OPTIONAL_CANDIDATE_FIELDS
-    )
+    allowed_types = {"open_match", "opponent_request"}
+    if allow_player_match_availability:
+        allowed_types.add("player_match_availability")
+    opportunity_type = candidate.get("opportunity_type")
+    if not isinstance(opportunity_type, str) or opportunity_type not in allowed_types:
+        return False
+    field_sets = _candidate_field_sets(candidate, require_source_context=True)
+    if field_sets is None:
+        return False
+    required_fields, optional_fields, structured_fields = field_sets
+    player_candidate = opportunity_type == "player_match_availability"
+    is_opponent_request = opportunity_type == "opponent_request"
     if (
         not required_fields.issubset(candidate)
-        or set(candidate)
-        - required_fields
-        - optional_fields
-        - _V2_STRUCTURED_CANDIDATE_FIELDS
-        or candidate.get("opportunity_type")
-        not in (
-            {"open_match", "player_match_availability"}
-            if allow_player_match_availability
-            else {"open_match"}
-        )
+        or set(candidate) - required_fields - optional_fields - structured_fields
         or not isinstance(candidate.get("candidate_key"), str)
         or not candidate["candidate_key"]
     ):
@@ -413,7 +496,9 @@ def _accepted_candidate_is_schema_valid(
     assert isinstance(candidate_key, str)
     evidence = candidate.get("evidence")
     expected_evidence = {"opportunity", "event_time", "location"}
-    if not player_candidate:
+    if is_opponent_request:
+        expected_evidence.add("opponent_request")
+    elif not player_candidate:
         expected_evidence.add("open_places")
     expected_evidence |= set(candidate) & optional_fields
     if (
@@ -475,6 +560,17 @@ def _accepted_candidate_is_schema_valid(
             or not all(isinstance(item, str) and item in allowed for item in values)
         ):
             return False
+    if is_opponent_request:
+        if candidate.get("opponent_request") is not True:
+            return False
+        if candidate.get("venue_provision") not in {
+            None,
+            "unknown",
+            "team_has_venue",
+            "needs_opponent_venue",
+            "arrange_jointly",
+        }:
+            return False
     if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
         return False
     if not all(_valid_response_route(route, body=body) for route in routes):
@@ -493,7 +589,7 @@ def _accepted_candidate_is_schema_valid(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
-        meaning=("player_match_availability" if player_candidate else "open_match"),
+        meaning=opportunity_type,
     )
 
 
@@ -558,6 +654,9 @@ def proposition_evidence_is_schema_valid(
             return False
     elif meaning == "player_match_availability":
         if "open_places" in facts or len(facts) < 3:
+            return False
+    elif meaning == "opponent_request":
+        if "opponent_request" not in facts or len(facts) < 4:
             return False
     else:
         return False
