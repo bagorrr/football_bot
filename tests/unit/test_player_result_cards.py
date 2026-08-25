@@ -99,6 +99,7 @@ def test_unknown_selected_quantity_is_visible_on_possible_player_card() -> None:
 
     assert "Needs clarification: number of players." in message.text
     assert "Additional: number of players" not in message.text
+    assert "Saint Petersburg\n\n\n" not in message.text
 
 
 def test_below_request_range_remains_visible_and_is_needs_clarification() -> None:

@@ -27,6 +27,14 @@ from modules.classifier_contract import (
     semantic_proof_is_authoritative,
     semantic_proof_is_schema_valid,
 )
+from modules.classifier_promotion import (
+    PLAYER_REQUIRED_CASE_FAMILIES,
+    PLAYER_REVIEWED_CORPUS_CASE_COUNT,
+    controlled_player_promotion_replay_digests,
+    describe_player_classifier_release,
+    player_classifier_promotion_evidence,
+    player_classifier_promotion_is_approved,
+)
 from modules.contracts import JsonValue
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
@@ -360,7 +368,7 @@ def _player_evaluation_output(case: dict[str, JsonValue]) -> dict[str, JsonValue
         if count_kind == "exact":
             value = count["value"]
             candidate["available_player_count"] = value
-            evidence["available_player_count"] = f"{value} players"
+            evidence["available_player_count"] = evidence["opportunity"]
         elif count_kind == "range":
             minimum = count["minimum"]
             maximum = count["maximum"]
@@ -379,6 +387,56 @@ def _player_evaluation_output(case: dict[str, JsonValue]) -> dict[str, JsonValue
         "candidates": [candidate],
         "routing": {"reason_code": "accepted", "required_context": "none"},
     }
+
+
+def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() -> None:
+    release = describe_player_classifier_release()
+
+    assert release.reviewed_corpus_case_count == PLAYER_REVIEWED_CORPUS_CASE_COUNT
+    assert release.reviewed_corpus_case_ids == tuple(
+        f"sm-{case_number:03d}"
+        for case_number in range(1, PLAYER_REVIEWED_CORPUS_CASE_COUNT + 1)
+    )
+    assert release.required_case_families == PLAYER_REQUIRED_CASE_FAMILIES
+    assert release.lifecycle_failure_suite_families == PLAYER_REQUIRED_CASE_FAMILIES
+    assert release.required_replays == 3
+    assert release.requested_model == "gpt-5.6-sol"
+    assert release.requested_reasoning_effort == "high"
+    assert release.proposal_only is True
+
+    evidence = player_classifier_promotion_evidence(
+        release,
+        replay_digests=controlled_player_promotion_replay_digests(release),
+    )
+    approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": evidence,
+    }
+    assert player_classifier_promotion_is_approved(approval)
+    proposal: dict[str, JsonValue] = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "player-match-primary-v1",
+        "schema_version": "source-message-classification-v3",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-player-v1",
+        "classification_status": "succeeded",
+    }
+    assert player_classifier_promotion_is_approved(approval, proposal=proposal)
+    assert not player_classifier_promotion_is_approved(
+        approval,
+        proposal={**proposal, "schema_version": "source-message-classification-v2"},
+    )
+    assert not player_classifier_promotion_is_approved(None)
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "release_fingerprint": "0" * 64}
+    )
 
 
 def test_player_evaluation_contract_is_a_deterministic_promotion_gate() -> None:
@@ -534,6 +592,18 @@ def test_player_evaluation_contract_is_a_deterministic_promotion_gate() -> None:
     assert replay_metrics[0][0] >= 5
     assert replay_metrics[0][1] == replay_metrics[0][0]
     assert replay_metrics[0][2] == len(cases)
+    release = describe_player_classifier_release()
+    approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": player_classifier_promotion_evidence(
+            release,
+            replay_digests=tuple(replay_digests),
+        ),
+    }
+    assert player_classifier_promotion_is_approved(approval)
 
 
 def test_player_semantic_proof_provider_path_allows_unknown_quantity() -> None:

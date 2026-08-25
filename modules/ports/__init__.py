@@ -915,6 +915,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read protected candidate state for a retryable semantic-proof pass."""
         ...
 
+    def classifier_release_promotion(
+        self, *, release_name: str
+    ) -> dict[str, JsonValue] | None:
+        """Read the latest durable promotion state for one classifier release."""
+        ...
+
+    def record_classifier_release_promotion(
+        self,
+        *,
+        release: dict[str, JsonValue],
+        recorded_at: datetime,
+    ) -> None:
+        """Record explicit versioned classifier promotion evidence."""
+        ...
+
     def proposition_opportunity_ids(
         self, source_message_id: str
     ) -> tuple[tuple[int, str], ...]:

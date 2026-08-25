@@ -116,6 +116,47 @@ def test_negative_availability_polarity_is_rejected_in_four_locales(
 
 
 @pytest.mark.parametrize(
+    ("negative", "positive"),
+    (
+        (
+            "4 players available but cannot play for the match.",
+            "4 players available and can play for the match.",
+        ),
+        (
+            "4 игрока доступны, но не можем играть на матч.",
+            "4 игрока доступны и можем играть на матч.",
+        ),
+        (
+            "4 jugadores disponibles pero no podemos jugar el partido.",
+            "4 jugadores disponibles y podemos jugar el partido.",
+        ),
+        (
+            "4 joueurs disponibles mais ne peuvent pas jouer le match.",
+            "4 joueurs disponibles et peuvent jouer le match.",
+        ),
+    ),
+)
+def test_cannot_play_polarity_is_rejected_with_positive_counterparts(
+    negative: str,
+    positive: str,
+) -> None:
+    assert not _player_availability_is_supported(
+        4,
+        None,
+        None,
+        negative,
+        authoritative_body=negative,
+    )
+    assert _player_availability_is_supported(
+        4,
+        None,
+        None,
+        positive,
+        authoritative_body=positive,
+    )
+
+
+@pytest.mark.parametrize(
     "text",
     (
         "We are 4 players available for the match.",

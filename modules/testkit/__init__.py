@@ -22,6 +22,12 @@ from modules.application import (
     RuntimeApplication,
     RuntimeProcessingError,
 )
+from modules.classifier_promotion import (
+    PLAYER_CLASSIFIER_RELEASE_NAME,
+    controlled_player_promotion_replay_digests,
+    describe_player_classifier_release,
+    player_classifier_promotion_evidence,
+)
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
     ContractDefinition,
@@ -2092,6 +2098,41 @@ class AcceptanceSpine:
     ) -> tuple[ClassificationRoutingOutcome, ...]:
         """Observe body-free Application classifier routing state."""
         return self._observer.classification_routing_outcomes()
+
+    def record_player_classifier_promotion(
+        self,
+        *,
+        release_fingerprint: str | None = None,
+        state: str = "approved",
+    ) -> None:
+        """Record explicit controlled evidence for the exact Player release."""
+        release = describe_player_classifier_release()
+        evidence = player_classifier_promotion_evidence(
+            release,
+            replay_digests=controlled_player_promotion_replay_digests(release),
+        )
+        promotion: dict[str, JsonValue] = {
+            "release_name": PLAYER_CLASSIFIER_RELEASE_NAME,
+            "contract_version": release.contract_version,
+            "release_fingerprint": (
+                release.release_fingerprint
+                if release_fingerprint is None
+                else release_fingerprint
+            ),
+            "state": state,
+            "evidence": evidence,
+        }
+        application = self._roles[RuntimeRole.APPLICATION]
+        application.store.record_classifier_release_promotion(
+            release=promotion,
+            recorded_at=application.clock.now(),
+        )
+
+    def player_classifier_promotion(self) -> dict[str, JsonValue] | None:
+        """Observe durable Player promotion evidence through Application."""
+        return self._roles[RuntimeRole.APPLICATION].store.classifier_release_promotion(
+            release_name=PLAYER_CLASSIFIER_RELEASE_NAME
+        )
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""

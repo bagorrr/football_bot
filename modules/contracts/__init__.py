@@ -55,6 +55,7 @@ class ContractName(StrEnum):
     SOURCE_CHAT_REGISTRATION_FAILED = "SourceChatRegistrationFailed"
     SOURCE_CHAT_GENERATION_CHANGED = "SourceChatGenerationChanged"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
+    CLASSIFIER_RELEASE_PROMOTION_APPROVED = "ClassifierReleasePromotionApproved"
     OWNER_STATE_WRITE = "OwnerStateWrite"
 
 
@@ -338,6 +339,13 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.BOT_ASSISTANT,
         None,
         "delivery_id",
+    ),
+    ContractDefinition(
+        ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED,
+        1,
+        RuntimeRole.APPLICATION,
+        None,
+        "release_name",
     ),
 )
 

@@ -4053,6 +4053,114 @@ class PostgresRoleStore:
             ),
         )
 
+    def classifier_release_promotion(
+        self, *, release_name: str
+    ) -> dict[str, JsonValue] | None:
+        """Read the latest Application-owned classifier promotion state."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT payload
+                FROM football_runtime.contract_outbox
+                WHERE producer_role = %s
+                  AND consumer_role IS NULL
+                  AND contract_name = %s
+                  AND subject_id = %s
+                ORDER BY recorded_at DESC, message_id DESC
+                LIMIT 1
+                """,
+                (
+                    RuntimeRole.APPLICATION.value,
+                    ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
+                    release_name,
+                ),
+            ).fetchone()
+        if row is None or not isinstance(row["payload"], dict):
+            return None
+        return cast(dict[str, JsonValue], row["payload"])
+
+    def record_classifier_release_promotion(
+        self,
+        *,
+        release: dict[str, JsonValue],
+        recorded_at: datetime,
+    ) -> None:
+        """Persist explicit versioned classifier promotion evidence."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        release_name = release.get("release_name")
+        release_fingerprint = release.get("release_fingerprint")
+        if (
+            not isinstance(release_name, str)
+            or not release_name
+            or not isinstance(release_fingerprint, str)
+            or not release_fingerprint
+        ):
+            raise ValueError("classifier release promotion identity is incomplete")
+        message_id = uuid5(
+            NAMESPACE_URL,
+            (
+                "football-bot:classifier-release-promotion:"
+                f"{release_name}:{release_fingerprint}"
+            ),
+        )
+        causation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{message_id}:causation",
+        )
+        correlation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{message_id}:correlation",
+        )
+        envelope = ContractEnvelope(
+            contract_name=ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED,
+            contract_version=1,
+            message_id=message_id,
+            producer=RuntimeRole.APPLICATION,
+            consumer=None,
+            subject_id=release_name,
+            subject_revision=1,
+            idempotency_key=(
+                f"classifier-release-promotion:{release_name}:{release_fingerprint}"
+            ),
+            causation_id=causation_id,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+            payload=release,
+        )
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.contract_outbox (
+                    message_id, producer_role, consumer_role, contract_name,
+                    contract_version, subject_id, subject_revision,
+                    idempotency_key, causation_id, correlation_id, recorded_at,
+                    payload, source_chat_admission_provenance_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (producer_role, idempotency_key) DO NOTHING
+                """,
+                (
+                    envelope.message_id,
+                    envelope.producer.value,
+                    None,
+                    envelope.contract_name.value,
+                    envelope.contract_version,
+                    envelope.subject_id,
+                    envelope.subject_revision,
+                    envelope.idempotency_key,
+                    envelope.causation_id,
+                    envelope.correlation_id,
+                    envelope.recorded_at,
+                    json.dumps(envelope.json_payload()),
+                    None,
+                ),
+            )
+
     def proposition_opportunity_ids(
         self, source_message_id: str
     ) -> tuple[tuple[int, str], ...]:

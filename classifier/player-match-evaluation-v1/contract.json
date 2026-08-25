@@ -12,6 +12,17 @@
     "semantic_proof_schema_version": "source-semantic-proof-v2",
     "routing_policy_version": "classifier-routing-player-v1"
   },
+  "reviewed_corpus": {
+    "path": "docs/product/source-message-corpus-v1.yaml",
+    "format": "yaml",
+    "case_count": 38,
+    "case_id_range": "sm-001..sm-038",
+    "controlled_event_sequence_ids": ["controlled-event-001"]
+  },
+  "controlled_lifecycle_failure_suite": {
+    "path": "classifier/player-match-evaluation-v1/lifecycle-failure-suite.json",
+    "version": "player-match-lifecycle-failure-v1"
+  },
   "promotion_gate": {
     "deterministic": true,
     "required_replays": 3,
@@ -210,6 +221,90 @@
       "family": "polarity",
       "source": "No players are available for the match in Moscow on 2026-09-16.",
       "expected": {"disposition": "needs_review", "candidate_count": 0, "reason_code": "needs_review"}
+    },
+    {
+      "case_id": "negative-english-cannot-play",
+      "family": "polarity",
+      "source": "4 players available but cannot play in Moscow on 2026-09-17.",
+      "expected": {"disposition": "needs_review", "candidate_count": 0, "reason_code": "needs_review"}
+    },
+    {
+      "case_id": "negative-russian-cannot-play",
+      "family": "polarity",
+      "source": "4 игрока доступны, но не можем играть в Москве 2026-09-18.",
+      "expected": {"disposition": "needs_review", "candidate_count": 0, "reason_code": "needs_review"}
+    },
+    {
+      "case_id": "negative-spanish-cannot-play",
+      "family": "polarity",
+      "source": "4 jugadores disponibles pero no podemos jugar en Madrid el 2026-09-19.",
+      "expected": {"disposition": "needs_review", "candidate_count": 0, "reason_code": "needs_review"}
+    },
+    {
+      "case_id": "negative-french-cannot-play",
+      "family": "polarity",
+      "source": "4 joueurs disponibles mais ne peuvent pas jouer à Paris le 2026-09-20.",
+      "expected": {"disposition": "needs_review", "candidate_count": 0, "reason_code": "needs_review"}
+    },
+    {
+      "case_id": "positive-english-can-play",
+      "family": "polarity",
+      "source": "4 players available and can play in Moscow on 2026-09-21.",
+      "fixture": {
+        "candidate_key": "player-positive-english",
+        "evidence": {
+          "opportunity": "4 players available and can play",
+          "event_time": "2026-09-21",
+          "location": "Moscow"
+        },
+        "count": {"kind": "exact", "value": 4}
+      },
+      "expected": {"disposition": "accepted", "candidate_count": 1, "application_supported": true}
+    },
+    {
+      "case_id": "positive-russian-can-play",
+      "family": "polarity",
+      "source": "4 игрока доступны и могут играть в Москве 2026-09-22.",
+      "fixture": {
+        "candidate_key": "player-positive-russian",
+        "evidence": {
+          "opportunity": "4 игрока доступны и могут играть",
+          "event_time": "2026-09-22",
+          "location": "Москве"
+        },
+        "count": {"kind": "exact", "value": 4}
+      },
+      "expected": {"disposition": "accepted", "candidate_count": 1, "application_supported": true}
+    },
+    {
+      "case_id": "positive-spanish-can-play",
+      "family": "polarity",
+      "source": "4 jugadores disponibles y pueden jugar en Madrid el 2026-09-23.",
+      "fixture": {
+        "candidate_key": "player-positive-spanish",
+        "evidence": {
+          "opportunity": "4 jugadores disponibles y pueden jugar",
+          "event_time": "2026-09-23",
+          "location": "Madrid"
+        },
+        "count": {"kind": "exact", "value": 4}
+      },
+      "expected": {"disposition": "accepted", "candidate_count": 1, "application_supported": true}
+    },
+    {
+      "case_id": "positive-french-can-play",
+      "family": "polarity",
+      "source": "4 joueurs disponibles et peuvent jouer à Paris le 2026-09-24.",
+      "fixture": {
+        "candidate_key": "player-positive-french",
+        "evidence": {
+          "opportunity": "4 joueurs disponibles et peuvent jouer",
+          "event_time": "2026-09-24",
+          "location": "Paris"
+        },
+        "count": {"kind": "exact", "value": 4}
+      },
+      "expected": {"disposition": "accepted", "candidate_count": 1, "application_supported": true}
     }
   ]
 }

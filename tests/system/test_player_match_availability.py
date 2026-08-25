@@ -130,6 +130,55 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
         city_id="city:ru:saint-petersburg",
     )
 
+    unapproved_body = (
+        "Football match 20 August 2026 in whole city. We are 4 players "
+        "available to play. Contact @player_unapproved."
+    )
+    classifier.return_for(
+        body=unapproved_body,
+        result=_player_classifier_result(
+            candidate_key="unapproved",
+            body=unapproved_body,
+            count_evidence="We are 4 players available to play",
+            exact_count=4,
+            minimum_count=None,
+            maximum_count=None,
+            contact="@player_unapproved",
+        ),
+    )
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4952),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4953),
+        source_event_id="source-event:player-match:unapproved",
+        telegram_message_id=5199,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=unapproved_body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    denied_revision = next(
+        revision
+        for revision in system.source_message_revisions()
+        if revision.body == unapproved_body
+    )
+    assert not system.opportunities()
+    assert (
+        system.opportunity_publication_contracts(
+            denied_revision.source_message_revision_id
+        )
+        == ()
+    )
+    assert system.player_classifier_promotion() is None
+
+    system.record_player_classifier_promotion()
+    assert system.player_classifier_promotion() is not None
+
     cases = (
         (
             "exact-four",
@@ -181,7 +230,7 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
         minimum_count,
         maximum_count,
         contact,
-    ) in enumerate(cases, start=1):
+    ) in enumerate(cases, start=2):
         classifier.return_for(
             body=body,
             result=_player_classifier_result(

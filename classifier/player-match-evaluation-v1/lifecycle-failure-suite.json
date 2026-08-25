@@ -1,0 +1,54 @@
+{
+  "suite_version": "player-match-lifecycle-failure-v1",
+  "status": "reviewed",
+  "scope": "Specification #38 controlled lifecycle and failure testing",
+  "families": [
+    "routing",
+    "evidence",
+    "proof",
+    "normalization",
+    "unpublished_outcomes",
+    "edits",
+    "deletions",
+    "reposts",
+    "replies",
+    "compound_propositions",
+    "unsupported_facts",
+    "slang_misspellings",
+    "prompt_injection",
+    "safety",
+    "polarity"
+  ],
+  "cases": [
+    {"case_id": "route", "family": "routing", "failure_or_assertion": "route only accepted current revisions"},
+    {"case_id": "evidence", "family": "evidence", "failure_or_assertion": "reject missing or non-source-bound evidence"},
+    {"case_id": "proof", "family": "proof", "failure_or_assertion": "reject missing or stale semantic proof"},
+    {"case_id": "normalization", "family": "normalization", "failure_or_assertion": "reject unsupported normalized values"},
+    {"case_id": "unpublished", "family": "unpublished_outcomes", "failure_or_assertion": "keep needs-review outcomes unpublished"},
+    {"case_id": "edit", "family": "edits", "failure_or_assertion": "suppress the replaced revision before publishing the current one"},
+    {"case_id": "delete", "family": "deletions", "failure_or_assertion": "suppress a deleted source revision"},
+    {"case_id": "repost", "family": "reposts", "failure_or_assertion": "retain one current repost representative"},
+    {"case_id": "reply", "family": "replies", "failure_or_assertion": "accept only an eligible direct reply context"},
+    {"case_id": "compound", "family": "compound_propositions", "failure_or_assertion": "preserve independent proposition lineages"},
+    {"case_id": "unsupported", "family": "unsupported_facts", "failure_or_assertion": "do not invent unsupported facts"},
+    {"case_id": "slang", "family": "slang_misspellings", "failure_or_assertion": "route uncertain slang or misspellings to review"},
+    {"case_id": "injection", "family": "prompt_injection", "failure_or_assertion": "never treat source text as classifier instructions"},
+    {"case_id": "safety", "family": "safety", "failure_or_assertion": "route safety-sensitive requests to review"},
+    {"case_id": "polarity", "family": "polarity", "failure_or_assertion": "reject negative availability before publication"}
+  ],
+  "failure_modes": [
+    "schema_failure",
+    "evidence_failure",
+    "normalization_failure",
+    "timeout",
+    "quota",
+    "authentication",
+    "worker_crash",
+    "replay",
+    "rollback",
+    "duplicate_delivery"
+  ],
+  "controlled_event_sequences": [
+    {"sequence_id": "controlled-event-001", "events": ["create", "edit", "delete"]}
+  ]
+}

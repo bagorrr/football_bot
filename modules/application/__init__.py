@@ -23,6 +23,11 @@ from modules.classifier_contract import (
     semantic_proof_is_authoritative,
     semantic_proof_is_schema_valid,
 )
+from modules.classifier_promotion import (
+    PLAYER_CLASSIFIER_RELEASE_NAME,
+    player_classifier_promotion_is_approved,
+    player_classifier_proposal_contains_player,
+)
 from modules.contracts import (
     SUB_CITY_GEOGRAPHIC_TYPES,
     SUPPORTED_CONTRACTS,
@@ -6487,13 +6492,14 @@ def _open_match_result_message(
         if key not in confirmed_keys and known_values.get(key)
     )
     additional_copy = f"\n{labels[8]}: {additional}\n" if additional else ""
+    detail_line = f"{details}\n" if details else ""
     route_copy = render_response_route(
         facts["response_route_kind"],
         facts["response_route_value"],
         copy_locale,
     )
     text = (
-        f"{title}\n{when}\n{where}\n{details}\n\n"
+        f"{title}\n{when}\n{where}\n{detail_line}\n"
         f"{possible_copy}{match_copy}\n{additional_copy}\n"
         f"{labels[3]}: {posted}\n"
         f"{labels[4]}: {route_copy}\n\n"
@@ -10063,6 +10069,28 @@ class RuntimeApplication:
             "eligible_reply_context": authoritative_reply_context,
             "validation_time": self.clock.now().isoformat(),
         }
+        if (
+            incoming.contract_version != 4
+            and player_classifier_proposal_contains_player(authoritative_payload)
+            and not player_classifier_promotion_is_approved(
+                self.store.classifier_release_promotion(
+                    release_name=PLAYER_CLASSIFIER_RELEASE_NAME
+                ),
+                proposal=authoritative_payload,
+            )
+        ):
+            self._record_classification_routing_outcome(
+                incoming=incoming,
+                outcome=_classification_routing_outcome(
+                    authoritative_payload,
+                    source_message_revision_id=revision_id,
+                    reason_code="application_validation_failed",
+                    recorded_at=self.clock.now(),
+                    pass_number=_classification_pass_number(authoritative_payload),
+                ),
+                received_at=self.clock.now(),
+            )
+            return
         if incoming.contract_version == 4:
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
@@ -10135,6 +10163,30 @@ class RuntimeApplication:
                         authoritative_payload,
                         source_message_revision_id=revision_id,
                         reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                        pass_number=(
+                            v4_pass_number if isinstance(v4_pass_number, int) else 1
+                        ),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            if player_classifier_proposal_contains_player(
+                authoritative_payload
+            ) and not (
+                player_classifier_promotion_is_approved(
+                    self.store.classifier_release_promotion(
+                        release_name=PLAYER_CLASSIFIER_RELEASE_NAME
+                    ),
+                    proposal=authoritative_payload,
+                )
+            ):
+                self._record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="application_validation_failed",
                         recorded_at=self.clock.now(),
                         pass_number=(
                             v4_pass_number if isinstance(v4_pass_number, int) else 1
@@ -15508,19 +15560,24 @@ def _source_player_opening_state(body: str) -> PropositionState:
     negative_availability_patterns = (
         r"\b(?:unavailable|not\s+available|not\s+free\s+to\s+play|"
         r"not\s+ready\s+to\s+play)\b",
+        r"\b(?:cannot|can\s+not|can\s+t|unable\s+to)\s+"
+        r"(?:play|join)\b",
         r"\b(?:no|zero)\s+(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
         r"\b(?:available|free\s+to\s+play|ready\s+to\s+play|can\s+play)\b",
         r"\b(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
         r"\b(?:are|is|we\s+are|we\s+re)\s+not\s+"
         r"(?:available|free\s+to\s+play|ready\s+to\s+play)\b",
         r"\b(?:недоступн\w*|не\s+доступн\w*|не\s+готов\w*|"
-        r"не\s+могут\s+играть|нет\s+(?:игрок\w*|групп\w*))\b",
+        r"не\s+(?:могу|можем|может|могут)\s+играть|"
+        r"нет\s+(?:игрок\w*|групп\w*))\b",
         r"\b(?:indisponible\w*|no\s+(?:estamos|están|son|pueden)\s+"
         r"disponible\w*|no\s+disponible\w*|ningún\w*\s+"
-        r"(?:jugador\w*|grupo)|no\s+hay\s+(?:jugador\w*))\b",
+        r"(?:jugador\w*|grupo)|no\s+(?:podemos|pueden|puede|puedo)\s+"
+        r"(?:jugar|participar)|no\s+hay\s+(?:jugador\w*))\b",
         r"\b(?:indisponible\w*|ne\s+(?:sommes|sont|peuvent)\s+pas\s+"
-        r"disponible\w*|pas\s+disponible\w*|aucun\w*\s+"
-        r"(?:joueur\w*|groupe))\b",
+        r"disponible\w*|ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+"
+        r"pas\s+(?:jouer|participer)|pas\s+disponible\w*|"
+        r"aucun\w*\s+(?:joueur\w*|groupe))\b",
     )
     if any(
         re.search(pattern, normalized) is not None
