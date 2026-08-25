@@ -2407,6 +2407,7 @@ def _validate_transfer_accepted_facts(
         "location_geographic_type",
         "location_parent_ids",
         "location_verified_disjoint_place_ids",
+        "iana_timezone",
         "city_display_en",
         "city_display_ru",
         "city_display_es",
@@ -2442,6 +2443,7 @@ def _validate_transfer_accepted_facts(
         "place_display_ru",
         "place_display_es",
         "place_display_fr",
+        "iana_timezone",
     ):
         _required_text(facts, field_name)
     if _required_text(facts, "location_geographic_type") not in {

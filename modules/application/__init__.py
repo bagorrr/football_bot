@@ -3257,16 +3257,13 @@ class ConversationOnboarding:
         screen_revision: int,
         text: str,
     ) -> None:
-        """Validate a local start date into the temporary timing draft."""
-        normalized = _normalize_transfer_timing_text(text, kind="start_local_date")
-        if normalized is None:
-            raise ValueError("Transfer Search start date is invalid")
+        """Interpret one local start date into the temporary timing draft."""
         self._change_transfer_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
-            operation="submit_timing",
-            value=normalized,
+            operation="submit_start_date_text",
+            value=text,
         )
 
     def open_transfer_search_seasonal_timing_season(
@@ -3311,6 +3308,62 @@ class ConversationOnboarding:
             screen_revision=screen_revision,
             operation="back",
         )
+
+    def _interpret_transfer_start_date_text(
+        self,
+        *,
+        text: str,
+        locale: str,
+        draft: DiscoveryDraft,
+    ) -> str:
+        """Resolve one current-or-future local date through the date boundary."""
+        if draft.city is None or not draft.city.iana_timezone:
+            raise ValueError("Transfer Search start date is invalid")
+        now = self._clock.now()
+        if now.tzinfo is None:
+            raise RuntimeError("authoritative UTC clock returned a naive instant")
+        authoritative_utc = now.astimezone(UTC)
+        timezone_name = draft.city.iana_timezone
+        try:
+            resolved_timezone = self._timezone_data.resolve(timezone_name)
+        except TimezoneDataError as error:
+            raise ValueError("Transfer Search start date is invalid") from error
+        if (
+            resolved_timezone.iana_timezone != timezone_name
+            or re.fullmatch(r"\S+", resolved_timezone.version) is None
+        ):
+            raise ValueError("Transfer Search start date is invalid")
+        current_local_date = authoritative_utc.astimezone(
+            resolved_timezone.timezone
+        ).date()
+        try:
+            resolution = self._date_interpretation.interpret(
+                DateInterpretationQuery(
+                    text=text,
+                    locale=locale,
+                    authoritative_utc=authoritative_utc,
+                    current_local_date=current_local_date,
+                    iana_timezone=timezone_name,
+                    timezone_data_version=resolved_timezone.version,
+                )
+            )
+        except DateInterpretationError as error:
+            raise ValueError("Transfer Search start date is invalid") from error
+        interpretations = tuple(
+            dict.fromkeys(
+                proposal
+                for proposal in resolution.interpretations
+                if proposal.start_local_date == proposal.end_local_date
+                and _valid_required_date_proposal(
+                    proposal,
+                    timezone_name=timezone_name,
+                    current_local_date=current_local_date,
+                )
+            )
+        )
+        if len(interpretations) != 1:
+            raise ValueError("Transfer Search start date is invalid")
+        return f"start_local_date:{interpretations[0].start_local_date.isoformat()}"
 
     def _change_transfer_search_details(
         self,
@@ -3389,6 +3442,21 @@ class ConversationOnboarding:
                 if value is None or not _canonical_transfer_timing(value):
                     raise ValueError("Transfer Search Seasonal Timing is invalid")
                 temporary = [value]
+                timing_prompt = None
+                target = "submenu"
+            elif operation == "submit_start_date_text":
+                if editing != "seasonal_timing" or timing_prompt != "start_local_date":
+                    raise RuntimeError(
+                        "Transfer Search Seasonal Timing date prompt is not open"
+                    )
+                if current.locale is None or value is None:
+                    raise ValueError("Transfer Search start date is invalid")
+                normalized = self._interpret_transfer_start_date_text(
+                    text=value,
+                    locale=current.locale,
+                    draft=draft,
+                )
+                temporary = [normalized]
                 timing_prompt = None
                 target = "submenu"
             elif operation == "commit":
@@ -15451,6 +15519,11 @@ def _validated_transfer_proposal(
     timing = candidate.get("seasonal_timing")
     if timing is not None and not _seasonal_timing_is_valid(timing):
         return None
+    boundary_body = (
+        validation_body
+        if isinstance(source_context, str)
+        else _transfer_candidate_boundary_text(evidence, opportunity_type)
+    )
     if (
         mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
@@ -15464,7 +15537,8 @@ def _validated_transfer_proposal(
             str(evidence["seasonal_timing"]) if "seasonal_timing" in evidence else None,
             authoritative_body=validation_body,
         )
-        or not _body_establishes_transfer_opportunity(body, opportunity_type)
+        or not _body_establishes_transfer_opportunity(boundary_body, opportunity_type)
+        or not _transfer_offer_is_single_player(validation_body, opportunity_type)
     ):
         return None
     source_posted_at = payload_value.get("source_posted_at")
@@ -15511,6 +15585,7 @@ def _validated_transfer_proposal(
         "location_verified_disjoint_place_ids": list(
             places[0].verified_disjoint_place_ids
         ),
+        "iana_timezone": places[0].iana_timezone,
         **{
             f"city_display_{locale}": label
             for locale, label in city_display_labels.items()
@@ -15707,6 +15782,37 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
         if explicit_long_term is None:
             return False
     return True
+
+
+def _transfer_candidate_boundary_text(
+    evidence: dict[str, JsonValue], opportunity_type: str
+) -> str:
+    """Build the candidate-local boundary evidence for v1 proposals."""
+    return " ".join(
+        value
+        for key in ("opportunity", opportunity_type, "seasonal_timing")
+        if isinstance((value := evidence.get(key)), str)
+    )
+
+
+def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
+    """Reject plural Player Transfer Availability offers as one Player."""
+    if opportunity_type != "player_transfer_availability":
+        return True
+    return (
+        re.search(
+            r"\b(?:players|several\s+players|multiple\s+players|two\s+players|"
+            r"three\s+players|four\s+players|pair\s+of\s+players|"
+            r"group\s+of\s+players|игроки|игроков|игроками|несколько\s+игрок\w*|"
+            r"два\s+игрок\w*|три\s+игрок\w*|пара\s+игрок\w*|"
+            r"jugadores|varios\s+jugador\w*|m[úu]ltiples\s+jugador\w*|"
+            r"dos\s+jugador\w*|grupo\s+de\s+jugador\w*|"
+            r"joueurs|plusieurs\s+joueur\w*|deux\s+joueur\w*|"
+            r"groupe\s+de\s+joueur\w*)\b",
+            body.casefold(),
+        )
+        is None
+    )
 
 
 def _body_establishes_current_open_match(body: str) -> bool:

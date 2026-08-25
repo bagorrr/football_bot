@@ -6,7 +6,10 @@ from typing import cast
 
 import pytest
 
-from modules.application import _body_establishes_transfer_opportunity
+from modules.application import (
+    _body_establishes_transfer_opportunity,
+    _transfer_offer_is_single_player,
+)
 from modules.classifier_contract import JsonValue, classifier_output_is_schema_valid
 from modules.domain import (
     CompletedSearch,
@@ -40,6 +43,9 @@ def _opportunity(
     *,
     timing: dict[str, str | None] | None = None,
     positions: list[str] | None = None,
+    identifier: str | None = None,
+    source_posted_at: str = "2026-08-18T08:00:00+00:00",
+    source_edited_at: str | None = None,
 ) -> OpportunityRevisionProjection:
     facts: dict[str, object] = {
         "country_id": "country:ru",
@@ -48,7 +54,7 @@ def _opportunity(
         "location_geographic_type": "city",
         "location_parent_ids": ["country:ru"],
         "location_verified_disjoint_place_ids": [],
-        "source_posted_at": "2026-08-18T08:00:00+00:00",
+        "source_posted_at": source_posted_at,
         "city_display_en": "Saint Petersburg",
         "city_display_ru": "Санкт-Петербург",
         "city_display_es": "San Petersburgo",
@@ -60,10 +66,13 @@ def _opportunity(
         "seasonal_timing": timing,
         "positions": positions,
     }
+    if source_edited_at is not None:
+        facts["source_edited_at"] = source_edited_at
     facts[opportunity_type] = True
+    opportunity_key = identifier or opportunity_type
     return OpportunityRevisionProjection(
-        opportunity_id=f"opportunity:{opportunity_type}",
-        opportunity_revision_id=f"opportunity:{opportunity_type}:revision:1",
+        opportunity_id=f"opportunity:{opportunity_key}",
+        opportunity_revision_id=f"opportunity:{opportunity_key}:revision:1",
         opportunity_type=opportunity_type,
         publication_state="active",
         accepted_facts=facts,
@@ -152,6 +161,31 @@ def test_transfer_search_exact_timing_rejects_adjacent_season() -> None:
     assert results == ()
 
 
+def test_transfer_search_orders_by_freshest_current_source_assertion() -> None:
+    results = evaluate_transfer_search(
+        _search(UserIntent.NEW_TEAM_SEARCH),
+        {},
+        (
+            _opportunity(
+                "roster_vacancy",
+                identifier="older",
+                source_posted_at="2026-08-18T08:00:00+00:00",
+                source_edited_at="2026-08-19T08:00:00+00:00",
+            ),
+            _opportunity(
+                "roster_vacancy",
+                identifier="fresher",
+                source_posted_at="2026-08-18T08:00:00+00:00",
+                source_edited_at="2026-08-20T08:00:00+00:00",
+            ),
+        ),
+    )
+    assert [result.result_id for result in results] == [
+        "result:completed-search:transfer:opportunity:fresher",
+        "result:completed-search:transfer:opportunity:older",
+    ]
+
+
 @pytest.mark.parametrize(
     ("body", "opportunity_type", "expected"),
     (
@@ -176,6 +210,24 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
     body: str, opportunity_type: str, expected: bool
 ) -> None:
     assert _body_establishes_transfer_opportunity(body, opportunity_type) is expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    (
+        ("A player is available for a long-term transfer.", True),
+        ("Two players are available for a long-term transfer.", False),
+        ("Dos jugadores están disponibles para un traspaso de temporada.", False),
+        ("Deux joueurs sont disponibles pour un transfert durable.", False),
+    ),
+)
+def test_player_transfer_availability_represents_one_player(
+    body: str, expected: bool
+) -> None:
+    assert (
+        _transfer_offer_is_single_player(body, "player_transfer_availability")
+        is expected
+    )
 
 
 def test_transfer_classifier_contract_is_proposal_only_and_directional() -> None:

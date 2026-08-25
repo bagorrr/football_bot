@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -299,6 +299,27 @@ def game_search_result_sort_key(
         facts.get("sort_local_date", facts["start_local_date"]),
         1 if time_is_unknown else 0,
         canonical_local_time,
+        -int(facts.get("location_specificity", "0")),
+        facts["opportunity_id"],
+    )
+
+
+def transfer_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, float, int, str]:
+    """Order standing transfer results by the freshest current assertion."""
+    facts = dict(result.card_facts)
+    assertion_at = facts.get("source_edited_at") or facts.get("source_posted_at")
+    try:
+        freshness = (
+            datetime.fromisoformat(str(assertion_at)).astimezone(UTC).timestamp()
+        )
+    except (TypeError, ValueError, OverflowError):
+        freshness = float("-inf")
+    return (
+        0 if result.result_class == "confirmed_match" else 1,
+        int(facts.get("unknown_criterion_count", "0")),
+        -freshness,
         -int(facts.get("location_specificity", "0")),
         facts["opportunity_id"],
     )
@@ -1268,7 +1289,8 @@ def evaluate_transfer_search(
             continue
         route = opportunity.response_route
         source_posted_at = str(facts.get("source_posted_at", ""))
-        sort_local_date = source_posted_at[:10] or "9999-12-31"
+        source_assertion_at = str(facts.get("source_edited_at") or source_posted_at)
+        sort_local_date = source_assertion_at[:10] or "9999-12-31"
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
@@ -1277,6 +1299,7 @@ def evaluate_transfer_search(
             "sort_local_date": sort_local_date,
             "start_local_date": sort_local_date,
             "end_local_date": sort_local_date,
+            "iana_timezone": str(facts.get("iana_timezone", "UTC")),
             "source_posted_at": source_posted_at,
             "response_route_kind": str(route["kind"]),
             "response_route_value": str(route["value"]),
@@ -1335,7 +1358,7 @@ def evaluate_transfer_search(
                 card_facts=tuple(sorted(card.items())),
             )
         )
-    matched.sort(key=game_search_result_sort_key)
+    matched.sort(key=transfer_search_result_sort_key)
     return tuple(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)

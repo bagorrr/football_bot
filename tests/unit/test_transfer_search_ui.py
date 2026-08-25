@@ -73,6 +73,7 @@ def test_transfer_result_card_localizes_timing_and_provenance(
                     "opportunity_id": "opportunity:transfer-card",
                     "opportunity_type": "roster_vacancy",
                     "roster_vacancy": "true",
+                    "iana_timezone": "Europe/Moscow",
                     "city_display_en": "Saint Petersburg",
                     "city_display_ru": "Санкт-Петербург",
                     "city_display_es": "San Petersburgo",

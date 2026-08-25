@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
 from modules.domain import (
     ConversationStage,
+    DateInterpretation,
+    DateInterpretationResolution,
     GeographicType,
     LocationCandidate,
     LocationInterpretation,
@@ -20,6 +22,7 @@ from modules.domain import (
     TelegramPeerKind,
 )
 from modules.testkit import (
+    ControlledDateInterpretationAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -93,6 +96,31 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     classifier = ControlledModelAdapter()
     resolver = ControlledLocationResolverAdapter()
+    date_interpretation = ControlledDateInterpretationAdapter()
+    date_interpretation.return_for(
+        text="from 1 September",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 9, 1),
+                    end_local_date=date(2026, 9, 1),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    date_interpretation.return_for(
+        text="last month",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 7, 17),
+                    end_local_date=date(2026, 7, 17),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
     clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
     administrator_id = 55_001
     bot_user_id = 55_002 if direction == "new_team_search" else 55_003
@@ -163,6 +191,7 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         telegram_delivery=telegram_delivery,
         model=classifier,
         location_resolver=resolver,
+        date_interpretation=date_interpretation,
         telegram_admin_user_id=administrator_id,
     )
     system.reset()
@@ -257,6 +286,27 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         telegram_user_id=bot_user_id,
         detail_key="seasonal_timing",
     )
+    system.open_transfer_search_seasonal_timing_start_date(
+        update_id=f"start-date-prompt:{direction}",
+        telegram_user_id=bot_user_id,
+    )
+    with pytest.raises(ValueError, match="start date is invalid"):
+        system.submit_transfer_search_seasonal_timing_start_date_text(
+            update_id=f"past-start-date:{direction}",
+            telegram_user_id=bot_user_id,
+            text="last month",
+        )
+    draft = system.discovery_draft(bot_user_id)
+    assert draft is not None
+    assert draft.transfer_search_detail_draft == ()
+    system.submit_transfer_search_seasonal_timing_start_date_text(
+        update_id=f"start-date-value:{direction}",
+        telegram_user_id=bot_user_id,
+        text="from 1 September",
+    )
+    draft = system.discovery_draft(bot_user_id)
+    assert draft is not None
+    assert draft.transfer_search_detail_draft == ("start_local_date:2026-09-01",)
     system.select_transfer_search_seasonal_timing(
         update_id=f"ready-now:{direction}",
         telegram_user_id=bot_user_id,
