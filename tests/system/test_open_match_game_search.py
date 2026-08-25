@@ -216,7 +216,9 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Adult football tournament on 20 August 2026 at Петроградская. "
         "Registration is open. Team format 7x7, average playing level, outdoor venue "
         "with artificial turf, "
-        "free entry. Tournament structure: group stage. Contact @tournament_contact"
+        "free entry. Tournament structure: group stage. "
+        "Registration deadline: 19 August 2026. Capacity: 16 teams. "
+        "Prizes: 1, 2. Contact @tournament_contact"
     )
     classifier.return_for(
         body=body,
@@ -239,6 +241,11 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
                             "playing_surfaces": "artificial turf",
                             "payment": "free entry",
                             "structure": "Tournament structure: group stage",
+                            "registration_deadline": (
+                                "Registration deadline: 19 August 2026"
+                            ),
+                            "capacity": "Capacity: 16 teams",
+                            "prizes": "Prizes: 1, 2",
                         },
                         "location": {
                             "mention": "Петроградская",
@@ -258,6 +265,9 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
                         "playing_surfaces": ["artificial_turf"],
                         "payment": "free",
                         "structure": "group stage",
+                        "registration_deadline": "2026-08-19",
+                        "capacity": "16 teams",
+                        "prizes": [1, 2],
                         "response_routes": [
                             {
                                 "kind": "explicit_telegram_username",
@@ -363,7 +373,9 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Matches: date and city.\n\n"
         "Additional: Team format: 7x7 · Playing levels: Average · "
         "Venue type: Outdoor · Playing surface: Artificial turf · Payment: Free · "
-        "Structure: group stage (source language)\n\n"
+        "Registration deadline: 19 August 2026 · "
+        "Structure: group stage (source language) · "
+        "Capacity: 16 teams (source language) · Prizes: 1, 2\n\n"
         "Posted: 18 July 2026 at 12:06\n"
         "Edited: 18 August 2026 at 13:06\n"
         "Contact: @tournament_contact\n\n"

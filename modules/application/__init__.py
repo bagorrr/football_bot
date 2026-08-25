@@ -6791,7 +6791,28 @@ def _tournament_result_message(
     if int(facts.get("location_specificity", "0")) > 1:
         where += f", {facts[f'place_display_{copy_locale}']}"
     value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
-    source_text_fields = {"schedule", "structure", "prizes"}
+    source_text_fields = {"schedule", "structure", "capacity", "prizes"}
+
+    def render_fact_value(value: JsonValue, *, list_item: bool = False) -> str:
+        if isinstance(value, str):
+            return value_copy.get(
+                value,
+                value.replace("_", " ").capitalize() if list_item else value,
+            )
+        if isinstance(value, list):
+            return ", ".join(render_fact_value(item, list_item=True) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return str(value)
+
+    def fact_contains_text(value: JsonValue) -> bool:
+        if isinstance(value, str):
+            return True
+        if isinstance(value, list):
+            return any(fact_contains_text(item) for item in value)
+        if isinstance(value, dict):
+            return any(fact_contains_text(item) for item in value.values())
+        return False
 
     def fact_value(key: str) -> str | None:
         raw = facts.get(key)
@@ -6805,19 +6826,8 @@ def _tournament_result_message(
             with suppress(ValueError):
                 deadline = date.fromisoformat(decoded)
                 return f"{deadline.day} {months[deadline.month - 1]} {deadline.year}"
-        if isinstance(decoded, list):
-            rendered = ", ".join(
-                value_copy.get(item, item.replace("_", " ").capitalize())
-                for item in decoded
-                if isinstance(item, str)
-            )
-        elif isinstance(decoded, dict):
-            rendered = json.dumps(decoded, ensure_ascii=False, sort_keys=True)
-        elif isinstance(decoded, str):
-            rendered = value_copy.get(decoded, decoded)
-        else:
-            rendered = str(decoded)
-        if key in source_text_fields and rendered:
+        rendered = render_fact_value(decoded)
+        if key in source_text_fields and fact_contains_text(decoded) and rendered:
             return f"{rendered} ({labels['source_language']})"
         return rendered
 
@@ -14278,6 +14288,10 @@ def _validated_tournament_proposal(
         event_timezone = ZoneInfo(str(timezone))
     except (ValueError, ZoneInfoNotFoundError):
         return None
+    registration_expiry = _tournament_registration_expiry(
+        candidate.get("registration_deadline"),
+        event_timezone,
+    )
     if (
         parsed_end < parsed_start
         or not isinstance(timezone, str)
@@ -14299,15 +14313,14 @@ def _validated_tournament_proposal(
                 else None
             ),
             authoritative_body=validation_body,
+            allowed_additional_dates=(
+                (registration_expiry.date(),) if registration_expiry is not None else ()
+            ),
         )
         or mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
     ):
         return None
-    registration_expiry = _tournament_registration_expiry(
-        candidate.get("registration_deadline"),
-        event_timezone,
-    )
     if (
         candidate.get("registration_deadline") is not None
         and registration_expiry is None
@@ -14463,8 +14476,10 @@ def _tournament_optional_facts_are_supported(
     return all(
         isinstance(evidence.get(field_name), str)
         and str(evidence[field_name]) in authoritative_body
-        and _tournament_fact_value_is_source_bound(
-            candidate[field_name], str(evidence[field_name])
+        and _tournament_optional_fact_is_source_bound(
+            field_name,
+            candidate[field_name],
+            str(evidence[field_name]),
         )
         for field_name in (
             "schedule",
@@ -14475,6 +14490,122 @@ def _tournament_optional_facts_are_supported(
         )
         if candidate.get(field_name) is not None
     )
+
+
+def _tournament_optional_fact_is_source_bound(
+    field_name: str,
+    value: JsonValue,
+    evidence: str,
+) -> bool:
+    """Bind normalized optional facts to their localized source evidence."""
+    if field_name == "registration_deadline":
+        return _tournament_registration_deadline_is_source_bound(value, evidence)
+    return _tournament_fact_value_is_source_bound(value, evidence)
+
+
+def _tournament_registration_deadline_is_source_bound(
+    value: JsonValue,
+    evidence: str,
+) -> bool:
+    """Accept ISO deadlines when their calendar date appears in local evidence."""
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            nested = value.get(key)
+            if nested is not None:
+                return _tournament_registration_deadline_is_source_bound(
+                    nested, evidence
+                )
+        return False
+    if not isinstance(value, str):
+        return _tournament_fact_value_is_source_bound(value, evidence)
+    try:
+        deadline = date.fromisoformat(value)
+    except ValueError:
+        try:
+            deadline = datetime.fromisoformat(value).date()
+        except ValueError:
+            return _tournament_fact_value_is_source_bound(value, evidence)
+    normalized = evidence.casefold()
+    if value.casefold() in normalized:
+        return True
+    day = str(deadline.day)
+    month = str(deadline.month)
+    year = str(deadline.year)
+    numeric_patterns = (
+        rf"\b0?{day}[./-]0?{month}[./-]{year}\b",
+        rf"\b{year}[./-]0?{month}[./-]0?{day}\b",
+    )
+    if any(re.search(pattern, normalized) is not None for pattern in numeric_patterns):
+        return True
+    month_names = {
+        "en": (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }
+    for names in month_names.values():
+        month_name = re.escape(names[deadline.month - 1])
+        if re.search(
+            rf"\b{day}\b(?:\s+de)?\s+{month_name}(?:\s+de)?\s+{year}\b",
+            normalized,
+        ) or re.search(
+            rf"\b{month_name}\s+{day}(?:,)?\s+{year}\b",
+            normalized,
+        ):
+            return True
+    return False
 
 
 def _tournament_fact_value_is_source_bound(
@@ -14990,6 +15121,7 @@ def _event_time_is_supported(
     source_event_time: datetime | None = None,
     source_timezone: str | None = None,
     authoritative_body: str | None = None,
+    allowed_additional_dates: tuple[date, ...] = (),
     _scoped_body_check: bool = False,
 ) -> bool:
     if authoritative_body is not None:
@@ -15001,6 +15133,7 @@ def _event_time_is_supported(
             day_part=day_part,
             source_event_time=source_event_time,
             source_timezone=source_timezone,
+            allowed_additional_dates=allowed_additional_dates,
         ):
             return False
         return _event_time_is_supported(
@@ -15011,6 +15144,7 @@ def _event_time_is_supported(
             day_part=day_part,
             source_event_time=source_event_time,
             source_timezone=source_timezone,
+            allowed_additional_dates=allowed_additional_dates,
             _scoped_body_check=True,
         )
     normalized = evidence.casefold()
@@ -15042,12 +15176,13 @@ def _event_time_is_supported(
         ):
             for match in re.finditer(pattern, normalized):
                 try:
-                    stated_dates.add(
-                        date(int(match.group("year")), month, int(match.group("day")))
+                    stated_date = date(
+                        int(match.group("year")), month, int(match.group("day"))
                     )
                 except ValueError:
                     return False
-    if stated_dates - {start, end}:
+                stated_dates.add(stated_date)
+    if stated_dates - {start, end, *allowed_additional_dates}:
         return False
 
     def date_spans(value: date) -> list[tuple[int, int]]:
