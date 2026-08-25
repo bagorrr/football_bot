@@ -37,16 +37,19 @@
     "acceptedCandidate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["candidate_key", "opportunity_type", "evidence", "source_context", "location", "event_time", "response_routes"],
+      "required": ["candidate_key", "opportunity_type", "evidence", "source_context", "location", "response_routes"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "opponent_request"]},
+        "opportunity_type": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "evidence": {"$ref": "#/$defs/evidence"},
         "source_context": {"type": "string", "minLength": 1},
         "location": {"$ref": "#/$defs/location"},
         "event_time": {"$ref": "#/$defs/eventTime"},
+        "seasonal_timing": {"$ref": "#/$defs/seasonalTiming"},
         "open_places": {"type": ["integer", "null"], "minimum": 1},
         "opponent_request": {"const": true},
+        "roster_vacancy": {"const": true},
+        "player_transfer_availability": {"const": true},
         "response_routes": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/route"}},
         "team_formats": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"]}},
         "positions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["goalkeeper", "defender", "midfielder", "forward"]}},
@@ -61,26 +64,46 @@
         {
           "if": {"properties": {"opportunity_type": {"const": "open_match"}}},
           "then": {
-            "required": ["open_places"],
+            "required": ["event_time", "open_places"],
             "properties": {
               "evidence": {
-                "required": ["open_places"],
-                "not": {"required": ["opponent_request"]}
+                "required": ["event_time", "open_places"],
+                "not": {"required": ["opponent_request", "roster_vacancy", "player_transfer_availability"]}
               }
             },
-            "not": {"required": ["opponent_request"]}
-          },
-          "else": {
-            "required": ["opponent_request"],
+            "not": {"anyOf": [{"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"const": "opponent_request"}}},
+          "then": {
+            "required": ["event_time", "opponent_request"],
             "properties": {
               "evidence": {
-                "required": ["opponent_request"],
-                "not": {"required": ["open_places"]}
+                "required": ["event_time", "opponent_request"],
+                "not": {"required": ["open_places", "roster_vacancy", "player_transfer_availability"]}
               }
             },
             "allOf": [
               {"not": {"required": ["open_places"]}},
               {"not": {"required": ["positions"]}}
+            ]
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"enum": ["roster_vacancy", "player_transfer_availability"]}}},
+          "then": {
+            "not": {"anyOf": [{"required": ["event_time"]}, {"required": ["open_places"]}, {"required": ["opponent_request"]}, {"required": ["venue_provision"]}]},
+            "properties": {
+              "evidence": {
+                "required": ["location"],
+                "not": {"required": ["event_time", "open_places", "opponent_request"]}
+              }
+            },
+            "allOf": [
+              {"if": {"properties": {"opportunity_type": {"const": "roster_vacancy"}}}, "then": {"required": ["roster_vacancy"]}},
+              {"if": {"properties": {"opportunity_type": {"const": "player_transfer_availability"}}}, "then": {"required": ["player_transfer_availability"]}},
+              {"if": {"required": ["seasonal_timing"]}, "then": {"properties": {"evidence": {"required": ["seasonal_timing"]}}}}
             ]
           }
         }
@@ -89,13 +112,16 @@
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["opportunity", "event_time", "location"],
+      "required": ["opportunity", "location"],
       "properties": {
         "opportunity": {"type": "string", "minLength": 1},
         "event_time": {"type": "string", "minLength": 1},
         "location": {"type": "string", "minLength": 1},
+        "seasonal_timing": {"type": "string", "minLength": 1},
         "open_places": {"type": "string", "minLength": 1},
         "opponent_request": {"type": "string", "minLength": 1},
+        "roster_vacancy": {"type": "string", "minLength": 1},
+        "player_transfer_availability": {"type": "string", "minLength": 1},
         "team_formats": {"type": "string", "minLength": 1},
         "positions": {"type": "string", "minLength": 1},
         "playing_levels": {"type": "string", "minLength": 1},
@@ -128,6 +154,20 @@
         "day_part": {"enum": ["morning", "daytime", "evening", "night"]},
         "iana_timezone": {"type": "string", "minLength": 1}
       }
+    },
+    "seasonalTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"enum": ["ready_now", "start_local_date", "stated_season"]},
+        "value": {"type": ["string", "null"], "minLength": 1, "maxLength": 80}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "ready_now"}}}, "then": {"properties": {"value": {"const": null}}}},
+        {"if": {"properties": {"kind": {"const": "start_local_date"}}}, "then": {"properties": {"value": {"type": "string", "format": "date"}}}},
+        {"if": {"properties": {"kind": {"const": "stated_season"}}}, "then": {"properties": {"value": {"type": "string"}}}}
+      ]
     },
     "route": {
       "type": "object",
@@ -169,7 +209,7 @@
       "properties": {
         "proposition_id": {"type": "string", "minLength": 1},
         "domain": {"enum": ["football_match"]},
-        "meaning": {"enum": ["open_match", "opponent_request"]},
+        "meaning": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "polarity": {"enum": ["positive", "negative", "ambiguous"]},
         "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
         "span": {"$ref": "#/$defs/sourceSpan"}
@@ -232,7 +272,7 @@
       "required": ["candidate_key", "opportunity_type", "evidence", "alternatives"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "opponent_request"]},
+        "opportunity_type": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}},
         "alternatives": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["alternative_key", "evidence"], "properties": {"alternative_key": {"type": "string", "minLength": 1}, "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}}}}}
       }

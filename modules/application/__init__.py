@@ -901,6 +901,117 @@ _OPPONENT_SEARCH_VALUE_COPY = {
         "paid": "Payant",
     },
 }
+_TRANSFER_SEARCH_DETAIL_OPTIONS = {
+    "positions": ("goalkeeper", "defender", "midfielder", "forward"),
+    "playing_levels": (
+        "novice",
+        "below_average",
+        "average",
+        "above_average",
+        "high",
+        "very_high",
+        "master",
+        "professional",
+    ),
+    "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
+    "seasonal_timing": ("ready_now", "start_local_date", "stated_season"),
+    "venue_settings": ("indoor", "outdoor", "covered_outdoor"),
+    "playing_surfaces": (
+        "natural_grass",
+        "artificial_turf",
+        "hard_surface",
+        "wood_parquet",
+    ),
+    "payment": ("free", "paid"),
+}
+_TRANSFER_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Positions",
+        "Playing level",
+        "Team format",
+        "Seasonal timing",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Позиции",
+        "Уровень игрока",
+        "Формат команды",
+        "Сезонные сроки",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Posiciones",
+        "Nivel de juego",
+        "Formato del equipo",
+        "Periodo de temporada",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Postes",
+        "Niveau de jeu",
+        "Format d’équipe",
+        "Période de saison",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_TRANSFER_SEARCH_VALUE_COPY = {
+    "en": {
+        "ready_now": "Ready now",
+        "start_local_date": "Start on a local date",
+        "stated_season": "Named season",
+        "free": "Free",
+        "paid": "Paid",
+        "covered_outdoor": "Covered outdoor",
+        "natural_grass": "Natural grass",
+        "artificial_turf": "Artificial turf",
+        "hard_surface": "Hard surface",
+        "wood_parquet": "Wood parquet",
+    },
+    "ru": {
+        "ready_now": "Готовы сейчас",
+        "start_local_date": "Начало с даты",
+        "stated_season": "Указанный сезон",
+        "free": "Бесплатно",
+        "paid": "Платно",
+        "covered_outdoor": "Крытая открытая площадка",
+        "natural_grass": "Натуральный газон",
+        "artificial_turf": "Искусственный газон",
+        "hard_surface": "Твёрдое покрытие",
+        "wood_parquet": "Деревянный паркет",
+    },
+    "es": {
+        "ready_now": "Disponible ahora",
+        "start_local_date": "Empezar en una fecha local",
+        "stated_season": "Temporada indicada",
+        "free": "Gratis",
+        "paid": "De pago",
+        "covered_outdoor": "Exterior cubierto",
+        "natural_grass": "Césped natural",
+        "artificial_turf": "Césped artificial",
+        "hard_surface": "Superficie dura",
+        "wood_parquet": "Parqué de madera",
+    },
+    "fr": {
+        "ready_now": "Disponible maintenant",
+        "start_local_date": "Commencer à une date locale",
+        "stated_season": "Saison indiquée",
+        "free": "Gratuit",
+        "paid": "Payant",
+        "covered_outdoor": "Extérieur couvert",
+        "natural_grass": "Gazon naturel",
+        "artificial_turf": "Gazon artificiel",
+        "hard_surface": "Surface dure",
+        "wood_parquet": "Parquet en bois",
+    },
+}
 _GAME_SEARCH_DETAIL_NAMES = {
     "en": (
         "Time",
@@ -2435,6 +2546,7 @@ class ConversationOnboarding:
         screen_revision: int,
         game_search_details: dict[str, list[str]] | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
+        transfer_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2484,7 +2596,17 @@ class ConversationOnboarding:
                 search_submission_update_id=update_id,
             )
             message_id = derive_run_search_message_id(telegram_user_id, update_id)
-            if game_search_details is not None and opponent_search_details is not None:
+            if (
+                sum(
+                    value is not None
+                    for value in (
+                        game_search_details,
+                        opponent_search_details,
+                        transfer_search_details,
+                    )
+                )
+                > 1
+            ):
                 raise ValueError("Search cannot contain both detail families")
             if draft.user_intent is UserIntent.OPPONENT_SEARCH:
                 selected_opponent_details = (
@@ -2496,6 +2618,21 @@ class ConversationOnboarding:
                     }
                 )
                 selected_game_details: dict[str, list[str]] = {}
+                selected_transfer_details: dict[str, list[str]] = {}
+            elif draft.user_intent in {
+                UserIntent.NEW_TEAM_SEARCH,
+                UserIntent.TRANSFER_PLAYER_SEARCH,
+            }:
+                selected_transfer_details = (
+                    transfer_search_details
+                    if transfer_search_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.transfer_search_details
+                    }
+                )
+                selected_game_details = {}
+                selected_opponent_details = {}
             else:
                 selected_game_details = (
                     game_search_details
@@ -2505,6 +2642,7 @@ class ConversationOnboarding:
                     }
                 )
                 selected_opponent_details = {}
+                selected_transfer_details = {}
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
                 contract_version=2,
@@ -2545,6 +2683,12 @@ class ConversationOnboarding:
                             )
                         }
                         if selected_opponent_details
+                        else {
+                            "transfer_search_details": cast(
+                                JsonValue, selected_transfer_details
+                            )
+                        }
+                        if selected_transfer_details
                         else {}
                     ),
                 },
@@ -3016,6 +3160,330 @@ class ConversationOnboarding:
             )
         self.deliver_pending()
 
+    def open_transfer_search_details(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the long-term transfer Details hub for either transfer direction."""
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+        )
+
+    def open_transfer_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one long-term transfer detail submenu."""
+        if detail_key not in _TRANSFER_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Transfer Search detail key must be canonical")
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+        )
+
+    def toggle_transfer_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one temporary long-term transfer detail value."""
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+        )
+
+    def commit_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit the current transfer detail submenu through Done."""
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+        )
+
+    def select_transfer_search_seasonal_timing(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str | None,
+    ) -> None:
+        """Select a temporary ready-now/clear Seasonal Timing answer."""
+        if value not in {None, "ready_now"}:
+            raise ValueError("Transfer Search Seasonal Timing value is invalid")
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_timing",
+            value=value,
+        )
+
+    def open_transfer_search_seasonal_timing_start_date(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the temporary local-start-date prompt."""
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="timing_prompt",
+            value="start_local_date",
+        )
+
+    def submit_transfer_search_seasonal_timing_start_date_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate a local start date into the temporary timing draft."""
+        normalized = _normalize_transfer_timing_text(text, kind="start_local_date")
+        if normalized is None:
+            raise ValueError("Transfer Search start date is invalid")
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_timing",
+            value=normalized,
+        )
+
+    def open_transfer_search_seasonal_timing_season(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the temporary named-season prompt."""
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="timing_prompt",
+            value="stated_season",
+        )
+
+    def submit_transfer_search_seasonal_timing_season_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate a named season into the temporary timing draft."""
+        normalized = _normalize_transfer_timing_text(text, kind="stated_season")
+        if normalized is None:
+            raise ValueError("Transfer Search named season is invalid")
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_timing",
+            value=normalized,
+        )
+
+    def back_from_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard temporary transfer detail edits on Back."""
+        self._change_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+        )
+
+    def _change_transfer_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        operation: str,
+        detail_key: str | None = None,
+        value: str | None = None,
+    ) -> None:
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.user_intent
+                not in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            details = dict(draft.transfer_search_details)
+            editing = draft.editing_transfer_search_detail
+            temporary = list(draft.transfer_search_detail_draft)
+            timing_prompt = draft.transfer_search_seasonal_timing_prompt
+            target = "hub"
+            if operation == "open_hub":
+                editing = None
+                temporary = []
+                timing_prompt = None
+            elif operation == "open_detail":
+                if detail_key is None:
+                    raise RuntimeError("Transfer Search detail key is missing")
+                editing = detail_key
+                temporary = list(details.get(detail_key, ()))
+                timing_prompt = None
+                target = "submenu"
+            elif operation == "toggle":
+                if editing is None or editing == "seasonal_timing":
+                    raise RuntimeError("No multi-select transfer detail is open")
+                if value not in _TRANSFER_SEARCH_DETAIL_OPTIONS[editing]:
+                    raise ValueError("Transfer Search detail value must be canonical")
+                if value in temporary:
+                    temporary.remove(value)
+                else:
+                    temporary.append(value)
+                target = "submenu"
+            elif operation == "select_timing":
+                if editing != "seasonal_timing":
+                    raise RuntimeError("Transfer Search Seasonal Timing is not open")
+                temporary = [] if value is None else [value]
+                timing_prompt = None
+                target = "submenu"
+            elif operation == "timing_prompt":
+                if editing != "seasonal_timing" or value not in {
+                    "start_local_date",
+                    "stated_season",
+                }:
+                    raise RuntimeError("Transfer Search Seasonal Timing is not open")
+                timing_prompt = value
+                target = "timing_prompt"
+            elif operation == "submit_timing":
+                if editing != "seasonal_timing" or timing_prompt is None:
+                    raise RuntimeError(
+                        "Transfer Search Seasonal Timing prompt is not open"
+                    )
+                if value is None or not _canonical_transfer_timing(value):
+                    raise ValueError("Transfer Search Seasonal Timing is invalid")
+                temporary = [value]
+                timing_prompt = None
+                target = "submenu"
+            elif operation == "commit":
+                if editing is None:
+                    raise RuntimeError("No transfer detail is open")
+                if temporary:
+                    details[editing] = tuple(temporary)
+                else:
+                    details.pop(editing, None)
+                editing = None
+                temporary = []
+                timing_prompt = None
+                target = "hub"
+            elif operation == "back":
+                if timing_prompt is not None and editing == "seasonal_timing":
+                    timing_prompt = None
+                    target = "submenu"
+                elif editing is None:
+                    target = "post_core"
+                else:
+                    editing = None
+                    temporary = []
+                    timing_prompt = None
+                    target = "hub"
+            else:
+                raise RuntimeError("Unknown Transfer Search detail operation")
+            now = self._clock.now()
+            state = replace(
+                current,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                transfer_search_details=tuple(sorted(details.items())),
+                editing_transfer_search_detail=editing,
+                transfer_search_detail_draft=tuple(temporary),
+                transfer_search_seasonal_timing_prompt=timing_prompt,
+            )
+            locale = current.locale or "en"
+            if target == "post_core":
+                if draft.country is None or draft.city is None:
+                    raise RuntimeError("Transfer Search Details lost its Search Area")
+                message = _post_core_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
+                    user_intent=draft.user_intent,
+                )
+            elif target == "submenu":
+                assert editing is not None
+                message = _transfer_search_detail_submenu_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    detail_key=editing,
+                    temporary=tuple(temporary),
+                )
+            elif target == "timing_prompt":
+                assert timing_prompt is not None
+                message = _transfer_search_timing_prompt_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    prompt_kind=timing_prompt,
+                )
+            else:
+                message = _transfer_search_details_hub_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    details=details,
+                    user_intent=draft.user_intent,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                draft=changed_draft,
+                state=state,
+                message=message,
+                recorded_at=now,
+            )
+        self.deliver_pending()
+
     def _change_game_search_details(
         self,
         *,
@@ -3253,6 +3721,9 @@ class ConversationOnboarding:
                 _opponent_request_result_message
                 if dict(current_result.card_facts).get("opportunity_type")
                 == "opponent_request"
+                else _transfer_search_result_message
+                if dict(current_result.card_facts).get("opportunity_type")
+                in {"roster_vacancy", "player_transfer_availability"}
                 else _open_match_result_message
             )
             message = renderer(
@@ -6007,6 +6478,9 @@ def _post_core_message(
     details_callback = (
         "opponent-details:hub"
         if user_intent is UserIntent.OPPONENT_SEARCH
+        else "transfer-details:hub"
+        if user_intent
+        in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
         else "details:open"
     )
     return TelegramMessage(
@@ -6294,6 +6768,582 @@ def _opponent_search_detail_submenu_message(
             *rows,
             ((back_label, f"opponent-details:back:{screen_revision}"),),
         ),
+    )
+
+
+def _transfer_search_details_hub_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    details: dict[str, tuple[str, ...]],
+    user_intent: UserIntent | None,
+) -> TelegramMessage:
+    """Render one shared long-term transfer Details hub."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    introduction, not_set, back_label, search_label = {
+        "en": ("You can choose the following settings:", "not set", "Back", "Search"),
+        "ru": ("Можно выбрать следующие настройки:", "не задано", "Назад", "Поиск"),
+        "es": (
+            "Puedes elegir las siguientes opciones:",
+            "sin definir",
+            "Atrás",
+            "Buscar",
+        ),
+        "fr": (
+            "Vous pouvez choisir les paramètres suivants :",
+            "non défini",
+            "Retour",
+            "Rechercher",
+        ),
+    }[copy_locale]
+    names = list(_TRANSFER_SEARCH_DETAIL_NAMES[copy_locale])
+    if user_intent is UserIntent.NEW_TEAM_SEARCH:
+        names[1] = {
+            "en": "Team playing level",
+            "ru": "Уровень команды",
+            "es": "Nivel del equipo",
+            "fr": "Niveau de l’équipe",
+        }[copy_locale]
+    summaries = tuple(
+        ", ".join(
+            _transfer_value_label(copy_locale, value) for value in details.get(key, ())
+        )
+        or not_set
+        for key in _TRANSFER_SEARCH_DETAIL_OPTIONS
+    )
+    keys = tuple(_TRANSFER_SEARCH_DETAIL_OPTIONS)
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=introduction + "\n\n" + "\n".join(f"- {name}" for name in names),
+        button_rows=(
+            *tuple(
+                (
+                    (
+                        f"{name}: {summary} ▸",
+                        f"transfer-details:open:{key}:{screen_revision}",
+                    ),
+                )
+                for key, name, summary in zip(keys, names, summaries, strict=True)
+            ),
+            ((back_label, f"details:back:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _transfer_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    """Render transfer detail edits with explicit Done and Back controls."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    names = list(_TRANSFER_SEARCH_DETAIL_NAMES[copy_locale])
+    heading = names[tuple(_TRANSFER_SEARCH_DETAIL_OPTIONS).index(detail_key)]
+    done_label, any_label, back_label = {
+        "en": ("Done", "Any", "Back"),
+        "ru": ("Готово", "Неважно", "Назад"),
+        "es": ("Listo", "Cualquiera", "Atrás"),
+        "fr": ("Valider", "Peu importe", "Retour"),
+    }[copy_locale]
+
+    def button(value: str, callback: str) -> tuple[str, str]:
+        return (
+            (
+                f"{'✓ ' if value in temporary else ''}"
+                f"{_transfer_value_label(copy_locale, value)}"
+            ),
+            callback,
+        )
+
+    rows: tuple[tuple[tuple[str, str], ...], ...]
+    if detail_key == "seasonal_timing":
+        rows = (
+            (
+                button(
+                    "ready_now", f"transfer-details:timing:ready_now:{screen_revision}"
+                ),
+            ),
+            (
+                (
+                    _transfer_value_label(copy_locale, "start_local_date"),
+                    f"transfer-details:timing:start_local_date:{screen_revision}",
+                ),
+            ),
+            (
+                (
+                    _transfer_value_label(copy_locale, "stated_season"),
+                    f"transfer-details:timing:stated_season:{screen_revision}",
+                ),
+            ),
+            ((any_label, f"transfer-details:timing:any:{screen_revision}"),),
+            ((done_label, f"transfer-details:done:{screen_revision}"),),
+        )
+    else:
+        rows = tuple(
+            (
+                button(
+                    value,
+                    f"transfer-details:toggle:{value}:{screen_revision}",
+                ),
+            )
+            for value in _TRANSFER_SEARCH_DETAIL_OPTIONS[detail_key]
+        )
+        rows = (*rows, ((done_label, f"transfer-details:done:{screen_revision}"),))
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"{heading}.",
+        button_rows=(
+            *rows,
+            ((back_label, f"transfer-details:back:{screen_revision}"),),
+        ),
+    )
+
+
+def _transfer_search_timing_prompt_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    prompt_kind: str,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    prompts = {
+        "en": {
+            "start_local_date": "Enter the local start date for the selected city.",
+            "stated_season": "Enter the named season exactly as stated in the source.",
+            "back": "Back",
+        },
+        "ru": {
+            "start_local_date": "Введите местную дату начала для выбранного города.",
+            "stated_season": (
+                "Введите название сезона так, как оно указано в источнике."
+            ),
+            "back": "Назад",
+        },
+        "es": {
+            "start_local_date": (
+                "Indique la fecha local de inicio para la ciudad seleccionada."
+            ),
+            "stated_season": "Indique la temporada tal como aparece en la fuente.",
+            "back": "Atrás",
+        },
+        "fr": {
+            "start_local_date": (
+                "Indiquez la date locale de début pour la ville sélectionnée."
+            ),
+            "stated_season": (
+                "Indiquez la saison telle qu’elle apparaît dans la source."
+            ),
+            "back": "Retour",
+        },
+    }[copy_locale]
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=prompts[prompt_kind],
+        button_rows=(((prompts["back"], f"transfer-details:back:{screen_revision}"),),),
+    )
+
+
+def _canonical_transfer_timing(value: str) -> bool:
+    """Check one encoded, language-neutral transfer timing value."""
+    return (
+        _normalize_transfer_timing_text(
+            value.removeprefix("start_local_date:")
+            if value.startswith("start_local_date:")
+            else value.removeprefix("stated_season:")
+            if value.startswith("stated_season:")
+            else value,
+            kind=(
+                "start_local_date"
+                if value.startswith("start_local_date:")
+                else "stated_season"
+                if value.startswith("stated_season:")
+                else "ready_now"
+            ),
+        )
+        == value
+    )
+
+
+def _normalize_transfer_timing_text(text: str, *, kind: str) -> str | None:
+    """Normalize a user timing answer without changing its semantic kind."""
+    normalized = " ".join(text.strip().casefold().split())
+    if kind == "ready_now":
+        return "ready_now" if normalized == "ready_now" else None
+    if kind == "start_local_date":
+        parsed: date | None = None
+        with suppress(ValueError):
+            parsed = date.fromisoformat(normalized)
+        if parsed is None:
+            match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", normalized)
+            if match is not None:
+                with suppress(ValueError):
+                    parsed = date(
+                        int(match.group(3)), int(match.group(2)), int(match.group(1))
+                    )
+        return f"start_local_date:{parsed.isoformat()}" if parsed is not None else None
+    if kind == "stated_season":
+        match = re.fullmatch(r"(20\d{2})\s*[-/]\s*(\d{2,4})", normalized)
+        if match is not None:
+            first = int(match.group(1))
+            second_text = match.group(2)
+            second = int(second_text)
+            if len(second_text) == 2:
+                second += (first // 100) * 100
+                if second <= first:
+                    second += 100
+            return f"stated_season:{first:04d}-{second:04d}"
+        return (
+            f"stated_season:{normalized}"
+            if normalized and len(normalized) <= 80
+            else None
+        )
+    return None
+
+
+def _transfer_value_label(locale: str, value: str) -> str:
+    if value.startswith("start_local_date:"):
+        return (
+            f"{_TRANSFER_SEARCH_VALUE_COPY[locale]['start_local_date']}: "
+            f"{value.split(':', 1)[1]}"
+        )
+    if value.startswith("stated_season:"):
+        return (
+            f"{_TRANSFER_SEARCH_VALUE_COPY[locale]['stated_season']}: "
+            f"{value.split(':', 1)[1]}"
+        )
+    return _TRANSFER_SEARCH_VALUE_COPY[locale].get(
+        value,
+        _GAME_SEARCH_VALUE_COPY[locale].get(
+            value, value.replace("_", " ").capitalize()
+        ),
+    )
+
+
+def _transfer_search_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+) -> TelegramMessage:
+    """Render a localized long-term transfer Result Card."""
+    facts = dict(result.card_facts)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    is_roster = facts.get("opportunity_type") == "roster_vacancy"
+    labels = {
+        "en": {
+            "roster_title": "Roster Vacancy",
+            "player_title": "Player Transfer Availability",
+            "matches": "Matches",
+            "needs": "Needs clarification",
+            "additional": "Additional",
+            "location": "Location",
+            "timing": "Seasonal timing",
+            "posted": "Posted",
+            "edited": "Edited",
+            "contact": "Contact",
+            "at": "at",
+            "invitation": (
+                "Questions? Message me. I can explain the card or help refine "
+                "your search."
+            ),
+        },
+        "ru": {
+            "roster_title": "Вакансия в составе",
+            "player_title": "Игрок доступен для трансфера",
+            "matches": "Подходит",
+            "needs": "Нужно уточнить",
+            "additional": "Дополнительно",
+            "location": "Место",
+            "timing": "Сезонные сроки",
+            "posted": "Пост",
+            "edited": "Изменён",
+            "contact": "Контакт",
+            "at": "в",
+            "invitation": (
+                "💬 Остались вопросы? Напишите, я объясню карточку или помогу "
+                "уточнить поиск."
+            ),
+        },
+        "es": {
+            "roster_title": "Vacante en la plantilla",
+            "player_title": "Jugador disponible para traspaso",
+            "matches": "Coincide",
+            "needs": "Falta confirmar",
+            "additional": "Información adicional",
+            "location": "Lugar",
+            "timing": "Periodo de temporada",
+            "posted": "Publicado",
+            "edited": "Modificado",
+            "contact": "Contacto",
+            "at": "a las",
+            "invitation": (
+                "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha o le "
+                "ayudaré a ajustar la búsqueda."
+            ),
+        },
+        "fr": {
+            "roster_title": "Poste vacant dans l’effectif",
+            "player_title": "Joueur disponible pour un transfert",
+            "matches": "Correspond",
+            "needs": "À préciser",
+            "additional": "Informations complémentaires",
+            "location": "Lieu",
+            "timing": "Période de saison",
+            "posted": "Publié",
+            "edited": "Modifié",
+            "contact": "Contact",
+            "at": "à",
+            "invitation": (
+                "Une question ? Écrivez-moi. Je peux expliquer la fiche ou vous "
+                "aider à affiner votre recherche."
+            ),
+        },
+    }[copy_locale]
+    where = facts[f"city_display_{copy_locale}"]
+    if int(facts.get("location_specificity", "0")) > 1:
+        where += f", {facts[f'place_display_{copy_locale}']}"
+
+    timing_copy = ""
+    raw_timing = facts.get("seasonal_timing")
+    if raw_timing:
+        with suppress(json.JSONDecodeError, TypeError):
+            timing = json.loads(raw_timing)
+            if isinstance(timing, dict):
+                kind = timing.get("kind")
+                value = timing.get("value")
+                if kind == "ready_now":
+                    timing_copy = _transfer_value_label(copy_locale, "ready_now")
+                elif isinstance(kind, str) and isinstance(value, str):
+                    timing_copy = _transfer_value_label(copy_locale, f"{kind}:{value}")
+
+    def json_values(key: str) -> tuple[str, ...]:
+        raw = facts.get(key)
+        if not raw:
+            return ()
+        with suppress(TypeError, json.JSONDecodeError):
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return tuple(value for value in parsed if isinstance(value, str))
+        return ()
+
+    known_values: dict[str, str] = {}
+    for key in (
+        "positions",
+        "playing_levels",
+        "team_formats",
+        "venue_settings",
+        "playing_surfaces",
+    ):
+        values = json_values(key)
+        if values:
+            known_values[key] = ", ".join(
+                _transfer_value_label(copy_locale, value) for value in values
+            )
+    if facts.get("payment"):
+        payment = _transfer_value_label(copy_locale, str(facts["payment"]))
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            payment += f" ({facts['payment_amount']} {facts['payment_currency']})"
+        known_values["payment"] = payment
+    if timing_copy:
+        known_values["seasonal_timing"] = timing_copy
+
+    match_states = json.loads(facts.get("match_states", "{}"))
+    criterion_names = {
+        "positions": {
+            "en": "positions",
+            "ru": "позиции",
+            "es": "posiciones",
+            "fr": "postes",
+        },
+        "playing_levels": {
+            "en": "playing level",
+            "ru": "уровень игры",
+            "es": "nivel de juego",
+            "fr": "niveau de jeu",
+        },
+        "team_formats": {
+            "en": "team format",
+            "ru": "формат команды",
+            "es": "formato del equipo",
+            "fr": "format d’équipe",
+        },
+        "seasonal_timing": {
+            "en": "seasonal timing",
+            "ru": "сезонные сроки",
+            "es": "periodo de temporada",
+            "fr": "période de saison",
+        },
+        "venue_settings": {
+            "en": "venue setting",
+            "ru": "тип площадки",
+            "es": "tipo de recinto",
+            "fr": "type de terrain",
+        },
+        "playing_surfaces": {
+            "en": "playing surface",
+            "ru": "покрытие",
+            "es": "superficie de juego",
+            "fr": "revêtement",
+        },
+        "payment": {"en": "payment", "ru": "оплата", "es": "pago", "fr": "paiement"},
+        "search_area": {
+            "en": "search area",
+            "ru": "район поиска",
+            "es": "zona de búsqueda",
+            "fr": "zone de recherche",
+        },
+    }
+    confirmed = [
+        criterion_names[key][copy_locale]
+        for key, state in match_states.items()
+        if state == "confirmed" and key in criterion_names
+    ]
+    unknown = [
+        criterion_names[key][copy_locale]
+        for key, state in match_states.items()
+        if state == "unknown" and key in criterion_names
+    ]
+    match_text = (
+        f"{labels['matches']}: " + ", ".join(confirmed or [labels["location"]]) + "."
+    )
+    if unknown:
+        match_text += f"\n{labels['needs']}: {', '.join(unknown)}."
+    detail_order = (
+        "positions",
+        "playing_levels",
+        "team_formats",
+        "seasonal_timing",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    )
+    additional = " · ".join(
+        f"{criterion_names[key][copy_locale]}: {known_values[key]}"
+        for key in detail_order
+        if key in known_values and match_states.get(key) != "confirmed"
+    )
+    confirmed_details = " · ".join(
+        known_values[key]
+        for key in detail_order
+        if key in known_values and match_states.get(key) == "confirmed"
+    )
+    source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
+        ZoneInfo(facts.get("iana_timezone", "UTC"))
+    )
+    months = {
+        "en": (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }[copy_locale]
+    posted = (
+        f"{labels['posted']}: {source_time.day} {months[source_time.month - 1]} "
+        f"{source_time.year} {labels['at']} {source_time:%H:%M}"
+    )
+    edited = ""
+    if facts.get("source_edited_at"):
+        edited_time = datetime.fromisoformat(facts["source_edited_at"]).astimezone(
+            ZoneInfo(facts.get("iana_timezone", "UTC"))
+        )
+        edited = (
+            f"\n{labels['edited']}: {edited_time.day} "
+            f"{months[edited_time.month - 1]} {edited_time.year} "
+            f"{labels['at']} {edited_time:%H:%M}"
+        )
+    route = render_response_route(
+        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    )
+    parts = [
+        labels["roster_title"] if is_roster else labels["player_title"],
+        f"{labels['location']}: {where}",
+    ]
+    if confirmed_details:
+        parts.append(confirmed_details)
+    parts.append(match_text)
+    if additional:
+        parts.append(f"{labels['additional']}: {additional}")
+    parts.extend(
+        [posted + edited, f"{labels['contact']}: {route}", labels["invitation"]]
+    )
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n\n".join(parts),
+        button_rows=(),
     )
 
 
@@ -11755,6 +12805,9 @@ class RuntimeApplication:
         opponent_search_details = _runtime_opponent_search_details(
             payload.get("opponent_search_details")
         )
+        transfer_search_details = _runtime_transfer_search_details(
+            payload.get("transfer_search_details")
+        )
         completed_search = CompletedSearch(
             completed_search_id=completed_search_id,
             telegram_user_id=telegram_user_id,
@@ -11768,6 +12821,7 @@ class RuntimeApplication:
             completed_at=self.clock.now(),
             game_search_details=tuple(sorted(game_search_details.items())),
             opponent_search_details=tuple(sorted(opponent_search_details.items())),
+            transfer_search_details=tuple(sorted(transfer_search_details.items())),
             sub_city_area_geographic_types=tuple(
                 value for value in area_types if isinstance(value, str)
             ),
@@ -13179,6 +14233,18 @@ _OPTIONAL_OPPONENT_REQUEST_FACTS = frozenset(
         "payment",
     }
 )
+_MANDATORY_TRANSFER_FACTS = frozenset({"opportunity", "location"})
+_OPTIONAL_TRANSFER_FACTS = frozenset(
+    {
+        "positions",
+        "playing_levels",
+        "team_formats",
+        "seasonal_timing",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+)
 
 
 _CLASSIFICATION_ROUTING_ROUTES = {
@@ -13301,9 +14367,12 @@ _PROPOSITION_LINEAGE_FACT_KEYS = (
     "location_parent_ids",
     "location_verified_disjoint_place_ids",
     "open_places",
+    "roster_vacancy",
+    "player_transfer_availability",
     "team_formats",
     "positions",
     "playing_levels",
+    "seasonal_timing",
     "venue_settings",
     "playing_surfaces",
     "payment",
@@ -13315,9 +14384,12 @@ _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "event_time",
     "location",
     "open_places",
+    "roster_vacancy",
+    "player_transfer_availability",
     "team_formats",
     "positions",
     "playing_levels",
+    "seasonal_timing",
     "venue_settings",
     "playing_surfaces",
     "payment",
@@ -13426,6 +14498,8 @@ def _canonicalize_legacy_proposition_records(
         if not isinstance(record_type, str) or record_type not in {
             "open_match",
             "opponent_request",
+            "roster_vacancy",
+            "player_transfer_availability",
         }:
             return None
         legacy_prefix = f"opportunity:{source_message_id}:{record_type}:candidate:"
@@ -13686,9 +14760,12 @@ def _candidate_target_manifest_hash(
             "location",
             "event_time",
             "open_places",
+            "roster_vacancy",
+            "player_transfer_availability",
             "team_formats",
             "positions",
             "playing_levels",
+            "seasonal_timing",
             "venue_settings",
             "playing_surfaces",
             "payment",
@@ -13765,11 +14842,19 @@ def _proposition_graph_has_closed_target_set(
     """
     fact_ids = {node.node_id for node in graph.facts}
     evidence_ids = set(evidence)
-    mandatory_facts, optional_facts = (
-        (_MANDATORY_OPPONENT_REQUEST_FACTS, _OPTIONAL_OPPONENT_REQUEST_FACTS)
-        if meaning == "opponent_request"
-        else (_MANDATORY_OPEN_MATCH_FACTS, _OPTIONAL_OPEN_MATCH_FACTS)
-    )
+    if meaning in {"roster_vacancy", "player_transfer_availability"}:
+        mandatory_facts = _MANDATORY_TRANSFER_FACTS | {meaning}
+        optional_facts = _OPTIONAL_TRANSFER_FACTS
+    elif meaning == "opponent_request":
+        mandatory_facts, optional_facts = (
+            _MANDATORY_OPPONENT_REQUEST_FACTS,
+            _OPTIONAL_OPPONENT_REQUEST_FACTS,
+        )
+    else:
+        mandatory_facts, optional_facts = (
+            _MANDATORY_OPEN_MATCH_FACTS,
+            _OPTIONAL_OPEN_MATCH_FACTS,
+        )
     if (
         not mandatory_facts.issubset(evidence_ids)
         or not evidence_ids.issubset(mandatory_facts | optional_facts)
@@ -13877,8 +14962,16 @@ def _validated_open_match_proposal(
     if not isinstance(opportunity_type, str) or opportunity_type not in {
         "open_match",
         "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
     }:
         return None
+    if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
+        return _validated_transfer_proposal(
+            payload_value,
+            candidate=candidate,
+            resolver=resolver,
+        )
     is_opponent_request = opportunity_type == "opponent_request"
     required = {
         "candidate_key",
@@ -14221,6 +15314,399 @@ def _validated_open_match_proposal(
         },
         "response_route": {"kind": route["kind"], "value": route_value},
     }
+
+
+def _validated_transfer_proposal(
+    payload_value: dict[str, JsonValue],
+    *,
+    candidate: dict[str, JsonValue],
+    resolver: LocationResolverAdapter,
+) -> dict[str, JsonValue] | None:
+    """Normalize one evidence-backed long-term transfer proposal."""
+    body = payload_value.get("body")
+    revision_id = payload_value.get("source_message_revision_id")
+    semantic_proof = payload_value.get("semantic_proof")
+    opportunity_type = candidate.get("opportunity_type")
+    if (
+        not isinstance(body, str)
+        or not isinstance(revision_id, str)
+        or opportunity_type not in {"roster_vacancy", "player_transfer_availability"}
+    ):
+        return None
+    assert isinstance(opportunity_type, str)
+    required = {
+        "candidate_key",
+        "opportunity_type",
+        "evidence",
+        "location",
+        "response_routes",
+        opportunity_type,
+    }
+    optional = {
+        "positions",
+        "playing_levels",
+        "team_formats",
+        "seasonal_timing",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+    structured = {"proposition_evidence", "source_context"}
+    if (
+        not required.issubset(candidate)
+        or set(candidate) - required - optional - structured
+    ):
+        return None
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    location = candidate.get("location")
+    routes = candidate.get("response_routes")
+    source_context = candidate.get("source_context")
+    expected_evidence = {"opportunity", "location", opportunity_type} | (
+        set(candidate) & optional
+    )
+    if (
+        not isinstance(candidate_key, str)
+        or not isinstance(evidence, dict)
+        or set(evidence) != expected_evidence
+        or not all(
+            isinstance(value, str) and value in body for value in evidence.values()
+        )
+        or not isinstance(location, dict)
+        or not isinstance(routes, list)
+        or (
+            source_context is not None
+            and (not isinstance(source_context, str) or not source_context)
+        )
+        or (isinstance(source_context, str) and source_context not in body)
+        or candidate.get(opportunity_type) is not True
+    ):
+        return None
+    validation_body = source_context if isinstance(source_context, str) else body
+    route = _select_response_route(
+        body=validation_body,
+        proposed_routes=routes,
+        bounded_metadata=payload_value.get("bounded_metadata"),
+    )
+    proposition_evidence = candidate.get("proposition_evidence")
+    if not _proposition_evidence_is_authoritative(
+        proposition_evidence,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+        semantic_proof=semantic_proof,
+        source_message_revision_reference=_opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
+        meaning=opportunity_type,
+    ):
+        return None
+    if route is None:
+        return None
+    mention = location.get("mention")
+    country_id = location.get("country_id")
+    city_id = location.get("city_id")
+    place_id = location.get("place_id")
+    if not all(
+        isinstance(value, str) and value
+        for value in (mention, country_id, city_id, place_id)
+    ):
+        return None
+    assert isinstance(mention, str)
+    assert isinstance(country_id, str)
+    assert isinstance(city_id, str)
+    assert isinstance(place_id, str)
+    resolved_location = _resolve_source_location_across_supported_locales(
+        resolver,
+        mention=mention,
+        country_id=country_id,
+        city_id=city_id,
+    )
+    if resolved_location is None:
+        return None
+    resolved_place, city_display_labels = resolved_location
+    places = tuple(
+        place
+        for place in (resolved_place,)
+        if place.place_id == place_id
+        and place.country_id == country_id
+        and place.city_id == city_id
+        and country_id in place.verified_parent_ids
+        and _valid_location_disjointness(place)
+        and bool(place.resolver_version)
+        and bool(place.glossary_version)
+        and len(place.verified_parent_ids) == len(place.parent_display_names)
+        and all(place.parent_display_names)
+        and (
+            city_id in place.verified_parent_ids
+            or (
+                place.geographic_type is GeographicType.CITY
+                and place.place_id == city_id
+            )
+        )
+    )
+    if len(places) != 1:
+        return None
+    timing = candidate.get("seasonal_timing")
+    if timing is not None and not _seasonal_timing_is_valid(timing):
+        return None
+    if (
+        mention not in str(evidence["location"])
+        or not _location_mention_is_authoritative(validation_body, mention)
+        or not _optional_values_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=validation_body,
+        )
+        or not _seasonal_timing_is_supported(
+            timing,
+            str(evidence["seasonal_timing"]) if "seasonal_timing" in evidence else None,
+            authoritative_body=validation_body,
+        )
+        or not _body_establishes_transfer_opportunity(body, opportunity_type)
+    ):
+        return None
+    source_posted_at = payload_value.get("source_posted_at")
+    source_edited_at = payload_value.get("source_edited_at")
+    validation_time = payload_value.get("validation_time")
+    try:
+        posted = datetime.fromisoformat(str(source_posted_at))
+        latest_assertion = datetime.fromisoformat(
+            str(source_edited_at)
+            if source_edited_at is not None
+            else str(source_posted_at)
+        )
+        validated_at = datetime.fromisoformat(str(validation_time))
+    except ValueError:
+        return None
+    if (
+        posted.tzinfo is None
+        or latest_assertion.tzinfo is None
+        or validated_at.tzinfo is None
+        or latest_assertion < posted
+        or validated_at >= latest_assertion + timedelta(days=30)
+        or not isinstance(source_posted_at, str)
+        or (source_edited_at is not None and not isinstance(source_edited_at, str))
+    ):
+        return None
+    team_formats = candidate.get("team_formats")
+    positions = candidate.get("positions")
+    levels = candidate.get("playing_levels")
+    settings = candidate.get("venue_settings")
+    surfaces = candidate.get("playing_surfaces")
+    payment = candidate.get("payment")
+    payment_details = (
+        _stated_payment_amount_and_currency(str(evidence["payment"]))
+        if payment == "paid" and "payment" in evidence
+        else None
+    )
+    localized = dict(places[0].localized_display_names)
+    accepted_facts: dict[str, JsonValue] = {
+        "country_id": country_id,
+        "city_id": city_id,
+        "place_id": place_id,
+        "location_geographic_type": places[0].geographic_type.value,
+        "location_parent_ids": list(places[0].verified_parent_ids),
+        "location_verified_disjoint_place_ids": list(
+            places[0].verified_disjoint_place_ids
+        ),
+        **{
+            f"city_display_{locale}": label
+            for locale, label in city_display_labels.items()
+        },
+        **{
+            f"place_display_{locale}": localized.get(locale, places[0].display_name)
+            for locale in ("en", "ru", "es", "fr")
+        },
+        opportunity_type: True,
+        "positions": positions,
+        "playing_levels": levels,
+        "team_formats": team_formats,
+        "seasonal_timing": timing,
+        "venue_settings": settings,
+        "playing_surfaces": surfaces,
+        "payment": None if payment == "unknown" else payment,
+        "payment_amount": payment_details[0] if payment_details is not None else None,
+        "payment_currency": payment_details[1] if payment_details is not None else None,
+        "source_posted_at": source_posted_at,
+        "source_edited_at": source_edited_at,
+    }
+    return {
+        "opportunity_id": (
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:{opportunity_type}"
+        ),
+        "source_message_revision_id": revision_id,
+        "opportunity_type": opportunity_type,
+        "publication_state": "active",
+        "accepted_facts": accepted_facts,
+        "evidence": {
+            **evidence,
+            "proposition_evidence": proposition_evidence,
+        },
+        "response_route": {"kind": route["kind"], "value": route["value"]},
+    }
+
+
+def _seasonal_timing_is_valid(value: JsonValue) -> bool:
+    """Validate one classifier-proposed normalized Seasonal Timing object."""
+    if not isinstance(value, dict) or set(value) != {"kind", "value"}:
+        return False
+    kind = value.get("kind")
+    raw_value = value.get("value")
+    if kind == "ready_now":
+        return raw_value is None
+    if not isinstance(raw_value, str) or not raw_value:
+        return False
+    if kind == "start_local_date":
+        try:
+            return date.fromisoformat(raw_value).isoformat() == raw_value
+        except ValueError:
+            return False
+    return (
+        kind == "stated_season"
+        and len(raw_value) <= 80
+        and raw_value == raw_value.casefold()
+    )
+
+
+def _seasonal_timing_is_supported(
+    value: JsonValue,
+    evidence: str | None,
+    *,
+    authoritative_body: str,
+) -> bool:
+    """Require the selected timing kind/value to be explicitly source-bound."""
+    if value is None:
+        return evidence is None
+    if not _seasonal_timing_is_valid(value) or not isinstance(evidence, str):
+        return False
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("kind")
+    raw_value = value.get("value")
+    if not isinstance(kind, str):
+        return False
+    normalized = evidence.casefold()
+    if kind == "ready_now":
+        patterns = (
+            r"\b(?:ready|available)\s*(?:now|immediately|right away)\b",
+            r"\bготов\w*\s*(?:сейчас|к\s+переходу)?\b",
+            r"\b(?:disponible|listo)\w*\s*(?:ahora|inmediatamente)?\b",
+            r"\b(?:disponible|pr[êe]t)\w*\s*(?:maintenant|imm[ée]diatement)?\b",
+        )
+        return any(
+            re.search(pattern, normalized) for pattern in patterns
+        ) and not re.search(
+            r"\b(?:not|no|не|не\s+готов|sin|pas)\b[^.!?;\n]{0,20}"
+            r"(?:ready|available|готов|disponible|pr[êe]t)",
+            normalized,
+        )
+    assert isinstance(raw_value, str)
+    if raw_value in evidence or raw_value in authoritative_body:
+        return True
+    if kind == "start_local_date":
+        parsed = date.fromisoformat(raw_value)
+        month_names = {
+            "en": parsed.strftime("%B").casefold(),
+            "ru": (
+                "января",
+                "февраля",
+                "марта",
+                "апреля",
+                "мая",
+                "июня",
+                "июля",
+                "августа",
+                "сентября",
+                "октября",
+                "ноября",
+                "декабря",
+            )[parsed.month - 1],
+            "es": (
+                "enero",
+                "febrero",
+                "marzo",
+                "abril",
+                "mayo",
+                "junio",
+                "julio",
+                "agosto",
+                "septiembre",
+                "octubre",
+                "noviembre",
+                "diciembre",
+            )[parsed.month - 1],
+            "fr": (
+                "janvier",
+                "février",
+                "mars",
+                "avril",
+                "mai",
+                "juin",
+                "juillet",
+                "août",
+                "septembre",
+                "octobre",
+                "novembre",
+                "décembre",
+            )[parsed.month - 1],
+        }
+        return (
+            str(parsed.day) in evidence
+            and str(parsed.year) in evidence
+            and any(month in normalized for month in month_names.values())
+        )
+    first_year, separator, second_year = raw_value.partition("-")
+    return (
+        bool(separator)
+        and first_year.isdigit()
+        and second_year.isdigit()
+        and first_year in evidence
+        and second_year in evidence
+    )
+
+
+def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> bool:
+    """Keep long-term transfer propositions separate from one-off requests."""
+    normalized = body.casefold()
+    one_off = re.search(
+        r"\b(?:match|game|fixture|opponent|матч|игр\w*|соперник|partid\w*|"
+        r"encuentro\w*|rencontre\w*)\b",
+        normalized,
+    )
+    if opportunity_type == "roster_vacancy":
+        long_term = re.search(
+            r"\b(?:roster|vacanc\w*|squad|season|seasonal|long[- ]term|"
+            r"need\w*\s+(?:a\s+)?player|looking\s+for\s+players|"
+            r"набор\w*|нужн\w*\s+игрок\w*|сезон\w*|команд\w*|"
+            r"plantilla|jugador\w*|temporad\w*|effectif|joueur\w*|saison\w*)\b",
+            normalized,
+        )
+    else:
+        long_term = re.search(
+            r"\b(?:transfer|available\s+for\s+(?:a\s+)?move|looking\s+for\s+"
+            r"a\s+team|seeking\s+a\s+team|long[- ]term|season|"
+            r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
+            r"сезон\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
+            r"equip\w*|transfert|cherche\w*\s+une\s+équipe|joueur\w*)\b",
+            normalized,
+        )
+    if long_term is None:
+        return False
+    # A one-off game mention is allowed only when the same source also makes
+    # the long-term or seasonal nature explicit. This keeps "need a player for
+    # Saturday's match" out of the long-term transfer publication path.
+    if one_off is not None:
+        explicit_long_term = re.search(
+            r"\b(?:roster|vacanc\w*|squad|season|seasonal|long[- ]term|"
+            r"transfer|transfert|переход\w*|сезон\w*|plantilla|"
+            r"temporad\w*|effectif|saison\w*)\b",
+            normalized,
+        )
+        if explicit_long_term is None:
+            return False
+    return True
 
 
 def _body_establishes_current_open_match(body: str) -> bool:
@@ -16208,9 +17694,10 @@ def _optional_values_are_supported(
     if authoritative_body is not None:
         if _body_has_terminal_retraction(authoritative_body):
             return False
-        if candidate.get("positions") is not None and not _open_places_are_supported(
-            None,
-            authoritative_body,
+        if (
+            candidate.get("positions") is not None
+            and candidate.get("opportunity_type") in {None, "open_match"}
+            and not _open_places_are_supported(None, authoritative_body)
         ):
             return False
         authoritative_evidence: dict[str, JsonValue] = {
@@ -16809,6 +18296,40 @@ def _runtime_opponent_search_details(
             or (key in {"times", "venue_provision"} and len(raw) > 1)
         ):
             raise ValueError("RunSearch Opponent Search details have invalid values")
+        details[key] = tuple(typed_raw)
+    return details
+
+
+def _runtime_transfer_search_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical optional long-term transfer criteria."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch transfer_search_details must be an object")
+    allowed = set(_TRANSFER_SEARCH_DETAIL_OPTIONS)
+    if set(value) - allowed:
+        raise ValueError("RunSearch transfer Search details have unsupported keys")
+    details: dict[str, tuple[str, ...]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise TypeError("RunSearch transfer Search details must be string lists")
+        typed_raw = cast(list[str], raw)
+        valid = all(
+            _canonical_transfer_timing(item)
+            if key == "seasonal_timing"
+            else item in _TRANSFER_SEARCH_DETAIL_OPTIONS[key]
+            for item in typed_raw
+        )
+        if (
+            not valid
+            or len(typed_raw) != len(set(typed_raw))
+            or (key == "seasonal_timing" and len(raw) > 1)
+        ):
+            raise ValueError("RunSearch transfer Search details have invalid values")
         details[key] = tuple(typed_raw)
     return details
 

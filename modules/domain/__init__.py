@@ -727,6 +727,10 @@ class DiscoveryDraft:
     editing_opponent_search_detail: str | None = None
     opponent_search_detail_draft: tuple[str, ...] = ()
     opponent_search_exact_time_prompt: bool = False
+    transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_transfer_search_detail: str | None = None
+    transfer_search_detail_draft: tuple[str, ...] = ()
+    transfer_search_seasonal_timing_prompt: str | None = None
     search_submission_update_id: str | None = None
 
 
@@ -935,6 +939,7 @@ class CompletedSearch:
     completed_at: datetime
     game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     opponent_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
 
@@ -972,6 +977,70 @@ _OPPONENT_SEARCH_DETAIL_KEYS = (
     "playing_surfaces",
     "payment",
 )
+_TRANSFER_SEARCH_DETAIL_KEYS = (
+    "positions",
+    "playing_levels",
+    "team_formats",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
+_TRANSFER_OPPORTUNITY_TYPES = {
+    UserIntent.NEW_TEAM_SEARCH: "roster_vacancy",
+    UserIntent.TRANSFER_PLAYER_SEARCH: "player_transfer_availability",
+}
+
+
+def _seasonal_timing_parts(value: Any) -> tuple[str, str | None] | None:
+    """Parse one canonical Seasonal Timing value without inferring adjacent time."""
+    if isinstance(value, Mapping):
+        kind = value.get("kind")
+        raw_value = value.get("value")
+        if not isinstance(kind, str):
+            return None
+        if raw_value is not None and not isinstance(raw_value, str):
+            return None
+        value = kind if raw_value is None else f"{kind}:{raw_value}"
+    if not isinstance(value, str):
+        return None
+    if value == "ready_now":
+        return "ready_now", None
+    kind, separator, raw_value = value.partition(":")
+    if not separator or not raw_value:
+        return None
+    if kind == "start_local_date":
+        try:
+            return kind, date.fromisoformat(raw_value).isoformat()
+        except ValueError:
+            return None
+    if kind == "stated_season":
+        normalized = raw_value.strip().casefold()
+        return (kind, normalized) if normalized else None
+    return None
+
+
+def match_seasonal_timing(
+    requested: tuple[str, ...],
+    accepted: Mapping[str, Any] | str | None,
+) -> MatchState:
+    """Compare one normalized Seasonal Timing criterion by exact equality."""
+    if not requested:
+        return MatchState.CONFIRMED
+    if len(requested) != 1:
+        return MatchState.CONFLICT
+    requested_parts = _seasonal_timing_parts(requested[0])
+    if requested_parts is None:
+        return MatchState.CONFLICT
+    if accepted is None:
+        return MatchState.UNKNOWN
+    accepted_parts = _seasonal_timing_parts(accepted)
+    if accepted_parts is None:
+        return MatchState.UNKNOWN
+    return (
+        MatchState.CONFIRMED
+        if requested_parts == accepted_parts
+        else MatchState.CONFLICT
+    )
 
 
 def match_venue_provision(
@@ -1133,6 +1202,129 @@ def evaluate_opponent_search(
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=(
+                    "possible_match"
+                    if MatchState.UNKNOWN in states
+                    else "confirmed_match"
+                ),
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=game_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
+
+
+def evaluate_transfer_search(
+    completed_search: CompletedSearch,
+    transfer_search_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Classify one directional long-term transfer Search deterministically."""
+    opportunity_type = _TRANSFER_OPPORTUNITY_TYPES.get(completed_search.user_intent)
+    if opportunity_type is None:
+        return ()
+    matched: list[SearchResult] = []
+    for opportunity in opportunities:
+        if (
+            opportunity.publication_state != "active"
+            or opportunity.opportunity_type != opportunity_type
+        ):
+            continue
+        facts = opportunity.accepted_facts
+        if facts.get(opportunity_type) is not True:
+            continue
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+        ):
+            continue
+        detail_state_by_key = {
+            key: match_detail(
+                transfer_search_details.get(key, ()),
+                tuple(facts[key]) if isinstance(facts.get(key), list) else None,
+            )
+            for key in _TRANSFER_SEARCH_DETAIL_KEYS
+        }
+        detail_state_by_key["seasonal_timing"] = match_seasonal_timing(
+            transfer_search_details.get("seasonal_timing", ()),
+            facts.get("seasonal_timing"),
+        )
+        detail_state_by_key["search_area"] = match_search_area(
+            whole_city=completed_search.whole_city,
+            selected_area_ids=completed_search.sub_city_area_ids,
+            selected_area_types=completed_search.sub_city_area_geographic_types,
+            selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+            country_id=completed_search.country_id,
+            city_id=completed_search.city_id,
+            facts=facts,
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+        route = opportunity.response_route
+        source_posted_at = str(facts.get("source_posted_at", ""))
+        sort_local_date = source_posted_at[:10] or "9999-12-31"
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "opportunity_type": opportunity_type,
+            opportunity_type: "true",
+            "sort_local_date": sort_local_date,
+            "start_local_date": sort_local_date,
+            "end_local_date": sort_local_date,
+            "source_posted_at": source_posted_at,
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if transfer_search_details.get(key)
+                    or (key == "search_area" and not completed_search.whole_city)
+                },
+                sort_keys=True,
+            ),
+        }
+        for locale in ("en", "ru", "es", "fr"):
+            card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
+            card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("seasonal_timing") is not None:
+            card["seasonal_timing"] = json.dumps(
+                facts["seasonal_timing"], ensure_ascii=False, sort_keys=True
+            )
+        for key in (
+            "team_formats",
+            "positions",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+        ):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key])
+        if facts.get("source_edited_at"):
+            card["source_edited_at"] = str(facts["source_edited_at"])
+        if facts.get("payment"):
+            card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
+        matched.append(
+            SearchResult(
+                result_id=(
+                    f"result:{completed_search.completed_search_id}:"
+                    f"{opportunity.opportunity_id}"
+                ),
                 completed_search_id=completed_search.completed_search_id,
                 absolute_position=1,
                 result_class=(

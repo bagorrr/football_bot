@@ -2520,6 +2520,7 @@ class AcceptanceSpine:
         screen_revision: int | None = None,
         game_search_details: dict[str, list[str]] | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
+        transfer_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2532,6 +2533,7 @@ class AcceptanceSpine:
             ),
             game_search_details=game_search_details,
             opponent_search_details=opponent_search_details,
+            transfer_search_details=transfer_search_details,
         )
 
     def open_game_search_details(
@@ -2733,6 +2735,111 @@ class AcceptanceSpine:
     ) -> None:
         """Leave an Opponent Search detail submenu or hub."""
         self._conversation_onboarding().back_from_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the long-term transfer Details hub."""
+        self._conversation_onboarding().open_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one long-term transfer detail submenu."""
+        self._conversation_onboarding().open_transfer_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_transfer_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one temporary transfer detail value."""
+        self._conversation_onboarding().toggle_transfer_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit one transfer detail submenu through Done."""
+        self._conversation_onboarding().commit_transfer_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_transfer_search_seasonal_timing(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Select a temporary ready-now Seasonal Timing value."""
+        self._conversation_onboarding().select_transfer_search_seasonal_timing(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_seasonal_timing_start_date(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the transfer local-start-date prompt."""
+        self._conversation_onboarding().open_transfer_search_seasonal_timing_start_date(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_transfer_search_seasonal_timing_start_date_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit the transfer local-start-date prompt."""
+        self._conversation_onboarding().submit_transfer_search_seasonal_timing_start_date_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_seasonal_timing_season(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the transfer named-season prompt."""
+        self._conversation_onboarding().open_transfer_search_seasonal_timing_season(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_transfer_search_seasonal_timing_season_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit the transfer named-season prompt."""
+        self._conversation_onboarding().submit_transfer_search_seasonal_timing_season_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from a transfer detail submenu or hub."""
+        self._conversation_onboarding().back_from_transfer_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

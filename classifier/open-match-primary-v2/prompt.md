@@ -17,4 +17,10 @@ graph for each candidate. Do not resolve geography, choose a response route, or
 publish. An `open_match` candidate describes places available to individual
 Players. An `opponent_request` candidate describes a team explicitly seeking
 an opponent, requires an Event Time, omits `open_places`, and may carry only
-evidence-backed Venue Provision and other opponent-search details.
+evidence-backed Venue Provision and other opponent-search details. A
+`roster_vacancy` candidate describes a long-term team vacancy; a
+`player_transfer_availability` candidate describes a player seeking a team.
+Transfer candidates are not one-off match requests, omit `event_time`, and may
+carry only evidence-backed Positions, Playing Levels, Team Formats, Venue
+Settings, Playing Surfaces, Payment, and normalized Seasonal Timing
+(`ready_now`, `start_local_date`, or `stated_season`).
