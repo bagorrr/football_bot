@@ -996,6 +996,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read one Application-owned immutable Source Message revision."""
         ...
 
+    def source_message_creation_time(self, source_message_id: str) -> datetime | None:
+        """Read the original publication time for one current Source Message."""
+        ...
+
     def eligible_reply_revision(
         self,
         *,

@@ -1198,6 +1198,8 @@ def evaluate_tournament_search(
                 sort_keys=True,
             ),
         }
+        if facts.get("source_edited_at"):
+            card["source_edited_at"] = str(facts["source_edited_at"])
         for locale in ("en", "ru", "es", "fr"):
             card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
             card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])

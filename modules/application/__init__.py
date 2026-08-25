@@ -6672,6 +6672,7 @@ def _tournament_result_message(
             "matches": "Matches",
             "needs_clarification": "Needs clarification",
             "posted": "Posted",
+            "edited": "Edited",
             "contact": "Contact",
             "posted_joiner": "at",
             "date_and_city": "date and city",
@@ -6681,12 +6682,14 @@ def _tournament_result_message(
             ),
             "additional": "Additional",
             "possible": "No exact match was found.",
+            "source_language": "source language",
         },
         "ru": {
             "title": "Турнир",
             "matches": "Подходит",
             "needs_clarification": "Нужно уточнить",
             "posted": "Пост",
+            "edited": "Изменён",
             "contact": "Контакт",
             "posted_joiner": "в",
             "date_and_city": "дата и город",
@@ -6696,12 +6699,14 @@ def _tournament_result_message(
             ),
             "additional": "Дополнительно",
             "possible": "Точного совпадения не найдено.",
+            "source_language": "исходный язык",
         },
         "es": {
             "title": "Torneo",
             "matches": "Coincide",
             "needs_clarification": "Falta confirmar",
             "posted": "Publicado",
+            "edited": "Modificado",
             "contact": "Contacto",
             "posted_joiner": "a las",
             "date_and_city": "fecha y ciudad",
@@ -6711,12 +6716,14 @@ def _tournament_result_message(
             ),
             "additional": "Información adicional",
             "possible": "No se encontró una coincidencia exacta.",
+            "source_language": "idioma de origen",
         },
         "fr": {
             "title": "Tournoi",
             "matches": "Correspond",
             "needs_clarification": "À préciser",
             "posted": "Publié",
+            "edited": "Modifié",
             "contact": "Contact",
             "posted_joiner": "à",
             "date_and_city": "date et ville",
@@ -6726,6 +6733,7 @@ def _tournament_result_message(
             ),
             "additional": "Informations complémentaires",
             "possible": "Aucune correspondance exacte n’a été trouvée.",
+            "source_language": "langue source",
         },
     }[copy_locale]
     event_date = date.fromisoformat(facts["start_local_date"])
@@ -6783,6 +6791,7 @@ def _tournament_result_message(
     if int(facts.get("location_specificity", "0")) > 1:
         where += f", {facts[f'place_display_{copy_locale}']}"
     value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
+    source_text_fields = {"schedule", "structure", "prizes"}
 
     def fact_value(key: str) -> str | None:
         raw = facts.get(key)
@@ -6792,17 +6801,25 @@ def _tournament_result_message(
             decoded = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
             decoded = raw
+        if key == "registration_deadline" and isinstance(decoded, str):
+            with suppress(ValueError):
+                deadline = date.fromisoformat(decoded)
+                return f"{deadline.day} {months[deadline.month - 1]} {deadline.year}"
         if isinstance(decoded, list):
-            return ", ".join(
+            rendered = ", ".join(
                 value_copy.get(item, item.replace("_", " ").capitalize())
                 for item in decoded
                 if isinstance(item, str)
             )
-        if isinstance(decoded, dict):
-            return json.dumps(decoded, ensure_ascii=False, sort_keys=True)
-        if isinstance(decoded, str):
-            return value_copy.get(decoded, decoded)
-        return str(decoded)
+        elif isinstance(decoded, dict):
+            rendered = json.dumps(decoded, ensure_ascii=False, sort_keys=True)
+        elif isinstance(decoded, str):
+            rendered = value_copy.get(decoded, decoded)
+        else:
+            rendered = str(decoded)
+        if key in source_text_fields and rendered:
+            return f"{rendered} ({labels['source_language']})"
+        return rendered
 
     field_labels = {
         "en": {
@@ -6979,6 +6996,12 @@ def _tournament_result_message(
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts["iana_timezone"])
     )
+    edited_time = facts.get("source_edited_at")
+    edited_copy = (
+        datetime.fromisoformat(edited_time).astimezone(ZoneInfo(facts["iana_timezone"]))
+        if edited_time is not None
+        else None
+    )
     route_copy = render_response_route(
         facts["response_route_kind"],
         facts["response_route_value"],
@@ -6990,6 +7013,15 @@ def _tournament_result_message(
             f"{labels['posted']}: {source_time.day} "
             f"{months[source_time.month - 1]} {source_time.year} "
             f"{labels['posted_joiner']} {source_time:%H:%M}",
+            *(
+                ()
+                if edited_copy is None
+                else (
+                    f"{labels['edited']}: {edited_copy.day} "
+                    f"{months[edited_copy.month - 1]} {edited_copy.year} "
+                    f"{labels['posted_joiner']} {edited_copy:%H:%M}",
+                )
+            ),
             f"{labels['contact']}: {route_copy}",
             "",
             labels["questions"],
@@ -10522,6 +10554,25 @@ class RuntimeApplication:
             "eligible_reply_context": authoritative_reply_context,
             "validation_time": self.clock.now().isoformat(),
         }
+        source_posted_at = source_revision.event_time
+        source_edited_at: datetime | None = None
+        if source_revision.event_kind.value == "edit":
+            initial_event_time = self.store.source_message_creation_time(
+                source_revision.source_message_id
+            )
+            if initial_event_time is not None:
+                source_posted_at = initial_event_time
+            source_edited_at = source_revision.event_time
+        authoritative_payload.update(
+            {
+                "source_posted_at": source_posted_at.isoformat(),
+                "source_edited_at": (
+                    source_edited_at.isoformat()
+                    if source_edited_at is not None
+                    else None
+                ),
+            }
+        )
         if incoming.contract_version == 4:
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
@@ -14262,6 +14313,27 @@ def _validated_tournament_proposal(
         and registration_expiry is None
     ):
         return None
+    try:
+        source_posted_at = datetime.fromisoformat(
+            str(
+                payload_value.get(
+                    "source_posted_at", payload_value.get("source_event_time")
+                )
+            )
+        )
+        raw_source_edited_at = payload_value.get("source_edited_at")
+        source_edited_at = (
+            datetime.fromisoformat(str(raw_source_edited_at))
+            if raw_source_edited_at is not None
+            else None
+        )
+    except ValueError:
+        return None
+    if source_posted_at.tzinfo is None or (
+        source_edited_at is not None
+        and (source_edited_at.tzinfo is None or source_edited_at < source_posted_at)
+    ):
+        return None
     expiry = _open_match_expiry(
         parsed_start,
         parsed_end,
@@ -14310,8 +14382,10 @@ def _validated_tournament_proposal(
         "payment_currency": (
             payment_details[1] if payment_details is not None else None
         ),
-        "source_posted_at": source_event_time.isoformat(),
+        "source_posted_at": source_posted_at.isoformat(),
     }
+    if source_edited_at is not None:
+        accepted_facts["source_edited_at"] = source_edited_at.isoformat()
     for field_name in (
         "schedule",
         "registration_deadline",
@@ -14361,10 +14435,16 @@ def _tournament_open_participation_is_supported(
             r"\b(?:registration|participation)\s+is\s+open\b|"
             r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
             r"\b(?:открыт\w*|ид[её]т|продолжается)\b|"
+            r"\b(?:открыт\w*|ид[её]т|продолжается)\b[^.!?;\n]{0,35}"
+            r"\b(?:регистрац\w*|набор\w*|участ\w*)\b|"
             r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b"
             r"[^.!?;\n]{0,35}\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b|"
+            r"\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b[^.!?;\n]{0,35}"
+            r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b|"
             r"\b(?:inscriptions?|participations?|entr[ée]e?s?)\b"
-            r"[^.!?;\n]{0,35}\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b",
+            r"[^.!?;\n]{0,35}\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b|"
+            r"\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b"
+            r"[^.!?;\n]{0,35}\b(?:inscriptions?|participations?|entr[ée]e?s?)\b",
             normalized,
         )
         is not None

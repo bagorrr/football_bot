@@ -5,6 +5,8 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from modules.application import (
     _accepted_city_display_labels,
     _body_establishes_current_open_match,
@@ -17,6 +19,7 @@ from modules.application import (
     _resolve_source_location_across_supported_locales,
     _select_response_route,
     _stated_payment_amount_and_currency,
+    _tournament_open_participation_is_supported,
 )
 from modules.contracts import JsonValue
 from modules.domain import (
@@ -26,6 +29,24 @@ from modules.domain import (
     LocationResolution,
     LocationResolutionQuery,
 )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Registration is open",
+        "Открыта регистрация",
+        "Abiertas las inscripciones",
+        "Ouvertes aux inscriptions",
+    ),
+)
+def test_tournament_open_participation_accepts_supported_word_orders(
+    evidence: str,
+) -> None:
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
 
 
 class _LocalizedLocationResolver:

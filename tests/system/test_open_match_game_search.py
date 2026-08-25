@@ -216,7 +216,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Adult football tournament on 20 August 2026 at Петроградская. "
         "Registration is open. Team format 7x7, average playing level, outdoor venue "
         "with artificial turf, "
-        "free entry. Contact @tournament_contact"
+        "free entry. Tournament structure: group stage. Contact @tournament_contact"
     )
     classifier.return_for(
         body=body,
@@ -238,6 +238,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
                             "venue_settings": "outdoor venue",
                             "playing_surfaces": "artificial turf",
                             "payment": "free entry",
+                            "structure": "Tournament structure: group stage",
                         },
                         "location": {
                             "mention": "Петроградская",
@@ -256,6 +257,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
                         "venue_settings": ["outdoor"],
                         "playing_surfaces": ["artificial_turf"],
                         "payment": "free",
+                        "structure": "group stage",
                         "response_routes": [
                             {
                                 "kind": "explicit_telegram_username",
@@ -309,6 +311,38 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
     assert publication_facts["open_participation"] is True
     assert publication_facts["start_local_date"] == "2026-08-20"
 
+    clock.advance_to(datetime(2026, 8, 18, 10, 7, tzinfo=UTC))
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4916),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4917),
+        source_event_id="source-event:tournament:publication-edit",
+        telegram_message_id=1115,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=body,
+        event_time=datetime(2026, 8, 18, 10, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    edited_revision_id = (
+        "source-chat:channel:4900115:generation:1:message:1115:revision:2"
+    )
+    active_edit_publication = next(
+        publication
+        for publication in system.opportunity_publication_contracts(edited_revision_id)
+        if isinstance(publication.payload, dict)
+        and publication.payload["publication_state"] == "active"
+    )
+    assert isinstance(active_edit_publication.payload, dict)
+    edited_facts = active_edit_publication.payload["accepted_facts"]
+    assert isinstance(edited_facts, dict)
+    assert edited_facts["source_posted_at"] == "2026-07-18T09:06:00+00:00"
+    assert edited_facts["source_edited_at"] == "2026-08-18T10:06:00+00:00"
+
     _advance_to_complete_tournament_search(system, bot_user_id=49_117)
     system.submit_search(
         update_id="submit-tournament-search",
@@ -328,8 +362,10 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "\n"
         "Matches: date and city.\n\n"
         "Additional: Team format: 7x7 · Playing levels: Average · "
-        "Venue type: Outdoor · Playing surface: Artificial turf · Payment: Free\n\n"
+        "Venue type: Outdoor · Playing surface: Artificial turf · Payment: Free · "
+        "Structure: group stage (source language)\n\n"
         "Posted: 18 July 2026 at 12:06\n"
+        "Edited: 18 August 2026 at 13:06\n"
         "Contact: @tournament_contact\n\n"
         "Questions? Message me. I can explain the card or help refine your search."
     )

@@ -2192,6 +2192,7 @@ def _validate_tournament_accepted_facts(facts: dict[str, JsonValue]) -> None:
         "structure",
         "capacity",
         "prizes",
+        "source_edited_at",
     }
     if set(facts) - base_required - optional or not base_required.issubset(facts):
         raise ValueError("tournament accepted facts are incomplete")
@@ -2204,6 +2205,10 @@ def _validate_tournament_accepted_facts(facts: dict[str, JsonValue]) -> None:
     base_facts["positions"] = None
     _validate_open_match_accepted_facts(base_facts)
     for field_name in optional:
+        if field_name == "source_edited_at":
+            if field_name in facts:
+                _required_iso_datetime(facts, field_name)
+            continue
         if field_name in facts and not _valid_tournament_json_fact(facts[field_name]):
             raise ValueError(f"tournament {field_name} is invalid")
 

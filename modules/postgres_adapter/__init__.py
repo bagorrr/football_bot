@@ -3318,6 +3318,24 @@ class PostgresRoleStore:
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
         )
 
+    def source_message_creation_time(self, source_message_id: str) -> datetime | None:
+        """Read the immutable create-event time for one current Source Message."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT event_time
+                FROM football_runtime.source_message_revisions
+                WHERE source_message_id = %s
+                  AND event_kind = 'create'
+                ORDER BY revision
+                LIMIT 1
+                """,
+                (source_message_id,),
+            ).fetchone()
+        return None if row is None else row[0]
+
     def eligible_reply_revision(
         self,
         *,
