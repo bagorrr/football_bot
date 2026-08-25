@@ -38,6 +38,7 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
 ):
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
+    classifier.enable_primary_v3()
     resolver = ControlledLocationResolverAdapter()
     dates = ControlledDateInterpretationAdapter()
     timezones = ControlledTimezoneDataAdapter()
@@ -132,9 +133,9 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
     cases = (
         (
             "exact-four",
-            "Football match 20 August 2026 in whole city. Need 4 players. "
-            "Contact @player_four.",
-            "Need 4 players",
+            "Football match 20 August 2026 in whole city. We are 4 players "
+            "available to play. Contact @player_four.",
+            "We are 4 players available to play",
             4,
             None,
             None,
@@ -142,9 +143,9 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
         ),
         (
             "exact-two",
-            "Football match 20 August 2026 in whole city. Need 2 players. "
-            "Contact @player_two.",
-            "Need 2 players",
+            "Football match 20 August 2026 in whole city. We are 2 players "
+            "available to play. Contact @player_two.",
+            "We are 2 players available to play",
             2,
             None,
             None,
@@ -152,9 +153,9 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
         ),
         (
             "range-two-five",
-            "Football match 20 August 2026 in whole city. 2-5 players "
-            "are available. Contact @player_range.",
-            "2-5 players are available",
+            "Football match 20 August 2026 in whole city. From 2 to 5 players "
+            "are available to play. Contact @player_range.",
+            "From 2 to 5 players are available to play",
             None,
             2,
             5,
@@ -162,9 +163,9 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
         ),
         (
             "unknown-count",
-            "Football match 20 August 2026 in whole city. Need some players. "
-            "Contact @player_unknown.",
-            "Need some players",
+            "Football match 20 August 2026 in whole city. We are available to "
+            "play as a group. Contact @player_unknown.",
+            "We are available to play as a group",
             None,
             None,
             None,
@@ -217,6 +218,70 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
         assert opportunity.opportunity_type == "player_match_availability"
         assert opportunity.publication_state == "active"
         opportunity_ids[label] = opportunity.opportunity_id
+
+    _advance_to_player_search_details(
+        system,
+        bot_user_id=49_533,
+    )
+    system.open_player_search_detail(
+        update_id="number:back-player-user:49533",
+        telegram_user_id=49_533,
+        detail_key="number_of_players",
+    )
+    system.back_from_game_search_detail(
+        update_id="back:number-prompt:49533",
+        telegram_user_id=49_533,
+    )
+    number_prompt_draft = system.discovery_draft(49_533)
+    assert number_prompt_draft.user_intent is not None
+    assert number_prompt_draft.user_intent.value == "player_search"
+    assert not number_prompt_draft.player_search_number_prompt
+    assert number_prompt_draft.editing_game_search_detail is None
+    assert any(
+        callback.startswith("details:open:number_of_players:")
+        for row in telegram_delivery.messages[-1].button_rows
+        for _, callback in row
+    )
+
+    _advance_to_player_search_details(
+        system,
+        bot_user_id=49_534,
+    )
+    system.open_player_search_detail(
+        update_id="team-format:back-player-user:49534",
+        telegram_user_id=49_534,
+        detail_key="team_formats",
+    )
+    system.back_from_game_search_detail(
+        update_id="back:submenu:49534",
+        telegram_user_id=49_534,
+    )
+    submenu_draft = system.discovery_draft(49_534)
+    assert submenu_draft.user_intent is not None
+    assert submenu_draft.user_intent.value == "player_search"
+    assert submenu_draft.editing_game_search_detail is None
+    assert any(
+        callback.startswith("details:open:team_formats:")
+        for row in telegram_delivery.messages[-1].button_rows
+        for _, callback in row
+    )
+
+    _advance_to_player_search_details(
+        system,
+        bot_user_id=49_535,
+    )
+    system.back_from_game_search_detail(
+        update_id="back:player-hub:49535",
+        telegram_user_id=49_535,
+    )
+    hub_draft = system.discovery_draft(49_535)
+    assert hub_draft.user_intent is not None
+    assert hub_draft.user_intent.value == "player_search"
+    assert any(
+        callback.startswith("details:open:")
+        for row in telegram_delivery.messages[-1].button_rows
+        for _, callback in row
+    )
 
     _advance_to_player_search(
         system,
@@ -364,6 +429,35 @@ def _advance_to_player_search(
     number_of_players: int,
     locale: str = "en",
 ) -> None:
+    _advance_to_player_search_details(
+        system,
+        bot_user_id=bot_user_id,
+        locale=locale,
+    )
+    system.open_player_search_detail(
+        update_id=f"number:player-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        detail_key="number_of_players",
+    )
+    system.submit_player_search_number_text(
+        update_id=f"number-submit:player-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        text=str(number_of_players),
+    )
+    assert system.discovery_draft(bot_user_id).number_of_players == number_of_players
+    system.submit_search(
+        update_id=f"submit:player-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+    )
+    system.process_searches_until_idle()
+
+
+def _advance_to_player_search_details(
+    system: AcceptanceSpine,
+    *,
+    bot_user_id: int,
+    locale: str = "en",
+) -> None:
     system.start_bot_user(
         update_id=f"start:player-user:{bot_user_id}",
         telegram_user_id=bot_user_id,
@@ -403,22 +497,6 @@ def _advance_to_player_search(
         update_id=f"details:player-user:{bot_user_id}",
         telegram_user_id=bot_user_id,
     )
-    system.open_player_search_detail(
-        update_id=f"number:player-user:{bot_user_id}",
-        telegram_user_id=bot_user_id,
-        detail_key="number_of_players",
-    )
-    system.submit_player_search_number_text(
-        update_id=f"number-submit:player-user:{bot_user_id}",
-        telegram_user_id=bot_user_id,
-        text=str(number_of_players),
-    )
-    assert system.discovery_draft(bot_user_id).number_of_players == number_of_players
-    system.submit_search(
-        update_id=f"submit:player-user:{bot_user_id}",
-        telegram_user_id=bot_user_id,
-    )
-    system.process_searches_until_idle()
 
 
 def _player_classifier_result(
@@ -469,9 +547,10 @@ def _player_classifier_result(
         candidate["available_player_count_max"] = maximum_count
     return ClassifierAdapterResult(
         output={
-            "schema_version": "source-message-classification-v1",
+            "schema_version": "source-message-classification-v3",
             "disposition": "accepted",
-            "candidates": [candidate],
+            "candidates": [{"source_context": body, **candidate}],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
         },
         effective_model="gpt-5.6-sol",
         effective_reasoning_effort="high",

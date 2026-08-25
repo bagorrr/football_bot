@@ -51,7 +51,17 @@ class ResponsesClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
-        return "source-message-classification-v2"
+        if (
+            "source-message-classification-v3" in self._schemas
+            and "player-match-primary-v1" in self._prompt_paths
+        ):
+            return "source-message-classification-v3"
+        if (
+            "source-message-classification-v2" in self._schemas
+            and "open-match-primary-v2" in self._prompt_paths
+        ):
+            return "source-message-classification-v2"
+        return "source-message-classification-v1"
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False

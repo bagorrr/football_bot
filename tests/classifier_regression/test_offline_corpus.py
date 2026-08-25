@@ -8,6 +8,7 @@ import json
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
+from typing import cast
 
 from modules.application import (
     _body_establishes_current_open_match,
@@ -15,6 +16,7 @@ from modules.application import (
     _location_mention_is_authoritative,
     _open_places_are_supported,
     _optional_values_are_supported,
+    _player_availability_is_supported,
     _select_response_route,
     _stated_payment_amount_and_currency,
 )
@@ -168,6 +170,144 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
         invalid_domain_value,
         body=cases[0]["source"],
     )
+
+
+def test_player_release_replays_offline_with_offering_semantics() -> None:
+    """The additive v3 release has its own controlled evaluation cases."""
+    cases = (
+        {
+            "source": "We are 4 players available in Moscow on 2026-09-01.",
+            "opportunity": "We are 4 players available",
+            "count_evidence": {"available_player_count": "4 players"},
+            "counts": {"available_player_count": 4},
+            "expected_supported": True,
+        },
+        {
+            "source": "De 2 à 5 joueurs sont disponibles à Paris le 2026-09-01.",
+            "opportunity": "De 2 à 5 joueurs sont disponibles",
+            "count_evidence": {
+                "available_player_count_min": "De 2 à 5 joueurs",
+                "available_player_count_max": "De 2 à 5 joueurs",
+            },
+            "counts": {
+                "available_player_count_min": 2,
+                "available_player_count_max": 5,
+            },
+            "expected_supported": True,
+        },
+        {
+            "source": "Need 4 players for the match in Moscow on 2026-09-01.",
+            "opportunity": "Need 4 players for the match",
+            "count_evidence": {"available_player_count": "4 players"},
+            "counts": {"available_player_count": 4},
+            "expected_supported": False,
+        },
+    )
+    adapter = ControlledModelAdapter()
+    adapter.enable_primary_v3()
+    for case_number, case in enumerate(cases, start=1):
+        source = case["source"]
+        opportunity = case["opportunity"]
+        count_evidence = case["count_evidence"]
+        counts = case["counts"]
+        assert isinstance(source, str)
+        assert isinstance(opportunity, str)
+        assert isinstance(count_evidence, dict)
+        assert isinstance(counts, dict)
+        candidate = {
+            "candidate_key": f"player-regression-{case_number}",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+                "opportunity": opportunity,
+                "event_time": "2026-09-01",
+                "location": "Moscow" if "Moscow" in source else "Paris",
+                **count_evidence,
+            },
+            "source_context": source,
+            "location": {
+                "mention": "Moscow" if "Moscow" in source else "Paris",
+                "place_id": "place:city",
+                "country_id": "country:country",
+                "city_id": "city:city",
+            },
+            "event_time": {
+                "start_local_date": "2026-09-01",
+                "end_local_date": "2026-09-01",
+                "iana_timezone": "Europe/Paris",
+            },
+            "response_routes": [],
+            **counts,
+        }
+        disposition = "accepted" if case["expected_supported"] else "irrelevant"
+        output = cast(
+            dict[str, JsonValue],
+            {
+                "schema_version": "source-message-classification-v3",
+                "disposition": disposition,
+                "candidates": [candidate] if disposition == "accepted" else [],
+                "routing": {
+                    "reason_code": "accepted"
+                    if disposition == "accepted"
+                    else "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        )
+        adapter.return_for(
+            body=source,
+            result=ClassifierAdapterResult(
+                output=output,
+                effective_model="gpt-5.6-sol",
+                effective_reasoning_effort="high",
+                codex_version="controlled-regression",
+                adapter_kind="controlled_recording",
+                adapter_version="player-classifier-regression-v1",
+                duration_ms=0,
+                input_tokens=0,
+                output_tokens=0,
+            ),
+        )
+        result = adapter.classify(
+            ClassifierRequest(
+                source_message_revision_id=f"player-regression:{case_number}",
+                body=source,
+                source_event_time="2026-08-20T09:00:00+00:00",
+                context_bundle_version="primary-classifier-context-v1",
+                source_chat_reference="controlled:chat",
+                source_chat_timezone="Europe/Paris",
+                source_chat_geography={"country_id": None, "city_id": None},
+                bounded_metadata={"message_language": None, "attachment_types": []},
+                eligible_reply_context=None,
+                requested_model="gpt-5.6-sol",
+                requested_reasoning_effort="high",
+                prompt_version="player-match-primary-v1",
+                schema_version="source-message-classification-v3",
+                glossary_version="football-opportunity-glossary-v1",
+                context_policy_version="classifier-context-v1",
+                routing_policy_version="classifier-routing-player-v1",
+            )
+        )
+        assert classifier_output_is_schema_valid(result.output, body=source)
+        candidates = result.output.get("candidates")
+        assert isinstance(candidates, list)
+        if disposition == "accepted":
+            validated_candidate = candidates[0]
+            assert isinstance(validated_candidate, dict)
+            validated_evidence = validated_candidate.get("evidence")
+            assert isinstance(validated_evidence, dict)
+            opportunity_evidence = validated_evidence.get("opportunity")
+            assert isinstance(opportunity_evidence, str)
+            assert _player_availability_is_supported(
+                validated_candidate.get("available_player_count"),
+                validated_candidate.get("available_player_count_min"),
+                validated_candidate.get("available_player_count_max"),
+                opportunity_evidence,
+                authoritative_body=source,
+            )
+        else:
+            assert not candidates
+        assert adapter.requests[-1].schema_version == "source-message-classification-v3"
+        assert adapter.requests[-1].prompt_version == "player-match-primary-v1"
 
 
 def test_v2_provider_schemas_match_strict_application_evidence_contract() -> None:

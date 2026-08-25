@@ -1099,7 +1099,7 @@ def evaluate_game_search(
 
 def player_search_result_sort_key(
     result: SearchResult,
-) -> tuple[int, int, int, str, int, str, int, str]:
+) -> tuple[int, int, str, int, str, int, int, str]:
     """Return the complete deterministic Player Search ordering key."""
     facts = dict(result.card_facts)
     contribution = int(facts.get("player_contribution_count", "0"))
@@ -1118,11 +1118,11 @@ def player_search_result_sort_key(
             "partial_result": 1,
             "possible_match": 2,
         }.get(result.result_class, 3),
-        -contribution,
         int(facts.get("unknown_criterion_count", "0")),
         facts.get("sort_local_date", facts["start_local_date"]),
         1 if time_is_unknown else 0,
         canonical_local_time,
+        -contribution,
         -int(facts.get("location_specificity", "0")),
         facts["opportunity_id"],
     )

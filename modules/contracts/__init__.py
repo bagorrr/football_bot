@@ -1411,9 +1411,9 @@ def _validate_classification_proposal(
         proof_reference = proof.get("source_message_revision_reference")
         if not isinstance(proof_reference, str) or not proof_reference:
             raise ValueError("ClassificationProposal v3 proof reference is invalid")
-        meaning = candidate.get("opportunity_type")
-        if not isinstance(meaning, str):
-            meaning = "open_match"
+        candidate_meaning = candidate.get("opportunity_type")
+        if not isinstance(candidate_meaning, str):
+            candidate_meaning = "open_match"
         if not semantic_proof_is_schema_valid(
             proof,
             body=body,
@@ -1421,7 +1421,7 @@ def _validate_classification_proposal(
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
-            meaning=meaning,
+            meaning=candidate_meaning,
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
@@ -1448,6 +1448,7 @@ def _validate_classification_proposal(
             raise TypeError(
                 f"ClassificationProposal requires non-negative {field_name}"
             )
+    player_release = payload.get("schema_version") == "source-message-classification-v3"
     pinned = (
         {
             "requested_model": "gpt-5.6-sol",
@@ -1468,14 +1469,30 @@ def _validate_classification_proposal(
             "requested_reasoning_effort": "high",
             "effective_reasoning_effort": "high",
             "prompt_version": (
-                "open-match-ambiguity-v1"
-                if payload["pass_number"] == 2
-                else "open-match-primary-v2"
+                (
+                    "player-match-ambiguity-v1"
+                    if payload["pass_number"] == 2
+                    else "player-match-primary-v1"
+                )
+                if player_release
+                else (
+                    "open-match-ambiguity-v1"
+                    if payload["pass_number"] == 2
+                    else "open-match-primary-v2"
+                )
             ),
-            "schema_version": "source-message-classification-v2",
+            "schema_version": (
+                "source-message-classification-v3"
+                if player_release
+                else "source-message-classification-v2"
+            ),
             "glossary_version": "football-opportunity-glossary-v1",
             "context_policy_version": "classifier-context-v1",
-            "routing_policy_version": "classifier-routing-v1",
+            "routing_policy_version": (
+                "classifier-routing-player-v1"
+                if player_release
+                else "classifier-routing-v1"
+            ),
             "context_bundle_version": "primary-classifier-context-v1",
         }
     )
@@ -1516,6 +1533,10 @@ def _validate_classification_proposal_v4(
     payload: dict[str, JsonValue], *, body: str
 ) -> None:
     """Validate multi-candidate proof and one-way ambiguity-pass provenance."""
+    player_release = payload.get("schema_version") == "source-message-classification-v3"
+    proof_version = (
+        "source-semantic-proof-v2" if player_release else "source-semantic-proof-v1"
+    )
     output = payload["output"]
     assert isinstance(output, dict)
     candidates = output.get("candidates")
@@ -1567,9 +1588,9 @@ def _validate_classification_proposal_v4(
         proof_reference = proof.get("source_message_revision_reference")
         if not isinstance(proof_reference, str):
             raise ValueError("ClassificationProposal v4 proof reference is invalid")
-        meaning = candidate.get("opportunity_type")
-        if not isinstance(meaning, str):
-            meaning = "open_match"
+        candidate_proof_meaning = candidate.get("opportunity_type")
+        if not isinstance(candidate_proof_meaning, str):
+            candidate_proof_meaning = "open_match"
         if not semantic_proof_is_schema_valid(
             proof,
             body=body,
@@ -1577,7 +1598,8 @@ def _validate_classification_proposal_v4(
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
-            meaning=meaning,
+            meaning=candidate_proof_meaning,
+            proof_version=proof_version,
         ):
             raise ValueError("ClassificationProposal v4 semantic proof is invalid")
         proof_keys.add(candidate_key)
@@ -1621,10 +1643,15 @@ def _validate_classification_proposal_v4(
     ):
         raise ValueError("v4 pass 1 cannot carry ambiguity-pass provenance")
     if ambiguity_execution is not None:
-        _validate_ambiguity_pass_execution(ambiguity_execution)
+        _validate_ambiguity_pass_execution(
+            ambiguity_execution,
+            player_release=player_release,
+        )
 
 
-def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
+def _validate_ambiguity_pass_execution(
+    value: JsonValue, *, player_release: bool = False
+) -> None:
     """Validate the one allowed semantic ambiguity-pass execution."""
     fields = {
         "requested_model",
@@ -1669,9 +1696,20 @@ def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
         _required_text(value, field_name)
     if value["status"] != "succeeded":
         raise ValueError("ambiguity-pass execution status is invalid")
-    if value["prompt_version"] != "open-match-ambiguity-v1":
+    expected_prompt = (
+        "player-match-ambiguity-v1" if player_release else "open-match-ambiguity-v1"
+    )
+    expected_schema = (
+        "source-message-classification-v3"
+        if player_release
+        else "source-message-classification-v2"
+    )
+    expected_routing = (
+        "classifier-routing-player-v1" if player_release else "classifier-routing-v1"
+    )
+    if value["prompt_version"] != expected_prompt:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
-    if value["schema_version"] != "source-message-classification-v2":
+    if value["schema_version"] != expected_schema:
         raise ValueError("ambiguity-pass schema provenance is invalid")
     if value["context_bundle_version"] != "primary-classifier-context-v1":
         raise ValueError("ambiguity-pass context provenance is invalid")
@@ -1685,7 +1723,7 @@ def _validate_ambiguity_pass_execution(value: JsonValue) -> None:
         or value["effective_reasoning_effort"] != "high"
         or value["glossary_version"] != "football-opportunity-glossary-v1"
         or value["context_policy_version"] != "classifier-context-v1"
-        or value["routing_policy_version"] != "classifier-routing-v1"
+        or value["routing_policy_version"] != expected_routing
     ):
         raise ValueError("ambiguity-pass policy provenance is invalid")
     if (
@@ -1762,16 +1800,27 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
             raise TypeError(
                 f"semantic-proof execution requires non-negative {field_name}"
             )
+    player_release = value["schema_version"] == "source-semantic-proof-v2"
     pinned = {
         "requested_model": "gpt-5.6-sol",
         "effective_model": "gpt-5.6-sol",
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
-        "prompt_version": "open-match-semantic-proof-v1",
-        "schema_version": "source-semantic-proof-v1",
+        "prompt_version": (
+            "player-match-semantic-proof-v1"
+            if player_release
+            else "open-match-semantic-proof-v1"
+        ),
+        "schema_version": (
+            "source-semantic-proof-v2" if player_release else "source-semantic-proof-v1"
+        ),
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "semantic-proof-context-v1",
-        "routing_policy_version": "classifier-routing-v1",
+        "routing_policy_version": (
+            "classifier-routing-player-v1"
+            if player_release
+            else "classifier-routing-v1"
+        ),
         "context_bundle_version": "semantic-proof-context-v1",
     }
     if any(value[field_name] != expected for field_name, expected in pinned.items()):

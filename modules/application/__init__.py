@@ -2634,11 +2634,18 @@ class ConversationOnboarding:
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
         """Discard submenu edits, or leave the hub while preserving criteria."""
+        draft = self._store.discovery_draft(telegram_user_id)
+        user_intent = (
+            UserIntent.PLAYER_SEARCH
+            if draft is not None and draft.user_intent is UserIntent.PLAYER_SEARCH
+            else UserIntent.GAME_SEARCH
+        )
         self._change_game_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="back",
+            user_intent=user_intent,
         )
 
     def open_player_search_details(
@@ -6360,7 +6367,7 @@ def _open_match_result_message(
         if player_result
         else ([open_place_copy] if open_place_copy is not None else [])
     )
-    if player_result and "team_formats" in facts and facts.get("team_formats"):
+    if player_result and "team_formats" in confirmed_keys and facts.get("team_formats"):
         detail_values.append(known_values["team_formats"])
     detail_values.extend(
         known_values[key]
@@ -6432,7 +6439,7 @@ def _open_match_result_message(
     selected_unknown = sorted(
         criterion_copy.get(key, key.replace("_", " "))
         for key, state in match_states.items()
-        if state == "unknown" and (not player_result or key != "number_of_players")
+        if state == "unknown"
     )
     confirmed_core = (
         {
@@ -8043,6 +8050,9 @@ class RuntimeApplication:
         if self.model.primary_schema_version == "source-message-classification-v2":
             self._classify_source_message_v2(incoming)
             return
+        if self.model.primary_schema_version == "source-message-classification-v3":
+            self._classify_source_message_v2(incoming, player_release=True)
+            return
         if self.model.primary_schema_version != "source-message-classification-v1":
             raise RuntimeError(
                 "classifier adapter exposes an unsupported primary schema version"
@@ -8641,7 +8651,12 @@ class RuntimeApplication:
             clear_proof_work=True,
         )
 
-    def _classify_source_message_v2(self, incoming: ContractEnvelope) -> None:
+    def _classify_source_message_v2(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        player_release: bool = False,
+    ) -> None:
         """Run the additive multi-candidate classifier and one-way ambiguity pass."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the v2 classifier")
@@ -8653,6 +8668,30 @@ class RuntimeApplication:
         if not isinstance(revision_id, str) or not isinstance(body, str):
             raise ValueError("classifier command requires revision identity and body")
 
+        primary_prompt_version = (
+            "player-match-primary-v1" if player_release else "open-match-primary-v2"
+        )
+        ambiguity_prompt_version = (
+            "player-match-ambiguity-v1" if player_release else "open-match-ambiguity-v1"
+        )
+        primary_schema_version = (
+            "source-message-classification-v3"
+            if player_release
+            else "source-message-classification-v2"
+        )
+        semantic_proof_prompt_version = (
+            "player-match-semantic-proof-v1"
+            if player_release
+            else "open-match-semantic-proof-v1"
+        )
+        semantic_proof_schema_version = (
+            "source-semantic-proof-v2" if player_release else "source-semantic-proof-v1"
+        )
+        routing_policy_version = (
+            "classifier-routing-player-v1"
+            if player_release
+            else "classifier-routing-v1"
+        )
         request = ClassifierRequest(
             source_message_revision_id=_opaque_classifier_reference(
                 revision_id, kind="revision"
@@ -8679,11 +8718,11 @@ class RuntimeApplication:
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
-            prompt_version="open-match-primary-v2",
-            schema_version="source-message-classification-v2",
+            prompt_version=primary_prompt_version,
+            schema_version=primary_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
-            routing_policy_version="classifier-routing-v1",
+            routing_policy_version=routing_policy_version,
             pass_kind="primary",
         )
 
@@ -8740,8 +8779,7 @@ class RuntimeApplication:
                 and result.effective_model == "gpt-5.6-sol"
                 and result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(result.output, body=body)
-                and result.output.get("schema_version")
-                == "source-message-classification-v2"
+                and result.output.get("schema_version") == primary_schema_version
             )
 
         prior_attempts = self.store.classification_attempts_for_revision(revision_id)
@@ -8927,7 +8965,7 @@ class RuntimeApplication:
             assert prior_proof_work is not None
             final_request = replace(
                 request,
-                prompt_version="open-match-ambiguity-v1",
+                prompt_version=ambiguity_prompt_version,
                 pass_kind="ambiguity_second_pass",
                 adjacent_context=prior_proof_work.ambiguity_adjacent_context,
             )
@@ -8995,7 +9033,7 @@ class RuntimeApplication:
             )
             second_request = replace(
                 request,
-                prompt_version="open-match-ambiguity-v1",
+                prompt_version=ambiguity_prompt_version,
                 pass_kind="ambiguity_second_pass",
                 adjacent_context=second_pass_adjacent_context,
             )
@@ -9119,8 +9157,7 @@ class RuntimeApplication:
                 and second_result.effective_model == "gpt-5.6-sol"
                 and second_result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(second_result.output, body=body)
-                and second_result.output.get("schema_version")
-                == "source-message-classification-v2"
+                and second_result.output.get("schema_version") == primary_schema_version
             )
             if second_valid:
                 final_request = second_request
@@ -9164,7 +9201,9 @@ class RuntimeApplication:
                     "status": "succeeded",
                 }
             else:
-                final_output = _safe_v2_review_output()
+                final_output = _safe_v2_review_output(
+                    schema_version=primary_schema_version
+                )
 
             second_attempt = ClassificationAttempt(
                 attempt_id=(
@@ -9359,8 +9398,8 @@ class RuntimeApplication:
                         continue
                     proof_request = replace(
                         final_request,
-                        prompt_version="open-match-semantic-proof-v1",
-                        schema_version="source-semantic-proof-v1",
+                        prompt_version=semantic_proof_prompt_version,
+                        schema_version=semantic_proof_schema_version,
                         context_bundle_version="semantic-proof-context-v1",
                         context_policy_version="semantic-proof-context-v1",
                         pass_kind="semantic_proof",
@@ -9459,6 +9498,7 @@ class RuntimeApplication:
                             evidence=evidence,
                             routes=routes,
                             meaning=proof_meaning,
+                            proof_version=semantic_proof_schema_version,
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -9598,7 +9638,9 @@ class RuntimeApplication:
             if not isinstance(candidates, list) or len(semantic_proofs) != len(
                 candidates
             ):
-                final_output = _safe_v2_review_output()
+                final_output = _safe_v2_review_output(
+                    schema_version=primary_schema_version
+                )
                 semantic_proofs = []
                 semantic_proof_executions = []
 
@@ -9610,7 +9652,7 @@ class RuntimeApplication:
             "irrelevant",
             "unresolved",
         }:
-            final_output = _safe_v2_review_output()
+            final_output = _safe_v2_review_output(schema_version=primary_schema_version)
             final_disposition = "needs_review"
         if resume_completed_ambiguity:
             assert completed_ambiguity_attempt is not None
@@ -11759,6 +11801,13 @@ def _classifier_proposal_has_pinned_provenance(
             revision_id=revision_id,
             body=body,
         )
+    if payload.get("schema_version") == "source-message-classification-v3":
+        return _v2_classifier_proposal_has_pinned_provenance(
+            payload,
+            revision_id=revision_id,
+            body=body,
+            player_release=True,
+        )
     attempt_number = payload.get("attempt_number")
     if (
         not isinstance(attempt_number, int)
@@ -11838,6 +11887,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
     *,
     revision_id: str,
     body: str,
+    player_release: bool = False,
 ) -> bool:
     """Validate v2 final-pass provenance and its deterministic input manifest."""
     pass_number = payload.get("pass_number")
@@ -11851,7 +11901,11 @@ def _v2_classifier_proposal_has_pinned_provenance(
     ):
         return False
     prompt_version = (
-        "open-match-ambiguity-v1" if pass_number == 2 else "open-match-primary-v2"
+        ("player-match-ambiguity-v1" if pass_number == 2 else "player-match-primary-v1")
+        if player_release
+        else "open-match-ambiguity-v1"
+        if pass_number == 2
+        else "open-match-primary-v2"
     )
     pass_kind = "ambiguity_second_pass" if pass_number == 2 else "primary"
     adjacent_context = _classifier_adjacent_context(payload.get("adjacent_context", []))
@@ -11863,10 +11917,18 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
         "prompt_version": prompt_version,
-        "schema_version": "source-message-classification-v2",
+        "schema_version": (
+            "source-message-classification-v3"
+            if player_release
+            else "source-message-classification-v2"
+        ),
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "classifier-context-v1",
-        "routing_policy_version": "classifier-routing-v1",
+        "routing_policy_version": (
+            "classifier-routing-player-v1"
+            if player_release
+            else "classifier-routing-v1"
+        ),
         "context_bundle_version": "primary-classifier-context-v1",
     }
     manifest = {
@@ -12105,6 +12167,26 @@ def _v4_classifier_provenance_is_current(
     payload: dict[str, JsonValue], *, revision_id: str, body: str
 ) -> bool:
     """Require current ambiguity and distinct proof execution per candidate."""
+    player_release = payload.get("schema_version") == "source-message-classification-v3"
+    ambiguity_prompt_version = (
+        "player-match-ambiguity-v1" if player_release else "open-match-ambiguity-v1"
+    )
+    primary_schema_version = (
+        "source-message-classification-v3"
+        if player_release
+        else "source-message-classification-v2"
+    )
+    semantic_proof_prompt_version = (
+        "player-match-semantic-proof-v1"
+        if player_release
+        else "open-match-semantic-proof-v1"
+    )
+    semantic_proof_schema_version = (
+        "source-semantic-proof-v2" if player_release else "source-semantic-proof-v1"
+    )
+    routing_policy_version = (
+        "classifier-routing-player-v1" if player_release else "classifier-routing-v1"
+    )
     output = payload.get("output")
     if (
         not isinstance(output, dict)
@@ -12113,6 +12195,7 @@ def _v4_classifier_provenance_is_current(
             payload,
             revision_id=revision_id,
             body=body,
+            player_release=player_release,
         )
     ):
         return False
@@ -12137,11 +12220,11 @@ def _v4_classifier_provenance_is_current(
             payload=payload,
             revision_id=revision_id,
             body=body,
-            prompt_version="open-match-ambiguity-v1",
-            schema_version="source-message-classification-v2",
+            prompt_version=ambiguity_prompt_version,
+            schema_version=primary_schema_version,
             context_bundle_version="primary-classifier-context-v1",
             context_policy_version="classifier-context-v1",
-            routing_policy_version="classifier-routing-v1",
+            routing_policy_version=routing_policy_version,
             pass_kind="ambiguity_second_pass",
             pass_number=2,
             attempt_number=ambiguity_attempt_number,
@@ -12217,11 +12300,11 @@ def _v4_classifier_provenance_is_current(
                 payload=payload,
                 revision_id=revision_id,
                 body=body,
-                prompt_version="open-match-semantic-proof-v1",
-                schema_version="source-semantic-proof-v1",
+                prompt_version=semantic_proof_prompt_version,
+                schema_version=semantic_proof_schema_version,
                 context_bundle_version="semantic-proof-context-v1",
                 context_policy_version="semantic-proof-context-v1",
-                routing_policy_version="classifier-routing-v1",
+                routing_policy_version=routing_policy_version,
                 pass_kind="semantic_proof",
                 pass_number=proof_pass_number,
                 attempt_number=proof_attempt_number,
@@ -12360,6 +12443,7 @@ def _proposition_evidence_is_authoritative(
     semantic_proof: JsonValue | None = None,
     source_message_revision_reference: str | None = None,
     meaning: str = "open_match",
+    proof_version: str = "source-semantic-proof-v1",
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
@@ -12370,6 +12454,7 @@ def _proposition_evidence_is_authoritative(
         evidence=evidence,
         routes=routes,
         meaning=meaning,
+        proof_version=proof_version,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -12576,10 +12661,12 @@ def _classification_routing_outcome(
     )
 
 
-def _safe_v2_review_output() -> dict[str, JsonValue]:
+def _safe_v2_review_output(
+    *, schema_version: str = "source-message-classification-v2"
+) -> dict[str, JsonValue]:
     """Create a strict, body-free review disposition after validation failure."""
     return {
-        "schema_version": "source-message-classification-v2",
+        "schema_version": schema_version,
         "disposition": "needs_review",
         "candidates": [],
         "routing": {"reason_code": "needs_review", "required_context": "none"},
@@ -12721,15 +12808,21 @@ def _legacy_candidate_alias_for_canonical(
     opportunity_id: str,
 ) -> str | None:
     """Return the exact historical candidate alias for one proposition id."""
-    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
-    if not opportunity_id.startswith(prefix):
+    prefix = f"opportunity:{source_message_id}:"
+    if not opportunity_id.startswith(prefix) or ":proposition:" not in opportunity_id:
         return None
-    candidate_hash = opportunity_id.removeprefix(prefix)
+    opportunity_type, candidate_hash = opportunity_id.removeprefix(prefix).split(
+        ":proposition:", 1
+    )
+    if opportunity_type not in {"open_match", "player_match_availability"}:
+        return None
     if len(candidate_hash) != 16 or any(
         character not in "0123456789abcdef" for character in candidate_hash
     ):
         return None
-    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:candidate:{candidate_hash}"
+    )
 
 
 def _canonicalize_legacy_proposition_records(
@@ -12745,23 +12838,65 @@ def _canonicalize_legacy_proposition_records(
         if not isinstance(opportunity_id, str) or not opportunity_id:
             canonical_records.append(dict(record))
             continue
-        legacy_prefix = f"opportunity:{source_message_id}:open_match:candidate:"
         if ":candidate:" in opportunity_id:
+            legacy_prefix = f"opportunity:{source_message_id}:"
             if not opportunity_id.startswith(legacy_prefix):
                 return None
-            candidate_hash = opportunity_id.removeprefix(legacy_prefix)
+            legacy_type, candidate_hash = opportunity_id.removeprefix(
+                legacy_prefix
+            ).split(":candidate:", 1)
+            record_type = record.get("opportunity_type")
+            canonical_type = (
+                record_type
+                if record_type in {"open_match", "player_match_availability"}
+                else legacy_type
+            )
+            if canonical_type not in {"open_match", "player_match_availability"}:
+                return None
             if len(candidate_hash) != 16 or any(
                 character not in "0123456789abcdef" for character in candidate_hash
             ):
                 return None
-            opportunity_id = (
-                f"opportunity:{source_message_id}:open_match:proposition:"
-                f"{candidate_hash}"
+            opportunity_id = ":".join(
+                (
+                    "opportunity",
+                    source_message_id,
+                    canonical_type,
+                    "proposition",
+                    candidate_hash,
+                )
             )
-        elif ":proposition:" in opportunity_id and not opportunity_id.startswith(
-            f"opportunity:{source_message_id}:open_match:proposition:"
-        ):
-            return None
+        elif ":proposition:" in opportunity_id:
+            canonical_prefix = f"opportunity:{source_message_id}:"
+            if not opportunity_id.startswith(canonical_prefix):
+                return None
+            stored_type, proposition_hash = opportunity_id.removeprefix(
+                canonical_prefix
+            ).split(":proposition:", 1)
+            record_type = record.get("opportunity_type")
+            canonical_type = (
+                record_type
+                if record_type in {"open_match", "player_match_availability"}
+                else stored_type
+            )
+            if (
+                canonical_type not in {"open_match", "player_match_availability"}
+                or len(proposition_hash) != 16
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in proposition_hash
+                )
+            ):
+                return None
+            opportunity_id = ":".join(
+                (
+                    "opportunity",
+                    source_message_id,
+                    canonical_type,
+                    "proposition",
+                    proposition_hash,
+                )
+            )
         if opportunity_id in seen_opportunity_ids:
             return None
         seen_opportunity_ids.add(opportunity_id)
@@ -12865,6 +13000,10 @@ def _reconcile_proposition_lineages(
     def score(candidate_index: int, record_index: int) -> int:
         candidate_values = candidate_features[candidate_index]
         record_values = record_features[record_index]
+        if candidate_values.get("opportunity_type") != record_values.get(
+            "opportunity_type"
+        ):
+            return -1
         return sum(
             candidate_values[key] == record_values[key]
             for key in candidate_values.keys() & record_values.keys()
@@ -13281,6 +13420,11 @@ def _validated_opportunity_proposal(
             revision_id, kind="revision"
         ),
         meaning=str(candidate.get("opportunity_type")),
+        proof_version=(
+            "source-semantic-proof-v2"
+            if payload_value.get("schema_version") == "source-message-classification-v3"
+            else "source-semantic-proof-v1"
+        ),
     ):
         return None
     if route is None:
@@ -13441,16 +13585,7 @@ def _validated_opportunity_proposal(
                 available_player_count,
                 available_player_count_min,
                 available_player_count_max,
-                ". ".join(
-                    str(evidence[key])
-                    for key in (
-                        "opportunity",
-                        "available_player_count",
-                        "available_player_count_min",
-                        "available_player_count_max",
-                    )
-                    if key in evidence
-                ),
+                _player_availability_evidence_text(evidence),
                 authoritative_body=validation_body,
             )
             if player_candidate
@@ -15216,6 +15351,24 @@ def _player_availability_count_is_valid(
     )
 
 
+def _player_availability_evidence_text(evidence: dict[str, JsonValue]) -> str:
+    """Combine count evidence without duplicating one source clause."""
+    parts: list[str] = []
+    for key in (
+        "opportunity",
+        "available_player_count",
+        "available_player_count_min",
+        "available_player_count_max",
+    ):
+        value = evidence.get(key)
+        if not isinstance(value, str):
+            continue
+        if any(value == part or value in part for part in parts):
+            continue
+        parts.append(value)
+    return ". ".join(parts)
+
+
 def _player_availability_is_supported(
     exact: JsonValue,
     minimum: JsonValue,
@@ -15224,7 +15377,13 @@ def _player_availability_is_supported(
     *,
     authoritative_body: str | None = None,
 ) -> bool:
-    """Require source-bound evidence of one jointly available Player group."""
+    """Require one source clause offering a jointly available Player group.
+
+    This parser is deliberately narrow. The model proposes evidence and counts;
+    this Application-owned gate only accepts a count when the same source clause
+    states that the group is available to play. Organizer requests are a
+    different proposition and never satisfy this gate.
+    """
     if authoritative_body is not None:
         return _player_availability_is_supported(
             exact,
@@ -15241,39 +15400,91 @@ def _player_availability_is_supported(
         return False
     if _source_player_opening_state(evidence) is not PropositionState.CURRENT_POSITIVE:
         return False
-    normalized = evidence.casefold()
-    player_words = (
-        r"player\w*|игрок\w*|jugador\w*|joueur\w*|"
-        r"goalkeeper\w*|defender\w*|midfielder\w*|forward\w*|"
+
+    normalized = re.sub(r"['’]", " ", evidence.casefold())
+    player_or_group = re.compile(
+        r"\b(?:players?|player group|group|"
+        r"игрок\w*|групп\w*|"
+        r"jugadores?|grupo|"
+        r"joueurs?|groupe|"
+        r"goalkeepers?|defenders?|midfielders?|forwards?|"
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
-        r"portero\w*|defensa\w*|centrocampista\w*|delantero\w*|"
-        r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*"
+        r"porteros?|defensas?|centrocampistas?|delanteros?|"
+        r"gardiens?|défenseurs?|milieux?|attaquants?)\b"
     )
-    availability_words = (
-        r"available|can\s+play|free\s+to\s+play|open|need\w*|"
-        r"доступн\w*|готов\w*|мог\w*\s+играть|нуж\w*|есть|"
-        r"disponible\w*|pued\w*\s+jugar|necesit\w*|"
-        r"disponible\w*|peuvent?\s+jouer|besoin\w*|recherch\w*"
+    offering_language = re.compile(
+        r"\b(?:available|free\s+to\s+play|can\s+play|can\s+join|"
+        r"ready\s+to\s+play|we\s+are|we're|our\s+group|"
+        r"доступн\w*|готов\w*|можем\s+играть|могут\s+играть|"
+        r"мы\s+играем|"
+        r"disponible\w*|podemos\s+jugar|pueden\s+jugar|estamos\s+disponible\w*|"
+        r"disponible\w*|pouvons\s+jouer|peuvent\s+jouer|nous\s+sommes\s+disponible\w*)\b"
     )
-    if (
-        re.search(player_words, normalized) is None
-        or re.search(availability_words, normalized) is None
-    ):
-        return False
-    if exact is not None:
-        if not isinstance(exact, int) or isinstance(exact, bool):
-            return False
-        return _open_places_are_supported(exact, evidence)
-    if minimum is not None and maximum is not None:
+    request_language = re.compile(
+        r"\b(?:need\w*|look(?:ing)?\s+for|seek(?:ing)?|wanted|require\w*|"
+        r"recruit\w*|needed|"
+        r"нуж\w*|ищ\w*|треб\w*|набор\w*|"
+        r"necesit\w*|busc\w*|hace\w*\s+falta|"
+        r"cherch\w*|recherch\w*|besoin\w*|recrut\w*)\b"
+    )
+    range_patterns = (
+        re.compile(
+            r"(?<![\d-])(?P<minimum>\d{1,2})\s*[-–—]\s*"
+            r"(?P<maximum>\d{1,2})(?![\d-])"
+        ),
+        re.compile(
+            r"(?<!\d)(?P<minimum>\d+)\s+(?:to|through)\s+"
+            r"(?P<maximum>\d+)(?!\d)"
+        ),
+        re.compile(r"\bbetween\s+(?P<minimum>\d+)\s+and\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bfrom\s+(?P<minimum>\d+)\s+to\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bот\s+(?P<minimum>\d+)\s+до\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bde\s+(?P<minimum>\d+)\s+(?:a|à)\s+(?P<maximum>\d+)\b"),
+    )
+    clauses = tuple(
+        clause.strip()
+        for clause in re.split(r"[.!?;\n]+", normalized)
+        if clause.strip()
+    )
+
+    def clause_offers_players(clause: str) -> bool:
         return (
-            re.search(
-                r"\d+\s*[-–]\s*\d+|\b(?:one|two|three|four|five|six|seven|"
-                r"один|два|три|четыре|пять|шесть|семь)\b",
-                normalized,
-            )
-            is not None
+            request_language.search(clause) is None
+            and player_or_group.search(clause) is not None
+            and offering_language.search(clause) is not None
         )
-    return True
+
+    for clause in clauses:
+        if not clause_offers_players(clause):
+            continue
+        ranges = list(
+            dict.fromkeys(
+                (int(match.group("minimum")), int(match.group("maximum")))
+                for pattern in range_patterns
+                for match in pattern.finditer(clause)
+            )
+        )
+        if len(ranges) > 1:
+            continue
+        player_count_matches = [
+            int(match.group(1))
+            for match in re.finditer(
+                r"(?<!\d)(\d+)(?!\d)\s+"
+                r"(?:players?|игрок\w*|jugadores?|joueurs?)\b",
+                clause,
+            )
+        ]
+        if exact is not None:
+            if ranges or player_count_matches != [exact]:
+                continue
+            return True
+        if minimum is not None and maximum is not None:
+            if ranges == [(minimum, maximum)]:
+                return True
+            continue
+        if not ranges and not player_count_matches:
+            return True
+    return False
 
 
 def _source_player_opening_state(body: str) -> PropositionState:

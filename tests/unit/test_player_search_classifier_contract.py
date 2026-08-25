@@ -4,8 +4,8 @@ from modules.classifier_contract import classifier_output_is_schema_valid
 from modules.contracts import JsonValue
 
 BODY = (
-    "Need 4 players; between 2 players and 6 players are available for football "
-    "in Moscow on 2026-09-01."
+    "We are 4 players available; between 2 and 6 players are available for "
+    "football in Moscow on 2026-09-01."
 )
 
 
@@ -22,7 +22,7 @@ def _candidate(
             "opportunity_type": opportunity_type,
             "evidence": evidence
             or {
-                "opportunity": "Need 4 players",
+                "opportunity": "We are 4 players available",
                 "event_time": "2026-09-01",
                 "location": "Moscow",
             },
@@ -51,6 +51,14 @@ def _output(candidate: dict[str, JsonValue], *, version: str) -> dict[str, JsonV
             "disposition": "accepted",
             "candidates": [candidate],
         }
+    if version == "source-message-classification-v3":
+        candidate = {"source_context": BODY, **candidate}
+        return {
+            "schema_version": version,
+            "disposition": "accepted",
+            "candidates": [candidate],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        }
     candidate = {"source_context": "Need 4 players", **candidate}
     return {
         "schema_version": "source-message-classification-v2",
@@ -60,54 +68,52 @@ def _output(candidate: dict[str, JsonValue], *, version: str) -> dict[str, JsonV
     }
 
 
-def test_player_availability_exact_count_is_valid_for_both_classifier_versions() -> (
-    None
-):
+def test_player_count_requires_v3_release() -> None:
     candidate = _candidate(
         evidence={
-            "opportunity": "Need 4 players",
+            "opportunity": "We are 4 players available",
             "event_time": "2026-09-01",
             "location": "Moscow",
             "available_player_count": "4 players",
         },
         available_player_count=4,
     )
-    assert all(
-        classifier_output_is_schema_valid(
-            _output(candidate, version=version), body=BODY
-        )
-        for version in (
-            "source-message-classification-v1",
-            "source-message-classification-v2",
-        )
+    assert classifier_output_is_schema_valid(
+        _output(candidate, version="source-message-classification-v3"), body=BODY
+    )
+    assert not classifier_output_is_schema_valid(
+        _output(candidate, version="source-message-classification-v1"), body=BODY
+    )
+    assert not classifier_output_is_schema_valid(
+        _output(candidate, version="source-message-classification-v2"), body=BODY
     )
 
 
 def test_player_availability_range_and_unknown_counts_are_valid() -> None:
     ranged = _candidate(
         evidence={
-            "opportunity": "Need 4 players",
+            "opportunity": "between 2 and 6 players are available",
             "event_time": "2026-09-01",
             "location": "Moscow",
-            "available_player_count_min": "2 players",
-            "available_player_count_max": "6 players",
+            "available_player_count_min": "between 2 and 6 players are available",
+            "available_player_count_max": "between 2 and 6 players are available",
         },
         available_player_count_min=2,
         available_player_count_max=6,
     )
     unknown = _candidate()
     assert classifier_output_is_schema_valid(
-        _output(ranged, version="source-message-classification-v2"), body=BODY
+        _output(ranged, version="source-message-classification-v3"), body=BODY
     )
     assert classifier_output_is_schema_valid(
-        _output(unknown, version="source-message-classification-v1"), body=BODY
+        _output(unknown, version="source-message-classification-v3"), body=BODY
     )
 
 
 def test_classifier_contract_rejects_cross_type_quantity_fields() -> None:
     player_with_open_places = _candidate(
         evidence={
-            "opportunity": "Need 4 players",
+            "opportunity": "We are 4 players available",
             "event_time": "2026-09-01",
             "location": "Moscow",
             "open_places": "4 places",
@@ -117,7 +123,7 @@ def test_classifier_contract_rejects_cross_type_quantity_fields() -> None:
     open_with_player_count = _candidate(
         opportunity_type="open_match",
         evidence={
-            "opportunity": "Need 4 players",
+            "opportunity": "We are 4 players available",
             "event_time": "2026-09-01",
             "location": "Moscow",
             "open_places": "4 places",
@@ -127,10 +133,10 @@ def test_classifier_contract_rejects_cross_type_quantity_fields() -> None:
         available_player_count=4,
     )
     assert not classifier_output_is_schema_valid(
-        _output(player_with_open_places, version="source-message-classification-v1"),
+        _output(player_with_open_places, version="source-message-classification-v3"),
         body=BODY,
     )
     assert not classifier_output_is_schema_valid(
-        _output(open_with_player_count, version="source-message-classification-v2"),
+        _output(open_with_player_count, version="source-message-classification-v3"),
         body=BODY,
     )

@@ -934,6 +934,10 @@ class ControlledModelAdapter:
         """Opt the controlled model boundary into the additive v2 output."""
         self.primary_schema_version = "source-message-classification-v2"
 
+    def enable_primary_v3(self) -> None:
+        """Opt the controlled model boundary into the additive Player release."""
+        self.primary_schema_version = "source-message-classification-v3"
+
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
         self._classify_failures.setdefault(pass_kind, []).append(error)
@@ -989,6 +993,11 @@ class ControlledModelAdapter:
                 _ensure_test_proposition_evidence(primary.output, body=request.body),
                 body=request.body,
                 source_message_revision_reference=request.source_message_revision_id,
+                proof_version=(
+                    "source-semantic-proof-v2"
+                    if request.schema_version == "source-semantic-proof-v2"
+                    else "source-semantic-proof-v1"
+                ),
             )
             return replace(primary, output=output)
         output = deepcopy(result.output)
@@ -1127,6 +1136,7 @@ def _build_test_semantic_proof(
     fact_state: str = "current_positive",
     route_state: str = "current_positive",
     check_state: str = "none",
+    proof_version: str = "source-semantic-proof-v1",
 ) -> dict[str, JsonValue]:
     """Build a complete proof fixture for controlled acceptance tests."""
     candidates = output.get("candidates")
@@ -1230,7 +1240,7 @@ def _build_test_semantic_proof(
             }
         )
     return {
-        "contract_version": "source-semantic-proof-v1",
+        "contract_version": proof_version,
         "source_message_revision_reference": source_message_revision_reference,
         "candidate_key": candidate_key,
         "coverage": "complete_source_revision",
