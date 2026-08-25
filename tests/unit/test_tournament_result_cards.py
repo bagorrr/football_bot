@@ -57,6 +57,36 @@ def test_tournament_result_card_localizes_free_text_field_by_field() -> None:
     assert "group stage (исходный язык)" not in message.text
 
 
+def test_tournament_result_card_renders_nested_free_text_leaves_field_by_field() -> (
+    None
+):
+    result = _result()
+    facts = dict(result.card_facts)
+    facts["schedule"] = (
+        '{"weekday": "Saturday", "rounds": 3, "note": "Final venue announced later"}'
+    )
+    nested_result = SearchResult(
+        result_id=result.result_id,
+        completed_search_id=result.completed_search_id,
+        absolute_position=result.absolute_position,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _tournament_result_message(
+        delivery_id="delivery:tournament:nested",
+        telegram_user_id=49_118,
+        locale="ru",
+        screen_revision=3,
+        result=nested_result,
+    )
+
+    assert "День недели: Суббота" in message.text
+    assert "Раундов: 3" in message.text
+    assert "Final venue announced later (исходный язык)" in message.text
+    assert "{" not in message.text
+    assert "}" not in message.text
+
+
 def test_tournament_result_card_covers_all_conversation_languages() -> None:
     expected_titles = {
         "en": "⚽ Tournament",
@@ -107,3 +137,39 @@ def test_tournament_historical_card_is_unavailable_without_contact() -> None:
             "es": "Contacto",
             "fr": "Contact",
         }[locale] + ":" not in message.text
+
+
+def test_tournament_card_with_missing_current_projection_fails_closed() -> None:
+    facts = dict(_result().card_facts)
+    facts.pop("publication_state")
+    result = SearchResult(
+        result_id="result:tournament:missing-projection",
+        completed_search_id="completed-search:tournament:missing-projection",
+        absolute_position=1,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _tournament_result_message(
+        delivery_id="delivery:tournament:missing-projection",
+        telegram_user_id=49_118,
+        locale="en",
+        screen_revision=4,
+        result=result,
+    )
+
+    assert "Unavailable" in message.text
+    assert "@tournament_contact" not in message.text
+    assert "Contact:" not in message.text
+
+
+def test_tournament_card_with_deleted_current_projection_is_unavailable() -> None:
+    message = _tournament_result_message(
+        delivery_id="delivery:tournament:deleted",
+        telegram_user_id=49_118,
+        locale="en",
+        screen_revision=4,
+        result=_result(publication_state="deleted"),
+    )
+
+    assert "Unavailable" in message.text
+    assert "@tournament_contact" not in message.text

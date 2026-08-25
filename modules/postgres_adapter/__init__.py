@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -89,6 +89,7 @@ from modules.domain import (
     evaluate_game_search,
     evaluate_opponent_search,
     evaluate_tournament_search,
+    tournament_publication_state_as_of,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -1589,7 +1590,9 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_completed_search(row) for row in rows)
 
-    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+    def results(
+        self, completed_search_id: str, *, as_of: datetime | None = None
+    ) -> tuple[SearchResult, ...]:
         """Observe one Completed Search's immutable ordered Results."""
         with psycopg.connect(
             self._admin_database_url,
@@ -1600,7 +1603,13 @@ class PostgresAcceptanceObserver:
                 SELECT result.result_id, result.completed_search_id,
                        result.absolute_position, result.result_class,
                        result.card_facts,
-                       current_projection.publication_state
+                       CASE
+                           WHEN result.card_facts->>'opportunity_type' = 'tournament'
+                           THEN COALESCE(
+                               current_projection.publication_state, 'suppressed'
+                           )
+                           ELSE current_projection.publication_state
+                       END AS publication_state
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
                     SELECT publication_state
@@ -1627,12 +1636,11 @@ class PostgresAcceptanceObserver:
                 card_facts=tuple(
                     sorted(
                         {
-                            **row["card_facts"],
-                            **(
-                                {"publication_state": row["publication_state"]}
-                                if row["publication_state"] is not None
-                                else {}
-                            ),
+                            **_result_card_facts_with_current_publication_state(
+                                row["card_facts"],
+                                row["publication_state"],
+                                as_of=as_of or datetime.now(UTC),
+                            )
                         }.items()
                     )
                 ),
@@ -6791,7 +6799,13 @@ class PostgresRoleStore:
                 SELECT result.result_id, result.completed_search_id,
                        result.absolute_position, result.result_class,
                        result.card_facts,
-                       current_projection.publication_state
+                       CASE
+                           WHEN result.card_facts->>'opportunity_type' = 'tournament'
+                           THEN COALESCE(
+                               current_projection.publication_state, 'suppressed'
+                           )
+                           ELSE current_projection.publication_state
+                       END AS publication_state
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
                     SELECT publication_state
@@ -6821,14 +6835,11 @@ class PostgresRoleStore:
                         result_class=row["result_class"],
                         card_facts=tuple(
                             sorted(
-                                {
-                                    **row["card_facts"],
-                                    **(
-                                        {"publication_state": row["publication_state"]}
-                                        if row["publication_state"] is not None
-                                        else {}
-                                    ),
-                                }.items()
+                                _result_card_facts_with_current_publication_state(
+                                    row["card_facts"],
+                                    row["publication_state"],
+                                    as_of=received_at,
+                                ).items()
                             )
                         ),
                     )
@@ -7426,6 +7437,27 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
         reply_button=row.get("reply_button"),
         reply_keyboard_action=ReplyKeyboardAction(row["reply_keyboard_action"]),
     )
+
+
+def _result_card_facts_with_current_publication_state(
+    card_facts: Mapping[str, Any],
+    current_publication_state: str | None,
+    *,
+    as_of: datetime,
+) -> dict[str, Any]:
+    """Overlay current Tournament state while preserving other history baselines."""
+    if card_facts.get("opportunity_type") == "tournament":
+        return {
+            **card_facts,
+            "publication_state": tournament_publication_state_as_of(
+                card_facts,
+                current_publication_state=current_publication_state,
+                as_of=as_of,
+            ),
+        }
+    if current_publication_state is None:
+        return dict(card_facts)
+    return {**card_facts, "publication_state": current_publication_state}
 
 
 def _completed_search(row: dict[str, Any]) -> CompletedSearch:

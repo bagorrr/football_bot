@@ -383,6 +383,11 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Questions? Message me. I can explain the card or help refine your search."
     )
 
+    clock.advance_to(datetime(2026, 8, 20, 0, 0, tzinfo=UTC))
+    expired_history = system.results(completed[0].completed_search_id)
+    assert len(expired_history) == 1
+    assert dict(expired_history[0].card_facts)["publication_state"] == "expired"
+
     closed_body = f"{body} Registration is closed."
     classifier.return_for(body=closed_body, result=tournament_result)
     telegram_ingestion.add_channel_difference_event(

@@ -1346,7 +1346,9 @@ class AcceptanceObserver(Protocol):
         """Observe immutable Completed Searches through the public testkit."""
         ...
 
-    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+    def results(
+        self, completed_search_id: str, *, as_of: datetime | None = None
+    ) -> tuple[SearchResult, ...]:
         """Observe ordered immutable Results through the public testkit."""
         ...
 

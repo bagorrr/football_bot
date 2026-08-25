@@ -1,81 +1,61 @@
 {
-  "corpus_version": "open-match-classifier-regression-v3-reviewed-v1",
+  "corpus_version": "open-match-classifier-regression-v3-reviewed-v2",
+  "evaluation_contract_version": "source-message-classification-v3-review-gate-v1",
   "reviewed": true,
   "redacted": true,
+  "source_corpus": "docs/product/source-message-corpus-v1.yaml",
+  "source_corpus_provenance": "docs/product/source-message-corpus-provenance.md",
+  "source_corpus_case_count": 38,
   "model": "gpt-5.6-sol",
   "reasoning_effort": "high",
   "prompt_version": "open-match-primary-v3",
   "schema_version": "source-message-classification-v3",
+  "semantic_proof_version": "source-semantic-proof-v2",
   "glossary_version": "football-opportunity-glossary-v1",
   "context_policy_version": "classifier-context-v1",
   "routing_policy_version": "classifier-routing-v1",
+  "independent_complete_runs": 3,
+  "required_passes": ["primary-v3", "ambiguity-second-pass-v2", "semantic-proof-v2", "normalization", "unpublished-outcomes"],
+  "failure_suite": ["timeout", "429", "auth", "crash", "replay", "rollback"],
+  "promotion_fixtures": ["tournament-current-registration", "football-discussion-without-opportunity"],
   "cases": [
-    {
-      "case_id": "tournament-current-registration",
-      "source": "Football tournament on 20 August at Central Stadium. Registration is open. Contact @tournament_contact",
-      "recorded_output": {
-        "schema_version": "source-message-classification-v3",
-        "disposition": "accepted",
-        "routing": {
-          "reason_code": "accepted",
-          "required_context": "none"
-        },
-        "candidates": [
-          {
-            "candidate_key": "tournament-current-registration",
-            "opportunity_type": "tournament",
-            "evidence": {
-              "opportunity": "Football tournament",
-              "event_time": "20 August",
-              "location": "Central Stadium",
-              "open_participation": "Registration is open"
-            },
-            "source_context": "Football tournament on 20 August at Central Stadium. Registration is open.",
-            "location": {
-              "mention": "Central Stadium",
-              "place_id": "place:central-stadium",
-              "country_id": "country:example",
-              "city_id": "city:example"
-            },
-            "event_time": {
-              "start_local_date": "2026-08-20",
-              "end_local_date": "2026-08-20",
-              "iana_timezone": "Europe/Moscow"
-            },
-            "open_participation": true,
-            "response_routes": [
-              {
-                "kind": "explicit_telegram_username",
-                "value": "@tournament_contact",
-                "evidence": "@tournament_contact"
-              }
-            ]
-          }
-        ]
-      },
-      "expected": {
-        "disposition": "accepted",
-        "candidate_count": 1,
-        "opportunity_type": "tournament"
-      }
-    },
-    {
-      "case_id": "football-discussion-without-opportunity",
-      "source": "Football discussion: what tournament format do you prefer?",
-      "recorded_output": {
-        "schema_version": "source-message-classification-v3",
-        "disposition": "irrelevant",
-        "routing": {
-          "reason_code": "irrelevant",
-          "required_context": "none"
-        },
-        "candidates": []
-      },
-      "expected": {
-        "disposition": "irrelevant",
-        "candidate_count": 0,
-        "opportunity_type": null
-      }
-    }
+    {"case_id": "sm-001", "opportunity_types": ["open_match"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-002", "opportunity_types": ["open_match"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-003", "opportunity_types": ["open_match", "roster_vacancy"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-004", "opportunity_types": ["player_match_availability"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-005", "opportunity_types": ["player_match_availability"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-006", "opportunity_types": ["player_match_availability"], "expected_pipeline_disposition": "needs_second_pass"},
+    {"case_id": "sm-007", "opportunity_types": ["tournament"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-008", "opportunity_types": ["tournament"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-009", "opportunity_types": ["tournament", "open_match"], "expected_pipeline_disposition": "needs_second_pass"},
+    {"case_id": "sm-010", "opportunity_types": ["opponent_request"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-011", "opportunity_types": ["opponent_request"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-012", "opportunity_types": ["opponent_request"], "expected_pipeline_disposition": "needs_second_pass"},
+    {"case_id": "sm-013", "opportunity_types": ["roster_vacancy"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-014", "opportunity_types": ["roster_vacancy"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-015", "opportunity_types": ["open_match", "roster_vacancy"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-016", "opportunity_types": ["player_transfer_availability"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-017", "opportunity_types": ["player_transfer_availability", "player_match_availability"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-018", "opportunity_types": ["player_transfer_availability"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-019", "opportunity_types": ["coach_availability"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-020", "opportunity_types": ["coach_availability", "roster_vacancy"], "expected_pipeline_disposition": "needs_second_pass"},
+    {"case_id": "sm-021", "opportunity_types": ["coach_availability"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-022", "opportunity_types": ["coach_request"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-023", "opportunity_types": ["coach_request"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-024", "opportunity_types": ["coach_request"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-025", "opportunity_types": ["referee_availability"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-026", "opportunity_types": ["referee_request"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-027", "opportunity_types": ["referee_request"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-028", "opportunity_types": [], "expected_pipeline_disposition": "irrelevant"},
+    {"case_id": "sm-029", "opportunity_types": [], "expected_pipeline_disposition": "irrelevant"},
+    {"case_id": "sm-030", "opportunity_types": [], "expected_pipeline_disposition": "irrelevant"},
+    {"case_id": "sm-031", "opportunity_types": [], "expected_pipeline_disposition": "irrelevant"},
+    {"case_id": "sm-032", "opportunity_types": [], "expected_pipeline_disposition": "irrelevant"},
+    {"case_id": "sm-033", "opportunity_types": [], "expected_pipeline_disposition": "irrelevant"},
+    {"case_id": "sm-034", "opportunity_types": ["player_match_availability"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-035", "opportunity_types": ["player_match_availability"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-036", "opportunity_types": ["open_match"], "expected_pipeline_disposition": "needs_review"},
+    {"case_id": "sm-037", "opportunity_types": ["player_match_availability"], "expected_pipeline_disposition": "unresolved"},
+    {"case_id": "sm-038", "opportunity_types": ["roster_vacancy"], "expected_pipeline_disposition": "needs_review"}
   ]
 }

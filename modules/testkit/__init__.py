@@ -1857,10 +1857,12 @@ class AcceptanceSpine:
         roles: Mapping[RuntimeRole, AcceptanceRole],
         observer: AcceptanceObserver,
         restart_role: Callable[[RuntimeRole], AcceptanceRole],
+        clock: Clock,
     ) -> None:
         self._roles = dict(roles)
         self._observer = observer
         self._restart_role = restart_role
+        self._clock = clock
 
     def restart(self, role: RuntimeRole) -> AcceptanceSpine:
         """Reconnect exactly one runtime role without replacing the others."""
@@ -2495,7 +2497,7 @@ class AcceptanceSpine:
 
     def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
         """Observe one Completed Search's ordered Results through the seam."""
-        return self._observer.results(completed_search_id)
+        return self._observer.results(completed_search_id, as_of=self._clock.now())
 
     def search_completions(
         self, search_update_id: str
@@ -3478,6 +3480,7 @@ def boot_acceptance_spine(
         roles={role: restart_role(role) for role in RuntimeRole},
         observer=PostgresAcceptanceObserver(admin_database_url),
         restart_role=restart_role,
+        clock=clock,
     )
 
 

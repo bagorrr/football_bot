@@ -114,11 +114,7 @@ class CodexCliClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
-        return (
-            "source-message-classification-v3"
-            if "source-message-classification-v3" in self._schema_paths
-            else "source-message-classification-v2"
-        )
+        return "source-message-classification-v2"
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False

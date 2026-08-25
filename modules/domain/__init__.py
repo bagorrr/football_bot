@@ -1309,12 +1309,16 @@ def evaluate_tournament_search(
         return ()
     matched: list[SearchResult] = []
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != "tournament"
-        ):
+        if opportunity.opportunity_type != "tournament":
             continue
         facts = opportunity.accepted_facts
+        publication_state = tournament_publication_state_as_of(
+            facts,
+            current_publication_state=opportunity.publication_state,
+            as_of=completed_search.completed_at,
+        )
+        if publication_state != "active":
+            continue
         if (
             facts.get("country_id") != completed_search.country_id
             or facts.get("city_id") != completed_search.city_id
@@ -1370,7 +1374,7 @@ def evaluate_tournament_search(
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
             "opportunity_type": "tournament",
-            "publication_state": opportunity.publication_state,
+            "publication_state": publication_state,
             "start_local_date": str(facts["start_local_date"]),
             "end_local_date": str(facts["end_local_date"]),
             "sort_local_date": max(start, required.start_local_date).isoformat()
@@ -1482,6 +1486,28 @@ def _tournament_search_expiry(
     return (
         min(event_expiry, registration_expiry) if registration_expiry else event_expiry
     )
+
+
+def tournament_publication_state_as_of(
+    facts: Mapping[str, Any],
+    *,
+    current_publication_state: str | None,
+    as_of: datetime,
+) -> str:
+    """Return the fail-closed Tournament publication state at a read time."""
+    if current_publication_state != "active":
+        return current_publication_state or "suppressed"
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return "suppressed"
+    try:
+        start = date.fromisoformat(str(facts["start_local_date"]))
+        end = date.fromisoformat(str(facts["end_local_date"]))
+    except (KeyError, TypeError, ValueError):
+        return "suppressed"
+    expiry = _tournament_search_expiry(facts, start=start, end=end)
+    if expiry is None:
+        return "suppressed"
+    return "expired" if as_of >= expiry else "active"
 
 
 def _tournament_registration_expiry(

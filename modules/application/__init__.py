@@ -7594,6 +7594,12 @@ _TOURNAMENT_FACT_TRANSLATIONS = {
             "es": "Cada sábado",
             "fr": "Chaque samedi",
         },
+        "saturday": {
+            "en": "Saturday",
+            "ru": "Суббота",
+            "es": "Sábado",
+            "fr": "Samedi",
+        },
         "saturday morning": {
             "en": "Saturday morning",
             "ru": "В субботу утром",
@@ -7639,6 +7645,33 @@ _TOURNAMENT_FACT_TRANSLATIONS = {
     },
 }
 
+_TOURNAMENT_FACT_KEY_TRANSLATIONS = {
+    "weekday": {
+        "en": "Weekday",
+        "ru": "День недели",
+        "es": "Día de la semana",
+        "fr": "Jour de la semaine",
+    },
+    "rounds": {
+        "en": "Rounds",
+        "ru": "Раундов",
+        "es": "Rondas",
+        "fr": "Tours",
+    },
+    "note": {
+        "en": "Note",
+        "ru": "Примечание",
+        "es": "Nota",
+        "fr": "Note",
+    },
+    "teams": {
+        "en": "Teams",
+        "ru": "Команды",
+        "es": "Equipos",
+        "fr": "Équipes",
+    },
+}
+
 
 def _render_tournament_free_text_value(
     value: JsonValue,
@@ -7671,7 +7704,21 @@ def _render_tournament_free_text_value(
             for item in value
         )
     if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        rendered_fields: list[str] = []
+        for key, item in sorted(value.items()):
+            if not isinstance(key, str):
+                continue
+            label = _TOURNAMENT_FACT_KEY_TRANSLATIONS.get(key.casefold(), {}).get(
+                locale, key.replace("_", " ")
+            )
+            rendered = _render_tournament_free_text_value(
+                item,
+                field_name=field_name,
+                locale=locale,
+                source_language_label=source_language_label,
+            )
+            rendered_fields.append(f"{label}: {rendered}")
+        return "; ".join(rendered_fields)
     return str(value)
 
 
@@ -8090,7 +8137,7 @@ def _tournament_result_message(
         if edited_time is not None
         else None
     )
-    publication_state = facts.get("publication_state", "active")
+    publication_state = facts.get("publication_state")
     contact_copy = (
         f"{labels['contact']}: "
         + render_response_route(
@@ -15521,6 +15568,12 @@ def _validated_tournament_proposal(
     settings = candidate.get("venue_settings")
     surfaces = candidate.get("playing_surfaces")
     payment = candidate.get("payment")
+    try:
+        validation_time = datetime.fromisoformat(
+            str(payload_value.get("validation_time"))
+        )
+    except ValueError:
+        return None
     if (
         not _optional_canonical_list(
             team_formats,
@@ -15550,6 +15603,7 @@ def _validated_tournament_proposal(
         or not _tournament_open_participation_is_supported(
             str(evidence[participation_field]),
             authoritative_body=validation_body,
+            validation_time=validation_time,
         )
         or not _optional_values_are_supported(
             candidate,
@@ -15575,9 +15629,6 @@ def _validated_tournament_proposal(
             datetime.strptime(str(exact_time), "%H:%M")
         source_event_time = datetime.fromisoformat(
             str(payload_value.get("source_event_time"))
-        )
-        validation_time = datetime.fromisoformat(
-            str(payload_value.get("validation_time"))
         )
         event_timezone = ZoneInfo(str(timezone))
     except (ValueError, ZoneInfoNotFoundError):
@@ -15746,6 +15797,7 @@ def _tournament_open_participation_is_supported(
     evidence: str,
     *,
     authoritative_body: str,
+    validation_time: datetime | None = None,
 ) -> bool:
     """Require an affirmative, current registration or participation opening."""
     normalized = evidence.casefold()
@@ -15757,6 +15809,27 @@ def _tournament_open_participation_is_supported(
         r"|(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)"
         r"|(?:inscriptions?|participations?|entr[ée]e?s?|inscri\w*))"
     )
+    form_or_route_pattern = (
+        r"\b(?:registration|registrations|participation|entry|entries|"
+        r"inscription\w*|participation\w*|entr[ée]e?s?)\b"
+        r"[^.!?;\n]{0,30}\b(?:form|link|url|route|page|форма|ссылк\w*|"
+        r"formulario|enlace|lien|formulaire)\b"
+    )
+    explicit_open_pattern = (
+        r"\b(?:registration|registrations|participation|entry|entries)\b"
+        r"[^.!?;\n]{0,35}\b(?:open\w*|accept\w*|ongoing)\b|"
+        r"\b(?:open\w*|accept\w*|ongoing)\b"
+        r"[^.!?;\n]{0,35}\b(?:registration|registrations|participation|entry|entries)\b|"
+        r"\b(?:register\w*|inscri\w*)\b[^.!?;\n]{0,55}\b"
+        r"(?:now|today|maintenant|aujourd'hui|ahora|hoy|сейчас|сегодня)\b|"
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|ид[её]т|продолжа\w*)\b|"
+        r"\b(?:остал\w*)\b[^.!?;\n]{0,35}\bмест\w*\b"
+    )
+    if re.search(form_or_route_pattern, normalized) and not re.search(
+        explicit_open_pattern, normalized
+    ):
+        return False
     closed_words = (
         r"closed|full|filled|ended|over|no\s+longer\s+available"
         r"|закрыт\w*|завершен\w*|заполнен\w*"
@@ -15804,11 +15877,20 @@ def _tournament_open_participation_is_supported(
         normalized,
     ):
         return False
+    explicit_opening_date = _tournament_explicit_opening_date(
+        normalized,
+        validation_time=validation_time,
+    )
+    if explicit_opening_date is not None:
+        if validation_time is None or validation_time.tzinfo is None:
+            return False
+        if explicit_opening_date > validation_time.date():
+            return False
     positive_patterns = (
-        r"\b(?:open|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
+        r"\b(?:open\w*|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
         rf"\b{participation_words}\b",
         rf"\b{participation_words}\b[^.!?;\n]{{0,35}}"
-        r"\b(?:open|accepting|available|ongoing)\b",
+        r"\b(?:open\w*|accepting|available|ongoing)\b",
         r"\b(?:registration|participation)\s+is\s+open\b",
         r"\b(?:register\w*|inscri\w*)\b[^.!?;\n]{0,55}"
         r"\b(?:now|today|maintenant|aujourd'hui|ahora|hoy|сейчас|сегодня)\b",
@@ -15833,6 +15915,106 @@ def _tournament_open_participation_is_supported(
     return any(
         re.search(pattern, normalized) is not None for pattern in positive_patterns
     )
+
+
+_TOURNAMENT_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+    "janvier": 1,
+    "février": 2,
+    "fevrier": 2,
+    "mars": 3,
+    "avril": 4,
+    "mai": 5,
+    "juin": 6,
+    "juillet": 7,
+    "août": 8,
+    "aout": 8,
+    "septembre": 9,
+    "octobre": 10,
+    "novembre": 11,
+    "décembre": 12,
+    "decembre": 12,
+}
+
+
+def _tournament_explicit_opening_date(
+    normalized_evidence: str,
+    *,
+    validation_time: datetime | None,
+) -> date | None:
+    """Find a calendar date explicitly attached to an opening assertion."""
+    month_names = "|".join(
+        re.escape(month) for month in sorted(_TOURNAMENT_MONTHS, key=len, reverse=True)
+    )
+    date_patterns = (
+        rf"(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+de)?\s+(?P<month>{month_names})"
+        rf"(?:\s+(?P<year>20\d{{2}}))?",
+        rf"(?P<month>{month_names})\s+(?P<day>\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?(?:,?\s+(?P<year>20\d{{2}}))?",
+    )
+    opening_words = re.compile(
+        r"(?:open\w*|accept\w*|available|ongoing|register\w*|"
+        r"откры\w*|запис\w*|приним\w*|abiert\w*|acept\w*|"
+        r"inscrib\w*|ouvr\w*|accept\w*)"
+    )
+    participation_words = re.compile(
+        r"(?:registration|registrations|participation|entry|entries|register\w*|"
+        r"регистрац\w*|набор\w*|участ\w*|inscripci\w*|participaci\w*|"
+        r"inscription\w*|participation\w*)"
+    )
+    for pattern in date_patterns:
+        for match in re.finditer(pattern, normalized_evidence):
+            context = normalized_evidence[max(0, match.start() - 60) : match.end() + 35]
+            if not participation_words.search(context) or not opening_words.search(
+                context
+            ):
+                continue
+            day = int(match.group("day"))
+            month = _TOURNAMENT_MONTHS[match.group("month")]
+            year = int(match.group("year")) if match.group("year") else None
+            if year is None:
+                if validation_time is None:
+                    return None
+                year = validation_time.year
+            with suppress(ValueError):
+                return date(year, month, day)
+    return None
 
 
 def _tournament_optional_facts_are_supported(

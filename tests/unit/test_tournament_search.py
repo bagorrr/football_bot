@@ -9,6 +9,7 @@ from modules.domain import (
     RequiredDate,
     UserIntent,
     evaluate_tournament_search,
+    tournament_publication_state_as_of,
 )
 
 
@@ -137,6 +138,48 @@ def test_tournament_matching_expires_at_registration_deadline() -> None:
 
     assert len(still_open) == 1
     assert expired == ()
+
+
+def test_tournament_publication_state_expires_against_read_time() -> None:
+    facts = _tournament().accepted_facts
+
+    assert (
+        tournament_publication_state_as_of(
+            facts,
+            current_publication_state="active",
+            as_of=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+        )
+        == "active"
+    )
+    assert (
+        tournament_publication_state_as_of(
+            facts,
+            current_publication_state="active",
+            as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+        )
+        == "expired"
+    )
+
+
+def test_tournament_publication_state_missing_projection_fails_closed() -> None:
+    assert (
+        tournament_publication_state_as_of(
+            _tournament().accepted_facts,
+            current_publication_state=None,
+            as_of=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+        )
+        == "suppressed"
+    )
+
+    malformed_facts = {**_tournament().accepted_facts, "iana_timezone": "unknown/zone"}
+    assert (
+        tournament_publication_state_as_of(
+            malformed_facts,
+            current_publication_state="active",
+            as_of=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+        )
+        == "suppressed"
+    )
 
 
 def test_tournament_details_use_or_within_a_field_and_and_across_fields() -> None:

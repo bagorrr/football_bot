@@ -101,6 +101,46 @@ def test_tournament_open_participation_rejects_negative_or_historical_evidence(
     )
 
 
+def test_tournament_opening_date_must_be_current() -> None:
+    evidence = "Registration opens 1 September 2026"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+
+
+def test_registration_form_or_route_is_not_open_participation_evidence() -> None:
+    evidence = "Registration form available: https://example.test/apply"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    route = _select_response_route(
+        body=evidence,
+        proposed_routes=[
+            {
+                "kind": "explicit_url",
+                "value": "https://example.test/apply",
+                "evidence": "https://example.test/apply",
+            }
+        ],
+        bounded_metadata=None,
+    )
+    assert route == {
+        "kind": "explicit_url",
+        "value": "https://example.test/apply",
+    }
+
+
 @pytest.mark.parametrize(
     ("value", "evidence", "expected"),
     (
