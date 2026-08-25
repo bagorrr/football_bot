@@ -16691,7 +16691,13 @@ def _player_availability_is_supported(
 
 def _source_player_opening_state(body: str) -> PropositionState:
     """Classify the bounded current/closed state of a player opening."""
-    normalized = re.sub(r"['’]", " ", body.casefold())
+    normalized = body.casefold()
+    normalized = re.sub(
+        r"\b(aren|isn|wasn|weren|don|doesn|didn|can|couldn|won|wouldn|shouldn)\s*['’]\s*t\b",
+        r"\1 not",
+        normalized,
+    )
+    normalized = re.sub(r"['’]", " ", normalized)
     if _body_has_terminal_retraction(normalized):
         return PropositionState.WITHDRAWN
     negative_availability_patterns = (
@@ -16722,13 +16728,14 @@ def _source_player_opening_state(body: str) -> PropositionState:
         r"(?:могу|можем|может|могут)|"
         r"\bне\s+(?:могу|можем|может|могут|способ\w*)\s+"
         r"(?:играть|участвовать|принять\s+участие)|"
+        r"\bне\s+в\s+состоянии\s+(?:играть|участвовать|принять\s+участие)|"
         r"\b(?:никто|ни\s+один|ни\s+одного)\s+не\s+может\s+"
         r"(?:играть|участвовать|принять\s+участие)\b",
         r"\b(?:indisponible\w*|no\s+(?:estamos|están|son|pueden)\s+"
         r"disponible\w*|no\s+disponible\w*|ningún\w*\s+"
         r"(?:jugador\w*|grupo)|no\s+(?:podemos|pueden|puede|puedo)\s+"
         r"(?:jugar|participar)|no\s+hay\s+(?:jugador\w*))\b",
-        r"\b(?:nadie|ningún\s+jugador|ningun\s+jugador)\s+"
+        r"\b(?:nadie|ningún\s+jugador|ningun\s+jugador|ninguno\s+de\s+ellos)\s+"
         r"(?:puede|podemos|pueden)\s+(?:jugar|participar)\b|"
         r"\b(?:no\s+(?:somos|son|es)\s+capaces\s+de|"
         r"incapaz\w*\s+de|incapac\w*\s+de|no\s+podemos|no\s+pueden|"
@@ -16737,7 +16744,7 @@ def _source_player_opening_state(body: str) -> PropositionState:
         r"disponible\w*|ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+"
         r"pas\s+(?:jouer|participer)|pas\s+disponible\w*|"
         r"aucun\w*\s+(?:joueur\w*|groupe))\b",
-        r"\b(?:personne|aucun\s+joueur|aucune\s+équipe)\s+ne\s+"
+        r"\b(?:personne|aucun\s+joueur|aucune\s+équipe|aucun\s+d\s+entre\s+eux)\s+ne\s+"
         r"peut\s+(?:jouer|participer)\b|"
         r"\b(?:nous\s+ne\s+sommes\s+pas\s+capables\s+de|"
         r"incapable\w*\s+de|impossible\s+de|"

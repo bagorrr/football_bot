@@ -8,7 +8,7 @@ from modules.classifier_contract import classifier_output_is_schema_valid
 from modules.contracts import JsonValue
 
 
-def test_open_match_artifacts_remain_open_match_only() -> None:
+def test_open_match_artifacts_preserve_open_match_and_opponent_request() -> None:
     root = Path(__file__).parents[2] / "classifier"
     primary_v1 = json.loads(
         (
@@ -28,10 +28,10 @@ def test_open_match_artifacts_remain_open_match_only() -> None:
     assert primary_v2["$id"] == "source-message-classification-v2"
     assert primary_v1["properties"]["candidates"]["items"]["properties"][
         "opportunity_type"
-    ] == {"const": "open_match"}
+    ] == {"enum": ["open_match", "opponent_request"]}
     assert primary_v2["$defs"]["acceptedCandidate"]["properties"][
         "opportunity_type"
-    ] == {"const": "open_match"}
+    ] == {"enum": ["open_match", "opponent_request"]}
     assert (
         not (root / "open-match-primary-v1" / "prompt.md")
         .read_text()

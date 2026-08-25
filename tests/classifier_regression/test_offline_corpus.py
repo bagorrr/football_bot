@@ -29,7 +29,9 @@ from modules.classifier_contract import (
 )
 from modules.classifier_promotion import (
     PLAYER_REQUIRED_CASE_FAMILIES,
+    PLAYER_REQUIRED_FAILURE_MODES,
     PLAYER_REVIEWED_CORPUS_CASE_COUNT,
+    ControlledPlayerClassifierRecordingAdapter,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
@@ -342,6 +344,10 @@ def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() 
     assert gate.reviewed_case_count == 38
     assert gate.reviewed_case_ids == release.reviewed_corpus_case_ids
     assert gate.lifecycle_case_count == len(release.lifecycle_failure_suite_cases)
+    assert gate.failure_mode_case_ids == tuple(
+        case["case_id"] for case in release.failure_mode_cases
+    )
+    assert len(gate.failure_mode_case_ids) == len(PLAYER_REQUIRED_FAILURE_MODES)
     assert gate.failed_case_ids == ()
     assert len(gate.replay_digests) == release.required_replays
     assert len(set(gate.replay_digests)) == 1
@@ -402,6 +408,53 @@ def test_player_promotion_rejects_fake_digest_and_exact_version_mismatch() -> No
         {**approval, "release_fingerprint": "0" * 64}
     )
     assert not player_classifier_promotion_is_approved({**approval, "state": "revoked"})
+
+
+def test_player_recording_adapter_is_independent_and_replays_all_failure_modes() -> (
+    None
+):
+    release = describe_player_classifier_release()
+    adapter = ControlledPlayerClassifierRecordingAdapter(release)
+
+    for case in release.reviewed_corpus_cases:
+        record = adapter.observe(
+            case_id=cast(str, case["case_id"]),
+            source=cast(str, case["source"]),
+        )
+        assert "expected" not in record
+        assert "observed_output" in record
+        assert "observed_facts" in record
+
+    evidence = player_classifier_promotion_evidence(release)
+    assert evidence["canonical_replay_digests"] == list(
+        release.canonical_replay_digests
+    )
+    assert evidence["failure_mode_case_count"] == len(PLAYER_REQUIRED_FAILURE_MODES)
+    assert evidence["failed_case_ids"] == []
+
+
+def test_player_promotion_rejects_cross_file_annotation_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import modules.classifier_promotion as promotion
+
+    original_read_json = promotion._read_json
+
+    def mismatched_read_json(
+        path: Path, *, description: str
+    ) -> tuple[dict[str, JsonValue], str]:
+        value, raw = original_read_json(path, description=description)
+        if description == "reviewed Player corpus":
+            altered = deepcopy(value)
+            cases = cast(list[dict[str, JsonValue]], altered["cases"])
+            expected = cast(dict[str, JsonValue], cases[0]["expected"])
+            expected["reason_code"] = "irrelevant"
+            return altered, raw
+        return value, raw
+
+    monkeypatch.setattr(promotion, "_read_json", mismatched_read_json)
+    with pytest.raises(ValueError, match="annotations mismatch"):
+        promotion.describe_player_classifier_release()
 
 
 def test_player_promotion_contract_contains_executable_expected_facts() -> None:

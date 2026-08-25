@@ -1,5 +1,5 @@
 {
-  "suite_version": "player-match-lifecycle-failure-v2",
+  "suite_version": "player-match-lifecycle-failure-v3",
   "status": "reviewed",
   "scope": "Specification #38 executable controlled lifecycle and failure testing",
   "families": [
@@ -314,6 +314,11 @@
         },
         {
           "kind": "polarity",
+          "source": "4 players are available but they aren't able to play the match",
+          "expected": false
+        },
+        {
+          "kind": "polarity",
           "source": "4 players available but unable to participate in the match",
           "expected": false
         },
@@ -339,12 +344,22 @@
         },
         {
           "kind": "polarity",
+          "source": "4 jugadores disponibles, pero ninguno de ellos puede jugar el partido",
+          "expected": false
+        },
+        {
+          "kind": "polarity",
           "source": "4 jugadores disponibles pero no podemos participar en el partido",
           "expected": false
         },
         {
           "kind": "polarity",
           "source": "4 joueurs disponibles, mais personne ne peut jouer le match",
+          "expected": false
+        },
+        {
+          "kind": "polarity",
+          "source": "4 joueurs disponibles, mais aucun d'entre eux ne peut jouer le match",
           "expected": false
         },
         {
@@ -386,6 +401,68 @@
     "replay",
     "rollback",
     "duplicate_delivery"
+  ],
+  "failure_cases": [
+    {
+      "case_id": "failure-schema",
+      "failure_mode": "schema_failure",
+      "operation": {"kind": "failure", "failure_mode": "schema_failure"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-evidence",
+      "failure_mode": "evidence_failure",
+      "operation": {"kind": "failure", "failure_mode": "evidence_failure"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-normalization",
+      "failure_mode": "normalization_failure",
+      "operation": {"kind": "failure", "failure_mode": "normalization_failure"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-timeout",
+      "failure_mode": "timeout",
+      "operation": {"kind": "failure", "failure_mode": "timeout"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-quota",
+      "failure_mode": "quota",
+      "operation": {"kind": "failure", "failure_mode": "quota"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-authentication",
+      "failure_mode": "authentication",
+      "operation": {"kind": "failure", "failure_mode": "authentication"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-worker-crash",
+      "failure_mode": "worker_crash",
+      "operation": {"kind": "failure", "failure_mode": "worker_crash"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-replay",
+      "failure_mode": "replay",
+      "operation": {"kind": "failure", "failure_mode": "replay"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-rollback",
+      "failure_mode": "rollback",
+      "operation": {"kind": "failure", "failure_mode": "rollback"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    },
+    {
+      "case_id": "failure-duplicate-delivery",
+      "failure_mode": "duplicate_delivery",
+      "operation": {"kind": "failure", "failure_mode": "duplicate_delivery"},
+      "expected": {"fail_closed": true, "publication_state": "suppressed", "publication_effects": 0}
+    }
   ],
   "controlled_event_sequences": [
     {

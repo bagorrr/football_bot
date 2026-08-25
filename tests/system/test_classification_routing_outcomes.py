@@ -3693,6 +3693,7 @@ def test_source_edit_and_delete_immediately_suppress_all_prior_projections() -> 
                 source_message_id, legacy_opportunity_id,
                 canonical_opportunity_id, created_at
             ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (legacy_opportunity_id) DO NOTHING
             """,
             (source_message_id, legacy_alias_id, opportunity_id, clock.now()),
         )

@@ -1,0 +1,1994 @@
+{
+  "recording_version": "player-match-recording-v1",
+  "status": "reviewed",
+  "adapter_kind": "controlled_recording",
+  "source_corpus_version": "player-match-reviewed-corpus-v1",
+  "case_count": 38,
+  "cases": [
+    {
+      "case_id": "sm-001",
+      "source_sha256": "3c8db6c915c771951fc83320d5eefaca9337388f97cb0e3650fb71b743ec3b54",
+      "source_revision_id": "recorded:player-release:sm-001:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "open_match"
+        ],
+        "source_evidence": {
+          "position": "кипер",
+          "event_time": "19:30",
+          "location": "[LOCATION]"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "open_match"
+          ],
+          "position": "goalkeeper",
+          "open_places": 1,
+          "event_time": "19:30",
+          "location": "[LOCATION]"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-002",
+      "source_sha256": "04aad648466c07830dff4c3ed1ce400e86f77f07ed2977fdf9732770d2eaa77a",
+      "source_revision_id": "recorded:player-release:sm-002:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "open_match"
+        ],
+        "source_evidence": {
+          "position": "кипер",
+          "time": "Сегодня на вечер",
+          "contact": "го лс"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "open_match"
+          ],
+          "position": "goalkeeper",
+          "time_horizon": "today_evening",
+          "open_places": 1
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-003",
+      "source_sha256": "ac306e12559598e7623230d9fc6d61c6611d325248df2051ab9618438d402bb3",
+      "source_revision_id": "recorded:player-release:sm-003:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-003-recorded-ambiguity",
+            "opportunity_type": "open_match",
+            "evidence": {
+              "goalkeeper": "кипер",
+              "field_players": "2 полевых"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-003-recorded-one-off",
+                "evidence": {
+                  "goalkeeper": "кипер",
+                  "field_players": "2 полевых"
+                }
+              },
+              {
+                "alternative_key": "sm-003-recorded-long-term",
+                "evidence": {
+                  "goalkeeper": "кипер",
+                  "field_players": "2 полевых"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "open_match",
+          "roster_vacancy"
+        ],
+        "source_evidence": {
+          "goalkeeper": "кипер",
+          "field_players": "2 полевых"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "open_match",
+            "roster_vacancy"
+          ],
+          "positions": [
+            "goalkeeper",
+            "defender"
+          ],
+          "open_places": 3,
+          "time_horizon": "ambiguous"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-004",
+      "source_sha256": "684935c8d5f287622935e6ae7f40a043c55435d29c83924945301db0ffe4ee89",
+      "source_revision_id": "recorded:player-release:sm-004:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "availability": "Поиграю сегодня вечером"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_match_availability"
+          ],
+          "availability": "today_evening"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-005",
+      "source_sha256": "5f21679d7f4fa1f7f3e908978bf6afc5b6fc31cbaca24f9140b7745ddb14cd86",
+      "source_revision_id": "recorded:player-release:sm-005:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-005-recorded-ambiguity",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+              "availability": "Впишусь поиграть",
+              "range": "1–2 человека"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-005-recorded-one-off",
+                "evidence": {
+                  "availability": "Впишусь поиграть",
+                  "range": "1–2 человека"
+                }
+              },
+              {
+                "alternative_key": "sm-005-recorded-long-term",
+                "evidence": {
+                  "availability": "Впишусь поиграть",
+                  "range": "1–2 человека"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "availability": "Впишусь поиграть",
+          "range": "1–2 человека"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_match_availability"
+          ],
+          "available_player_count_min": 1,
+          "available_player_count_max": 2
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-006",
+      "source_sha256": "618c4c0b45be0d2f393f057cc0fa1528de0adac63cc1a82790dc0bfc31ba5209",
+      "source_revision_id": "recorded:player-release:sm-006:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_second_pass",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "deterministic_ambiguity",
+          "required_context": "direct_reply"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "availability": "Сыграю на любой позиции в поле"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_match_availability"
+          ],
+          "positions": [
+            "goalkeeper",
+            "defender",
+            "midfielder",
+            "forward"
+          ],
+          "availability": "open"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_second_pass"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-007",
+      "source_sha256": "505a7706ae63c2420802881ef29085b75507e376df20ec0c3e51b0d787199cb5",
+      "source_revision_id": "recorded:player-release:sm-007:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "tournament"
+        ],
+        "source_evidence": {
+          "competition": "чемпионат 5х5",
+          "surface": "на газоне",
+          "opening": "последнее место для команды"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "tournament"
+          ],
+          "team_format": "5x5",
+          "surface": "natural_grass",
+          "open_places": 1
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-008",
+      "source_sha256": "5f4ba9717ebdf153e8e046a26d910a456c88aa9ba03fc8588624b3f830427a85",
+      "source_revision_id": "recorded:player-release:sm-008:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "tournament"
+        ],
+        "source_evidence": {
+          "first_event": "однодневный турнир [DATE]",
+          "second_event": "весеннее первенство по футболу 5х5",
+          "venue": "крытых манежах"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "tournament"
+          ],
+          "team_format": "5x5",
+          "open_places": 3,
+          "surface": "covered_outdoor"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-009",
+      "source_sha256": "e79c6da85fe9e0f2917830f5e770a8c725ee49cda0a9636460421d824f5ac743",
+      "source_revision_id": "recorded:player-release:sm-009:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_second_pass",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "deterministic_ambiguity",
+          "required_context": "adjacent_revisions"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "tournament",
+          "open_match"
+        ],
+        "source_evidence": {
+          "time": "Завтра с 21:00 до 00:00",
+          "team_opening": "одно место для команды",
+          "player_opening": "пару мест для игроков"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "tournament",
+            "open_match"
+          ],
+          "open_places": 2,
+          "time_horizon": "tomorrow"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_second_pass"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-010",
+      "source_sha256": "3ffaccaeeb79ff385ce6e91ac681a477376667a147964a72b64ea3788cc27742",
+      "source_revision_id": "recorded:player-release:sm-010:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-010-recorded-ambiguity",
+            "opportunity_type": "open_match",
+            "evidence": {
+              "request": "Ищем соперника",
+              "format": "8х8"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-010-recorded-one-off",
+                "evidence": {
+                  "request": "Ищем соперника",
+                  "format": "8х8"
+                }
+              },
+              {
+                "alternative_key": "sm-010-recorded-long-term",
+                "evidence": {
+                  "request": "Ищем соперника",
+                  "format": "8х8"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "opponent_request"
+        ],
+        "source_evidence": {
+          "request": "Ищем соперника",
+          "format": "8х8"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "opponent_request"
+          ],
+          "team_format": "8x8"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-011",
+      "source_sha256": "52881cee552ec960247a4ce59b4bd725037c15a360ae02480eb081112e7ba9b7",
+      "source_revision_id": "recorded:player-release:sm-011:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "opponent_request"
+        ],
+        "source_evidence": {
+          "request": "ищем соперника",
+          "schedule": "пятницу, 19:00"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "opponent_request"
+          ],
+          "weekday": "friday",
+          "event_time": "19:00"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-012",
+      "source_sha256": "bf7fff279874a8c2686f22afeefcb8e7faf2cc255a7f0c6f771c4c544b0cbf1c",
+      "source_revision_id": "recorded:player-release:sm-012:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_second_pass",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "deterministic_ambiguity",
+          "required_context": "direct_reply"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "opponent_request"
+        ],
+        "source_evidence": {
+          "request": "Ищем соперников"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "opponent_request"
+          ],
+          "request_scope": "opponent"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_second_pass"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-013",
+      "source_sha256": "ec0ca257bdafb09079131dee857a838c16e1279af36fd4491427b586d8e6d840",
+      "source_revision_id": "recorded:player-release:sm-013:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "roster_vacancy"
+        ],
+        "source_evidence": {
+          "position": "постоянный вратарь",
+          "schedule": "по выходным",
+          "format": "5х5"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "roster_vacancy"
+          ],
+          "position": "goalkeeper",
+          "team_format": "5x5",
+          "time_horizon": "recurring"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-014",
+      "source_sha256": "a9f7d143b0ee87688ec8066c57394d99c360d97a5fe0795244ed2866cda911d4",
+      "source_revision_id": "recorded:player-release:sm-014:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "roster_vacancy"
+        ],
+        "source_evidence": {
+          "opening": "нужны игроки",
+          "season": "на сезон",
+          "contact": "пишите в лс"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "roster_vacancy"
+          ],
+          "time_horizon": "season",
+          "contact_route": "private_message"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-015",
+      "source_sha256": "6b12ae514ab610a1d6afd9091f42c551b990b25818e7fa0a83849ccafe1aa50e",
+      "source_revision_id": "recorded:player-release:sm-015:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-015-recorded-ambiguity",
+            "opportunity_type": "open_match",
+            "evidence": {
+              "position": "ищем вратаря",
+              "format": "8х8",
+              "contact": "подробности в лс"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-015-recorded-one-off",
+                "evidence": {
+                  "position": "ищем вратаря",
+                  "format": "8х8",
+                  "contact": "подробности в лс"
+                }
+              },
+              {
+                "alternative_key": "sm-015-recorded-long-term",
+                "evidence": {
+                  "position": "ищем вратаря",
+                  "format": "8х8",
+                  "contact": "подробности в лс"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "open_match",
+          "roster_vacancy"
+        ],
+        "source_evidence": {
+          "position": "ищем вратаря",
+          "format": "8х8",
+          "contact": "подробности в лс"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "open_match",
+            "roster_vacancy"
+          ],
+          "position": "goalkeeper",
+          "team_format": "8x8"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-016",
+      "source_sha256": "fbbfcf7a2e4fd9e3c2035e636cfd0624c22456fc293fbf5e73f76fe49b6eec9e",
+      "source_revision_id": "recorded:player-release:sm-016:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "player_transfer_availability"
+        ],
+        "source_evidence": {
+          "request": "Ищу команду для постоянных игр",
+          "position": "вратарь"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_transfer_availability"
+          ],
+          "position": "goalkeeper",
+          "time_horizon": "recurring"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-017",
+      "source_sha256": "21035b827272b2c8efa465c8abf5c33cd7c8c829fdc7b79913e73e5d3ccc6d6d",
+      "source_revision_id": "recorded:player-release:sm-017:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-017-recorded-ambiguity",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+              "position": "Вратарь",
+              "age": "[AGE]",
+              "format": "8х8"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-017-recorded-one-off",
+                "evidence": {
+                  "position": "Вратарь",
+                  "age": "[AGE]",
+                  "format": "8х8"
+                }
+              },
+              {
+                "alternative_key": "sm-017-recorded-long-term",
+                "evidence": {
+                  "position": "Вратарь",
+                  "age": "[AGE]",
+                  "format": "8х8"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "player_transfer_availability",
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "position": "Вратарь",
+          "age": "[AGE]",
+          "format": "8х8"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_transfer_availability",
+            "player_match_availability"
+          ],
+          "position": "goalkeeper",
+          "team_format": "8x8"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-018",
+      "source_sha256": "0f91b56afa4b8dcd49ea58ca6f9a86187e4a17e37470a9bf950ed4d319017d04",
+      "source_revision_id": "recorded:player-release:sm-018:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "player_transfer_availability"
+        ],
+        "source_evidence": {
+          "request": "ищу команду для игры",
+          "formats": "8х8 и 11х11",
+          "experience": "большой опыт игры"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_transfer_availability"
+          ],
+          "position": "goalkeeper",
+          "team_formats": [
+            "8x8",
+            "11x11"
+          ],
+          "experience": "experienced"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-019",
+      "source_sha256": "1863db27dc192b229ee5d75a3c86086887135857d8a418baae0a5157d5e2f4f9",
+      "source_revision_id": "recorded:player-release:sm-019:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "coach_availability"
+        ],
+        "source_evidence": {
+          "date": "[DATE]",
+          "qualification": "лицензированным тренером",
+          "time": "19:00–21:00",
+          "location": "[LOCATION]"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "coach_availability"
+          ],
+          "event_time": "19:00–21:00",
+          "location": "[LOCATION]",
+          "payment": "free_trial"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-020",
+      "source_sha256": "53bfc5fdc7a1dd8c24325ea86c3b5b65f4b26e4b74364058d957c6e873a26537",
+      "source_revision_id": "recorded:player-release:sm-020:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_second_pass",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "deterministic_ambiguity",
+          "required_context": "adjacent_revisions"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "coach_availability",
+          "roster_vacancy"
+        ],
+        "source_evidence": {
+          "time": "Сегодня в 21:00",
+          "coach": "квалифицированного тренера",
+          "payment": "Стоимость [AMOUNT]"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "coach_availability",
+            "roster_vacancy"
+          ],
+          "event_time": "21:00",
+          "time_horizon": "today",
+          "payment": "paid"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_second_pass"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-021",
+      "source_sha256": "c98ad742f4593a02c6898947acbe8aae2cdb614bd2ea763c40b78063be421b52",
+      "source_revision_id": "recorded:player-release:sm-021:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "coach_availability"
+        ],
+        "source_evidence": {
+          "training": "приходите на тренировку",
+          "schedule": "по средам с 21:30 до 23:00",
+          "price": "[AMOUNT]"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "coach_availability"
+          ],
+          "event_time": "21:30–23:00",
+          "time_horizon": "recurring",
+          "payment": "paid"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-022",
+      "source_sha256": "6743f80bb4b4bdc5dcff76180aeab08cc6af76ad420792fe5fb69505332b94c8",
+      "source_revision_id": "recorded:player-release:sm-022:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "coach_request"
+        ],
+        "source_evidence": {
+          "request": "требуется тренер",
+          "format": "11х11"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "coach_request"
+          ],
+          "team_format": "11x11",
+          "request_scope": "coach"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-023",
+      "source_sha256": "2c6d850afd63aebbc4ab6ce00819bf6a0010abda4df4d1fb34fb8885442eb27d",
+      "source_revision_id": "recorded:player-release:sm-023:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "coach_request"
+        ],
+        "source_evidence": {
+          "request": "Ищу тренера вратарей",
+          "mode": "индивидуальных занятий",
+          "alternative": "группе"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "coach_request"
+          ],
+          "position": "goalkeeper",
+          "request_scope": "coach"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-024",
+      "source_sha256": "deca00f857ce08940dc3466cc64af232b176b1011040bd51185d373474207d43",
+      "source_revision_id": "recorded:player-release:sm-024:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "coach_request"
+        ],
+        "source_evidence": {
+          "request": "Ищем тренера",
+          "context": "наш уехал с концами"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "coach_request"
+          ],
+          "request_scope": "coach"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-025",
+      "source_sha256": "e2c561377a5f3bd4c177f1bf31ae27ef87e78edaee9a30a4b6e5f8bca6dd5d95",
+      "source_revision_id": "recorded:player-release:sm-025:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "referee_availability"
+        ],
+        "source_evidence": {
+          "availability": "Могу судить матчи",
+          "contact": "кому надо"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "referee_availability"
+          ],
+          "availability": "referee",
+          "contact_route": "reply"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-026",
+      "source_sha256": "f43894b887b8d0c5e322e45a052c938a65ba38248d26b11ef1f051fdd0c4dc6e",
+      "source_revision_id": "recorded:player-release:sm-026:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-026-recorded-ambiguity",
+            "opportunity_type": "open_match",
+            "evidence": {
+              "request": "Нужен судья",
+              "schedule": "воскресенье"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-026-recorded-one-off",
+                "evidence": {
+                  "request": "Нужен судья",
+                  "schedule": "воскресенье"
+                }
+              },
+              {
+                "alternative_key": "sm-026-recorded-long-term",
+                "evidence": {
+                  "request": "Нужен судья",
+                  "schedule": "воскресенье"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "referee_request"
+        ],
+        "source_evidence": {
+          "request": "Нужен судья",
+          "schedule": "воскресенье"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "referee_request"
+          ],
+          "request_scope": "referee",
+          "weekday": "sunday"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-027",
+      "source_sha256": "7605e909b17d79bcb1df617b34232b829644a40154b693612c685851d07483c8",
+      "source_revision_id": "recorded:player-release:sm-027:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "referee_request"
+        ],
+        "source_evidence": {
+          "request": "нужен судья на сегодня",
+          "format": "товарка 8:8",
+          "time": "21–22:30",
+          "location": "[LOCATION]"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "referee_request"
+          ],
+          "request_scope": "referee",
+          "team_format": "8x8",
+          "event_time": "21–22:30",
+          "location": "[LOCATION]"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-028",
+      "source_sha256": "6f338af9b7afb8f6fa792b35d2ac6f14ed178eb0538bb2adf719a59679a40b43",
+      "source_revision_id": "recorded:player-release:sm-028:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+
+        ],
+        "source_evidence": {
+          "scope": "детский турнир"
+        },
+        "normalized": {
+          "opportunity_types": [
+
+          ],
+          "scope": "children_only"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "irrelevant"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-029",
+      "source_sha256": "8a8de823d5ed3e12746a62ef169bcf372be0ca44f0a1236abc35df05d96928e1",
+      "source_revision_id": "recorded:player-release:sm-029:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+
+        ],
+        "source_evidence": {
+          "malformed": "?"
+        },
+        "normalized": {
+          "opportunity_types": [
+
+          ],
+          "scope": "malformed"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "irrelevant"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-030",
+      "source_sha256": "cdc78c7ab0def009f0ac1097d1f2d70fbd65878d826b6c75ea39506825970d5d",
+      "source_revision_id": "recorded:player-release:sm-030:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+
+        ],
+        "source_evidence": {
+          "off_topic": "женщина роковая"
+        },
+        "normalized": {
+          "opportunity_types": [
+
+          ],
+          "scope": "off_topic"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "irrelevant"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-031",
+      "source_sha256": "98b30d76f8257f079d27a838e48bfcf2e2c47cbce1ffec3ea43bb1d05bf4d313",
+      "source_revision_id": "recorded:player-release:sm-031:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+
+        ],
+        "source_evidence": {
+          "off_topic": "бухал"
+        },
+        "normalized": {
+          "opportunity_types": [
+
+          ],
+          "scope": "off_topic"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "irrelevant"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-032",
+      "source_sha256": "1b29870dbe1222bd2f0f009d2146b64f43113a3fa28504b57ee3ac99375fda20",
+      "source_revision_id": "recorded:player-release:sm-032:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+
+        ],
+        "source_evidence": {
+          "football_context": "фола нет"
+        },
+        "normalized": {
+          "opportunity_types": [
+
+          ],
+          "scope": "football_discussion"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "irrelevant"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-033",
+      "source_sha256": "cd696a3a042717c393f27d05af5855c9e3efac28761168dbebf701135fe3eca3",
+      "source_revision_id": "recorded:player-release:sm-033:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "irrelevant",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "irrelevant",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+
+        ],
+        "source_evidence": {
+          "equipment": "футбольный мяч",
+          "request": "купить"
+        },
+        "normalized": {
+          "opportunity_types": [
+
+          ],
+          "scope": "equipment_purchase"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "irrelevant"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-034",
+      "source_sha256": "68b6baac2569b480265224e244a09ef4b9009b10b3c7035ea661dd531b4633c3",
+      "source_revision_id": "recorded:player-release:sm-034:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-034-recorded-ambiguity",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+              "availability": "Сегодня есть где поиграть?"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-034-recorded-one-off",
+                "evidence": {
+                  "availability": "Сегодня есть где поиграть?"
+                }
+              },
+              {
+                "alternative_key": "sm-034-recorded-long-term",
+                "evidence": {
+                  "availability": "Сегодня есть где поиграть?"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "availability": "Сегодня есть где поиграть?"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_match_availability"
+          ],
+          "availability": "today",
+          "search_or_offering": "ambiguous"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-035",
+      "source_sha256": "68b6baac2569b480265224e244a09ef4b9009b10b3c7035ea661dd531b4633c3",
+      "source_revision_id": "recorded:player-release:sm-035:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-035-recorded-ambiguity",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+              "availability": "Сегодня есть где поиграть?"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-035-recorded-one-off",
+                "evidence": {
+                  "availability": "Сегодня есть где поиграть?"
+                }
+              },
+              {
+                "alternative_key": "sm-035-recorded-long-term",
+                "evidence": {
+                  "availability": "Сегодня есть где поиграть?"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "availability": "Сегодня есть где поиграть?"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_match_availability"
+          ],
+          "availability": "today",
+          "search_or_offering": "ambiguous"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-036",
+      "source_sha256": "3ee0f9cfa95d5e85be47d79663bb979949746cd81170e76b9d5a23c280988a98",
+      "source_revision_id": "recorded:player-release:sm-036:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "open_match"
+        ],
+        "source_evidence": {
+          "replacement": "Требуется замена",
+          "time": "19:30 до 21:00",
+          "opening": "один полевой игрок"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "open_match"
+          ],
+          "open_places": 1,
+          "position": "outfield",
+          "event_time": "19:30–21:00"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-037",
+      "source_sha256": "b5b83ae3be5520de80487a4b46e36fa516d85663c98705f45b78ea59b7ef6d22",
+      "source_revision_id": "recorded:player-release:sm-037:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "candidates": [
+          {
+            "candidate_key": "sm-037-recorded-ambiguity",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+              "availability": "Есть где сегодня бесплатно поиграть?"
+            },
+            "alternatives": [
+              {
+                "alternative_key": "sm-037-recorded-one-off",
+                "evidence": {
+                  "availability": "Есть где сегодня бесплатно поиграть?"
+                }
+              },
+              {
+                "alternative_key": "sm-037-recorded-long-term",
+                "evidence": {
+                  "availability": "Есть где сегодня бесплатно поиграть?"
+                }
+              }
+            ]
+          }
+        ],
+        "routing": {
+          "reason_code": "competing_interpretations",
+          "required_context": "refined_prompt"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 1,
+        "opportunity_types": [
+          "player_match_availability"
+        ],
+        "source_evidence": {
+          "availability": "Есть где сегодня бесплатно поиграть?"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "player_match_availability"
+          ],
+          "availability": "today",
+          "payment": "free"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "unresolved"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    },
+    {
+      "case_id": "sm-038",
+      "source_sha256": "5dd7f0afb269ca95ba8bdaa41576f1907342dcc19fceef5b1a57024e5d37f8f0",
+      "source_revision_id": "recorded:player-release:sm-038:r1",
+      "observed_output": {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "needs_review",
+        "candidates": [
+
+        ],
+        "routing": {
+          "reason_code": "needs_review",
+          "required_context": "none"
+        }
+      },
+      "observed_facts": {
+        "candidate_count": 0,
+        "opportunity_types": [
+          "roster_vacancy"
+        ],
+        "source_evidence": {
+          "opening": "требуются игроки",
+          "time_horizon": "на постоянную перспективу",
+          "context": "Тренировки с тренером"
+        },
+        "normalized": {
+          "opportunity_types": [
+            "roster_vacancy"
+          ],
+          "time_horizon": "recurring",
+          "request_scope": "roster"
+        }
+      },
+      "safety": {
+        "fail_closed": true,
+        "publication_allowed": false,
+        "publication_state": "suppressed",
+        "disposition_rechecked": "needs_review"
+      },
+      "provenance": {
+        "adapter_kind": "controlled_recording",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
+        "schema_version": "source-message-classification-v3",
+        "recording_version": "player-match-recording-v1"
+      }
+    }
+  ]
+}
