@@ -13132,12 +13132,59 @@ def _source_edit_qualifies_freshness(
     return normalize(previous_revision.body) != normalize(current_revision.body)
 
 
+def _transfer_directional_clauses(
+    body: str,
+    opportunity_type: str,
+) -> tuple[str, ...]:
+    """Partition compound transfer prose by its explicit direction anchors."""
+    roster_anchor = re.compile(
+        r"(?:roster|squad|vacanc\w*|opening|spot|position|plantilla|effectif|"
+        r"набор\w*|команд\w*\s+ищ\w*|нужн\w*\s+игрок\w*|требу\w*|"
+        r"усилен\w*)",
+        re.IGNORECASE,
+    )
+    player_anchor = re.compile(
+        r"(?:player\s+transfer|transfer|transfert|available\s+for\s+"
+        r"(?:a\s+)?move|looking\s+for\s+a\s+team|seeking\s+a\s+team|"
+        r"join\s+(?:a\s+)?team|переход\w*|доступ\w*\s+для\s+переход\w*|"
+        r"ищ\w*\s+команд\w*|disponible\s+para\s+(?:un\s+)?traspaso|"
+        r"busc\w*\s+equip\w*|cherche\w*\s+une\s+équipe)",
+        re.IGNORECASE,
+    )
+    raw_clauses = tuple(re.split(r"[.!?;\n]+", body))
+    selected: list[str] = []
+    pending_neutral: list[str] = []
+    active_direction: str | None = None
+    for clause in raw_clauses:
+        normalized_clause = clause.casefold()
+        has_roster_anchor = roster_anchor.search(normalized_clause) is not None
+        has_player_anchor = player_anchor.search(normalized_clause) is not None
+        if not has_roster_anchor and not has_player_anchor:
+            if active_direction in {opportunity_type, "both"}:
+                selected.append(clause)
+            else:
+                pending_neutral.append(clause)
+            continue
+        if has_roster_anchor and has_player_anchor:
+            active_direction = "both"
+        elif has_roster_anchor:
+            active_direction = "roster_vacancy"
+        elif has_player_anchor:
+            active_direction = "player_transfer_availability"
+        if active_direction in {opportunity_type, "both"}:
+            selected.extend(pending_neutral)
+        pending_neutral = []
+        if active_direction in {opportunity_type, "both"}:
+            selected.append(clause)
+    return tuple(selected) or raw_clauses
+
+
 def _transfer_assertion_signature(
     body: str,
     opportunity_type: str,
     bounded_metadata: Mapping[str, object] | None = None,
 ) -> tuple[str, ...]:
-    """Keep transfer assertion clauses and usable metadata routes."""
+    """Keep one direction's actionable assertion terms and route values."""
     marker = re.compile(
         r"(?:roster|squad|vacanc\w*|opening|spot|position|transfer|transfert|"
         r"переход\w*|long[- ]term|season\w*|temporad\w*|saison\w*|"
@@ -13147,15 +13194,62 @@ def _transfer_assertion_signature(
         r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*|"
         r"available|seeking|looking|need\w*|join\w*|команд\w*|"
         r"доступ\w*|ищ\w*|нужн\w*|"
+        r"location|city|country|place|место|город|стран\w*|"
         r"@[a-z0-9_]{3,}|https?://|[\w.+-]+@[\w.-]+\.[a-z]{2,}|"
         r"\+?[0-9][0-9 ()-]{5,}[0-9])",
         re.IGNORECASE,
     )
     clauses = tuple(
         clause
-        for clause in re.split(r"[.!?;\n]+", body.casefold())
+        for clause in _transfer_directional_clauses(body, opportunity_type)
         if marker.search(clause)
     ) or (body.casefold(),)
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "at",
+        "about",
+        "are",
+        "as",
+        "city",
+        "contact",
+        "country",
+        "email",
+        "for",
+        "from",
+        "have",
+        "has",
+        "in",
+        "is",
+        "location",
+        "message",
+        "of",
+        "on",
+        "or",
+        "our",
+        "phone",
+        "place",
+        "reply",
+        "the",
+        "there",
+        "this",
+        "to",
+        "we",
+        "with",
+        "whatsapp",
+        "telegram",
+        "место",
+        "город",
+        "страна",
+    }
+    actionable_tokens = tuple(
+        token
+        for token in re.findall(
+            r"[\w@]+", " ".join(clauses).casefold(), flags=re.UNICODE
+        )
+        if token not in stopwords
+    )
     metadata_tokens: list[str] = []
     if bounded_metadata is not None:
         for key in (
@@ -13169,7 +13263,7 @@ def _transfer_assertion_signature(
                 metadata_tokens.extend((key, str(value).casefold()))
     return (
         opportunity_type,
-        *re.findall(r"[\w@]+", " ".join(clauses), flags=re.UNICODE),
+        *actionable_tokens,
         *metadata_tokens,
     )
 
@@ -15996,14 +16090,23 @@ def _seasonal_timing_is_supported(
     if kind == "ready_now":
         patterns = (
             r"\b(?:ready|available)\s*(?:now|immediately|right away)\b",
-            r"\bготов\w*\s*(?:сейчас|к\s+переходу)?\b",
-            r"\b(?:disponible|listo)\w*\s*(?:ahora|inmediatamente)?\b",
-            r"\b(?:disponible|pr[êe]t)\w*\s*(?:maintenant|imm[ée]diatement)?\b",
+            r"\bготов\w*\s+(?:сейчас|немедленно|прямо\s+сейчас|к\s+переходу)\b",
+            r"\b(?:disponible|listo)\w*\s+(?:ahora|inmediatamente|ya)\b",
+            r"\b(?:disponible|pr[êe]t)\w*\s+(?:maintenant|imm[ée]diatement|"
+            r"tout\s+de\s+suite)\b",
         )
+        if re.search(
+            r"\b(?:next|upcoming|future|próxim\w*|siguiente|"
+            r"prochain\w*|suivant\w*|следующ\w*)\b",
+            normalized,
+        ):
+            return False
         return any(
             re.search(pattern, normalized) for pattern in patterns
         ) and not re.search(
-            r"\b(?:not|no|не|не\s+готов|sin|pas)\b[^.!?;\n]{0,20}"
+            r"\b(?:not|no|не|не\s+готов|sin|pas|next|upcoming|future|"
+            r"próxim\w*|siguiente|prochain\w*|suivant\w*|следующ\w*)\b"
+            r"[^.!?;\n]{0,40}"
             r"(?:ready|available|готов|disponible|pr[êe]t)",
             normalized,
         )
@@ -16118,6 +16221,23 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     # the long-term or seasonal nature explicit. A bare "season" in a phrase
     # such as "this season's Saturday match" is not enough.
     if one_off is not None:
+        clauses = re.split(r"[.!?;\n]+", normalized)
+        one_off_only_pattern = re.compile(
+            r"\b(?:for|on|at|this|the)\b[^.!?;\n]{0,40}"
+            r"\b(?:match(?:es)?|game(?:s)?|fixture(?:s)?|opponent|"
+            r"матч\w*|игр(?:а|ы|у|е|ой)|соперник|partid\w*|"
+            r"encuentro\w*|rencontre\w*)\b|"
+            r"\b(?:match(?:es)?|game(?:s)?|fixture(?:s)?|opponent|"
+            r"матч\w*|игр(?:а|ы|у|е|ой)|соперник|partid\w*|"
+            r"encuentro\w*|rencontre\w*)\b[^.!?;\n]{0,20}"
+            r"\b(?:only|just|exclusiv\w*|только|лишь|solo|seulement)\b"
+        )
+        if any(
+            one_off_pattern.search(clause) is not None
+            and one_off_only_pattern.search(clause) is not None
+            for clause in clauses
+        ):
+            return False
         explicit_long_term_pattern = re.compile(
             r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
             r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
@@ -16134,7 +16254,6 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"équipe|effectif\s+vacant)\b",
         )
         explicit_long_term = explicit_long_term_pattern.search(normalized)
-        clauses = re.split(r"[.!?;\n]+", normalized)
         if explicit_long_term is None or not any(
             one_off_pattern.search(clause) is not None
             and explicit_long_term_pattern.search(clause) is not None
@@ -16148,6 +16267,8 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
     """Reject plural Player Transfer Availability offers as one Player."""
     if opportunity_type != "player_transfer_availability":
         return True
+    candidate_body = "; ".join(_transfer_directional_clauses(body, opportunity_type))
+    normalized_body = candidate_body.casefold()
     multiple_position_terms = re.search(
         r"\b(?:goalkeeper|defender|midfielder|forward|striker|"
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
@@ -16158,7 +16279,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
         r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
         r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b",
-        body.casefold(),
+        normalized_body,
     )
     explicit_multiple_players = re.search(
         r"\b(?:a|an|one)\s+\w+(?:\s+\w+){0,2}\s+(?:and|plus)\s+"
@@ -16170,7 +16291,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"(?:a|an|one|un|una|un|une|один|одна)\s+\w+|"
         r"\b(?:another|otro|otra|un\s+autre|une\s+autre|ещё\s+один|"
         r"еще\s+один)\s+\w+",
-        body.casefold(),
+        normalized_body,
     )
     plural_position_or_count = re.search(
         r"\b(?:\d+|two|three|four|five|several|multiple|many|"
@@ -16190,14 +16311,14 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"porteros|defensas|centrocampistas|delanteros|futbolistas|"
         r"compañeros|gardiens|défenseurs|milieux|attaquants|"
         r"footballeurs|coéquipiers)\b",
-        body.casefold(),
+        normalized_body,
     )
     named_multiple_players = re.search(
         r"\b[A-ZА-ЯЁ][\w'’-]+\s+(?:and|&|y|et|и)\s+"
         r"[A-ZА-ЯЁ][\w'’-]+\b|"
         r"\b[A-ZА-ЯЁ][\w'’-]+\s*[,;/]\s*"
         r"[A-ZА-ЯЁ][\w'’-]+\b",
-        body,
+        candidate_body,
     )
     return (
         multiple_position_terms is None
@@ -16220,7 +16341,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
             r"deux\s+(?:joueur\w*|footballeur\w*)|"
             r"groupe\s+de\s+(?:joueur\w*|footballeur\w*)|"
             r"groupe\s+de\s+coéquipier\w*)\b",
-            body.casefold(),
+            normalized_body,
         )
         is None
     )
