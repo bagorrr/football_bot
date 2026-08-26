@@ -114,6 +114,7 @@ class _ApplicationResponsesTransport:
                 },
             },
             "effective_model": "gpt-5.6-sol",
+            "effective_reasoning_effort": "high",
             "input_tokens": 12,
             "output_tokens": 8,
             "duration_ms": 4,

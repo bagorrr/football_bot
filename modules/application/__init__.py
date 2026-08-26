@@ -13982,7 +13982,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
     if (
         not isinstance(attempt_number, int)
         or isinstance(attempt_number, bool)
-        or attempt_number < 1
+        or not 1 <= attempt_number <= 3
     ):
         return False
     prompt_version = (

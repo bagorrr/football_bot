@@ -155,7 +155,9 @@ class ResponsesClassifierAdapter:
         return ClassifierAdapterResult(
             output=cast(dict[str, JsonValue], output),
             effective_model=str(response.get("effective_model", "")),
-            effective_reasoning_effort="high",
+            effective_reasoning_effort=str(
+                response.get("effective_reasoning_effort", "")
+            ),
             codex_version="not_applicable",
             adapter_kind=self.adapter_kind,
             adapter_version=self._adapter_version,
