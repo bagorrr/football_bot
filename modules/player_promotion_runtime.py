@@ -705,6 +705,17 @@ CONTROLLED_LIFECYCLE_BODY = (
     "Open match in Saint Petersburg on 2026-12-01. Need one place. "
     "Contact @controlled_open_match."
 )
+CONTROLLED_COSMETIC_EDIT_BODY = (
+    "⚽ Open match in Saint Petersburg on 2026-12-01.   Need one place. "
+    "Contact @controlled_open_match. ⚽"
+)
+CONTROLLED_MATERIAL_EDIT_BODY = (
+    "Open match in Saint Petersburg on 2026-12-02. Need one place. "
+    "Contact @controlled_open_match."
+)
+CONTROLLED_REJECTED_MATERIAL_EDIT_BODY = (
+    "This edited source message is unrelated to a football match."
+)
 CONTROLLED_COMPOUND_BODY = (
     "Two open matches in Saint Petersburg on 2026-12-01. "
     "Need one place for each. "
@@ -1255,8 +1266,8 @@ def _output_for_operation(
     if kind == "failure":
         return _provider_review_response()
     if kind in {"route", "create", "edit", "repost", "reply", "publication"}:
-        if kind == "create" and operation.get("accepted") is not True:
-            return _provider_review_response()
+        if kind == "edit" and body == CONTROLLED_REJECTED_MATERIAL_EDIT_BODY:
+            return _provider_review_response(reason_code="irrelevant")
         if kind == "publication" and operation.get("promotion_approved") is not True:
             return _provider_review_response()
         if kind == "reply" and operation.get("eligible_reply") is not True:
@@ -1363,7 +1374,13 @@ class DurableAcceptanceProbe:
             body = (
                 source_override
                 if kind
-                in {"repost", "repost_replay", "repost_delete", "repost_moderation"}
+                in {
+                    "edit",
+                    "repost",
+                    "repost_replay",
+                    "repost_delete",
+                    "repost_moderation",
+                }
                 and isinstance(source_override, str)
                 else _operation_body(case_id, operation_number, kind)
             )
@@ -2052,6 +2069,149 @@ def _operation_source(operation: dict[str, JsonValue], body: str) -> str:
     return source if isinstance(source, str) else body
 
 
+def _edit_durable_metrics(
+    probe: DurableAcceptanceProbe,
+    *,
+    first_revision_id: str,
+    second_revision_id: str,
+    first_snapshot: dict[str, JsonValue],
+    second_snapshot: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Derive edit assertions from the persisted source and cluster state."""
+    before_exact = first_snapshot.get("exact_repost")
+    after_exact = second_snapshot.get("exact_repost")
+    if not isinstance(before_exact, dict) or not isinstance(after_exact, dict):
+        raise RuntimeError("edit probe did not persist exact-repost observations")
+    before_clusters = before_exact.get("clusters")
+    after_clusters = after_exact.get("clusters")
+    if not isinstance(before_clusters, list) or len(before_clusters) != 1:
+        raise RuntimeError("edit probe did not create its initial exact-repost cluster")
+    if not isinstance(after_clusters, list):
+        raise RuntimeError("edit probe exact-repost state is incomplete")
+    before_cluster = _json_object(
+        before_clusters[0], description="initial edit exact-repost cluster"
+    )
+    old_cluster_id = before_cluster.get("exact_repost_cluster_id")
+    if not isinstance(old_cluster_id, str):
+        raise RuntimeError("edit probe initial cluster identity is invalid")
+
+    def members(cluster: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+        value = cluster.get("members")
+        if not isinstance(value, list) or not all(
+            isinstance(item, dict) for item in value
+        ):
+            raise RuntimeError("edit probe exact-repost members are incomplete")
+        return cast(list[dict[str, JsonValue]], value)
+
+    old_after = next(
+        (
+            _json_object(item, description="edited old exact-repost cluster")
+            for item in after_clusters
+            if isinstance(item, dict)
+            and item.get("exact_repost_cluster_id") == old_cluster_id
+        ),
+        None,
+    )
+    if old_after is None:
+        raise RuntimeError("edit probe lost the historical exact-repost cluster")
+    old_members = members(old_after)
+    source_message_id = _source_id_from_revision(second_revision_id)
+    current_cluster = next(
+        (
+            _json_object(item, description="edited current exact-repost cluster")
+            for item in after_clusters
+            if isinstance(item, dict)
+            and any(
+                member.get("source_message_id") == source_message_id
+                for member in members(_json_object(item, description="cluster"))
+            )
+        ),
+        None,
+    )
+    current_member = next(
+        (
+            member
+            for member in (members(current_cluster) if current_cluster else ())
+            if member.get("source_message_id") == source_message_id
+        ),
+        None,
+    )
+    first_ids = set(cast(list[JsonValue], first_snapshot["opportunity_ids"]))
+    second_ids = set(cast(list[JsonValue], second_snapshot["opportunity_ids"]))
+    current_opportunity = next(
+        (
+            opportunity
+            for opportunity in probe.system.opportunities()
+            if opportunity.opportunity_id in second_ids
+            and opportunity.source_message_revision_id == second_revision_id
+        ),
+        None,
+    )
+    historical_revision_ids = {
+        item.source_message_revision_id
+        for item in probe.system.source_message_revisions()
+    }
+    current_cluster_id = (
+        current_cluster.get("exact_repost_cluster_id")
+        if current_cluster is not None
+        else None
+    )
+    new_cluster_member_count = sum(
+        len(members(_json_object(item, description="edited cluster")))
+        for item in after_clusters
+        if isinstance(item, dict)
+        and item.get("exact_repost_cluster_id") != old_cluster_id
+    )
+    return {
+        "previous": "suppressed" if first_ids & second_ids else "active",
+        "current": second_snapshot["publication_state"],
+        "identity_reused": bool(first_ids & second_ids),
+        "cluster_count": after_exact["cluster_count"],
+        "member_count": after_exact["member_count"],
+        "representative_count": after_exact["representative_count"],
+        "publication_state": (
+            current_cluster["publication_state"]
+            if current_cluster is not None
+            else old_after["publication_state"]
+        ),
+        "projection_consistent": after_exact["projection_consistent"],
+        "historical_revision_preserved": (
+            first_revision_id in historical_revision_ids
+            and second_revision_id in historical_revision_ids
+        ),
+        "current_member_revision_matches": (
+            current_member is not None
+            and current_member.get("source_message_revision_id") == second_revision_id
+        ),
+        "membership_retained": current_member is not None,
+        "membership_removed_from_old_cluster": not any(
+            member.get("source_message_id") == source_message_id
+            for member in old_members
+        ),
+        "old_cluster_member_count": len(old_members),
+        "new_cluster_member_count": new_cluster_member_count,
+        "old_cluster_empty": not old_members,
+        "key_unchanged": current_cluster_id == old_cluster_id,
+        "freshness_renewed": bool(
+            current_member is not None
+            and current_cluster is not None
+            and current_cluster.get("freshness_renewed") is True
+        ),
+        "current_publication_reason": (
+            current_opportunity.publication_reason
+            if current_opportunity is not None
+            else None
+        ),
+        "current_representative_is_current": bool(
+            current_cluster is not None
+            and current_cluster.get("representative_source_message_id")
+            == source_message_id
+            and current_cluster.get("representative_source_message_revision_id")
+            == second_revision_id
+        ),
+    }
+
+
 def _proposal_is_source_bound(snapshot: dict[str, JsonValue], *, source: str) -> bool:
     output = snapshot.get("proposal_output")
     if not isinstance(output, dict):
@@ -2201,10 +2361,14 @@ def execute_lifecycle_case(
             )
             actual = snapshot.get("publication_state") == "active"
         elif kind == "edit":
+            first_body = CONTROLLED_LIFECYCLE_BODY
+            probe.clock.advance_to(datetime(2026, 8, 18, 9, 6, tzinfo=UTC))
             first_id, first_snapshot = probe.source_event(
-                body=body,
+                body=first_body,
                 operation_number=operation_number,
                 revision=1,
+                source_publisher_id="publisher:one",
+                event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
                 process=True,
             )
             message_id = next(
@@ -2217,24 +2381,31 @@ def execute_lifecycle_case(
             )
             if message_id is None:
                 raise RuntimeError("edit setup did not persist its creation")
+            probe.clock.advance_to(datetime(2026, 8, 18, 9, 8, tzinfo=UTC))
+            edit_publisher = operation.get("source_publisher_id")
             second_id, second_snapshot = probe.source_event(
-                body=body,
+                body=source,
                 operation_number=operation_number,
                 revision=2,
                 telegram_message_id=message_id,
                 kind=SourceEventKind.EDIT,
+                source_publisher_id=(
+                    edit_publisher
+                    if isinstance(edit_publisher, str)
+                    else "publisher:one"
+                ),
+                event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
                 process=True,
             )
             if first_id is None or second_id is None:
                 raise RuntimeError("edit setup did not persist its edit")
-            first_ids = set(cast(list[JsonValue], first_snapshot["opportunity_ids"]))
-            second_ids = set(cast(list[JsonValue], second_snapshot["opportunity_ids"]))
-            identity_reused = bool(first_ids & second_ids)
-            actual = {
-                "previous": "suppressed" if identity_reused else "active",
-                "current": second_snapshot["publication_state"],
-                "identity_reused": identity_reused,
-            }
+            actual = _edit_durable_metrics(
+                probe,
+                first_revision_id=first_id,
+                second_revision_id=second_id,
+                first_snapshot=first_snapshot,
+                second_snapshot=second_snapshot,
+            )
             snapshot = second_snapshot
             revision_id = second_id
         elif kind == "delete":

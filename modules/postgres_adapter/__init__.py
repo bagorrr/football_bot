@@ -5026,6 +5026,9 @@ class PostgresRoleStore:
         source_suppression_guard = ""
         if incoming.idempotency_key.startswith(
             "opportunity-publication-source-suppression:"
+        ) or (
+            payload.get("publication_state") == "suppressed"
+            and payload.get("publication_reason") == "source_revision_superseded"
         ):
             source_suppression_guard = """
                           AND recommendation_opportunities.publication_state <>
@@ -9107,7 +9110,7 @@ def _reconcile_exact_repost_cluster(
         or bool(changes)
     )
     transition_revision = cluster[6]
-    if cluster_changed and changes:
+    if cluster_changed:
         transition_revision += 1
     connection.execute(
         """
@@ -9327,6 +9330,102 @@ def _reconcile_exact_repost_for_opportunity(
     return tuple(outgoings), current_state, current_reason, transition_revision or None
 
 
+def _remove_stale_exact_repost_members_for_source_message(
+    connection: psycopg.Connection[Any],
+    *,
+    exact_repost_cluster_id: str,
+    source_message_id: str,
+) -> bool:
+    """Remove members whose current Source Message no longer proves the key.
+
+    A Source Message edit creates a new immutable revision before the
+    classifier gets a chance to publish a replacement.  Re-election must not
+    turn that pending revision into a member of the old cluster: the cluster
+    key is evidence about the revision that was accepted into it.  Deletion
+    remains a separate lifecycle because its historical member is needed for
+    ``source_deleted`` fallback.
+    """
+    cluster = connection.execute(
+        """
+        SELECT source_chat_reference, source_publisher_id, normalized_body,
+               resolved_event_date
+        FROM football_runtime.application_exact_repost_clusters
+        WHERE exact_repost_cluster_id = %s
+        FOR UPDATE
+        """,
+        (exact_repost_cluster_id,),
+    ).fetchone()
+    if cluster is None:
+        return False
+    current = connection.execute(
+        """
+        SELECT source.tombstoned, revision.body, revision.bounded_metadata
+        FROM football_runtime.source_messages AS source
+        JOIN football_runtime.source_message_revisions AS revision
+          ON revision.source_message_id = source.source_message_id
+         AND revision.revision = source.current_revision
+        WHERE source.source_message_id = %s
+        FOR UPDATE OF source
+        """,
+        (source_message_id,),
+    ).fetchone()
+    if current is None or current[0]:
+        # Keep the historical member so the existing deletion fallback can
+        # mark it source_deleted and re-elect a surviving source.
+        return False
+
+    current_body = current[1]
+    current_metadata = current[2]
+    current_publisher_id = (
+        source_publisher_id_from_metadata(current_metadata)
+        if isinstance(current_metadata, Mapping)
+        else None
+    )
+    current_normalized_body = (
+        normalize_exact_repost_text(current_body)
+        if isinstance(current_body, str)
+        else ""
+    )
+    current_source_chat_reference = _exact_repost_source_chat_reference(
+        source_message_id
+    )
+    stale = (
+        current_source_chat_reference != cluster[0]
+        or current_publisher_id != cluster[1]
+        or current_normalized_body != cluster[2]
+        or not current_normalized_body
+    )
+    if not stale:
+        accepted_fact_rows = connection.execute(
+            """
+            SELECT opportunity.accepted_facts
+            FROM football_runtime.application_exact_repost_cluster_members AS member
+            JOIN football_runtime.application_opportunities AS opportunity
+              ON opportunity.opportunity_id = member.opportunity_id
+            WHERE member.exact_repost_cluster_id = %s
+              AND member.source_message_id = %s
+            FOR UPDATE OF member, opportunity
+            """,
+            (exact_repost_cluster_id, source_message_id),
+        ).fetchall()
+        stale = not accepted_fact_rows or any(
+            not isinstance(row[0], Mapping)
+            or _exact_repost_resolved_event_date(row[0]) != cluster[3]
+            for row in accepted_fact_rows
+        )
+    if not stale:
+        return False
+    connection.execute(
+        """
+        DELETE FROM football_runtime.application_exact_repost_cluster_members
+        WHERE exact_repost_cluster_id = %s
+          AND source_message_id = %s
+        """,
+        (exact_repost_cluster_id, source_message_id),
+    )
+    return True
+
+
 def _reconcile_exact_repost_clusters_for_source_message(
     connection: psycopg.Connection[Any],
     *,
@@ -9349,6 +9448,11 @@ def _reconcile_exact_repost_clusters_for_source_message(
     )
     outgoings: list[ContractEnvelope] = []
     for cluster_id in cluster_ids:
+        _remove_stale_exact_repost_members_for_source_message(
+            connection,
+            exact_repost_cluster_id=cluster_id,
+            source_message_id=source_message_id,
+        )
         changes, transition_revision = _reconcile_exact_repost_cluster(
             connection,
             exact_repost_cluster_id=cluster_id,

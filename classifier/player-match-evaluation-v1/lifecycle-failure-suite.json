@@ -1,5 +1,5 @@
 {
-  "suite_version": "player-match-lifecycle-failure-v6",
+  "suite_version": "player-match-lifecycle-failure-v7",
   "status": "reviewed",
   "scope": "Specification #38 executable controlled lifecycle and failure testing",
   "families": [
@@ -130,27 +130,132 @@
       "operations": [
         {
           "kind": "create",
-          "revision": "r1",
-          "accepted": true,
           "expected": true
         },
         {
           "kind": "edit",
-          "previous_revision": "r1",
-          "current_revision": "r2",
-          "same_identity": true,
+          "source": "⚽ Open match in Saint Petersburg on 2026-12-01.   Need one place. Contact @controlled_open_match. ⚽",
           "expected": {
             "previous": "suppressed",
             "current": "active",
-            "identity_reused": true
+            "identity_reused": true,
+            "cluster_count": 1,
+            "member_count": 1,
+            "representative_count": 1,
+            "publication_state": "active",
+            "projection_consistent": true,
+            "historical_revision_preserved": true,
+            "current_member_revision_matches": true,
+            "membership_retained": true,
+            "membership_removed_from_old_cluster": false,
+            "old_cluster_member_count": 1,
+            "new_cluster_member_count": 0,
+            "old_cluster_empty": false,
+            "key_unchanged": true,
+            "freshness_renewed": true,
+            "current_publication_reason": null,
+            "current_representative_is_current": true
           }
         },
         {
           "kind": "delete",
-          "revision": "r2",
           "expected": {
             "publication_state": "suppressed",
             "body_retained": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "material-body-edit-without-reclassification",
+      "family": "edits",
+      "operations": [
+        {
+          "kind": "edit",
+          "source": "This edited source message is unrelated to a football match.",
+          "expected": {
+            "previous": "suppressed",
+            "current": "suppressed",
+            "identity_reused": true,
+            "cluster_count": 1,
+            "member_count": 0,
+            "representative_count": 0,
+            "publication_state": "suppressed",
+            "projection_consistent": true,
+            "historical_revision_preserved": true,
+            "current_member_revision_matches": false,
+            "membership_retained": false,
+            "membership_removed_from_old_cluster": true,
+            "old_cluster_member_count": 0,
+            "new_cluster_member_count": 0,
+            "old_cluster_empty": true,
+            "key_unchanged": false,
+            "freshness_renewed": false,
+            "current_publication_reason": "source_revision_superseded",
+            "current_representative_is_current": false
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "visible-publisher-edit-reconciles-cluster",
+      "family": "edits",
+      "operations": [
+        {
+          "kind": "edit",
+          "source": "Open match in Saint Petersburg on 2026-12-01. Need one place. Contact @controlled_open_match.",
+          "source_publisher_id": "publisher:two",
+          "expected": {
+            "previous": "suppressed",
+            "current": "active",
+            "identity_reused": true,
+            "cluster_count": 2,
+            "member_count": 1,
+            "representative_count": 1,
+            "publication_state": "active",
+            "projection_consistent": true,
+            "historical_revision_preserved": true,
+            "current_member_revision_matches": true,
+            "membership_retained": true,
+            "membership_removed_from_old_cluster": true,
+            "old_cluster_member_count": 0,
+            "new_cluster_member_count": 1,
+            "old_cluster_empty": true,
+            "key_unchanged": false,
+            "freshness_renewed": true,
+            "current_publication_reason": null,
+            "current_representative_is_current": true
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "resolved-date-edit-reconciles-cluster",
+      "family": "edits",
+      "operations": [
+        {
+          "kind": "edit",
+          "source": "Open match in Saint Petersburg on 2026-12-02. Need one place. Contact @controlled_open_match.",
+          "expected": {
+            "previous": "suppressed",
+            "current": "active",
+            "identity_reused": true,
+            "cluster_count": 2,
+            "member_count": 1,
+            "representative_count": 1,
+            "publication_state": "active",
+            "projection_consistent": true,
+            "historical_revision_preserved": true,
+            "current_member_revision_matches": true,
+            "membership_retained": true,
+            "membership_removed_from_old_cluster": true,
+            "old_cluster_member_count": 0,
+            "new_cluster_member_count": 1,
+            "old_cluster_empty": true,
+            "key_unchanged": false,
+            "freshness_renewed": true,
+            "current_publication_reason": null,
+            "current_representative_is_current": true
           }
         }
       ]

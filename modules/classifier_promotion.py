@@ -27,7 +27,7 @@ from modules.contracts import JsonValue
 
 PLAYER_CLASSIFIER_RELEASE_NAME = "player-match-evaluation-v1"
 PLAYER_REVIEWED_CORPUS_CASE_COUNT = 38
-PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT = 15
+PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT = 18
 PLAYER_REQUIRED_REPLAYS = 3
 PLAYER_REQUESTED_MODEL = "gpt-5.6-sol"
 PLAYER_REQUESTED_REASONING_EFFORT = "high"
@@ -134,6 +134,37 @@ _REPOST_OPERATION_FIELDS = {
     "repost_replay": frozenset({"kind", "expected"}),
     "repost_delete": frozenset({"kind", "expected"}),
     "repost_moderation": frozenset({"kind", "decision", "expected"}),
+}
+_EDIT_EXPECTED_FIELDS = frozenset(
+    {
+        "previous",
+        "current",
+        "identity_reused",
+        "cluster_count",
+        "member_count",
+        "representative_count",
+        "publication_state",
+        "projection_consistent",
+        "historical_revision_preserved",
+        "current_member_revision_matches",
+        "membership_retained",
+        "membership_removed_from_old_cluster",
+        "old_cluster_member_count",
+        "new_cluster_member_count",
+        "old_cluster_empty",
+        "key_unchanged",
+        "freshness_renewed",
+        "current_publication_reason",
+        "current_representative_is_current",
+    }
+)
+_EDIT_OPERATION_FIELDS = {
+    "create": frozenset({"kind", "expected"}),
+    "edit": frozenset({"kind", "source", "expected"}),
+    "edit_with_publisher": frozenset(
+        {"kind", "source", "source_publisher_id", "expected"}
+    ),
+    "delete": frozenset({"kind", "expected"}),
 }
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -416,6 +447,29 @@ def _validate_suite_case(
                     raise ValueError(f"{case_id} repost moderation decision is invalid")
             if frozenset(expected) != _REPOST_EXPECTED_FIELDS[expected_key]:
                 raise ValueError(f"{case_id} repost expectation is not semantic")
+        elif family == "edits":
+            if kind not in {"create", "edit", "delete"}:
+                raise ValueError(f"{case_id} has an unsupported edit operation")
+            if kind == "edit":
+                expected = _json_object(
+                    operation.get("expected"), description=f"{case_id} edit expected"
+                )
+                expected_fields = _EDIT_EXPECTED_FIELDS
+                operation_fields = (
+                    "edit_with_publisher"
+                    if "source_publisher_id" in operation
+                    else "edit"
+                )
+            elif kind == "create":
+                expected_fields = None
+                operation_fields = "create"
+            else:
+                expected_fields = None
+                operation_fields = "delete"
+            if frozenset(operation) != _EDIT_OPERATION_FIELDS[operation_fields]:
+                raise ValueError(f"{case_id} accepts no caller-supplied edit labels")
+            if expected_fields is not None and frozenset(expected) != expected_fields:
+                raise ValueError(f"{case_id} edit expectation is not semantic")
         operations.append(operation)
     return case_id, family, tuple(operations)
 
@@ -698,7 +752,10 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
         not isinstance(raw_suite_cases, list)
         or len(raw_suite_cases) != PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT
     ):
-        raise ValueError("Lifecycle/failure suite must contain all 15 lifecycle cases")
+        raise ValueError(
+            "Lifecycle/failure suite must contain all "
+            f"{PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT} lifecycle cases"
+        )
     lifecycle_cases: list[dict[str, JsonValue]] = []
     lifecycle_ids: set[str] = set()
     lifecycle_families: set[str] = set()
