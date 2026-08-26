@@ -962,6 +962,49 @@ class PostgresAcceptanceObserver:
             for row in rows
         )
 
+    def classification_proposals_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe the real Application-bound proposal for one revision.
+
+        This is an administrative observation seam.  It deliberately returns
+        the serialized contract emitted by Classification rather than a copy
+        assembled from a fixture or from the classification-attempt table.
+        """
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'ClassificationProposal'
+                  AND payload ->> 'source_message_revision_id' = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (source_message_revision_id,),
+            ).fetchall()
+        return tuple(_row_to_envelope(row) for row in rows)
+
+    def classifier_commands_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe durable Classification commands for one revision."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM football_runtime.contract_outbox
+                WHERE contract_name = 'ClassifySourceMessageRevision'
+                  AND payload ->> 'source_message_revision_id' = %s
+                ORDER BY recorded_at, message_id
+                """,
+                (source_message_revision_id,),
+            ).fetchall()
+        return tuple(_row_to_envelope(row) for row in rows)
+
     def classification_queue_health(
         self, observed_at: datetime
     ) -> ClassificationQueueHealth:

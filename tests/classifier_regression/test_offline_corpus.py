@@ -1,4 +1,4 @@
-"""Deterministic, credential-free classifier regression gate."""
+"""Deterministic controlled classifier regression gate."""
 
 # ruff: noqa: RUF001 -- reviewed multilingual evidence is intentional.
 
@@ -512,7 +512,7 @@ def test_player_promotion_validates_candidate_type_and_every_classifier_fact(
             source_revision_id=source_revision_id,
             execution_id=execution_id,
         )
-        if "судья" in source.casefold():
+        if "воскресень" in source.casefold():
             facts = cast(dict[str, JsonValue], record["observed_facts"])
             normalized = cast(dict[str, JsonValue], facts["normalized"])
             normalized["weekday"] = "monday"
@@ -520,7 +520,7 @@ def test_player_promotion_validates_candidate_type_and_every_classifier_fact(
 
     monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_facts)
     fact_gate = run_player_classifier_promotion_gate(release)
-    assert "sm-026:annotation" in fact_gate.failed_case_ids
+    assert "sm-026:candidate-facts" in fact_gate.failed_case_ids
 
     def change_evidence(
         classifier: ControlledPlayerClassifierAdapter,
@@ -609,10 +609,11 @@ def test_player_classifier_execution_is_raw_source_bound_and_traced() -> None:
     trace = cast(dict[str, JsonValue], execution["trace"])
     assert trace["input_source_sha256"]
     assert trace["stages"] == [
-        "source_signals",
-        "controlled_proposal",
+        "raw_source_request",
+        "controlled_model_transport",
+        "responses_schema_adapter",
         "schema_validation",
-        "application_adaptation",
+        "application_proposal_observation",
         "fail_closed_publication_check",
     ]
     assert execution["execution_id"] == "controlled-run-1"
@@ -620,12 +621,12 @@ def test_player_classifier_execution_is_raw_source_bound_and_traced() -> None:
     assert "recorded-observations.json" not in json.dumps(observation)
 
     changed_source = source.replace("кипер", "защитник")
-    changed = adapter.observe(
-        source=changed_source,
-        source_revision_id="controlled:sm-001:revision:2",
-        execution_id="controlled-run-1b",
-    )
-    assert changed["observed_facts"] != observation["observed_facts"]
+    with pytest.raises(RuntimeError, match="no raw response"):
+        adapter.observe(
+            source=changed_source,
+            source_revision_id="controlled:sm-001:revision:2",
+            execution_id="controlled-run-1b",
+        )
 
 
 def test_player_lifecycle_gate_detects_changed_expected_operation_and_publication() -> (

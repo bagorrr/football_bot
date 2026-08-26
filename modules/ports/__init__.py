@@ -1211,6 +1211,18 @@ class AcceptanceObserver(Protocol):
         """Observe durable classifier execution provenance."""
         ...
 
+    def classification_proposals_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe real ClassificationProposal contracts for one revision."""
+        ...
+
+    def classifier_commands_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe real classifier command contracts for one revision."""
+        ...
+
     def classification_queue_health(
         self, observed_at: datetime
     ) -> ClassificationQueueHealth:

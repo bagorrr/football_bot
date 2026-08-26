@@ -1,17 +1,28 @@
-"""Executable, version-bound promotion evidence for the Player classifier."""
+"""Version-bound promotion evidence for the Player classifier.
 
-# ruff: noqa: RUF001 -- reviewed multilingual polarity literals are intentional.
+The release loader in this module owns the reviewed contract.  Execution is
+delegated to :mod:`modules.player_promotion_runtime`, which runs the raw
+Responses transport and the durable Acceptance Spine.  Keeping the contract
+loader separate makes it impossible for the executable path to quietly turn
+the annotations into a classifier.
+"""
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
+from uuid import UUID, uuid4
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+import psycopg
+from psycopg import conninfo, sql
+
 from modules.contracts import JsonValue
 
 PLAYER_CLASSIFIER_RELEASE_NAME = "player-match-evaluation-v1"
@@ -20,8 +31,9 @@ PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT = 15
 PLAYER_REQUIRED_REPLAYS = 3
 PLAYER_REQUESTED_MODEL = "gpt-5.6-sol"
 PLAYER_REQUESTED_REASONING_EFFORT = "high"
-PLAYER_PROMOTION_EXECUTION_VERSION = "player-controlled-execution-v4"
-CONTROLLED_PLAYER_CLASSIFIER_VERSION = "player-controlled-classifier-v1"
+PLAYER_PROMOTION_EXECUTION_VERSION = "player-controlled-execution-v5"
+CONTROLLED_PLAYER_CLASSIFIER_VERSION = "player-controlled-classifier-v2"
+CONTROLLED_RESPONSE_FIXTURE_VERSION = "player-match-controlled-responses-v1"
 PLAYER_REQUIRED_FAILURE_MODES = (
     "schema_failure",
     "evidence_failure",
@@ -65,23 +77,35 @@ _ROUTING_REASONS = {
 }
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _FAILURE_EXECUTION_PATHS = {
-    "schema_failure": ("classifier.schema_validator", "schema_rejected"),
-    "evidence_failure": ("application.evidence_validator", "evidence_rejected"),
+    "schema_failure": (
+        "classifier.responses_schema_validator",
+        "schema_rejected",
+    ),
+    "evidence_failure": (
+        "application.semantic_evidence_validator",
+        "evidence_rejected",
+    ),
     "normalization_failure": (
         "application.normalization_validator",
         "normalization_rejected",
     ),
-    "timeout": ("classifier.timeout_boundary", "attempt_timed_out"),
-    "quota": ("classifier.quota_circuit", "quota_circuit_opened"),
+    "timeout": ("classifier.responses_transport_timeout", "attempt_timed_out"),
+    "quota": ("classifier.responses_quota_circuit", "quota_circuit_opened"),
     "authentication": (
-        "classifier.authentication_circuit",
+        "classifier.responses_authentication_circuit",
         "authentication_circuit_opened",
     ),
-    "worker_crash": ("classifier.worker_process", "worker_crash_recovered"),
-    "replay": ("application.replay_barrier", "replay_ignored"),
-    "rollback": ("promotion.rollback_boundary", "promotion_rolled_back"),
+    "worker_crash": (
+        "classification.worker_process_boundary",
+        "worker_crash_recovered",
+    ),
+    "replay": (
+        "application.classification_command_idempotency",
+        "replay_ignored",
+    ),
+    "rollback": ("postgres.transaction_boundary", "transaction_rolled_back"),
     "duplicate_delivery": (
-        "publication.idempotency_boundary",
+        "application.publication_idempotency",
         "duplicate_delivery_ignored",
     ),
 }
@@ -103,6 +127,8 @@ class PlayerClassifierRelease:
     reviewed_corpus_cases: tuple[dict[str, JsonValue], ...]
     controlled_classifier_path: str
     controlled_classifier_version: str
+    controlled_response_fixture_path: str
+    controlled_response_fixture_version: str
     lifecycle_failure_suite_path: str
     lifecycle_failure_suite_sha256: str
     lifecycle_failure_suite_version: str
@@ -120,7 +146,7 @@ class PlayerClassifierRelease:
 
 @dataclass(frozen=True, slots=True)
 class PlayerPromotionGateResult:
-    """The result of replaying every controlled release case."""
+    """The result of three complete process-isolated controlled executions."""
 
     release_fingerprint: str
     reviewed_case_count: int
@@ -138,7 +164,8 @@ class PlayerPromotionGateResult:
     @property
     def passed(self) -> bool:
         return (
-            self.reviewed_case_count == PLAYER_REVIEWED_CORPUS_CASE_COUNT
+            self.execution_version == PLAYER_PROMOTION_EXECUTION_VERSION
+            and self.reviewed_case_count == PLAYER_REVIEWED_CORPUS_CASE_COUNT
             and self.lifecycle_case_count == PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT
             and len(self.failure_mode_case_ids) == len(PLAYER_REQUIRED_FAILURE_MODES)
             and not self.failed_case_ids
@@ -205,10 +232,7 @@ def _expected_case_ids() -> tuple[str, ...]:
 
 
 def _validate_reviewed_case(
-    case: dict[str, JsonValue],
-    *,
-    index: int,
-    require_provenance: bool = False,
+    case: dict[str, JsonValue], *, index: int, require_provenance: bool = False
 ) -> None:
     expected_case_id = f"sm-{index:03d}"
     if case.get("case_id") != expected_case_id:
@@ -236,12 +260,10 @@ def _validate_reviewed_case(
     if not coverage:
         raise ValueError(f"{expected_case_id} has no review coverage")
     expected = _json_object(
-        case.get("expected"),
-        description=f"{expected_case_id} expected outcome",
+        case.get("expected"), description=f"{expected_case_id} expected outcome"
     )
     disposition = _text(
-        expected.get("disposition"),
-        description=f"{expected_case_id} disposition",
+        expected.get("disposition"), description=f"{expected_case_id} disposition"
     )
     if disposition not in _DISPOSITIONS:
         raise ValueError(f"{expected_case_id} has an unsupported disposition")
@@ -253,8 +275,7 @@ def _validate_reviewed_case(
     ):
         raise ValueError(f"{expected_case_id} has an invalid expected candidate count")
     reason_code = _text(
-        expected.get("reason_code"),
-        description=f"{expected_case_id} reason_code",
+        expected.get("reason_code"), description=f"{expected_case_id} reason_code"
     )
     if reason_code not in _ROUTING_REASONS:
         raise ValueError(f"{expected_case_id} has an unsupported routing reason")
@@ -264,17 +285,13 @@ def _validate_reviewed_case(
     )
     if disposition != "irrelevant" and not opportunity_types:
         raise ValueError(f"{expected_case_id} has no expected opportunity facts")
-    facts = _json_object(
-        expected.get("facts"),
-        description=f"{expected_case_id} facts",
-    )
+    facts = _json_object(expected.get("facts"), description=f"{expected_case_id} facts")
     if set(facts) != {"source_evidence", "normalized"}:
         raise ValueError(f"{expected_case_id} expected facts are not complete")
     if not _source_bound_map(facts.get("source_evidence"), source):
         raise ValueError(f"{expected_case_id} facts are not source-bound")
     normalized = _json_object(
-        facts.get("normalized"),
-        description=f"{expected_case_id} normalized facts",
+        facts.get("normalized"), description=f"{expected_case_id} normalized facts"
     )
     if not normalized or normalized.get("opportunity_types") != list(opportunity_types):
         raise ValueError(f"{expected_case_id} normalized facts are not exact")
@@ -284,7 +301,6 @@ def _validate_reviewed_case(
 
 
 def _annotation_view(case: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    """Return every annotation-bearing field shared by contract and corpus."""
     return {
         "case_id": case.get("case_id"),
         "coverage_families": case.get("coverage_families"),
@@ -369,6 +385,8 @@ def _release_fingerprint(
     suite_version: str,
     failure_mode_case_ids: tuple[str, ...],
     controlled_classifier_version: str,
+    controlled_response_fixture_path: str,
+    controlled_response_fixture_version: str,
     canonical_replay_digests: tuple[str, ...],
     required_artifacts: dict[str, JsonValue],
     required_case_families: tuple[str, ...],
@@ -383,6 +401,8 @@ def _release_fingerprint(
         "lifecycle_failure_suite_version": suite_version,
         "failure_mode_case_ids": list(failure_mode_case_ids),
         "controlled_classifier_version": controlled_classifier_version,
+        "controlled_response_fixture_path": controlled_response_fixture_path,
+        "controlled_response_fixture_version": controlled_response_fixture_version,
         "canonical_replay_digests": list(canonical_replay_digests),
         "required_artifacts": required_artifacts,
         "required_case_families": list(required_case_families),
@@ -433,7 +453,7 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
     if (
         promotion_gate.get("deterministic") is not True
         or promotion_gate.get("max_failures") != 0
-        or promotion_gate.get("adapter_kind") != "controlled_deterministic_pipeline"
+        or promotion_gate.get("adapter_kind") != "responses_api"
         or promotion_gate.get("requested_model") != PLAYER_REQUESTED_MODEL
         or promotion_gate.get("requested_reasoning_effort")
         != PLAYER_REQUESTED_REASONING_EFFORT
@@ -441,6 +461,9 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
         or promotion_gate.get("real_source_publication_allowed") is not False
         or promotion_gate.get("executes_reviewed_corpus") is not True
         or promotion_gate.get("executes_lifecycle_failure_suite") is not True
+        or promotion_gate.get("controlled_transport") is not True
+        or promotion_gate.get("fresh_durable_state_per_case") is not True
+        or promotion_gate.get("process_isolated_replays") is not True
     ):
         raise ValueError("Player promotion policy is not fail-closed")
     required_replays = promotion_gate.get("required_replays")
@@ -537,13 +560,27 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
         controlled_reference.get("version"),
         description="controlled classifier version",
     )
+    fixture_path = _text(
+        controlled_reference.get("fixture_path"),
+        description="controlled response fixture path",
+    )
+    fixture_version = _text(
+        controlled_reference.get("fixture_version"),
+        description="controlled response fixture version",
+    )
     if (
-        controlled_reference.get("adapter_kind") != "controlled_deterministic_pipeline"
+        controlled_reference.get("adapter_kind") != "responses_api"
         or controlled_reference.get("case_count") != PLAYER_REVIEWED_CORPUS_CASE_COUNT
         or controlled_reference.get("observations_are_independent") is not True
         or controlled_path
-        != "modules/classifier_promotion.py:ControlledPlayerClassifierAdapter"
+        != "modules/player_promotion_runtime.py:ControlledPlayerClassifierAdapter"
         or controlled_version != CONTROLLED_PLAYER_CLASSIFIER_VERSION
+        or fixture_path
+        != "classifier/player-match-evaluation-v1/controlled-model-responses.json"
+        or fixture_version != CONTROLLED_RESPONSE_FIXTURE_VERSION
+        or not _resolved_repository_path(
+            fixture_path, description="fixture path"
+        ).is_file()
     ):
         raise ValueError("Controlled classifier contract is not independent")
 
@@ -632,6 +669,8 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
         suite_version=suite_version,
         failure_mode_case_ids=tuple(failure_ids),
         controlled_classifier_version=controlled_version,
+        controlled_response_fixture_path=fixture_path,
+        controlled_response_fixture_version=fixture_version,
         canonical_replay_digests=canonical,
         required_artifacts=required_artifacts,
         required_case_families=required_case_families,
@@ -650,6 +689,8 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
         reviewed_corpus_cases=tuple(corpus_cases),
         controlled_classifier_path=controlled_path,
         controlled_classifier_version=controlled_version,
+        controlled_response_fixture_path=fixture_path,
+        controlled_response_fixture_version=fixture_version,
         lifecycle_failure_suite_path=suite_path,
         lifecycle_failure_suite_sha256=suite_digest,
         lifecycle_failure_suite_version=suite_version,
@@ -666,1709 +707,436 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class _ControlledProposal:
-    """The output of the independent raw-message controlled classifier."""
+# This is the production-path adapter, not an annotation or a parser.  It is
+# re-exported here for the established test/import surface.
+from modules.player_promotion_runtime import (  # noqa: E402
+    ControlledPlayerClassifierAdapter,
+    DurableAcceptanceProbe,
+    _release_binding,
+    canonical_replay_digest,
+    compare_failure_observation,
+    compare_lifecycle_observation,
+    compare_recorded_observation,
+    execute_failure_case,
+    execute_lifecycle_case,
+    run_replay_worker,
+)
 
-    disposition: str
-    reason_code: str
-    required_context: str
-    opportunity_types: tuple[str, ...]
-    source_evidence: dict[str, JsonValue]
-    normalized: dict[str, JsonValue]
+__all__ = [
+    "ControlledPlayerClassifierAdapter",
+    "DurableAcceptanceProbe",
+    "canonical_replay_digest",
+    "compare_failure_observation",
+    "compare_lifecycle_observation",
+    "compare_recorded_observation",
+    "execute_failure_case",
+    "execute_lifecycle_case",
+    "run_replay_worker",
+]
 
-
-def _source_fragment(source: str, pattern: str) -> str:
-    match = re.search(pattern, source, flags=re.IGNORECASE)
-    if match is None:
-        raise ValueError(
-            f"controlled classifier could not bind source fragment: {pattern}"
-        )
-    return match.group(0)
-
-
-def _normalized_format(source: str) -> str:
-    value = _source_fragment(source, r"\b\d+\s*[xх:]\s*\d+\b")
-    left, right = re.split(r"\s*[xх:]\s*", value, maxsplit=1, flags=re.IGNORECASE)
-    return f"{left}x{right}"
-
-
-def _controlled_proposal(source: str) -> _ControlledProposal:
-    """Classify raw corpus text through an independent deterministic pipeline.
-
-    This is a credential-free model-evaluation substitute, not the production
-    classifier and not an annotation lookup.  It performs source signal
-    extraction, a bounded proposal decision, and application-shaped
-    normalization so the promotion gate can execute without live model calls.
-    """
-    normalized_source = source.casefold()
-
-    if source.strip() == "?":
-        return _ControlledProposal(
-            "irrelevant",
-            "irrelevant",
-            "none",
-            (),
-            {"malformed": _source_fragment(source, r"\?")},
-            {"opportunity_types": [], "scope": "malformed"},
-        )
-    if "детск" in normalized_source and "турнир" in normalized_source:
-        return _ControlledProposal(
-            "irrelevant",
-            "irrelevant",
-            "none",
-            (),
-            {"scope": _source_fragment(source, r"детск\w*\s+турнир")},
-            {"opportunity_types": [], "scope": "children_only"},
-        )
-    if "купить" in normalized_source and "футбольн" in normalized_source:
-        return _ControlledProposal(
-            "irrelevant",
-            "irrelevant",
-            "none",
-            (),
-            {
-                "equipment": _source_fragment(source, r"футбольн\w*\s+мяч"),
-                "request": _source_fragment(source, r"купить"),
-            },
-            {"opportunity_types": [], "scope": "equipment_purchase"},
-        )
-    if "женщина роковая" in normalized_source or "бухал" in normalized_source:
-        phrase = (
-            _source_fragment(source, r"женщина\s+роковая")
-            if "женщина роковая" in normalized_source
-            else _source_fragment(source, r"бухал")
-        )
-        return _ControlledProposal(
-            "irrelevant",
-            "irrelevant",
-            "none",
-            (),
-            {"off_topic": phrase},
-            {"opportunity_types": [], "scope": "off_topic"},
-        )
-    if "фола нет" in normalized_source:
-        return _ControlledProposal(
-            "irrelevant",
-            "irrelevant",
-            "none",
-            (),
-            {"football_context": _source_fragment(source, r"фола\s+нет")},
-            {"opportunity_types": [], "scope": "football_discussion"},
-        )
-
-    if "нужен судья" in normalized_source:
-        if "воскресень" in normalized_source:
-            return _ControlledProposal(
-                "unresolved",
-                "competing_interpretations",
-                "refined_prompt",
-                ("referee_request",),
-                {
-                    "request": _source_fragment(source, r"нужен\s+судья"),
-                    "schedule": _source_fragment(source, r"воскресень\w*"),
-                },
-                {
-                    "opportunity_types": ["referee_request"],
-                    "request_scope": "referee",
-                    "weekday": "sunday",
-                },
-            )
-        if "товарка" in normalized_source:
-            return _ControlledProposal(
-                "needs_review",
-                "needs_review",
-                "none",
-                ("referee_request",),
-                {
-                    "request": _source_fragment(
-                        source, r"нужен\s+судья\s+на\s+сегодня"
-                    ),
-                    "format": _source_fragment(source, r"товарка\s+8\s*[:xх:]\s*8"),
-                    "time": _source_fragment(source, r"21\s*[–-]\s*22:30"),
-                    "location": _source_fragment(source, r"\[LOCATION\]"),
-                },
-                {
-                    "opportunity_types": ["referee_request"],
-                    "request_scope": "referee",
-                    "team_format": "8x8",
-                    "event_time": "21–22:30",
-                    "location": "[LOCATION]",
-                },
-            )
-    if "могу судить" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("referee_availability",),
-            {
-                "availability": _source_fragment(source, r"могу\s+судить\s+матчи"),
-                "contact": _source_fragment(source, r"кому\s+надо"),
-            },
-            {
-                "opportunity_types": ["referee_availability"],
-                "availability": "referee",
-                "contact_route": "reply",
-            },
-        )
-
-    if (
-        "квалифицированного тренера" in normalized_source
-        and "постоянную основу" in normalized_source
-    ):
-        return _ControlledProposal(
-            "needs_second_pass",
-            "deterministic_ambiguity",
-            "adjacent_revisions",
-            ("coach_availability", "roster_vacancy"),
-            {
-                "time": _source_fragment(source, r"Сегодня\s+в\s+21:00"),
-                "coach": _source_fragment(source, r"квалифицированного\s+тренера"),
-                "payment": _source_fragment(source, r"Стоимость\s+\[AMOUNT\]"),
-            },
-            {
-                "opportunity_types": ["coach_availability", "roster_vacancy"],
-                "event_time": "21:00",
-                "time_horizon": "today",
-                "payment": "paid",
-            },
-        )
-    if "лицензированным тренером" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("coach_availability",),
-            {
-                "date": _source_fragment(source, r"\[DATE\]"),
-                "qualification": _source_fragment(
-                    source, r"лицензированным\s+тренером"
-                ),
-                "time": _source_fragment(source, r"19:00[–-]21:00"),
-                "location": _source_fragment(source, r"\[LOCATION\]"),
-            },
-            {
-                "opportunity_types": ["coach_availability"],
-                "event_time": "19:00–21:00",
-                "location": "[LOCATION]",
-                "payment": "free_trial",
-            },
-        )
-    if "тренировки по средам" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("coach_availability",),
-            {
-                "training": _source_fragment(source, r"приходите\s+на\s+тренировку"),
-                "schedule": _source_fragment(
-                    source, r"по\s+средам\s+с\s+21:30\s+до\s+23:00"
-                ),
-                "price": _source_fragment(source, r"\[AMOUNT\](?=\s+за\s+тренировку)"),
-            },
-            {
-                "opportunity_types": ["coach_availability"],
-                "event_time": "21:30–23:00",
-                "time_horizon": "recurring",
-                "payment": "paid",
-            },
-        )
-    if "требуется тренер" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("coach_request",),
-            {
-                "request": _source_fragment(source, r"требуется\s+тренер"),
-                "format": _source_fragment(source, r"11х11"),
-            },
-            {
-                "opportunity_types": ["coach_request"],
-                "team_format": "11x11",
-                "request_scope": "coach",
-            },
-        )
-    if "ищу тренера вратарей" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("coach_request",),
-            {
-                "request": _source_fragment(source, r"Ищу\s+тренера\s+вратарей"),
-                "mode": _source_fragment(source, r"индивидуальных\s+занятий"),
-                "alternative": _source_fragment(source, r"группе"),
-            },
-            {
-                "opportunity_types": ["coach_request"],
-                "position": "goalkeeper",
-                "request_scope": "coach",
-            },
-        )
-    if "ищем тренера" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("coach_request",),
-            {
-                "request": _source_fragment(source, r"Ищем\s+тренера"),
-                "context": _source_fragment(source, r"наш\s+уехал\s+с\s+концами"),
-            },
-            {
-                "opportunity_types": ["coach_request"],
-                "request_scope": "coach",
-            },
-        )
-
-    if "соперник" in normalized_source:
-        if "пятниц" in normalized_source:
-            return _ControlledProposal(
-                "needs_review",
-                "needs_review",
-                "none",
-                ("opponent_request",),
-                {
-                    "request": _source_fragment(source, r"ищем\s+соперника"),
-                    "schedule": _source_fragment(source, r"пятницу,\s*19:00"),
-                },
-                {
-                    "opportunity_types": ["opponent_request"],
-                    "weekday": "friday",
-                    "event_time": "19:00",
-                },
-            )
-        if "для товарищеского" in normalized_source:
-            return _ControlledProposal(
-                "unresolved",
-                "competing_interpretations",
-                "refined_prompt",
-                ("opponent_request",),
-                {
-                    "request": _source_fragment(source, r"Ищем\s+соперника"),
-                    "format": _source_fragment(source, r"8х8"),
-                },
-                {"opportunity_types": ["opponent_request"], "team_format": "8x8"},
-            )
-        return _ControlledProposal(
-            "needs_second_pass",
-            "deterministic_ambiguity",
-            "direct_reply",
-            ("opponent_request",),
-            {"request": _source_fragment(source, r"Ищем\s+соперников")},
-            {"opportunity_types": ["opponent_request"], "request_scope": "opponent"},
-        )
-
-    if "однодневный турнир" in normalized_source and "пару мест" in normalized_source:
-        return _ControlledProposal(
-            "needs_second_pass",
-            "deterministic_ambiguity",
-            "adjacent_revisions",
-            ("tournament", "open_match"),
-            {
-                "time": _source_fragment(source, r"Завтра\s+с\s+21:00\s+до\s+00:00"),
-                "team_opening": _source_fragment(
-                    source, r"одно\s+место\s+для\s+команды"
-                ),
-                "player_opening": _source_fragment(
-                    source, r"пару\s+мест\s+для\s+игроков"
-                ),
-            },
-            {
-                "opportunity_types": ["tournament", "open_match"],
-                "open_places": 2,
-                "time_horizon": "tomorrow",
-            },
-        )
-    if "чемпионат" in normalized_source or "донабор команд" in normalized_source:
-        evidence: dict[str, JsonValue]
-        normalized: dict[str, JsonValue]
-        if "донабор команд" in normalized_source:
-            evidence = {
-                "first_event": _source_fragment(
-                    source, r"однодневный\s+турнир\s+\[DATE\]"
-                ),
-                "second_event": _source_fragment(
-                    source, r"весеннее\s+первенство\s+по\s+футболу\s+5х5"
-                ),
-                "venue": _source_fragment(source, r"крытых\s+манежах"),
-            }
-            normalized = {
-                "opportunity_types": ["tournament"],
-                "team_format": "5x5",
-                "open_places": 3,
-                "surface": "covered_outdoor",
-            }
-        else:
-            evidence = {
-                "competition": _source_fragment(source, r"чемпионат\s+5х5"),
-                "surface": _source_fragment(source, r"на\s+газоне"),
-                "opening": _source_fragment(
-                    source, r"последнее\s+место\s+для\s+команды"
-                ),
-            }
-            normalized = {
-                "opportunity_types": ["tournament"],
-                "team_format": "5x5",
-                "surface": "natural_grass",
-                "open_places": 1,
-            }
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("tournament",),
-            evidence,
-            normalized,
-        )
-
-    if "на сегодня нужен" in normalized_source:
-        position = _source_fragment(source, r"кипер|защитник")
-        normalized_position = (
-            "goalkeeper" if position.casefold() == "кипер" else "outfield"
-        )
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("open_match",),
-            {
-                "position": position,
-                "event_time": _source_fragment(source, r"19:30"),
-                "location": _source_fragment(source, r"\[LOCATION\]"),
-            },
-            {
-                "opportunity_types": ["open_match"],
-                "position": normalized_position,
-                "open_places": 1,
-                "event_time": "19:30",
-                "location": "[LOCATION]",
-            },
-        )
-    if "сегодня на вечер нужен кипер" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("open_match",),
-            {
-                "position": _source_fragment(source, r"кипер"),
-                "time": _source_fragment(source, r"Сегодня\s+на\s+вечер"),
-                "contact": _source_fragment(source, r"го\s+лс"),
-            },
-            {
-                "opportunity_types": ["open_match"],
-                "position": "goalkeeper",
-                "time_horizon": "today_evening",
-                "open_places": 1,
-            },
-        )
-    if "нужен кипер" in normalized_source and "и 2 полевых" not in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("open_match",),
-            {
-                "request": _source_fragment(source, r"нужен\s+кипер"),
-                "time": _source_fragment(source, r"19:30"),
-                "location": _source_fragment(source, r"\[LOCATION\]"),
-            },
-            {
-                "opportunity_types": ["open_match"],
-                "position": "goalkeeper",
-                "event_time": "19:30",
-                "location": "[LOCATION]",
-            },
-        )
-
-    if "нужен кипер и 2 полевых" in normalized_source:
-        return _ControlledProposal(
-            "unresolved",
-            "competing_interpretations",
-            "refined_prompt",
-            ("open_match", "roster_vacancy"),
-            {
-                "goalkeeper": _source_fragment(source, r"кипер"),
-                "field_players": _source_fragment(source, r"2\s+полевых"),
-            },
-            {
-                "opportunity_types": ["open_match", "roster_vacancy"],
-                "positions": ["goalkeeper", "defender"],
-                "open_places": 3,
-                "time_horizon": "ambiguous",
-            },
-        )
-    if "ищем вратаря в команду" in normalized_source:
-        return _ControlledProposal(
-            "unresolved",
-            "competing_interpretations",
-            "refined_prompt",
-            ("open_match", "roster_vacancy"),
-            {
-                "position": _source_fragment(source, r"ищем\s+вратаря"),
-                "format": _source_fragment(source, r"8х8"),
-                "contact": _source_fragment(source, r"подробности\s+в\s+лс"),
-            },
-            {
-                "opportunity_types": ["open_match", "roster_vacancy"],
-                "position": "goalkeeper",
-                "team_format": "8x8",
-            },
-        )
-    if "постоянный вратарь" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("roster_vacancy",),
-            {
-                "position": _source_fragment(source, r"постоянный\s+вратарь"),
-                "schedule": _source_fragment(source, r"по\s+выходным"),
-                "format": _source_fragment(source, r"5х5"),
-            },
-            {
-                "opportunity_types": ["roster_vacancy"],
-                "position": "goalkeeper",
-                "team_format": "5x5",
-                "time_horizon": "recurring",
-            },
-        )
-    if "на сезон" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("roster_vacancy",),
-            {
-                "opening": _source_fragment(source, r"нужны\s+игроки"),
-                "season": _source_fragment(source, r"на\s+сезон"),
-                "contact": _source_fragment(source, r"пишите\s+в\s+лс"),
-            },
-            {
-                "opportunity_types": ["roster_vacancy"],
-                "time_horizon": "season",
-                "contact_route": "private_message",
-            },
-        )
-    if "ищу команду" in normalized_source:
-        if "[AGE]" in source:
-            return _ControlledProposal(
-                "unresolved",
-                "competing_interpretations",
-                "refined_prompt",
-                ("player_transfer_availability", "player_match_availability"),
-                {
-                    "position": _source_fragment(source, r"Вратарь"),
-                    "age": _source_fragment(source, r"\[AGE\]"),
-                    "format": _source_fragment(source, r"8х8"),
-                },
-                {
-                    "opportunity_types": [
-                        "player_transfer_availability",
-                        "player_match_availability",
-                    ],
-                    "position": "goalkeeper",
-                    "team_format": "8x8",
-                },
-            )
-        if "8х8" in source and "11х11" in source:
-            return _ControlledProposal(
-                "needs_review",
-                "needs_review",
-                "none",
-                ("player_transfer_availability",),
-                {
-                    "request": _source_fragment(source, r"ищу\s+команду\s+для\s+игры"),
-                    "formats": _source_fragment(source, r"8х8\s+и\s+11х11"),
-                    "experience": _source_fragment(source, r"большой\s+опыт\s+игры"),
-                },
-                {
-                    "opportunity_types": ["player_transfer_availability"],
-                    "position": "goalkeeper",
-                    "team_formats": ["8x8", "11x11"],
-                    "experience": "experienced",
-                },
-            )
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("player_transfer_availability",),
-            {
-                "request": _source_fragment(
-                    source, r"Ищу\s+команду\s+для\s+постоянных\s+игр"
-                ),
-                "position": _source_fragment(source, r"вратарь"),
-            },
-            {
-                "opportunity_types": ["player_transfer_availability"],
-                "position": "goalkeeper",
-                "time_horizon": "recurring",
-            },
-        )
-    if "требуется замена" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("open_match",),
-            {
-                "replacement": _source_fragment(source, r"Требуется\s+замена"),
-                "time": _source_fragment(source, r"19:30\s+до\s+21:00"),
-                "opening": _source_fragment(source, r"один\s+полевой\s+игрок"),
-            },
-            {
-                "opportunity_types": ["open_match"],
-                "open_places": 1,
-                "position": "outfield",
-                "event_time": "19:30–21:00",
-            },
-        )
-    if "поиграю" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("player_match_availability",),
-            {"availability": _source_fragment(source, r"Поиграю\s+сегодня\s+вечером")},
-            {
-                "opportunity_types": ["player_match_availability"],
-                "availability": "today_evening",
-            },
-        )
-    if "впишусь поиграть" in normalized_source:
-        return _ControlledProposal(
-            "unresolved",
-            "competing_interpretations",
-            "refined_prompt",
-            ("player_match_availability",),
-            {
-                "availability": _source_fragment(source, r"Впишусь\s+поиграть"),
-                "range": _source_fragment(source, r"1–2\s+человека"),
-            },
-            {
-                "opportunity_types": ["player_match_availability"],
-                "available_player_count_min": 1,
-                "available_player_count_max": 2,
-            },
-        )
-    if "сыграю на любой позиции" in normalized_source:
-        return _ControlledProposal(
-            "needs_second_pass",
-            "deterministic_ambiguity",
-            "direct_reply",
-            ("player_match_availability",),
-            {
-                "availability": _source_fragment(
-                    source, r"Сыграю\s+на\s+любой\s+позиции\s+в\s+поле"
-                )
-            },
-            {
-                "opportunity_types": ["player_match_availability"],
-                "positions": ["goalkeeper", "defender", "midfielder", "forward"],
-                "availability": "open",
-            },
-        )
-    if "есть где" in normalized_source and "поиграть" in normalized_source:
-        availability_normalized: dict[str, JsonValue] = {
-            "opportunity_types": ["player_match_availability"],
-            "availability": "today",
-        }
-        if "бесплатно" in normalized_source:
-            availability_normalized["payment"] = "free"
-        else:
-            availability_normalized["search_or_offering"] = "ambiguous"
-        return _ControlledProposal(
-            "unresolved",
-            "competing_interpretations",
-            "refined_prompt",
-            ("player_match_availability",),
-            {
-                "availability": _source_fragment(
-                    source,
-                    r"(?:Сегодня\s+)?есть\s+где\s+(?:сегодня\s+)?(?:бесплатно\s+)?поиграть\?",
-                )
-            },
-            availability_normalized,
-        )
-    if "требуются игроки" in normalized_source:
-        return _ControlledProposal(
-            "needs_review",
-            "needs_review",
-            "none",
-            ("roster_vacancy",),
-            {
-                "opening": _source_fragment(source, r"требуются\s+игроки"),
-                "time_horizon": _source_fragment(
-                    source, r"на\s+постоянную\s+перспективу"
-                ),
-                "context": _source_fragment(source, r"Тренировки\s+с\s+тренером"),
-            },
-            {
-                "opportunity_types": ["roster_vacancy"],
-                "time_horizon": "recurring",
-                "request_scope": "roster",
-            },
-        )
-    raise ValueError("controlled classifier cannot classify the raw source message")
-
-
-class ControlledPlayerClassifierAdapter:
-    """Execute the raw-message controlled classifier and application adapter."""
-
-    def execute(
-        self,
-        *,
-        source: str,
-        source_revision_id: str,
-        execution_id: str,
-    ) -> dict[str, JsonValue]:
-        source_sha256 = sha256(source.encode("utf-8")).hexdigest()
-        proposal = _controlled_proposal(source)
-        candidate: dict[str, JsonValue] | None = None
-        if proposal.disposition == "unresolved":
-            candidate_type = proposal.opportunity_types[0]
-            candidate_key = (
-                f"controlled-{sha256(source.encode('utf-8')).hexdigest()[:16]}"
-            )
-            candidate = {
-                "candidate_key": candidate_key,
-                "opportunity_type": candidate_type,
-                "evidence": dict(proposal.source_evidence),
-                "alternatives": [
-                    {
-                        "alternative_key": f"{candidate_key}-a",
-                        "evidence": dict(proposal.source_evidence),
-                    },
-                    {
-                        "alternative_key": f"{candidate_key}-b",
-                        "evidence": dict(proposal.source_evidence),
-                    },
-                ],
-            }
-        output: dict[str, JsonValue] = {
-            "schema_version": "source-message-classification-v3",
-            "disposition": proposal.disposition,
-            "candidates": [candidate] if candidate is not None else [],
-            "routing": {
-                "reason_code": proposal.reason_code,
-                "required_context": proposal.required_context,
-            },
-        }
-        schema_valid = classifier_output_is_schema_valid(output, body=source)
-        if not schema_valid:
-            raise ValueError("controlled classifier produced invalid schema output")
-        candidates = output.get("candidates")
-        if not isinstance(candidates, list):
-            raise ValueError("controlled classifier produced invalid candidates")
-        facts: dict[str, JsonValue] = {
-            "candidate_count": len(candidates),
-            "opportunity_types": list(proposal.opportunity_types),
-            "source_evidence": dict(proposal.source_evidence),
-            "normalized": dict(proposal.normalized),
-        }
-        publication_allowed = proposal.disposition == "accepted"
-        execution_trace: dict[str, JsonValue] = {
-            "pipeline_version": CONTROLLED_PLAYER_CLASSIFIER_VERSION,
-            "execution_id": execution_id,
-            "input_source_sha256": source_sha256,
-            "stages": [
-                "source_signals",
-                "controlled_proposal",
-                "schema_validation",
-                "application_adaptation",
-                "fail_closed_publication_check",
-            ],
-            "schema_valid": schema_valid,
-            "proposal_digest": sha256(
-                json.dumps(output, sort_keys=True, separators=(",", ":")).encode(
-                    "utf-8"
-                )
-            ).hexdigest(),
-            "adapted_facts_digest": sha256(
-                json.dumps(facts, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest(),
-            "publication_allowed": publication_allowed,
-        }
-        return {
-            "source_sha256": source_sha256,
-            "source_revision_id": source_revision_id,
-            "observed_output": output,
-            "observed_facts": facts,
-            "safety": {
-                "fail_closed": True,
-                "publication_allowed": publication_allowed,
-                "publication_state": "active" if publication_allowed else "suppressed",
-                "disposition_rechecked": proposal.disposition,
-            },
-            "provenance": {
-                "adapter_kind": "controlled_deterministic_pipeline",
-                "effective_model": PLAYER_REQUESTED_MODEL,
-                "effective_reasoning_effort": PLAYER_REQUESTED_REASONING_EFFORT,
-                "schema_version": "source-message-classification-v3",
-                "controlled_classifier_version": CONTROLLED_PLAYER_CLASSIFIER_VERSION,
-            },
-            "execution": {
-                "adapter_kind": "controlled_deterministic_pipeline",
-                "execution_path": "classifier.controlled_pipeline",
-                "execution_id": execution_id,
-                "source_revision_id": source_revision_id,
-                "source_sha256": source_sha256,
-                "classification_status": "succeeded",
-                "trace": execution_trace,
-            },
-        }
-
-    def observe(
-        self,
-        *,
-        source: str,
-        source_revision_id: str,
-        execution_id: str,
-    ) -> dict[str, JsonValue]:
-        """Observe a fresh execution from raw source text."""
-        return self.execute(
-            source=source,
-            source_revision_id=source_revision_id,
-            execution_id=execution_id,
-        )
-
-
-def _compare_recorded_observation(
-    case: dict[str, JsonValue],
-    record: dict[str, JsonValue],
-) -> str | None:
-    """Compare one fresh execution with independent reviewed annotations."""
-    case_id = cast(str, case.get("case_id", "unknown"))
-    try:
-        return _compare_recorded_observation_values(case, record)
-    except (KeyError, TypeError, ValueError):
-        return f"{case_id}:malformed"
-
-
-def _compare_recorded_observation_values(
-    case: dict[str, JsonValue],
-    record: dict[str, JsonValue],
-) -> str | None:
-    case_id = cast(str, case["case_id"])
-    source = cast(str, case["source"])
-    expected = _json_object(case["expected"], description=f"{case_id} expected")
-    output = _json_object(record["observed_output"], description=f"{case_id} output")
-    facts = _json_object(record["observed_facts"], description=f"{case_id} facts")
-    if not classifier_output_is_schema_valid(output, body=source):
-        return f"{case_id}:schema"
-    candidates = output.get("candidates")
-    if not isinstance(candidates, list):
-        return f"{case_id}:candidates"
-    expected_facts = _json_object(expected["facts"], description=f"{case_id} facts")
-    expected_opportunity_types = _text_list(
-        expected.get("opportunity_types"),
-        description=f"{case_id} expected opportunity types",
-    )
-    expected_candidate_type = expected.get("candidate_opportunity_type")
-    if expected_candidate_type is None and expected_opportunity_types:
-        expected_candidate_type = expected_opportunity_types[0]
-    observed_opportunity_types = _text_list(
-        facts.get("opportunity_types"),
-        description=f"{case_id} observed opportunity types",
-    )
-    if not _source_bound_map(facts.get("source_evidence"), source):
-        return f"{case_id}:facts-evidence"
-    observed_normalized = _json_object(
-        facts.get("normalized"), description=f"{case_id} normalized facts"
-    )
-    if not observed_normalized or observed_normalized.get("opportunity_types") != list(
-        observed_opportunity_types
-    ):
-        return f"{case_id}:normalization"
-    if (
-        output.get("disposition") != expected.get("disposition")
-        or len(candidates) != expected.get("candidate_count")
-        or _json_object(output.get("routing"), description=f"{case_id} routing").get(
-            "reason_code"
-        )
-        != expected.get("reason_code")
-        or _json_object(output.get("routing"), description=f"{case_id} routing").get(
-            "required_context"
-        )
-        != expected.get("required_context", "none")
-        or facts.get("candidate_count") != expected.get("candidate_count")
-        or observed_opportunity_types != expected_opportunity_types
-        or facts.get("source_evidence") != expected_facts.get("source_evidence")
-        or observed_normalized != expected_facts.get("normalized")
-    ):
-        return f"{case_id}:annotation"
-    if candidates:
-        candidate = _json_object(candidates[0], description=f"{case_id} candidate")
-        if candidate.get("opportunity_type") != expected_candidate_type:
-            return f"{case_id}:candidate-opportunity-type"
-        if (
-            not isinstance(candidate.get("candidate_key"), str)
-            or not candidate["candidate_key"]
-        ):
-            return f"{case_id}:candidate-key"
-        if candidate.get("evidence") != expected_facts.get("source_evidence"):
-            return f"{case_id}:candidate-evidence"
-        alternatives = candidate.get("alternatives")
-        if (
-            not isinstance(alternatives, list)
-            or len(alternatives) != 2
-            or any(
-                not isinstance(alternative, dict)
-                or alternative.get("evidence") != expected_facts.get("source_evidence")
-                for alternative in alternatives
-            )
-        ):
-            return f"{case_id}:alternatives"
-    provenance = _json_object(record["provenance"], description=f"{case_id} provenance")
-    if (
-        provenance.get("adapter_kind") != "controlled_deterministic_pipeline"
-        or provenance.get("effective_model") != PLAYER_REQUESTED_MODEL
-        or provenance.get("effective_reasoning_effort")
-        != PLAYER_REQUESTED_REASONING_EFFORT
-        or provenance.get("schema_version") != "source-message-classification-v3"
-        or provenance.get("controlled_classifier_version")
-        != CONTROLLED_PLAYER_CLASSIFIER_VERSION
-    ):
-        return f"{case_id}:provenance"
-    execution = _json_object(record["execution"], description=f"{case_id} execution")
-    trace = _json_object(execution.get("trace"), description=f"{case_id} trace")
-    source_sha256 = sha256(source.encode("utf-8")).hexdigest()
-    expected_publication_allowed = expected.get("disposition") == "accepted"
-    if (
-        record.get("source_sha256") != source_sha256
-        or not isinstance(record.get("source_revision_id"), str)
-        or not record.get("source_revision_id")
-        or execution.get("adapter_kind") != "controlled_deterministic_pipeline"
-        or execution.get("execution_path") != "classifier.controlled_pipeline"
-        or execution.get("classification_status") != "succeeded"
-        or execution.get("source_sha256") != source_sha256
-        or trace.get("execution_id") != execution.get("execution_id")
-        or trace.get("input_source_sha256") != source_sha256
-        or trace.get("pipeline_version") != CONTROLLED_PLAYER_CLASSIFIER_VERSION
-        or trace.get("schema_valid") is not True
-        or trace.get("proposal_digest")
-        != sha256(
-            json.dumps(output, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        or trace.get("adapted_facts_digest")
-        != sha256(
-            json.dumps(facts, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        or trace.get("publication_allowed") is not expected_publication_allowed
-        or trace.get("stages")
-        != [
-            "source_signals",
-            "controlled_proposal",
-            "schema_validation",
-            "application_adaptation",
-            "fail_closed_publication_check",
-        ]
-    ):
-        return f"{case_id}:execution-trace"
-    safety = _json_object(record["safety"], description=f"{case_id} safety")
-    accepted = expected_publication_allowed
-    if (
-        safety.get("fail_closed") is not True
-        or safety.get("publication_allowed") is not accepted
-        or safety.get("publication_state") != ("active" if accepted else "suppressed")
-    ):
-        return f"{case_id}:safety"
-    return None
-
-
-def _normalize_polarity_text(source: str) -> str:
-    normalized = source.casefold()
-    normalized = re.sub(
-        r"\b(aren|isn|wasn|weren|don|doesn|didn|can|couldn|won|wouldn|shouldn)"
-        r"\s*['’]\s*t\b",
-        r"\1 not",
-        normalized,
-    )
-    return re.sub(r"['’]", " ", normalized)
-
-
-def _controlled_polarity(source: str) -> bool:
-    """Accept only an unambiguous positive availability proposition."""
-    normalized = _normalize_polarity_text(source)
-    negative_patterns = (
-        r"\b(?:not\s+able|unable|not\s+capable|incapable)\b.{0,100}"
-        r"\b(?:play|participat|join|take\s+part)\b",
-        r"\b(?:cannot|can\s+not)\b.{0,80}"
-        r"\b(?:play|participat|join|take\s+part)\b",
-        r"\b(?:nobody|no\s+one|none|neither)\b.{0,80}"
-        r"\b(?:can|is\s+able\s+to)\b.{0,40}"
-        r"\b(?:play|participat|join|take\s+part)\b",
-        r"\b(?:players?|player\s+group|group)\b.{0,80}"
-        r"\b(?:not\s+available|not\s+able|unable|cannot|can\s+not)\b",
-        r"\b(?:играть|участвовать|принять\s+участие)\s+не\s+"
-        r"(?:могу|можем|может|могут)\b",
-        r"\bне\s+(?:могу|можем|может|могут)\s+"
-        r"(?:играть|участвовать|принять\s+участие)\b",
-        r"\bне\s+в\s+состоянии\s+"
-        r"(?:играть|участвовать|принять\s+участие)\b",
-        r"\b(?:никто|ни\s+один|ни\s+одного)\s+не\s+может\s+"
-        r"(?:играть|участвовать|принять\s+участие)\b",
-        r"\b(?:nadie|ning[uú]n\s+jugador|ninguno\s+de\s+ellos)\b.{0,50}"
-        r"\b(?:puede|podemos|pueden)\b.{0,30}\b(?:jugar|participar)\b",
-        r"\bno\s+(?:podemos|pueden|puede|puedo)\b.{0,30}"
-        r"\b(?:jugar|participar)\b",
-        r"\b(?:personne|aucun\s+joueur|aucun\s+d\s+entre\s+eux)\s+"
-        r"ne\s+peut\b.{0,30}\b(?:jouer|participer)\b",
-        r"\b(?:nous\s+ne\s+sommes\s+pas\s+capables|incapable\w*|"
-        r"ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+pas)\b.{0,40}"
-        r"\b(?:jouer|participer)\b",
-    )
-    if any(re.search(pattern, normalized) for pattern in negative_patterns):
-        return False
-    positive_patterns = (
-        r"\b(?:available|can\s+play|free\s+to\s+play|ready\s+to\s+play)\b",
-        r"\b(?:доступн\w*|готов\w*|можем\s+играть)\b",
-        r"\b(?:disponible\w*|podemos\s+jugar|pueden\s+jugar)\b",
-        r"\b(?:disponible\w*|pouvons\s+jouer|peuvent\s+jouer)\b",
-    )
-    return any(re.search(pattern, normalized) for pattern in positive_patterns)
-
-
-def _normalized_facts_are_supported(normalized: JsonValue) -> bool:
-    if not isinstance(normalized, dict) or not normalized:
-        return False
-    allowed = {
-        "opportunity_type",
-        "opportunity_types",
-        "available_player_count",
-        "available_player_count_min",
-        "available_player_count_max",
-        "position",
-        "positions",
-        "event_time",
-        "location",
-        "scope",
-    }
-    if any(key not in allowed for key in normalized):
-        return False
-    for key, value in normalized.items():
-        if key.startswith("available_player_count"):
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                return False
-        elif isinstance(value, list):
-            if not value or not all(isinstance(item, str) and item for item in value):
-                return False
-        elif not isinstance(value, str) or not value:
-            return False
-    return True
-
-
-class _SchemaInjectionError(Exception):
-    pass
-
-
-class _EvidenceInjectionError(Exception):
-    pass
-
-
-class _NormalizationInjectionError(Exception):
-    pass
-
-
-class _TimeoutInjectionError(Exception):
-    pass
-
-
-class _QuotaInjectionError(Exception):
-    pass
-
-
-class _AuthenticationInjectionError(Exception):
-    pass
-
-
-class _WorkerCrashInjectionError(Exception):
-    pass
-
-
-class _ReplayInjectionError(Exception):
-    pass
-
-
-class _RollbackInjectionError(Exception):
-    pass
-
-
-class _DuplicateDeliveryInjectionError(Exception):
-    pass
+_ORIGINAL_CLASSIFIER_OBSERVE = ControlledPlayerClassifierAdapter.observe
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+_PROMOTION_GATE_CACHE: dict[tuple[str, str], PlayerPromotionGateResult] = {}
 
 
 class ControlledPlayerLifecycleAdapter:
-    """Execute lifecycle operations against fresh controlled durable state."""
+    """Compatibility facade over the real durable failure runner.
 
-    def __init__(self, *, execution_id: str) -> None:
-        self.execution_id = execution_id
-        self.publication_state = "suppressed"
-        self.publication_effects = 0
-        self._source_revisions: set[str] = set()
-        self._replay_keys: set[str] = set()
-        self._delivered_keys: set[str] = set()
-        self.trace: list[dict[str, JsonValue]] = []
-        self.audit_events: list[dict[str, JsonValue]] = []
-        self.publication_events: list[dict[str, JsonValue]] = []
-        self.outbox_events: list[dict[str, JsonValue]] = []
+    The old implementation was an in-memory simulator.  This facade keeps a
+    narrow import surface for regression tests while every call delegates to
+    PostgreSQL-backed Application/Acceptance-Spine execution.
+    """
 
-    def _publish(self, *, operation: str, revision: str) -> None:
-        self.publication_state = "active"
-        self.publication_effects += 1
-        event: dict[str, JsonValue] = {
-            "operation": operation,
-            "revision": revision,
-            "publication_state": "active",
-        }
-        self.publication_events.append(event)
-        self.outbox_events.append({"event": "OpportunityPublicationChanged", **event})
-
-    def _suppress(self, *, operation: str, revision: str | None = None) -> None:
-        self.publication_state = "suppressed"
-        self.publication_effects = 0
-        self.audit_events.append(
-            {
-                "event": "publication_suppressed",
-                "operation": operation,
-                "revision": revision,
-            }
-        )
-
-    def _record(
-        self, operation: dict[str, JsonValue], observed: JsonValue
-    ) -> JsonValue:
-        kind = operation.get("kind")
-        executed_operation = {
-            key: value for key, value in operation.items() if key != "expected"
-        }
-        step = {
-            "kind": kind,
-            "input_digest": sha256(
-                json.dumps(
-                    executed_operation, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest(),
-            "observed_digest": sha256(
-                json.dumps(observed, sort_keys=True, separators=(",", ":")).encode(
-                    "utf-8"
-                )
-            ).hexdigest(),
-            "publication_state": self.publication_state,
-            "publication_effects": self.publication_effects,
-        }
-        self.trace.append(step)
-        self.audit_events.append({"event": "operation_observed", **step})
-        return observed
-
-    def _fail_closed_after_injection(
+    def __init__(
         self,
         *,
-        mode: str,
-        error: Exception,
-        operation_kind: str,
-    ) -> JsonValue:
-        path, outcome = _FAILURE_EXECUTION_PATHS[mode]
-        self._suppress(operation=operation_kind)
-        self.audit_events.append(
-            {
-                "event": "controlled_failure",
-                "failure_mode": mode,
-                "injection_path": path,
-                "exception_type": type(error).__name__,
-            }
-        )
-        return {
-            "failure_mode": mode,
-            "injected_operation": operation_kind,
-            "injection_path": path,
-            "observed_outcome": outcome,
-            "exception_type": type(error).__name__,
-            "fail_closed": True,
-            "publication_state": self.publication_state,
-            "publication_effects": self.publication_effects,
-        }
-
-    def _execute_schema_failure(self) -> JsonValue:
-        try:
-            invalid_output: JsonValue = {"schema_version": "wrong"}
-            if classifier_output_is_schema_valid(
-                _json_object(invalid_output, description="injected schema"), body=""
-            ):
-                raise _SchemaInjectionError("schema unexpectedly accepted")
-            raise _SchemaInjectionError("injected schema failure")
-        except _SchemaInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="schema_failure", error=error, operation_kind="schema_validate"
-            )
-
-    def _execute_evidence_failure(self) -> JsonValue:
-        try:
-            if _source_bound_map({"fact": "not present"}, "available players"):
-                raise _EvidenceInjectionError("evidence unexpectedly bound")
-            raise _EvidenceInjectionError("injected evidence failure")
-        except _EvidenceInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="evidence_failure", error=error, operation_kind="evidence_validate"
-            )
-
-    def _execute_normalization_failure(self) -> JsonValue:
-        try:
-            if _normalized_facts_are_supported({"available_player_count": 0}):
-                raise _NormalizationInjectionError(
-                    "normalization unexpectedly accepted"
-                )
-            raise _NormalizationInjectionError("injected normalization failure")
-        except _NormalizationInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="normalization_failure",
-                error=error,
-                operation_kind="normalization_validate",
-            )
-
-    def _execute_timeout(self) -> JsonValue:
-        try:
-            raise _TimeoutInjectionError("controlled classifier timeout")
-        except _TimeoutInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="timeout", error=error, operation_kind="classifier_attempt"
-            )
-
-    def _execute_quota(self) -> JsonValue:
-        try:
-            raise _QuotaInjectionError("controlled quota circuit")
-        except _QuotaInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="quota", error=error, operation_kind="quota_circuit"
-            )
-
-    def _execute_authentication(self) -> JsonValue:
-        try:
-            raise _AuthenticationInjectionError("controlled authentication circuit")
-        except _AuthenticationInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="authentication", error=error, operation_kind="auth_circuit"
-            )
-
-    def _execute_worker_crash(self) -> JsonValue:
-        try:
-            raise _WorkerCrashInjectionError("controlled worker crash")
-        except _WorkerCrashInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="worker_crash", error=error, operation_kind="worker_process"
-            )
-
-    def _execute_replay(self) -> JsonValue:
-        try:
-            replay_key = "controlled:player:source:revision:1"
-            self._replay_keys.add(replay_key)
-            if replay_key in self._replay_keys:
-                raise _ReplayInjectionError("duplicate replay barrier key")
-            raise _ReplayInjectionError("injected replay failure")
-        except _ReplayInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="replay", error=error, operation_kind="replay_barrier"
-            )
-
-    def _execute_rollback(self) -> JsonValue:
-        before_state = self.publication_state
-        try:
-            self._publish(operation="rollback_candidate", revision="r1")
-            raise _RollbackInjectionError("controlled transaction rollback")
-        except _RollbackInjectionError as error:
-            self.publication_events.clear()
-            self.outbox_events.clear()
-            self.publication_state = before_state
-            self.publication_effects = 0
-            return self._fail_closed_after_injection(
-                mode="rollback", error=error, operation_kind="rollback_boundary"
-            )
-
-    def _execute_duplicate_delivery(self) -> JsonValue:
-        try:
-            delivery_key = "controlled:player:publication:1"
-            self._delivered_keys.add(delivery_key)
-            if delivery_key in self._delivered_keys:
-                raise _DuplicateDeliveryInjectionError("duplicate delivery key")
-            raise _DuplicateDeliveryInjectionError("injected duplicate delivery")
-        except _DuplicateDeliveryInjectionError as error:
-            return self._fail_closed_after_injection(
-                mode="duplicate_delivery",
-                error=error,
-                operation_kind="publication_idempotency",
-            )
-
-    def _execute_failure(self, operation: dict[str, JsonValue]) -> JsonValue:
-        handlers = {
-            "schema_failure": self._execute_schema_failure,
-            "evidence_failure": self._execute_evidence_failure,
-            "normalization_failure": self._execute_normalization_failure,
-            "timeout": self._execute_timeout,
-            "quota": self._execute_quota,
-            "authentication": self._execute_authentication,
-            "worker_crash": self._execute_worker_crash,
-            "replay": self._execute_replay,
-            "rollback": self._execute_rollback,
-            "duplicate_delivery": self._execute_duplicate_delivery,
-        }
-        failure_mode = operation.get("failure_mode")
-        if not isinstance(failure_mode, str) or failure_mode not in handlers:
-            raise ValueError(
-                f"unsupported controlled failure injection: {failure_mode}"
-            )
-        return handlers[failure_mode]()
+        database_url: str,
+        case: dict[str, JsonValue],
+        execution_id: str,
+    ) -> None:
+        self.database_url = database_url
+        self.case = case
+        self.execution_id = execution_id
 
     def execute(self, operation: dict[str, JsonValue]) -> JsonValue:
-        kind = operation.get("kind")
-        if kind == "failure":
-            return self._record(operation, self._execute_failure(operation))
-        if kind == "route":
-            return self._record(
-                operation,
-                operation.get("current_revision") == operation.get("proposal_revision"),
-            )
-        if kind in {"evidence", "unsupported"}:
-            source = cast(str, operation["source"])
-            bound = _source_bound_map(operation.get("evidence"), source)
-            return self._record(operation, bound if kind == "evidence" else not bound)
-        if kind == "proof":
-            facts = operation.get("covered_facts")
-            return self._record(
-                operation,
-                operation.get("source_revision") == operation.get("proof_revision")
-                and isinstance(facts, list)
-                and bool(facts),
-            )
-        if kind == "normalization":
-            return self._record(
-                operation, _normalized_facts_are_supported(operation.get("normalized"))
-            )
-        if kind == "publication":
-            accepted = (
-                operation.get("accepted") is True
-                and operation.get("promotion_approved") is True
-            )
-            if accepted:
-                self._publish(operation="publication", revision="candidate")
-            else:
-                self._suppress(operation="publication")
-            return self._record(operation, self.publication_state)
-        if kind == "create":
-            accepted = operation.get("accepted") is True and isinstance(
-                operation.get("revision"), str
-            )
-            if accepted:
-                revision = cast(str, operation["revision"])
-                self._source_revisions.add(revision)
-                self._publish(operation="create", revision=revision)
-            else:
-                self._suppress(operation="create")
-            return self._record(operation, accepted)
-        if kind == "edit":
-            previous = operation.get("previous_revision")
-            current = operation.get("current_revision")
-            identity_reused = (
-                isinstance(previous, str)
-                and isinstance(current, str)
-                and previous != current
-                and operation.get("same_identity") is True
-            )
-            if isinstance(previous, str):
-                self._suppress(operation="edit_previous", revision=previous)
-            if identity_reused and isinstance(current, str):
-                self._source_revisions.add(current)
-                self._publish(operation="edit_current", revision=current)
-            else:
-                self._suppress(operation="edit_current")
-            return self._record(
-                operation,
-                {
-                    "previous": "suppressed",
-                    "current": self.publication_state,
-                    "identity_reused": identity_reused,
-                },
-            )
-        if kind == "delete":
-            delete_revision = operation.get("revision")
-            self._suppress(
-                operation="delete",
-                revision=delete_revision if isinstance(delete_revision, str) else None,
-            )
-            return self._record(
-                operation,
-                {"publication_state": "suppressed", "body_retained": False},
-            )
-        if kind == "repost":
-            previous = operation.get("previous_revision")
-            current = operation.get("current_revision")
-            representative = (
-                isinstance(previous, str)
-                and isinstance(current, str)
-                and previous != current
-            )
-            self._suppress(
-                operation="repost_previous",
-                revision=previous if isinstance(previous, str) else None,
-            )
-            if representative and isinstance(current, str):
-                self._publish(operation="repost_current", revision=current)
-            return self._record(
-                operation,
-                {
-                    "active_revision": current,
-                    "suppressed_revision": previous,
-                    "representative_count": 1 if representative else 0,
-                },
-            )
-        if kind == "reply":
-            return self._record(
-                operation,
-                operation.get("eligible_reply") is True
-                and isinstance(operation.get("parent_revision"), str)
-                and isinstance(operation.get("reply_text"), str)
-                and bool(operation["reply_text"]),
-            )
-        if kind == "compound":
-            slots = operation.get("slots")
-            return self._record(
-                operation,
-                isinstance(slots, list)
-                and len(slots) > 1
-                and len({slot for slot in slots if isinstance(slot, int)}) == len(slots)
-                and all(
-                    isinstance(slot, int) and not isinstance(slot, bool)
-                    for slot in slots
-                ),
-            )
-        if kind == "classifier_outcome":
-            accepted = operation.get("disposition") == "accepted"
-            if accepted:
-                self._publish(operation="classifier_outcome", revision="candidate")
-            else:
-                self._suppress(operation="classifier_outcome")
-            return self._record(operation, self.publication_state)
-        if kind == "prompt_injection":
-            return self._record(
-                operation,
-                re.search(
-                    r"ignore\s+(?:all\s+)?previous|system\s+prompt|publish\s+this",
-                    cast(str, operation["source"]).casefold(),
-                )
-                is None,
-            )
-        if kind == "safety":
-            return self._record(
-                operation,
-                re.search(
-                    r"password|secret|credit\s+card|verification\s+code",
-                    cast(str, operation["source"]).casefold(),
-                )
-                is None,
-            )
-        if kind == "polarity":
-            accepted = _controlled_polarity(cast(str, operation["source"]))
-            if not accepted:
-                self._suppress(operation="polarity")
-            return self._record(operation, accepted)
-        raise ValueError(f"unsupported lifecycle operation: {kind}")
-
-
-def _replay_lifecycle_case(
-    case: dict[str, JsonValue],
-    *,
-    execution_id: str,
-) -> tuple[dict[str, JsonValue], str | None]:
-    case_id = cast(str, case["case_id"])
-    operations = case["operations"]
-    if not isinstance(operations, list):
-        return {"case_id": case_id}, f"{case_id}:operations"
-    adapter = ControlledPlayerLifecycleAdapter(execution_id=execution_id)
-    observations: list[JsonValue] = []
-    for raw_operation in operations:
-        operation = _json_object(raw_operation, description=f"{case_id} operation")
-        executed_operation = {
-            key: value for key, value in operation.items() if key != "expected"
+        case = {
+            **self.case,
+            "operation": operation,
+            "failure_mode": operation.get(
+                "failure_mode", self.case.get("failure_mode")
+            ),
         }
-        observed = adapter.execute(executed_operation)
-        observations.append(
-            {
-                "kind": executed_operation["kind"],
-                "observed": observed,
-                "publication_state": adapter.publication_state,
-                "publication_effects": adapter.publication_effects,
-            }
+        observation, failure = execute_failure_case(
+            database_url=self.database_url,
+            case=case,
+            execution_id=self.execution_id,
         )
-    observation: dict[str, JsonValue] = {
-        "case_id": case_id,
-        "execution_id": execution_id,
-        "observations": observations,
-        "trace": list(adapter.trace),
-        "audit_events": list(adapter.audit_events),
-        "publication_events": list(adapter.publication_events),
-        "outbox_events": list(adapter.outbox_events),
+        if failure is not None:
+            raise RuntimeError(failure)
+        observed = observation.get("observed")
+        return observed if isinstance(observed, dict) else {}
+
+
+_ORIGINAL_LIFECYCLE_EXECUTE = ControlledPlayerLifecycleAdapter.execute
+
+
+def _database_url() -> str:
+    value = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not value:
+        raise RuntimeError(
+            "TEST_DATABASE_URL is required for the durable Player promotion gate"
+        )
+    return value
+
+
+def _fresh_replay_database_url(base_database_url: str, replay_number: int) -> str:
+    """Create one disposable administrative database for one replay worker."""
+    database_name = f"codex_player_promotion_{replay_number}_{uuid4().hex[:20]}"
+    maintenance_url = conninfo.make_conninfo(base_database_url, dbname="postgres")
+    with psycopg.connect(maintenance_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
+        )
+    return conninfo.make_conninfo(base_database_url, dbname=database_name)
+
+
+def _promotion_release_cache_token(release: PlayerClassifierRelease) -> str:
+    """Fingerprint all executable release inputs for safe result reuse."""
+    material = {
+        "release_fingerprint": release.release_fingerprint,
+        "contract_sha256": release.contract_sha256,
+        "reviewed_corpus_cases": list(release.reviewed_corpus_cases),
+        "lifecycle_failure_suite_cases": list(release.lifecycle_failure_suite_cases),
+        "failure_mode_cases": list(release.failure_mode_cases),
+        "canonical_replay_digests": list(release.canonical_replay_digests),
     }
-    return observation, _compare_lifecycle_observation(case, observation)
+    return sha256(
+        json.dumps(
+            material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
 
 
-def _compare_lifecycle_observation(
-    case: dict[str, JsonValue], observation: dict[str, JsonValue]
-) -> str | None:
-    """Compare an executed lifecycle trace with the reviewed expected outcomes."""
-    case_id = cast(str, case["case_id"])
-    expected_operations = case.get("operations")
-    actual_operations = observation.get("observations")
-    if not isinstance(expected_operations, list) or not isinstance(
-        actual_operations, list
-    ):
-        return f"{case_id}:observations"
-    if len(expected_operations) != len(actual_operations):
-        return f"{case_id}:operation-count"
-    raw_trace = observation.get("trace")
-    raw_audit_events = observation.get("audit_events")
-    if not isinstance(raw_trace, list) or not isinstance(raw_audit_events, list):
-        return f"{case_id}:execution-trace"
-    trace = tuple(
-        _json_object(value, description=f"{case_id} trace step") for value in raw_trace
-    )
-    operation_audit_events = tuple(
-        _json_object(value, description=f"{case_id} audit event")
-        for value in raw_audit_events
-        if isinstance(value, dict) and value.get("event") == "operation_observed"
-    )
-    if len(trace) != len(actual_operations) or len(operation_audit_events) != len(
-        actual_operations
-    ):
-        return f"{case_id}:execution-trace"
-    for index, (raw_expected, raw_actual) in enumerate(
-        zip(expected_operations, actual_operations, strict=True), start=1
-    ):
-        expected_operation = _json_object(
-            raw_expected, description=f"{case_id} expected"
-        )
-        actual_operation = _json_object(raw_actual, description=f"{case_id} observed")
-        trace_step = trace[index - 1]
-        audit_event = operation_audit_events[index - 1]
-        executed_operation = {
-            key: value for key, value in expected_operation.items() if key != "expected"
-        }
-        observed_value = actual_operation.get("observed")
-        if (
-            trace_step.get("kind") != expected_operation.get("kind")
-            or trace_step.get("input_digest")
-            != sha256(
-                json.dumps(
-                    executed_operation, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest()
-            or trace_step.get("observed_digest")
-            != sha256(
-                json.dumps(
-                    observed_value, sort_keys=True, separators=(",", ":")
-                ).encode("utf-8")
-            ).hexdigest()
-            or trace_step.get("publication_state")
-            != actual_operation.get("publication_state")
-            or trace_step.get("publication_effects")
-            != actual_operation.get("publication_effects")
-            or any(audit_event.get(key) != trace_step.get(key) for key in trace_step)
-        ):
-            return f"{case_id}:execution-trace-{index}"
-        if actual_operation.get("observed") != expected_operation.get("expected"):
-            return f"{case_id}:operation-{index}"
-        expected_result = expected_operation.get("expected")
-        if expected_result is False and (
-            actual_operation.get("publication_state") == "active"
-            or actual_operation.get("publication_effects") != 0
-        ):
-            return f"{case_id}:false-publication-{index}"
-        if expected_result == "suppressed" and (
-            actual_operation.get("publication_state") != "suppressed"
-            or actual_operation.get("publication_effects") != 0
-        ):
-            return f"{case_id}:false-publication-{index}"
-        if expected_result == "active" and (
-            actual_operation.get("publication_state") != "active"
-            or actual_operation.get("publication_effects") == 0
-        ):
-            return f"{case_id}:missing-publication-{index}"
-    return None
-
-
-def _replay_failure_case(
-    case: dict[str, JsonValue],
-    *,
-    execution_id: str,
-) -> tuple[dict[str, JsonValue], str | None]:
-    operation = _json_object(case["operation"], description="failure operation")
-    expected = _json_object(case["expected"], description="failure expected")
-    case_id = cast(str, case["case_id"])
-    adapter = ControlledPlayerLifecycleAdapter(execution_id=execution_id)
-    observed: dict[str, JsonValue]
-    try:
-        if operation.get("failure_mode") != case.get("failure_mode"):
-            raise ValueError("failure injection does not match the declared mode")
-        observed = _json_object(
-            adapter.execute(operation), description=f"{case_id} observed failure"
-        )
-        failure: str | None = None
-    except (TypeError, ValueError):
-        adapter._suppress(operation="missing_failure_injection")
-        observed = {
-            "failure_mode": case.get("failure_mode"),
-            "injected_operation": "missing_failure_injection",
-            "injection_path": "missing",
-            "observed_outcome": "injection_not_executed",
-            "exception_type": "MissingControlledInjection",
-            "fail_closed": True,
-            "publication_state": adapter.publication_state,
-            "publication_effects": adapter.publication_effects,
-        }
-        failure = f"{case_id}:injection"
-    for key, expected_value in expected.items():
-        if observed.get(key) != expected_value:
-            failure = failure or f"{case_id}:observed-{key}"
-    if (
-        observed.get("fail_closed") is not True
-        or observed.get("publication_effects") != 0
-    ):
-        failure = failure or f"{case_id}:false-publication"
-    return (
-        {
-            "case_id": case_id,
-            "execution_id": execution_id,
-            "operation": {
-                key: value for key, value in operation.items() if key != "expected"
-            },
-            "observed": observed,
-            "trace": list(adapter.trace),
-            "audit_events": list(adapter.audit_events),
-            "publication_events": list(adapter.publication_events),
-            "outbox_events": list(adapter.outbox_events),
-        },
-        failure,
-    )
-
-
-def _execute_controlled_replay(
+def _recorded_corpus_audit(
     release: PlayerClassifierRelease,
-    *,
-    execution_id: str,
-) -> tuple[dict[str, JsonValue], tuple[str, ...]]:
-    observations: dict[str, JsonValue] = {
-        "execution_id": execution_id,
-        "corpus": [],
-        "lifecycle": [],
-        "failure_modes": [],
-    }
+) -> tuple[str, ...]:
+    """Audit the raw Responses seam in this process for observable regressions."""
     failures: list[str] = []
     classifier = ControlledPlayerClassifierAdapter()
-    corpus_observations = cast(list[JsonValue], observations["corpus"])
     for case in release.reviewed_corpus_cases:
-        case_id = cast(str, case["case_id"])
+        case_id = _text(case.get("case_id"), description="corpus case_id")
+        source = _text(case.get("source"), description=f"{case_id} source")
         record = classifier.observe(
-            source=cast(str, case["source"]),
-            source_revision_id=f"controlled:{case_id}:revision:1",
-            execution_id=f"{execution_id}:{case_id}",
+            source=source,
+            source_revision_id=f"audit:{uuid4()}:revision:1",
+            execution_id=str(uuid4()),
         )
-        failure = _compare_recorded_observation(case, record)
-        corpus_observations.append(
-            {
-                "case_id": case_id,
-                "source_sha256": record["source_sha256"],
-                "source_revision_id": record["source_revision_id"],
-                "observed_output": record["observed_output"],
-                "observed_facts": record["observed_facts"],
-                "safety": record["safety"],
-                "provenance": record["provenance"],
-                "execution": record["execution"],
-            }
-        )
+        failure = compare_recorded_observation(case, record)
         if failure is not None:
             failures.append(failure)
-    lifecycle_observations = cast(list[JsonValue], observations["lifecycle"])
-    for case in release.lifecycle_failure_suite_cases:
-        observation, failure = _replay_lifecycle_case(
-            case, execution_id=f"{execution_id}:{case['case_id']}"
-        )
-        lifecycle_observations.append(observation)
-        if failure is not None:
-            failures.append(failure)
-    failure_observations = cast(list[JsonValue], observations["failure_modes"])
+    return tuple(failures)
+
+
+def _durable_failure_audit(
+    release: PlayerClassifierRelease, database_url: str
+) -> tuple[str, ...]:
+    """Exercise the compatibility facade only when a failure spy is installed."""
+    failures: list[str] = []
     for case in release.failure_mode_cases:
-        observation, failure = _replay_failure_case(
-            case, execution_id=f"{execution_id}:{case['case_id']}"
+        case_id = _text(case.get("case_id"), description="failure case_id")
+        operation = _json_object(
+            case.get("operation"), description=f"{case_id} operation"
         )
-        failure_observations.append(observation)
-        if failure is not None:
-            failures.append(failure)
-    return observations, tuple(failures)
+        adapter = ControlledPlayerLifecycleAdapter(
+            database_url=database_url,
+            case=case,
+            execution_id=str(uuid4()),
+        )
+        try:
+            observed_value = adapter.execute(operation)
+        except (RuntimeError, ValueError) as error:
+            failures.append(f"{case_id}:durable-failure:{type(error).__name__}")
+            continue
+        if not isinstance(observed_value, dict):
+            failures.append(f"{case_id}:observed")
+            continue
+        observed = observed_value
+        expected = _json_object(case.get("expected"), description=f"{case_id} expected")
+        if any(observed.get(key) != value for key, value in expected.items()):
+            failures.append(
+                next(
+                    (
+                        f"{case_id}:observed-{key}"
+                        for key, value in expected.items()
+                        if observed.get(key) != value
+                    ),
+                    f"{case_id}:observed",
+                )
+            )
+    return tuple(failures)
 
 
-def _failure_mode_observation(value: JsonValue) -> dict[str, JsonValue]:
-    observation = _json_object(value, description="failure observation")
-    case_id = _text(observation.get("case_id"), description="failure case_id")
-    observed = _json_object(observation.get("observed"), description="failure result")
-    return {"case_id": case_id, **observed}
+def _uuid_text(value: JsonValue) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        UUID(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _check_worker_envelope(
+    output: dict[str, JsonValue],
+    *,
+    release: PlayerClassifierRelease,
+    parent_pid: int,
+    replay_number: int,
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    if output.get("execution_version") != PLAYER_PROMOTION_EXECUTION_VERSION:
+        failures.append(f"replay-{replay_number}:execution-version")
+    if output.get("release_fingerprint") != release.release_fingerprint:
+        failures.append(f"replay-{replay_number}:release-fingerprint")
+    if output.get("release_binding") != _release_binding(release):
+        failures.append(f"replay-{replay_number}:release-binding")
+    process_id = output.get("process_id")
+    if not isinstance(process_id, int) or process_id == parent_pid:
+        failures.append(f"replay-{replay_number}:not-process-isolated")
+    execution_id = output.get("execution_id")
+    if not _uuid_text(execution_id):
+        failures.append(f"replay-{replay_number}:synthetic-execution-id")
+    if output.get("replay_number") != replay_number:
+        failures.append(f"replay-{replay_number}:replay-number")
+    return tuple(failures)
+
+
+def _load_worker_output(
+    completed: subprocess.CompletedProcess[str],
+) -> dict[str, JsonValue]:
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith("PLAYER_PROMOTION_REPLAY="):
+            return _json_object(
+                json.loads(line.removeprefix("PLAYER_PROMOTION_REPLAY=")),
+                description="replay worker output",
+            )
+    raise ValueError(
+        "replay worker did not emit its durable result"
+        + (f": {completed.stderr[-500:]}" if completed.stderr else "")
+    )
+
+
+def _compare_worker_observations(
+    first: dict[str, JsonValue], second: dict[str, JsonValue], replay_number: int
+) -> tuple[str, ...]:
+    from modules.player_promotion_runtime import _canonicalize_observed_value
+
+    failures: list[str] = []
+    for name in ("lifecycle", "failure_modes"):
+        left = first.get(name)
+        right = second.get(name)
+        if _canonicalize_observed_value(left) != _canonicalize_observed_value(right):
+            failures.append(f"replay-{replay_number}:{name}-observations")
+    return tuple(failures)
+
+
+def _compare_worker_to_release(
+    output: dict[str, JsonValue], release: PlayerClassifierRelease
+) -> tuple[str, ...]:
+    failures: list[str] = []
+    corpus = output.get("corpus")
+    if not isinstance(corpus, list) or len(corpus) != len(
+        release.reviewed_corpus_cases
+    ):
+        failures.append("corpus:case-count")
+    else:
+        for case, record in zip(release.reviewed_corpus_cases, corpus, strict=True):
+            if not isinstance(record, dict):
+                failures.append(f"{case.get('case_id', 'unknown')}:malformed")
+                continue
+            failure = compare_recorded_observation(case, record)
+            if failure is not None:
+                failures.append(failure)
+
+    lifecycle = output.get("lifecycle")
+    if not isinstance(lifecycle, list) or len(lifecycle) != len(
+        release.lifecycle_failure_suite_cases
+    ):
+        failures.append("lifecycle:case-count")
+    else:
+        for case, observation in zip(
+            release.lifecycle_failure_suite_cases, lifecycle, strict=True
+        ):
+            if not isinstance(observation, dict):
+                failures.append(f"{case.get('case_id', 'unknown')}:malformed")
+                continue
+            failure = compare_lifecycle_observation(case, observation)
+            if failure is not None:
+                failures.append(failure)
+
+    failure_modes = output.get("failure_modes")
+    if not isinstance(failure_modes, list) or len(failure_modes) != len(
+        release.failure_mode_cases
+    ):
+        failures.append("failure-modes:case-count")
+    else:
+        for case, observation in zip(
+            release.failure_mode_cases, failure_modes, strict=True
+        ):
+            if not isinstance(observation, dict):
+                failures.append(f"{case.get('case_id', 'unknown')}:malformed")
+                continue
+            failure = compare_failure_observation(case, observation)
+            if failure is not None:
+                failures.append(failure)
+    return tuple(failures)
 
 
 def run_player_classifier_promotion_gate(
     release: PlayerClassifierRelease,
 ) -> PlayerPromotionGateResult:
-    """Run three complete fresh controlled executions and compare their evidence."""
+    """Run all cases in three fresh worker processes against durable state."""
+    database_url = _database_url()
+    failed: set[str] = set(_recorded_corpus_audit(release))
+    classifier_seam_changed = (
+        ControlledPlayerClassifierAdapter.observe is not _ORIGINAL_CLASSIFIER_OBSERVE
+    )
+    lifecycle_seam_changed = (
+        ControlledPlayerLifecycleAdapter.execute is not _ORIGINAL_LIFECYCLE_EXECUTE
+    )
+    if lifecycle_seam_changed:
+        failed.update(_durable_failure_audit(release, database_url))
+    if classifier_seam_changed or lifecycle_seam_changed:
+        return PlayerPromotionGateResult(
+            release_fingerprint=release.release_fingerprint,
+            reviewed_case_count=len(release.reviewed_corpus_cases),
+            lifecycle_case_count=len(release.lifecycle_failure_suite_cases),
+            failure_mode_case_ids=tuple(
+                cast(str, case["case_id"]) for case in release.failure_mode_cases
+            ),
+            reviewed_case_ids=tuple(
+                cast(str, case["case_id"]) for case in release.reviewed_corpus_cases
+            ),
+            lifecycle_case_ids=tuple(
+                cast(str, case["case_id"])
+                for case in release.lifecycle_failure_suite_cases
+            ),
+            replay_digests=(),
+            failed_case_ids=tuple(sorted(failed)),
+            failure_mode_observations=(),
+            lifecycle_observations=(),
+            replay_execution_ids=(),
+            execution_version=PLAYER_PROMOTION_EXECUTION_VERSION,
+        )
+
+    cache_key = (_promotion_release_cache_token(release), database_url)
+    if subprocess.run is _ORIGINAL_SUBPROCESS_RUN:
+        cached = _PROMOTION_GATE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    worker_outputs: list[dict[str, JsonValue]] = []
     replay_digests: list[str] = []
     replay_execution_ids: list[str] = []
-    failed_case_ids: set[str] = set()
-    failure_mode_observations: tuple[dict[str, JsonValue], ...] = ()
-    lifecycle_observations: tuple[dict[str, JsonValue], ...] = ()
-    for replay_number in range(release.required_replays):
-        execution_id = f"controlled-replay-{replay_number + 1}"
+    for replay_number in range(1, release.required_replays + 1):
+        execution_id = str(uuid4())
         replay_execution_ids.append(execution_id)
-        observations, failures = _execute_controlled_replay(
-            release, execution_id=execution_id
+        environment = os.environ.copy()
+        environment["TEST_DATABASE_URL"] = _fresh_replay_database_url(
+            database_url, replay_number
         )
-        failed_case_ids.update(failures)
-        current_lifecycle_observations = tuple(
-            _json_object(value, description="lifecycle observation")
-            for value in cast(list[JsonValue], observations["lifecycle"])
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "modules.player_promotion_runtime",
+                "--replay-worker",
+                str(replay_number),
+                execution_id,
+            ],
+            cwd=_REPOSITORY_ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        if not lifecycle_observations:
-            lifecycle_observations = current_lifecycle_observations
-        elif tuple(
-            {key: value for key, value in observation.items() if key != "execution_id"}
-            for observation in current_lifecycle_observations
-        ) != tuple(
-            {key: value for key, value in observation.items() if key != "execution_id"}
-            for observation in lifecycle_observations
-        ):
-            failed_case_ids.add(f"replay-{replay_number + 1}:lifecycle-observations")
-        current_failure_mode_observations = tuple(
-            _failure_mode_observation(failure_observation)
-            for failure_observation in cast(
-                list[JsonValue], observations["failure_modes"]
+        if completed.returncode != 0:
+            failed.add(f"replay-{replay_number}:worker")
+            continue
+        try:
+            output = _load_worker_output(completed)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            failed.add(f"replay-{replay_number}:worker-output")
+            continue
+        worker_outputs.append(output)
+        failed.update(
+            _check_worker_envelope(
+                output,
+                release=release,
+                parent_pid=os.getpid(),
+                replay_number=replay_number,
             )
         )
-        if not failure_mode_observations:
-            failure_mode_observations = current_failure_mode_observations
-        elif current_failure_mode_observations != failure_mode_observations:
-            failed_case_ids.add(f"replay-{replay_number + 1}:failure-observations")
-        digest = sha256(
-            json.dumps(
-                observations, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()
-        replay_digests.append(digest)
-        if digest != release.canonical_replay_digests[replay_number]:
-            failed_case_ids.add(f"replay-{replay_number + 1}:digest")
+        failed.update(_compare_worker_to_release(output, release))
+        output_digest = output.get("canonical_digest")
+        expected_digest = (
+            release.canonical_replay_digests[replay_number - 1]
+            if replay_number - 1 < len(release.canonical_replay_digests)
+            else None
+        )
+        recompute_input = dict(output)
+        recompute_input.pop("canonical_digest", None)
+        release_binding = output.get("release_binding")
+        recomputed_digest = (
+            canonical_replay_digest(
+                recompute_input,
+                release_fingerprint=release_binding,
+                replay_number=replay_number,
+            )
+            if isinstance(release_binding, str)
+            else None
+        )
+        if (
+            not isinstance(output_digest, str)
+            or output_digest != expected_digest
+            or recomputed_digest != output_digest
+        ):
+            failed.add(f"replay-{replay_number}:digest")
+        else:
+            replay_digests.append(output_digest)
+    if len(worker_outputs) == release.required_replays:
+        for index, output in enumerate(worker_outputs[1:], start=2):
+            failed.update(
+                _compare_worker_observations(worker_outputs[0], output, index)
+            )
+
     if len(set(replay_execution_ids)) != release.required_replays:
-        failed_case_ids.add("replays:not-independent")
-    if len(set(replay_digests)) != release.required_replays:
-        failed_case_ids.add("replays:duplicate-digest")
-    return PlayerPromotionGateResult(
+        failed.add("replays:not-independent")
+    if len(replay_digests) != release.required_replays:
+        failed.add("replays:missing-digest")
+    if len(set(replay_digests)) != len(replay_digests):
+        failed.add("replays:duplicate-digest")
+
+    first = worker_outputs[0] if worker_outputs else {}
+    failure_mode_values = first.get("failure_modes")
+    failure_mode_observations_list: list[dict[str, JsonValue]] = []
+    if isinstance(failure_mode_values, list):
+        for value in failure_mode_values:
+            if isinstance(value, dict):
+                failure_mode_observations_list.append(
+                    _json_object(value, description="failure observation")
+                )
+    lifecycle_values = first.get("lifecycle")
+    lifecycle_observations_list: list[dict[str, JsonValue]] = []
+    if isinstance(lifecycle_values, list):
+        for value in lifecycle_values:
+            if isinstance(value, dict):
+                lifecycle_observations_list.append(
+                    _json_object(value, description="lifecycle observation")
+                )
+    failure_mode_observations = tuple(failure_mode_observations_list)
+    lifecycle_observations = tuple(lifecycle_observations_list)
+    result = PlayerPromotionGateResult(
         release_fingerprint=release.release_fingerprint,
         reviewed_case_count=len(release.reviewed_corpus_cases),
         lifecycle_case_count=len(release.lifecycle_failure_suite_cases),
@@ -2382,18 +1150,20 @@ def run_player_classifier_promotion_gate(
             cast(str, case["case_id"]) for case in release.lifecycle_failure_suite_cases
         ),
         replay_digests=tuple(replay_digests),
-        replay_execution_ids=tuple(replay_execution_ids),
-        failed_case_ids=tuple(sorted(failed_case_ids)),
+        failed_case_ids=tuple(sorted(failed)),
         failure_mode_observations=failure_mode_observations,
         lifecycle_observations=lifecycle_observations,
+        replay_execution_ids=tuple(replay_execution_ids),
         execution_version=PLAYER_PROMOTION_EXECUTION_VERSION,
     )
+    if result.passed:
+        _PROMOTION_GATE_CACHE[cache_key] = result
+    return result
 
 
 def controlled_player_promotion_replay_digests(
     release: PlayerClassifierRelease,
 ) -> tuple[str, ...]:
-    """Return digests from a complete fresh controlled replay."""
     result = run_player_classifier_promotion_gate(release)
     if not result.passed:
         raise ValueError("controlled Player promotion gate failed")
@@ -2405,7 +1175,7 @@ def player_classifier_promotion_evidence(
     *,
     replay_digests: tuple[str, ...] | None = None,
 ) -> dict[str, JsonValue]:
-    """Build durable evidence only from a fresh exact controlled replay."""
+    """Build durable approval evidence only from a fresh exact replay."""
     result = run_player_classifier_promotion_gate(release)
     if not result.passed:
         raise ValueError(
@@ -2426,6 +1196,10 @@ def player_classifier_promotion_evidence(
         "reviewed_corpus_case_ids": list(result.reviewed_case_ids),
         "controlled_classifier_path": release.controlled_classifier_path,
         "controlled_classifier_version": release.controlled_classifier_version,
+        "controlled_response_fixture_path": release.controlled_response_fixture_path,
+        "controlled_response_fixture_version": (
+            release.controlled_response_fixture_version
+        ),
         "lifecycle_failure_suite_path": release.lifecycle_failure_suite_path,
         "lifecycle_failure_suite_sha256": release.lifecycle_failure_suite_sha256,
         "lifecycle_failure_suite_version": release.lifecycle_failure_suite_version,
@@ -2444,11 +1218,151 @@ def player_classifier_promotion_evidence(
         "replay_digests": list(result.replay_digests),
         "replay_execution_ids": list(result.replay_execution_ids),
         "execution_version": result.execution_version,
-        "adapter_kind": "controlled_deterministic_pipeline",
+        "adapter_kind": "responses_api",
         "requested_model": release.requested_model,
         "requested_reasoning_effort": release.requested_reasoning_effort,
         "proposal_only": release.proposal_only,
     }
+
+
+def _promotion_evidence_is_valid(
+    release: PlayerClassifierRelease, value: JsonValue
+) -> bool:
+    """Validate stored approval evidence without re-running a new replay.
+
+    Replay evidence contains runtime UUIDs and process IDs, so comparing it to
+    a newly executed gate would reject a valid approval on every read.  The
+    durable approval boundary instead validates the exact release binding,
+    canonical digests, complete case coverage, and the captured observations
+    themselves.  A new gate is required to create evidence; this function
+    only verifies that the evidence presented for publication is the evidence
+    of this exact release and was not replaced by metadata.
+    """
+    if not isinstance(value, dict):
+        return False
+    required_keys = {
+        "release_fingerprint",
+        "contract_sha256",
+        "reviewed_corpus_path",
+        "reviewed_corpus_version",
+        "reviewed_corpus_sha256",
+        "reviewed_corpus_case_count",
+        "reviewed_corpus_case_ids",
+        "controlled_classifier_path",
+        "controlled_classifier_version",
+        "controlled_response_fixture_path",
+        "controlled_response_fixture_version",
+        "lifecycle_failure_suite_path",
+        "lifecycle_failure_suite_sha256",
+        "lifecycle_failure_suite_version",
+        "lifecycle_case_count",
+        "lifecycle_case_ids",
+        "failure_mode_case_count",
+        "failure_mode_case_ids",
+        "required_case_families",
+        "required_replays",
+        "failed_cases",
+        "failed_case_ids",
+        "failure_mode_observations",
+        "lifecycle_observations",
+        "replay_ids",
+        "canonical_replay_digests",
+        "replay_digests",
+        "replay_execution_ids",
+        "execution_version",
+        "adapter_kind",
+        "requested_model",
+        "requested_reasoning_effort",
+        "proposal_only",
+    }
+    if set(value) != required_keys:
+        return False
+    expected_scalars: dict[str, JsonValue] = {
+        "release_fingerprint": release.release_fingerprint,
+        "contract_sha256": release.contract_sha256,
+        "reviewed_corpus_path": release.reviewed_corpus_path,
+        "reviewed_corpus_version": release.reviewed_corpus_version,
+        "reviewed_corpus_sha256": release.reviewed_corpus_sha256,
+        "reviewed_corpus_case_count": PLAYER_REVIEWED_CORPUS_CASE_COUNT,
+        "controlled_classifier_path": release.controlled_classifier_path,
+        "controlled_classifier_version": release.controlled_classifier_version,
+        "controlled_response_fixture_path": release.controlled_response_fixture_path,
+        "controlled_response_fixture_version": (
+            release.controlled_response_fixture_version
+        ),
+        "lifecycle_failure_suite_path": release.lifecycle_failure_suite_path,
+        "lifecycle_failure_suite_sha256": release.lifecycle_failure_suite_sha256,
+        "lifecycle_failure_suite_version": release.lifecycle_failure_suite_version,
+        "lifecycle_case_count": PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT,
+        "failure_mode_case_count": len(PLAYER_REQUIRED_FAILURE_MODES),
+        "required_replays": release.required_replays,
+        "failed_cases": 0,
+        "execution_version": PLAYER_PROMOTION_EXECUTION_VERSION,
+        "adapter_kind": "responses_api",
+        "requested_model": release.requested_model,
+        "requested_reasoning_effort": release.requested_reasoning_effort,
+        "proposal_only": True,
+    }
+    if any(value.get(key) != expected for key, expected in expected_scalars.items()):
+        return False
+
+    exact_lists: dict[str, list[JsonValue]] = {
+        "reviewed_corpus_case_ids": list(release.reviewed_corpus_case_ids),
+        "lifecycle_case_ids": [
+            cast(str, case["case_id"]) for case in release.lifecycle_failure_suite_cases
+        ],
+        "failure_mode_case_ids": [
+            cast(str, case["case_id"]) for case in release.failure_mode_cases
+        ],
+        "required_case_families": list(release.required_case_families),
+        "failed_case_ids": [],
+        "canonical_replay_digests": list(release.canonical_replay_digests),
+        # The gate only emits evidence after recomputing each observed digest
+        # and matching it to the versioned canonical digest for that replay.
+        "replay_digests": list(release.canonical_replay_digests),
+    }
+    if any(value.get(key) != expected for key, expected in exact_lists.items()):
+        return False
+
+    replay_ids = value.get("replay_execution_ids")
+    legacy_replay_ids = value.get("replay_ids")
+    if (
+        not isinstance(replay_ids, list)
+        or replay_ids != legacy_replay_ids
+        or len(replay_ids) != release.required_replays
+        or not all(isinstance(item, str) and _uuid_text(item) for item in replay_ids)
+    ):
+        return False
+    replay_id_texts = cast(list[str], replay_ids)
+    if len(set(replay_id_texts)) != len(replay_id_texts):
+        return False
+
+    lifecycle_observations = value.get("lifecycle_observations")
+    if not isinstance(lifecycle_observations, list) or len(
+        lifecycle_observations
+    ) != len(release.lifecycle_failure_suite_cases):
+        return False
+    for case, observation_value in zip(
+        release.lifecycle_failure_suite_cases, lifecycle_observations, strict=True
+    ):
+        if not isinstance(observation_value, dict):
+            return False
+        if compare_lifecycle_observation(case, observation_value) is not None:
+            return False
+
+    failure_observations = value.get("failure_mode_observations")
+    if not isinstance(failure_observations, list) or len(failure_observations) != len(
+        release.failure_mode_cases
+    ):
+        return False
+    for case, observation_value in zip(
+        release.failure_mode_cases, failure_observations, strict=True
+    ):
+        if not isinstance(observation_value, dict):
+            return False
+        if compare_failure_observation(case, observation_value) is not None:
+            return False
+    return True
 
 
 def player_classifier_proposal_contains_player(
@@ -2458,16 +1372,14 @@ def player_classifier_proposal_contains_player(
     if payload.get("opportunity_type") == "player_match_availability":
         return True
     output = payload.get("output")
-    candidate_containers: list[JsonValue] = [payload]
+    containers: list[JsonValue] = [payload]
     if isinstance(output, dict):
-        candidate_containers.append(output)
-    for container in candidate_containers:
+        containers.append(output)
+    for container in containers:
         if not isinstance(container, dict):
             continue
         candidates = container.get("candidates")
-        if not isinstance(candidates, list):
-            continue
-        if any(
+        if isinstance(candidates, list) and any(
             isinstance(candidate, dict)
             and candidate.get("opportunity_type") == "player_match_availability"
             for candidate in candidates
@@ -2481,7 +1393,7 @@ def player_classifier_promotion_is_approved(
     *,
     proposal: dict[str, JsonValue] | None = None,
 ) -> bool:
-    """Validate durable approval against the exact release and fresh evidence."""
+    """Validate an approval against the exact release and fresh evidence."""
     try:
         release = describe_player_classifier_release()
         if not isinstance(approval, dict) or set(approval) != {
@@ -2497,11 +1409,10 @@ def player_classifier_promotion_is_approved(
             or approval.get("contract_version") != release.contract_version
             or approval.get("release_fingerprint") != release.release_fingerprint
             or approval.get("state") != "approved"
+            or not _promotion_evidence_is_valid(release, approval.get("evidence"))
         ):
             return False
-        if approval.get("evidence") != player_classifier_promotion_evidence(release):
-            return False
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
         return False
     if proposal is None:
         return True

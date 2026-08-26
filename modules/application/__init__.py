@@ -8637,6 +8637,21 @@ class RuntimeApplication:
         )
         return result is ConsumeResult.APPLIED
 
+    def redeliver_contract(self, incoming: RawContractEnvelope) -> bool:
+        """Replay an owned durable contract through its idempotency boundary."""
+        if incoming.consumer is not self.role:
+            raise RuntimeError("runtime role cannot consume another owner's contract")
+        if incoming.contract_version not in self.versions_for(incoming.contract_name):
+            raise ValueError("contract version is unsupported by this runtime")
+        envelope = ContractEnvelope.from_raw(incoming)
+        result = self.store.consume(
+            incoming=envelope,
+            supported_versions=self.versions_for(incoming.contract_name),
+            received_at=self.clock.now(),
+            outgoing=None,
+        )
+        return result is ConsumeResult.APPLIED
+
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
         claimed = self.store.claim_next(

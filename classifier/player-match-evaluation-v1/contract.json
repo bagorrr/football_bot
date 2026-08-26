@@ -23,32 +23,37 @@
     "release_evaluation": "reviewed cases contain independent expected outcomes, normalized facts, and source-bound evidence"
   },
   "controlled_classifier": {
-    "path": "modules/classifier_promotion.py:ControlledPlayerClassifierAdapter",
-    "version": "player-controlled-classifier-v1",
-    "adapter_kind": "controlled_deterministic_pipeline",
+    "path": "modules/player_promotion_runtime.py:ControlledPlayerClassifierAdapter",
+    "version": "player-controlled-classifier-v2",
+    "adapter_kind": "responses_api",
     "case_count": 38,
-    "observations_are_independent": true
+    "observations_are_independent": true,
+    "fixture_path": "classifier/player-match-evaluation-v1/controlled-model-responses.json",
+    "fixture_version": "player-match-controlled-responses-v1"
   },
   "controlled_lifecycle_failure_suite": {
     "path": "classifier/player-match-evaluation-v1/lifecycle-failure-suite.json",
-    "version": "player-match-lifecycle-failure-v3"
+    "version": "player-match-lifecycle-failure-v4"
   },
   "promotion_gate": {
     "deterministic": true,
     "required_replays": 3,
     "max_failures": 0,
-    "adapter_kind": "controlled_deterministic_pipeline",
+    "adapter_kind": "responses_api",
     "requested_model": "gpt-5.6-sol",
     "requested_reasoning_effort": "high",
     "proposal_only": true,
     "real_source_publication_allowed": false,
     "executes_reviewed_corpus": true,
-    "executes_lifecycle_failure_suite": true
+    "executes_lifecycle_failure_suite": true,
+    "controlled_transport": true,
+    "fresh_durable_state_per_case": true,
+    "process_isolated_replays": true
   },
   "canonical_replay_digests": [
-    "f4ea83f31d9abbe618dbaaecf8553da3e0cc72bb2bc95c985ce1afce3c945d34",
-    "699bfd82131fab424f067aaaff186ad8793f4eb250ae15311a78603bea6b4f9f",
-    "f42069348e90efa3f457801a145115b7c92a5c520e4b9e74c956a9b1067cb53d"
+    "872a417bd657f2f392d2c6cb36a02b3bc29e20fa9040bf1a5fc235613aabce35",
+    "64be56459cb2bceb06853a3233c2bc94ac9014dfac694404f918be607d47c7e3",
+    "d734dd92c3a0d7b02f375ab891dfa77bbbbded8017db53ce24b0697c6ceccb78"
   ],
   "required_case_families": [
     "routing",

@@ -8,7 +8,8 @@
     "schema_version": {"const": "source-message-classification-v3"},
     "disposition": {"enum": ["accepted", "needs_second_pass", "needs_review", "irrelevant", "unresolved"]},
     "candidates": {"type": "array", "maxItems": 8},
-    "routing": {"$ref": "#/$defs/routing"}
+    "routing": {"$ref": "#/$defs/routing"},
+    "facts": {"$ref": "#/$defs/factObservations"}
   },
   "allOf": [
     {
@@ -25,6 +26,17 @@
     }
   ],
   "$defs": {
+    "factObservations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_count", "opportunity_types", "source_evidence", "normalized"],
+      "properties": {
+        "candidate_count": {"type": "integer", "minimum": 0},
+        "opportunity_types": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}},
+        "source_evidence": {"type": "object", "minProperties": 1, "maxProperties": 8, "additionalProperties": {"type": "string", "minLength": 1}},
+        "normalized": {"type": "object"}
+      }
+    },
     "routing": {
       "type": "object",
       "additionalProperties": false,

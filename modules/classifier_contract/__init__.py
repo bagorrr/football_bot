@@ -125,6 +125,7 @@ def classifier_output_is_schema_valid(
             output,
             body=body,
             allow_player_match_availability=True,
+            allow_fact_observations=True,
         )
     if (
         set(output) != {"schema_version", "disposition", "candidates"}
@@ -282,9 +283,12 @@ def _classifier_output_v2_is_schema_valid(
     *,
     body: str,
     allow_player_match_availability: bool = False,
+    allow_fact_observations: bool = False,
 ) -> bool:
     """Validate the additive multi-candidate and alternatives contract."""
-    if set(output) != {"schema_version", "disposition", "candidates", "routing"}:
+    required_keys = {"schema_version", "disposition", "candidates", "routing"}
+    allowed_keys = required_keys | ({"facts"} if allow_fact_observations else set())
+    if not required_keys.issubset(output) or not set(output).issubset(allowed_keys):
         return False
     disposition = output.get("disposition")
     candidates = output.get("candidates")
@@ -295,6 +299,10 @@ def _classifier_output_v2_is_schema_valid(
         "reason_code",
         "required_context",
     }:
+        return False
+    if "facts" in output and not _fact_observations_is_schema_valid(
+        output["facts"], body=body, candidates=candidates
+    ):
         return False
     reason_code = routing.get("reason_code")
     required_context = routing.get("required_context")
@@ -379,6 +387,31 @@ def _classifier_output_v2_is_schema_valid(
     if isinstance(expected_reason, set):
         return reason_code in expected_reason
     return reason_code == expected_reason
+
+
+def _fact_observations_is_schema_valid(
+    value: JsonValue, *, body: str, candidates: list[JsonValue]
+) -> bool:
+    """Validate optional model-emitted facts carried by the Player v3 output."""
+    if not isinstance(value, dict) or set(value) != {
+        "candidate_count",
+        "opportunity_types",
+        "source_evidence",
+        "normalized",
+    }:
+        return False
+    candidate_count = value.get("candidate_count")
+    opportunity_types = value.get("opportunity_types")
+    return (
+        isinstance(candidate_count, int)
+        and not isinstance(candidate_count, bool)
+        and candidate_count == len(candidates)
+        and isinstance(opportunity_types, list)
+        and len(opportunity_types) <= 8
+        and all(isinstance(item, str) and item for item in opportunity_types)
+        and _source_bound_text_map(value.get("source_evidence"), body)
+        and isinstance(value.get("normalized"), dict)
+    )
 
 
 def _source_bound_text_map(value: JsonValue, body: str) -> bool:

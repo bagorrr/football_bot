@@ -1861,10 +1861,12 @@ class AcceptanceSpine:
         roles: Mapping[RuntimeRole, AcceptanceRole],
         observer: AcceptanceObserver,
         restart_role: Callable[[RuntimeRole], AcceptanceRole],
+        admin_database_url: str,
     ) -> None:
         self._roles = dict(roles)
         self._observer = observer
         self._restart_role = restart_role
+        self._admin_database_url = admin_database_url
 
     def restart(self, role: RuntimeRole) -> AcceptanceSpine:
         """Reconnect exactly one runtime role without replacing the others."""
@@ -2082,6 +2084,40 @@ class AcceptanceSpine:
         """Observe durable primary-classifier provenance."""
         return self._observer.classification_attempts()
 
+    def classification_proposals_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Classification's serialized proposal at the public seam."""
+        return self._observer.classification_proposals_for_revision(
+            source_message_revision_id
+        )
+
+    def classifier_commands_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Classification commands emitted by Application."""
+        return self._observer.classifier_commands_for_revision(
+            source_message_revision_id
+        )
+
+    def redeliver_classifier_command(self, source_message_revision_id: str) -> bool:
+        """Redeliver one durable classifier command through Classification."""
+        commands = self.classifier_commands_for_revision(source_message_revision_id)
+        if len(commands) != 1:
+            raise ValueError("expected exactly one classifier command")
+        return self._roles[RuntimeRole.CLASSIFICATION].redeliver_contract(commands[0])
+
+    def redeliver_classification_proposal(
+        self, source_message_revision_id: str
+    ) -> bool:
+        """Redeliver one serialized proposal through Application."""
+        proposals = self.classification_proposals_for_revision(
+            source_message_revision_id
+        )
+        if not proposals:
+            raise ValueError("classification proposal does not exist")
+        return self._roles[RuntimeRole.APPLICATION].redeliver_contract(proposals[-1])
+
     def classification_queue_health(self) -> ClassificationQueueHealth:
         """Observe low-cardinality classifier operations at the public seam."""
         role = self._roles[RuntimeRole.CLASSIFICATION]
@@ -2117,7 +2153,20 @@ class AcceptanceSpine:
             and release_fingerprint != release.release_fingerprint
         ):
             raise ValueError("promotion fingerprint must match the reviewed release")
-        evidence = player_classifier_promotion_evidence(release)
+        try:
+            evidence = player_classifier_promotion_evidence(release)
+        finally:
+            # Replay workers provision the same cluster-global runtime role
+            # names on their isolated databases.  Restore this spine's
+            # credentials before the caller continues using its application
+            # and recommendation stores.
+            from modules.postgres_adapter import PostgresAcceptanceMigrator
+
+            passwords = _TESTKIT_RUNTIME_PASSWORDS.get(self._admin_database_url)
+            if passwords is not None:
+                PostgresAcceptanceMigrator(
+                    self._admin_database_url
+                ).provision_runtime_credentials(passwords)
         promotion: dict[str, JsonValue] = {
             "release_name": PLAYER_CLASSIFIER_RELEASE_NAME,
             "contract_version": release.contract_version,
@@ -3505,6 +3554,7 @@ def boot_acceptance_spine(
         roles={role: restart_role(role) for role in RuntimeRole},
         observer=PostgresAcceptanceObserver(admin_database_url),
         restart_role=restart_role,
+        admin_database_url=admin_database_url,
     )
 
 
