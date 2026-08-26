@@ -10,7 +10,7 @@
     "output_tokens": 0
   },
   "canonical_digests": {
-    "artifact_records_sha256": "735c2a03d62e7a387abd61987d1b181decae0c2a580c791545555cd7e9a9c250",
+    "artifact_records_sha256": "f86a19280b1a2f403be42d87dd6e0fd6fec93c9b397ff894ed1df3560670d25d",
     "case_manifest_sha256": "5e6bb07d657f9c15e0839a2202da5056e3b8d82e02faedc4394d8245ddc8111c",
     "promotion_fixtures_sha256": "2aa48e5bada70abfe68eaf7f57b065a4384de4fe1a7c43360a8bb297d5ed8a5f",
     "recorded_outputs_sha256": "0cdc65dd3d2928b594ba89e239a4589fb1b4d9752ddeae96329c968ba2a01ba5",
@@ -52,7 +52,7 @@
     "source_corpus_case_count": 38
   },
   "expected_digests": {
-    "artifact_records_sha256": "735c2a03d62e7a387abd61987d1b181decae0c2a580c791545555cd7e9a9c250",
+    "artifact_records_sha256": "f86a19280b1a2f403be42d87dd6e0fd6fec93c9b397ff894ed1df3560670d25d",
     "request_manifests_sha256": "9046dcacd566a20568d1eafcead2228939e6bc01787ee5fcf1eafb4a945bcdb4"
   },
   "selected_execution": {
@@ -81,7 +81,7 @@
       "semantic_proof_execution_count": 4,
       "output_artifact_sha256": "92b937d3525ac25aa943d595715a5293c0fbcec14a50c21340062acc9b3e4337",
       "protocol_artifact_sha256": "73fda499e962bae50ccf2c7b47c358e50be3c0d8cc571f42dfe476cef6b25398",
-      "execution_artifact_sha256": "262eda04e2dce815607e08ab42c29342dc40b4bac33b74505796aa24b2b88b4f"
+    "execution_artifact_sha256": "efc9cf81f7393d81ebd4e3ef42a66aeb75edf709e879a9b0fbda46ce6c8db0df"
     }
   },
   "expected_publication_outcomes": {
@@ -111,7 +111,7 @@
     },
     "artifact_manifest": {
       "path": "tests/classifier_regression/evidence/v3_artifact_manifest.json",
-      "sha256": "f30da9871a1eb1e5dae837182a37f2fbcdff020aedc38984cbdf5575f76ff0b2"
+      "sha256": "693bde3929a6a7fd18aded99876152a5f56fc600e3310e6fa2acb5ef74bbf999"
     },
     "semantic_proofs": {
       "path": "tests/classifier_regression/evidence/v3_semantic_proofs.json",
@@ -119,15 +119,15 @@
     },
     "selected_execution_anchor": {
       "path": "tests/classifier_regression/evidence/v3_selected_execution_anchor.json",
-      "sha256": "1615e61e979818aa1e88166b61bc8f8297633e1a97327fca683b825e76a26e5a"
+      "sha256": "44816ed990daa15014266ac313d6fcbe4964e9106f68e150798884c2e56d9af6"
     },
     "artifact:open-match-primary-v3:prompt_filename": {
       "path": "classifier/open-match-primary-v3/prompt.md",
-      "sha256": "1b394971fc64c89c959673a0da6ae9eaa4cd8b30368b550bf0dd6a7f63abc6d8"
+      "sha256": "e620eef019875915a082d8d5b159eac6806532906f901d4db581c3ba20b4e3ed"
     },
     "artifact:open-match-primary-v3:schema_filename": {
       "path": "classifier/open-match-primary-v3/source-message-classification-v3.schema.json",
-      "sha256": "e0c0f123a24dc3e7f0180f4b3cbfe8d04f006417c4dae7bf766b5015588a343c"
+      "sha256": "d15152aec7c51217006baec21c002029ed7aae23eee27f44aeba669209204732"
     },
     "artifact:open-match-primary-v3:provenance_filename": {
       "path": "classifier/open-match-primary-v3/provenance.json",
@@ -135,11 +135,11 @@
     },
     "artifact:open-match-ambiguity-v2:prompt_filename": {
       "path": "classifier/open-match-ambiguity-v2/prompt.md",
-      "sha256": "4b9932c71b217ccbdbd4903ebca42c774ca376fbbf85dcb155aa5ff6ab23fc71"
+      "sha256": "ccac0d45faaa66168c131ffa5f9862c218414cb7f01dcf378a20a11e3999a03b"
     },
     "artifact:open-match-ambiguity-v2:schema_filename": {
       "path": "classifier/open-match-ambiguity-v2/source-message-classification-v3.schema.json",
-      "sha256": "e0c0f123a24dc3e7f0180f4b3cbfe8d04f006417c4dae7bf766b5015588a343c"
+      "sha256": "fcb632bcd44843f2d527d6d946c0803a9fa687164103f95158f744d9882ceb1c"
     },
     "artifact:open-match-ambiguity-v2:provenance_filename": {
       "path": "classifier/open-match-ambiguity-v2/provenance.json",
@@ -147,11 +147,11 @@
     },
     "artifact:open-match-semantic-proof-v2:prompt_filename": {
       "path": "classifier/open-match-semantic-proof-v2/prompt.md",
-      "sha256": "bc8af92dae6f4ac672f748bb086388145813d50a2738aa34a310dbebe0f8cb92"
+      "sha256": "f5252fd954df422c86347beb5b3aa12dd758ebf539570602bc7396186f428e1b"
     },
     "artifact:open-match-semantic-proof-v2:schema_filename": {
       "path": "classifier/open-match-semantic-proof-v2/source-semantic-proof-v2.schema.json",
-      "sha256": "41722e8e6229d2f49f983406b1cac24a3cd191d576644707955fd7298c079b6a"
+      "sha256": "d064778fe255b7dfb69a3ef50cb30fa65814176b951e2d3977fd6920bf2e1c59"
     },
     "artifact:open-match-semantic-proof-v2:provenance_filename": {
       "path": "classifier/open-match-semantic-proof-v2/provenance.json",

@@ -97,6 +97,7 @@ class CodexCliClassifierAdapter:
         codex_version: str,
         adapter_version: str,
         smoke_test: Callable[[], bool] | None = None,
+        primary_schema_version: str | None = None,
     ) -> None:
         self._codex_executable = codex_executable
         self._codex_home = codex_home
@@ -106,6 +107,47 @@ class CodexCliClassifierAdapter:
         self._runner = runner
         self._codex_version = codex_version
         self._adapter_version = adapter_version
+        v2_primary_available = (
+            "source-message-classification-v2" in self._schema_paths
+            and "open-match-primary-v2" in self._prompt_paths
+        )
+        v3_artifacts_complete = (
+            "source-message-classification-v3" in self._schema_paths
+            and "open-match-primary-v3" in self._prompt_paths
+            and "open-match-ambiguity-v2" in self._prompt_paths
+            and "source-semantic-proof-v2" in self._schema_paths
+            and "open-match-semantic-proof-v2" in self._prompt_paths
+        )
+        if primary_schema_version is None:
+            available_versions = [
+                version
+                for version, available in (
+                    ("source-message-classification-v2", v2_primary_available),
+                    ("source-message-classification-v3", v3_artifacts_complete),
+                )
+                if available
+            ]
+            if not available_versions:
+                raise ValueError("no complete primary classifier artifact set")
+            if len(available_versions) > 1:
+                raise ValueError(
+                    "classifier artifact version requires explicit activation"
+                )
+            primary_schema_version = available_versions[0]
+        if primary_schema_version == "source-message-classification-v3" and not (
+            v3_artifacts_complete
+        ):
+            raise ValueError("incomplete v3 classifier artifact set")
+        if primary_schema_version == "source-message-classification-v2" and not (
+            v2_primary_available
+        ):
+            raise ValueError("incomplete v2 classifier artifact set")
+        self._primary_schema_version = primary_schema_version
+        if self._primary_schema_version not in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise ValueError("unsupported primary classifier schema version")
         self._smoke_test = smoke_test
 
     @property
@@ -116,7 +158,7 @@ class CodexCliClassifierAdapter:
     def primary_schema_version(self) -> str:
         # v3 remains evaluation-only until its promotion gate is accepted;
         # v2 is the compatible runtime contract for opponent_request.
-        return "source-message-classification-v2"
+        return self._primary_schema_version
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False
@@ -213,10 +255,14 @@ def _integer_metric(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, object]:
+def _codex_jsonl_result(
+    stdout: str, *, argv: tuple[str, ...] | None = None
+) -> dict[str, object]:
     """Extract the final structured message and usage from Codex JSONL."""
     final_text: str | None = None
     usage: dict[str, object] = {}
+    effective_model = ""
+    effective_reasoning_effort = ""
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -238,8 +284,29 @@ def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, obje
             and isinstance(item.get("text"), str)
         ):
             final_text = cast(str, item["text"])
-        if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
-            usage = cast(dict[str, object], event["usage"])
+        if event_type == "turn.completed":
+            if isinstance(event.get("usage"), dict):
+                usage = cast(dict[str, object], event["usage"])
+            for key in ("effective_model", "model"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    effective_model = value
+                    break
+            for key in ("effective_reasoning_effort", "reasoning_effort"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    effective_reasoning_effort = value
+                    break
+            provider_metadata = event.get("provider_metadata")
+            if isinstance(provider_metadata, dict):
+                if not effective_model:
+                    value = provider_metadata.get("effective_model")
+                    if isinstance(value, str) and value.strip():
+                        effective_model = value
+                if not effective_reasoning_effort:
+                    value = provider_metadata.get("effective_reasoning_effort")
+                    if isinstance(value, str) and value.strip():
+                        effective_reasoning_effort = value
     if final_text is None:
         raise RuntimeError("Codex classifier emitted no final agent message")
     try:
@@ -248,16 +315,19 @@ def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, obje
         raise RuntimeError("Codex classifier final message is not JSON") from error
     if not isinstance(output, dict):
         raise RuntimeError("Codex classifier final output is not an object")
-    try:
-        model = argv[argv.index("--model") + 1]
-    except (ValueError, IndexError) as error:
-        raise RuntimeError(
-            "Codex classifier command omitted its pinned model"
-        ) from error
+    if not effective_model and argv is not None:
+        try:
+            effective_model = argv[argv.index("--model") + 1]
+        except (ValueError, IndexError) as error:
+            raise RuntimeError(
+                "Codex classifier command omitted its pinned model"
+            ) from error
+    if not effective_reasoning_effort and argv is not None:
+        effective_reasoning_effort = "high"
     return {
         "output": output,
-        "effective_model": model,
-        "effective_reasoning_effort": "high",
+        "effective_model": effective_model,
+        "effective_reasoning_effort": effective_reasoning_effort,
         "input_tokens": _integer_metric(usage.get("input_tokens")),
         "output_tokens": _integer_metric(usage.get("output_tokens")),
     }

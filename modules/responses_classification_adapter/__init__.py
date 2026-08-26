@@ -38,11 +38,53 @@ class ResponsesClassifierAdapter:
         prompt_paths: Mapping[str, Path],
         adapter_version: str,
         smoke_test: Callable[[], bool] | None = None,
+        primary_schema_version: str | None = None,
     ) -> None:
         self._transport = transport
         self._schemas = dict(schemas)
         self._prompt_paths = dict(prompt_paths)
         self._adapter_version = adapter_version
+        v2_primary_available = (
+            "source-message-classification-v2" in self._schemas
+            and "open-match-primary-v2" in self._prompt_paths
+        )
+        v3_artifacts_complete = (
+            "source-message-classification-v3" in self._schemas
+            and "open-match-primary-v3" in self._prompt_paths
+            and "open-match-ambiguity-v2" in self._prompt_paths
+            and "source-semantic-proof-v2" in self._schemas
+            and "open-match-semantic-proof-v2" in self._prompt_paths
+        )
+        if primary_schema_version is None:
+            available_versions = [
+                version
+                for version, available in (
+                    ("source-message-classification-v2", v2_primary_available),
+                    ("source-message-classification-v3", v3_artifacts_complete),
+                )
+                if available
+            ]
+            if not available_versions:
+                raise ValueError("no complete primary classifier artifact set")
+            if len(available_versions) > 1:
+                raise ValueError(
+                    "classifier artifact version requires explicit activation"
+                )
+            primary_schema_version = available_versions[0]
+        if primary_schema_version == "source-message-classification-v3" and not (
+            v3_artifacts_complete
+        ):
+            raise ValueError("incomplete v3 classifier artifact set")
+        if primary_schema_version == "source-message-classification-v2" and not (
+            v2_primary_available
+        ):
+            raise ValueError("incomplete v2 classifier artifact set")
+        self._primary_schema_version = primary_schema_version
+        if self._primary_schema_version not in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise ValueError("unsupported primary classifier schema version")
         self._smoke_test = smoke_test
 
     @property
@@ -53,7 +95,7 @@ class ResponsesClassifierAdapter:
     def primary_schema_version(self) -> str:
         # v3 remains evaluation-only until its promotion gate is accepted;
         # v2 is the compatible runtime contract for opponent_request.
-        return "source-message-classification-v2"
+        return self._primary_schema_version
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False
@@ -115,7 +157,9 @@ class ResponsesClassifierAdapter:
         return ClassifierAdapterResult(
             output=cast(dict[str, JsonValue], output),
             effective_model=str(response.get("effective_model", "")),
-            effective_reasoning_effort="high",
+            effective_reasoning_effort=str(
+                response.get("effective_reasoning_effort", "")
+            ),
             codex_version="not_applicable",
             adapter_kind=self.adapter_kind,
             adapter_version=self._adapter_version,

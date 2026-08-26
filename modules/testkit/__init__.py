@@ -1045,7 +1045,13 @@ def _add_test_proposition_evidence(
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
         return
-    if opportunity_type not in {"open_match", "opponent_request", "tournament"}:
+    if opportunity_type not in {
+        "open_match",
+        "opponent_request",
+        "tournament",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }:
         return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
         return
@@ -1159,7 +1165,14 @@ def _build_test_semantic_proof(
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
         or not isinstance(routes, list)
-        or opportunity_type not in {"open_match", "opponent_request", "tournament"}
+        or opportunity_type
+        not in {
+            "open_match",
+            "tournament",
+            "opponent_request",
+            "roster_vacancy",
+            "player_transfer_availability",
+        }
     ):
         return {}
 
@@ -1246,7 +1259,10 @@ def _build_test_semantic_proof(
         )
     semantic_proof_version = (
         "source-semantic-proof-v2"
-        if output.get("schema_version") == "source-message-classification-v3"
+        if (
+            output.get("schema_version") == "source-message-classification-v3"
+            or opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+        )
         else "source-semantic-proof-v1"
     )
     return {
@@ -2544,6 +2560,7 @@ class AcceptanceSpine:
         game_search_details: dict[str, list[str]] | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         tournament_search_details: dict[str, list[str]] | None = None,
+        transfer_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2557,6 +2574,7 @@ class AcceptanceSpine:
             game_search_details=game_search_details,
             opponent_search_details=opponent_search_details,
             tournament_search_details=tournament_search_details,
+            transfer_search_details=transfer_search_details,
         )
 
     def open_game_search_details(
@@ -2810,6 +2828,111 @@ class AcceptanceSpine:
     ) -> None:
         """Drive Back from Tournament Search details."""
         self._conversation_onboarding().back_from_tournament_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the long-term transfer Details hub."""
+        self._conversation_onboarding().open_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one long-term transfer detail submenu."""
+        self._conversation_onboarding().open_transfer_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_transfer_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one temporary transfer detail value."""
+        self._conversation_onboarding().toggle_transfer_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit one transfer detail submenu through Done."""
+        self._conversation_onboarding().commit_transfer_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_transfer_search_seasonal_timing(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Select a temporary ready-now Seasonal Timing value."""
+        self._conversation_onboarding().select_transfer_search_seasonal_timing(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_seasonal_timing_start_date(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the transfer local-start-date prompt."""
+        self._conversation_onboarding().open_transfer_search_seasonal_timing_start_date(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_transfer_search_seasonal_timing_start_date_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit the transfer local-start-date text."""
+        self._conversation_onboarding().submit_transfer_search_seasonal_timing_start_date_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_seasonal_timing_season(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the transfer named-season prompt."""
+        self._conversation_onboarding().open_transfer_search_seasonal_timing_season(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_transfer_search_seasonal_timing_season_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit the transfer named-season text."""
+        self._conversation_onboarding().submit_transfer_search_seasonal_timing_season_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from a transfer detail submenu or hub."""
+        self._conversation_onboarding().back_from_transfer_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
@@ -3467,7 +3590,9 @@ def boot_acceptance_spine(
                 else None
             ),
             timezone_data=(
-                installed_timezone_data if role is RuntimeRole.BOT_ASSISTANT else None
+                installed_timezone_data
+                if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
+                else None
             ),
             telegram_admin_user_id=(
                 telegram_admin_user_id
