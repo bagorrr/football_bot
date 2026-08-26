@@ -9,6 +9,7 @@ from modules.contracts import (
     ContractName,
     JsonValue,
     RuntimeRole,
+    _validate_transfer_seasonal_timing_fact,
     derive_run_search_message_id,
 )
 
@@ -70,6 +71,13 @@ def test_transfer_search_details_accept_canonical_timing_and_direction() -> None
     )
     assert isinstance(envelope.payload, dict)
     assert envelope.payload["user_intent"] == "new_team_search"
+
+
+def test_transfer_accepted_facts_reject_noncanonical_start_date() -> None:
+    with pytest.raises(ValueError, match="date is not normalized"):
+        _validate_transfer_seasonal_timing_fact(
+            {"kind": "start_local_date", "value": "20260801"}
+        )
 
 
 def test_transfer_search_rejects_required_date() -> None:

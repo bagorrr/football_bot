@@ -13195,6 +13195,8 @@ def _transfer_assertion_signature(
         r"available|seeking|looking|need\w*|join\w*|команд\w*|"
         r"доступ\w*|ищ\w*|нужн\w*|"
         r"location|city|country|place|место|город|стран\w*|"
+        r"payment|оплат\w*|pago|paiement|campaign\w*|кампан\w*|"
+        r"recruit\w*|набор\w*|"
         r"@[a-z0-9_]{3,}|https?://|[\w.+-]+@[\w.-]+\.[a-z]{2,}|"
         r"\+?[0-9][0-9 ()-]{5,}[0-9])",
         re.IGNORECASE,
@@ -16201,6 +16203,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"squad\s+(?:vacanc\w*|opening|spot)|season(?:al)?|long[- ]term|"
             r"набор\w*|нужн\w*\s+игрок\w*|требу\w*|постоян\w*|"
             r"долгосроч\w*|перспектив\w*|усилен\w*|сезон\w*|"
+            r"campaign\w*|recruit\w*|"
             r"команд\w*\s+ищ\w*|"
             r"plantilla\s+(?:vacante|abierta)|temporad\w*|effectif\s+vacant|"
             r"saison\w*)\b",
@@ -16210,6 +16213,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
         long_term = re.search(
             r"\b(?:transfer|available\s+for\s+(?:a\s+)?move|looking\s+for\s+"
             r"a\s+team|seeking\s+a\s+team|join\s+(?:a\s+)?team|long[- ]term|season|"
+            r"campaign\w*|"
             r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
             r"сезон\w*|постоян\w*|долгосроч\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
             r"equip\w*|transfert|cherche\w*\s+une\s+équipe)\b",
@@ -16247,6 +16251,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"long[- ]term|transfer|available\s+for\s+(?:a\s+)?move|"
             r"looking\s+for\s+a\s+team|seeking\s+a\s+team|"
             r"join\s+(?:a\s+)?team|vacanc\w*|"
+            r"campaign\w*|recruit\w*|"
             r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
             r"сезон\w*\s+(?:набор\w*|ваканси\w*|переход\w*)|"
             r"disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+equip\w*|"
@@ -16314,6 +16319,15 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"footballeurs|coéquipiers)\b",
         normalized_body,
     )
+    singular_player_references = re.findall(
+        r"\b(?:one|a|an|another|один|одна|un|una|une)\s+"
+        r"(?:player|footballer|teammate|игрок\w*|футболист\w*|товарищ\w*|"
+        r"jugador\w*|futbolista\w*|compañero\w*|joueur\w*|footballeur\w*)\b",
+        normalized_body,
+    )
+    single_player_with_multiple_positions = (
+        multiple_position_terms is not None and len(singular_player_references) == 1
+    )
     named_multiple_players_pattern = re.compile(
         r"\b[A-ZА-ЯЁ][\w'’-]+\s+(?:and|&|y|et|и)\s+"
         r"[A-ZА-ЯЁ][\w'’-]+\b|"
@@ -16325,8 +16339,8 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         for clause in candidate_clauses
     )
     return (
-        multiple_position_terms is None
-        and explicit_multiple_players is None
+        (multiple_position_terms is None or single_player_with_multiple_positions)
+        and (explicit_multiple_players is None or single_player_with_multiple_positions)
         and plural_position_or_count is None
         and not named_multiple_players
         and re.search(

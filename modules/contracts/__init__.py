@@ -2580,9 +2580,11 @@ def _validate_transfer_seasonal_timing_fact(value: JsonValue) -> None:
         raise ValueError("transfer Seasonal Timing value is invalid")
     if kind == "start_local_date":
         try:
-            date.fromisoformat(raw_value)
+            parsed = date.fromisoformat(raw_value)
         except ValueError as error:
             raise ValueError("transfer Seasonal Timing date is invalid") from error
+        if parsed.isoformat() != raw_value:
+            raise ValueError("transfer Seasonal Timing date is not normalized")
         return
     if kind == "stated_season":
         if len(raw_value) > 80 or raw_value != raw_value.casefold():

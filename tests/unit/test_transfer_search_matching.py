@@ -471,6 +471,37 @@ def test_transfer_freshness_tracks_location_but_ignores_filler() -> None:
     )
 
 
+def test_transfer_freshness_tracks_payment_changes() -> None:
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body="Long-term roster vacancy for a goalkeeper. Payment: free.",
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+    )
+    payment_edit = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body="Long-term roster vacancy for a goalkeeper. Payment: paid.",
+        event_time=datetime(2026, 8, 1, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 1, 8, tzinfo=UTC),
+    )
+    assert (
+        _source_transfer_qualifying_assertion_at(
+            payment_edit,
+            (created, payment_edit),
+            "roster_vacancy",
+        )
+        == payment_edit.event_time
+    )
+
+
 def test_transfer_unrelated_prose_edit_does_not_renew_source_assertion() -> None:
     created = SourceMessageRevision(
         source_message_revision_id="source:revision:1",
@@ -593,6 +624,16 @@ def test_transfer_source_start_date_is_current_or_future_in_place_timezone(
             "roster_vacancy",
             False,
         ),
+        (
+            "Recruiting a goalkeeper for the 2026/27 campaign in Saint Petersburg.",
+            "roster_vacancy",
+            True,
+        ),
+        (
+            "A goalkeeper is available for the 2026/27 campaign in Saint Petersburg.",
+            "player_transfer_availability",
+            True,
+        ),
     ),
 )
 def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
@@ -638,6 +679,10 @@ def test_transfer_ready_now_evidence_requires_current_timing(
         (
             "Long-term player transfer availability: need a goalkeeper for "
             "the 2026-2027 season on Petrogradskaya. Message @transfer_contact",
+            True,
+        ),
+        (
+            "One player, a goalkeeper and defender are available for a transfer.",
             True,
         ),
         ("Футболист доступен для перехода.", True),
