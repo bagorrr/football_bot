@@ -133,6 +133,34 @@ def test_localized_tournament_opening_dates_must_be_current(
     )
 
 
+def test_tournament_opening_date_uses_event_local_calendar() -> None:
+    evidence = "Registration opens 1 September 2026"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 0, 30, tzinfo=ZoneInfo("UTC")),
+        event_timezone=ZoneInfo("America/New_York"),
+    )
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 4, 30, tzinfo=ZoneInfo("UTC")),
+        event_timezone=ZoneInfo("America/New_York"),
+    )
+
+
+def test_spanish_explicit_opening_year_is_not_replaced_by_validation_year() -> None:
+    evidence = "Las entradas estarán abiertas el 1 de septiembre de 2027"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 12, 0, tzinfo=ZoneInfo("UTC")),
+        event_timezone=ZoneInfo("Europe/Madrid"),
+    )
+
+
 def test_registration_form_or_route_is_not_open_participation_evidence() -> None:
     evidence = "Registration form available: https://example.test/apply"
 

@@ -15574,6 +15574,10 @@ def _validated_tournament_proposal(
         )
     except ValueError:
         return None
+    try:
+        event_timezone = ZoneInfo(str(event_time.get("iana_timezone")))
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
     if (
         not _optional_canonical_list(
             team_formats,
@@ -15604,6 +15608,7 @@ def _validated_tournament_proposal(
             str(evidence[participation_field]),
             authoritative_body=validation_body,
             validation_time=validation_time,
+            event_timezone=event_timezone,
         )
         or not _optional_values_are_supported(
             candidate,
@@ -15798,6 +15803,7 @@ def _tournament_open_participation_is_supported(
     *,
     authoritative_body: str,
     validation_time: datetime | None = None,
+    event_timezone: ZoneInfo | None = None,
 ) -> bool:
     """Require an affirmative, current registration or participation opening."""
     normalized = evidence.casefold()
@@ -15884,7 +15890,11 @@ def _tournament_open_participation_is_supported(
     if explicit_opening_date is not None:
         if validation_time is None or validation_time.tzinfo is None:
             return False
-        if explicit_opening_date > validation_time.date():
+        comparison_timezone = event_timezone or validation_time.tzinfo
+        if (
+            explicit_opening_date
+            > validation_time.astimezone(comparison_timezone).date()
+        ):
             return False
     positive_patterns = (
         r"\b(?:open\w*|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
@@ -15984,7 +15994,7 @@ def _tournament_explicit_opening_date(
     )
     date_patterns = (
         rf"(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+de)?\s+(?P<month>{month_names})"
-        rf"(?:\s+(?P<year>20\d{{2}}))?",
+        rf"(?:\s+(?:de\s+)?(?P<year>20\d{{2}}))?",
         rf"(?P<month>{month_names})\s+(?P<day>\d{{1,2}})"
         rf"(?:st|nd|rd|th)?(?:,?\s+(?P<year>20\d{{2}}))?",
     )
