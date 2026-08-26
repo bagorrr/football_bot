@@ -162,13 +162,13 @@ def test_tournament_card_with_missing_current_projection_fails_closed() -> None:
     assert "Contact:" not in message.text
 
 
-def test_tournament_card_with_deleted_current_projection_is_unavailable() -> None:
+def test_tournament_card_with_suppressed_current_projection_is_unavailable() -> None:
     message = _tournament_result_message(
-        delivery_id="delivery:tournament:deleted",
+        delivery_id="delivery:tournament:suppressed",
         telegram_user_id=49_118,
         locale="en",
         screen_revision=4,
-        result=_result(publication_state="deleted"),
+        result=_result(publication_state="suppressed"),
     )
 
     assert "Unavailable" in message.text

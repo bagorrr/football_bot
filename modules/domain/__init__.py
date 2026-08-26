@@ -1492,8 +1492,11 @@ def tournament_publication_state_as_of(
     as_of: datetime,
 ) -> str:
     """Return the fail-closed Tournament publication state at a read time."""
+    canonical_states = {"active", "held_for_review", "suppressed", "expired"}
+    if current_publication_state not in canonical_states:
+        return "suppressed"
     if current_publication_state != "active":
-        return current_publication_state or "suppressed"
+        return current_publication_state
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         return "suppressed"
     try:

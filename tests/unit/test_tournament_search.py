@@ -182,6 +182,18 @@ def test_tournament_publication_state_missing_projection_fails_closed() -> None:
     )
 
 
+def test_tournament_publication_state_rejects_deletion_and_unknown_states() -> None:
+    for invalid_state in ("deleted", "unknown"):
+        assert (
+            tournament_publication_state_as_of(
+                _tournament().accepted_facts,
+                current_publication_state=invalid_state,
+                as_of=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+            )
+            == "suppressed"
+        )
+
+
 def test_tournament_details_use_or_within_a_field_and_and_across_fields() -> None:
     valid = _tournament()
     incomplete = replace(
