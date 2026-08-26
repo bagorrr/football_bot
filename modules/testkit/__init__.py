@@ -1228,8 +1228,13 @@ def _build_test_semantic_proof(
                 "span": {"start": 0, "end": len(body), "text": body},
             }
         )
+    contract_version = (
+        "source-semantic-proof-v2"
+        if opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+        else "source-semantic-proof-v1"
+    )
     return {
-        "contract_version": "source-semantic-proof-v1",
+        "contract_version": contract_version,
         "source_message_revision_reference": source_message_revision_reference,
         "candidate_key": candidate_key,
         "coverage": "complete_source_revision",
