@@ -7,8 +7,10 @@ evidence for the Application, never a publication decision.
 
 The proof must be bound to the supplied source-message revision reference and
 candidate key. Cover the complete source revision with exact source spans for
-the target-specific Open Match, Opponent Request, Roster Vacancy, or Player
-Transfer Availability meaning, every mandatory target fact, every present optional fact
+the target-specific Open Match, Tournament, Opponent Request, Roster Vacancy, or
+Player
+Transfer Availability meaning, every mandatory target fact, every present
+optional fact
 or payment fact, and every proposed response route. Use the target-specific
 state `current_positive` only when the source meaning currently supports that
 target. Record explicit contradiction, competition, replacement, and closure
@@ -16,6 +18,10 @@ checks, and cover each check with a typed relation. A source-valid all-positive
 proposition graph is not sufficient when ordinary language excludes individual
 players or otherwise contradicts a target proposition.
 
-Missing, ambiguous, contradictory, stale, non-target, or incomplete proof must
+The target meaning may be `open_match`, `tournament`, `opponent_request`,
+`roster_vacancy`, or `player_transfer_availability`. A tournament proof must
+cover the source-bound open-participation or registration-open fact and any
+present optional tournament facts. Missing, ambiguous, contradictory, stale,
+non-target, or incomplete proof must
 remain non-positive. The Application independently validates the exact wire
 shape, source binding, topology, state, and publication policy.

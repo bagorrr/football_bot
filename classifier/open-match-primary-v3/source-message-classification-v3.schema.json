@@ -40,13 +40,15 @@
       "required": ["candidate_key", "opportunity_type", "evidence", "source_context", "location", "response_routes"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
+        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "evidence": {"$ref": "#/$defs/evidence"},
         "source_context": {"type": "string", "minLength": 1},
         "location": {"$ref": "#/$defs/location"},
         "event_time": {"$ref": "#/$defs/eventTime"},
         "seasonal_timing": {"$ref": "#/$defs/seasonalTiming"},
         "open_places": {"type": ["integer", "null"], "minimum": 1},
+        "open_participation": {"const": true},
+        "registration_open": {"const": true},
         "opponent_request": {"const": true},
         "roster_vacancy": {"const": true},
         "player_transfer_availability": {"const": true},
@@ -54,10 +56,15 @@
         "team_formats": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"]}},
         "positions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["goalkeeper", "defender", "midfielder", "forward"]}},
         "playing_levels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["novice", "below_average", "average", "above_average", "high", "very_high", "master", "professional"]}},
-        "venue_provision": {"enum": ["team_has_venue", "needs_opponent_venue", "arrange_jointly", "unknown", null]},
         "venue_settings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["indoor", "outdoor", "covered_outdoor"]}},
         "playing_surfaces": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["natural_grass", "artificial_turf", "hard_surface", "wood_parquet"]}},
         "payment": {"enum": ["free", "paid", "unknown", null]},
+        "schedule": {"$ref": "#/$defs/tournament_fact"},
+        "registration_deadline": {"$ref": "#/$defs/tournament_fact"},
+        "structure": {"$ref": "#/$defs/tournament_fact"},
+        "capacity": {"$ref": "#/$defs/tournament_fact"},
+        "prizes": {"$ref": "#/$defs/tournament_fact"},
+        "venue_provision": {"enum": ["team_has_venue", "needs_opponent_venue", "arrange_jointly", "unknown", null]},
         "proposition_evidence": {"$ref": "#/$defs/propositionEvidence"}
       },
       "allOf": [
@@ -68,6 +75,27 @@
             "properties": {
               "evidence": {
                 "required": ["event_time", "open_places"],
+                "not": {"required": ["opponent_request", "roster_vacancy", "player_transfer_availability"]}
+              }
+            },
+            "not": {"anyOf": [{"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"const": "tournament"}}},
+          "then": {
+            "required": ["event_time"],
+            "oneOf": [
+              {"required": ["open_participation"]},
+              {"required": ["registration_open"]}
+            ],
+            "properties": {
+              "evidence": {
+                "required": ["event_time"],
+                "oneOf": [
+                  {"required": ["open_participation"]},
+                  {"required": ["registration_open"]}
+                ],
                 "not": {"required": ["opponent_request", "roster_vacancy", "player_transfer_availability"]}
               }
             },
@@ -119,6 +147,8 @@
         "location": {"type": "string", "minLength": 1},
         "seasonal_timing": {"type": "string", "minLength": 1},
         "open_places": {"type": "string", "minLength": 1},
+        "open_participation": {"type": "string", "minLength": 1},
+        "registration_open": {"type": "string", "minLength": 1},
         "opponent_request": {"type": "string", "minLength": 1},
         "roster_vacancy": {"type": "string", "minLength": 1},
         "player_transfer_availability": {"type": "string", "minLength": 1},
@@ -128,7 +158,12 @@
         "venue_provision": {"type": "string", "minLength": 1},
         "venue_settings": {"type": "string", "minLength": 1},
         "playing_surfaces": {"type": "string", "minLength": 1},
-        "payment": {"type": "string", "minLength": 1}
+        "payment": {"type": "string", "minLength": 1},
+        "schedule": {"type": "string", "minLength": 1},
+        "registration_deadline": {"type": "string", "minLength": 1},
+        "structure": {"type": "string", "minLength": 1},
+        "capacity": {"type": "string", "minLength": 1},
+        "prizes": {"type": "string", "minLength": 1}
       }
     },
     "location": {
@@ -168,6 +203,12 @@
         {"if": {"properties": {"kind": {"const": "start_local_date"}}}, "then": {"properties": {"value": {"type": "string", "format": "date"}}}},
         {"if": {"properties": {"kind": {"const": "stated_season"}}}, "then": {"properties": {"value": {"type": "string"}}}}
       ]
+    },
+    "tournament_fact": {
+      "type": ["string", "number", "array", "object"],
+      "minLength": 1,
+      "minItems": 1,
+      "minProperties": 1
     },
     "route": {
       "type": "object",
@@ -209,7 +250,7 @@
       "properties": {
         "proposition_id": {"type": "string", "minLength": 1},
         "domain": {"enum": ["football_match"]},
-        "meaning": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
+        "meaning": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "polarity": {"enum": ["positive", "negative", "ambiguous"]},
         "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
         "span": {"$ref": "#/$defs/sourceSpan"}
@@ -246,7 +287,7 @@
       "additionalProperties": false,
       "required": ["contract_version", "coverage", "root", "facts", "routes", "relations"],
       "properties": {
-        "contract_version": {"const": "source-proposition-evidence-v1"},
+        "contract_version": {"const": "source-proposition-evidence-v2"},
         "coverage": {"const": "complete_source_revision"},
         "root": {"$ref": "#/$defs/propositionRoot"},
         "facts": {
@@ -272,7 +313,7 @@
       "required": ["candidate_key", "opportunity_type", "evidence", "alternatives"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
+        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability"]},
         "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}},
         "alternatives": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["alternative_key", "evidence"], "properties": {"alternative_key": {"type": "string", "minLength": 1}, "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}}}}}
       }

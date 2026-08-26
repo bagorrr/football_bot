@@ -6,10 +6,11 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class LocaleSource(StrEnum):
@@ -752,6 +753,9 @@ class DiscoveryDraft:
     editing_opponent_search_detail: str | None = None
     opponent_search_detail_draft: tuple[str, ...] = ()
     opponent_search_exact_time_prompt: bool = False
+    tournament_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_tournament_search_detail: str | None = None
+    tournament_search_detail_draft: tuple[str, ...] = ()
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     editing_transfer_search_detail: str | None = None
     transfer_search_detail_draft: tuple[str, ...] = ()
@@ -964,6 +968,7 @@ class CompletedSearch:
     completed_at: datetime
     game_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     opponent_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    tournament_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
@@ -1555,6 +1560,254 @@ def evaluate_game_search(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)
     )
+
+
+def tournament_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, str, int, str, int, str]:
+    """Return the deterministic Tournament Search ordering key."""
+    return game_search_result_sort_key(result)
+
+
+def evaluate_tournament_search(
+    completed_search: CompletedSearch,
+    tournament_search_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Purely classify, snapshot and order one Tournament Search input set."""
+    if completed_search.user_intent is not UserIntent.TOURNAMENT_SEARCH:
+        return ()
+    matched: list[SearchResult] = []
+    for opportunity in opportunities:
+        if opportunity.opportunity_type != "tournament":
+            continue
+        facts = opportunity.accepted_facts
+        publication_state = tournament_publication_state_as_of(
+            facts,
+            current_publication_state=opportunity.publication_state,
+            as_of=completed_search.completed_at,
+        )
+        if publication_state != "active":
+            continue
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+            or facts.get("open_participation") is not True
+        ):
+            continue
+        try:
+            start = date.fromisoformat(str(facts["start_local_date"]))
+            end = date.fromisoformat(str(facts["end_local_date"]))
+        except (KeyError, ValueError):
+            continue
+        required = completed_search.required_date
+        if required is not None and (
+            end < required.start_local_date or start > required.end_local_date
+        ):
+            continue
+        detail_state_by_key = {
+            key: match_detail(
+                tournament_search_details.get(key, ()),
+                tuple(facts[key]) if facts.get(key) else None,
+            )
+            for key in (
+                "team_formats",
+                "playing_levels",
+                "venue_settings",
+                "playing_surfaces",
+            )
+        }
+        detail_state_by_key["payment"] = match_detail(
+            tournament_search_details.get("payment", ()),
+            (str(facts["payment"]),) if facts.get("payment") else None,
+        )
+        detail_state_by_key["search_area"] = match_search_area(
+            whole_city=completed_search.whole_city,
+            selected_area_ids=completed_search.sub_city_area_ids,
+            selected_area_types=completed_search.sub_city_area_geographic_types,
+            selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+            country_id=completed_search.country_id,
+            city_id=completed_search.city_id,
+            facts=facts,
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+        result_class = (
+            "possible_match" if MatchState.UNKNOWN in states else "confirmed_match"
+        )
+        route = opportunity.response_route
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "opportunity_type": "tournament",
+            "publication_state": publication_state,
+            "start_local_date": str(facts["start_local_date"]),
+            "end_local_date": str(facts["end_local_date"]),
+            "sort_local_date": max(start, required.start_local_date).isoformat()
+            if required is not None
+            else str(facts["start_local_date"]),
+            "iana_timezone": str(facts["iana_timezone"]),
+            "source_posted_at": str(facts["source_posted_at"]),
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if tournament_search_details.get(key)
+                    or (key == "search_area" and not completed_search.whole_city)
+                },
+                sort_keys=True,
+            ),
+        }
+        if facts.get("source_edited_at"):
+            card["source_edited_at"] = str(facts["source_edited_at"])
+        for locale in ("en", "ru", "es", "fr"):
+            card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
+            card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("exact_local_time"):
+            card["exact_local_time"] = str(facts["exact_local_time"])
+        if facts.get("day_part"):
+            card["day_part"] = str(facts["day_part"])
+        for key in (
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+        ):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key])
+        if facts.get("payment"):
+            card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
+        for key in (
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        ):
+            value = facts.get(key)
+            if value is not None:
+                card[key] = (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    if isinstance(value, (dict, list))
+                    else str(value)
+                )
+        matched.append(
+            SearchResult(
+                result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=result_class,
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=tournament_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
+
+
+def _tournament_search_expiry(
+    facts: Mapping[str, Any],
+    *,
+    start: date,
+    end: date,
+) -> datetime | None:
+    """Return the earlier local cutoff for event time and registration."""
+    try:
+        timezone = ZoneInfo(str(facts["iana_timezone"]))
+    except (KeyError, ZoneInfoNotFoundError):
+        return None
+    exact_time = facts.get("exact_local_time")
+    if isinstance(exact_time, str) and start == end:
+        try:
+            event_expiry = datetime.combine(
+                start,
+                datetime.strptime(exact_time, "%H:%M").time(),
+                tzinfo=timezone,
+            )
+        except ValueError:
+            return None
+    else:
+        event_expiry = datetime.combine(
+            end + timedelta(days=1),
+            time.min,
+            tzinfo=timezone,
+        )
+    registration_expiry = (
+        _tournament_registration_expiry(
+            facts["registration_deadline"],
+            timezone,
+        )
+        if "registration_deadline" in facts
+        else None
+    )
+    if "registration_deadline" in facts and registration_expiry is None:
+        return None
+    return (
+        min(event_expiry, registration_expiry) if registration_expiry else event_expiry
+    )
+
+
+def tournament_publication_state_as_of(
+    facts: Mapping[str, Any],
+    *,
+    current_publication_state: str | None,
+    as_of: datetime,
+) -> str:
+    """Return the fail-closed Tournament publication state at a read time."""
+    canonical_states = {"active", "held_for_review", "suppressed", "expired"}
+    if current_publication_state not in canonical_states:
+        return "suppressed"
+    if current_publication_state != "active":
+        return current_publication_state
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return "suppressed"
+    if facts.get("open_participation") is not True:
+        return "suppressed"
+    try:
+        start = date.fromisoformat(str(facts["start_local_date"]))
+        end = date.fromisoformat(str(facts["end_local_date"]))
+    except (KeyError, TypeError, ValueError):
+        return "suppressed"
+    expiry = _tournament_search_expiry(facts, start=start, end=end)
+    if expiry is None:
+        return "suppressed"
+    return "expired" if as_of >= expiry else "active"
+
+
+def _tournament_registration_expiry(
+    value: Any,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    """Normalize a date-only deadline as inclusive through its local day."""
+    if isinstance(value, str):
+        try:
+            deadline = date.fromisoformat(value)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed.replace(tzinfo=timezone) if parsed.tzinfo is None else parsed
+        return datetime.combine(deadline + timedelta(days=1), time.min, tzinfo=timezone)
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            if key in value:
+                return _tournament_registration_expiry(value[key], timezone)
+    return None
 
 
 def replace_result_position(result: SearchResult, position: int) -> SearchResult:

@@ -6,7 +6,7 @@ import json
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -88,7 +88,9 @@ from modules.domain import (
     empty_bounded_source_metadata,
     evaluate_game_search,
     evaluate_opponent_search,
+    evaluate_tournament_search,
     evaluate_transfer_search,
+    tournament_publication_state_as_of,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -125,6 +127,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0021_classification_proof_work.sql",
     "0022_classifier_execution_recovery.sql",
     "0023_opponent_requests.sql",
+    "0023_tournament_discovery.sql",
     "0024_long_term_transfer_opportunities.sql",
 )
 
@@ -152,7 +155,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
     "0315157b15c682039beb369dba0523ff770900a674be50d3b449dfbc2d019747",
     "f469b7ef0dea58eb9f767571f33a3005385bc74c1ffcaf33117f2060c510cc05",
-    "879bb4b3e4b086409e0094c02c4b017eecfd3b275a2bc922f1f9c8470952a156",
+    "6cde9a66b0dc40e58189c3e4e6c0251e290aaa41eb559f897d043b420143dd55",
+    "680c189420c71e3aa452a51cbee1a6ba786885d726cd1ad983a79fe891b5b5d9",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1579,7 +1583,8 @@ class PostgresAcceptanceObserver:
                        sub_city_area_geographic_types,
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
-                       opponent_search_details, transfer_search_details,
+                       opponent_search_details, tournament_search_details,
+                       transfer_search_details,
                        completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE telegram_user_id = %s
@@ -1589,7 +1594,9 @@ class PostgresAcceptanceObserver:
             ).fetchall()
         return tuple(_completed_search(row) for row in rows)
 
-    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+    def results(
+        self, completed_search_id: str, *, as_of: datetime | None = None
+    ) -> tuple[SearchResult, ...]:
         """Observe one Completed Search's immutable ordered Results."""
         with psycopg.connect(
             self._admin_database_url,
@@ -1597,11 +1604,54 @@ class PostgresAcceptanceObserver:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT result_id, completed_search_id, absolute_position,
-                       result_class, card_facts
-                FROM football_runtime.recommendation_results
-                WHERE completed_search_id = %s
-                ORDER BY absolute_position
+                SELECT result.result_id, result.completed_search_id,
+                       result.absolute_position, result.result_class,
+                       result.card_facts,
+                       current_projection.opportunity_revision_id
+                           AS current_opportunity_revision_id,
+                       current_projection.publication_state
+                           AS current_publication_state,
+                       current_projection.current_facts,
+                       current_projection.response_route_kind,
+                       current_projection.response_route_value
+                FROM football_runtime.recommendation_results AS result
+                LEFT JOIN LATERAL (
+                    SELECT opportunity_revision_id, publication_state,
+                           jsonb_build_object(
+                               'start_local_date', accepted_facts -> 'start_local_date',
+                               'end_local_date', accepted_facts -> 'end_local_date',
+                               'exact_local_time', accepted_facts -> 'exact_local_time',
+                               'day_part', accepted_facts -> 'day_part',
+                               'iana_timezone', accepted_facts -> 'iana_timezone',
+                               'open_participation',
+                               accepted_facts -> 'open_participation'
+                           ) || CASE
+                               WHEN accepted_facts ? 'registration_deadline'
+                               THEN jsonb_build_object(
+                                   'registration_deadline',
+                                   accepted_facts -> 'registration_deadline'
+                               )
+                               ELSE '{}'::jsonb
+                           END AS current_facts,
+                           response_route ->> 'kind' AS response_route_kind,
+                           response_route ->> 'value' AS response_route_value
+                    FROM football_runtime.recommendation_opportunities
+                    WHERE opportunity_id = result.card_facts->>'opportunity_id'
+                      AND result.card_facts->>'opportunity_type' = 'tournament'
+                    ORDER BY CASE
+                                 WHEN opportunity_revision_id ~ ':revision:[0-9]+$'
+                                 THEN substring(
+                                     opportunity_revision_id
+                                     FROM ':revision:([0-9]+)$'
+                                 )::bigint
+                                 ELSE 0
+                             END DESC,
+                             published_at DESC,
+                             opportunity_revision_id DESC
+                    LIMIT 1
+                ) AS current_projection ON TRUE
+                WHERE result.completed_search_id = %s
+                ORDER BY result.absolute_position
                 """,
                 (completed_search_id,),
             ).fetchall()
@@ -1611,7 +1661,17 @@ class PostgresAcceptanceObserver:
                 completed_search_id=row["completed_search_id"],
                 absolute_position=row["absolute_position"],
                 result_class=row["result_class"],
-                card_facts=tuple(sorted(row["card_facts"].items())),
+                card_facts=tuple(
+                    sorted(
+                        {
+                            **_result_card_facts_with_current_publication_state(
+                                row["card_facts"],
+                                _current_tournament_projection(row),
+                                as_of=as_of or datetime.now(UTC),
+                            )
+                        }.items()
+                    )
+                ),
             )
             for row in rows
         )
@@ -3361,6 +3421,24 @@ class PostgresRoleStore:
             for row in rows
         )
 
+    def source_message_creation_time(self, source_message_id: str) -> datetime | None:
+        """Read the immutable create-event time for one current Source Message."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT event_time
+                FROM football_runtime.source_message_revisions
+                WHERE source_message_id = %s
+                  AND event_kind = 'create'
+                ORDER BY revision
+                LIMIT 1
+                """,
+                (source_message_id,),
+            ).fetchone()
+        return None if row is None else row[0]
+
     def eligible_reply_revision(
         self,
         *,
@@ -4786,12 +4864,20 @@ class PostgresRoleStore:
     def find_search_results(
         self,
         completed_search: CompletedSearch,
-        game_search_details: Mapping[str, tuple[str, ...]],
+        search_details: Mapping[str, tuple[str, ...]],
         transfer_search_details: Mapping[str, tuple[str, ...]] | None = None,
     ) -> tuple[SearchResult, ...]:
         """Load accepted projections and delegate deterministic evaluation."""
         if self._role is not RuntimeRole.RECOMMENDATION:
             raise ConversationAccessDeniedError
+        if completed_search.user_intent not in {
+            UserIntent.GAME_SEARCH,
+            UserIntent.OPPONENT_SEARCH,
+            UserIntent.TOURNAMENT_SEARCH,
+            UserIntent.NEW_TEAM_SEARCH,
+            UserIntent.TRANSFER_PLAYER_SEARCH,
+        }:
+            return ()
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             rows = connection.execute(
                 """
@@ -4818,12 +4904,14 @@ class PostgresRoleStore:
             for row in rows
         )
         if completed_search.user_intent is UserIntent.GAME_SEARCH:
-            return evaluate_game_search(
-                completed_search, game_search_details, projections
-            )
+            return evaluate_game_search(completed_search, search_details, projections)
         if completed_search.user_intent is UserIntent.OPPONENT_SEARCH:
             return evaluate_opponent_search(
-                completed_search, game_search_details, projections
+                completed_search, search_details, projections
+            )
+        if completed_search.user_intent is UserIntent.TOURNAMENT_SEARCH:
+            return evaluate_tournament_search(
+                completed_search, search_details, projections
             )
         if completed_search.user_intent in {
             UserIntent.NEW_TEAM_SEARCH,
@@ -4963,6 +5051,12 @@ class PostgresRoleStore:
                     dict(completed_search.opponent_search_details),
                     projections,
                 )
+            elif completed_search.user_intent is UserIntent.TOURNAMENT_SEARCH:
+                results = evaluate_tournament_search(
+                    completed_search,
+                    dict(completed_search.tournament_search_details),
+                    projections,
+                )
             elif completed_search.user_intent in {
                 UserIntent.NEW_TEAM_SEARCH,
                 UserIntent.TRANSFER_PLAYER_SEARCH,
@@ -4990,12 +5084,13 @@ class PostgresRoleStore:
                     sub_city_area_geographic_types,
                     sub_city_area_verified_parent_ids, whole_city, required_date,
                     game_search_details, opponent_search_details,
+                    tournament_search_details,
                     transfer_search_details, opportunity_revision_inputs,
                     completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                     %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s::jsonb, %s
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s
                 )
                 """,
                 (
@@ -5012,6 +5107,7 @@ class PostgresRoleStore:
                     json.dumps(_required_date_json(completed_search.required_date)),
                     json.dumps(dict(completed_search.game_search_details)),
                     json.dumps(dict(completed_search.opponent_search_details)),
+                    json.dumps(dict(completed_search.tournament_search_details)),
                     json.dumps(dict(completed_search.transfer_search_details)),
                     json.dumps(input_set),
                     completed_search.completed_at,
@@ -5427,6 +5523,9 @@ class PostgresRoleStore:
                            opponent_search_details, editing_opponent_search_detail,
                            opponent_search_detail_draft,
                            opponent_search_exact_time_prompt,
+                           tournament_search_details,
+                           editing_tournament_search_detail,
+                           tournament_search_detail_draft,
                            transfer_search_details, editing_transfer_search_detail,
                            transfer_search_detail_draft,
                            transfer_search_seasonal_timing_prompt,
@@ -5473,6 +5572,12 @@ class PostgresRoleStore:
             editing_opponent_search_detail=row["editing_opponent_search_detail"],
             opponent_search_detail_draft=tuple(row["opponent_search_detail_draft"]),
             opponent_search_exact_time_prompt=row["opponent_search_exact_time_prompt"],
+            tournament_search_details=tuple(
+                (key, tuple(values))
+                for key, values in sorted(row["tournament_search_details"].items())
+            ),
+            editing_tournament_search_detail=row["editing_tournament_search_detail"],
+            tournament_search_detail_draft=tuple(row["tournament_search_detail_draft"]),
             transfer_search_details=tuple(
                 (key, tuple(values))
                 for key, values in sorted(row["transfer_search_details"].items())
@@ -5645,6 +5750,9 @@ class PostgresRoleStore:
                     draft.editing_opponent_search_detail,
                     json.dumps(draft.opponent_search_detail_draft),
                     draft.opponent_search_exact_time_prompt,
+                    json.dumps(dict(draft.tournament_search_details)),
+                    draft.editing_tournament_search_detail,
+                    json.dumps(draft.tournament_search_detail_draft),
                     json.dumps(dict(draft.transfer_search_details)),
                     draft.editing_transfer_search_detail,
                     json.dumps(draft.transfer_search_detail_draft),
@@ -5664,6 +5772,9 @@ class PostgresRoleStore:
                             editing_opponent_search_detail,
                             opponent_search_detail_draft,
                             opponent_search_exact_time_prompt,
+                            tournament_search_details,
+                            editing_tournament_search_detail,
+                            tournament_search_detail_draft,
                             transfer_search_details,
                             editing_transfer_search_detail,
                             transfer_search_detail_draft,
@@ -5673,7 +5784,9 @@ class PostgresRoleStore:
                             %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb,
                             %s::jsonb, %s, %s::jsonb, %s,
                             %s::jsonb, %s, %s::jsonb, %s,
-                            %s::jsonb, %s, %s::jsonb, %s, %s
+                            %s::jsonb, %s, %s::jsonb,
+                            %s::jsonb, %s, %s::jsonb, %s,
+                            %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -5703,6 +5816,9 @@ class PostgresRoleStore:
                             editing_opponent_search_detail = %s,
                             opponent_search_detail_draft = %s::jsonb,
                             opponent_search_exact_time_prompt = %s,
+                            tournament_search_details = %s::jsonb,
+                            editing_tournament_search_detail = %s,
+                            tournament_search_detail_draft = %s::jsonb,
                             transfer_search_details = %s::jsonb,
                             editing_transfer_search_detail = %s,
                             transfer_search_detail_draft = %s::jsonb,
@@ -6748,7 +6864,8 @@ class PostgresRoleStore:
                        sub_city_area_geographic_types,
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
-                       opponent_search_details, transfer_search_details,
+                       opponent_search_details, tournament_search_details,
+                       transfer_search_details,
                        completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
@@ -6759,11 +6876,28 @@ class PostgresRoleStore:
                 return CompletedSearchQueryResult(CompletedSearchQueryStatus.ACCEPTED)
             result_rows = connection.execute(
                 """
-                SELECT result_id, completed_search_id, absolute_position,
-                       result_class, card_facts
-                FROM football_runtime.recommendation_results
-                WHERE completed_search_id = %s
-                ORDER BY absolute_position
+                SELECT result.result_id, result.completed_search_id,
+                       result.absolute_position, result.result_class,
+                       result.card_facts,
+                       current_projection.opportunity_revision_id
+                           AS current_opportunity_revision_id,
+                       current_projection.publication_state
+                           AS current_publication_state,
+                       current_projection.current_facts,
+                       current_projection.response_route_kind,
+                       current_projection.response_route_value
+                FROM football_runtime.recommendation_results AS result
+                LEFT JOIN LATERAL (
+                    SELECT opportunity_revision_id, publication_state,
+                           current_facts, response_route_kind, response_route_value
+                    FROM football_runtime.read_current_tournament_result_projection(
+                        result.card_facts->>'opportunity_id'
+                    )
+                    WHERE result.card_facts->>'opportunity_type' = 'tournament'
+                    LIMIT 1
+                ) AS current_projection ON TRUE
+                WHERE result.completed_search_id = %s
+                ORDER BY result.absolute_position
                 """,
                 (completed_search_id,),
             ).fetchall()
@@ -6777,7 +6911,15 @@ class PostgresRoleStore:
                         completed_search_id=row["completed_search_id"],
                         absolute_position=row["absolute_position"],
                         result_class=row["result_class"],
-                        card_facts=tuple(sorted(row["card_facts"].items())),
+                        card_facts=tuple(
+                            sorted(
+                                _result_card_facts_with_current_publication_state(
+                                    row["card_facts"],
+                                    _current_tournament_projection(row),
+                                    as_of=received_at,
+                                ).items()
+                            )
+                        ),
                     )
                     for row in result_rows
                 ),
@@ -7375,6 +7517,66 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
     )
 
 
+def _result_card_facts_with_current_publication_state(
+    card_facts: Mapping[str, Any],
+    current_projection: Mapping[str, Any] | None,
+    *,
+    as_of: datetime,
+) -> dict[str, Any]:
+    """Overlay current Tournament facts while preserving immutable card history."""
+    if card_facts.get("opportunity_type") == "tournament":
+        current_facts = (
+            current_projection.get("current_facts")
+            if current_projection is not None
+            else None
+        )
+        if not isinstance(current_facts, Mapping) or current_projection is None:
+            publication_state = "suppressed"
+        else:
+            publication_state = tournament_publication_state_as_of(
+                current_facts,
+                current_publication_state=current_projection.get("publication_state"),
+                as_of=as_of,
+            )
+        result = {
+            **card_facts,
+            "publication_state": publication_state,
+        }
+        if publication_state == "active":
+            assert current_projection is not None
+            route_kind = current_projection.get("response_route_kind")
+            route_value = current_projection.get("response_route_value")
+            if isinstance(route_kind, str) and isinstance(route_value, str):
+                result["response_route_kind"] = route_kind
+                result["response_route_value"] = route_value
+            else:
+                result.pop("response_route_kind", None)
+                result.pop("response_route_value", None)
+        else:
+            result.pop("response_route_kind", None)
+            result.pop("response_route_value", None)
+        return result
+    if current_projection is None:
+        return dict(card_facts)
+    return {**card_facts, "publication_state": current_projection["publication_state"]}
+
+
+def _current_tournament_projection(
+    row: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Return the narrow current projection returned by either read path."""
+    revision_id = row.get("current_opportunity_revision_id")
+    if not isinstance(revision_id, str) or not revision_id:
+        return None
+    return {
+        "opportunity_revision_id": revision_id,
+        "publication_state": row.get("current_publication_state"),
+        "current_facts": row.get("current_facts"),
+        "response_route_kind": row.get("response_route_kind"),
+        "response_route_value": row.get("response_route_value"),
+    }
+
+
 def _completed_search(row: dict[str, Any]) -> CompletedSearch:
     return CompletedSearch(
         completed_search_id=row["completed_search_id"],
@@ -7398,6 +7600,10 @@ def _completed_search(row: dict[str, Any]) -> CompletedSearch:
         opponent_search_details=tuple(
             (key, tuple(values))
             for key, values in sorted(row["opponent_search_details"].items())
+        ),
+        tournament_search_details=tuple(
+            (key, tuple(values))
+            for key, values in sorted(row["tournament_search_details"].items())
         ),
         transfer_search_details=tuple(
             (key, tuple(values))
@@ -7489,15 +7695,34 @@ def _legacy_candidate_opportunity_id(
     opportunity_id: str,
 ) -> str | None:
     """Map one legacy v4 candidate identity to its canonical proposition id."""
-    prefix = f"opportunity:{source_message_id}:open_match:candidate:"
-    if not opportunity_id.startswith(prefix):
+    prefix = next(
+        (
+            f"opportunity:{source_message_id}:{opportunity_type}:candidate:"
+            for opportunity_type in (
+                "open_match",
+                "opponent_request",
+                "tournament",
+                "roster_vacancy",
+                "player_transfer_availability",
+            )
+            if opportunity_id.startswith(
+                f"opportunity:{source_message_id}:{opportunity_type}:candidate:"
+            )
+        ),
+        None,
+    )
+    if prefix is None:
         return None
     candidate_hash = opportunity_id.removeprefix(prefix)
     if len(candidate_hash) != 16 or any(
         character not in "0123456789abcdef" for character in candidate_hash
     ):
         return None
-    return f"opportunity:{source_message_id}:open_match:proposition:{candidate_hash}"
+    opportunity_type = prefix.split(":")[-3]
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:"
+        f"proposition:{candidate_hash}"
+    )
 
 
 def _ensure_application_proposition_identity_mapping(
@@ -7610,15 +7835,33 @@ def _legacy_candidate_alias_for_canonical(
     opportunity_id: str,
 ) -> str | None:
     """Return the exact historical candidate alias for one proposition id."""
-    prefix = f"opportunity:{source_message_id}:open_match:proposition:"
-    if not opportunity_id.startswith(prefix):
+    prefix = next(
+        (
+            f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
+            for opportunity_type in (
+                "open_match",
+                "opponent_request",
+                "tournament",
+                "roster_vacancy",
+                "player_transfer_availability",
+            )
+            if opportunity_id.startswith(
+                f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
+            )
+        ),
+        None,
+    )
+    if prefix is None:
         return None
     candidate_hash = opportunity_id.removeprefix(prefix)
     if len(candidate_hash) != 16 or any(
         character not in "0123456789abcdef" for character in candidate_hash
     ):
         return None
-    return f"opportunity:{source_message_id}:open_match:candidate:{candidate_hash}"
+    opportunity_type = prefix.split(":")[-3]
+    return (
+        f"opportunity:{source_message_id}:{opportunity_type}:candidate:{candidate_hash}"
+    )
 
 
 def _suppress_source_event_opportunities(

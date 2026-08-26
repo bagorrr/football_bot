@@ -4,27 +4,69 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from collections.abc import Callable
+from contextlib import suppress
 from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
+from time import monotonic
+from typing import Any, cast
+
+import pytest
 
 from modules.application import (
     _body_establishes_current_open_match,
+    _classifier_input_manifest_hash,
     _event_time_is_supported,
     _location_mention_is_authoritative,
+    _opaque_classifier_reference,
     _open_places_are_supported,
     _optional_values_are_supported,
     _select_response_route,
     _stated_payment_amount_and_currency,
+    _validated_tournament_proposal,
 )
 from modules.classifier_contract import (
     PROPOSITION_EVIDENCE_VERSION,
     classifier_output_is_schema_valid,
+    semantic_proof_is_schema_valid,
+)
+from modules.codex_classification_adapter import (
+    CodexCliClassifierAdapter,
+    _codex_jsonl_failure,
+    _codex_jsonl_result,
+    _request_payload,
 )
 from modules.contracts import JsonValue
-from modules.ports import ClassifierAdapterResult, ClassifierRequest
-from modules.testkit import ControlledModelAdapter
+from modules.domain import (
+    ConversationStage,
+    GeographicType,
+    LocationCandidate,
+    LocationInterpretation,
+    LocationResolution,
+    LocationResolutionQuery,
+)
+from modules.ports import (
+    ClassifierAdapterResult,
+    ClassifierAuthenticationError,
+    ClassifierExecutionTimeoutError,
+    ClassifierQuotaError,
+    ClassifierRequest,
+    LocationResolverAdapter,
+    ModelAdapter,
+)
+from modules.testkit import (
+    ControlledModelAdapter,
+    InjectedClassifierCrash,
+)
 
 
 def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
@@ -167,6 +209,2084 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     assert not classifier_output_is_schema_valid(
         invalid_domain_value,
         body=cases[0]["source"],
+    )
+
+
+_V3_EVIDENCE_ROOT = Path(__file__).with_name("evidence")
+_HERMETIC_EXECUTABLE = Path(__file__).with_name("hermetic-codex")
+_V3_EVIDENCE_FILENAMES = {
+    "case_manifest": "v3_case_manifest.json",
+    "recorded_evidence": "v3_recorded_evidence.json",
+    "request_manifests": "v3_input_manifests.json",
+    "artifact_manifest": "v3_artifact_manifest.json",
+    "semantic_proofs": "v3_semantic_proofs.json",
+    "selected_execution_anchor": "v3_selected_execution_anchor.json",
+}
+
+
+def _read_v3_evidence(filename: str) -> dict[str, Any]:
+    value = json.loads((_V3_EVIDENCE_ROOT / filename).read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def _load_reviewed_v3_contract() -> dict[str, Any]:
+    """Load metadata plus independently anchored, immutable review evidence."""
+    corpus = cast(
+        dict[str, Any],
+        json.loads(
+            (Path(__file__).with_name("corpus.v3.json")).read_text(encoding="utf-8")
+        ),
+    )
+    assert not {
+        "evaluation_provenance",
+        "cases",
+        "recorded_outputs",
+        "recorded_promotion_fixtures",
+    }.intersection(corpus)
+    anchor = _read_v3_evidence("v3_anchor.json")
+    assert anchor["anchor_version"] == (
+        "open-match-classifier-regression-v3-external-anchor-v1"
+    )
+    evaluation = anchor["evaluation"]
+    assert isinstance(evaluation, dict)
+    for key in (
+        "corpus_version",
+        "evaluation_contract_version",
+        "source_corpus_case_count",
+        "model",
+        "reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "semantic_proof_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "independent_complete_runs",
+        "required_passes",
+        "failure_suite",
+        "promotion_fixtures",
+    ):
+        assert corpus[key] == evaluation[key]
+    assert corpus["evidence_files"] == {
+        **{
+            key: f"tests/classifier_regression/evidence/{filename}"
+            for key, filename in _V3_EVIDENCE_FILENAMES.items()
+        },
+        "anchor": "tests/classifier_regression/evidence/v3_anchor.json",
+    }
+
+    evidence = {
+        key: _read_v3_evidence(filename)
+        for key, filename in _V3_EVIDENCE_FILENAMES.items()
+    }
+    case_manifest = evidence["case_manifest"]
+    recorded_evidence = evidence["recorded_evidence"]
+    request_manifests = evidence["request_manifests"]
+    artifact_manifest = evidence["artifact_manifest"]
+    semantic_proofs = evidence["semantic_proofs"]
+    selected_execution_anchor = evidence["selected_execution_anchor"]
+    corpus["cases"] = case_manifest["cases"]
+    corpus["recorded_outputs"] = recorded_evidence["recorded_outputs"]
+    corpus["recorded_promotion_fixtures"] = recorded_evidence[
+        "recorded_promotion_fixtures"
+    ]
+    corpus["_v3_anchor"] = anchor
+    corpus["_v3_semantic_proofs"] = semantic_proofs
+    corpus["evaluation_provenance"] = {
+        "source_corpus_sha256": anchor["raw_files"]["source_corpus"]["sha256"],
+        "source_corpus_provenance_sha256": anchor["raw_files"][
+            "source_corpus_provenance"
+        ]["sha256"],
+        "case_manifest_sha256": anchor["canonical_digests"]["case_manifest_sha256"],
+        "recorded_outputs_sha256": anchor["canonical_digests"][
+            "recorded_outputs_sha256"
+        ],
+        "promotion_fixtures_sha256": anchor["canonical_digests"][
+            "promotion_fixtures_sha256"
+        ],
+        "request_manifests": request_manifests["request_manifests"],
+        "expected_digests": anchor["expected_digests"],
+        "expected_publication_outcomes": anchor["expected_publication_outcomes"],
+        "artifacts": artifact_manifest["artifacts"],
+        "artifact_records_sha256": artifact_manifest["artifact_records_sha256"],
+        "execution": anchor["artifact_execution"],
+        "selected_execution": selected_execution_anchor,
+    }
+    return corpus
+
+
+def _load_reviewed_source_cases() -> dict[str, dict[str, Any]]:
+    """Read the small, stable YAML shape without adding a runtime YAML dependency."""
+    source_path = (
+        Path(__file__).parents[2] / "docs/product/source-message-corpus-v1.yaml"
+    )
+    source_text = source_path.read_text(encoding="utf-8")
+    cases: dict[str, dict[str, Any]] = {}
+    for match in re.finditer(
+        r'(?ms)^  - case_id: "(?P<case_id>sm-\d+)"(?P<body>.*?)(?=^  - case_id:|\Z)',
+        source_text,
+    ):
+        case_id = match.group("case_id")
+        block = match.group("body")
+        text_match = re.search(r"(?m)^    text: (?P<value>.*)$", block)
+        assert text_match is not None
+        raw_text = text_match.group("value").strip()
+        if raw_text in {"|", "|-"}:
+            text_lines: list[str] = []
+            for line in block[text_match.end() :].splitlines()[1:]:
+                if line.startswith("      "):
+                    text_lines.append(line[6:])
+                else:
+                    break
+            source = "\n".join(text_lines)
+        else:
+            source = json.loads(raw_text)
+        types_match = re.search(
+            r"^      opportunity_types: \[(?P<values>[^]]*)\]$", block, re.M
+        )
+        disposition_match = re.search(
+            r'^      expected_pipeline_disposition: "(?P<value>[^"]+)"$', block, re.M
+        )
+        assert types_match is not None
+        assert disposition_match is not None
+        cases[case_id] = {
+            "source": source,
+            "opportunity_types": re.findall(r'"([^"]+)"', types_match.group("values")),
+            "expected_pipeline_disposition": disposition_match.group("value"),
+        }
+    return cases
+
+
+def _gate_request(
+    *,
+    case_id: str,
+    body: str,
+    schema_version: str = "source-message-classification-v3",
+    prompt_version: str = "open-match-primary-v3",
+    pass_kind: str = "primary",
+) -> ClassifierRequest:
+    return ClassifierRequest(
+        source_message_revision_id=f"reviewed:{case_id}:revision:1",
+        body=body,
+        source_event_time="2026-01-09T09:00:00+03:00",
+        context_bundle_version="primary-classifier-context-v1",
+        source_chat_reference="reviewed:source-chat",
+        source_chat_timezone="Europe/Moscow",
+        source_chat_geography={"country_id": None, "city_id": None},
+        bounded_metadata={"message_language": "ru", "attachment_types": []},
+        eligible_reply_context=None,
+        requested_model="gpt-5.6-sol",
+        requested_reasoning_effort="high",
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        glossary_version="football-opportunity-glossary-v1",
+        context_policy_version="classifier-context-v1",
+        routing_policy_version="classifier-routing-v1",
+        pass_kind=pass_kind,
+    )
+
+
+def _canonical_digest(value: object) -> str:
+    """Hash one reviewed JSON value with the corpus' canonical encoding."""
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _evaluation_provenance(corpus: dict[str, Any]) -> dict[str, Any]:
+    provenance = corpus.get("evaluation_provenance")
+    assert isinstance(provenance, dict)
+    return provenance
+
+
+def _classifier_request_payload(request: ClassifierRequest) -> dict[str, JsonValue]:
+    """Expose one adapter request as the application manifest input shape."""
+    return {
+        "source_message_revision_id": request.source_message_revision_id,
+        "body": request.body,
+        "source_event_time": request.source_event_time,
+        "context_bundle_version": request.context_bundle_version,
+        "source_chat_reference": request.source_chat_reference,
+        "source_chat_timezone": request.source_chat_timezone,
+        "source_chat_geography": request.source_chat_geography,
+        "bounded_metadata": request.bounded_metadata,
+        "eligible_reply_context": request.eligible_reply_context,
+        "adjacent_context": list(request.adjacent_context),
+    }
+
+
+def _request_manifest_hash(request: ClassifierRequest) -> str:
+    """Recompute the application-owned manifest for one controlled request."""
+    manifest_hash = _classifier_input_manifest_hash(
+        _classifier_request_payload(request),
+        revision_id=request.source_message_revision_id,
+        body=request.body,
+        prompt_version=request.prompt_version,
+        schema_version=request.schema_version,
+        context_bundle_version=request.context_bundle_version,
+        context_policy_version=request.context_policy_version,
+        routing_policy_version=request.routing_policy_version,
+        pass_kind=request.pass_kind,
+        pass_number=2 if request.pass_kind == "ambiguity_second_pass" else 1,
+        attempt_number=1,
+    )
+    assert manifest_hash is not None
+    return manifest_hash
+
+
+def _classifier_case_id(source_message_revision_id: str) -> str:
+    """Extract the opaque reviewed case key used by the hermetic model."""
+    reviewed_id = source_message_revision_id.removeprefix("reviewed:")
+    return reviewed_id.rsplit(":revision:", 1)[0]
+
+
+@dataclass(slots=True)
+class _HermeticCodexProcessRunner:
+    """Real child-process transport used by the selected Codex CLI adapter."""
+
+    run_id: str
+    process_id: int
+    codex_version: str = "hermetic-codex-execution-v2"
+    execution_records: list[dict[str, Any]] = field(default_factory=list)
+    _failures: dict[str, str] = field(default_factory=dict)
+
+    def fail_for(self, *, case_id: str, error: BaseException) -> None:
+        """Ask the real fixture child to return one controlled failure."""
+        if isinstance(error, TimeoutError):
+            failure_kind = "timeout"
+        elif isinstance(error, ClassifierQuotaError):
+            failure_kind = "429"
+        elif isinstance(error, ClassifierAuthenticationError):
+            failure_kind = "auth"
+        elif isinstance(error, InjectedClassifierCrash):
+            failure_kind = "crash"
+        else:
+            raise TypeError(f"unsupported hermetic failure: {type(error).__name__}")
+        self._failures[case_id] = failure_kind
+
+    def execute(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        input_text: str,
+        timeout_seconds: int,
+    ) -> dict[str, object]:
+        envelope = json.loads(input_text)
+        assert isinstance(envelope, dict)
+        request = envelope.get("request")
+        assert isinstance(request, dict)
+        revision_id = request.get("source_message_revision_id")
+        assert isinstance(revision_id, str)
+        case_id = _classifier_case_id(revision_id)
+        request_digest = _canonical_digest(request)
+        prompt = envelope.get("instruction")
+        assert isinstance(prompt, str)
+        child_environment = dict(environment)
+        child_environment.update(
+            {
+                "HERMETIC_RUN_ID": self.run_id,
+                "HERMETIC_PARENT_PROCESS_ID": str(self.process_id),
+                "HERMETIC_ENV_MARKER": f"{self.run_id}:{case_id}",
+            }
+        )
+        failure_kind = self._failures.pop(case_id, None)
+        if failure_kind is not None:
+            child_environment["HERMETIC_FAILURE_KIND"] = failure_kind
+        started = monotonic()
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=child_environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            start_new_session=True,
+        )
+        child_process_id = process.pid
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(
+                input=input_text,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            with suppress(ProcessLookupError):
+                os.killpg(child_process_id, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        duration_ms = max(1, int((monotonic() - started) * 1000))
+        metadata = _hermetic_execution_metadata(stdout)
+        self._assert_child_contract(
+            metadata,
+            argv=argv,
+            cwd=cwd,
+            environment=child_environment,
+            child_process_id=child_process_id,
+            request_digest=request_digest,
+        )
+        execution_id = metadata["execution_id"]
+        assert isinstance(execution_id, str)
+        record: dict[str, Any] = {
+            "execution_id": execution_id,
+            "run_id": self.run_id,
+            "process_id": self.process_id,
+            "child_process_id": child_process_id,
+            "case_id": case_id,
+            "source_message_revision_id": revision_id,
+            "pass_kind": request.get("pass_kind"),
+            "request_sha256": request_digest,
+            "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "argv": list(argv),
+            "cwd": str(cwd.resolve()),
+            "environment": child_environment,
+            "timeout_seconds": timeout_seconds,
+            "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+            "stdout_protocol_sha256": _hermetic_protocol_digest(
+                stdout,
+                repository_root=cwd,
+            ),
+            "exit_code": process.returncode,
+            "duration_ms": duration_ms,
+            "adapter_kind": "codex_cli",
+            "adapter_version": "classifier-hermetic-execution-v2",
+            "codex_version": self.codex_version,
+        }
+        if timed_out:
+            record.update({"status": "failed", "failure_kind": "process_timeout"})
+            self.execution_records.append(record)
+            raise TimeoutError
+        if process.returncode != 0:
+            record.update(
+                {
+                    "status": "failed",
+                    "failure_kind": failure_kind or "child_process_error",
+                }
+            )
+            self.execution_records.append(record)
+            raise self._failure_for_child(
+                failure_kind,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        try:
+            execution = _codex_jsonl_result(stdout, argv=argv)
+        except BaseException:
+            record.update({"status": "failed", "failure_kind": "protocol_error"})
+            self.execution_records.append(record)
+            raise
+        output = execution.get("output")
+        assert isinstance(output, dict)
+        record.update(
+            {
+                "output_sha256": _canonical_digest(output),
+                "effective_model": execution.get("effective_model"),
+                "effective_reasoning_effort": execution.get(
+                    "effective_reasoning_effort"
+                ),
+                "input_tokens": execution.get("input_tokens"),
+                "output_tokens": execution.get("output_tokens"),
+                "status": "succeeded",
+            }
+        )
+        self.execution_records.append(record)
+        execution["duration_ms"] = duration_ms
+        return execution
+
+    def _assert_child_contract(
+        self,
+        metadata: dict[str, object],
+        *,
+        argv: tuple[str, ...],
+        cwd: Path,
+        environment: dict[str, str],
+        child_process_id: int,
+        request_digest: str,
+    ) -> None:
+        execution_id = metadata.get("execution_id")
+        assert isinstance(execution_id, str) and execution_id
+        assert metadata.get("child_process_id") == child_process_id
+        assert metadata.get("parent_process_id") == self.process_id
+        assert metadata.get("run_id") == self.run_id
+        assert metadata.get("argv") == list(argv)
+        assert metadata.get("cwd") == str(cwd.resolve())
+        assert metadata.get("codex_home") == environment["CODEX_HOME"]
+        assert metadata.get("environment_marker") == environment["HERMETIC_ENV_MARKER"]
+        assert metadata.get("input_sha256") == request_digest
+
+    def _failure_for_child(
+        self,
+        failure_kind: str | None,
+        *,
+        stdout: str,
+        stderr: str,
+    ) -> BaseException:
+        if failure_kind == "timeout":
+            return TimeoutError()
+        if failure_kind == "429":
+            return ClassifierQuotaError(retry_after_seconds=240)
+        if failure_kind == "auth":
+            return ClassifierAuthenticationError()
+        if failure_kind == "crash":
+            return InjectedClassifierCrash()
+        failure = _codex_jsonl_failure(stdout) or RuntimeError(
+            stderr.strip() or "hermetic Codex child failed"
+        )
+        return failure
+
+
+def _hermetic_execution_metadata(stdout: str) -> dict[str, object]:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        metadata = event.get("hermetic_execution")
+        if isinstance(metadata, dict):
+            return metadata
+    return {}
+
+
+def _relative_process_path(value: str, *, repository_root: Path) -> str:
+    path = Path(value)
+    try:
+        return str(path.resolve().relative_to(repository_root.resolve()))
+    except ValueError:
+        return path.name if path.is_absolute() else value
+
+
+def _stable_hermetic_argv(
+    argv: list[str] | tuple[str, ...], *, repository_root: Path
+) -> list[str]:
+    stable: list[str] = []
+    for value in argv:
+        if value.startswith("/"):
+            stable.append(
+                _relative_process_path(value, repository_root=repository_root)
+            )
+        else:
+            stable.append(value)
+    return stable
+
+
+def _hermetic_protocol_digest(stdout: str, *, repository_root: Path) -> str:
+    """Hash protocol evidence after replacing only run-local identities."""
+    normalized_events: list[dict[str, object]] = []
+    for line in stdout.splitlines():
+        event = json.loads(line)
+        assert isinstance(event, dict)
+        normalized = deepcopy(event)
+        if event.get("type") == "thread.started":
+            metadata = normalized.get("hermetic_execution")
+            assert isinstance(metadata, dict)
+            metadata["execution_id"] = "<execution_id>"
+            metadata["run_id"] = "<run_id>"
+            metadata["child_process_id"] = 0
+            metadata["parent_process_id"] = 0
+            metadata["argv"] = _stable_hermetic_argv(
+                cast(list[str], metadata["argv"]),
+                repository_root=repository_root,
+            )
+            metadata["cwd"] = "."
+            metadata["codex_home"] = ".hermetic-codex-home"
+            metadata["environment_marker"] = "<environment_marker>"
+        normalized_events.append(normalized)
+    return _canonical_digest(normalized_events)
+
+
+def _selected_execution_artifacts(
+    runner: _HermeticCodexProcessRunner,
+    *,
+    repository_root: Path,
+) -> dict[str, Any]:
+    """Return path-independent, externally anchorable selected-run digests."""
+    successful = [
+        record for record in runner.execution_records if record["status"] == "succeeded"
+    ]
+    output_records = [
+        {
+            "case_id": record["case_id"],
+            "pass_kind": record["pass_kind"],
+            "output_sha256": record["output_sha256"],
+            "status": record["status"],
+        }
+        for record in successful
+    ]
+    execution_records: list[dict[str, Any]] = []
+    for record in runner.execution_records:
+        environment = record["environment"]
+        stable_environment = {
+            "CODEX_HOME": _relative_process_path(
+                str(environment["CODEX_HOME"]),
+                repository_root=repository_root,
+            ),
+            **(
+                {"HERMETIC_FAILURE_KIND": environment["HERMETIC_FAILURE_KIND"]}
+                if environment.get("HERMETIC_FAILURE_KIND")
+                else {}
+            ),
+        }
+        stable_record = {
+            "case_id": record["case_id"],
+            "pass_kind": record["pass_kind"],
+            "request_sha256": record["request_sha256"],
+            "input_sha256": record["input_sha256"],
+            "prompt_sha256": record["prompt_sha256"],
+            "argv": _stable_hermetic_argv(
+                cast(list[str], record["argv"]),
+                repository_root=repository_root,
+            ),
+            "cwd": ".",
+            "environment": stable_environment,
+            "timeout_seconds": record["timeout_seconds"],
+            "exit_code": record["exit_code"],
+            "stdout_protocol_sha256": record["stdout_protocol_sha256"],
+            "stderr_sha256": record["stderr_sha256"],
+            "adapter_kind": record["adapter_kind"],
+            "adapter_version": record["adapter_version"],
+            "codex_version": record["codex_version"],
+            "status": record["status"],
+        }
+        if record["status"] == "succeeded":
+            stable_record.update(
+                {
+                    "effective_model": record["effective_model"],
+                    "effective_reasoning_effort": record["effective_reasoning_effort"],
+                    "input_tokens": record["input_tokens"],
+                    "output_tokens": record["output_tokens"],
+                    "output_sha256": record["output_sha256"],
+                }
+            )
+        else:
+            stable_record["failure_kind"] = record["failure_kind"]
+        execution_records.append(stable_record)
+    return {
+        "output_records": output_records,
+        "output_artifact_sha256": _canonical_digest(output_records),
+        "protocol_records": [
+            {
+                "case_id": record["case_id"],
+                "pass_kind": record["pass_kind"],
+                "stdout_protocol_sha256": record["stdout_protocol_sha256"],
+                "stderr_sha256": record["stderr_sha256"],
+            }
+            for record in runner.execution_records
+        ],
+        "protocol_artifact_sha256": _canonical_digest(
+            [
+                {
+                    "case_id": record["case_id"],
+                    "pass_kind": record["pass_kind"],
+                    "stdout_protocol_sha256": record["stdout_protocol_sha256"],
+                    "stderr_sha256": record["stderr_sha256"],
+                }
+                for record in runner.execution_records
+            ]
+        ),
+        "execution_records": execution_records,
+        "execution_artifact_sha256": _canonical_digest(execution_records),
+    }
+
+
+def _selected_classifier_adapter(
+    *,
+    run_id: str,
+    process_id: int,
+) -> tuple[CodexCliClassifierAdapter, _HermeticCodexProcessRunner]:
+    """Build the selected Codex adapter over the offline provider transport."""
+    repository_root = Path(__file__).parents[2]
+    artifact_root = repository_root / "classifier"
+    runner = _HermeticCodexProcessRunner(
+        run_id=run_id,
+        process_id=process_id,
+    )
+    adapter = CodexCliClassifierAdapter(
+        codex_executable=_HERMETIC_EXECUTABLE,
+        codex_home=repository_root / ".hermetic-codex-home",
+        workspace=repository_root,
+        schema_paths={
+            "source-message-classification-v3": (
+                artifact_root
+                / "open-match-primary-v3"
+                / "source-message-classification-v3.schema.json"
+            ),
+            "source-semantic-proof-v2": (
+                artifact_root
+                / "open-match-semantic-proof-v2"
+                / "source-semantic-proof-v2.schema.json"
+            ),
+        },
+        prompt_paths={
+            "open-match-primary-v3": artifact_root
+            / "open-match-primary-v3"
+            / "prompt.md",
+            "open-match-ambiguity-v2": artifact_root
+            / "open-match-ambiguity-v2"
+            / "prompt.md",
+            "open-match-semantic-proof-v2": artifact_root
+            / "open-match-semantic-proof-v2"
+            / "prompt.md",
+        },
+        runner=runner,
+        codex_version=runner.codex_version,
+        adapter_version="classifier-hermetic-execution-v2",
+    )
+    return adapter, runner
+
+
+def _assert_selected_execution_provenance(
+    result: ClassifierAdapterResult,
+    *,
+    request: ClassifierRequest,
+    runner: _HermeticCodexProcessRunner,
+) -> None:
+    """Validate one selected-adapter result and its independent execution record."""
+    assert result.effective_model == "gpt-5.6-sol"
+    assert result.effective_reasoning_effort == "high"
+    assert result.codex_version == runner.codex_version
+    assert result.adapter_kind == "codex_cli"
+    assert result.adapter_version == "classifier-hermetic-execution-v2"
+    assert result.duration_ms > 0
+    assert result.input_tokens > 0
+    assert result.output_tokens > 0
+    record = runner.execution_records[-1]
+    assert record["status"] == "succeeded"
+    assert record["source_message_revision_id"] == request.source_message_revision_id
+    assert record["case_id"] == _classifier_case_id(request.source_message_revision_id)
+    assert record["pass_kind"] == request.pass_kind
+    assert isinstance(record["child_process_id"], int)
+    assert record["child_process_id"] != record["process_id"]
+    assert record["exit_code"] == 0
+    assert record["duration_ms"] > 0
+    assert len(record["input_sha256"]) == 64
+    assert len(record["stdout_sha256"]) == 64
+    assert len(record["stderr_sha256"]) == 64
+    assert record["argv"][0] == str(_HERMETIC_EXECUTABLE)
+    assert record["cwd"] == str(_HERMETIC_EXECUTABLE.parents[2])
+    assert record["environment"]["CODEX_HOME"] == str(
+        _HERMETIC_EXECUTABLE.parents[2] / ".hermetic-codex-home"
+    )
+    assert record["timeout_seconds"] == 180
+    assert record["output_sha256"] == _canonical_digest(result.output)
+
+
+def _assert_semantic_proofs_for_output(
+    corpus: dict[str, Any],
+    *,
+    case_id: str,
+    pass_name: str,
+    body: str,
+    output: dict[str, JsonValue],
+) -> set[tuple[str, str, str]]:
+    """Validate every candidate proof for one complete corpus output."""
+    candidates = output.get("candidates")
+    assert isinstance(candidates, list)
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    records = semantic_evidence["records"]
+    assert isinstance(records, list)
+    validated: set[tuple[str, str, str]] = set()
+    for candidate_value in candidates:
+        assert isinstance(candidate_value, dict)
+        candidate = candidate_value
+        candidate_key = candidate.get("candidate_key")
+        opportunity_type = candidate.get("opportunity_type")
+        evidence = candidate.get("evidence")
+        routes = candidate.get("response_routes", [])
+        assert isinstance(candidate_key, str)
+        assert isinstance(opportunity_type, str)
+        assert isinstance(evidence, dict)
+        assert isinstance(routes, list)
+        matching_records = [
+            record
+            for record in records
+            if record.get("case_id") == case_id
+            and record.get("pass_name") == pass_name
+            and record.get("candidate_key") == candidate_key
+        ]
+        assert len(matching_records) == 1
+        recorded_proof = matching_records[0].get("proof")
+        assert isinstance(recorded_proof, dict)
+        recorded_source_reference = recorded_proof.get(
+            "source_message_revision_reference"
+        )
+        assert isinstance(recorded_source_reference, str)
+        assert semantic_proof_is_schema_valid(
+            recorded_proof,
+            body=body,
+            source_message_revision_reference=recorded_source_reference,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+            opportunity_type=opportunity_type,
+            semantic_proof_version=corpus["semantic_proof_version"],
+        )
+        validated.add((case_id, pass_name, candidate_key))
+    return validated
+
+
+def _execute_selected_semantic_proofs(
+    adapter: CodexCliClassifierAdapter,
+    runner: _HermeticCodexProcessRunner,
+    corpus: dict[str, Any],
+    *,
+    case_id: str,
+    pass_name: str,
+    body: str,
+    request: ClassifierRequest,
+    output: dict[str, JsonValue],
+    proof_outputs: dict[str, dict[str, JsonValue]] | None = None,
+) -> set[tuple[str, str, str]]:
+    """Execute and validate every candidate's semantic-proof port request."""
+    validated = _assert_semantic_proofs_for_output(
+        corpus,
+        case_id=case_id,
+        pass_name=pass_name,
+        body=body,
+        output=output,
+    )
+    candidates = output.get("candidates")
+    assert isinstance(candidates, list)
+    for candidate_value in candidates:
+        assert isinstance(candidate_value, dict)
+        candidate_key = candidate_value.get("candidate_key")
+        evidence = candidate_value.get("evidence")
+        routes = candidate_value.get("response_routes", [])
+        opportunity_type = candidate_value.get("opportunity_type")
+        assert isinstance(candidate_key, str)
+        assert isinstance(evidence, dict)
+        assert isinstance(routes, list)
+        assert isinstance(opportunity_type, str)
+        proof_request = replace(
+            request,
+            context_bundle_version="semantic-proof-context-v1",
+            context_policy_version="semantic-proof-context-v1",
+            prompt_version="open-match-semantic-proof-v2",
+            schema_version="source-semantic-proof-v2",
+            pass_kind="semantic_proof",
+            proof_candidate_key=candidate_key,
+        )
+        proof_result = adapter.semantic_proof(proof_request)
+        _assert_selected_execution_provenance(
+            proof_result,
+            request=proof_request,
+            runner=runner,
+        )
+        selected_proof = proof_result.output
+        source_reference = selected_proof.get("source_message_revision_reference")
+        assert source_reference == _opaque_classifier_reference(
+            proof_request.source_message_revision_id,
+            kind="revision",
+        )
+        assert semantic_proof_is_schema_valid(
+            selected_proof,
+            body=body,
+            source_message_revision_reference=str(source_reference),
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+            opportunity_type=opportunity_type,
+            semantic_proof_version=corpus["semantic_proof_version"],
+        )
+        if proof_outputs is not None:
+            proof_outputs[candidate_key] = deepcopy(selected_proof)
+    return validated
+
+
+class _RecordedTournamentResolver:
+    """Return one fully versioned location without crossing a provider boundary."""
+
+    def opportunity_revision_id(self, proposal_id: str) -> str:
+        return f"recorded-opportunity-revision:{proposal_id}"
+
+    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
+        assert query.stage is ConversationStage.SEARCH_AREA
+        return LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="place:central-stadium",
+                            display_name="Central Stadium",
+                            geographic_type=GeographicType.LANDMARK,
+                            country_id="country:example",
+                            city_id="city:example",
+                            verified_parent_ids=(
+                                "country:example",
+                                "city:example",
+                            ),
+                            parent_display_names=("Exampleland", "Example City"),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="recorded-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Central Stadium"),
+                                ("es", "Central Stadium"),
+                                ("fr", "Central Stadium"),
+                                ("ru", "Central Stadium"),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+
+
+def _tournament_promotion_payload(
+    corpus: dict[str, Any],
+) -> tuple[dict[str, JsonValue], str]:
+    fixture = corpus["recorded_promotion_fixtures"]["tournament-current-registration"]
+    assert isinstance(fixture, dict)
+    body = fixture["source"]
+    assert isinstance(body, str)
+    execution = _evaluation_provenance(corpus)["execution"]
+    assert isinstance(execution, dict)
+    revision_id = "reviewed:promotion:tournament-current-registration:revision:1"
+    payload: dict[str, JsonValue] = {
+        "source_message_revision_id": revision_id,
+        "body": body,
+        "source_event_time": "2026-07-01T12:00:00+00:00",
+        "source_posted_at": "2026-07-01T12:00:00+00:00",
+        "validation_time": "2026-08-01T12:00:00+00:00",
+        "context_bundle_version": "primary-classifier-context-v1",
+        "source_chat_reference": "reviewed:source-chat",
+        "source_chat_timezone": "Europe/Moscow",
+        "source_chat_geography": {"country_id": None, "city_id": None},
+        "bounded_metadata": {"message_language": "en", "attachment_types": []},
+        "eligible_reply_context": None,
+        "adjacent_context": [],
+        "requested_model": corpus["model"],
+        "effective_model": corpus["model"],
+        "requested_reasoning_effort": corpus["reasoning_effort"],
+        "effective_reasoning_effort": corpus["reasoning_effort"],
+        "prompt_version": corpus["prompt_version"],
+        "schema_version": corpus["schema_version"],
+        "glossary_version": corpus["glossary_version"],
+        "context_policy_version": corpus["context_policy_version"],
+        "routing_policy_version": corpus["routing_policy_version"],
+        "codex_version": execution["codex_version"],
+        "adapter_kind": execution["adapter_kind"],
+        "adapter_version": execution["adapter_version"],
+        "pass_number": 1,
+        "attempt_number": 1,
+        "duration_ms": execution["duration_ms"],
+        "input_tokens": execution["input_tokens"],
+        "output_tokens": execution["output_tokens"],
+        "classification_status": "succeeded",
+        "semantic_proof": None,
+        "output": None,
+    }
+    manifest_hash = _classifier_input_manifest_hash(
+        payload,
+        revision_id=revision_id,
+        body=body,
+        prompt_version="open-match-primary-v3",
+        schema_version="source-message-classification-v3",
+        context_bundle_version="primary-classifier-context-v1",
+        context_policy_version="classifier-context-v1",
+        routing_policy_version="classifier-routing-v1",
+        pass_kind="primary",
+        pass_number=1,
+        attempt_number=1,
+    )
+    assert manifest_hash is not None
+    payload["input_manifest_hash"] = manifest_hash
+    return payload, body
+
+
+@dataclass
+class _EvaluationPersistence:
+    """Controlled application/persistence seam for promotion side effects."""
+
+    staged: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    committed: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    started: list[str] = field(default_factory=list)
+    fail_next_commit: bool = False
+
+    def begin(self, effect_key: str) -> None:
+        self.started.append(effect_key)
+
+    def stage(self, effect_key: str, output: dict[str, JsonValue]) -> None:
+        self.staged[effect_key] = deepcopy(output)
+
+    def commit(self) -> None:
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise RuntimeError("controlled persistence commit failure")
+        self.committed.update(self.staged)
+        self.staged.clear()
+
+    def rollback(self) -> None:
+        self.staged.clear()
+
+
+def _run_selected_evaluation(
+    adapter: ModelAdapter,
+    request: ClassifierRequest,
+    *,
+    effect_key: str,
+    persistence: _EvaluationPersistence,
+    normalize: Callable[[dict[str, JsonValue]], object] | None = None,
+) -> str:
+    """Run one proposal through the application persistence boundary."""
+    persistence.begin(effect_key)
+    try:
+        result = adapter.classify(request)
+        if result.output.get("disposition") != "accepted":
+            persistence.rollback()
+            return "unpublished"
+        if normalize is not None and normalize(result.output) is None:
+            persistence.rollback()
+            return "unpublished"
+        if effect_key in persistence.committed:
+            persistence.rollback()
+            return "replayed"
+        persistence.stage(effect_key, result.output)
+        persistence.commit()
+    except BaseException:
+        persistence.rollback()
+        raise
+    return "published"
+
+
+def _validate_reviewed_provenance(
+    corpus: dict[str, Any],
+    *,
+    repository_root: Path,
+) -> list[dict[str, Any]]:
+    """Pin every reviewed input to the external v3 evidence anchor."""
+    anchor = corpus["_v3_anchor"]
+    assert isinstance(anchor, dict)
+    raw_files = anchor["raw_files"]
+    assert isinstance(raw_files, dict)
+    provenance = _evaluation_provenance(corpus)
+    expected_artifacts = provenance.get("artifacts")
+    assert isinstance(expected_artifacts, dict)
+    expected_raw_keys = {
+        "source_corpus",
+        "source_corpus_provenance",
+        "case_manifest",
+        "recorded_evidence",
+        "request_manifests",
+        "artifact_manifest",
+        "semantic_proofs",
+        "selected_execution_anchor",
+    }
+    expected_raw_keys.update(
+        f"artifact:{directory}:{field_name}"
+        for directory in expected_artifacts
+        for field_name in ("prompt_filename", "schema_filename", "provenance_filename")
+    )
+    assert set(raw_files) == expected_raw_keys
+    for _key, raw_file in raw_files.items():
+        assert isinstance(raw_file, dict)
+        relative_path = Path(str(raw_file["path"]))
+        assert not relative_path.is_absolute()
+        path = repository_root / relative_path
+        assert path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == raw_file["sha256"]
+
+    assert corpus["source_corpus"] == raw_files["source_corpus"]["path"]
+    assert (
+        corpus["source_corpus_provenance"]
+        == raw_files["source_corpus_provenance"]["path"]
+    )
+    anchor_digests = anchor["canonical_digests"]
+    assert isinstance(anchor_digests, dict)
+    assert _canonical_digest(corpus["cases"]) == anchor_digests["case_manifest_sha256"]
+    assert (
+        _canonical_digest(corpus["recorded_outputs"])
+        == anchor_digests["recorded_outputs_sha256"]
+    )
+    assert (
+        _canonical_digest(corpus["recorded_promotion_fixtures"])
+        == (anchor_digests["promotion_fixtures_sha256"])
+    )
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    assert isinstance(semantic_evidence, dict)
+    assert (
+        _canonical_digest(semantic_evidence["case_coverage"])
+        == (anchor_digests["semantic_case_coverage_sha256"])
+    )
+    assert (
+        _canonical_digest(semantic_evidence["records"])
+        == (anchor_digests["semantic_records_sha256"])
+    )
+    expected_request_manifests = provenance.get("request_manifests")
+    assert isinstance(expected_request_manifests, list)
+    expected_digests = provenance.get("expected_digests")
+    assert isinstance(expected_digests, dict)
+    assert (
+        _canonical_digest(expected_request_manifests)
+        == expected_digests["request_manifests_sha256"]
+    )
+
+    assert set(expected_artifacts) == {
+        "open-match-primary-v3",
+        "open-match-ambiguity-v2",
+        "open-match-semantic-proof-v2",
+    }
+    artifact_records: list[dict[str, Any]] = []
+    for directory, expected in expected_artifacts.items():
+        assert isinstance(expected, dict)
+        artifact_root = repository_root / "classifier" / directory
+        prompt_path = artifact_root / str(expected["prompt_filename"])
+        schema_path = artifact_root / str(expected["schema_filename"])
+        provenance_path = artifact_root / str(expected["provenance_filename"])
+        prompt_sha256 = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+        schema_sha256 = hashlib.sha256(schema_path.read_bytes()).hexdigest()
+        provenance_sha256 = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        artifact_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        assert prompt_path.read_text(encoding="utf-8").strip()
+        assert schema["$id"] == expected["schema_id"]
+        assert schema["additionalProperties"] is False
+        assert artifact_provenance == expected["provenance"]
+        assert prompt_sha256 == expected["prompt_sha256"]
+        assert schema_sha256 == expected["schema_sha256"]
+        assert provenance_sha256 == expected["provenance_sha256"]
+        artifact_records.append(
+            {
+                "directory": directory,
+                "prompt_sha256": prompt_sha256,
+                "schema_sha256": schema_sha256,
+                "provenance_sha256": provenance_sha256,
+                "schema_id": schema["$id"],
+                "provenance": artifact_provenance,
+            }
+        )
+    assert (
+        _canonical_digest(artifact_records) == anchor_digests["artifact_records_sha256"]
+    )
+    assert _canonical_digest(artifact_records) == provenance["artifact_records_sha256"]
+    return artifact_records
+
+
+def _validate_selected_execution_anchor(
+    corpus: dict[str, Any],
+    *,
+    runner: _HermeticCodexProcessRunner,
+    repository_root: Path,
+) -> dict[str, Any]:
+    """Validate real selected execution evidence against a committed anchor."""
+    anchor = _evaluation_provenance(corpus).get("selected_execution")
+    assert isinstance(anchor, dict)
+    assert anchor["anchor_version"] == (
+        "open-match-classifier-regression-v3-selected-execution-anchor-v1"
+    )
+    fixture = anchor["fixture"]
+    assert isinstance(fixture, dict)
+    external_anchor = corpus["_v3_anchor"].get("selected_execution")
+    assert isinstance(external_anchor, dict)
+    assert external_anchor == anchor
+    fixture_path = repository_root / str(fixture["path"])
+    assert fixture_path == _HERMETIC_EXECUTABLE
+    assert fixture_path.is_file()
+    assert os.access(fixture_path, os.X_OK)
+    assert hashlib.sha256(fixture_path.read_bytes()).hexdigest() == fixture["sha256"]
+
+    contract = anchor["contract"]
+    assert isinstance(contract, dict)
+    assert contract == {
+        "adapter_kind": "codex_cli",
+        "adapter_version": "classifier-hermetic-execution-v2",
+        "codex_version": "hermetic-codex-execution-v2",
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "timeout_seconds": 180,
+        "requires_child_process": True,
+        "requires_exit_status": True,
+        "requires_stdout_stderr_digests": True,
+        "requires_input_output_evidence": True,
+    }
+    records = runner.execution_records
+    assert records
+    child_process_ids = [record.get("child_process_id") for record in records]
+    assert all(isinstance(child_id, int) for child_id in child_process_ids)
+    assert len(set(child_process_ids)) == len(records)
+    assert all(child_id != runner.process_id for child_id in child_process_ids)
+    execution_ids = [record.get("execution_id") for record in records]
+    assert all(isinstance(execution_id, str) for execution_id in execution_ids)
+    assert len(set(execution_ids)) == len(records)
+    assert all(record["run_id"] == runner.run_id for record in records)
+    assert all(record["process_id"] == runner.process_id for record in records)
+    assert all(record["timeout_seconds"] == 180 for record in records)
+    assert all(
+        record["adapter_kind"] == contract["adapter_kind"]
+        and record["adapter_version"] == contract["adapter_version"]
+        and record["codex_version"] == contract["codex_version"]
+        for record in records
+    )
+    assert all(
+        all(
+            isinstance(record.get(field_name), str)
+            and len(str(record[field_name])) == 64
+            for field_name in (
+                "request_sha256",
+                "input_sha256",
+                "prompt_sha256",
+                "stdout_sha256",
+                "stderr_sha256",
+                "stdout_protocol_sha256",
+            )
+        )
+        and isinstance(record.get("exit_code"), int)
+        and isinstance(record.get("duration_ms"), int)
+        and record["duration_ms"] > 0
+        for record in records
+    )
+    expected = anchor["expected"]
+    assert isinstance(expected, dict)
+    successful_count = sum(record["status"] == "succeeded" for record in records)
+    failed_count = sum(record["status"] == "failed" for record in records)
+    semantic_proof_count = sum(
+        record["status"] == "succeeded" and record["pass_kind"] == "semantic_proof"
+        for record in records
+    )
+    assert len(records) == expected["execution_count"]
+    assert successful_count == expected["successful_execution_count"]
+    assert failed_count == expected["failed_execution_count"]
+    assert semantic_proof_count == expected["semantic_proof_execution_count"]
+    artifacts = _selected_execution_artifacts(
+        runner,
+        repository_root=repository_root,
+    )
+    assert artifacts["output_artifact_sha256"] == expected["output_artifact_sha256"]
+    assert artifacts["protocol_artifact_sha256"] == expected["protocol_artifact_sha256"]
+    assert (
+        artifacts["execution_artifact_sha256"] == expected["execution_artifact_sha256"]
+    )
+    return artifacts
+
+
+def _run_v3_evaluation_gate(
+    corpus: dict[str, Any], *, run_id: str = "standalone", process_id: int | None = None
+) -> str:
+    """Run one complete hermetic evaluation through the selected classifier port."""
+    if process_id is None:
+        process_id = os.getpid()
+    repository_root = Path(__file__).parents[2]
+    provenance = _evaluation_provenance(corpus)
+    artifact_records = _validate_reviewed_provenance(
+        corpus,
+        repository_root=repository_root,
+    )
+    source_cases = _load_reviewed_source_cases()
+    manifest_cases = corpus["cases"]
+    assert len(manifest_cases) == corpus["source_corpus_case_count"] == 38
+    assert {case["case_id"] for case in manifest_cases} == set(source_cases)
+    assert {case["case_id"] for case in manifest_cases} == {
+        f"sm-{index:03d}" for index in range(1, 39)
+    }
+    all_types = {
+        "open_match",
+        "tournament",
+        "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
+        "player_match_availability",
+        "coach_availability",
+        "coach_request",
+        "referee_availability",
+        "referee_request",
+    }
+    assert (
+        set().union(*(set(case["opportunity_types"]) for case in manifest_cases))
+        == all_types
+    )
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    assert isinstance(semantic_evidence, dict)
+    semantic_coverage = semantic_evidence["case_coverage"]
+    semantic_records = semantic_evidence["records"]
+    assert isinstance(semantic_coverage, list)
+    assert isinstance(semantic_records, list)
+    assert {coverage["case_id"] for coverage in semantic_coverage} == set(source_cases)
+    recorded_cases = corpus["recorded_outputs"]
+    assert len(recorded_cases) == 38
+    assert {case["case_id"] for case in recorded_cases} == {
+        case["case_id"] for case in manifest_cases
+    }
+    for coverage in semantic_coverage:
+        case_id = coverage["case_id"]
+        recorded_case = next(
+            case for case in recorded_cases if case["case_id"] == case_id
+        )
+        candidate_count = 0
+        for pass_name in ("primary_output", "second_pass_output"):
+            output = recorded_case.get(pass_name)
+            if isinstance(output, dict):
+                candidates = output.get("candidates")
+                assert isinstance(candidates, list)
+                candidate_count += len(candidates)
+        record_count = sum(
+            1 for record in semantic_records if record.get("case_id") == case_id
+        )
+        assert coverage["candidate_count"] == candidate_count
+        assert coverage["semantic_proof_record_count"] == record_count
+    semantic_contract = corpus["_v3_anchor"]["semantic_proof"]
+    assert semantic_contract["case_count"] == 38
+    assert semantic_contract["case_ids"] == [
+        f"sm-{index:03d}" for index in range(1, 39)
+    ]
+    assert set(semantic_contract["all_opportunity_types"]) == all_types
+    assert semantic_contract["candidate_count"] == sum(
+        coverage["candidate_count"] for coverage in semantic_coverage
+    )
+    assert semantic_contract["record_count"] == len(semantic_records)
+    validated_semantic_records: set[tuple[str, str, str]] = set()
+    adapter, runner = _selected_classifier_adapter(
+        run_id=run_id,
+        process_id=process_id,
+    )
+    observed: list[dict[str, Any]] = []
+    request_manifests: list[dict[str, str]] = []
+    for manifest_case in manifest_cases:
+        case_id = manifest_case["case_id"]
+        source_case = source_cases[case_id]
+        assert manifest_case["opportunity_types"] == source_case["opportunity_types"]
+        assert (
+            manifest_case["expected_pipeline_disposition"]
+            == source_case["expected_pipeline_disposition"]
+        )
+        body = source_case["source"]
+        request = _gate_request(case_id=case_id, body=body)
+        result = adapter.classify(request)
+        _assert_selected_execution_provenance(
+            result,
+            request=request,
+            runner=runner,
+        )
+        assert classifier_output_is_schema_valid(result.output, body=body)
+        validated_semantic_records.update(
+            _execute_selected_semantic_proofs(
+                adapter,
+                runner,
+                corpus,
+                case_id=case_id,
+                pass_name="primary",
+                body=body,
+                request=request,
+                output=result.output,
+            )
+        )
+        request_manifests.append(
+            {
+                "case_id": case_id,
+                "pass_kind": request.pass_kind,
+                "input_manifest_hash": _request_manifest_hash(request),
+            }
+        )
+        expected_disposition = manifest_case["expected_pipeline_disposition"]
+        if expected_disposition == "unresolved" and not set(
+            manifest_case["opportunity_types"]
+        ).intersection({"open_match", "tournament"}):
+            expected_disposition = "needs_review"
+        assert result.output["disposition"] == expected_disposition
+        if "opponent_request" in manifest_case["opportunity_types"]:
+            assert result.output["disposition"] != "accepted"
+        record: dict[str, Any] = {
+            "case_id": case_id,
+            "primary": result.output,
+        }
+        if expected_disposition == "needs_second_pass":
+            second_request = _gate_request(
+                case_id=case_id,
+                body=body,
+                prompt_version="open-match-ambiguity-v2",
+                pass_kind="ambiguity_second_pass",
+            )
+            second_result = adapter.classify(second_request)
+            _assert_selected_execution_provenance(
+                second_result,
+                request=second_request,
+                runner=runner,
+            )
+            assert classifier_output_is_schema_valid(second_result.output, body=body)
+            validated_semantic_records.update(
+                _execute_selected_semantic_proofs(
+                    adapter,
+                    runner,
+                    corpus,
+                    case_id=case_id,
+                    pass_name="second_pass",
+                    body=body,
+                    request=second_request,
+                    output=second_result.output,
+                )
+            )
+            request_manifests.append(
+                {
+                    "case_id": case_id,
+                    "pass_kind": second_request.pass_kind,
+                    "input_manifest_hash": _request_manifest_hash(second_request),
+                }
+            )
+            assert second_result.output["disposition"] != "accepted"
+            record["second_pass"] = second_result.output
+        observed.append(record)
+
+    recorded_promotion_fixtures = corpus["recorded_promotion_fixtures"]
+    assert isinstance(recorded_promotion_fixtures, dict)
+    promotion_results: dict[str, ClassifierAdapterResult] = {}
+    promotion_proofs: dict[str, dict[str, JsonValue]] = {}
+    for fixture_name in corpus["promotion_fixtures"]:
+        fixture = recorded_promotion_fixtures[fixture_name]
+        assert isinstance(fixture, dict)
+        body = fixture["source"]
+        assert isinstance(body, str)
+        assert fixture_name in corpus["promotion_fixtures"]
+        request = _gate_request(
+            case_id=f"promotion:{fixture_name}",
+            body=body,
+        )
+        result = adapter.classify(request)
+        _assert_selected_execution_provenance(
+            result,
+            request=request,
+            runner=runner,
+        )
+        assert classifier_output_is_schema_valid(result.output, body=body)
+        promotion_results[fixture_name] = result
+        validated_semantic_records.update(
+            _execute_selected_semantic_proofs(
+                adapter,
+                runner,
+                corpus,
+                case_id=f"promotion:{fixture_name}",
+                pass_name="promotion",
+                body=body,
+                request=request,
+                output=result.output,
+                proof_outputs=promotion_proofs,
+            )
+        )
+        if result.output["disposition"] == "accepted":
+            candidates = result.output.get("candidates")
+            assert isinstance(candidates, list) and len(candidates) == 1
+            candidate_value = candidates[0]
+            assert isinstance(candidate_value, dict)
+            candidate = candidate_value
+            opportunity_type = candidate.get("opportunity_type")
+            assert opportunity_type in {"open_match", "tournament"}
+            assert candidate.get("open_participation") is True
+            event_time = candidate.get("event_time")
+            assert isinstance(event_time, dict)
+            assert event_time.get("start_local_date") == "2026-08-20"
+            routes = candidate.get("response_routes")
+            assert isinstance(routes, list) and routes
+            route = routes[0]
+            assert isinstance(route, dict)
+            assert route.get("value") == "@tournament_contact"
+            candidate_key = candidate.get("candidate_key")
+            evidence = candidate.get("evidence")
+            assert isinstance(candidate_key, str)
+            assert isinstance(evidence, dict)
+
+    promotion_payload, promotion_body = _tournament_promotion_payload(corpus)
+    promotion_result = promotion_results["tournament-current-registration"]
+    promotion_output = promotion_result.output
+    promotion_proof = promotion_proofs["tournament-current-registration"]
+    promotion_payload["output"] = promotion_output
+    promotion_payload["semantic_proof"] = promotion_proof
+    for field_name in (
+        "effective_model",
+        "effective_reasoning_effort",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+    ):
+        promotion_payload[field_name] = getattr(promotion_result, field_name)
+    promotion_manifest_hash = _classifier_input_manifest_hash(
+        promotion_payload,
+        revision_id=str(promotion_payload["source_message_revision_id"]),
+        body=promotion_body,
+        prompt_version="open-match-primary-v3",
+        schema_version="source-message-classification-v3",
+        context_bundle_version="primary-classifier-context-v1",
+        context_policy_version="classifier-context-v1",
+        routing_policy_version="classifier-routing-v1",
+        pass_kind="primary",
+        pass_number=1,
+        attempt_number=1,
+    )
+    assert promotion_manifest_hash is not None
+    promotion_payload["input_manifest_hash"] = promotion_manifest_hash
+    resolver: LocationResolverAdapter = _RecordedTournamentResolver()
+    normalized_promotion = _validated_tournament_proposal(
+        promotion_payload,
+        resolver=resolver,
+    )
+    assert normalized_promotion is not None
+    normalized_facts = normalized_promotion["accepted_facts"]
+    assert isinstance(normalized_facts, dict)
+    assert normalized_facts["open_participation"] is True
+    assert normalized_promotion["publication_state"] == "active"
+    assert normalized_promotion["response_route"] == {
+        "kind": "explicit_telegram_username",
+        "value": "@tournament_contact",
+    }
+    promotion_candidates = promotion_output.get("candidates")
+    assert isinstance(promotion_candidates, list) and len(promotion_candidates) == 1
+    promotion_candidate = promotion_candidates[0]
+    assert isinstance(promotion_candidate, dict)
+    promotion_evidence = promotion_candidate.get("evidence")
+    promotion_routes = promotion_candidate.get("response_routes")
+    assert isinstance(promotion_evidence, dict)
+    assert isinstance(promotion_routes, list)
+    assert semantic_proof_is_schema_valid(
+        promotion_proof,
+        body=promotion_body,
+        source_message_revision_reference=str(
+            promotion_proof["source_message_revision_reference"]
+        ),
+        candidate_key="tournament-current-registration",
+        evidence=promotion_evidence,
+        routes=promotion_routes,
+        opportunity_type="tournament",
+        semantic_proof_version=corpus["semantic_proof_version"],
+    )
+
+    rejected_output = deepcopy(promotion_output)
+    rejected_candidates = rejected_output.get("candidates")
+    assert isinstance(rejected_candidates, list) and len(rejected_candidates) == 1
+    rejected_candidate = rejected_candidates[0]
+    assert isinstance(rejected_candidate, dict)
+    rejected_event_time = rejected_candidate.get("event_time")
+    assert isinstance(rejected_event_time, dict)
+    rejected_event_time["start_local_date"] = "2026-08-21"
+    rejected_payload = deepcopy(promotion_payload)
+    rejected_payload["output"] = rejected_output
+    assert _validated_tournament_proposal(rejected_payload, resolver=resolver) is None
+
+    normalization_persistence = _EvaluationPersistence()
+
+    def reject_normalization(output: dict[str, JsonValue]) -> object:
+        normalized_output = deepcopy(output)
+        candidates = normalized_output.get("candidates")
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        event_time = candidate.get("event_time")
+        assert isinstance(event_time, dict)
+        event_time["start_local_date"] = "2026-08-21"
+        rejected_payload["output"] = normalized_output
+        return _validated_tournament_proposal(rejected_payload, resolver=resolver)
+
+    normalization_outcome = _run_selected_evaluation(
+        adapter,
+        _gate_request(case_id="normalization-rejection", body=promotion_body),
+        effect_key="normalization-rejection",
+        persistence=normalization_persistence,
+        normalize=reject_normalization,
+    )
+    assert normalization_outcome == "unpublished"
+    assert normalization_persistence.committed == {}
+    assert normalization_persistence.staged == {}
+
+    unpublished_fixture = recorded_promotion_fixtures[
+        "football-discussion-without-opportunity"
+    ]
+    assert isinstance(unpublished_fixture, dict)
+    unpublished_body = unpublished_fixture["source"]
+    assert isinstance(unpublished_body, str)
+    unpublished_persistence = _EvaluationPersistence()
+    unpublished_outcome = _run_selected_evaluation(
+        adapter,
+        _gate_request(case_id="unpublished-persistence", body=unpublished_body),
+        effect_key="unpublished-persistence",
+        persistence=unpublished_persistence,
+    )
+    assert unpublished_outcome == "unpublished"
+    assert unpublished_persistence.committed == {}
+    assert unpublished_persistence.staged == {}
+
+    failure_results: list[str] = []
+    for name, error, expected_error in (
+        ("timeout", TimeoutError(), ClassifierExecutionTimeoutError),
+        ("429", ClassifierQuotaError(), ClassifierQuotaError),
+        ("auth", ClassifierAuthenticationError(), ClassifierAuthenticationError),
+        ("crash", InjectedClassifierCrash(), InjectedClassifierCrash),
+    ):
+        runner.fail_for(case_id=name, error=error)
+        failure_persistence = _EvaluationPersistence()
+        try:
+            _run_selected_evaluation(
+                adapter,
+                _gate_request(case_id=name, body="failure fixture"),
+                effect_key=name,
+                persistence=failure_persistence,
+            )
+        except expected_error:
+            assert failure_persistence.committed == {}
+            assert failure_persistence.staged == {}
+            assert failure_persistence.started == [name]
+            failure_results.append(name)
+        else:
+            raise AssertionError(f"failure fixture did not fail closed: {name}")
+    replay_body = promotion_body
+    replay_persistence = _EvaluationPersistence()
+    replay_request = _gate_request(case_id="replay", body=replay_body)
+    assert (
+        _run_selected_evaluation(
+            adapter,
+            replay_request,
+            effect_key="tournament-current-registration",
+            persistence=replay_persistence,
+        )
+        == "published"
+    )
+    assert (
+        _run_selected_evaluation(
+            adapter,
+            replay_request,
+            effect_key="tournament-current-registration",
+            persistence=replay_persistence,
+        )
+        == "replayed"
+    )
+    assert (
+        len(
+            [
+                record
+                for record in runner.execution_records
+                if record["case_id"] == "replay"
+            ]
+        )
+        == 2
+    )
+    assert set(replay_persistence.committed) == {"tournament-current-registration"}
+    assert replay_persistence.staged == {}
+    assert replay_persistence.started == [
+        "tournament-current-registration",
+        "tournament-current-registration",
+    ]
+    failure_results.append("replay")
+
+    rollback_persistence = _EvaluationPersistence(fail_next_commit=True)
+    rollback_request = _gate_request(case_id="rollback", body=promotion_body)
+    try:
+        _run_selected_evaluation(
+            adapter,
+            rollback_request,
+            effect_key="tournament-current-registration",
+            persistence=rollback_persistence,
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("rollback fixture committed unexpectedly")
+    assert rollback_persistence.committed == {}
+    assert rollback_persistence.staged == {}
+    assert rollback_persistence.started == ["tournament-current-registration"]
+    assert (
+        _run_selected_evaluation(
+            adapter,
+            rollback_request,
+            effect_key="tournament-current-registration",
+            persistence=rollback_persistence,
+        )
+        == "published"
+    )
+    assert set(rollback_persistence.committed) == {"tournament-current-registration"}
+    failure_results.append("rollback")
+    assert failure_results == corpus["failure_suite"]
+    expected_semantic_records = {
+        (
+            str(record["case_id"]),
+            str(record["pass_name"]),
+            str(record["candidate_key"]),
+        )
+        for record in semantic_records
+    }
+    assert validated_semantic_records == expected_semantic_records
+    output_digest = hashlib.sha256(
+        json.dumps(observed, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    failure_digest = hashlib.sha256(
+        json.dumps(failure_results, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    request_manifest_digest = _canonical_digest(request_manifests)
+    assert request_manifests == provenance["request_manifests"]
+    expected_digests = provenance["expected_digests"]
+    assert isinstance(expected_digests, dict)
+    assert (
+        _canonical_digest(artifact_records)
+        == expected_digests["artifact_records_sha256"]
+    )
+    assert request_manifest_digest == expected_digests["request_manifests_sha256"]
+    publication_outcomes = {
+        "normalization_rejection": normalization_outcome,
+        "unpublished_persistence": unpublished_outcome,
+    }
+    assert publication_outcomes == provenance["expected_publication_outcomes"]
+    successful_execution_records = [
+        record for record in runner.execution_records if record["status"] == "succeeded"
+    ]
+    failed_execution_records = [
+        record for record in runner.execution_records if record["status"] == "failed"
+    ]
+    assert len(successful_execution_records) == 54
+    assert len(failed_execution_records) == 4
+    assert {record["case_id"] for record in failed_execution_records} == {
+        "timeout",
+        "429",
+        "auth",
+        "crash",
+    }
+    assert {record["case_id"] for record in runner.execution_records}.issuperset(
+        set(corpus["failure_suite"])
+    )
+    selected_artifacts = _validate_selected_execution_anchor(
+        corpus,
+        runner=runner,
+        repository_root=repository_root,
+    )
+    output_records = [
+        {
+            key: record[key]
+            for key in (
+                "execution_id",
+                "run_id",
+                "process_id",
+                "case_id",
+                "pass_kind",
+                "output_sha256",
+                "status",
+            )
+            if key in record
+        }
+        for record in successful_execution_records
+    ]
+    selected_classifier_evidence = {
+        "run_id": run_id,
+        "process_id": process_id,
+        "adapter_kind": adapter.adapter_kind,
+        "adapter_version": "classifier-hermetic-execution-v2",
+        "codex_version": runner.codex_version,
+        "execution_count": len(runner.execution_records),
+        "successful_execution_count": len(successful_execution_records),
+        "failed_execution_count": len(failed_execution_records),
+        "semantic_proof_execution_count": sum(
+            record["pass_kind"] == "semantic_proof"
+            for record in successful_execution_records
+        ),
+        "output_digest": _canonical_digest(output_records),
+        "provenance_digest": _canonical_digest(
+            [
+                {
+                    key: record[key]
+                    for key in (
+                        "execution_id",
+                        "run_id",
+                        "process_id",
+                        "case_id",
+                        "pass_kind",
+                        "request_sha256",
+                        "adapter_kind",
+                        "adapter_version",
+                        "codex_version",
+                        "status",
+                    )
+                    if key in record
+                }
+                for record in runner.execution_records
+            ]
+        ),
+        "evidence_digest": _canonical_digest(runner.execution_records),
+        "canonical_output_artifact_sha256": selected_artifacts[
+            "output_artifact_sha256"
+        ],
+        "canonical_protocol_artifact_sha256": selected_artifacts[
+            "protocol_artifact_sha256"
+        ],
+        "canonical_execution_artifact_sha256": selected_artifacts[
+            "execution_artifact_sha256"
+        ],
+        "output_records": output_records,
+        "execution_records": runner.execution_records,
+    }
+    return json.dumps(
+        {
+            "case_count": len(observed),
+            "case_ids": [record["case_id"] for record in observed],
+            "output_digest": output_digest,
+            "failure_digest": failure_digest,
+            "artifact_digest": _canonical_digest(artifact_records),
+            "request_manifest_digest": request_manifest_digest,
+            "publication_outcomes": publication_outcomes,
+            "selected_classifier": selected_classifier_evidence,
+        },
+        sort_keys=True,
+    )
+
+
+def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -> None:
+    """Keep v3 promotion behind the reviewed corpus, pass, and failure gate."""
+    corpus = _load_reviewed_v3_contract()
+    assert corpus["reviewed"] is True
+    assert corpus["redacted"] is True
+    assert corpus["model"] == "gpt-5.6-sol"
+    assert corpus["reasoning_effort"] == "high"
+    assert corpus["independent_complete_runs"] == 3
+    assert corpus["required_passes"] == [
+        "primary-v3",
+        "ambiguity-second-pass-v2",
+        "semantic-proof-v2",
+        "normalization",
+        "unpublished-outcomes",
+    ]
+    assert corpus["failure_suite"] == [
+        "timeout",
+        "429",
+        "auth",
+        "crash",
+        "replay",
+        "rollback",
+    ]
+
+    runner = Path(__file__).with_name("run_v3_evaluation.py")
+    run_summaries = []
+    for run_id in ("run-1", "run-2", "run-3"):
+        completed = subprocess.run(
+            [sys.executable, str(runner), run_id],
+            cwd=Path(__file__).parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert not completed.stderr
+        run_summaries.append(json.loads(completed.stdout))
+    assert [summary["run_id"] for summary in run_summaries] == [
+        "run-1",
+        "run-2",
+        "run-3",
+    ]
+    assert len({summary["process_id"] for summary in run_summaries}) == 3
+    assert all(summary["case_count"] == 38 for summary in run_summaries)
+    assert all(
+        summary["case_ids"] == [f"sm-{index:03d}" for index in range(1, 39)]
+        for summary in run_summaries
+    )
+    selected_runs = [summary["selected_classifier"] for summary in run_summaries]
+    assert all(selected["adapter_kind"] == "codex_cli" for selected in selected_runs)
+    assert all(
+        selected["adapter_version"] == "classifier-hermetic-execution-v2"
+        for selected in selected_runs
+    )
+    assert all(
+        selected["codex_version"] == "hermetic-codex-execution-v2"
+        for selected in selected_runs
+    )
+    assert all(selected["execution_count"] == 58 for selected in selected_runs)
+    assert all(
+        selected["successful_execution_count"] == 54 for selected in selected_runs
+    )
+    assert all(selected["failed_execution_count"] == 4 for selected in selected_runs)
+    assert all(
+        selected["semantic_proof_execution_count"] == 4 for selected in selected_runs
+    )
+    selected_anchor = _evaluation_provenance(corpus)["selected_execution"]
+    assert isinstance(selected_anchor, dict)
+    selected_expected = selected_anchor["expected"]
+    assert isinstance(selected_expected, dict)
+    assert all(
+        selected["canonical_output_artifact_sha256"]
+        == selected_expected["output_artifact_sha256"]
+        for selected in selected_runs
+    )
+    assert all(
+        selected["canonical_execution_artifact_sha256"]
+        == selected_expected["execution_artifact_sha256"]
+        for selected in selected_runs
+    )
+    assert all(
+        selected["canonical_protocol_artifact_sha256"]
+        == selected_expected["protocol_artifact_sha256"]
+        for selected in selected_runs
+    )
+    assert len({selected["output_digest"] for selected in selected_runs}) == 3
+    assert len({selected["provenance_digest"] for selected in selected_runs}) == 3
+    assert len({selected["evidence_digest"] for selected in selected_runs}) == 3
+    for selected in selected_runs:
+        records = selected["execution_records"]
+        assert len({record["execution_id"] for record in records}) == 58
+        assert len({record["child_process_id"] for record in records}) == 58
+        assert all(
+            record["child_process_id"] != selected["process_id"] for record in records
+        )
+        assert all(record["run_id"] == selected["run_id"] for record in records)
+        assert all(record["process_id"] == selected["process_id"] for record in records)
+        assert all(
+            record["exit_code"] == 0
+            for record in records
+            if record["status"] == "succeeded"
+        )
+        assert all(
+            record["exit_code"] != 0
+            for record in records
+            if record["status"] == "failed"
+        )
+        assert all(record["duration_ms"] > 0 for record in records)
+        assert all(
+            record["input_sha256"] and record["stdout_sha256"] for record in records
+        )
+        assert all(record["stderr_sha256"] for record in records)
+        assert {
+            record["case_id"] for record in records if record["status"] == "failed"
+        } == {"timeout", "429", "auth", "crash"}
+    deterministic_summaries = [
+        {
+            key: value
+            for key, value in summary.items()
+            if key not in {"process_id", "run_id", "selected_classifier"}
+        }
+        for summary in run_summaries
+    ]
+    assert (
+        len(
+            {json.dumps(summary, sort_keys=True) for summary in deterministic_summaries}
+        )
+        == 1
+    )
+    summary = run_summaries[0]
+    assert summary["case_count"] == 38
+    expected_provenance = _evaluation_provenance(corpus)
+    expected_digests = expected_provenance["expected_digests"]
+    assert isinstance(expected_digests, dict)
+    assert summary["artifact_digest"] == expected_digests["artifact_records_sha256"]
+    assert (
+        summary["request_manifest_digest"]
+        == expected_digests["request_manifests_sha256"]
+    )
+    assert (
+        summary["publication_outcomes"]
+        == expected_provenance["expected_publication_outcomes"]
+    )
+
+
+def test_selected_classifier_uses_a_real_process_and_not_recorded_v3_output() -> None:
+    """The selected gate must execute its configured fixture outside this process."""
+    repository_root = Path(__file__).parents[2]
+    executable = Path(__file__).with_name("hermetic-codex")
+    assert executable.is_file()
+    assert os.access(executable, os.X_OK)
+
+    corpus = _load_reviewed_v3_contract()
+    source_cases = _load_reviewed_source_cases()
+    request = _gate_request(case_id="sm-001", body=source_cases["sm-001"]["source"])
+    adapter, runner = _selected_classifier_adapter(
+        run_id="process-contract",
+        process_id=os.getpid(),
+    )
+    original = adapter.classify(request)
+
+    recorded_cases = corpus["recorded_outputs"]
+    assert isinstance(recorded_cases, list)
+    recorded_cases[0]["primary_output"] = {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+        "candidates": [],
+    }
+    changed_corpus_adapter, changed_corpus_runner = _selected_classifier_adapter(
+        run_id="process-contract-mutated-corpus",
+        process_id=os.getpid(),
+    )
+    changed_corpus_result = changed_corpus_adapter.classify(request)
+
+    assert changed_corpus_result.output == original.output
+    record = runner.execution_records[-1]
+    changed_record = changed_corpus_runner.execution_records[-1]
+    assert record["status"] == "succeeded"
+    assert isinstance(record["child_process_id"], int)
+    assert record["child_process_id"] != os.getpid()
+    assert record["child_process_id"] != record["process_id"]
+    assert record["argv"][0] == str(executable)
+    assert record["cwd"] == str(repository_root)
+    assert record["environment"]["CODEX_HOME"] == str(
+        repository_root / ".hermetic-codex-home"
+    )
+    assert record["timeout_seconds"] == 180
+    assert record["stdout_sha256"]
+    assert record["stderr_sha256"]
+    assert record["request_sha256"] == _canonical_digest(_request_payload(request))
+    assert len(record["input_sha256"]) == 64
+    assert isinstance(changed_record["child_process_id"], int)
+    assert changed_record["child_process_id"] != record["child_process_id"]
+
+
+def test_selected_execution_digest_anchor_is_external_to_selected_summary() -> None:
+    """The selected run cannot redefine its own expected digest anchor."""
+    corpus = _load_reviewed_v3_contract()
+    selected_anchor = _evaluation_provenance(corpus)["selected_execution"]
+    assert isinstance(selected_anchor, dict)
+    selected_expected = selected_anchor["expected"]
+    assert isinstance(selected_expected, dict)
+    selected_expected["output_artifact_sha256"] = "0" * 64
+
+    with pytest.raises(AssertionError):
+        _validate_selected_execution_anchor(
+            corpus,
+            runner=_HermeticCodexProcessRunner(
+                run_id="external-anchor-contract",
+                process_id=os.getpid(),
+            ),
+            repository_root=Path(__file__).parents[2],
+        )
+
+
+def test_selected_process_runner_honors_child_environment_and_timeout() -> None:
+    """A real sleeping child must be terminated by the supplied deadline."""
+    repository_root = Path(__file__).parents[2]
+    schema_path = (
+        repository_root
+        / "classifier"
+        / "open-match-primary-v3"
+        / "source-message-classification-v3.schema.json"
+    )
+    prompt_path = repository_root / "classifier" / "open-match-primary-v3" / "prompt.md"
+    request = _gate_request(case_id="timeout-contract", body="timeout contract")
+    input_text = json.dumps(
+        {
+            "instruction": prompt_path.read_text(encoding="utf-8"),
+            "request": _request_payload(request),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    runner = _HermeticCodexProcessRunner(
+        run_id="timeout-contract",
+        process_id=os.getpid(),
+    )
+    argv = (
+        str(_HERMETIC_EXECUTABLE),
+        "exec",
+        "--ephemeral",
+        "--json",
+        "--output-schema",
+        str(schema_path),
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--fixture-argv-marker",
+        "argv-contract",
+        "--sandbox",
+        "read-only",
+        "-",
+    )
+    try:
+        runner.execute(
+            argv,
+            cwd=Path("/tmp"),
+            environment={
+                "CODEX_HOME": str(repository_root / ".hermetic-codex-home"),
+                "HERMETIC_SLEEP_SECONDS": "2",
+            },
+            input_text=input_text,
+            timeout_seconds=1,
+        )
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("sleeping hermetic child exceeded its deadline")
+    record = runner.execution_records[-1]
+    assert record["status"] == "failed"
+    assert record["failure_kind"] == "process_timeout"
+    assert record["exit_code"] != 0
+    assert isinstance(record["child_process_id"], int)
+    assert record["cwd"] == str(Path("/tmp").resolve())
+    assert record["environment"]["HERMETIC_SLEEP_SECONDS"] == "2"
+    assert record["timeout_seconds"] == 1
+
+
+def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
+    """Recorded v3 outputs stay anchored independently of selected execution."""
+    corpus = _load_reviewed_v3_contract()
+    repository_root = Path(__file__).parents[2]
+    artifact_records = _validate_reviewed_provenance(
+        corpus,
+        repository_root=repository_root,
+    )
+    source_cases = _load_reviewed_source_cases()
+    manifest_cases = {str(case["case_id"]): case for case in corpus["cases"]}
+    recorded_cases = {str(case["case_id"]): case for case in corpus["recorded_outputs"]}
+    for case_id, recorded_case in recorded_cases.items():
+        body = source_cases[case_id]["source"]
+        primary = recorded_case["primary_output"]
+        assert isinstance(primary, dict)
+        assert classifier_output_is_schema_valid(primary, body=body)
+        expected_disposition = manifest_cases[case_id]["expected_pipeline_disposition"]
+        if expected_disposition == "unresolved" and not set(
+            manifest_cases[case_id]["opportunity_types"]
+        ).intersection({"open_match", "tournament"}):
+            expected_disposition = "needs_review"
+        assert primary["disposition"] == expected_disposition
+        _assert_semantic_proofs_for_output(
+            corpus,
+            case_id=case_id,
+            pass_name="primary",
+            body=body,
+            output=primary,
+        )
+        second = recorded_case.get("second_pass_output")
+        if isinstance(second, dict):
+            assert classifier_output_is_schema_valid(second, body=body)
+            _assert_semantic_proofs_for_output(
+                corpus,
+                case_id=case_id,
+                pass_name="second_pass",
+                body=body,
+                output=second,
+            )
+    recorded_fixtures = corpus["recorded_promotion_fixtures"]
+    assert isinstance(recorded_fixtures, dict)
+    for fixture_name, fixture in recorded_fixtures.items():
+        assert isinstance(fixture, dict)
+        body = fixture["source"]
+        output = fixture["primary_output"]
+        assert isinstance(body, str)
+        assert isinstance(output, dict)
+        assert classifier_output_is_schema_valid(output, body=body)
+        _assert_semantic_proofs_for_output(
+            corpus,
+            case_id=f"promotion:{fixture_name}",
+            pass_name="promotion",
+            body=body,
+            output=output,
+        )
+    provenance = _evaluation_provenance(corpus)
+    recorded_execution = provenance["execution"]
+    selected_execution = provenance["selected_execution"]
+    assert recorded_execution["adapter_kind"] == "recorded_corpus"
+    assert recorded_execution["codex_version"] == "reviewed-offline"
+    assert selected_execution["anchor_version"] == (
+        "open-match-classifier-regression-v3-selected-execution-anchor-v1"
+    )
+    assert _canonical_digest(artifact_records) == provenance["artifact_records_sha256"]
+    assert (
+        _canonical_digest(corpus["recorded_outputs"])
+        == corpus["_v3_anchor"]["canonical_digests"]["recorded_outputs_sha256"]
     )
 
 

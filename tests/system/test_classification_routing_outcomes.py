@@ -160,14 +160,24 @@ def test_concrete_classifier_adapters_route_application_through_v2(
         runner = _ApplicationCodexRunner()
         schema_path = tmp_path / "source-message-classification-v2.json"
         schema_path.write_text("{}", encoding="utf-8")
+        v3_schema_path = tmp_path / "source-message-classification-v3.json"
+        v3_schema_path.write_text("{}", encoding="utf-8")
         prompt_path = tmp_path / "open-match-primary-v2.prompt.md"
         prompt_path.write_text("application primary prompt", encoding="utf-8")
+        v3_prompt_path = tmp_path / "open-match-primary-v3.prompt.md"
+        v3_prompt_path.write_text("application v3 primary prompt", encoding="utf-8")
         adapter: ModelAdapter = CodexCliClassifierAdapter(
             codex_executable=Path("/opt/classifier/bin/codex"),
             codex_home=tmp_path / "codex-home",
             workspace=tmp_path / "workspace",
-            schema_paths={"source-message-classification-v2": schema_path},
-            prompt_paths={"open-match-primary-v2": prompt_path},
+            schema_paths={
+                "source-message-classification-v2": schema_path,
+                "source-message-classification-v3": v3_schema_path,
+            },
+            prompt_paths={
+                "open-match-primary-v2": prompt_path,
+                "open-match-primary-v3": v3_prompt_path,
+            },
             runner=runner,
             codex_version="codex-test-version",
             adapter_version="codex-classifier-v1",
@@ -176,13 +186,25 @@ def test_concrete_classifier_adapters_route_application_through_v2(
         transport = _ApplicationResponsesTransport()
         prompt_path = tmp_path / "open-match-primary-v2.prompt.md"
         prompt_path.write_text("application primary prompt", encoding="utf-8")
+        v3_prompt_path = tmp_path / "open-match-primary-v3.prompt.md"
+        v3_prompt_path.write_text("application v3 primary prompt", encoding="utf-8")
         adapter = ResponsesClassifierAdapter(
             transport=transport,
-            schemas={"source-message-classification-v2": {}},
-            prompt_paths={"open-match-primary-v2": prompt_path},
+            schemas={
+                "source-message-classification-v2": {},
+                "source-message-classification-v3": {},
+            },
+            prompt_paths={
+                "open-match-primary-v2": prompt_path,
+                "open-match-primary-v3": v3_prompt_path,
+            },
             adapter_version="responses-classifier-v1",
         )
 
+    # v3 is an additive tournament/open-match artifact; opponent_request must
+    # continue to enter Application through the compatible v2 contract even
+    # when both provider artifacts are installed.
+    assert adapter.primary_schema_version == "source-message-classification-v2"
     system, _, _, revision_id = _stage_v2_source_delivery(
         classifier=cast(ControlledModelAdapter, adapter),
         body=body,

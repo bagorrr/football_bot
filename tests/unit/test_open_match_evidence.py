@@ -5,6 +5,8 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from modules.application import (
     _accepted_city_display_labels,
     _body_establishes_current_open_match,
@@ -17,6 +19,8 @@ from modules.application import (
     _resolve_source_location_across_supported_locales,
     _select_response_route,
     _stated_payment_amount_and_currency,
+    _tournament_fact_value_is_source_bound,
+    _tournament_open_participation_is_supported,
 )
 from modules.contracts import JsonValue
 from modules.domain import (
@@ -26,6 +30,176 @@ from modules.domain import (
     LocationResolution,
     LocationResolutionQuery,
 )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Registration is open",
+        "Открыта регистрация",
+        "Abiertas las inscripciones",
+        "Ouvertes aux inscriptions",
+    ),
+)
+def test_tournament_open_participation_accepts_supported_word_orders(
+    evidence: str,
+) -> None:
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Teams can register now",
+        "Register now for the tournament",
+        "Les équipes peuvent s'inscrire maintenant",
+    ),
+)
+def test_tournament_open_participation_accepts_registration_verbs(
+    evidence: str,
+) -> None:
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Осталось последнее место для команды",
+        "Идёт донабор команд",
+    ),
+)
+def test_tournament_open_participation_accepts_remaining_team_places(
+    evidence: str,
+) -> None:
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Registration is not open",
+        "Registration was open last year",
+        "Registration will be open next week",
+        "Регистрация закрыта",
+    ),
+)
+def test_tournament_open_participation_rejects_negative_or_historical_evidence(
+    evidence: str,
+) -> None:
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+    )
+
+
+def test_tournament_opening_date_must_be_current() -> None:
+    evidence = "Registration opens 1 September 2026"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        "Las entradas estarán abiertas el 1 de septiembre de 2026",
+        "Les inscriptions seront ouvertes le 1 septembre 2026",
+    ),
+)
+def test_localized_tournament_opening_dates_must_be_current(
+    evidence: str,
+) -> None:
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+
+
+def test_tournament_opening_date_uses_event_local_calendar() -> None:
+    evidence = "Registration opens 1 September 2026"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 0, 30, tzinfo=ZoneInfo("UTC")),
+        event_timezone=ZoneInfo("America/New_York"),
+    )
+    assert _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 4, 30, tzinfo=ZoneInfo("UTC")),
+        event_timezone=ZoneInfo("America/New_York"),
+    )
+
+
+def test_spanish_explicit_opening_year_is_not_replaced_by_validation_year() -> None:
+    evidence = "Las entradas estarán abiertas el 1 de septiembre de 2027"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 9, 1, 12, 0, tzinfo=ZoneInfo("UTC")),
+        event_timezone=ZoneInfo("Europe/Madrid"),
+    )
+
+
+def test_registration_form_or_route_is_not_open_participation_evidence() -> None:
+    evidence = "Registration form available: https://example.test/apply"
+
+    assert not _tournament_open_participation_is_supported(
+        evidence,
+        authoritative_body=evidence,
+        validation_time=datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("UTC")),
+    )
+    route = _select_response_route(
+        body=evidence,
+        proposed_routes=[
+            {
+                "kind": "explicit_url",
+                "value": "https://example.test/apply",
+                "evidence": "https://example.test/apply",
+            }
+        ],
+        bounded_metadata=None,
+    )
+    assert route == {
+        "kind": "explicit_url",
+        "value": "https://example.test/apply",
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "evidence", "expected"),
+    (
+        (1, "Registration deadline: 19 August 2026", False),
+        (1, "Capacity: 1 team", True),
+        ([1, 2], "Prizes: 1, 2", True),
+    ),
+)
+def test_tournament_numeric_optional_facts_require_exact_source_tokens(
+    value: JsonValue,
+    evidence: str,
+    expected: bool,
+) -> None:
+    assert _tournament_fact_value_is_source_bound(value, evidence) is expected
 
 
 class _LocalizedLocationResolver:

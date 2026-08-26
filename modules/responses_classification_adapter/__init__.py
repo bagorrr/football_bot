@@ -93,6 +93,8 @@ class ResponsesClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
+        # v3 remains evaluation-only until its promotion gate is accepted;
+        # v2 is the compatible runtime contract for opponent_request.
         return self._primary_schema_version
 
     def schema_smoke_test(self) -> bool:

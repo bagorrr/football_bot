@@ -1,0 +1,531 @@
+#!/usr/bin/python3
+"""Offline Codex-compatible executable used only by the v3 regression gate.
+
+The executable deliberately accepts the same structured stdin contract as the
+selected Codex CLI adapter.  Its deterministic semantic fixture is test-only;
+the production runtime continues to use the pinned Codex model policy.
+"""
+
+# ruff: noqa: RUF001 -- reviewed multilingual evidence is intentional.
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from uuid import NAMESPACE_URL, uuid5
+
+
+def _canonical_digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _opaque_revision_reference(revision_id: str) -> str:
+    opaque_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:classifier:revision:{revision_id}",
+    )
+    return f"classifier-revision:{opaque_id}"
+
+
+def _case_id(revision_id: str) -> str:
+    reviewed_id = revision_id.removeprefix("reviewed:")
+    return reviewed_id.rsplit(":revision:", 1)[0]
+
+
+def _span(body: str, text: str) -> dict[str, object]:
+    start = body.index(text)
+    return {"start": start, "end": start + len(text), "text": text}
+
+
+def _routing_output(disposition: str, reason_code: str) -> dict[str, object]:
+    return {
+        "schema_version": "source-message-classification-v3",
+        "disposition": disposition,
+        "routing": {"reason_code": reason_code, "required_context": "none"},
+        "candidates": [],
+    }
+
+
+def _unresolved_output(
+    *, body: str, candidate_key: str, opportunity_type: str
+) -> dict[str, object]:
+    return {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "unresolved",
+        "routing": {
+            "reason_code": "competing_interpretations",
+            "required_context": "none",
+        },
+        "candidates": [
+            {
+                "candidate_key": candidate_key,
+                "opportunity_type": opportunity_type,
+                "evidence": {"opportunity": body},
+                "alternatives": [
+                    {"alternative_key": "one-off", "evidence": {"opportunity": body}},
+                    {
+                        "alternative_key": "recurring",
+                        "evidence": {"opportunity": body},
+                    },
+                ],
+            }
+        ],
+    }
+
+
+def _proposition_evidence(
+    *,
+    body: str,
+    candidate_key: str,
+    evidence: dict[str, str],
+    routes: list[dict[str, str]],
+) -> dict[str, object]:
+    facts = {
+        name: {
+            "proposition_id": candidate_key,
+            "polarity": "positive",
+            "currentness": "current",
+            "span": _span(body, text),
+        }
+        for name, text in evidence.items()
+    }
+    structured_routes = [
+        {
+            "kind": route["kind"],
+            "value": route["value"],
+            "proposition_id": candidate_key,
+            "polarity": "positive",
+            "currentness": "current",
+            "span": _span(body, route["evidence"]),
+        }
+        for route in routes
+    ]
+    relations: list[dict[str, object]] = [
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "target": "root",
+            "span": _span(body, body),
+        }
+    ]
+    relations.extend(
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "target": name,
+            "span": _span(body, text),
+        }
+        for name, text in evidence.items()
+    )
+    relations.extend(
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "target": f"route:{route['kind']}:{route['value']}",
+            "span": _span(body, route["evidence"]),
+        }
+        for route in routes
+    )
+    return {
+        "contract_version": "source-proposition-evidence-v2",
+        "coverage": "complete_source_revision",
+        "root": {
+            "proposition_id": candidate_key,
+            "domain": "football_match",
+            "meaning": "tournament",
+            "polarity": "positive",
+            "currentness": "current",
+            "span": _span(body, body),
+        },
+        "facts": facts,
+        "routes": structured_routes,
+        "relations": relations,
+    }
+
+
+def _promotion_output(body: str) -> dict[str, object]:
+    date_match = re.search(r"\b(\d{1,2} [A-Z][a-z]+ \d{4})\b", body)
+    location_match = re.search(r"\bat (.+?)\. Registration is open", body)
+    route_match = re.search(r"@[A-Za-z0-9_]+", body)
+    if date_match is None or location_match is None or route_match is None:
+        raise ValueError("promotion fixture is incomplete")
+    date_text = date_match.group(1)
+    parsed_date = datetime.strptime(date_text, "%d %B %Y").date().isoformat()
+    location_text = location_match.group(1)
+    route_value = route_match.group(0)
+    candidate_key = "tournament-current-registration"
+    evidence = {
+        "opportunity": "Football tournament",
+        "event_time": date_text,
+        "location": location_text,
+        "open_participation": "Registration is open",
+    }
+    routes = [
+        {
+            "kind": "explicit_telegram_username",
+            "value": route_value,
+            "evidence": route_value,
+        }
+    ]
+    candidate: dict[str, object] = {
+        "candidate_key": candidate_key,
+        "opportunity_type": "tournament",
+        "evidence": evidence,
+        "source_context": body[: body.index(" Contact ")],
+        "location": {
+            "mention": location_text,
+            "place_id": "place:central-stadium",
+            "country_id": "country:example",
+            "city_id": "city:example",
+        },
+        "event_time": {
+            "start_local_date": parsed_date,
+            "end_local_date": parsed_date,
+            "iana_timezone": "Europe/Moscow",
+        },
+        "open_participation": True,
+        "response_routes": routes,
+    }
+    candidate["proposition_evidence"] = _proposition_evidence(
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+    )
+    return {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+        "candidates": [candidate],
+    }
+
+
+def _classify(request: dict[str, object]) -> dict[str, object]:
+    body = request.get("body")
+    revision_id = request.get("source_message_revision_id")
+    pass_kind = request.get("pass_kind")
+    if not isinstance(body, str) or not isinstance(revision_id, str):
+        raise ValueError("hermetic classifier request is incomplete")
+    if pass_kind == "semantic_proof":
+        return _semantic_proof(request)
+    if not isinstance(pass_kind, str):
+        raise ValueError("hermetic classifier pass kind is missing")
+
+    if (
+        re.search(r"\bFootball tournament\b", body)
+        and "Registration is open" in body
+        and re.search(r"@[A-Za-z0-9_]+", body)
+    ):
+        return _promotion_output(body)
+    body_folded = body.casefold()
+    if (
+        body == "?"
+        or "детский" in body_folded
+        or body_folded.startswith("ну что за женщина")
+        or body_folded.startswith("ну или другим языком")
+        or body_folded.startswith("если судить по этому видео")
+        or body_folded.startswith("ребята, сорри за оффтоп")
+        or body_folded.startswith("football discussion:")
+    ):
+        return _routing_output("irrelevant", "irrelevant")
+
+    if pass_kind == "ambiguity_second_pass":
+        if (
+            "одно место для команды" in body_folded
+            and "пару мест для игроков" in body_folded
+        ):
+            return _unresolved_output(
+                body=body,
+                candidate_key=f"{_case_id(revision_id)}:second-pass:ambiguous",
+                opportunity_type="tournament",
+            )
+        return _routing_output("needs_review", "needs_review")
+
+    if "Нужен кипер и 2 полевых" in body or (
+        "ищем вратаря в команду 8х8" in body_folded and "подробности" in body_folded
+    ):
+        return _unresolved_output(
+            body=body,
+            candidate_key=f"{_case_id(revision_id)}:ambiguous",
+            opportunity_type="open_match",
+        )
+    if (
+        "Сыграю на любой позиции" in body
+        or body.strip() == "Ищем соперников"
+        or (
+            "одно место для команды" in body_folded
+            and "пару мест для игроков" in body_folded
+        )
+        or ("тренировка" in body_folded and "на постоянную основу" in body_folded)
+    ):
+        return _routing_output("needs_second_pass", "deterministic_ambiguity")
+    return _routing_output("needs_review", "needs_review")
+
+
+def _semantic_proof(request: dict[str, object]) -> dict[str, object]:
+    body = request.get("body")
+    revision_id = request.get("source_message_revision_id")
+    candidate_key = request.get("proof_candidate_key")
+    if not all(isinstance(value, str) for value in (body, revision_id, candidate_key)):
+        raise ValueError("hermetic semantic-proof request is incomplete")
+    assert isinstance(body, str)
+    assert isinstance(revision_id, str)
+    assert isinstance(candidate_key, str)
+    is_promotion = candidate_key == "tournament-current-registration"
+    if is_promotion:
+        output = _promotion_output(body)
+        candidate = output["candidates"][0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        routes = candidate["response_routes"]
+        assert isinstance(evidence, dict)
+        assert isinstance(routes, list)
+        meaning = "tournament"
+        state = "current_positive"
+    else:
+        evidence = {"opportunity": body}
+        routes = []
+        meaning = "tournament" if ":second-pass:" in candidate_key else "open_match"
+        state = "ambiguous"
+
+    fact_values = {
+        name: {
+            "target_id": f"fact:{name}",
+            "state": state,
+            "span": _span(body, text),
+        }
+        for name, text in evidence.items()
+        if isinstance(text, str)
+    }
+    structured_routes = [
+        {
+            "kind": route["kind"],
+            "value": route["value"],
+            "target_id": f"route:{route['kind']}:{route['value']}",
+            "state": state,
+            "span": _span(body, route["evidence"]),
+        }
+        for route in routes
+        if isinstance(route, dict)
+    ]
+    assertion_target_ids = [
+        "root",
+        *(f"fact:{name}" for name in evidence),
+        *(route["target_id"] for route in structured_routes),
+    ]
+    checks = {
+        check_name: {
+            "state": "none" if is_promotion else "ambiguous",
+            "spans": [_span(body, body)],
+            "target_ids": assertion_target_ids,
+        }
+        for check_name in ("contradiction", "competition", "replacement", "closure")
+    }
+    relations: list[dict[str, object]] = [
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "source": "root",
+            "target": "root",
+            "span": _span(body, body),
+        }
+    ]
+    relations.extend(
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "source": "root",
+            "target": f"fact:{name}",
+            "span": _span(body, text),
+        }
+        for name, text in evidence.items()
+        if isinstance(text, str)
+    )
+    relations.extend(
+        {
+            "kind": "supports",
+            "direction": "outgoing",
+            "source": "root",
+            "target": route["target_id"],
+            "span": _span(body, route["span"]["text"]),
+        }
+        for route in structured_routes
+    )
+    relations.extend(
+        {
+            "kind": "covers",
+            "direction": "outgoing",
+            "source": "root",
+            "target": f"check:{check_name}",
+            "span": _span(body, body),
+        }
+        for check_name in ("contradiction", "competition", "replacement", "closure")
+    )
+    return {
+        "contract_version": "source-semantic-proof-v2",
+        "source_message_revision_reference": _opaque_revision_reference(revision_id),
+        "candidate_key": candidate_key,
+        "coverage": "complete_source_revision",
+        "root": {
+            "target_id": "root",
+            "domain": "football_match",
+            "meaning": meaning,
+            "state": state,
+            "span": _span(body, body),
+        },
+        "facts": fact_values,
+        "routes": structured_routes,
+        "checks": checks,
+        "relations": relations,
+    }
+
+
+def _validate_argv(argv: list[str]) -> None:
+    if len(argv) < 2 or argv[1] != "exec":
+        raise ValueError("hermetic executable requires the Codex exec command")
+    required_flags = {
+        "--ephemeral",
+        "--json",
+        "--output-schema",
+        "--model",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--sandbox",
+    }
+    if not required_flags.issubset(argv):
+        raise ValueError("hermetic executable received an incomplete Codex argv")
+    try:
+        model = argv[argv.index("--model") + 1]
+        reasoning = argv[argv.index("-c") + 1]
+        sandbox = argv[argv.index("--sandbox") + 1]
+    except (IndexError, ValueError) as error:
+        raise ValueError(
+            "hermetic executable received incomplete Codex argv"
+        ) from error
+    if model != "gpt-5.6-sol":
+        raise ValueError("hermetic executable received an unexpected model")
+    if reasoning != 'model_reasoning_effort="high"':
+        raise ValueError("hermetic executable received unexpected reasoning effort")
+    if sandbox != "read-only" or argv[-1] != "-":
+        raise ValueError("hermetic executable received an unexpected sandbox")
+    if not os.environ.get("CODEX_HOME"):
+        raise ValueError("hermetic executable requires CODEX_HOME")
+
+
+def _execution_metadata(
+    *, request: dict[str, object], run_id: str
+) -> dict[str, object]:
+    pid = os.getpid()
+    parent_pid = os.getppid()
+    declared_parent_pid = int(os.environ.get("HERMETIC_PARENT_PROCESS_ID", "0"))
+    if declared_parent_pid != parent_pid:
+        raise ValueError("hermetic parent-process evidence does not match the OS")
+    request_digest = _canonical_digest(request)
+    return {
+        "execution_id": f"{run_id}:child-{pid}:request-{request_digest[:16]}",
+        "run_id": run_id,
+        "child_process_id": pid,
+        "parent_process_id": parent_pid,
+        "argv": list(sys.argv),
+        "cwd": os.getcwd(),
+        "codex_home": os.environ["CODEX_HOME"],
+        "environment_marker": os.environ.get("HERMETIC_ENV_MARKER", ""),
+        "input_sha256": request_digest,
+    }
+
+
+def _emit(event: dict[str, object]) -> None:
+    print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def main() -> int:
+    try:
+        _validate_argv(sys.argv)
+        envelope = json.loads(sys.stdin.read())
+        if not isinstance(envelope, dict):
+            raise ValueError("hermetic classifier envelope is not an object")
+        request = envelope.get("request")
+        if not isinstance(request, dict):
+            raise ValueError("hermetic classifier request is not an object")
+        run_id = os.environ.get("HERMETIC_RUN_ID", "unscoped")
+        metadata = _execution_metadata(request=request, run_id=run_id)
+        _emit({"type": "thread.started", "hermetic_execution": metadata})
+        sleep_seconds = float(os.environ.get("HERMETIC_SLEEP_SECONDS", "0"))
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        failure_kind = os.environ.get("HERMETIC_FAILURE_KIND", "")
+        if failure_kind:
+            error: dict[str, object] = {"code": failure_kind}
+            if failure_kind == "429":
+                error = {"code": "quota_exhausted"}
+                _emit(
+                    {
+                        "type": "error",
+                        "status": 429,
+                        "headers": {"Retry-After": "240"},
+                        "error": error,
+                    }
+                )
+            elif failure_kind == "auth":
+                _emit(
+                    {
+                        "type": "error",
+                        "status": 401,
+                        "error": {"code": "authentication_required"},
+                    }
+                )
+            elif failure_kind == "timeout":
+                _emit({"type": "error", "error": {"code": "execution_timeout"}})
+            else:
+                _emit({"type": "error", "error": error})
+            return 1
+        output = _classify(request)
+        _emit(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "hermetic-item",
+                    "type": "agent_message",
+                    "text": json.dumps(output, ensure_ascii=False, sort_keys=True),
+                },
+            }
+        )
+        _emit(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": max(
+                        1, len(json.dumps(request, ensure_ascii=False).split())
+                    ),
+                    "output_tokens": max(
+                        1, len(json.dumps(output, ensure_ascii=False).split())
+                    ),
+                },
+            }
+        )
+        return 0
+    except Exception as error:
+        _emit(
+            {
+                "type": "error",
+                "error": {"code": "hermetic_fixture_error", "message": str(error)},
+            }
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

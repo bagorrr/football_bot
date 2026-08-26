@@ -4,7 +4,7 @@ ALTER TABLE football_runtime.application_opportunities
 ALTER TABLE football_runtime.application_opportunities
     ADD CONSTRAINT application_opportunities_opportunity_type_check CHECK (
         opportunity_type IN (
-            'open_match', 'opponent_request', 'roster_vacancy',
+            'open_match', 'opponent_request', 'tournament', 'roster_vacancy',
             'player_transfer_availability'
         )
     );
@@ -15,7 +15,7 @@ ALTER TABLE football_runtime.recommendation_opportunities
 ALTER TABLE football_runtime.recommendation_opportunities
     ADD CONSTRAINT recommendation_opportunities_opportunity_type_check CHECK (
         opportunity_type IN (
-            'open_match', 'opponent_request', 'roster_vacancy',
+            'open_match', 'opponent_request', 'tournament', 'roster_vacancy',
             'player_transfer_availability'
         )
     );

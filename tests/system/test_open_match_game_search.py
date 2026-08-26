@@ -133,6 +133,387 @@ def test_untyped_classifier_peer_fails_closed_before_model_and_replay() -> None:
     system.reset()
 
 
+def test_tournament_with_event_time_and_open_participation_is_published() -> None:
+    """Publish a Tournament only after both required facts are accepted."""
+    telegram_ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v3()
+    resolver = ControlledLocationResolverAdapter()
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    dates = ControlledDateInterpretationAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_115
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_115,
+    )
+    telegram_ingestion.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4915",
+    )
+    timezones.add_source(version="controlled-tzdb-v1", timezones=("Europe/Moscow",))
+    dates.return_for(
+        text="20 August",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 20),
+                    end_local_date=date(2026, 8, 20),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="Петроградская",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="station:ru:spb:petrogradskaya",
+                            display_name="Petrogradskaya",
+                            geographic_type=GeographicType.STATION,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=(
+                                "country:ru",
+                                "city:ru:saint-petersburg",
+                            ),
+                            parent_display_names=("Russia", "Saint Petersburg"),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Petrogradskaya"),
+                                ("es", "Petrogradskaya"),
+                                ("fr", "Petrogradskaya"),
+                                ("ru", "Петроградская"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=telegram_delivery,
+        model=classifier,
+        location_resolver=resolver,
+        date_interpretation=dates,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    body = (
+        "Adult football tournament on 20 August 2026 at Петроградская. "
+        "Registration is open. Team format 7x7, average playing level, outdoor venue "
+        "with artificial turf, "
+        "free entry. Tournament structure: group stage. "
+        "Registration deadline: 19 August 2026. Capacity: 16 teams. "
+        "Prizes: 1, 2. Contact @tournament_contact"
+    )
+    tournament_result = ClassifierAdapterResult(
+        output={
+            "schema_version": "source-message-classification-v3",
+            "disposition": "accepted",
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+            "candidates": [
+                {
+                    "candidate_key": "tournament-registration",
+                    "opportunity_type": "tournament",
+                    "source_context": body,
+                    "evidence": {
+                        "opportunity": "Adult football tournament",
+                        "event_time": "20 August 2026",
+                        "location": "Петроградская",
+                        "open_participation": "Registration is open",
+                        "team_formats": "Team format 7x7",
+                        "playing_levels": "average playing level",
+                        "venue_settings": "outdoor venue",
+                        "playing_surfaces": "artificial turf",
+                        "payment": "free entry",
+                        "structure": "Tournament structure: group stage",
+                        "registration_deadline": (
+                            "Registration deadline: 19 August 2026"
+                        ),
+                        "capacity": "Capacity: 16 teams",
+                        "prizes": "Prizes: 1, 2",
+                    },
+                    "location": {
+                        "mention": "Петроградская",
+                        "place_id": "station:ru:spb:petrogradskaya",
+                        "country_id": "country:ru",
+                        "city_id": "city:ru:saint-petersburg",
+                    },
+                    "event_time": {
+                        "start_local_date": "2026-08-20",
+                        "end_local_date": "2026-08-20",
+                        "iana_timezone": "Europe/Moscow",
+                    },
+                    "open_participation": True,
+                    "team_formats": ["7x7"],
+                    "playing_levels": ["average"],
+                    "venue_settings": ["outdoor"],
+                    "playing_surfaces": ["artificial_turf"],
+                    "payment": "free",
+                    "structure": "group stage",
+                    "registration_deadline": "2026-08-19",
+                    "capacity": "16 teams",
+                    "prizes": [1, 2],
+                    "response_routes": [
+                        {
+                            "kind": "explicit_telegram_username",
+                            "value": "@tournament_contact",
+                            "evidence": "@tournament_contact",
+                        }
+                    ],
+                }
+            ],
+        },
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="controlled_recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
+    classifier.return_for(body=body, result=tournament_result)
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4915),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4916),
+        source_event_id="source-event:tournament:publication",
+        telegram_message_id=1115,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 7, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+
+    published = tuple(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id.endswith(":1115:revision:1")
+    )
+    assert len(published) == 1
+    assert published[0].opportunity_type == "tournament"
+    publication = system.opportunity_publication_contracts(
+        "source-chat:channel:4900115:generation:1:message:1115:revision:1"
+    )[0]
+    assert isinstance(publication.payload, dict)
+    publication_facts = publication.payload["accepted_facts"]
+    assert isinstance(publication_facts, dict)
+    assert publication_facts["open_participation"] is True
+    assert publication_facts["start_local_date"] == "2026-08-20"
+
+    clock.advance_to(datetime(2026, 8, 18, 10, 7, tzinfo=UTC))
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4916),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4917),
+        source_event_id="source-event:tournament:publication-edit",
+        telegram_message_id=1115,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=body,
+        event_time=datetime(2026, 8, 18, 10, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    edited_revision_id = (
+        "source-chat:channel:4900115:generation:1:message:1115:revision:2"
+    )
+    active_edit_publication = next(
+        publication
+        for publication in system.opportunity_publication_contracts(edited_revision_id)
+        if isinstance(publication.payload, dict)
+        and publication.payload["publication_state"] == "active"
+    )
+    assert isinstance(active_edit_publication.payload, dict)
+    edited_facts = active_edit_publication.payload["accepted_facts"]
+    assert isinstance(edited_facts, dict)
+    assert edited_facts["source_posted_at"] == "2026-07-18T09:06:00+00:00"
+    assert edited_facts["source_edited_at"] == "2026-08-18T10:06:00+00:00"
+
+    _advance_to_complete_tournament_search(system, bot_user_id=49_117)
+    system.submit_search(
+        update_id="submit-tournament-search",
+        telegram_user_id=49_117,
+    )
+    system.process_searches_until_idle()
+    completed = system.completed_searches(49_117)
+    assert len(completed) == 1
+    results = system.results(completed[0].completed_search_id)
+    assert len(results) == 1
+    assert results[0].result_class == "confirmed_match"
+    assert dict(results[0].card_facts)["opportunity_type"] == "tournament"
+    assert telegram_delivery.messages[-1].text == (
+        "⚽ Tournament\n"
+        "20 August 2026\n"
+        "Saint Petersburg, Petrogradskaya\n"
+        "\n"
+        "Matches: date and city.\n\n"
+        "Additional: Team format: 7x7 · Playing levels: Average · "
+        "Venue type: Outdoor · Playing surface: Artificial turf · Payment: Free · "
+        "Registration deadline: 19 August 2026 · "
+        "Structure: Group stage · "
+        "Capacity: 16 teams · Prizes: 1, 2\n\n"
+        "Posted: 18 July 2026 at 12:06\n"
+        "Edited: 18 August 2026 at 13:06\n"
+        "Contact: @tournament_contact\n\n"
+        "Questions? Message me. I can explain the card or help refine your search."
+    )
+
+    clock.advance_to(datetime(2026, 8, 20, 0, 0, tzinfo=UTC))
+    expired_history = system.results(completed[0].completed_search_id)
+    assert len(expired_history) == 1
+    assert dict(expired_history[0].card_facts)["publication_state"] == "expired"
+
+    closed_body = f"{body} Registration is closed."
+    classifier.return_for(body=closed_body, result=tournament_result)
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4917),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4918),
+        source_event_id="source-event:tournament:registration-closed",
+        telegram_message_id=1115,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body=closed_body,
+        event_time=datetime(2026, 8, 18, 10, 8, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    closed_revision_id = (
+        "source-chat:channel:4900115:generation:1:message:1115:revision:3"
+    )
+    closed_outcome = next(
+        outcome
+        for outcome in system.classification_routing_outcomes()
+        if outcome.source_message_revision_id == closed_revision_id
+    )
+    assert closed_outcome.disposition == "needs_review"
+    assert closed_outcome.reason_code == "application_validation_failed"
+    closed_publications = system.opportunity_publication_contracts(closed_revision_id)
+    closed_payloads = [
+        publication.payload
+        for publication in closed_publications
+        if isinstance(publication.payload, dict)
+    ]
+    assert closed_payloads
+    assert {payload["publication_state"] for payload in closed_payloads} == {
+        "suppressed"
+    }
+    retracted_history = system.results(completed[0].completed_search_id)
+    assert len(retracted_history) == 1
+    retracted_facts = dict(retracted_history[0].card_facts)
+    assert retracted_facts["publication_state"] == "suppressed"
+    assert "response_route_value" not in retracted_facts
+    system.reset()
+
+
+def test_tournament_search_details_are_durable_and_preserve_product_order() -> None:
+    """Persist Tournament Search Details through the Bot User public seam."""
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    dates = ControlledDateInterpretationAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    dates.return_for(
+        text="20 August",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 20),
+                    end_local_date=date(2026, 8, 20),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    timezones.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram_delivery,
+        date_interpretation=dates,
+        timezone_data=timezones,
+    )
+    system.reset()
+    bot_user_id = 49_116
+    _advance_to_complete_tournament_search(system, bot_user_id=bot_user_id)
+
+    system.open_tournament_search_details(
+        update_id="open-tournament-details",
+        telegram_user_id=bot_user_id,
+    )
+    hub = telegram_delivery.messages[-1]
+    assert hub.text.startswith("You can choose the following settings:")
+    assert [row[0][0].split(":", 1)[0] for row in hub.button_rows[:5]] == [
+        "Team format",
+        "Playing levels",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ]
+
+    system.open_tournament_search_detail(
+        update_id="open-tournament-team-format",
+        telegram_user_id=bot_user_id,
+        detail_key="team_formats",
+    )
+    assert telegram_delivery.messages[-1].text == "👥 Select team formats."
+    system.toggle_tournament_search_detail_value(
+        update_id="toggle-tournament-team-format",
+        telegram_user_id=bot_user_id,
+        value="7x7",
+    )
+    draft = system.discovery_draft(bot_user_id)
+    assert draft.tournament_search_details == ()
+    assert draft.tournament_search_detail_draft == ("7x7",)
+    system.commit_tournament_search_detail(
+        update_id="commit-tournament-team-format",
+        telegram_user_id=bot_user_id,
+    )
+    assert dict(system.discovery_draft(bot_user_id).tournament_search_details) == {
+        "team_formats": ("7x7",)
+    }
+
+    system.submit_search(
+        update_id="submit-tournament-detail-search",
+        telegram_user_id=bot_user_id,
+    )
+    system.process_searches_until_idle()
+    completed = system.completed_searches(bot_user_id)
+    assert len(completed) == 1
+    assert completed[0].user_intent == "tournament_search"
+    assert dict(completed[0].tournament_search_details) == {"team_formats": ("7x7",)}
+
+
 def test_semantically_negated_open_match_has_no_postgres_publication_effect() -> None:
     """Model-positive evidence cannot publish a source-negated opening."""
     telegram_ingestion = ControlledTelegramIngestionAdapter()
@@ -3977,6 +4358,57 @@ def _advance_to_complete_game_search(
     )
     system.submit_required_date_text(
         update_id=f"date:open-match-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        text=date_text,
+    )
+
+
+def _advance_to_complete_tournament_search(
+    system: AcceptanceSpine,
+    *,
+    bot_user_id: int,
+    locale: str = "en",
+    area_text: str = "whole city",
+    date_text: str = "20 August",
+) -> None:
+    """Confirm the Competition/Tournament search core through public inputs."""
+    system.start_bot_user(
+        update_id=f"start:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id=f"language:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        locale=locale,
+    )
+    system.select_direction(
+        update_id=f"branch:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        direction="competition_search",
+    )
+    system.select_direction(
+        update_id=f"intent:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        direction="tournament_search",
+    )
+    system.submit_location_text(
+        update_id=f"country:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id=f"city:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        text="Saint Petersburg",
+    )
+    system.submit_location_text(
+        update_id=f"area:tournament-user:{bot_user_id}",
+        telegram_user_id=bot_user_id,
+        text=area_text,
+    )
+    system.submit_required_date_text(
+        update_id=f"date:tournament-user:{bot_user_id}",
         telegram_user_id=bot_user_id,
         text=date_text,
     )

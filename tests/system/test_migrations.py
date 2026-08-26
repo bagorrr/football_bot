@@ -23,7 +23,7 @@ from modules.domain import (
     empty_bounded_source_metadata,
 )
 from modules.ports import ClassifierAdapterResult
-from modules.postgres_adapter import PostgresAcceptanceMigrator
+from modules.postgres_adapter import PostgresAcceptanceMigrator, runtime_database_url
 from modules.testkit import (
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
@@ -508,6 +508,243 @@ def _assert_final_migration_state(database_url: str) -> None:
             "event_sequence",
         ),
     ]
+
+
+def test_bot_assistant_can_read_only_the_current_tournament_projection(
+    fresh_database_url: str,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    passwords = {role: "migration-projection-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (
+                'opportunity:tournament:least-privilege',
+                'opportunity:tournament:least-privilege:revision:1',
+                'tournament', 'active',
+                %s, %s, '2026-08-18T09:00:00+00:00'
+            )
+            """,
+            (
+                json.dumps(
+                    {
+                        "start_local_date": "2026-08-20",
+                        "end_local_date": "2026-08-20",
+                        "iana_timezone": "Europe/Moscow",
+                        "open_participation": True,
+                        "registration_deadline": "2026-08-19",
+                        "accepted_sensitive_fact": "must-not-leak",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": "@tournament_contact",
+                    }
+                ),
+            ),
+        )
+    bot_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.BOT_ASSISTANT,
+        passwords[RuntimeRole.BOT_ASSISTANT],
+    )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        assert connection.execute(
+            """
+            SELECT has_table_privilege(
+                current_user,
+                'football_runtime.recommendation_opportunities',
+                'SELECT'
+            )
+            """
+        ).fetchone() == (False,)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                """
+                SELECT accepted_facts, response_route
+                FROM football_runtime.recommendation_opportunities
+                """
+            ).fetchall()
+        projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   current_facts, response_route_kind, response_route_value
+            FROM football_runtime.read_current_tournament_result_projection(%s)
+            """,
+            ("opportunity:tournament:least-privilege",),
+        ).fetchone()
+
+    assert projection is not None
+    assert projection[0:3] == (
+        "opportunity:tournament:least-privilege",
+        "opportunity:tournament:least-privilege:revision:1",
+        "active",
+    )
+    assert projection[3] == {
+        "start_local_date": "2026-08-20",
+        "end_local_date": "2026-08-20",
+        "exact_local_time": None,
+        "day_part": None,
+        "iana_timezone": "Europe/Moscow",
+        "open_participation": True,
+        "registration_deadline": "2026-08-19",
+    }
+    assert projection[4:] == (
+        "explicit_telegram_username",
+        "@tournament_contact",
+    )
+    assert "accepted_sensitive_fact" not in projection[3]
+
+
+@pytest.mark.parametrize(
+    "publication_state",
+    ("held_for_review", "suppressed", "expired"),
+)
+def test_bot_assistant_tournament_projection_hides_routes_for_non_active_states(
+    fresh_database_url: str,
+    publication_state: str,
+) -> None:
+    """Non-active and unknown rows never expose historical Contact fields."""
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    passwords = {role: "migration-projection-non-active-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    opportunity_id = f"opportunity:tournament:projection:{publication_state}"
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (%s, %s, 'tournament', %s, %s, %s, %s)
+            """,
+            (
+                opportunity_id,
+                f"{opportunity_id}:revision:1",
+                publication_state,
+                json.dumps(
+                    {
+                        "start_local_date": "2026-08-20",
+                        "end_local_date": "2026-08-20",
+                        "iana_timezone": "Europe/Moscow",
+                        "open_participation": True,
+                        "accepted_sensitive_fact": "must-not-leak",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": "@historical_contact",
+                    }
+                ),
+                "2026-08-18T09:00:00+00:00",
+            ),
+        )
+
+    bot_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.BOT_ASSISTANT,
+        passwords[RuntimeRole.BOT_ASSISTANT],
+    )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        assert connection.execute(
+            """
+            SELECT has_table_privilege(
+                current_user,
+                'football_runtime.recommendation_opportunities',
+                'SELECT'
+            )
+            """
+        ).fetchone() == (False,)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                """
+                SELECT accepted_facts, response_route
+                FROM football_runtime.recommendation_opportunities
+                """
+            ).fetchall()
+        projection = connection.execute(
+            """
+            SELECT opportunity_id, publication_state, current_facts,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_tournament_result_projection(%s)
+            """,
+            (opportunity_id,),
+        ).fetchone()
+
+    assert projection is not None
+    assert projection[0:2] == (opportunity_id, publication_state)
+    assert projection[2]["open_participation"] is True
+    assert "accepted_sensitive_fact" not in projection[2]
+    assert projection[3:] == (None, None)
+
+
+def test_bot_assistant_tournament_projection_fails_closed_for_unknown_state(
+    fresh_database_url: str,
+) -> None:
+    """An unforeseen publication state is treated as non-active by the projection."""
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    passwords = {
+        role: "migration-projection-unknown-state-test" for role in RuntimeRole
+    }
+    migrator.provision_runtime_credentials(passwords)
+    opportunity_id = "opportunity:tournament:projection:unknown"
+    with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+        connection.execute(
+            """
+            ALTER TABLE football_runtime.recommendation_opportunities
+            DROP CONSTRAINT recommendation_opportunities_publication_state_check
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (%s, %s, 'tournament', 'future_state', %s, %s, %s)
+            """,
+            (
+                opportunity_id,
+                f"{opportunity_id}:revision:1",
+                json.dumps(
+                    {
+                        "start_local_date": "2026-08-20",
+                        "end_local_date": "2026-08-20",
+                        "iana_timezone": "Europe/Moscow",
+                        "open_participation": True,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": "@unknown_state_contact",
+                    }
+                ),
+                "2026-08-18T09:00:00+00:00",
+            ),
+        )
+    bot_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.BOT_ASSISTANT,
+        passwords[RuntimeRole.BOT_ASSISTANT],
+    )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        projection = connection.execute(
+            """
+            SELECT publication_state, response_route_kind, response_route_value
+            FROM football_runtime.read_current_tournament_result_projection(%s)
+            """,
+            (opportunity_id,),
+        ).fetchone()
+
+    assert projection == ("future_state", None, None)
 
 
 def test_repeated_migrate_preserves_completed_and_submitting_search_state(

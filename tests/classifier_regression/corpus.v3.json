@@ -1,0 +1,46 @@
+{
+  "corpus_version": "open-match-classifier-regression-v3-reviewed-v2",
+  "evaluation_contract_version": "source-message-classification-v3-review-gate-v1",
+  "reviewed": true,
+  "redacted": true,
+  "source_corpus": "docs/product/source-message-corpus-v1.yaml",
+  "source_corpus_provenance": "docs/product/source-message-corpus-provenance.md",
+  "source_corpus_case_count": 38,
+  "model": "gpt-5.6-sol",
+  "reasoning_effort": "high",
+  "prompt_version": "open-match-primary-v3",
+  "schema_version": "source-message-classification-v3",
+  "semantic_proof_version": "source-semantic-proof-v2",
+  "glossary_version": "football-opportunity-glossary-v1",
+  "context_policy_version": "classifier-context-v1",
+  "routing_policy_version": "classifier-routing-v1",
+  "independent_complete_runs": 3,
+  "required_passes": [
+    "primary-v3",
+    "ambiguity-second-pass-v2",
+    "semantic-proof-v2",
+    "normalization",
+    "unpublished-outcomes"
+  ],
+  "failure_suite": [
+    "timeout",
+    "429",
+    "auth",
+    "crash",
+    "replay",
+    "rollback"
+  ],
+  "promotion_fixtures": [
+    "tournament-current-registration",
+    "football-discussion-without-opportunity"
+  ],
+  "evidence_files": {
+    "case_manifest": "tests/classifier_regression/evidence/v3_case_manifest.json",
+    "recorded_evidence": "tests/classifier_regression/evidence/v3_recorded_evidence.json",
+    "request_manifests": "tests/classifier_regression/evidence/v3_input_manifests.json",
+    "artifact_manifest": "tests/classifier_regression/evidence/v3_artifact_manifest.json",
+    "semantic_proofs": "tests/classifier_regression/evidence/v3_semantic_proofs.json",
+    "selected_execution_anchor": "tests/classifier_regression/evidence/v3_selected_execution_anchor.json",
+    "anchor": "tests/classifier_regression/evidence/v3_anchor.json"
+  }
+}

@@ -1000,6 +1000,11 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         self, source_message_id: str
     ) -> tuple[SourceMessageRevision, ...]:
         """Read the immutable revision history for one current Source Message."""
+
+        ...
+
+    def source_message_creation_time(self, source_message_id: str) -> datetime | None:
+        """Read the original publication time for one current Source Message."""
         ...
 
     def eligible_reply_revision(
@@ -1097,7 +1102,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
     def find_search_results(
         self,
         completed_search: CompletedSearch,
-        game_search_details: Mapping[str, tuple[str, ...]],
+        search_details: Mapping[str, tuple[str, ...]],
     ) -> tuple[SearchResult, ...]:
         """Deterministically match active Recommendation projections."""
         ...
@@ -1341,7 +1346,9 @@ class AcceptanceObserver(Protocol):
         """Observe immutable Completed Searches through the public testkit."""
         ...
 
-    def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
+    def results(
+        self, completed_search_id: str, *, as_of: datetime | None = None
+    ) -> tuple[SearchResult, ...]:
         """Observe ordered immutable Results through the public testkit."""
         ...
 
