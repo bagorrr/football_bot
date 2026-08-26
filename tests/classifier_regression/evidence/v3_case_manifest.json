@@ -1,0 +1,264 @@
+{
+  "manifest_version": "open-match-classifier-regression-v3-case-manifest-v1",
+  "cases": [
+    {
+      "case_id": "sm-001",
+      "opportunity_types": [
+        "open_match"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-002",
+      "opportunity_types": [
+        "open_match"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-003",
+      "opportunity_types": [
+        "open_match",
+        "roster_vacancy"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-004",
+      "opportunity_types": [
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-005",
+      "opportunity_types": [
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-006",
+      "opportunity_types": [
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "needs_second_pass"
+    },
+    {
+      "case_id": "sm-007",
+      "opportunity_types": [
+        "tournament"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-008",
+      "opportunity_types": [
+        "tournament"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-009",
+      "opportunity_types": [
+        "tournament",
+        "open_match"
+      ],
+      "expected_pipeline_disposition": "needs_second_pass"
+    },
+    {
+      "case_id": "sm-010",
+      "opportunity_types": [
+        "opponent_request"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-011",
+      "opportunity_types": [
+        "opponent_request"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-012",
+      "opportunity_types": [
+        "opponent_request"
+      ],
+      "expected_pipeline_disposition": "needs_second_pass"
+    },
+    {
+      "case_id": "sm-013",
+      "opportunity_types": [
+        "roster_vacancy"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-014",
+      "opportunity_types": [
+        "roster_vacancy"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-015",
+      "opportunity_types": [
+        "open_match",
+        "roster_vacancy"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-016",
+      "opportunity_types": [
+        "player_transfer_availability"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-017",
+      "opportunity_types": [
+        "player_transfer_availability",
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-018",
+      "opportunity_types": [
+        "player_transfer_availability"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-019",
+      "opportunity_types": [
+        "coach_availability"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-020",
+      "opportunity_types": [
+        "coach_availability",
+        "roster_vacancy"
+      ],
+      "expected_pipeline_disposition": "needs_second_pass"
+    },
+    {
+      "case_id": "sm-021",
+      "opportunity_types": [
+        "coach_availability"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-022",
+      "opportunity_types": [
+        "coach_request"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-023",
+      "opportunity_types": [
+        "coach_request"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-024",
+      "opportunity_types": [
+        "coach_request"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-025",
+      "opportunity_types": [
+        "referee_availability"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-026",
+      "opportunity_types": [
+        "referee_request"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-027",
+      "opportunity_types": [
+        "referee_request"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-028",
+      "opportunity_types": [],
+      "expected_pipeline_disposition": "irrelevant"
+    },
+    {
+      "case_id": "sm-029",
+      "opportunity_types": [],
+      "expected_pipeline_disposition": "irrelevant"
+    },
+    {
+      "case_id": "sm-030",
+      "opportunity_types": [],
+      "expected_pipeline_disposition": "irrelevant"
+    },
+    {
+      "case_id": "sm-031",
+      "opportunity_types": [],
+      "expected_pipeline_disposition": "irrelevant"
+    },
+    {
+      "case_id": "sm-032",
+      "opportunity_types": [],
+      "expected_pipeline_disposition": "irrelevant"
+    },
+    {
+      "case_id": "sm-033",
+      "opportunity_types": [],
+      "expected_pipeline_disposition": "irrelevant"
+    },
+    {
+      "case_id": "sm-034",
+      "opportunity_types": [
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-035",
+      "opportunity_types": [
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-036",
+      "opportunity_types": [
+        "open_match"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    },
+    {
+      "case_id": "sm-037",
+      "opportunity_types": [
+        "player_match_availability"
+      ],
+      "expected_pipeline_disposition": "unresolved"
+    },
+    {
+      "case_id": "sm-038",
+      "opportunity_types": [
+        "roster_vacancy"
+      ],
+      "expected_pipeline_disposition": "needs_review"
+    }
+  ]
+}

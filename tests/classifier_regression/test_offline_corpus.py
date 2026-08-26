@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
+import sys
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -195,13 +197,104 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     )
 
 
+_V3_EVIDENCE_ROOT = Path(__file__).with_name("evidence")
+_V3_EVIDENCE_FILENAMES = {
+    "case_manifest": "v3_case_manifest.json",
+    "recorded_evidence": "v3_recorded_evidence.json",
+    "request_manifests": "v3_input_manifests.json",
+    "artifact_manifest": "v3_artifact_manifest.json",
+    "semantic_proofs": "v3_semantic_proofs.json",
+}
+
+
+def _read_v3_evidence(filename: str) -> dict[str, Any]:
+    value = json.loads((_V3_EVIDENCE_ROOT / filename).read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
 def _load_reviewed_v3_contract() -> dict[str, Any]:
-    return cast(
+    """Load metadata plus independently anchored, immutable review evidence."""
+    corpus = cast(
         dict[str, Any],
         json.loads(
             (Path(__file__).with_name("corpus.v3.json")).read_text(encoding="utf-8")
         ),
     )
+    assert not {
+        "evaluation_provenance",
+        "cases",
+        "recorded_outputs",
+        "recorded_promotion_fixtures",
+    }.intersection(corpus)
+    anchor = _read_v3_evidence("v3_anchor.json")
+    assert anchor["anchor_version"] == (
+        "open-match-classifier-regression-v3-external-anchor-v1"
+    )
+    evaluation = anchor["evaluation"]
+    assert isinstance(evaluation, dict)
+    for key in (
+        "corpus_version",
+        "evaluation_contract_version",
+        "source_corpus_case_count",
+        "model",
+        "reasoning_effort",
+        "prompt_version",
+        "schema_version",
+        "semantic_proof_version",
+        "glossary_version",
+        "context_policy_version",
+        "routing_policy_version",
+        "independent_complete_runs",
+        "required_passes",
+        "failure_suite",
+        "promotion_fixtures",
+    ):
+        assert corpus[key] == evaluation[key]
+    assert corpus["evidence_files"] == {
+        **{
+            key: f"tests/classifier_regression/evidence/{filename}"
+            for key, filename in _V3_EVIDENCE_FILENAMES.items()
+        },
+        "anchor": "tests/classifier_regression/evidence/v3_anchor.json",
+    }
+
+    evidence = {
+        key: _read_v3_evidence(filename)
+        for key, filename in _V3_EVIDENCE_FILENAMES.items()
+    }
+    case_manifest = evidence["case_manifest"]
+    recorded_evidence = evidence["recorded_evidence"]
+    request_manifests = evidence["request_manifests"]
+    artifact_manifest = evidence["artifact_manifest"]
+    semantic_proofs = evidence["semantic_proofs"]
+    corpus["cases"] = case_manifest["cases"]
+    corpus["recorded_outputs"] = recorded_evidence["recorded_outputs"]
+    corpus["recorded_promotion_fixtures"] = recorded_evidence[
+        "recorded_promotion_fixtures"
+    ]
+    corpus["_v3_anchor"] = anchor
+    corpus["_v3_semantic_proofs"] = semantic_proofs
+    corpus["evaluation_provenance"] = {
+        "source_corpus_sha256": anchor["raw_files"]["source_corpus"]["sha256"],
+        "source_corpus_provenance_sha256": anchor["raw_files"][
+            "source_corpus_provenance"
+        ]["sha256"],
+        "case_manifest_sha256": anchor["canonical_digests"]["case_manifest_sha256"],
+        "recorded_outputs_sha256": anchor["canonical_digests"][
+            "recorded_outputs_sha256"
+        ],
+        "promotion_fixtures_sha256": anchor["canonical_digests"][
+            "promotion_fixtures_sha256"
+        ],
+        "request_manifests": request_manifests["request_manifests"],
+        "expected_digests": anchor["expected_digests"],
+        "expected_publication_outcomes": anchor["expected_publication_outcomes"],
+        "artifacts": artifact_manifest["artifacts"],
+        "artifact_records_sha256": artifact_manifest["artifact_records_sha256"],
+        "execution": anchor["artifact_execution"],
+    }
+    return corpus
 
 
 def _load_reviewed_source_cases() -> dict[str, dict[str, Any]]:
@@ -400,6 +493,58 @@ def _recorded_v3_output(
     return cast(dict[str, JsonValue], deepcopy(output))
 
 
+def _assert_semantic_proofs_for_output(
+    corpus: dict[str, Any],
+    *,
+    case_id: str,
+    pass_name: str,
+    body: str,
+    output: dict[str, JsonValue],
+) -> set[tuple[str, str, str]]:
+    """Validate every candidate proof for one complete corpus output."""
+    candidates = output.get("candidates")
+    assert isinstance(candidates, list)
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    records = semantic_evidence["records"]
+    assert isinstance(records, list)
+    validated: set[tuple[str, str, str]] = set()
+    for candidate_value in candidates:
+        assert isinstance(candidate_value, dict)
+        candidate = candidate_value
+        candidate_key = candidate.get("candidate_key")
+        opportunity_type = candidate.get("opportunity_type")
+        evidence = candidate.get("evidence")
+        routes = candidate.get("response_routes", [])
+        assert isinstance(candidate_key, str)
+        assert isinstance(opportunity_type, str)
+        assert isinstance(evidence, dict)
+        assert isinstance(routes, list)
+        matching_records = [
+            record
+            for record in records
+            if record.get("case_id") == case_id
+            and record.get("pass_name") == pass_name
+            and record.get("candidate_key") == candidate_key
+        ]
+        assert len(matching_records) == 1
+        proof = matching_records[0].get("proof")
+        assert isinstance(proof, dict)
+        source_reference = proof.get("source_message_revision_reference")
+        assert isinstance(source_reference, str)
+        assert semantic_proof_is_schema_valid(
+            proof,
+            body=body,
+            source_message_revision_reference=source_reference,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+            opportunity_type=opportunity_type,
+            semantic_proof_version=corpus["semantic_proof_version"],
+        )
+        validated.add((case_id, pass_name, candidate_key))
+    return validated
+
+
 class _RecordedTournamentResolver:
     """Return one fully versioned location without crossing a provider boundary."""
 
@@ -571,26 +716,62 @@ def _validate_reviewed_provenance(
     *,
     repository_root: Path,
 ) -> list[dict[str, Any]]:
-    """Pin source, case-manifest, fixture, and classifier-artifact inputs."""
+    """Pin every reviewed input to the external v3 evidence anchor."""
+    anchor = corpus["_v3_anchor"]
+    assert isinstance(anchor, dict)
+    raw_files = anchor["raw_files"]
+    assert isinstance(raw_files, dict)
     provenance = _evaluation_provenance(corpus)
-    source_path = repository_root / str(corpus["source_corpus"])
-    source_provenance_path = repository_root / str(corpus["source_corpus_provenance"])
-    assert (
-        hashlib.sha256(source_path.read_bytes()).hexdigest()
-        == provenance["source_corpus_sha256"]
+    expected_artifacts = provenance.get("artifacts")
+    assert isinstance(expected_artifacts, dict)
+    expected_raw_keys = {
+        "source_corpus",
+        "source_corpus_provenance",
+        "case_manifest",
+        "recorded_evidence",
+        "request_manifests",
+        "artifact_manifest",
+        "semantic_proofs",
+    }
+    expected_raw_keys.update(
+        f"artifact:{directory}:{field_name}"
+        for directory in expected_artifacts
+        for field_name in ("prompt_filename", "schema_filename", "provenance_filename")
     )
+    assert set(raw_files) == expected_raw_keys
+    for _key, raw_file in raw_files.items():
+        assert isinstance(raw_file, dict)
+        relative_path = Path(str(raw_file["path"]))
+        assert not relative_path.is_absolute()
+        path = repository_root / relative_path
+        assert path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == raw_file["sha256"]
+
+    assert corpus["source_corpus"] == raw_files["source_corpus"]["path"]
     assert (
-        hashlib.sha256(source_provenance_path.read_bytes()).hexdigest()
-        == (provenance["source_corpus_provenance_sha256"])
+        corpus["source_corpus_provenance"]
+        == raw_files["source_corpus_provenance"]["path"]
     )
-    assert _canonical_digest(corpus["cases"]) == provenance["case_manifest_sha256"]
+    anchor_digests = anchor["canonical_digests"]
+    assert isinstance(anchor_digests, dict)
+    assert _canonical_digest(corpus["cases"]) == anchor_digests["case_manifest_sha256"]
     assert (
         _canonical_digest(corpus["recorded_outputs"])
-        == provenance["recorded_outputs_sha256"]
+        == anchor_digests["recorded_outputs_sha256"]
     )
     assert (
         _canonical_digest(corpus["recorded_promotion_fixtures"])
-        == provenance["promotion_fixtures_sha256"]
+        == (anchor_digests["promotion_fixtures_sha256"])
+    )
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    assert isinstance(semantic_evidence, dict)
+    assert (
+        _canonical_digest(semantic_evidence["case_coverage"])
+        == (anchor_digests["semantic_case_coverage_sha256"])
+    )
+    assert (
+        _canonical_digest(semantic_evidence["records"])
+        == (anchor_digests["semantic_records_sha256"])
     )
     expected_request_manifests = provenance.get("request_manifests")
     assert isinstance(expected_request_manifests, list)
@@ -601,8 +782,6 @@ def _validate_reviewed_provenance(
         == expected_digests["request_manifests_sha256"]
     )
 
-    expected_artifacts = provenance.get("artifacts")
-    assert isinstance(expected_artifacts, dict)
     assert set(expected_artifacts) == {
         "open-match-primary-v3",
         "open-match-ambiguity-v2",
@@ -637,6 +816,9 @@ def _validate_reviewed_provenance(
                 "provenance": artifact_provenance,
             }
         )
+    assert (
+        _canonical_digest(artifact_records) == anchor_digests["artifact_records_sha256"]
+    )
     assert _canonical_digest(artifact_records) == provenance["artifact_records_sha256"]
     return artifact_records
 
@@ -671,11 +853,46 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         set().union(*(set(case["opportunity_types"]) for case in manifest_cases))
         == all_types
     )
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    assert isinstance(semantic_evidence, dict)
+    semantic_coverage = semantic_evidence["case_coverage"]
+    semantic_records = semantic_evidence["records"]
+    assert isinstance(semantic_coverage, list)
+    assert isinstance(semantic_records, list)
+    assert {coverage["case_id"] for coverage in semantic_coverage} == set(source_cases)
     recorded_cases = corpus["recorded_outputs"]
     assert len(recorded_cases) == 38
     assert {case["case_id"] for case in recorded_cases} == {
         case["case_id"] for case in manifest_cases
     }
+    for coverage in semantic_coverage:
+        case_id = coverage["case_id"]
+        recorded_case = next(
+            case for case in recorded_cases if case["case_id"] == case_id
+        )
+        candidate_count = 0
+        for pass_name in ("primary_output", "second_pass_output"):
+            output = recorded_case.get(pass_name)
+            if isinstance(output, dict):
+                candidates = output.get("candidates")
+                assert isinstance(candidates, list)
+                candidate_count += len(candidates)
+        record_count = sum(
+            1 for record in semantic_records if record.get("case_id") == case_id
+        )
+        assert coverage["candidate_count"] == candidate_count
+        assert coverage["semantic_proof_record_count"] == record_count
+    semantic_contract = corpus["_v3_anchor"]["semantic_proof"]
+    assert semantic_contract["case_count"] == 38
+    assert semantic_contract["case_ids"] == [
+        f"sm-{index:03d}" for index in range(1, 39)
+    ]
+    assert set(semantic_contract["all_opportunity_types"]) == all_types
+    assert semantic_contract["candidate_count"] == sum(
+        coverage["candidate_count"] for coverage in semantic_coverage
+    )
+    assert semantic_contract["record_count"] == len(semantic_records)
+    validated_semantic_records: set[tuple[str, str, str]] = set()
     adapter = ControlledModelAdapter()
     adapter.enable_primary_v3()
     observed: list[dict[str, Any]] = []
@@ -705,6 +922,15 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             primary_output,
             body=body,
             corpus=corpus,
+        )
+        validated_semantic_records.update(
+            _assert_semantic_proofs_for_output(
+                corpus,
+                case_id=case_id,
+                pass_name="primary",
+                body=body,
+                output=primary_output,
+            )
         )
         request_manifests.append(
             {
@@ -747,6 +973,15 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
                 second_output,
                 body=body,
                 corpus=corpus,
+            )
+            validated_semantic_records.update(
+                _assert_semantic_proofs_for_output(
+                    corpus,
+                    case_id=case_id,
+                    pass_name="second_pass",
+                    body=body,
+                    output=second_output,
+                )
             )
             request_manifests.append(
                 {
@@ -791,19 +1026,14 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             evidence = candidate.get("evidence")
             assert isinstance(candidate_key, str)
             assert isinstance(evidence, dict)
-            proof = fixture["semantic_proof_output"]
-            assert isinstance(proof, dict)
-            assert semantic_proof_is_schema_valid(
-                proof,
-                body=body,
-                source_message_revision_reference=str(
-                    proof["source_message_revision_reference"]
-                ),
-                candidate_key=candidate_key,
-                evidence=evidence,
-                routes=routes,
-                opportunity_type=opportunity_type,
-                semantic_proof_version=corpus["semantic_proof_version"],
+            validated_semantic_records.update(
+                _assert_semantic_proofs_for_output(
+                    corpus,
+                    case_id=f"promotion:{fixture_name}",
+                    pass_name="promotion",
+                    body=body,
+                    output=cast(dict[str, JsonValue], output),
+                )
             )
 
     promotion_payload, promotion_body, promotion_output, promotion_proof = (
@@ -1012,6 +1242,15 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     assert set(rollback_persistence.committed) == {"tournament-current-registration"}
     failure_results.append("rollback")
     assert failure_results == corpus["failure_suite"]
+    expected_semantic_records = {
+        (
+            str(record["case_id"]),
+            str(record["pass_name"]),
+            str(record["candidate_key"]),
+        )
+        for record in semantic_records
+    }
+    assert validated_semantic_records == expected_semantic_records
     output_digest = hashlib.sha256(
         json.dumps(observed, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -1070,9 +1309,44 @@ def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -
         "rollback",
     ]
 
-    runs = [_run_v3_evaluation_gate(corpus) for _ in range(3)]
-    assert len(set(runs)) == 1
-    summary = json.loads(runs[0])
+    runner = Path(__file__).with_name("run_v3_evaluation.py")
+    run_summaries = []
+    for run_id in ("run-1", "run-2", "run-3"):
+        completed = subprocess.run(
+            [sys.executable, str(runner), run_id],
+            cwd=Path(__file__).parents[2],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert not completed.stderr
+        run_summaries.append(json.loads(completed.stdout))
+    assert [summary["run_id"] for summary in run_summaries] == [
+        "run-1",
+        "run-2",
+        "run-3",
+    ]
+    assert len({summary["process_id"] for summary in run_summaries}) == 3
+    assert all(summary["case_count"] == 38 for summary in run_summaries)
+    assert all(
+        summary["case_ids"] == [f"sm-{index:03d}" for index in range(1, 39)]
+        for summary in run_summaries
+    )
+    deterministic_summaries = [
+        {
+            key: value
+            for key, value in summary.items()
+            if key not in {"process_id", "run_id"}
+        }
+        for summary in run_summaries
+    ]
+    assert (
+        len(
+            {json.dumps(summary, sort_keys=True) for summary in deterministic_summaries}
+        )
+        == 1
+    )
+    summary = run_summaries[0]
     assert summary["case_count"] == 38
     expected_provenance = _evaluation_provenance(corpus)
     expected_digests = expected_provenance["expected_digests"]

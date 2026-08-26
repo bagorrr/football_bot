@@ -153,7 +153,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
     "0315157b15c682039beb369dba0523ff770900a674be50d3b449dfbc2d019747",
     "f469b7ef0dea58eb9f767571f33a3005385bc74c1ffcaf33117f2060c510cc05",
-    "908015ff52aa8d9f2943bd2c892f7e19362f05617028c45d630496f38c1112a0",
+    "5c43ac1bddfe5702ebf280732fb3c2dcf92358b754977548d36e40ffb1308308",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1603,21 +1603,45 @@ class PostgresAcceptanceObserver:
                 SELECT result.result_id, result.completed_search_id,
                        result.absolute_position, result.result_class,
                        result.card_facts,
-                       CASE
-                           WHEN result.card_facts->>'opportunity_type' = 'tournament'
-                           THEN COALESCE(
-                               current_projection.publication_state, 'suppressed'
-                           )
-                           ELSE current_projection.publication_state
-                       END AS publication_state
+                       current_projection.opportunity_revision_id
+                           AS current_opportunity_revision_id,
+                       current_projection.publication_state
+                           AS current_publication_state,
+                       current_projection.current_facts,
+                       current_projection.response_route_kind,
+                       current_projection.response_route_value
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
-                    SELECT publication_state
+                    SELECT opportunity_revision_id, publication_state,
+                           jsonb_build_object(
+                               'start_local_date', accepted_facts -> 'start_local_date',
+                               'end_local_date', accepted_facts -> 'end_local_date',
+                               'exact_local_time', accepted_facts -> 'exact_local_time',
+                               'day_part', accepted_facts -> 'day_part',
+                               'iana_timezone', accepted_facts -> 'iana_timezone',
+                               'open_participation',
+                               accepted_facts -> 'open_participation'
+                           ) || CASE
+                               WHEN accepted_facts ? 'registration_deadline'
+                               THEN jsonb_build_object(
+                                   'registration_deadline',
+                                   accepted_facts -> 'registration_deadline'
+                               )
+                               ELSE '{}'::jsonb
+                           END AS current_facts,
+                           response_route ->> 'kind' AS response_route_kind,
+                           response_route ->> 'value' AS response_route_value
                     FROM football_runtime.recommendation_opportunities
                     WHERE opportunity_id = result.card_facts->>'opportunity_id'
                       AND result.card_facts->>'opportunity_type' = 'tournament'
-                    ORDER BY (substring(opportunity_revision_id
-                                        FROM ':revision:([0-9]+)$'))::bigint DESC,
+                    ORDER BY CASE
+                                 WHEN opportunity_revision_id ~ ':revision:[0-9]+$'
+                                 THEN substring(
+                                     opportunity_revision_id
+                                     FROM ':revision:([0-9]+)$'
+                                 )::bigint
+                                 ELSE 0
+                             END DESC,
                              published_at DESC,
                              opportunity_revision_id DESC
                     LIMIT 1
@@ -1638,7 +1662,7 @@ class PostgresAcceptanceObserver:
                         {
                             **_result_card_facts_with_current_publication_state(
                                 row["card_facts"],
-                                row["publication_state"],
+                                _current_tournament_projection(row),
                                 as_of=as_of or datetime.now(UTC),
                             )
                         }.items()
@@ -6799,23 +6823,21 @@ class PostgresRoleStore:
                 SELECT result.result_id, result.completed_search_id,
                        result.absolute_position, result.result_class,
                        result.card_facts,
-                       CASE
-                           WHEN result.card_facts->>'opportunity_type' = 'tournament'
-                           THEN COALESCE(
-                               current_projection.publication_state, 'suppressed'
-                           )
-                           ELSE current_projection.publication_state
-                       END AS publication_state
+                       current_projection.opportunity_revision_id
+                           AS current_opportunity_revision_id,
+                       current_projection.publication_state
+                           AS current_publication_state,
+                       current_projection.current_facts,
+                       current_projection.response_route_kind,
+                       current_projection.response_route_value
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
-                    SELECT publication_state
-                    FROM football_runtime.recommendation_opportunities
-                    WHERE opportunity_id = result.card_facts->>'opportunity_id'
-                      AND result.card_facts->>'opportunity_type' = 'tournament'
-                    ORDER BY (substring(opportunity_revision_id
-                                        FROM ':revision:([0-9]+)$'))::bigint DESC,
-                             published_at DESC,
-                             opportunity_revision_id DESC
+                    SELECT opportunity_revision_id, publication_state,
+                           current_facts, response_route_kind, response_route_value
+                    FROM football_runtime.read_current_tournament_result_projection(
+                        result.card_facts->>'opportunity_id'
+                    )
+                    WHERE result.card_facts->>'opportunity_type' = 'tournament'
                     LIMIT 1
                 ) AS current_projection ON TRUE
                 WHERE result.completed_search_id = %s
@@ -6837,7 +6859,7 @@ class PostgresRoleStore:
                             sorted(
                                 _result_card_facts_with_current_publication_state(
                                     row["card_facts"],
-                                    row["publication_state"],
+                                    _current_tournament_projection(row),
                                     as_of=received_at,
                                 ).items()
                             )
@@ -7441,23 +7463,62 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
 
 def _result_card_facts_with_current_publication_state(
     card_facts: Mapping[str, Any],
-    current_publication_state: str | None,
+    current_projection: Mapping[str, Any] | None,
     *,
     as_of: datetime,
 ) -> dict[str, Any]:
-    """Overlay current Tournament state while preserving other history baselines."""
+    """Overlay current Tournament facts while preserving immutable card history."""
     if card_facts.get("opportunity_type") == "tournament":
-        return {
-            **card_facts,
-            "publication_state": tournament_publication_state_as_of(
-                card_facts,
-                current_publication_state=current_publication_state,
+        current_facts = (
+            current_projection.get("current_facts")
+            if current_projection is not None
+            else None
+        )
+        if not isinstance(current_facts, Mapping) or current_projection is None:
+            publication_state = "suppressed"
+        else:
+            publication_state = tournament_publication_state_as_of(
+                current_facts,
+                current_publication_state=current_projection.get("publication_state"),
                 as_of=as_of,
-            ),
+            )
+        result = {
+            **card_facts,
+            "publication_state": publication_state,
         }
-    if current_publication_state is None:
+        if publication_state == "active":
+            assert current_projection is not None
+            route_kind = current_projection.get("response_route_kind")
+            route_value = current_projection.get("response_route_value")
+            if isinstance(route_kind, str) and isinstance(route_value, str):
+                result["response_route_kind"] = route_kind
+                result["response_route_value"] = route_value
+            else:
+                result.pop("response_route_kind", None)
+                result.pop("response_route_value", None)
+        else:
+            result.pop("response_route_kind", None)
+            result.pop("response_route_value", None)
+        return result
+    if current_projection is None:
         return dict(card_facts)
-    return {**card_facts, "publication_state": current_publication_state}
+    return {**card_facts, "publication_state": current_projection["publication_state"]}
+
+
+def _current_tournament_projection(
+    row: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Return the narrow current projection returned by either read path."""
+    revision_id = row.get("current_opportunity_revision_id")
+    if not isinstance(revision_id, str) or not revision_id:
+        return None
+    return {
+        "opportunity_revision_id": revision_id,
+        "publication_state": row.get("current_publication_state"),
+        "current_facts": row.get("current_facts"),
+        "response_route_kind": row.get("response_route_kind"),
+        "response_route_value": row.get("response_route_value"),
+    }
 
 
 def _completed_search(row: dict[str, Any]) -> CompletedSearch:

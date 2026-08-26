@@ -23,7 +23,7 @@ from modules.domain import (
     empty_bounded_source_metadata,
 )
 from modules.ports import ClassifierAdapterResult
-from modules.postgres_adapter import PostgresAcceptanceMigrator
+from modules.postgres_adapter import PostgresAcceptanceMigrator, runtime_database_url
 from modules.testkit import (
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
@@ -508,6 +508,98 @@ def _assert_final_migration_state(database_url: str) -> None:
             "event_sequence",
         ),
     ]
+
+
+def test_bot_assistant_can_read_only_the_current_tournament_projection(
+    fresh_database_url: str,
+) -> None:
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    passwords = {role: "migration-projection-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (
+                'opportunity:tournament:least-privilege',
+                'opportunity:tournament:least-privilege:revision:1',
+                'tournament', 'active',
+                %s, %s, '2026-08-18T09:00:00+00:00'
+            )
+            """,
+            (
+                json.dumps(
+                    {
+                        "start_local_date": "2026-08-20",
+                        "end_local_date": "2026-08-20",
+                        "iana_timezone": "Europe/Moscow",
+                        "open_participation": True,
+                        "registration_deadline": "2026-08-19",
+                        "accepted_sensitive_fact": "must-not-leak",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "kind": "explicit_telegram_username",
+                        "value": "@tournament_contact",
+                    }
+                ),
+            ),
+        )
+    bot_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.BOT_ASSISTANT,
+        passwords[RuntimeRole.BOT_ASSISTANT],
+    )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        assert connection.execute(
+            """
+            SELECT has_table_privilege(
+                current_user,
+                'football_runtime.recommendation_opportunities',
+                'SELECT'
+            )
+            """
+        ).fetchone() == (False,)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                """
+                SELECT accepted_facts, response_route
+                FROM football_runtime.recommendation_opportunities
+                """
+            ).fetchall()
+        projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   current_facts, response_route_kind, response_route_value
+            FROM football_runtime.read_current_tournament_result_projection(%s)
+            """,
+            ("opportunity:tournament:least-privilege",),
+        ).fetchone()
+
+    assert projection is not None
+    assert projection[0:3] == (
+        "opportunity:tournament:least-privilege",
+        "opportunity:tournament:least-privilege:revision:1",
+        "active",
+    )
+    assert projection[3] == {
+        "start_local_date": "2026-08-20",
+        "end_local_date": "2026-08-20",
+        "exact_local_time": None,
+        "day_part": None,
+        "iana_timezone": "Europe/Moscow",
+        "open_participation": True,
+        "registration_deadline": "2026-08-19",
+    }
+    assert projection[4:] == (
+        "explicit_telegram_username",
+        "@tournament_contact",
+    )
+    assert "accepted_sensitive_fact" not in projection[3]
 
 
 def test_repeated_migrate_preserves_completed_and_submitting_search_state(

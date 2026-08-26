@@ -1476,10 +1476,16 @@ def _tournament_search_expiry(
             time.min,
             tzinfo=timezone,
         )
-    registration_expiry = _tournament_registration_expiry(
-        facts.get("registration_deadline"),
-        timezone,
+    registration_expiry = (
+        _tournament_registration_expiry(
+            facts["registration_deadline"],
+            timezone,
+        )
+        if "registration_deadline" in facts
+        else None
     )
+    if "registration_deadline" in facts and registration_expiry is None:
+        return None
     return (
         min(event_expiry, registration_expiry) if registration_expiry else event_expiry
     )
@@ -1498,6 +1504,8 @@ def tournament_publication_state_as_of(
     if current_publication_state != "active":
         return current_publication_state
     if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return "suppressed"
+    if facts.get("open_participation") is not True:
         return "suppressed"
     try:
         start = date.fromisoformat(str(facts["start_local_date"]))

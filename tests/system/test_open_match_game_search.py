@@ -426,6 +426,11 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
     assert {payload["publication_state"] for payload in closed_payloads} == {
         "suppressed"
     }
+    retracted_history = system.results(completed[0].completed_search_id)
+    assert len(retracted_history) == 1
+    retracted_facts = dict(retracted_history[0].card_facts)
+    assert retracted_facts["publication_state"] == "suppressed"
+    assert "response_route_value" not in retracted_facts
     system.reset()
 
 

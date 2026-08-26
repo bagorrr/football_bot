@@ -182,6 +182,46 @@ def test_tournament_publication_state_missing_projection_fails_closed() -> None:
     )
 
 
+def test_tournament_publication_state_fails_closed_for_current_fact_errors() -> None:
+    facts = _tournament().accepted_facts
+    shortened_deadline = {
+        **facts,
+        "registration_deadline": "2026-08-18",
+    }
+    assert (
+        tournament_publication_state_as_of(
+            shortened_deadline,
+            current_publication_state="active",
+            as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+        )
+        == "expired"
+    )
+
+    malformed_deadline = {
+        **facts,
+        "registration_deadline": "not-a-date",
+    }
+    assert (
+        tournament_publication_state_as_of(
+            malformed_deadline,
+            current_publication_state="active",
+            as_of=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+        )
+        == "suppressed"
+    )
+
+    missing_open_participation = dict(facts)
+    missing_open_participation.pop("open_participation")
+    assert (
+        tournament_publication_state_as_of(
+            missing_open_participation,
+            current_publication_state="active",
+            as_of=datetime(2026, 8, 18, 20, 59, tzinfo=UTC),
+        )
+        == "suppressed"
+    )
+
+
 def test_tournament_publication_state_rejects_deletion_and_unknown_states() -> None:
     for invalid_state in ("deleted", "unknown"):
         assert (

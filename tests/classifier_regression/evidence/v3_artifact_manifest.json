@@ -1,0 +1,76 @@
+{
+  "evidence_version": "open-match-classifier-regression-v3-artifact-manifest-v1",
+  "artifacts": {
+    "open-match-primary-v3": {
+      "prompt_filename": "prompt.md",
+      "schema_filename": "source-message-classification-v3.schema.json",
+      "provenance_filename": "provenance.json",
+      "schema_id": "source-message-classification-v3",
+      "prompt_sha256": "1b394971fc64c89c959673a0da6ae9eaa4cd8b30368b550bf0dd6a7f63abc6d8",
+      "schema_sha256": "e0c0f123a24dc3e7f0180f4b3cbfe8d04f006417c4dae7bf766b5015588a343c",
+      "provenance_sha256": "0f8d3fd7212ee873874d87aa55bb3095b63906042c727b718688c8864acb23ab",
+      "provenance": {
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "prompt_version": "open-match-primary-v3",
+        "schema_version": "source-message-classification-v3",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1"
+      }
+    },
+    "open-match-ambiguity-v2": {
+      "prompt_filename": "prompt.md",
+      "schema_filename": "source-message-classification-v3.schema.json",
+      "provenance_filename": "provenance.json",
+      "schema_id": "source-message-classification-v3",
+      "prompt_sha256": "4b9932c71b217ccbdbd4903ebca42c774ca376fbbf85dcb155aa5ff6ab23fc71",
+      "schema_sha256": "e0c0f123a24dc3e7f0180f4b3cbfe8d04f006417c4dae7bf766b5015588a343c",
+      "provenance_sha256": "3e4240bf0125b15b0c2f56a7fcdb03659dad99ee0ec208cbdb4619fc336f5ea7",
+      "provenance": {
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "prompt_version": "open-match-ambiguity-v2",
+        "schema_version": "source-message-classification-v3",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-v1"
+      }
+    },
+    "open-match-semantic-proof-v2": {
+      "prompt_filename": "prompt.md",
+      "schema_filename": "source-semantic-proof-v2.schema.json",
+      "provenance_filename": "provenance.json",
+      "schema_id": "source-semantic-proof-v2",
+      "prompt_sha256": "bc8af92dae6f4ac672f748bb086388145813d50a2738aa34a310dbebe0f8cb92",
+      "schema_sha256": "41722e8e6229d2f49f983406b1cac24a3cd191d576644707955fd7298c079b6a",
+      "provenance_sha256": "8a8fa5d5a59a7bc5d06bca5658062edd02968325bb9876930bb4d7769f58dbd8",
+      "provenance": {
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "prompt_version": "open-match-semantic-proof-v2",
+        "schema_version": "source-semantic-proof-v2",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "semantic-proof-context-v1",
+        "routing_policy_version": "classifier-routing-v1"
+      }
+    }
+  },
+  "artifact_records_sha256": "735c2a03d62e7a387abd61987d1b181decae0c2a580c791545555cd7e9a9c250",
+  "expected_digests": {
+    "artifact_records_sha256": "735c2a03d62e7a387abd61987d1b181decae0c2a580c791545555cd7e9a9c250",
+    "request_manifests_sha256": "9046dcacd566a20568d1eafcead2228939e6bc01787ee5fcf1eafb4a945bcdb4"
+  },
+  "execution": {
+    "codex_version": "reviewed-offline",
+    "adapter_kind": "recorded_corpus",
+    "adapter_version": "open-match-classifier-regression-v3-reviewed-v2",
+    "duration_ms": 0,
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "expected_publication_outcomes": {
+    "normalization_rejection": "unpublished",
+    "unpublished_persistence": "unpublished"
+  }
+}

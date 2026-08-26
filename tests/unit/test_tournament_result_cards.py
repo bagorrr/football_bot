@@ -1,7 +1,10 @@
 """Tournament Result Card localization and publication-state regressions."""
 
+from datetime import UTC, datetime
+
 from modules.application import _tournament_result_message
 from modules.domain import SearchResult
+from modules.postgres_adapter import _result_card_facts_with_current_publication_state
 
 
 def _result(*, publication_state: str = "active") -> SearchResult:
@@ -37,6 +40,29 @@ def _result(*, publication_state: str = "active") -> SearchResult:
         absolute_position=1,
         card_facts=tuple(sorted(facts.items())),
     )
+
+
+def _current_projection(
+    *,
+    publication_state: str = "active",
+    registration_deadline: str | None = "2026-08-25",
+    response_route_value: str | None = "@current_tournament_contact",
+) -> dict[str, object]:
+    current_facts: dict[str, object] = {
+        "start_local_date": "2026-08-20",
+        "end_local_date": "2026-08-20",
+        "iana_timezone": "Europe/Moscow",
+        "open_participation": True,
+    }
+    if registration_deadline is not None:
+        current_facts["registration_deadline"] = registration_deadline
+    return {
+        "opportunity_revision_id": "opportunity:tournament:card:revision:2",
+        "publication_state": publication_state,
+        "current_facts": current_facts,
+        "response_route_kind": "explicit_telegram_username",
+        "response_route_value": response_route_value,
+    }
 
 
 def test_tournament_result_card_localizes_free_text_field_by_field() -> None:
@@ -173,3 +199,51 @@ def test_tournament_card_with_suppressed_current_projection_is_unavailable() -> 
 
     assert "Unavailable" in message.text
     assert "@tournament_contact" not in message.text
+
+
+def test_historical_card_uses_shortened_current_deadline_and_hides_contact() -> None:
+    current_facts = _result().card_facts
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(current_facts),
+        _current_projection(registration_deadline="2026-08-18"),
+        as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "expired"
+    assert "response_route_value" not in overlaid
+    assert "@tournament_contact" not in str(overlaid)
+
+
+def test_historical_card_uses_retracted_current_revision_and_hides_contact() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_result().card_facts),
+        _current_projection(publication_state="suppressed"),
+        as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_kind" not in overlaid
+    assert "response_route_value" not in overlaid
+
+
+def test_historical_card_fails_closed_on_malformed_current_deadline() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_result().card_facts),
+        _current_projection(registration_deadline="not-a-date"),
+        as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_value" not in overlaid
+
+
+def test_historical_card_uses_current_route_when_current_revision_is_active() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_result().card_facts),
+        _current_projection(),
+        as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "active"
+    assert overlaid["response_route_value"] == "@current_tournament_contact"
+    assert "@tournament_contact" not in str(overlaid)
