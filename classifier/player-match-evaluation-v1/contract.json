@@ -22,10 +22,10 @@
     "provenance_policy_version": "source-redaction-v1",
     "release_evaluation": "reviewed cases contain independent expected outcomes, normalized facts, and source-bound evidence"
   },
-  "recording_adapter": {
-    "path": "classifier/player-match-evaluation-v1/recorded-observations.json",
-    "version": "player-match-recording-v1",
-    "adapter_kind": "controlled_recording",
+  "controlled_classifier": {
+    "path": "modules/classifier_promotion.py:ControlledPlayerClassifierAdapter",
+    "version": "player-controlled-classifier-v1",
+    "adapter_kind": "controlled_deterministic_pipeline",
     "case_count": 38,
     "observations_are_independent": true
   },
@@ -37,7 +37,7 @@
     "deterministic": true,
     "required_replays": 3,
     "max_failures": 0,
-    "adapter_kind": "controlled_recording",
+    "adapter_kind": "controlled_deterministic_pipeline",
     "requested_model": "gpt-5.6-sol",
     "requested_reasoning_effort": "high",
     "proposal_only": true,
@@ -46,9 +46,9 @@
     "executes_lifecycle_failure_suite": true
   },
   "canonical_replay_digests": [
-    "ef7808bef37350f2e825e037997f77f8748c49482df5c6d8031d7f11cc9af7ff",
-    "ef7808bef37350f2e825e037997f77f8748c49482df5c6d8031d7f11cc9af7ff",
-    "ef7808bef37350f2e825e037997f77f8748c49482df5c6d8031d7f11cc9af7ff"
+    "f4ea83f31d9abbe618dbaaecf8553da3e0cc72bb2bc95c985ce1afce3c945d34",
+    "699bfd82131fab424f067aaaff186ad8793f4eb250ae15311a78603bea6b4f9f",
+    "f42069348e90efa3f457801a145115b7c92a5c520e4b9e74c956a9b1067cb53d"
   ],
   "required_case_families": [
     "routing",

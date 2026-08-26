@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime
@@ -33,8 +32,8 @@ from modules.classifier_promotion import (
     PLAYER_REQUIRED_CASE_FAMILIES,
     PLAYER_REQUIRED_FAILURE_MODES,
     PLAYER_REVIEWED_CORPUS_CASE_COUNT,
-    ControlledPlayerClassifierRecordingAdapter,
-    PlayerClassifierRelease,
+    ControlledPlayerClassifierAdapter,
+    ControlledPlayerLifecycleAdapter,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
@@ -353,7 +352,7 @@ def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() 
     assert len(gate.failure_mode_case_ids) == len(PLAYER_REQUIRED_FAILURE_MODES)
     assert gate.failed_case_ids == ()
     assert len(gate.replay_digests) == release.required_replays
-    assert len(set(gate.replay_digests)) == 1
+    assert len(set(gate.replay_digests)) == release.required_replays
     evidence = player_classifier_promotion_evidence(release)
     assert evidence["replay_digests"] == list(gate.replay_digests)
     approval: dict[str, JsonValue] = {
@@ -419,16 +418,15 @@ def test_player_promotion_rejects_fake_digest_and_exact_version_mismatch() -> No
     assert not player_classifier_promotion_is_approved({**approval, "state": "revoked"})
 
 
-def test_player_recording_adapter_is_independent_and_replays_all_failure_modes() -> (
-    None
-):
+def test_player_classifier_adapter_executes_all_raw_corpus_cases() -> None:
     release = describe_player_classifier_release()
-    adapter = ControlledPlayerClassifierRecordingAdapter(release)
+    adapter = ControlledPlayerClassifierAdapter()
 
-    for case in release.reviewed_corpus_cases:
+    for case_number, case in enumerate(release.reviewed_corpus_cases, start=1):
         record = adapter.observe(
-            case_id=cast(str, case["case_id"]),
             source=cast(str, case["source"]),
+            source_revision_id=f"controlled:{case['case_id']}:revision:1",
+            execution_id=f"test-run:{case_number}",
         )
         assert "expected" not in record
         assert "observed_output" in record
@@ -442,98 +440,134 @@ def test_player_recording_adapter_is_independent_and_replays_all_failure_modes()
     assert evidence["failed_case_ids"] == []
 
 
-def _release_with_record_mutation(
-    release: PlayerClassifierRelease,
-    *,
-    case_id: str,
-    mutate: Callable[[dict[str, JsonValue]], None],
-) -> PlayerClassifierRelease:
-    records = deepcopy(list(release.recorded_observation_cases))
-    record = next(record for record in records if record["case_id"] == case_id)
-    mutate(record)
-    return replace(release, recorded_observation_cases=tuple(records))
-
-
-def _recorded_candidate(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    output = cast(dict[str, JsonValue], record["observed_output"])
-    candidates = cast(list[JsonValue], output["candidates"])
-    return cast(dict[str, JsonValue], candidates[0])
-
-
-def _recorded_facts(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    return cast(dict[str, JsonValue], record["observed_facts"])
-
-
 def _expected_facts(case: dict[str, JsonValue]) -> dict[str, JsonValue]:
     expected = cast(dict[str, JsonValue], case["expected"])
     return cast(dict[str, JsonValue], expected["facts"])
 
 
-def test_player_promotion_validates_candidate_type_and_every_recorded_fact() -> None:
+def test_player_promotion_validates_candidate_type_and_every_classifier_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     release = describe_player_classifier_release()
     expected_types = {"sm-010": "opponent_request", "sm-026": "referee_request"}
+    adapter = ControlledPlayerClassifierAdapter()
 
     for case_id, expected_type in expected_types.items():
         expected = next(
             case for case in release.reviewed_corpus_cases if case["case_id"] == case_id
         )
-        record = next(
-            record
-            for record in release.recorded_observation_cases
-            if record["case_id"] == case_id
+        record = adapter.observe(
+            source=cast(str, expected["source"]),
+            source_revision_id=f"controlled:{case_id}:revision:1",
+            execution_id=f"fact-test:{case_id}",
         )
-        candidate = _recorded_candidate(record)
-        facts = _recorded_facts(record)
+        output = cast(dict[str, JsonValue], record["observed_output"])
+        candidate = cast(
+            dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+        )
+        facts = cast(dict[str, JsonValue], record["observed_facts"])
         expected_facts = _expected_facts(expected)
         assert candidate["opportunity_type"] == expected_type
         assert facts["opportunity_types"] == [expected_type]
         assert facts["source_evidence"] == expected_facts["source_evidence"]
         assert facts["normalized"] == expected_facts["normalized"]
 
-    def change_type(record: dict[str, JsonValue]) -> None:
-        _recorded_candidate(record)["opportunity_type"] = "open_match"
+    original_observe = ControlledPlayerClassifierAdapter.observe
 
-    def change_normalized_facts(record: dict[str, JsonValue]) -> None:
-        normalized = cast(dict[str, JsonValue], _recorded_facts(record)["normalized"])
-        normalized["weekday"] = "monday"
+    def change_type(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "товарищеского" in source.casefold():
+            output = cast(dict[str, JsonValue], record["observed_output"])
+            candidate = cast(
+                dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+            )
+            candidate["opportunity_type"] = "open_match"
+        return record
 
-    def change_candidate_evidence(record: dict[str, JsonValue]) -> None:
-        evidence = cast(dict[str, JsonValue], _recorded_candidate(record)["evidence"])
-        evidence["request"] = "Ищем соперника для"
-
-    type_mismatch = _release_with_record_mutation(
-        release,
-        case_id="sm-010",
-        mutate=change_type,
-    )
-    type_gate = run_player_classifier_promotion_gate(type_mismatch)
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_type)
+    type_gate = run_player_classifier_promotion_gate(release)
     assert "sm-010:candidate-opportunity-type" in type_gate.failed_case_ids
 
-    fact_mismatch = _release_with_record_mutation(
-        release,
-        case_id="sm-026",
-        mutate=change_normalized_facts,
-    )
-    fact_gate = run_player_classifier_promotion_gate(fact_mismatch)
+    def change_facts(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "судья" in source.casefold():
+            facts = cast(dict[str, JsonValue], record["observed_facts"])
+            normalized = cast(dict[str, JsonValue], facts["normalized"])
+            normalized["weekday"] = "monday"
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_facts)
+    fact_gate = run_player_classifier_promotion_gate(release)
     assert "sm-026:annotation" in fact_gate.failed_case_ids
 
-    evidence_mismatch = _release_with_record_mutation(
-        release,
-        case_id="sm-010",
-        mutate=change_candidate_evidence,
-    )
-    evidence_gate = run_player_classifier_promotion_gate(evidence_mismatch)
+    def change_evidence(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "товарищеского" in source.casefold():
+            output = cast(dict[str, JsonValue], record["observed_output"])
+            candidate = cast(
+                dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+            )
+            evidence = cast(dict[str, JsonValue], candidate["evidence"])
+            evidence["request"] = "Ищем соперника для"
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_evidence)
+    evidence_gate = run_player_classifier_promotion_gate(release)
     assert "sm-010:candidate-evidence" in evidence_gate.failed_case_ids
 
-    def remove_normalized_facts(record: dict[str, JsonValue]) -> None:
-        _recorded_facts(record).pop("normalized")
+    def remove_facts(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "судья" in source.casefold():
+            facts = cast(dict[str, JsonValue], record["observed_facts"])
+            facts.pop("normalized")
+        return record
 
-    malformed_facts = _release_with_record_mutation(
-        release,
-        case_id="sm-026",
-        mutate=remove_normalized_facts,
-    )
-    malformed_gate = run_player_classifier_promotion_gate(malformed_facts)
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", remove_facts)
+    malformed_gate = run_player_classifier_promotion_gate(release)
     assert "sm-026:malformed" in malformed_gate.failed_case_ids
 
 
@@ -557,6 +591,152 @@ def test_player_promotion_executes_each_failure_mode_with_distinct_evidence() ->
         and observation["publication_effects"] == 0
         for observation in observations
     )
+
+
+def test_player_classifier_execution_is_raw_source_bound_and_traced() -> None:
+    release = describe_player_classifier_release()
+    case = release.reviewed_corpus_cases[0]
+    source = cast(str, case["source"])
+    adapter = ControlledPlayerClassifierAdapter()
+
+    observation = adapter.observe(
+        source=source,
+        source_revision_id="controlled:sm-001:revision:1",
+        execution_id="controlled-run-1",
+    )
+
+    execution = cast(dict[str, JsonValue], observation["execution"])
+    trace = cast(dict[str, JsonValue], execution["trace"])
+    assert trace["input_source_sha256"]
+    assert trace["stages"] == [
+        "source_signals",
+        "controlled_proposal",
+        "schema_validation",
+        "application_adaptation",
+        "fail_closed_publication_check",
+    ]
+    assert execution["execution_id"] == "controlled-run-1"
+    assert execution["source_revision_id"] == "controlled:sm-001:revision:1"
+    assert "recorded-observations.json" not in json.dumps(observation)
+
+    changed_source = source.replace("кипер", "защитник")
+    changed = adapter.observe(
+        source=changed_source,
+        source_revision_id="controlled:sm-001:revision:2",
+        execution_id="controlled-run-1b",
+    )
+    assert changed["observed_facts"] != observation["observed_facts"]
+
+
+def test_player_lifecycle_gate_detects_changed_expected_operation_and_publication() -> (
+    None
+):
+    release = describe_player_classifier_release()
+    suites = deepcopy(list(release.lifecycle_failure_suite_cases))
+    target = next(
+        case for case in suites if case["case_id"] == "create-edit-delete-flow"
+    )
+    operations = cast(list[JsonValue], target["operations"])
+    first = cast(dict[str, JsonValue], operations[0])
+    first["expected"] = False
+    mutated = replace(release, lifecycle_failure_suite_cases=tuple(suites))
+
+    gate = run_player_classifier_promotion_gate(mutated)
+
+    assert "create-edit-delete-flow:operation-1" in gate.failed_case_ids
+    flow = next(
+        observation
+        for observation in gate.lifecycle_observations
+        if observation["case_id"] == "create-edit-delete-flow"
+    )
+    flow_operations = cast(list[JsonValue], flow["observations"])
+    assert cast(dict[str, JsonValue], flow_operations[0])["publication_effects"] == 1
+
+
+def test_player_failure_gate_rejects_removed_injection() -> None:
+    release = describe_player_classifier_release()
+    failures = deepcopy(list(release.failure_mode_cases))
+    operation = cast(dict[str, JsonValue], failures[0]["operation"])
+    operation.pop("failure_mode")
+    mutated = replace(release, failure_mode_cases=tuple(failures))
+
+    gate = run_player_classifier_promotion_gate(mutated)
+
+    assert "failure-schema:injection" in gate.failed_case_ids
+    assert any(
+        observation["case_id"] == "failure-schema"
+        and observation["publication_state"] == "suppressed"
+        and observation["publication_effects"] == 0
+        for observation in gate.failure_mode_observations
+    )
+
+
+def test_player_failure_gate_rejects_altered_observed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = describe_player_classifier_release()
+    original_execute = ControlledPlayerLifecycleAdapter.execute
+
+    def alter_timeout_result(
+        adapter: ControlledPlayerLifecycleAdapter,
+        operation: dict[str, JsonValue],
+    ) -> JsonValue:
+        observed = original_execute(adapter, operation)
+        if operation.get("failure_mode") == "timeout":
+            result = cast(dict[str, JsonValue], observed)
+            result["observed_outcome"] = "quota_circuit_opened"
+        return observed
+
+    monkeypatch.setattr(
+        ControlledPlayerLifecycleAdapter, "execute", alter_timeout_result
+    )
+    gate = run_player_classifier_promotion_gate(release)
+
+    assert "failure-timeout:observed-observed_outcome" in gate.failed_case_ids
+    assert all(
+        observation["publication_effects"] == 0
+        for observation in gate.failure_mode_observations
+    )
+
+
+def test_player_promotion_rejects_tampered_classifier_execution_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = describe_player_classifier_release()
+    original_observe = ControlledPlayerClassifierAdapter.observe
+
+    def alter_trace(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if source == cast(str, release.reviewed_corpus_cases[0]["source"]):
+            execution = cast(dict[str, JsonValue], record["execution"])
+            trace = cast(dict[str, JsonValue], execution["trace"])
+            trace["adapted_facts_digest"] = "0" * 64
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", alter_trace)
+    gate = run_player_classifier_promotion_gate(release)
+
+    assert "sm-001:execution-trace" in gate.failed_case_ids
+
+
+def test_player_promotion_replays_are_separate_execution_traces() -> None:
+    release = describe_player_classifier_release()
+    gate = run_player_classifier_promotion_gate(release)
+
+    assert len(gate.replay_execution_ids) == release.required_replays
+    assert len(set(gate.replay_execution_ids)) == release.required_replays
+    assert len(set(gate.replay_digests)) == release.required_replays
 
 
 def test_player_promotion_rejects_cross_file_annotation_mismatch(
