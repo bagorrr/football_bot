@@ -2,6 +2,7 @@
 
 # ruff: noqa: RUF001 -- reviewed multilingual transfer evidence is intentional.
 
+import json
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import cast
@@ -56,6 +57,9 @@ def _opportunity(
     *,
     timing: dict[str, str | None] | None = None,
     positions: list[str] | None = None,
+    payment: str | None = None,
+    payment_amount: str | None = None,
+    payment_currency: str | None = None,
     identifier: str | None = None,
     source_posted_at: str = "2026-08-18T08:00:00+00:00",
     source_edited_at: str | None = None,
@@ -78,7 +82,12 @@ def _opportunity(
         "place_display_fr": "Saint-Pétersbourg",
         "seasonal_timing": timing,
         "positions": positions,
+        "payment": payment,
     }
+    if payment_amount is not None:
+        facts["payment_amount"] = payment_amount
+    if payment_currency is not None:
+        facts["payment_currency"] = payment_currency
     if source_edited_at is not None:
         facts["source_edited_at"] = source_edited_at
     facts[opportunity_type] = True
@@ -162,6 +171,50 @@ def test_transfer_searches_are_directional_and_exclude_one_off_opportunities() -
     assert [result.result_id for result in player_results] == [
         "result:completed-search:transfer:opportunity:player_transfer_availability"
     ]
+
+
+@pytest.mark.parametrize(
+    ("requested_payment", "accepted_payment", "expected_result_class"),
+    (
+        ("free", "paid", None),
+        ("paid", "free", None),
+        ("free", "free", "confirmed_match"),
+        ("paid", "paid", "confirmed_match"),
+        ("free", None, "possible_match"),
+        ("free", "unknown", "possible_match"),
+    ),
+)
+def test_transfer_search_matches_scalar_payment_status_without_losing_unknowns(
+    requested_payment: str,
+    accepted_payment: str | None,
+    expected_result_class: str | None,
+) -> None:
+    results = evaluate_transfer_search(
+        _search(UserIntent.NEW_TEAM_SEARCH),
+        {"payment": (requested_payment,)},
+        (
+            _opportunity(
+                "roster_vacancy",
+                payment=accepted_payment,
+                payment_amount="500" if accepted_payment == "paid" else None,
+                payment_currency="RUB" if accepted_payment == "paid" else None,
+            ),
+        ),
+    )
+
+    if expected_result_class is None:
+        assert results == ()
+        return
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.result_class == expected_result_class
+    card_facts = dict(result.card_facts)
+    expected_state = "confirmed" if accepted_payment == requested_payment else "unknown"
+    assert json.loads(card_facts["match_states"])["payment"] == expected_state
+    if accepted_payment == "paid":
+        assert card_facts["payment_amount"] == "500"
+        assert card_facts["payment_currency"] == "RUB"
 
 
 def test_transfer_search_exact_timing_rejects_adjacent_season() -> None:

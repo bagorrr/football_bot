@@ -1305,13 +1305,21 @@ def evaluate_transfer_search(
             >= source_qualifying_assertion_at + timedelta(days=30)
         ):
             continue
+        payment = facts.get("payment")
         detail_state_by_key = {
             key: match_detail(
                 transfer_search_details.get(key, ()),
                 tuple(facts[key]) if isinstance(facts.get(key), list) else None,
             )
             for key in _TRANSFER_SEARCH_DETAIL_KEYS
+            if key != "payment"
         }
+        detail_state_by_key["payment"] = match_detail(
+            transfer_search_details.get("payment", ()),
+            (payment,)
+            if isinstance(payment, str) and payment in {"free", "paid"}
+            else None,
+        )
         detail_state_by_key["seasonal_timing"] = match_seasonal_timing(
             transfer_search_details.get("seasonal_timing", ()),
             facts.get("seasonal_timing"),
