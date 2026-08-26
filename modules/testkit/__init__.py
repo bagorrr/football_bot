@@ -1030,15 +1030,27 @@ def _ensure_test_proposition_evidence(
     candidates = enriched.get("candidates")
     if not isinstance(candidates, list):
         return enriched
+    proposition_version = (
+        "source-proposition-evidence-v2"
+        if enriched.get("schema_version") == "source-message-classification-v3"
+        else "source-proposition-evidence-v1"
+    )
     for candidate in candidates:
         if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
             continue
-        _add_test_proposition_evidence(candidate, body=body)
+        _add_test_proposition_evidence(
+            candidate,
+            body=body,
+            proposition_version=proposition_version,
+        )
     return enriched
 
 
 def _add_test_proposition_evidence(
-    candidate: dict[str, JsonValue], *, body: str
+    candidate: dict[str, JsonValue],
+    *,
+    body: str,
+    proposition_version: str = "source-proposition-evidence-v1",
 ) -> None:
     candidate_key = candidate.get("candidate_key")
     opportunity_type = candidate.get("opportunity_type", "open_match")
@@ -1046,7 +1058,14 @@ def _add_test_proposition_evidence(
     routes = candidate.get("response_routes")
     if not isinstance(candidate_key, str) or not isinstance(evidence, dict):
         return
-    if not isinstance(opportunity_type, str):
+    if opportunity_type not in {
+        "open_match",
+        "player_match_availability",
+        "opponent_request",
+        "tournament",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }:
         return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
         return
@@ -1100,7 +1119,7 @@ def _add_test_proposition_evidence(
             }
         )
     candidate["proposition_evidence"] = {
-        "contract_version": "source-proposition-evidence-v1",
+        "contract_version": proposition_version,
         "coverage": "complete_source_revision",
         "root": {
             "proposition_id": candidate_key,
@@ -1161,12 +1180,21 @@ def _build_test_semantic_proof(
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
         or not isinstance(routes, list)
-        or not isinstance(opportunity_type, str)
+        or opportunity_type
+        not in {
+            "open_match",
+            "tournament",
+            "player_match_availability",
+            "opponent_request",
+            "roster_vacancy",
+            "player_transfer_availability",
+        }
     ):
         return {}
     meaning = opportunity_type
     if meaning not in {
         "open_match",
+        "tournament",
         "player_match_availability",
         "opponent_request",
         "roster_vacancy",
@@ -1255,14 +1283,14 @@ def _build_test_semantic_proof(
                 "span": {"start": 0, "end": len(body), "text": body},
             }
         )
-    contract_version = (
-        "source-semantic-proof-v2"
-        if opportunity_type in {"roster_vacancy", "player_transfer_availability"}
-        and proof_version == "source-semantic-proof-v1"
-        else proof_version
-    )
+    semantic_proof_version = proof_version
+    if semantic_proof_version == "source-semantic-proof-v1" and (
+        output.get("schema_version") == "source-message-classification-v3"
+        or opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+    ):
+        semantic_proof_version = "source-semantic-proof-v2"
     return {
-        "contract_version": contract_version,
+        "contract_version": semantic_proof_version,
         "source_message_revision_reference": source_message_revision_reference,
         "candidate_key": candidate_key,
         "coverage": "complete_source_revision",
@@ -1872,11 +1900,13 @@ class AcceptanceSpine:
         roles: Mapping[RuntimeRole, AcceptanceRole],
         observer: AcceptanceObserver,
         restart_role: Callable[[RuntimeRole], AcceptanceRole],
+        clock: Clock,
         admin_database_url: str,
     ) -> None:
         self._roles = dict(roles)
         self._observer = observer
         self._restart_role = restart_role
+        self._clock = clock
         self._admin_database_url = admin_database_url
 
     def restart(self, role: RuntimeRole) -> AcceptanceSpine:
@@ -2592,7 +2622,7 @@ class AcceptanceSpine:
 
     def results(self, completed_search_id: str) -> tuple[SearchResult, ...]:
         """Observe one Completed Search's ordered Results through the seam."""
-        return self._observer.results(completed_search_id)
+        return self._observer.results(completed_search_id, as_of=self._clock.now())
 
     def search_completions(
         self, search_update_id: str
@@ -2639,6 +2669,7 @@ class AcceptanceSpine:
         game_search_details: dict[str, list[str]] | None = None,
         number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
+        tournament_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
@@ -2653,6 +2684,7 @@ class AcceptanceSpine:
             game_search_details=game_search_details,
             number_of_players=number_of_players,
             opponent_search_details=opponent_search_details,
+            tournament_search_details=tournament_search_details,
             transfer_search_details=transfer_search_details,
         )
 
@@ -2796,11 +2828,32 @@ class AcceptanceSpine:
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
+    def open_tournament_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Tournament Search Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
     def open_opponent_search_detail(
         self, *, update_id: str, telegram_user_id: int, detail_key: str
     ) -> None:
         """Drive one Opponent Search detail submenu."""
         self._conversation_onboarding().open_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Tournament Search detail submenu."""
+        self._conversation_onboarding().open_tournament_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             detail_key=detail_key,
@@ -2829,11 +2882,32 @@ class AcceptanceSpine:
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
+    def toggle_tournament_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Drive one Tournament Search detail toggle."""
+        self._conversation_onboarding().toggle_tournament_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
     def commit_opponent_search_detail(
         self, *, update_id: str, telegram_user_id: int
     ) -> None:
         """Commit the current Opponent Search detail submenu."""
         self._conversation_onboarding().commit_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit the current Tournament Search detail submenu."""
+        self._conversation_onboarding().commit_tournament_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
@@ -2897,6 +2971,16 @@ class AcceptanceSpine:
     ) -> None:
         """Leave an Opponent Search detail submenu or hub."""
         self._conversation_onboarding().back_from_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from Tournament Search details."""
+        self._conversation_onboarding().back_from_tournament_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
@@ -2968,7 +3052,7 @@ class AcceptanceSpine:
     def submit_transfer_search_seasonal_timing_start_date_text(
         self, *, update_id: str, telegram_user_id: int, text: str
     ) -> None:
-        """Submit the transfer local-start-date prompt."""
+        """Submit the transfer local-start-date text."""
         self._conversation_onboarding().submit_transfer_search_seasonal_timing_start_date_text(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
@@ -2989,7 +3073,7 @@ class AcceptanceSpine:
     def submit_transfer_search_seasonal_timing_season_text(
         self, *, update_id: str, telegram_user_id: int, text: str
     ) -> None:
-        """Submit the transfer named-season prompt."""
+        """Submit the transfer named-season text."""
         self._conversation_onboarding().submit_transfer_search_seasonal_timing_season_text(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
@@ -3674,6 +3758,7 @@ def boot_acceptance_spine(
         roles={role: restart_role(role) for role in RuntimeRole},
         observer=PostgresAcceptanceObserver(admin_database_url),
         restart_role=restart_role,
+        clock=clock,
         admin_database_url=admin_database_url,
     )
 

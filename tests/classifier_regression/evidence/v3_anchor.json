@@ -1,0 +1,218 @@
+{
+  "anchor_purpose": "The reviewed v3 gate reads source, case, recorded-output, input-manifest, promotion, semantic-proof, classifier-artifact, and selected-child-execution evidence from these independently anchored files; corpus.v3.json contains metadata only.",
+  "anchor_version": "open-match-classifier-regression-v3-external-anchor-v1",
+  "artifact_execution": {
+    "adapter_kind": "recorded_corpus",
+    "adapter_version": "open-match-classifier-regression-v3-reviewed-v2",
+    "codex_version": "reviewed-offline",
+    "duration_ms": 0,
+    "input_tokens": 0,
+    "output_tokens": 0
+  },
+  "canonical_digests": {
+    "artifact_records_sha256": "f86a19280b1a2f403be42d87dd6e0fd6fec93c9b397ff894ed1df3560670d25d",
+    "case_manifest_sha256": "5e6bb07d657f9c15e0839a2202da5056e3b8d82e02faedc4394d8245ddc8111c",
+    "promotion_fixtures_sha256": "2aa48e5bada70abfe68eaf7f57b065a4384de4fe1a7c43360a8bb297d5ed8a5f",
+    "recorded_outputs_sha256": "0cdc65dd3d2928b594ba89e239a4589fb1b4d9752ddeae96329c968ba2a01ba5",
+    "request_manifests_sha256": "9046dcacd566a20568d1eafcead2228939e6bc01787ee5fcf1eafb4a945bcdb4",
+    "semantic_case_coverage_sha256": "40fc3ac5cd349a76c6e0f69b587d3b0f4a57ec56ad8588fc17909bbcc1fe8302",
+    "semantic_records_sha256": "00f24df62fc442a8dcb5c1076a0e80c5da25d03f1aed7f10a76672a82d7ed686"
+  },
+  "evaluation": {
+    "context_policy_version": "classifier-context-v1",
+    "corpus_version": "open-match-classifier-regression-v3-reviewed-v2",
+    "evaluation_contract_version": "source-message-classification-v3-review-gate-v1",
+    "failure_suite": [
+      "timeout",
+      "429",
+      "auth",
+      "crash",
+      "replay",
+      "rollback"
+    ],
+    "glossary_version": "football-opportunity-glossary-v1",
+    "independent_complete_runs": 3,
+    "model": "gpt-5.6-sol",
+    "promotion_fixtures": [
+      "tournament-current-registration",
+      "football-discussion-without-opportunity"
+    ],
+    "prompt_version": "open-match-primary-v3",
+    "reasoning_effort": "high",
+    "required_passes": [
+      "primary-v3",
+      "ambiguity-second-pass-v2",
+      "semantic-proof-v2",
+      "normalization",
+      "unpublished-outcomes"
+    ],
+    "routing_policy_version": "classifier-routing-v1",
+    "schema_version": "source-message-classification-v3",
+    "semantic_proof_version": "source-semantic-proof-v2",
+    "source_corpus_case_count": 38
+  },
+  "expected_digests": {
+    "artifact_records_sha256": "f86a19280b1a2f403be42d87dd6e0fd6fec93c9b397ff894ed1df3560670d25d",
+    "request_manifests_sha256": "9046dcacd566a20568d1eafcead2228939e6bc01787ee5fcf1eafb4a945bcdb4"
+  },
+  "selected_execution": {
+    "anchor_purpose": "Externally anchor the real selected Codex child-process protocol separately from recorded v3 replay evidence.",
+    "anchor_version": "open-match-classifier-regression-v3-selected-execution-anchor-v1",
+    "contract": {
+      "adapter_kind": "codex_cli",
+      "adapter_version": "classifier-hermetic-execution-v2",
+      "codex_version": "hermetic-codex-execution-v2",
+      "requested_model": "gpt-5.6-sol",
+      "requested_reasoning_effort": "high",
+      "timeout_seconds": 180,
+      "requires_child_process": true,
+      "requires_exit_status": true,
+      "requires_stdout_stderr_digests": true,
+      "requires_input_output_evidence": true
+    },
+    "fixture": {
+      "path": "tests/classifier_regression/hermetic-codex",
+      "sha256": "2c1f80ce40ca4ff9db132f70ba512487edd1783a1abe6b76d98095ad0f1f643c"
+    },
+    "expected": {
+      "execution_count": 58,
+      "successful_execution_count": 54,
+      "failed_execution_count": 4,
+      "semantic_proof_execution_count": 4,
+      "output_artifact_sha256": "92b937d3525ac25aa943d595715a5293c0fbcec14a50c21340062acc9b3e4337",
+      "protocol_artifact_sha256": "73fda499e962bae50ccf2c7b47c358e50be3c0d8cc571f42dfe476cef6b25398",
+    "execution_artifact_sha256": "efc9cf81f7393d81ebd4e3ef42a66aeb75edf709e879a9b0fbda46ce6c8db0df"
+    }
+  },
+  "expected_publication_outcomes": {
+    "normalization_rejection": "unpublished",
+    "unpublished_persistence": "unpublished"
+  },
+  "raw_files": {
+    "source_corpus": {
+      "path": "docs/product/source-message-corpus-v1.yaml",
+      "sha256": "b406ccd92e190e01b85dc3cc8b9571456165c5e4d57c3f8c7bc99d4c7e69b92c"
+    },
+    "source_corpus_provenance": {
+      "path": "docs/product/source-message-corpus-provenance.md",
+      "sha256": "6cb82cdfd29b1d542fbf79cb164a2cebc00822b83fcd2adfc2296241d5822714"
+    },
+    "case_manifest": {
+      "path": "tests/classifier_regression/evidence/v3_case_manifest.json",
+      "sha256": "47dad76fe80a71afa6442322b895e968c10c8b59ed351750b65cd5734ed9d902"
+    },
+    "recorded_evidence": {
+      "path": "tests/classifier_regression/evidence/v3_recorded_evidence.json",
+      "sha256": "d8979bd9cafd69c59e5084fb4c5da68f23898f5dce90c7afd5926a6aa7975a85"
+    },
+    "request_manifests": {
+      "path": "tests/classifier_regression/evidence/v3_input_manifests.json",
+      "sha256": "13a4dbb2fef33089b55acfabf828b1fa8941803137bde072ef3c10c9f2b5eef0"
+    },
+    "artifact_manifest": {
+      "path": "tests/classifier_regression/evidence/v3_artifact_manifest.json",
+      "sha256": "693bde3929a6a7fd18aded99876152a5f56fc600e3310e6fa2acb5ef74bbf999"
+    },
+    "semantic_proofs": {
+      "path": "tests/classifier_regression/evidence/v3_semantic_proofs.json",
+      "sha256": "1aeb55f369e070dff29cec179f089506180da8e8c05a3ffbcdd2f1c6c9fc3899"
+    },
+    "selected_execution_anchor": {
+      "path": "tests/classifier_regression/evidence/v3_selected_execution_anchor.json",
+      "sha256": "44816ed990daa15014266ac313d6fcbe4964e9106f68e150798884c2e56d9af6"
+    },
+    "artifact:open-match-primary-v3:prompt_filename": {
+      "path": "classifier/open-match-primary-v3/prompt.md",
+      "sha256": "e620eef019875915a082d8d5b159eac6806532906f901d4db581c3ba20b4e3ed"
+    },
+    "artifact:open-match-primary-v3:schema_filename": {
+      "path": "classifier/open-match-primary-v3/source-message-classification-v3.schema.json",
+      "sha256": "d15152aec7c51217006baec21c002029ed7aae23eee27f44aeba669209204732"
+    },
+    "artifact:open-match-primary-v3:provenance_filename": {
+      "path": "classifier/open-match-primary-v3/provenance.json",
+      "sha256": "0f8d3fd7212ee873874d87aa55bb3095b63906042c727b718688c8864acb23ab"
+    },
+    "artifact:open-match-ambiguity-v2:prompt_filename": {
+      "path": "classifier/open-match-ambiguity-v2/prompt.md",
+      "sha256": "ccac0d45faaa66168c131ffa5f9862c218414cb7f01dcf378a20a11e3999a03b"
+    },
+    "artifact:open-match-ambiguity-v2:schema_filename": {
+      "path": "classifier/open-match-ambiguity-v2/source-message-classification-v3.schema.json",
+      "sha256": "fcb632bcd44843f2d527d6d946c0803a9fa687164103f95158f744d9882ceb1c"
+    },
+    "artifact:open-match-ambiguity-v2:provenance_filename": {
+      "path": "classifier/open-match-ambiguity-v2/provenance.json",
+      "sha256": "3e4240bf0125b15b0c2f56a7fcdb03659dad99ee0ec208cbdb4619fc336f5ea7"
+    },
+    "artifact:open-match-semantic-proof-v2:prompt_filename": {
+      "path": "classifier/open-match-semantic-proof-v2/prompt.md",
+      "sha256": "f5252fd954df422c86347beb5b3aa12dd758ebf539570602bc7396186f428e1b"
+    },
+    "artifact:open-match-semantic-proof-v2:schema_filename": {
+      "path": "classifier/open-match-semantic-proof-v2/source-semantic-proof-v2.schema.json",
+      "sha256": "d064778fe255b7dfb69a3ef50cb30fa65814176b951e2d3977fd6920bf2e1c59"
+    },
+    "artifact:open-match-semantic-proof-v2:provenance_filename": {
+      "path": "classifier/open-match-semantic-proof-v2/provenance.json",
+      "sha256": "8a8fa5d5a59a7bc5d06bca5658062edd02968325bb9876930bb4d7769f58dbd8"
+    }
+  },
+  "semantic_proof": {
+    "all_opportunity_types": [
+      "coach_availability",
+      "coach_request",
+      "open_match",
+      "opponent_request",
+      "player_match_availability",
+      "player_transfer_availability",
+      "referee_availability",
+      "referee_request",
+      "roster_vacancy",
+      "tournament"
+    ],
+    "candidate_count": 3,
+    "case_count": 38,
+    "case_ids": [
+      "sm-001",
+      "sm-002",
+      "sm-003",
+      "sm-004",
+      "sm-005",
+      "sm-006",
+      "sm-007",
+      "sm-008",
+      "sm-009",
+      "sm-010",
+      "sm-011",
+      "sm-012",
+      "sm-013",
+      "sm-014",
+      "sm-015",
+      "sm-016",
+      "sm-017",
+      "sm-018",
+      "sm-019",
+      "sm-020",
+      "sm-021",
+      "sm-022",
+      "sm-023",
+      "sm-024",
+      "sm-025",
+      "sm-026",
+      "sm-027",
+      "sm-028",
+      "sm-029",
+      "sm-030",
+      "sm-031",
+      "sm-032",
+      "sm-033",
+      "sm-034",
+      "sm-035",
+      "sm-036",
+      "sm-037",
+      "sm-038"
+    ],
+    "record_count": 4
+  }
+}

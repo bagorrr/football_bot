@@ -77,7 +77,7 @@ class SubprocessCodexRunner:
             if failure is not None:
                 raise failure
             raise RuntimeError("isolated Codex classifier process failed")
-        payload = _codex_jsonl_result(stdout)
+        payload = _codex_jsonl_result(stdout, argv=argv)
         payload.setdefault("duration_ms", int((monotonic() - started) * 1000))
         return payload
 
@@ -185,6 +185,8 @@ class CodexCliClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
+        # v3 remains evaluation-only until its promotion gate is accepted;
+        # v2 is the compatible runtime contract for opponent_request.
         return self._primary_schema_version
 
     @property
@@ -287,7 +289,9 @@ def _integer_metric(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _codex_jsonl_result(stdout: str) -> dict[str, object]:
+def _codex_jsonl_result(
+    stdout: str, *, argv: tuple[str, ...] | None = None
+) -> dict[str, object]:
     """Extract the final structured message and usage from Codex JSONL."""
     final_text: str | None = None
     usage: dict[str, object] = {}
@@ -345,6 +349,15 @@ def _codex_jsonl_result(stdout: str) -> dict[str, object]:
         raise RuntimeError("Codex classifier final message is not JSON") from error
     if not isinstance(output, dict):
         raise RuntimeError("Codex classifier final output is not an object")
+    if not effective_model and argv is not None:
+        try:
+            effective_model = argv[argv.index("--model") + 1]
+        except (ValueError, IndexError) as error:
+            raise RuntimeError(
+                "Codex classifier command omitted its pinned model"
+            ) from error
+    if not effective_reasoning_effort and argv is not None:
+        effective_reasoning_effort = "high"
     return {
         "output": output,
         "effective_model": effective_model,

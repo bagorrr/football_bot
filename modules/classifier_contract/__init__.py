@@ -64,6 +64,19 @@ _OPTIONAL_OPPONENT_CANDIDATE_FIELDS = {
     "playing_surfaces",
     "payment",
 }
+_TOURNAMENT_OPTIONAL_CANDIDATE_FIELDS = {
+    "team_formats",
+    "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+    "schedule",
+    "registration_deadline",
+    "structure",
+    "capacity",
+    "prizes",
+}
+_TOURNAMENT_PARTICIPATION_FIELDS = {"open_participation", "registration_open"}
 _PLAYER_OPTIONAL_CANDIDATE_FIELDS = {
     "available_player_count",
     "available_player_count_min",
@@ -157,6 +170,7 @@ def _candidate_field_sets(
 
 
 PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
+PROPOSITION_EVIDENCE_V2_VERSION = "source-proposition-evidence-v2"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
 SEMANTIC_PROOF_V2_VERSION = "source-semantic-proof-v2"
 _SEMANTIC_PROOF_VERSIONS = {SEMANTIC_PROOF_VERSION, SEMANTIC_PROOF_V2_VERSION}
@@ -199,6 +213,7 @@ def classifier_output_is_schema_valid(
         return _classifier_output_v2_is_schema_valid(
             output,
             body=body,
+            allow_tournament=True,
             allow_player_match_availability=True,
             allow_fact_observations=True,
         )
@@ -361,6 +376,7 @@ def _classifier_output_v2_is_schema_valid(
     output: dict[str, JsonValue],
     *,
     body: str,
+    allow_tournament: bool = False,
     allow_player_match_availability: bool = False,
     allow_fact_observations: bool = False,
 ) -> bool:
@@ -409,10 +425,23 @@ def _classifier_output_v2_is_schema_valid(
             return False
         return all(
             isinstance(candidate, dict)
-            and _accepted_candidate_is_schema_valid(
-                candidate,
-                body=body,
-                allow_player_match_availability=allow_player_match_availability,
+            and (
+                _accepted_candidate_v3_is_schema_valid(
+                    candidate,
+                    body=body,
+                    allow_player_match_availability=allow_player_match_availability,
+                )
+                if allow_tournament
+                else _accepted_candidate_is_schema_valid(
+                    candidate,
+                    body=body,
+                    proposition_version=(
+                        PROPOSITION_EVIDENCE_V2_VERSION
+                        if allow_player_match_availability
+                        else PROPOSITION_EVIDENCE_VERSION
+                    ),
+                    allow_player_match_availability=allow_player_match_availability,
+                )
             )
             for candidate in candidates
         )
@@ -431,11 +460,12 @@ def _classifier_output_v2_is_schema_valid(
             candidate.get("opportunity_type")
             not in (
                 _UNRESOLVED_OPPORTUNITY_TYPES
-                if allow_player_match_availability
+                if allow_tournament or allow_player_match_availability
                 else {
                     "open_match",
                     "opponent_request",
-                    *_TRANSFER_OPPORTUNITY_TYPES,
+                    "roster_vacancy",
+                    "player_transfer_availability",
                 }
             )
             or not isinstance(candidate.get("candidate_key"), str)
@@ -546,6 +576,7 @@ def _accepted_candidate_is_schema_valid(
     candidate: dict[str, JsonValue],
     *,
     body: str,
+    proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
     allow_player_match_availability: bool = False,
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
@@ -670,7 +701,201 @@ def _accepted_candidate_is_schema_valid(
         evidence=evidence,
         routes=routes,
         meaning=opportunity_type,
+        proposition_version=proposition_version,
     )
+
+
+def _accepted_candidate_v3_is_schema_valid(
+    candidate: dict[str, JsonValue],
+    *,
+    body: str,
+    allow_player_match_availability: bool = False,
+) -> bool:
+    """Validate one v3 candidate while retaining the v2 open-match contract."""
+    if candidate.get("opportunity_type") == "tournament":
+        return _tournament_candidate_is_schema_valid(
+            candidate,
+            body=body,
+            require_source_context=True,
+        )
+    if candidate.get("opportunity_type") in _TRANSFER_OPPORTUNITY_TYPES:
+        return _accepted_transfer_candidate_is_schema_valid(
+            candidate,
+            body=body,
+            require_source_context=True,
+        )
+    proposition_evidence = candidate.get("proposition_evidence")
+    # The Player release reuses the v3 envelope but deliberately retains its
+    # published v1 proposition graph.  Main's Tournament/open-match v3
+    # artifacts use the additive v2 graph.  Select the validator from the
+    # immutable graph marker so both published artifact sets remain valid.
+    proposition_version = (
+        PROPOSITION_EVIDENCE_VERSION
+        if isinstance(proposition_evidence, dict)
+        and proposition_evidence.get("contract_version") == PROPOSITION_EVIDENCE_VERSION
+        else PROPOSITION_EVIDENCE_V2_VERSION
+    )
+    return _accepted_candidate_is_schema_valid(
+        candidate,
+        body=body,
+        proposition_version=proposition_version,
+        allow_player_match_availability=allow_player_match_availability,
+    )
+
+
+def _tournament_candidate_is_schema_valid(
+    candidate: dict[str, JsonValue],
+    *,
+    body: str,
+    require_source_context: bool,
+) -> bool:
+    """Validate a v3 Tournament candidate with source-bound facts."""
+    structured_fields = (
+        _V2_STRUCTURED_CANDIDATE_FIELDS
+        if require_source_context
+        else _STRUCTURED_CANDIDATE_FIELDS
+    )
+    allowed_fields = {
+        "candidate_key",
+        "opportunity_type",
+        "evidence",
+        "location",
+        "event_time",
+        "response_routes",
+        *_TOURNAMENT_PARTICIPATION_FIELDS,
+        *_TOURNAMENT_OPTIONAL_CANDIDATE_FIELDS,
+        *structured_fields,
+    }
+    participation_fields = set(candidate).intersection(_TOURNAMENT_PARTICIPATION_FIELDS)
+    participation_field = next(iter(participation_fields), None)
+    if (
+        set(candidate) - allowed_fields
+        or candidate.get("opportunity_type") != "tournament"
+        or not isinstance(candidate.get("candidate_key"), str)
+        or not candidate["candidate_key"]
+        or participation_field is None
+        or len(participation_fields) != 1
+        or candidate.get(participation_field) is not True
+    ):
+        return False
+    if require_source_context:
+        source_context = candidate.get("source_context")
+        if (
+            not isinstance(source_context, str)
+            or not source_context
+            or source_context not in body
+        ):
+            return False
+    candidate_key = candidate["candidate_key"]
+    assert isinstance(candidate_key, str)
+    evidence = candidate.get("evidence")
+    expected_evidence = {
+        "opportunity",
+        "event_time",
+        "location",
+        participation_field,
+    } | (set(candidate) & _TOURNAMENT_OPTIONAL_CANDIDATE_FIELDS)
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != expected_evidence
+        or not all(
+            isinstance(value, str) and bool(value) and value in body
+            for value in evidence.values()
+        )
+    ):
+        return False
+    location = candidate.get("location")
+    event_time = candidate.get("event_time")
+    routes = candidate.get("response_routes")
+    if (
+        not isinstance(location, dict)
+        or set(location) != {"mention", "place_id", "country_id", "city_id"}
+        or not all(isinstance(value, str) and value for value in location.values())
+        or not isinstance(event_time, dict)
+        or set(event_time)
+        not in (
+            {"start_local_date", "end_local_date", "iana_timezone"},
+            {"start_local_date", "end_local_date", "exact_local_time", "iana_timezone"},
+            {"start_local_date", "end_local_date", "day_part", "iana_timezone"},
+        )
+        or not isinstance(routes, list)
+        or len(routes) > 8
+    ):
+        return False
+    try:
+        start = date.fromisoformat(str(event_time["start_local_date"]))
+        end = date.fromisoformat(str(event_time["end_local_date"]))
+    except (KeyError, ValueError):
+        return False
+    exact_time = event_time.get("exact_local_time")
+    day_part = event_time.get("day_part")
+    if (
+        start > end
+        or not isinstance(event_time.get("iana_timezone"), str)
+        or not event_time["iana_timezone"]
+        or (
+            exact_time is not None
+            and (
+                not isinstance(exact_time, str)
+                or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
+            )
+        )
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
+    ):
+        return False
+    for field_name, allowed in _CANONICAL_LISTS.items():
+        values = candidate.get(field_name)
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(item for item in values if isinstance(item, str)))
+            or not all(isinstance(item, str) and item in allowed for item in values)
+        ):
+            return False
+    if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
+        return False
+    for field_name in (
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
+    ):
+        if field_name in candidate and not _valid_tournament_fact(
+            candidate[field_name]
+        ):
+            return False
+    if not all(_valid_response_route(route, body=body) for route in routes):
+        return False
+    proposition_evidence = candidate.get("proposition_evidence")
+    return proposition_evidence is None or proposition_evidence_is_schema_valid(
+        proposition_evidence,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+        opportunity_type="tournament",
+        proposition_version=PROPOSITION_EVIDENCE_V2_VERSION,
+    )
+
+
+def _valid_tournament_fact(value: JsonValue) -> bool:
+    """Allow only non-empty JSON facts whose source evidence is separately bound."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, list):
+        return bool(value) and all(_valid_tournament_fact(item) for item in value)
+    if isinstance(value, dict):
+        return bool(value) and all(
+            isinstance(key, str) and bool(key) and _valid_tournament_fact(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _accepted_transfer_candidate_is_schema_valid(
@@ -790,6 +1015,8 @@ def proposition_evidence_is_schema_valid(
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
     meaning: str = "open_match",
+    opportunity_type: str | None = None,
+    proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
 ) -> bool:
     """Validate the versioned source-proposition/evidence wire contract.
 
@@ -798,6 +1025,7 @@ def proposition_evidence_is_schema_valid(
     addressable. Application code separately decides whether the graph is
     current, positive, non-competing, and publishable.
     """
+    effective_meaning = opportunity_type if opportunity_type is not None else meaning
     if not isinstance(value, dict) or set(value) != {
         "contract_version",
         "coverage",
@@ -808,7 +1036,7 @@ def proposition_evidence_is_schema_valid(
     }:
         return False
     if (
-        value.get("contract_version") != PROPOSITION_EVIDENCE_VERSION
+        value.get("contract_version") != proposition_version
         or value.get("coverage") != "complete_source_revision"
         or not body
     ):
@@ -826,7 +1054,7 @@ def proposition_evidence_is_schema_valid(
     if (
         root.get("proposition_id") != candidate_key
         or root.get("domain") not in _PROPOSITION_DOMAINS
-        or root.get("meaning") != meaning
+        or root.get("meaning") != effective_meaning
         or root.get("polarity") not in _PROPOSITION_POLARITIES
         or root.get("currentness") not in _PROPOSITION_CURRENTNESS
         or not _valid_source_span(root.get("span"), body, expected_text=body)
@@ -835,24 +1063,28 @@ def proposition_evidence_is_schema_valid(
     facts = value.get("facts")
     if not isinstance(facts, dict) or set(facts) != set(evidence):
         return False
-    if meaning in {"roster_vacancy", "player_transfer_availability"}:
-        mandatory_fact_names = {"opportunity", "location", meaning}
+    if effective_meaning in {"roster_vacancy", "player_transfer_availability"}:
+        mandatory_fact_names = {"opportunity", "location", effective_meaning}
         if not mandatory_fact_names.issubset(facts):
             return False
     else:
         mandatory_fact_names = {"opportunity", "event_time", "location"}
         if not mandatory_fact_names.issubset(facts):
             return False
-    if meaning == "open_match":
+    if effective_meaning == "open_match":
         if "open_places" not in facts or len(facts) < 4:
             return False
-    elif meaning == "player_match_availability":
+    elif effective_meaning == "player_match_availability":
         if "open_places" in facts or len(facts) < 3:
             return False
-    elif meaning == "opponent_request":
+    elif effective_meaning == "opponent_request":
         if "opponent_request" not in facts or len(facts) < 4:
             return False
-    elif meaning in {"roster_vacancy", "player_transfer_availability"}:
+    elif effective_meaning in {
+        "roster_vacancy",
+        "player_transfer_availability",
+        "tournament",
+    }:
         if len(facts) < 3:
             return False
     else:
@@ -962,6 +1194,8 @@ def semantic_proof_is_schema_valid(
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
     meaning: str = "open_match",
+    opportunity_type: str | None = None,
+    semantic_proof_version: str | None = None,
     proof_version: str | None = None,
 ) -> bool:
     """Validate the strict, source-bound semantic-proof representation.
@@ -971,6 +1205,11 @@ def semantic_proof_is_schema_valid(
     decision and the explicit coverage needed before Application can consider
     any fact publishable.
     """
+    expected_semantic_proof_version = semantic_proof_version or proof_version
+    if expected_semantic_proof_version is None and isinstance(value, dict):
+        raw_semantic_proof_version = value.get("contract_version")
+        if isinstance(raw_semantic_proof_version, str):
+            expected_semantic_proof_version = raw_semantic_proof_version
     if (
         not isinstance(value, dict)
         or set(value)
@@ -985,10 +1224,8 @@ def semantic_proof_is_schema_valid(
             "checks",
             "relations",
         }
-        or value.get("contract_version") not in _SEMANTIC_PROOF_VERSIONS
-        or (
-            proof_version is not None and value.get("contract_version") != proof_version
-        )
+        or expected_semantic_proof_version not in _SEMANTIC_PROOF_VERSIONS
+        or value.get("contract_version") != expected_semantic_proof_version
         or value.get("coverage") != "complete_source_revision"
         or not body
         or value.get("source_message_revision_reference")
@@ -1007,6 +1244,7 @@ def semantic_proof_is_schema_valid(
         if contract_version == SEMANTIC_PROOF_VERSION
         else {
             "open_match",
+            "tournament",
             "opponent_request",
             "player_match_availability",
             "roster_vacancy",
@@ -1026,8 +1264,9 @@ def semantic_proof_is_schema_valid(
     if (
         root.get("target_id") != "root"
         or root.get("domain") != "football_match"
+        or root.get("meaning")
+        != (meaning if opportunity_type is None else opportunity_type)
         or root.get("meaning") not in allowed_meanings
-        or root.get("meaning") != meaning
         or root.get("state") not in _SEMANTIC_PROOF_STATES
         or not _valid_source_span(root.get("span"), body, expected_text=body)
     ):
@@ -1201,6 +1440,8 @@ def semantic_proof_is_authoritative(
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
     meaning: str = "open_match",
+    opportunity_type: str | None = None,
+    semantic_proof_version: str | None = None,
     proof_version: str | None = None,
 ) -> bool:
     """Accept only a complete current-positive proof with clean coverage."""
@@ -1211,6 +1452,8 @@ def semantic_proof_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
+        opportunity_type=opportunity_type,
+        semantic_proof_version=semantic_proof_version,
         meaning=meaning,
         proof_version=proof_version,
     ):

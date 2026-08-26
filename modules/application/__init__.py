@@ -18,6 +18,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.classifier_contract import (
+    PROPOSITION_EVIDENCE_V2_VERSION,
+    SEMANTIC_PROOF_V2_VERSION,
     classifier_output_is_schema_valid,
     proposition_evidence_is_schema_valid,
     semantic_proof_is_authoritative,
@@ -823,6 +825,27 @@ _OPPONENT_SEARCH_DETAIL_OPTIONS = {
     ),
     "payment": ("free", "paid"),
 }
+_TOURNAMENT_SEARCH_DETAIL_OPTIONS = {
+    "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
+    "playing_levels": (
+        "novice",
+        "below_average",
+        "average",
+        "above_average",
+        "high",
+        "very_high",
+        "master",
+        "professional",
+    ),
+    "venue_settings": ("indoor", "outdoor", "covered_outdoor"),
+    "playing_surfaces": (
+        "natural_grass",
+        "artificial_turf",
+        "hard_surface",
+        "wood_parquet",
+    ),
+    "payment": ("free", "paid"),
+}
 _OPPONENT_SEARCH_DETAIL_NAMES = {
     "en": (
         "Time",
@@ -856,6 +879,36 @@ _OPPONENT_SEARCH_DETAIL_NAMES = {
         "Format d’équipes",
         "Niveaux de jeu",
         "Mise à disposition du terrain",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_TOURNAMENT_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Team format",
+        "Playing levels",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Формат команд",
+        "Уровни игры",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Formato de equipos",
+        "Niveles de juego",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Format des équipes",
+        "Niveaux de jeu",
         "Type de terrain",
         "Revêtement",
         "Paiement",
@@ -906,6 +959,36 @@ _OPPONENT_SEARCH_VALUE_COPY = {
         "free": "Gratuit",
         "paid": "Payant",
     },
+}
+_TOURNAMENT_SEARCH_DETAIL_HEADINGS = {
+    "en": (
+        "👥 Select team formats.",
+        "⚽ Select playing levels.",
+        "🏟 Select the venue type.",
+        "🌱 Select the playing surface.",
+        "💳 Select the payment type.",
+    ),
+    "ru": (
+        "👥 Выберите форматы команд.",
+        "⚽ Выберите уровни игры.",
+        "🏟 Выберите тип площадки.",
+        "🌱 Выберите покрытие.",
+        "💳 Выберите тип оплаты.",
+    ),
+    "es": (
+        "👥 Selecciona los formatos de equipos.",
+        "⚽ Selecciona los niveles de juego.",
+        "🏟 Selecciona el tipo de recinto.",
+        "🌱 Selecciona la superficie de juego.",
+        "💳 Selecciona el tipo de pago.",
+    ),
+    "fr": (
+        "👥 Sélectionnez les formats d’équipes.",
+        "⚽ Sélectionnez les niveaux de jeu.",
+        "🏟 Sélectionnez le type de terrain.",
+        "🌱 Sélectionnez le revêtement.",
+        "💳 Sélectionnez le type de paiement.",
+    ),
 }
 _TRANSFER_SEARCH_DETAIL_OPTIONS = {
     "positions": ("goalkeeper", "defender", "midfielder", "forward"),
@@ -2617,6 +2700,7 @@ class ConversationOnboarding:
         telegram_user_id: int,
         screen_revision: int,
         game_search_details: dict[str, list[str]] | None = None,
+        tournament_search_details: dict[str, list[str]] | None = None,
         number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
@@ -2675,14 +2759,16 @@ class ConversationOnboarding:
                     for value in (
                         game_search_details,
                         opponent_search_details,
+                        tournament_search_details,
                         transfer_search_details,
                     )
                 )
                 > 1
             ):
                 raise ValueError("Search cannot contain both detail families")
+            selected_number_of_players: int | None = None
             if draft.user_intent is UserIntent.OPPONENT_SEARCH:
-                selected_opponent_details = (
+                selected_details = (
                     opponent_search_details
                     if opponent_search_details is not None
                     else {
@@ -2690,14 +2776,22 @@ class ConversationOnboarding:
                         for key, values in draft.opponent_search_details
                     }
                 )
-                selected_game_details: dict[str, list[str]] = {}
-                selected_number_of_players = None
-                selected_transfer_details: dict[str, list[str]] = {}
+                details_payload_key = "opponent_search_details"
+            elif draft.user_intent is UserIntent.TOURNAMENT_SEARCH:
+                selected_details = (
+                    tournament_search_details
+                    if tournament_search_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.tournament_search_details
+                    }
+                )
+                details_payload_key = "tournament_search_details"
             elif draft.user_intent in {
                 UserIntent.NEW_TEAM_SEARCH,
                 UserIntent.TRANSFER_PLAYER_SEARCH,
             }:
-                selected_transfer_details = (
+                selected_details = (
                     transfer_search_details
                     if transfer_search_details is not None
                     else {
@@ -2705,18 +2799,16 @@ class ConversationOnboarding:
                         for key, values in draft.transfer_search_details
                     }
                 )
-                selected_game_details = {}
-                selected_opponent_details = {}
-                selected_number_of_players = None
+                details_payload_key = "transfer_search_details"
             else:
-                selected_game_details = (
+                selected_details = (
                     game_search_details
                     if game_search_details is not None
                     else {
                         key: list(values) for key, values in draft.game_search_details
                     }
                 )
-                selected_opponent_details = {}
+                details_payload_key = "game_search_details"
                 selected_number_of_players = (
                     number_of_players
                     if number_of_players is not None
@@ -2729,14 +2821,9 @@ class ConversationOnboarding:
                     or selected_number_of_players < 1
                 ):
                     raise ValueError("Number of Players must be a positive integer")
-                selected_transfer_details = {}
             changed_draft = replace(
                 changed_draft,
                 number_of_players=selected_number_of_players,
-                transfer_search_details=tuple(
-                    (key, tuple(values))
-                    for key, values in sorted(selected_transfer_details.items())
-                ),
             )
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
@@ -2770,20 +2857,8 @@ class ConversationOnboarding:
                     "whole_city": draft.whole_city,
                     "required_date": _required_date_payload(draft.required_date),
                     **(
-                        {"game_search_details": cast(JsonValue, selected_game_details)}
-                        if selected_game_details
-                        else {
-                            "opponent_search_details": cast(
-                                JsonValue, selected_opponent_details
-                            )
-                        }
-                        if selected_opponent_details
-                        else {
-                            "transfer_search_details": cast(
-                                JsonValue, selected_transfer_details
-                            )
-                        }
-                        if selected_transfer_details
+                        {details_payload_key: cast(JsonValue, selected_details)}
+                        if selected_details
                         else {}
                     ),
                     **(
@@ -3022,6 +3097,21 @@ class ConversationOnboarding:
             operation="open_hub",
         )
 
+    def open_tournament_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Open the durable Tournament Search Details hub."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+        )
+
     def open_opponent_search_detail(
         self,
         *,
@@ -3034,6 +3124,25 @@ class ConversationOnboarding:
         if detail_key not in _OPPONENT_SEARCH_DETAIL_OPTIONS:
             raise ValueError("Opponent Search detail key must be canonical")
         self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+        )
+
+    def open_tournament_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one Tournament Search detail submenu."""
+        if detail_key not in _TOURNAMENT_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Tournament Search detail key must be canonical")
+        self._change_tournament_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
@@ -3058,11 +3167,39 @@ class ConversationOnboarding:
             value=value,
         )
 
+    def toggle_tournament_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one canonical Tournament Search detail value."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+        )
+
     def commit_opponent_search_detail(
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
         """Commit one Opponent Search detail submenu."""
         self._change_opponent_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+        )
+
+    def commit_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit a Tournament Search detail submenu."""
+        self._change_tournament_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
@@ -3338,6 +3475,17 @@ class ConversationOnboarding:
                 recorded_at=now,
             )
         self.deliver_pending()
+
+    def back_from_tournament_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard submenu edits or leave the Tournament Search Details hub."""
+        self._change_tournament_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+        )
 
     def open_transfer_search_details(
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
@@ -3732,6 +3880,129 @@ class ConversationOnboarding:
             )
         self.deliver_pending()
 
+    def _change_tournament_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        operation: str,
+        detail_key: str | None = None,
+        value: str | None = None,
+    ) -> None:
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.user_intent is not UserIntent.TOURNAMENT_SEARCH
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            details = dict(draft.tournament_search_details)
+            editing = draft.editing_tournament_search_detail
+            temporary = list(draft.tournament_search_detail_draft)
+            target = "hub"
+            if operation == "open_detail":
+                assert detail_key is not None
+                editing = detail_key
+                temporary = list(details.get(detail_key, ()))
+                target = "submenu"
+            elif operation == "toggle":
+                if editing is None:
+                    raise RuntimeError("No Tournament Search detail is open")
+                if value not in _TOURNAMENT_SEARCH_DETAIL_OPTIONS[editing]:
+                    raise ValueError("Tournament Search detail value must be canonical")
+                if value in temporary:
+                    temporary.remove(value)
+                else:
+                    temporary.append(value)
+                target = "submenu"
+            elif operation == "commit":
+                if editing is None:
+                    raise RuntimeError("No Tournament Search detail is open")
+                if temporary:
+                    details[editing] = tuple(temporary)
+                else:
+                    details.pop(editing, None)
+                editing = None
+                temporary = []
+            elif operation == "back":
+                if editing is None:
+                    target = "post_core"
+                else:
+                    editing = None
+                    temporary = []
+            elif operation == "open_hub":
+                editing = None
+                temporary = []
+            else:
+                raise RuntimeError("Unknown Tournament Search detail operation")
+            now = self._clock.now()
+            state = replace(
+                current,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                tournament_search_details=tuple(sorted(details.items())),
+                editing_tournament_search_detail=editing,
+                tournament_search_detail_draft=tuple(temporary),
+            )
+            if target == "submenu":
+                assert editing is not None
+                message = _tournament_search_detail_submenu_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    detail_key=editing,
+                    temporary=tuple(temporary),
+                )
+            elif target == "post_core":
+                if draft.country is None or draft.city is None:
+                    raise RuntimeError("Tournament Search Details lost its Search Area")
+                message = _post_core_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
+                )
+            else:
+                message = _tournament_search_details_hub_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                    details=details,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                state=state,
+                draft=changed_draft,
+                message=message,
+                recorded_at=now,
+            )
+        self.deliver_pending()
+
     def _change_game_search_details(
         self,
         *,
@@ -4016,12 +4287,14 @@ class ConversationOnboarding:
                 selection=self._language_rendering(current.locale or "en"),
             )
         else:
+            opportunity_type = dict(current_result.card_facts).get("opportunity_type")
             renderer = (
                 _opponent_request_result_message
-                if dict(current_result.card_facts).get("opportunity_type")
-                == "opponent_request"
+                if opportunity_type == "opponent_request"
+                else _tournament_result_message
+                if opportunity_type == "tournament"
                 else _transfer_search_result_message
-                if dict(current_result.card_facts).get("opportunity_type")
+                if opportunity_type
                 in {"roster_vacancy", "player_transfer_availability"}
                 else _open_match_result_message
             )
@@ -8122,6 +8395,122 @@ def _opponent_request_result_message(
     )
 
 
+def _tournament_search_details_hub_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    details: dict[str, tuple[str, ...]],
+) -> TelegramMessage:
+    """Render the Tournament Search Details hub in the fixed field order."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    introduction, not_set, back_label, search_label = {
+        "en": ("You can choose the following settings:", "not set", "Back", "Search"),
+        "ru": ("Можно выбрать следующие настройки:", "не задано", "Назад", "Поиск"),
+        "es": (
+            "Puedes elegir las siguientes opciones:",
+            "sin definir",
+            "Atrás",
+            "Buscar",
+        ),
+        "fr": (
+            "Vous pouvez choisir les paramètres suivants :",
+            "non défini",
+            "Retour",
+            "Rechercher",
+        ),
+    }[copy_locale]
+    keys = tuple(_TOURNAMENT_SEARCH_DETAIL_OPTIONS)
+    names = _TOURNAMENT_SEARCH_DETAIL_NAMES[copy_locale]
+    summaries = tuple(
+        ", ".join(
+            _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+            for value in details.get(key, ())
+        )
+        or not_set
+        for key in keys
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=introduction + "\n\n" + "\n".join(f"- {name}" for name in names),
+        button_rows=(
+            *tuple(
+                (
+                    (
+                        f"{name}: {summary} ▸",
+                        f"details:open:{key}:{screen_revision}",
+                    ),
+                )
+                for key, name, summary in zip(keys, names, summaries, strict=True)
+            ),
+            ((back_label, f"details:back:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _tournament_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    """Render one Tournament Search multi-select detail submenu."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    keys = tuple(_TOURNAMENT_SEARCH_DETAIL_OPTIONS)
+    heading = _TOURNAMENT_SEARCH_DETAIL_HEADINGS[copy_locale][keys.index(detail_key)]
+    done_label, back_label = {
+        "en": ("Done", "⬅️ Back"),
+        "ru": ("Готово", "⬅️ Назад"),
+        "es": ("Listo", "⬅️ Atrás"),
+        "fr": ("Valider", "⬅️ Retour"),
+    }[copy_locale]
+
+    def button(value: str) -> tuple[str, str]:
+        return (
+            f"{'✓ ' if value in temporary else ''}"
+            f"{_GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)}",
+            f"details:toggle:{value}:{screen_revision}",
+        )
+
+    options = _TOURNAMENT_SEARCH_DETAIL_OPTIONS[detail_key]
+    grouped_options: tuple[tuple[str, ...], ...] = {
+        "team_formats": (options[:3], options[3:6], options[6:]),
+        "playing_levels": (
+            options[:2],
+            options[2:4],
+            options[4:6],
+            options[6:],
+        ),
+        "venue_settings": tuple((value,) for value in options),
+        "playing_surfaces": tuple((value,) for value in options),
+        "payment": (options,),
+    }[detail_key]
+    rows = tuple(tuple(button(value) for value in row) for row in grouped_options)
+    if detail_key == "team_formats":
+        rows = (
+            *rows[:-1],
+            (*rows[-1], (done_label, f"details:done:{screen_revision}")),
+        )
+    else:
+        rows = (*rows, ((done_label, f"details:done:{screen_revision}"),))
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=heading,
+        button_rows=(*rows, ((back_label, f"details:back:{screen_revision}"),)),
+    )
+
+
 def _open_match_result_message(
     *,
     delivery_id: str,
@@ -8133,6 +8522,14 @@ def _open_match_result_message(
     """Render one Result Card only from its immutable accepted-fact snapshot."""
     facts = dict(result.card_facts)
     player_result = facts.get("opportunity_type") == "player_match_availability"
+    if facts.get("opportunity_type") == "tournament":
+        return _tournament_result_message(
+            delivery_id=delivery_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            result=result,
+        )
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     event_date = date.fromisoformat(facts["start_local_date"])
     event_end_date = date.fromisoformat(
@@ -8637,6 +9034,601 @@ def _open_match_result_message(
         display_locale=locale,
         screen_revision=screen_revision,
         text=text,
+        button_rows=(),
+        reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+_TOURNAMENT_FACT_TRANSLATIONS = {
+    "schedule": {
+        "every saturday": {
+            "en": "Every Saturday",
+            "ru": "Каждую субботу",
+            "es": "Cada sábado",
+            "fr": "Chaque samedi",
+        },
+        "saturday": {
+            "en": "Saturday",
+            "ru": "Суббота",
+            "es": "Sábado",
+            "fr": "Samedi",
+        },
+        "saturday morning": {
+            "en": "Saturday morning",
+            "ru": "В субботу утром",
+            "es": "El sábado por la mañana",
+            "fr": "Samedi matin",
+        },
+    },
+    "structure": {
+        "group stage": {
+            "en": "Group stage",
+            "ru": "Групповой этап",
+            "es": "Fase de grupos",
+            "fr": "Phase de groupes",
+        },
+        "knockout": {
+            "en": "Knockout",
+            "ru": "Плей-офф",
+            "es": "Eliminatoria",
+            "fr": "Élimination directe",
+        },
+    },
+    "capacity": {
+        "16 teams": {
+            "en": "16 teams",
+            "ru": "16 команд",
+            "es": "16 equipos",
+            "fr": "16 équipes",
+        },
+    },
+    "prizes": {
+        "cup": {
+            "en": "Cup",
+            "ru": "Кубок",
+            "es": "Copa",
+            "fr": "Coupe",
+        },
+        "medal": {
+            "en": "Medal",
+            "ru": "Медаль",
+            "es": "Medalla",
+            "fr": "Médaille",
+        },
+    },
+}
+
+_TOURNAMENT_FACT_KEY_TRANSLATIONS = {
+    "weekday": {
+        "en": "Weekday",
+        "ru": "День недели",
+        "es": "Día de la semana",
+        "fr": "Jour de la semaine",
+    },
+    "rounds": {
+        "en": "Rounds",
+        "ru": "Раундов",
+        "es": "Rondas",
+        "fr": "Tours",
+    },
+    "note": {
+        "en": "Note",
+        "ru": "Примечание",
+        "es": "Nota",
+        "fr": "Note",
+    },
+    "teams": {
+        "en": "Teams",
+        "ru": "Команды",
+        "es": "Equipos",
+        "fr": "Équipes",
+    },
+}
+
+
+def _render_tournament_free_text_value(
+    value: JsonValue,
+    *,
+    field_name: str,
+    locale: str,
+    source_language_label: str,
+    list_item: bool = False,
+) -> str:
+    """Translate allowlisted fact leaves only when the translation is reviewed."""
+    if isinstance(value, str):
+        translation = (
+            _TOURNAMENT_FACT_TRANSLATIONS.get(field_name, {})
+            .get(value.casefold(), {})
+            .get(locale)
+        )
+        if translation is not None:
+            return translation
+        rendered = value.replace("_", " ").capitalize() if list_item else value
+        return f"{rendered} ({source_language_label})"
+    if isinstance(value, list):
+        return ", ".join(
+            _render_tournament_free_text_value(
+                item,
+                field_name=field_name,
+                locale=locale,
+                source_language_label=source_language_label,
+                list_item=True,
+            )
+            for item in value
+        )
+    if isinstance(value, dict):
+        rendered_fields: list[str] = []
+        for key, item in sorted(value.items()):
+            if not isinstance(key, str):
+                continue
+            label = _TOURNAMENT_FACT_KEY_TRANSLATIONS.get(key.casefold(), {}).get(
+                locale, key.replace("_", " ")
+            )
+            rendered = _render_tournament_free_text_value(
+                item,
+                field_name=field_name,
+                locale=locale,
+                source_language_label=source_language_label,
+            )
+            rendered_fields.append(f"{label}: {rendered}")
+        return "; ".join(rendered_fields)
+    return str(value)
+
+
+def _tournament_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+) -> TelegramMessage:
+    """Render a Tournament Result Card in the specification field order."""
+    facts = dict(result.card_facts)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    months = {
+        "en": (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }[copy_locale]
+    labels = {
+        "en": {
+            "title": "Tournament",
+            "matches": "Matches",
+            "needs_clarification": "Needs clarification",
+            "posted": "Posted",
+            "edited": "Edited",
+            "contact": "Contact",
+            "unavailable": "Unavailable",
+            "posted_joiner": "at",
+            "date_and_city": "date and city",
+            "questions": (
+                "Questions? Message me. I can explain the card "
+                "or help refine your search."
+            ),
+            "additional": "Additional",
+            "possible": "No exact match was found.",
+            "source_language": "source language",
+        },
+        "ru": {
+            "title": "Турнир",
+            "matches": "Подходит",
+            "needs_clarification": "Нужно уточнить",
+            "posted": "Пост",
+            "edited": "Изменён",
+            "contact": "Контакт",
+            "unavailable": "Недоступно",
+            "posted_joiner": "в",
+            "date_and_city": "дата и город",
+            "questions": (
+                "💬 Остались вопросы? Напишите, я объясню карточку "
+                "или помогу уточнить поиск."
+            ),
+            "additional": "Дополнительно",
+            "possible": "Точного совпадения не найдено.",
+            "source_language": "исходный язык",
+        },
+        "es": {
+            "title": "Torneo",
+            "matches": "Coincide",
+            "needs_clarification": "Falta confirmar",
+            "posted": "Publicado",
+            "edited": "Modificado",
+            "contact": "Contacto",
+            "unavailable": "No disponible",
+            "posted_joiner": "a las",
+            "date_and_city": "fecha y ciudad",
+            "questions": (
+                "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha "
+                "o le ayudaré a ajustar la búsqueda."
+            ),
+            "additional": "Información adicional",
+            "possible": "No se encontró una coincidencia exacta.",
+            "source_language": "idioma de origen",
+        },
+        "fr": {
+            "title": "Tournoi",
+            "matches": "Correspond",
+            "needs_clarification": "À préciser",
+            "posted": "Publié",
+            "edited": "Modifié",
+            "contact": "Contact",
+            "unavailable": "Indisponible",
+            "posted_joiner": "à",
+            "date_and_city": "date et ville",
+            "questions": (
+                "Une question ? Écrivez-moi. Je peux expliquer la fiche "
+                "ou vous aider à affiner votre recherche."
+            ),
+            "additional": "Informations complémentaires",
+            "possible": "Aucune correspondance exacte n’a été trouvée.",
+            "source_language": "langue source",
+        },
+    }[copy_locale]
+    event_date = date.fromisoformat(facts["start_local_date"])
+    end_date = date.fromisoformat(
+        facts.get("end_local_date", facts["start_local_date"])
+    )
+    if event_date == end_date:
+        date_copy = f"{event_date.day} {months[event_date.month - 1]} {event_date.year}"
+    elif event_date.year == end_date.year and event_date.month == end_date.month:
+        date_copy = (
+            f"{event_date.day}–{end_date.day} "
+            f"{months[event_date.month - 1]} {event_date.year}"
+        )
+    elif event_date.year == end_date.year:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]}–"
+            f"{end_date.day} {months[end_date.month - 1]} {event_date.year}"
+        )
+    else:
+        date_copy = (
+            f"{event_date.day} {months[event_date.month - 1]} {event_date.year}–"
+            f"{end_date.day} {months[end_date.month - 1]} {end_date.year}"
+        )
+    day_part_copy = {
+        "en": {
+            "morning": "morning",
+            "daytime": "daytime",
+            "evening": "evening",
+            "night": "night",
+        },
+        "ru": {
+            "morning": "утром",
+            "daytime": "днём",
+            "evening": "вечером",
+            "night": "ночью",
+        },
+        "es": {
+            "morning": "por la mañana",
+            "daytime": "de día",
+            "evening": "por la tarde",
+            "night": "por la noche",
+        },
+        "fr": {
+            "morning": "le matin",
+            "daytime": "l’après-midi",
+            "evening": "le soir",
+            "night": "la nuit",
+        },
+    }[copy_locale]
+    accepted_time = facts.get("exact_local_time")
+    if accepted_time is None and facts.get("day_part") is not None:
+        accepted_time = day_part_copy[facts["day_part"]]
+    when = date_copy + (f", {accepted_time}" if accepted_time is not None else "")
+    where = facts[f"city_display_{copy_locale}"]
+    if int(facts.get("location_specificity", "0")) > 1:
+        where += f", {facts[f'place_display_{copy_locale}']}"
+    value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
+    source_text_fields = {"schedule", "structure", "capacity", "prizes"}
+
+    def render_fact_value(value: JsonValue, *, list_item: bool = False) -> str:
+        if isinstance(value, str):
+            return value_copy.get(
+                value,
+                value.replace("_", " ").capitalize() if list_item else value,
+            )
+        if isinstance(value, list):
+            return ", ".join(render_fact_value(item, list_item=True) for item in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return str(value)
+
+    def fact_value(key: str) -> str | None:
+        raw = facts.get(key)
+        if raw is None:
+            return None
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            decoded = raw
+        if key == "registration_deadline" and isinstance(decoded, str):
+            with suppress(ValueError):
+                deadline = date.fromisoformat(decoded)
+                return f"{deadline.day} {months[deadline.month - 1]} {deadline.year}"
+        if key in source_text_fields:
+            return _render_tournament_free_text_value(
+                decoded,
+                field_name=key,
+                locale=copy_locale,
+                source_language_label=labels["source_language"],
+            )
+        rendered = render_fact_value(decoded)
+        return rendered
+
+    field_labels = {
+        "en": {
+            "team_formats": "Team format",
+            "playing_levels": "Playing levels",
+            "venue_settings": "Venue type",
+            "playing_surfaces": "Playing surface",
+            "payment": "Payment",
+            "schedule": "Schedule",
+            "registration_deadline": "Registration deadline",
+            "structure": "Structure",
+            "capacity": "Capacity",
+            "prizes": "Prizes",
+        },
+        "ru": {
+            "team_formats": "Формат команд",
+            "playing_levels": "Уровни игры",
+            "venue_settings": "Тип площадки",
+            "playing_surfaces": "Покрытие",
+            "payment": "Оплата",
+            "schedule": "Расписание",
+            "registration_deadline": "Дедлайн регистрации",
+            "structure": "Структура",
+            "capacity": "Вместимость",
+            "prizes": "Призы",
+        },
+        "es": {
+            "team_formats": "Formato de equipos",
+            "playing_levels": "Niveles de juego",
+            "venue_settings": "Tipo de recinto",
+            "playing_surfaces": "Superficie de juego",
+            "payment": "Pago",
+            "schedule": "Programa",
+            "registration_deadline": "Fecha límite de inscripción",
+            "structure": "Estructura",
+            "capacity": "Capacidad",
+            "prizes": "Premios",
+        },
+        "fr": {
+            "team_formats": "Format des équipes",
+            "playing_levels": "Niveaux de jeu",
+            "venue_settings": "Type de terrain",
+            "playing_surfaces": "Revêtement",
+            "payment": "Paiement",
+            "schedule": "Programme",
+            "registration_deadline": "Date limite d’inscription",
+            "structure": "Structure",
+            "capacity": "Capacité",
+            "prizes": "Prix",
+        },
+    }[copy_locale]
+    match_states = json.loads(facts.get("match_states", "{}"))
+    confirmed_keys = {
+        key for key, state in match_states.items() if state == "confirmed"
+    }
+    detail_names = dict(
+        zip(
+            _TOURNAMENT_SEARCH_DETAIL_OPTIONS,
+            _TOURNAMENT_SEARCH_DETAIL_NAMES[copy_locale],
+            strict=True,
+        )
+    )
+    known_values = {
+        key: value
+        for key in (
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        )
+        if (value := fact_value(key))
+    }
+    details = " · ".join(
+        known_values[key]
+        for key in _TOURNAMENT_SEARCH_DETAIL_OPTIONS
+        if key in confirmed_keys and key in known_values
+    )
+    criterion_copy = {
+        "en": {
+            "team_formats": "team format",
+            "playing_levels": "playing level",
+            "venue_settings": "venue setting",
+            "playing_surfaces": "playing surface",
+            "payment": "payment",
+            "search_area": "search area",
+        },
+        "ru": {
+            "team_formats": "формат",
+            "playing_levels": "уровень игры",
+            "venue_settings": "тип площадки",
+            "playing_surfaces": "покрытие",
+            "payment": "оплата",
+            "search_area": "район поиска",
+        },
+        "es": {
+            "team_formats": "formato",
+            "playing_levels": "nivel",
+            "venue_settings": "tipo de campo",
+            "playing_surfaces": "superficie",
+            "payment": "pago",
+            "search_area": "zona de búsqueda",
+        },
+        "fr": {
+            "team_formats": "format",
+            "playing_levels": "niveau",
+            "venue_settings": "type de terrain",
+            "playing_surfaces": "surface",
+            "payment": "paiement",
+            "search_area": "zone de recherche",
+        },
+    }[copy_locale]
+    selected_confirmed = sorted(
+        criterion_copy.get(key, key.replace("_", " "))
+        for key, state in match_states.items()
+        if state == "confirmed" and key != "search_area"
+    )
+    selected_unknown = sorted(
+        criterion_copy.get(key, key.replace("_", " "))
+        for key, state in match_states.items()
+        if state == "unknown"
+    )
+    confirmed_core = (
+        {
+            "en": "date and search area",
+            "ru": "дата и район поиска",
+            "es": "fecha y zona de búsqueda",
+            "fr": "date et zone de recherche",
+        }[copy_locale]
+        if match_states.get("search_area") == "confirmed"
+        else labels["date_and_city"]
+    )
+    match_lines = [
+        f"{labels['matches']}: "
+        + ", ".join((confirmed_core, *selected_confirmed))
+        + "."
+    ]
+    if selected_unknown:
+        match_lines.append(
+            f"{labels['needs_clarification']}: {', '.join(selected_unknown)}."
+        )
+    match_copy = "\n".join(match_lines)
+    additional_parts = [
+        f"{detail_names[key]}: {known_values[key]}"
+        for key in _TOURNAMENT_SEARCH_DETAIL_OPTIONS
+        if key not in confirmed_keys and key in known_values
+    ]
+    additional_parts.extend(
+        f"{field_labels[key]}: {known_values[key]}"
+        for key in (
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        )
+        if key in known_values
+    )
+    additional = " · ".join(additional_parts)
+    lines = [f"⚽ {labels['title']}", when, where]
+    if details:
+        lines.append(details)
+    lines.append("")
+    if result.result_class == "possible_match":
+        lines.extend((labels["possible"], ""))
+    lines.extend(match_copy.split("\n"))
+    if additional:
+        lines.extend(("", f"{labels['additional']}: {additional}"))
+    source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
+        ZoneInfo(facts["iana_timezone"])
+    )
+    edited_time = facts.get("source_edited_at")
+    edited_copy = (
+        datetime.fromisoformat(edited_time).astimezone(ZoneInfo(facts["iana_timezone"]))
+        if edited_time is not None
+        else None
+    )
+    publication_state = facts.get("publication_state")
+    contact_copy = (
+        f"{labels['contact']}: "
+        + render_response_route(
+            facts["response_route_kind"],
+            facts["response_route_value"],
+            copy_locale,
+        )
+        if publication_state == "active"
+        else labels["unavailable"]
+    )
+    lines.extend(
+        (
+            "",
+            f"{labels['posted']}: {source_time.day} "
+            f"{months[source_time.month - 1]} {source_time.year} "
+            f"{labels['posted_joiner']} {source_time:%H:%M}",
+            *(
+                ()
+                if edited_copy is None
+                else (
+                    f"{labels['edited']}: {edited_copy.day} "
+                    f"{months[edited_copy.month - 1]} {edited_copy.year} "
+                    f"{labels['posted_joiner']} {edited_copy:%H:%M}",
+                )
+            ),
+            contact_copy,
+            "",
+            labels["questions"],
+        )
+    )
+    menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n".join(lines),
         button_rows=(),
         reply_button=menu_label,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
@@ -9201,7 +10193,7 @@ class RuntimeApplication:
                         ContractName.CLASSIFICATION_PROPOSAL,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
-                    and definition.version in {2, 3, 4}
+                    and definition.version in {2, 3, 4, 5}
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -9833,7 +10825,7 @@ class RuntimeApplication:
                 if (
                     self.role is RuntimeRole.APPLICATION
                     and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-                    and incoming.contract_version == 4
+                    and incoming.contract_version in {4, 5}
                 ):
                     invalid_payload = (
                         incoming.payload if isinstance(incoming.payload, dict) else {}
@@ -10047,7 +11039,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and incoming.contract_version in {2, 3, 4}
+            and incoming.contract_version in {2, 3, 4, 5}
             and supported_incoming is not None
         ):
             self._accept_classification_proposal(supported_incoming)
@@ -10196,13 +11188,23 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
-        if self.model.primary_schema_version == "source-message-classification-v2":
-            self._classify_source_message_v2(incoming)
-            return
-        if self.model.primary_schema_version == "source-message-classification-v3":
+        if self.model.primary_schema_version in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
             self._classify_source_message_v2(
                 incoming,
-                player_release=_classifier_model_uses_player_release(self.model),
+                artifact_version=(
+                    "v3"
+                    if self.model.primary_schema_version
+                    == "source-message-classification-v3"
+                    else "v2"
+                ),
+                player_release=(
+                    self.model.primary_schema_version
+                    == "source-message-classification-v3"
+                    and _classifier_model_uses_player_release(self.model)
+                ),
             )
             return
         if self.model.primary_schema_version != "source-message-classification-v1":
@@ -10615,6 +11617,9 @@ class RuntimeApplication:
                 candidate_key=proof_candidate_key,
                 evidence=cast(dict[str, JsonValue], proof_candidate["evidence"]),
                 routes=cast(list[JsonValue], proof_candidate["response_routes"]),
+                opportunity_type=cast(
+                    str, proof_candidate.get("opportunity_type", "open_match")
+                ),
                 meaning=proof_meaning,
                 proof_version=semantic_proof_request.schema_version,
             )
@@ -10818,6 +11823,7 @@ class RuntimeApplication:
         self,
         incoming: ContractEnvelope,
         *,
+        artifact_version: str | None = None,
         player_release: bool = False,
     ) -> None:
         """Run the additive multi-candidate classifier and one-way ambiguity pass."""
@@ -10825,15 +11831,43 @@ class RuntimeApplication:
             raise RuntimeError(
                 "only Classification executes the multi-candidate classifier"
             )
-        primary_schema_version = self.model.primary_schema_version
-        artifact_versions = _classifier_artifact_versions(
-            primary_schema_version, player_release=player_release
-        )
-        if artifact_versions is None:
-            raise RuntimeError("classifier adapter exposes unsupported artifacts")
-        primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
-            artifact_versions
-        )
+        if artifact_version is None:
+            primary_schema_version = str(self.model.primary_schema_version)
+            artifact_versions = _classifier_artifact_versions(
+                primary_schema_version, player_release=player_release
+            )
+            if artifact_versions is None:
+                raise RuntimeError("classifier adapter exposes unsupported artifacts")
+            primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
+                artifact_versions
+            )
+            classification_schema_version = primary_schema_version
+            semantic_proof_prompt_version, semantic_proof_schema_version = (
+                semantic_proof_version
+            )
+            is_v3 = primary_schema_version == "source-message-classification-v3"
+        else:
+            if artifact_version not in {"v2", "v3"}:
+                raise RuntimeError("unsupported additive classifier artifact version")
+            is_v3 = artifact_version == "v3"
+            classification_schema_version = (
+                "source-message-classification-v3"
+                if is_v3
+                else "source-message-classification-v2"
+            )
+            artifact_versions = _classifier_artifact_versions(
+                classification_schema_version, player_release=player_release
+            )
+            if artifact_versions is None:
+                raise RuntimeError("classifier adapter exposes unsupported artifacts")
+            primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
+                artifact_versions
+            )
+            semantic_proof_prompt_version, semantic_proof_schema_version = (
+                semantic_proof_version
+            )
+            primary_schema_version = classification_schema_version
+        proposal_contract_version = 5 if is_v3 else 4
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -10877,7 +11911,7 @@ class RuntimeApplication:
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
             prompt_version=primary_prompt_version,
-            schema_version=primary_schema_version,
+            schema_version=classification_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
             routing_policy_version=routing_policy_version,
@@ -10937,7 +11971,7 @@ class RuntimeApplication:
                 and result.effective_model == "gpt-5.6-sol"
                 and result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(result.output, body=body)
-                and result.output.get("schema_version") == primary_schema_version
+                and result.output.get("schema_version") == classification_schema_version
             )
 
         prior_attempts = self.store.classification_attempts_for_revision(revision_id)
@@ -11315,7 +12349,8 @@ class RuntimeApplication:
                 and second_result.effective_model == "gpt-5.6-sol"
                 and second_result.effective_reasoning_effort == "high"
                 and classifier_output_is_schema_valid(second_result.output, body=body)
-                and second_result.output.get("schema_version") == primary_schema_version
+                and second_result.output.get("schema_version")
+                == classification_schema_version
             )
             if second_valid:
                 final_request = second_request
@@ -11360,7 +12395,7 @@ class RuntimeApplication:
                 }
             else:
                 final_output = _safe_v2_review_output(
-                    schema_version=primary_schema_version
+                    schema_version=classification_schema_version
                 )
 
             second_attempt = ClassificationAttempt(
@@ -11656,7 +12691,7 @@ class RuntimeApplication:
                             evidence=evidence,
                             routes=routes,
                             meaning=proof_meaning,
-                            proof_version=semantic_proof_schema_version,
+                            semantic_proof_version=semantic_proof_schema_version,
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -11797,7 +12832,7 @@ class RuntimeApplication:
                 candidates
             ):
                 final_output = _safe_v2_review_output(
-                    schema_version=primary_schema_version
+                    schema_version=classification_schema_version
                 )
                 semantic_proofs = []
                 semantic_proof_executions = []
@@ -11810,7 +12845,9 @@ class RuntimeApplication:
             "irrelevant",
             "unresolved",
         }:
-            final_output = _safe_v2_review_output(schema_version=primary_schema_version)
+            final_output = _safe_v2_review_output(
+                schema_version=classification_schema_version
+            )
             final_disposition = "needs_review"
         if resume_completed_ambiguity:
             assert completed_ambiguity_attempt is not None
@@ -11908,7 +12945,7 @@ class RuntimeApplication:
         if _classifier_adapter_result_has_complete_provenance(final_metrics):
             outgoing = ContractEnvelope(
                 contract_name=ContractName.CLASSIFICATION_PROPOSAL,
-                contract_version=4,
+                contract_version=proposal_contract_version,
                 message_id=derive_contract_message_id(
                     incoming.message_id, ContractName.CLASSIFICATION_PROPOSAL
                 ),
@@ -12186,7 +13223,7 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
-        if incoming.contract_version == 4:
+        if incoming.contract_version in {4, 5}:
             adjacent_context = payload.get("adjacent_context")
             output = payload.get("output")
             routing = output.get("routing") if isinstance(output, dict) else None
@@ -12263,7 +13300,7 @@ class RuntimeApplication:
             },
         }
         if (
-            incoming.contract_version != 4
+            incoming.contract_version not in {4, 5}
             and player_classifier_proposal_contains_player(authoritative_payload)
             and not player_classifier_promotion_is_approved(
                 self.store.classifier_release_promotion(
@@ -12284,7 +13321,7 @@ class RuntimeApplication:
                 received_at=self.clock.now(),
             )
             return
-        if incoming.contract_version == 4:
+        if incoming.contract_version in {4, 5}:
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
             if not isinstance(v4_output, dict):
@@ -12349,6 +13386,7 @@ class RuntimeApplication:
                 authoritative_payload,
                 revision_id=revision_id,
                 body=source_revision.body,
+                artifact_version=("v3" if incoming.contract_version == 5 else "v2"),
             ):
                 self._record_classification_routing_outcome(
                     incoming=incoming,
@@ -13364,6 +14402,9 @@ class RuntimeApplication:
         opponent_search_details = _runtime_opponent_search_details(
             payload.get("opponent_search_details")
         )
+        tournament_search_details = _runtime_tournament_search_details(
+            payload.get("tournament_search_details")
+        )
         transfer_search_details = _runtime_transfer_search_details(
             payload.get("transfer_search_details")
         )
@@ -13380,6 +14421,7 @@ class RuntimeApplication:
             completed_at=self.clock.now(),
             game_search_details=tuple(sorted(game_search_details.items())),
             opponent_search_details=tuple(sorted(opponent_search_details.items())),
+            tournament_search_details=tuple(sorted(tournament_search_details.items())),
             transfer_search_details=tuple(sorted(transfer_search_details.items())),
             sub_city_area_geographic_types=tuple(
                 value for value in area_types if isinstance(value, str)
@@ -14309,6 +15351,11 @@ def _classifier_proposal_has_pinned_provenance(
             payload,
             revision_id=revision_id,
             body=body,
+            artifact_version=(
+                "v3"
+                if payload.get("schema_version") == "source-message-classification-v3"
+                else "v2"
+            ),
             player_release=(
                 payload.get("routing_policy_version") == "classifier-routing-player-v1"
             ),
@@ -14432,6 +15479,7 @@ def _v2_classifier_proposal_has_pinned_provenance(
     *,
     revision_id: str,
     body: str,
+    artifact_version: str = "v2",
     player_release: bool = False,
 ) -> bool:
     """Validate v2 final-pass provenance and its deterministic input manifest."""
@@ -14707,7 +15755,11 @@ def _classifier_execution_metadata_is_current(
 
 
 def _v4_classifier_provenance_is_current(
-    payload: dict[str, JsonValue], *, revision_id: str, body: str
+    payload: dict[str, JsonValue],
+    *,
+    revision_id: str,
+    body: str,
+    artifact_version: str = "v2",
 ) -> bool:
     """Require current ambiguity and distinct proof execution per candidate."""
     player_release = (
@@ -14736,6 +15788,7 @@ def _v4_classifier_provenance_is_current(
             payload,
             revision_id=revision_id,
             body=body,
+            artifact_version=artifact_version,
             player_release=player_release,
         )
     ):
@@ -14984,9 +16037,24 @@ def _proposition_evidence_is_authoritative(
     semantic_proof: JsonValue | None = None,
     source_message_revision_reference: str | None = None,
     meaning: str = "open_match",
-    proof_version: str = "source-semantic-proof-v1",
+    opportunity_type: str | None = None,
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
+    semantic_proof_version = (
+        SEMANTIC_PROOF_V2_VERSION
+        if isinstance(semantic_proof, dict)
+        and semantic_proof.get("contract_version") == SEMANTIC_PROOF_V2_VERSION
+        else "source-semantic-proof-v1"
+    )
+    proposition_version = (
+        PROPOSITION_EVIDENCE_V2_VERSION
+        if isinstance(value, dict)
+        and value.get("contract_version") == PROPOSITION_EVIDENCE_V2_VERSION
+        else "source-proposition-evidence-v1"
+    )
+    effective_opportunity_type = (
+        meaning if opportunity_type is None else opportunity_type
+    )
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
         semantic_proof,
         body=body,
@@ -14994,8 +16062,8 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
-        meaning=meaning,
-        proof_version=proof_version,
+        opportunity_type=effective_opportunity_type,
+        semantic_proof_version=semantic_proof_version,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -15004,7 +16072,8 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
-        meaning=meaning,
+        opportunity_type=effective_opportunity_type,
+        proposition_version=proposition_version,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -15013,7 +16082,8 @@ def _proposition_evidence_is_authoritative(
         candidate_key=candidate_key,
         evidence=evidence,
         routes=routes,
-        meaning=meaning,
+        opportunity_type=effective_opportunity_type,
+        proposition_version=proposition_version,
     )
     if (
         graph is None
@@ -15021,7 +16091,10 @@ def _proposition_evidence_is_authoritative(
         or not graph.has_complete_support_topology()
         or not graph.has_exact_support_spans()
         or not _proposition_graph_has_closed_target_set(
-            graph, evidence, routes, meaning=meaning
+            graph,
+            evidence,
+            routes,
+            opportunity_type=effective_opportunity_type,
         )
     ):
         return False
@@ -15033,7 +16106,7 @@ def _proposition_evidence_is_authoritative(
     if (
         not isinstance(root, dict)
         or root.get("domain") != "football_match"
-        or root.get("meaning") != meaning
+        or root.get("meaning") != effective_opportunity_type
         or root.get("polarity") != "positive"
         or root.get("currentness") != "current"
         or not isinstance(facts, dict)
@@ -15131,6 +16204,23 @@ _OPTIONAL_OPPONENT_REQUEST_FACTS = frozenset(
         "venue_settings",
         "playing_surfaces",
         "payment",
+    }
+)
+_MANDATORY_TOURNAMENT_FACTS = frozenset({"opportunity", "event_time", "location"})
+_OPTIONAL_TOURNAMENT_FACTS = frozenset(
+    {
+        "open_participation",
+        "registration_open",
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
     }
 )
 _MANDATORY_TRANSFER_FACTS = frozenset({"opportunity", "location"})
@@ -15280,11 +16370,13 @@ _PROPOSITION_LINEAGE_FACT_KEYS = (
     "payment",
     "payment_amount",
     "payment_currency",
-)
-_PLAYER_PROPOSITION_LINEAGE_FACT_KEYS = (
-    "available_player_count",
-    "available_player_count_min",
-    "available_player_count_max",
+    "open_participation",
+    "registration_open",
+    "schedule",
+    "registration_deadline",
+    "structure",
+    "capacity",
+    "prizes",
 )
 _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "opportunity",
@@ -15300,19 +16392,13 @@ _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "venue_settings",
     "playing_surfaces",
     "payment",
-)
-_PLAYER_PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
-    "available_player_count",
-    "available_player_count_min",
-    "available_player_count_max",
-)
-_OPPONENT_PROPOSITION_LINEAGE_FACT_KEYS = (
-    "opponent_request",
-    "venue_provision",
-)
-_OPPONENT_PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
-    "opponent_request",
-    "venue_provision",
+    "open_participation",
+    "registration_open",
+    "schedule",
+    "registration_deadline",
+    "structure",
+    "capacity",
+    "prizes",
 )
 
 
@@ -15329,30 +16415,34 @@ def _proposition_lineage_features(
         or not isinstance(response_route, dict)
     ):
         raise ValueError("proposition lineage target is incomplete")
-    # Opportunity type is a publication interpretation, not a proposition
-    # identity discriminator.  A reclassification of one source proposition
-    # between Open Match and Player availability must retain its lineage.
     features: dict[str, JsonValue] = {}
     for key in _PROPOSITION_LINEAGE_FACT_KEYS:
         features[f"fact:{key}"] = accepted_facts.get(key)
-    if value.get("opportunity_type") == "player_match_availability":
-        for key in _PLAYER_PROPOSITION_LINEAGE_FACT_KEYS:
-            features[f"fact:{key}"] = accepted_facts.get(key)
     for key in _PROPOSITION_LINEAGE_EVIDENCE_KEYS:
         evidence_value = evidence.get(key)
         features[f"evidence:{key}"] = (
             evidence_value if isinstance(evidence_value, str) else None
         )
     if value.get("opportunity_type") == "player_match_availability":
-        for key in _PLAYER_PROPOSITION_LINEAGE_EVIDENCE_KEYS:
+        for key in (
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        ):
+            features[f"fact:{key}"] = accepted_facts.get(key)
+        for key in (
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        ):
             evidence_value = evidence.get(key)
             features[f"evidence:{key}"] = (
                 evidence_value if isinstance(evidence_value, str) else None
             )
     if value.get("opportunity_type") == "opponent_request":
-        for key in _OPPONENT_PROPOSITION_LINEAGE_FACT_KEYS:
-            features[f"fact:{key}"] = accepted_facts.get(key)
-        for key in _OPPONENT_PROPOSITION_LINEAGE_EVIDENCE_KEYS:
+        features["fact:opponent_request"] = accepted_facts.get("opponent_request")
+        features["fact:venue_provision"] = accepted_facts.get("venue_provision")
+        for key in ("opponent_request", "venue_provision"):
             evidence_value = evidence.get(key)
             features[f"evidence:{key}"] = (
                 evidence_value if isinstance(evidence_value, str) else None
@@ -15386,6 +16476,15 @@ def _proposition_opportunity_id(
     opportunity_type: str = "open_match",
 ) -> str:
     """Return the stable Application-owned identity for one proposition lineage."""
+    if opportunity_type not in {
+        "open_match",
+        "opponent_request",
+        "tournament",
+        "player_match_availability",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }:
+        raise ValueError("unsupported proposition opportunity type")
     return (
         f"opportunity:{source_message_id}:{opportunity_type}:proposition:{anchor[:16]}"
     )
@@ -15398,20 +16497,26 @@ def _legacy_candidate_alias_for_canonical(
     opportunity_type: str | None = None,
 ) -> str | None:
     """Return the exact historical candidate alias for one proposition id."""
-    prefix = f"opportunity:{source_message_id}:"
-    if not opportunity_id.startswith(prefix) or ":proposition:" not in opportunity_id:
-        return None
-    opportunity_type, candidate_hash = opportunity_id.removeprefix(prefix).split(
-        ":proposition:", 1
-    )
-    if opportunity_type not in {
-        "open_match",
-        "player_match_availability",
-        "opponent_request",
-        "roster_vacancy",
-        "player_transfer_availability",
-    }:
-        return None
+    prefix = f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
+    if not opportunity_id.startswith(prefix):
+        for candidate_type in (
+            "open_match",
+            "opponent_request",
+            "tournament",
+            "roster_vacancy",
+            "player_match_availability",
+            "player_transfer_availability",
+        ):
+            candidate_prefix = (
+                f"opportunity:{source_message_id}:{candidate_type}:proposition:"
+            )
+            if opportunity_id.startswith(candidate_prefix):
+                prefix = candidate_prefix
+                opportunity_type = candidate_type
+                break
+        else:
+            return None
+    candidate_hash = opportunity_id.removeprefix(prefix)
     if len(candidate_hash) != 16 or any(
         character not in "0123456789abcdef" for character in candidate_hash
     ):
@@ -15433,6 +16538,7 @@ def _canonicalize_legacy_proposition_records(
         "open_match",
         "player_match_availability",
         "opponent_request",
+        "tournament",
         "roster_vacancy",
         "player_transfer_availability",
     }
@@ -15442,15 +16548,8 @@ def _canonicalize_legacy_proposition_records(
             canonical_records.append(dict(record))
             continue
         record_type = record.get("opportunity_type", "open_match")
-        if not isinstance(record_type, str) or record_type not in {
-            "open_match",
-            "player_match_availability",
-            "opponent_request",
-            "roster_vacancy",
-            "player_transfer_availability",
-        }:
+        if not isinstance(record_type, str) or record_type not in allowed_types:
             return None
-        legacy_prefix = f"opportunity:{source_message_id}:{record_type}:candidate:"
         if ":candidate:" in opportunity_id:
             legacy_prefix = f"opportunity:{source_message_id}:"
             if not opportunity_id.startswith(legacy_prefix):
@@ -15458,7 +16557,6 @@ def _canonicalize_legacy_proposition_records(
             legacy_type, candidate_hash = opportunity_id.removeprefix(
                 legacy_prefix
             ).split(":candidate:", 1)
-            record_type = record.get("opportunity_type")
             canonical_type = (
                 record_type if record_type in allowed_types else legacy_type
             )
@@ -15694,18 +16792,10 @@ def _reconcile_proposition_lineages(
         opportunity_type = candidates[candidate_index].get(
             "opportunity_type", "open_match"
         )
-        if not isinstance(opportunity_type, str) or opportunity_type not in {
-            "open_match",
-            "player_match_availability",
-            "opponent_request",
-            "roster_vacancy",
-            "player_transfer_availability",
-        }:
+        if not isinstance(opportunity_type, str):
             return None
         opportunity_id = _proposition_opportunity_id(
-            source_message_id,
-            anchor,
-            opportunity_type,
+            source_message_id, anchor, opportunity_type
         )
         if not assign(
             candidate_index,
@@ -15741,9 +16831,6 @@ def _candidate_target_manifest_hash(
             "location",
             "event_time",
             "open_places",
-            "available_player_count",
-            "available_player_count_min",
-            "available_player_count_max",
             "roster_vacancy",
             "player_transfer_availability",
             "team_formats",
@@ -15753,6 +16840,13 @@ def _candidate_target_manifest_hash(
             "venue_settings",
             "playing_surfaces",
             "payment",
+            "open_participation",
+            "registration_open",
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
             "response_routes",
             "proposition_evidence",
             "source_context",
@@ -15813,8 +16907,9 @@ def _proposition_graph_has_closed_target_set(
     graph: CanonicalPropositionGraph,
     evidence: dict[str, JsonValue],
     routes: list[JsonValue],
+    opportunity_type: str = "open_match",
     *,
-    meaning: str = "open_match",
+    meaning: str | None = None,
 ) -> bool:
     """Bind v1 nodes to the closed Application target set.
 
@@ -15826,27 +16921,37 @@ def _proposition_graph_has_closed_target_set(
     """
     fact_ids = {node.node_id for node in graph.facts}
     evidence_ids = set(evidence)
-    if meaning in {"roster_vacancy", "player_transfer_availability"}:
-        mandatory_facts = _MANDATORY_TRANSFER_FACTS | {meaning}
-        optional_facts = _OPTIONAL_TRANSFER_FACTS
-    elif meaning == "player_match_availability":
-        mandatory_facts, optional_facts = (
-            _MANDATORY_PLAYER_MATCH_FACTS,
-            _OPTIONAL_PLAYER_MATCH_FACTS,
+    effective_meaning = opportunity_type if meaning is None else meaning
+    if effective_meaning in {"roster_vacancy", "player_transfer_availability"}:
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_TRANSFER_FACTS | {effective_meaning}
+        allowed_facts = (
+            _MANDATORY_TRANSFER_FACTS | _OPTIONAL_TRANSFER_FACTS | {effective_meaning}
         )
-    elif meaning == "opponent_request":
-        mandatory_facts, optional_facts = (
-            _MANDATORY_OPPONENT_REQUEST_FACTS,
-            _OPTIONAL_OPPONENT_REQUEST_FACTS,
+    elif effective_meaning == "tournament":
+        participation_ids = evidence_ids.intersection(
+            {"open_participation", "registration_open"}
+        )
+        expected_mandatory = _MANDATORY_TOURNAMENT_FACTS | participation_ids
+        allowed_facts = _MANDATORY_TOURNAMENT_FACTS | _OPTIONAL_TOURNAMENT_FACTS
+    elif effective_meaning == "player_match_availability":
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_PLAYER_MATCH_FACTS
+        allowed_facts = _MANDATORY_PLAYER_MATCH_FACTS | _OPTIONAL_PLAYER_MATCH_FACTS
+    elif effective_meaning == "opponent_request":
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_OPPONENT_REQUEST_FACTS
+        allowed_facts = (
+            _MANDATORY_OPPONENT_REQUEST_FACTS | _OPTIONAL_OPPONENT_REQUEST_FACTS
         )
     else:
-        mandatory_facts, optional_facts = (
-            _MANDATORY_OPEN_MATCH_FACTS,
-            _OPTIONAL_OPEN_MATCH_FACTS,
-        )
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_OPEN_MATCH_FACTS
+        allowed_facts = _MANDATORY_OPEN_MATCH_FACTS | _OPTIONAL_OPEN_MATCH_FACTS
     if (
-        not mandatory_facts.issubset(evidence_ids)
-        or not evidence_ids.issubset(mandatory_facts | optional_facts)
+        not expected_mandatory.issubset(evidence_ids)
+        or (effective_meaning == "tournament" and len(participation_ids) != 1)
+        or not evidence_ids.issubset(allowed_facts)
         or fact_ids != evidence_ids
     ):
         return False
@@ -15954,6 +17059,7 @@ def _validated_opportunity_proposal(
         "open_match",
         "player_match_availability",
         "opponent_request",
+        "tournament",
         "roster_vacancy",
         "player_transfer_availability",
     }:
@@ -15963,6 +17069,8 @@ def _validated_opportunity_proposal(
         and opportunity_type != expected_opportunity_type
     ):
         return None
+    if opportunity_type == "tournament":
+        return _validated_tournament_proposal(payload_value, resolver=resolver)
     is_player_match = opportunity_type == "player_match_availability"
     if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
         return _validated_transfer_proposal(
@@ -16059,11 +17167,6 @@ def _validated_opportunity_proposal(
             revision_id, kind="revision"
         ),
         meaning=opportunity_type,
-        proof_version=(
-            "source-semantic-proof-v2"
-            if payload_value.get("schema_version") == "source-message-classification-v3"
-            else "source-semantic-proof-v1"
-        ),
     ):
         return None
     if route is None:
@@ -16384,16 +17487,385 @@ def _validated_opportunity_proposal(
     }
 
 
+def _validated_tournament_proposal(
+    payload_value: JsonValue,
+    *,
+    resolver: LocationResolverAdapter,
+) -> dict[str, JsonValue] | None:
+    """Validate a Tournament proposal without borrowing Open Match gates."""
+    if not isinstance(payload_value, dict):
+        return None
+    body = payload_value.get("body")
+    revision_id = payload_value.get("source_message_revision_id")
+    output = payload_value.get("output")
+    semantic_proof = payload_value.get("semantic_proof")
+    if (
+        not isinstance(body, str)
+        or not isinstance(revision_id, str)
+        or _is_explicit_children_only_game(body)
+        or not _classifier_proposal_has_pinned_provenance(
+            payload_value,
+            revision_id=revision_id,
+            body=body,
+        )
+        or not isinstance(output, dict)
+        or not classifier_output_is_schema_valid(output, body=body)
+        or output.get("disposition") != "accepted"
+    ):
+        return None
+    candidates = output.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) != 1:
+        return None
+    candidate = candidates[0]
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("opportunity_type") != "tournament"
+    ):
+        return None
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    location = candidate.get("location")
+    event_time = candidate.get("event_time")
+    routes = candidate.get("response_routes")
+    source_context = candidate.get("source_context")
+    participation_fields = set(candidate).intersection(
+        {"open_participation", "registration_open"}
+    )
+    if (
+        not isinstance(candidate_key, str)
+        or not isinstance(evidence, dict)
+        or not isinstance(location, dict)
+        or not isinstance(event_time, dict)
+        or not isinstance(routes, list)
+        or len(participation_fields) != 1
+        or candidate.get(next(iter(participation_fields), "")) is not True
+        or (
+            source_context is not None
+            and (not isinstance(source_context, str) or not source_context)
+        )
+        or (isinstance(source_context, str) and source_context not in body)
+    ):
+        return None
+    participation_field = next(iter(participation_fields))
+    if set(evidence) != {
+        "opportunity",
+        "event_time",
+        "location",
+        participation_field,
+    } | (
+        set(candidate)
+        & {
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        }
+    ) or not all(
+        isinstance(value, str) and value in body for value in evidence.values()
+    ):
+        return None
+    # The bounded model context is useful evidence, but the complete source
+    # revision is authoritative for currentness and source-level gates.
+    validation_body = body
+    route = _select_response_route(
+        body=validation_body,
+        proposed_routes=routes,
+        bounded_metadata=payload_value.get("bounded_metadata"),
+    )
+    if (
+        not _proposition_evidence_is_authoritative(
+            candidate.get("proposition_evidence"),
+            body=body,
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+            semantic_proof=semantic_proof,
+            source_message_revision_reference=_opaque_classifier_reference(
+                revision_id, kind="revision"
+            ),
+            opportunity_type="tournament",
+        )
+        or route is None
+    ):
+        return None
+    mention = location.get("mention")
+    country_id = location.get("country_id")
+    city_id = location.get("city_id")
+    place_id = location.get("place_id")
+    if not all(
+        isinstance(value, str) and value
+        for value in (mention, country_id, city_id, place_id)
+    ):
+        return None
+    assert isinstance(mention, str)
+    assert isinstance(country_id, str)
+    assert isinstance(city_id, str)
+    assert isinstance(place_id, str)
+    resolved_location = _resolve_source_location_across_supported_locales(
+        resolver,
+        mention=mention,
+        country_id=country_id,
+        city_id=city_id,
+    )
+    if resolved_location is None:
+        return None
+    resolved_place, city_display_labels = resolved_location
+    places = tuple(
+        place
+        for place in (resolved_place,)
+        if place.place_id == place_id
+        and place.country_id == country_id
+        and place.city_id == city_id
+        and country_id in place.verified_parent_ids
+        and _valid_location_disjointness(place)
+        and bool(place.resolver_version)
+        and bool(place.glossary_version)
+        and len(place.verified_parent_ids) == len(place.parent_display_names)
+        and all(place.parent_display_names)
+        and (
+            city_id in place.verified_parent_ids
+            or (
+                place.geographic_type is GeographicType.CITY
+                and place.place_id == city_id
+            )
+        )
+    )
+    if len(places) != 1:
+        return None
+    team_formats = candidate.get("team_formats")
+    levels = candidate.get("playing_levels")
+    settings = candidate.get("venue_settings")
+    surfaces = candidate.get("playing_surfaces")
+    payment = candidate.get("payment")
+    try:
+        validation_time = datetime.fromisoformat(
+            str(payload_value.get("validation_time"))
+        )
+    except ValueError:
+        return None
+    try:
+        event_timezone = ZoneInfo(str(event_time.get("iana_timezone")))
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    if (
+        not _optional_canonical_list(
+            team_formats,
+            {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
+        )
+        or not _optional_canonical_list(
+            levels,
+            {
+                "novice",
+                "below_average",
+                "average",
+                "above_average",
+                "high",
+                "very_high",
+                "master",
+                "professional",
+            },
+        )
+        or not _optional_canonical_list(
+            settings, {"indoor", "outdoor", "covered_outdoor"}
+        )
+        or not _optional_canonical_list(
+            surfaces,
+            {"natural_grass", "artificial_turf", "hard_surface", "wood_parquet"},
+        )
+        or payment not in {None, "free", "paid", "unknown"}
+        or not _tournament_open_participation_is_supported(
+            str(evidence[participation_field]),
+            authoritative_body=validation_body,
+            validation_time=validation_time,
+            event_timezone=event_timezone,
+        )
+        or not _optional_values_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=validation_body,
+        )
+        or not _tournament_optional_facts_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=validation_body,
+        )
+    ):
+        return None
+    start_date = event_time.get("start_local_date")
+    end_date = event_time.get("end_local_date")
+    exact_time = event_time.get("exact_local_time")
+    day_part = event_time.get("day_part")
+    timezone = event_time.get("iana_timezone")
+    try:
+        parsed_start = date.fromisoformat(str(start_date))
+        parsed_end = date.fromisoformat(str(end_date))
+        if exact_time is not None:
+            datetime.strptime(str(exact_time), "%H:%M")
+        source_event_time = datetime.fromisoformat(
+            str(payload_value.get("source_event_time"))
+        )
+        event_timezone = ZoneInfo(str(timezone))
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    registration_expiry = _tournament_registration_expiry(
+        candidate.get("registration_deadline"),
+        event_timezone,
+    )
+    registration_deadline_date = _tournament_registration_deadline_date(
+        candidate.get("registration_deadline")
+    )
+    if (
+        parsed_end < parsed_start
+        or not isinstance(timezone, str)
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
+        or places[0].iana_timezone != timezone
+        or source_event_time.tzinfo is None
+        or validation_time.tzinfo is None
+        or not _event_time_is_supported(
+            parsed_start,
+            parsed_end,
+            exact_time if isinstance(exact_time, str) else None,
+            str(evidence["event_time"]),
+            day_part=day_part if isinstance(day_part, str) else None,
+            source_event_time=source_event_time,
+            source_timezone=(
+                str(payload_value.get("source_chat_timezone"))
+                if payload_value.get("source_chat_timezone") is not None
+                else None
+            ),
+            authoritative_body=validation_body,
+            allowed_additional_dates=(
+                (registration_deadline_date,)
+                if registration_deadline_date is not None
+                else ()
+            ),
+        )
+        or mention not in str(evidence["location"])
+        or not _location_mention_is_authoritative(validation_body, mention)
+    ):
+        return None
+    if (
+        candidate.get("registration_deadline") is not None
+        and registration_expiry is None
+    ):
+        return None
+    try:
+        source_posted_at = datetime.fromisoformat(
+            str(
+                payload_value.get(
+                    "source_posted_at", payload_value.get("source_event_time")
+                )
+            )
+        )
+        raw_source_edited_at = payload_value.get("source_edited_at")
+        source_edited_at = (
+            datetime.fromisoformat(str(raw_source_edited_at))
+            if raw_source_edited_at is not None
+            else None
+        )
+    except ValueError:
+        return None
+    if source_posted_at.tzinfo is None or (
+        source_edited_at is not None
+        and (source_edited_at.tzinfo is None or source_edited_at < source_posted_at)
+    ):
+        return None
+    expiry = _open_match_expiry(
+        parsed_start,
+        parsed_end,
+        exact_time if isinstance(exact_time, str) else None,
+        event_timezone,
+    )
+    if registration_expiry is not None:
+        expiry = min(expiry, registration_expiry)
+    if validation_time.astimezone(event_timezone) >= expiry:
+        return None
+    payment_details = (
+        _stated_payment_amount_and_currency(str(evidence["payment"]))
+        if payment == "paid"
+        else None
+    )
+    localized = dict(places[0].localized_display_names)
+    accepted_facts: dict[str, JsonValue] = {
+        "start_local_date": str(start_date),
+        "end_local_date": str(end_date),
+        "exact_local_time": exact_time,
+        "day_part": day_part,
+        "iana_timezone": timezone,
+        "country_id": country_id,
+        "city_id": city_id,
+        "place_id": place_id,
+        "location_geographic_type": places[0].geographic_type.value,
+        "location_parent_ids": list(places[0].verified_parent_ids),
+        "location_verified_disjoint_place_ids": list(
+            places[0].verified_disjoint_place_ids
+        ),
+        **{
+            f"city_display_{locale}": label
+            for locale, label in city_display_labels.items()
+        },
+        **{
+            f"place_display_{locale}": localized.get(locale, places[0].display_name)
+            for locale in ("en", "ru", "es", "fr")
+        },
+        "open_participation": True,
+        "team_formats": team_formats,
+        "playing_levels": levels,
+        "venue_settings": settings,
+        "playing_surfaces": surfaces,
+        "payment": None if payment == "unknown" else payment,
+        "payment_amount": payment_details[0] if payment_details is not None else None,
+        "payment_currency": (
+            payment_details[1] if payment_details is not None else None
+        ),
+        "source_posted_at": source_posted_at.isoformat(),
+    }
+    if source_edited_at is not None:
+        accepted_facts["source_edited_at"] = source_edited_at.isoformat()
+    for field_name in (
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
+    ):
+        if candidate.get(field_name) is not None:
+            accepted_facts[field_name] = candidate[field_name]
+    return {
+        "opportunity_id": (
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:tournament"
+        ),
+        "source_message_revision_id": revision_id,
+        "opportunity_type": "tournament",
+        "publication_state": "active",
+        "accepted_facts": accepted_facts,
+        "evidence": {
+            **evidence,
+            "proposition_evidence": candidate.get("proposition_evidence"),
+        },
+        "response_route": {"kind": route["kind"], "value": route["value"]},
+    }
+
+
 def _validated_open_match_proposal(
     payload_value: JsonValue,
     *,
     resolver: LocationResolverAdapter,
+    timezone_data: TimezoneDataAdapter | None = None,
 ) -> dict[str, JsonValue] | None:
     """Keep the established Open Match validation seam explicit."""
     return _validated_opportunity_proposal(
         payload_value,
         resolver=resolver,
         expected_opportunity_type="open_match",
+        timezone_data=timezone_data,
     )
 
 
@@ -16483,7 +17955,6 @@ def _validated_transfer_proposal(
             revision_id, kind="revision"
         ),
         meaning=opportunity_type,
-        proof_version="source-semantic-proof-v2",
     ):
         return None
     if route is None:
@@ -16685,6 +18156,477 @@ def _validated_transfer_proposal(
         },
         "response_route": {"kind": route["kind"], "value": route["value"]},
     }
+
+
+def _validated_classification_proposal(
+    payload_value: JsonValue,
+    *,
+    resolver: LocationResolverAdapter,
+    timezone_data: TimezoneDataAdapter | None = None,
+) -> dict[str, JsonValue] | None:
+    """Route each accepted v3 candidate to its matching application validator."""
+    if not isinstance(payload_value, dict):
+        return None
+    output = payload_value.get("output")
+    candidates = output.get("candidates") if isinstance(output, dict) else None
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    if (
+        isinstance(candidate, dict)
+        and candidate.get("opportunity_type") == "tournament"
+    ):
+        return _validated_tournament_proposal(payload_value, resolver=resolver)
+    return _validated_open_match_proposal(
+        payload_value,
+        resolver=resolver,
+        timezone_data=timezone_data,
+    )
+
+
+def _tournament_open_participation_is_supported(
+    evidence: str,
+    *,
+    authoritative_body: str,
+    validation_time: datetime | None = None,
+    event_timezone: ZoneInfo | None = None,
+) -> bool:
+    """Require an affirmative, current registration or participation opening."""
+    normalized = evidence.casefold()
+    if _body_has_terminal_retraction(authoritative_body):
+        return False
+    participation_words = (
+        r"(?:(?:registration|registrations|participation|entry|entries|register\w*)"
+        r"|(?:регистрац\w*|набор\w*|участ\w*)"
+        r"|(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)"
+        r"|(?:inscriptions?|participations?|entr[ée]e?s?|inscri\w*))"
+    )
+    form_or_route_pattern = (
+        r"\b(?:registration|registrations|participation|entry|entries|"
+        r"inscription\w*|participation\w*|entr[ée]e?s?)\b"
+        r"[^.!?;\n]{0,30}\b(?:form|link|url|route|page|форма|ссылк\w*|"
+        r"formulario|enlace|lien|formulaire)\b"
+    )
+    explicit_open_pattern = (
+        r"\b(?:registration|registrations|participation|entry|entries)\b"
+        r"[^.!?;\n]{0,35}\b(?:open\w*|accept\w*|ongoing)\b|"
+        r"\b(?:open\w*|accept\w*|ongoing)\b"
+        r"[^.!?;\n]{0,35}\b(?:registration|registrations|participation|entry|entries)\b|"
+        r"\b(?:register\w*|inscri\w*)\b[^.!?;\n]{0,55}\b"
+        r"(?:now|today|maintenant|aujourd'hui|ahora|hoy|сейчас|сегодня)\b|"
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|ид[её]т|продолжа\w*)\b|"
+        r"\b(?:остал\w*)\b[^.!?;\n]{0,35}\bмест\w*\b"
+    )
+    if re.search(form_or_route_pattern, normalized) and not re.search(
+        explicit_open_pattern, normalized
+    ):
+        return False
+    closed_words = (
+        r"closed|full|filled|ended|over|no\s+longer\s+available"
+        r"|закрыт\w*|завершен\w*|заполнен\w*"
+        r"|cerrad\w*|complet\w*|terminad\w*"
+        r"|ferm[ée]e?s?|complet\w*|termin[ée]e?s?"
+    )
+    future_opening_patterns = (
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:will|shall|going\s+to)\b[^.!?;\n]{0,35}"
+        r"\b(?:open|available|accepting|ongoing|register\w*)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:open\w*|available|accept\w*|register\w*)\b"
+        r"[^.!?;\n]{0,35}\b(?:next\s+week|next\s+month|tomorrow|later|soon)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:будет|собира\w*|откро\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|доступ\w*|принимать\w*|запис\w*)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:será|estará|abrir\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:abiert\w*|disponible|acept\w*|inscrib\w*)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:sera|ouvrira|prévu|prevue|prévue)\b[^.!?;\n]{0,35}"
+        r"\b(?:ouvert\w*|disponible|accept\w*|inscri\w*)\b"
+    )
+    if re.search(future_opening_patterns, normalized):
+        return False
+    if re.search(
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        rf"\b(?:{closed_words})\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:is|are|was|were|has\s+been|had\s+been|used\s+to\s+be)?\s*"
+        r"(?:not|never|no\s+longer)\s+"
+        r"(?:open|available|accepting|ongoing)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:was|were|had\s+been|used\s+to\s+be)\b[^.!?;\n]{0,35}"
+        r"\b(?:open|available|accepting|ongoing)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:не|был\w*|была|были|раньше|уже\s+не)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|доступ\w*|ид[её]т|продолжа\w*)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:no|nunca|ya\s+no|era|estaba|estuvo)\b[^.!?;\n]{0,35}"
+        r"\b(?:abiert\w*|disponible|acept\w*|en\s+curso)\b|"
+        rf"\b{participation_words}\b[^.!?;\n]{{0,45}}"
+        r"\b(?:n['’]est\w*|était|etait|ét[ée]|n['’]est\s+plus)\b"
+        r"[^.!?;\n]{0,35}\b(?:ouvert\w*|disponible|accept[ée]e?s?|en\s+cours)\b",
+        normalized,
+    ):
+        return False
+    explicit_opening_date = _tournament_explicit_opening_date(
+        normalized,
+        validation_time=validation_time,
+    )
+    if explicit_opening_date is not None:
+        if validation_time is None or validation_time.tzinfo is None:
+            return False
+        comparison_timezone = event_timezone or validation_time.tzinfo
+        if (
+            explicit_opening_date
+            > validation_time.astimezone(comparison_timezone).date()
+        ):
+            return False
+    positive_patterns = (
+        r"\b(?:open\w*|accepting|available|ongoing)\b[^.!?;\n]{0,35}"
+        rf"\b{participation_words}\b",
+        rf"\b{participation_words}\b[^.!?;\n]{{0,35}}"
+        r"\b(?:open\w*|accepting|available|ongoing)\b",
+        r"\b(?:registration|participation)\s+is\s+open\b",
+        r"\b(?:register\w*|inscri\w*)\b[^.!?;\n]{0,55}"
+        r"\b(?:now|today|maintenant|aujourd'hui|ahora|hoy|сейчас|сегодня)\b",
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:открыт\w*|ид[её]т|продолжа\w*)\b",
+        r"\b(?:открыт\w*|ид[её]т|продолжа\w*)\b[^.!?;\n]{0,35}"
+        r"\b(?:регистрац\w*|набор\w*|участ\w*)\b",
+        r"\b(?:остал\w*)\b[^.!?;\n]{0,35}\bмест\w*\b"
+        r"[^.!?;\n]{0,20}\bкоманд\w*\b",
+        r"\b(?:ид[её]т|продолжа\w*)\s+донабор\w*\b"
+        r"(?:[^.!?;\n]{0,20}\bкоманд\w*\b)?",
+        r"\bдонабор\w*\b[^.!?;\n]{0,35}\bкоманд\w*\b",
+        r"\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b"
+        r"[^.!?;\n]{0,35}\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b",
+        r"\b(?:abiert\w*|acept\w*|disponible|en\s+curso)\b"
+        r"[^.!?;\n]{0,35}\b(?:inscripci[oó]n(?:es)?|participaci[oó]n(?:es)?|entrad[ao]s?)\b",
+        r"\b(?:inscriptions?|participations?|entr[ée]e?s?)\b"
+        r"[^.!?;\n]{0,35}\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b",
+        r"\b(?:ouvert\w*|accept[ée]e?s?|disponible|en\s+cours)\b"
+        r"[^.!?;\n]{0,35}\b(?:inscriptions?|participations?|entr[ée]e?s?)\b",
+    )
+    return any(
+        re.search(pattern, normalized) is not None for pattern in positive_patterns
+    )
+
+
+_TOURNAMENT_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+    "janvier": 1,
+    "février": 2,
+    "fevrier": 2,
+    "mars": 3,
+    "avril": 4,
+    "mai": 5,
+    "juin": 6,
+    "juillet": 7,
+    "août": 8,
+    "aout": 8,
+    "septembre": 9,
+    "octobre": 10,
+    "novembre": 11,
+    "décembre": 12,
+    "decembre": 12,
+}
+
+
+def _tournament_explicit_opening_date(
+    normalized_evidence: str,
+    *,
+    validation_time: datetime | None,
+) -> date | None:
+    """Find a calendar date explicitly attached to an opening assertion."""
+    month_names = "|".join(
+        re.escape(month) for month in sorted(_TOURNAMENT_MONTHS, key=len, reverse=True)
+    )
+    date_patterns = (
+        rf"(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:\s+de)?\s+(?P<month>{month_names})"
+        rf"(?:\s+(?:de\s+)?(?P<year>20\d{{2}}))?",
+        rf"(?P<month>{month_names})\s+(?P<day>\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?(?:,?\s+(?P<year>20\d{{2}}))?",
+    )
+    opening_words = re.compile(
+        r"(?:open\w*|accept\w*|available|ongoing|register\w*|"
+        r"откры\w*|запис\w*|приним\w*|abiert\w*|acept\w*|"
+        r"inscrib\w*|ouvr\w*|ouvert\w*|accept\w*)"
+    )
+    participation_words = re.compile(
+        r"(?:registration|registrations|participation|entry|entries|register\w*|"
+        r"регистрац\w*|набор\w*|участ\w*|inscripci\w*|participaci\w*|"
+        r"entrad\w*|inscription\w*|participation\w*)"
+    )
+    for pattern in date_patterns:
+        for match in re.finditer(pattern, normalized_evidence):
+            context = normalized_evidence[max(0, match.start() - 60) : match.end() + 35]
+            if not participation_words.search(context) or not opening_words.search(
+                context
+            ):
+                continue
+            day = int(match.group("day"))
+            month = _TOURNAMENT_MONTHS[match.group("month")]
+            year = int(match.group("year")) if match.group("year") else None
+            if year is None:
+                if validation_time is None:
+                    return None
+                year = validation_time.year
+            with suppress(ValueError):
+                return date(year, month, day)
+    return None
+
+
+def _tournament_optional_facts_are_supported(
+    candidate: dict[str, JsonValue],
+    evidence: dict[str, JsonValue],
+    *,
+    authoritative_body: str,
+) -> bool:
+    """Keep tournament-only facts source-bound and current."""
+    if _body_has_terminal_retraction(authoritative_body):
+        return False
+    return all(
+        isinstance(evidence.get(field_name), str)
+        and str(evidence[field_name]) in authoritative_body
+        and _tournament_optional_fact_is_source_bound(
+            field_name,
+            candidate[field_name],
+            str(evidence[field_name]),
+        )
+        for field_name in (
+            "schedule",
+            "registration_deadline",
+            "structure",
+            "capacity",
+            "prizes",
+        )
+        if candidate.get(field_name) is not None
+    )
+
+
+def _tournament_optional_fact_is_source_bound(
+    field_name: str,
+    value: JsonValue,
+    evidence: str,
+) -> bool:
+    """Bind normalized optional facts to their localized source evidence."""
+    if field_name == "registration_deadline":
+        return _tournament_registration_deadline_is_source_bound(value, evidence)
+    return _tournament_fact_value_is_source_bound(value, evidence)
+
+
+def _tournament_registration_deadline_is_source_bound(
+    value: JsonValue,
+    evidence: str,
+) -> bool:
+    """Accept ISO deadlines when their calendar date appears in local evidence."""
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            nested = value.get(key)
+            if nested is not None:
+                return _tournament_registration_deadline_is_source_bound(
+                    nested, evidence
+                )
+        return False
+    if not isinstance(value, str):
+        return _tournament_fact_value_is_source_bound(value, evidence)
+    try:
+        deadline = date.fromisoformat(value)
+    except ValueError:
+        try:
+            deadline = datetime.fromisoformat(value).date()
+        except ValueError:
+            return _tournament_fact_value_is_source_bound(value, evidence)
+    normalized = evidence.casefold()
+    if value.casefold() in normalized:
+        return True
+    day = str(deadline.day)
+    month = str(deadline.month)
+    year = str(deadline.year)
+    numeric_patterns = (
+        rf"\b0?{day}[./-]0?{month}[./-]{year}\b",
+        rf"\b{year}[./-]0?{month}[./-]0?{day}\b",
+    )
+    if any(re.search(pattern, normalized) is not None for pattern in numeric_patterns):
+        return True
+    month_names = {
+        "en": (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }
+    for names in month_names.values():
+        month_name = re.escape(names[deadline.month - 1])
+        if re.search(
+            rf"\b{day}\b(?:\s+de)?\s+{month_name}(?:\s+de)?\s+{year}\b",
+            normalized,
+        ) or re.search(
+            rf"\b{month_name}\s+{day}(?:,)?\s+{year}\b",
+            normalized,
+        ):
+            return True
+    return False
+
+
+def _tournament_fact_value_is_source_bound(
+    value: JsonValue,
+    evidence: str,
+) -> bool:
+    """Require every normalized optional fact leaf to be represented in evidence."""
+    normalized_evidence = evidence.casefold()
+    if isinstance(value, str):
+        return value.casefold() in normalized_evidence
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        token = re.escape(str(value).casefold())
+        return (
+            re.search(rf"(?<![\w.]){token}(?![\w.])", normalized_evidence) is not None
+        )
+    if isinstance(value, list):
+        return bool(value) and all(
+            _tournament_fact_value_is_source_bound(item, evidence) for item in value
+        )
+    if isinstance(value, dict):
+        return bool(value) and all(
+            key.casefold() in normalized_evidence
+            and _tournament_fact_value_is_source_bound(item, evidence)
+            for key, item in value.items()
+            if isinstance(key, str) and key
+        )
+    return False
+
+
+def _tournament_registration_expiry(
+    value: JsonValue,
+    timezone: ZoneInfo,
+) -> datetime | None:
+    """Normalize the supported explicit registration deadline forms."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return datetime.combine(
+                date.fromisoformat(value) + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=timezone,
+            )
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed.replace(tzinfo=timezone) if parsed.tzinfo is None else parsed
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            raw = value.get(key)
+            if isinstance(raw, str):
+                return _tournament_registration_expiry(raw, timezone)
+    return None
+
+
+def _tournament_registration_deadline_date(value: JsonValue) -> date | None:
+    """Return the source calendar date represented by a deadline fact."""
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(value).date()
+            except ValueError:
+                return None
+    if isinstance(value, dict):
+        for key in ("local_date", "date", "end_local_date"):
+            if key in value:
+                return _tournament_registration_deadline_date(value[key])
+    return None
 
 
 def _normalize_classifier_transfer_timing(
@@ -17526,6 +19468,7 @@ def _event_time_is_supported(
     source_event_time: datetime | None = None,
     source_timezone: str | None = None,
     authoritative_body: str | None = None,
+    allowed_additional_dates: tuple[date, ...] = (),
     _scoped_body_check: bool = False,
 ) -> bool:
     if authoritative_body is not None:
@@ -17537,6 +19480,7 @@ def _event_time_is_supported(
             day_part=day_part,
             source_event_time=source_event_time,
             source_timezone=source_timezone,
+            allowed_additional_dates=allowed_additional_dates,
         ):
             return False
         return _event_time_is_supported(
@@ -17547,6 +19491,7 @@ def _event_time_is_supported(
             day_part=day_part,
             source_event_time=source_event_time,
             source_timezone=source_timezone,
+            allowed_additional_dates=allowed_additional_dates,
             _scoped_body_check=True,
         )
     normalized = evidence.casefold()
@@ -17578,12 +19523,13 @@ def _event_time_is_supported(
         ):
             for match in re.finditer(pattern, normalized):
                 try:
-                    stated_dates.add(
-                        date(int(match.group("year")), month, int(match.group("day")))
+                    stated_date = date(
+                        int(match.group("year")), month, int(match.group("day"))
                     )
                 except ValueError:
                     return False
-    if stated_dates - {start, end}:
+                stated_dates.add(stated_date)
+    if stated_dates - {start, end, *allowed_additional_dates}:
         return False
 
     def date_spans(value: date) -> list[tuple[int, int]]:
@@ -19895,6 +21841,33 @@ def _runtime_opponent_search_details(
         ):
             raise ValueError("RunSearch Opponent Search details have invalid values")
         details[key] = tuple(typed_raw)
+    return details
+
+
+def _runtime_tournament_search_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical Tournament Search detail criteria."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch tournament_search_details must be an object")
+    allowed = {
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+    if set(value) - allowed:
+        raise ValueError("RunSearch tournament_search_details has unsupported keys")
+    details: dict[str, tuple[str, ...]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise TypeError("RunSearch Tournament Search details must be string lists")
+        details[key] = tuple(item for item in raw if isinstance(item, str))
     return details
 
 

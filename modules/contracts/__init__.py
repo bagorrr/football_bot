@@ -221,6 +221,13 @@ SUPPORTED_CONTRACTS = (
         "proposal_id",
     ),
     ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        5,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
         1,
         RuntimeRole.APPLICATION,
@@ -480,7 +487,7 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_classify_source_message_revision(self, self.payload)
         elif (
             self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and self.contract_version in {2, 3, 4}
+            and self.contract_version in {2, 3, 4, 5}
         ):
             _validate_classification_proposal(self, self.payload)
         elif (
@@ -705,6 +712,7 @@ def _validate_run_search(
             "game_search_details",
             "number_of_players",
             "opponent_search_details",
+            "tournament_search_details",
             "transfer_search_details",
         }
         if not required_fields <= set(payload) or set(payload) - allowed_fields:
@@ -808,13 +816,16 @@ def _validate_run_search(
             required_date,
             exact_fields=contract_version >= 2,
         )
-    details = payload.get("game_search_details")
-    if details is not None:
+    game_details = payload.get("game_search_details")
+    tournament_details = payload.get("tournament_search_details")
+    if game_details is not None and tournament_details is not None:
+        raise ValueError("RunSearch cannot contain both Search detail sets")
+    if game_details is not None:
         if user_intent not in {"game_search", "player_search"} or not isinstance(
-            details, dict
+            game_details, dict
         ):
             raise ValueError("RunSearch details require Game Search or Player Search")
-        if set(details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
+        if set(game_details) - ({"times"} | set(_GAME_SEARCH_DETAIL_VALUES)) or not all(
             isinstance(values, list)
             and (key != "times" or len(values) <= 1)
             and len(values)
@@ -834,7 +845,7 @@ def _validate_run_search(
                 )
                 for value in values
             )
-            for key, values in details.items()
+            for key, values in game_details.items()
         ):
             raise ValueError("RunSearch has invalid Game Search details")
     opponent_details = payload.get("opponent_search_details")
@@ -867,6 +878,43 @@ def _validate_run_search(
         ):
             raise ValueError("RunSearch has invalid Opponent Search details")
     transfer_details = payload.get("transfer_search_details")
+    if (
+        sum(
+            details is not None
+            for details in (
+                game_details,
+                opponent_details,
+                tournament_details,
+                transfer_details,
+            )
+        )
+        > 1
+    ):
+        raise ValueError("RunSearch cannot contain multiple Search detail sets")
+    if tournament_details is not None:
+        if user_intent != "tournament_search" or not isinstance(
+            tournament_details, dict
+        ):
+            raise ValueError("RunSearch tournament details require Tournament Search")
+        allowed = {
+            "team_formats",
+            "playing_levels",
+            "venue_settings",
+            "playing_surfaces",
+            "payment",
+        }
+        if set(tournament_details) - allowed or not all(
+            isinstance(values, list)
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and value in _GAME_SEARCH_DETAIL_VALUES.get(key, ())
+                for value in values
+            )
+            for key, values in tournament_details.items()
+        ):
+            raise ValueError("RunSearch has invalid Tournament Search details")
     if transfer_details is not None:
         if user_intent not in {
             "new_team_search",
@@ -1053,7 +1101,7 @@ def _validate_source_event_recorded(
         canonical_source_message_id(
             source_chat_key, registry_generation, telegram_message_id
         )
-        if envelope.contract_version == 4
+        if envelope.contract_version in {4, 5}
         else f"{source_chat_key}:message:{telegram_message_id}"
     )
     if envelope.subject_id != expected_subject:
@@ -1451,19 +1499,19 @@ def _validate_classification_proposal(
             "semantic_proof_executions",
             "ambiguity_pass_execution",
         }
-        if envelope.contract_version == 4
+        if envelope.contract_version in {4, 5}
         else set()
     )
     proposal_context_fields = (
         context_fields | {"adjacent_context"}
-        if envelope.contract_version == 4
+        if envelope.contract_version in {4, 5}
         else context_fields
     )
     allowed = (
         {"proposal_id", "source_message_revision_id", "body"}
         | proposal_context_fields
         | provenance_fields
-        | (semantic_fields if envelope.contract_version in {3, 4} else set())
+        | (semantic_fields if envelope.contract_version in {3, 4, 5} else set())
     )
     if set(payload) != allowed:
         raise ValueError("ClassificationProposal has incomplete semantics")
@@ -1538,7 +1586,7 @@ def _validate_classification_proposal(
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
         _validate_semantic_proof_execution(payload["semantic_proof_execution"])
-    if envelope.contract_version == 4:
+    if envelope.contract_version in {4, 5}:
         _validate_adjacent_context(
             payload["adjacent_context"],
             source_chat_reference=_required_text(payload, "source_chat_reference"),
@@ -1550,7 +1598,25 @@ def _validate_classification_proposal(
             ),
             current_event_time=_required_iso_datetime(payload, "source_event_time"),
         )
-        _validate_classification_proposal_v4(payload, body=body)
+        _validate_classification_proposal_v4(
+            payload,
+            body=body,
+            semantic_proof_version=(
+                "source-semantic-proof-v2"
+                if envelope.contract_version == 5
+                else "source-semantic-proof-v1"
+            ),
+            ambiguity_prompt_version=(
+                "open-match-ambiguity-v2"
+                if envelope.contract_version == 5
+                else "open-match-ambiguity-v1"
+            ),
+            ambiguity_schema_version=(
+                "source-message-classification-v3"
+                if envelope.contract_version == 5
+                else "source-message-classification-v2"
+            ),
+        )
     for field_name in ("pass_number", "attempt_number"):
         metric = payload[field_name]
         if not isinstance(metric, int) or isinstance(metric, bool) or metric < 1:
@@ -1622,6 +1688,35 @@ def _validate_classification_proposal(
             ),
             "context_bundle_version": "primary-classifier-context-v1",
         }
+    if envelope.contract_version == 5:
+        pinned = {
+            "requested_model": "gpt-5.6-sol",
+            "effective_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "high",
+            "effective_reasoning_effort": "high",
+            "prompt_version": (
+                (
+                    "player-match-ambiguity-v1"
+                    if payload["pass_number"] == 2
+                    else "player-match-primary-v1"
+                )
+                if player_release
+                else (
+                    "open-match-ambiguity-v2"
+                    if payload["pass_number"] == 2
+                    else "open-match-primary-v3"
+                )
+            ),
+            "schema_version": "source-message-classification-v3",
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": "classifier-context-v1",
+            "routing_policy_version": (
+                "classifier-routing-player-v1"
+                if player_release
+                else "classifier-routing-v1"
+            ),
+            "context_bundle_version": "primary-classifier-context-v1",
+        }
     if any(payload[field_name] != value for field_name, value in pinned.items()):
         raise ValueError("ClassificationProposal provenance version is unsupported")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
@@ -1656,7 +1751,12 @@ def _validate_classification_proposal(
 
 
 def _validate_classification_proposal_v4(
-    payload: dict[str, JsonValue], *, body: str
+    payload: dict[str, JsonValue],
+    *,
+    body: str,
+    semantic_proof_version: str = "source-semantic-proof-v1",
+    ambiguity_prompt_version: str = "open-match-ambiguity-v1",
+    ambiguity_schema_version: str = "source-message-classification-v2",
 ) -> None:
     """Validate multi-candidate proof and one-way ambiguity-pass provenance."""
     player_release = (
@@ -1754,7 +1854,19 @@ def _validate_classification_proposal_v4(
             or "candidate_target_manifest_hash" not in execution
         ):
             raise ValueError("ClassificationProposal v4 target manifest is incomplete")
-        _validate_semantic_proof_execution(execution)
+        _validate_semantic_proof_execution(
+            execution,
+            prompt_version=(
+                "player-match-semantic-proof-v1"
+                if player_release
+                else (
+                    "open-match-semantic-proof-v2"
+                    if semantic_proof_version == "source-semantic-proof-v2"
+                    else "open-match-semantic-proof-v1"
+                )
+            ),
+            schema_version=semantic_proof_version,
+        )
         execution_keys.add(candidate_key)
     if output.get("disposition") == "accepted" and (
         proof_keys != execution_keys or proof_keys != set(candidate_by_key)
@@ -1776,12 +1888,18 @@ def _validate_classification_proposal_v4(
     if ambiguity_execution is not None:
         _validate_ambiguity_pass_execution(
             ambiguity_execution,
+            prompt_version=ambiguity_prompt_version,
+            schema_version=ambiguity_schema_version,
             player_release=player_release,
         )
 
 
 def _validate_ambiguity_pass_execution(
-    value: JsonValue, *, player_release: bool = False
+    value: JsonValue,
+    *,
+    prompt_version: str | None = None,
+    schema_version: str | None = None,
+    player_release: bool = False,
 ) -> None:
     """Validate the one allowed semantic ambiguity-pass execution."""
     fields = {
@@ -1833,12 +1951,17 @@ def _validate_ambiguity_pass_execution(
     if player_release:
         expected_prompt = "player-match-ambiguity-v1"
         expected_schema = "source-message-classification-v3"
-    elif value["prompt_version"] == "open-match-ambiguity-v2":
-        expected_prompt = "open-match-ambiguity-v2"
-        expected_schema = "source-message-classification-v3"
     else:
-        expected_prompt = "open-match-ambiguity-v1"
-        expected_schema = "source-message-classification-v2"
+        expected_prompt = prompt_version or (
+            "open-match-ambiguity-v2"
+            if value["prompt_version"] == "open-match-ambiguity-v2"
+            else "open-match-ambiguity-v1"
+        )
+        expected_schema = schema_version or (
+            "source-message-classification-v3"
+            if expected_prompt == "open-match-ambiguity-v2"
+            else "source-message-classification-v2"
+        )
     if value["prompt_version"] != expected_prompt:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
     if value["schema_version"] != expected_schema:
@@ -1884,7 +2007,12 @@ def _validate_ambiguity_pass_execution(
         raise ValueError("ambiguity-pass manifest hash is invalid")
 
 
-def _validate_semantic_proof_execution(value: JsonValue) -> None:
+def _validate_semantic_proof_execution(
+    value: JsonValue,
+    *,
+    prompt_version: str | None = None,
+    schema_version: str | None = None,
+) -> None:
     """Validate the pinned bounded semantic-proof pass provenance."""
     fields = {
         "requested_model",
@@ -1950,12 +2078,15 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
         "prompt_version": (
-            "player-match-semantic-proof-v1"
-            if player_release
-            else (
-                "open-match-semantic-proof-v2"
-                if value["schema_version"] == "source-semantic-proof-v2"
-                else "open-match-semantic-proof-v1"
+            prompt_version
+            or (
+                "player-match-semantic-proof-v1"
+                if player_release
+                else (
+                    "open-match-semantic-proof-v2"
+                    if value["schema_version"] == "source-semantic-proof-v2"
+                    else "open-match-semantic-proof-v1"
+                )
             )
         ),
         "schema_version": value["schema_version"],
@@ -2008,6 +2139,7 @@ def _validate_opportunity_publication_changed(
     opportunity_type = payload["opportunity_type"]
     if opportunity_type not in {
         "open_match",
+        "tournament",
         "player_match_availability",
         "opponent_request",
         "roster_vacancy",
@@ -2135,6 +2267,7 @@ def _validate_opportunity_publication_batch_changed(
         opportunity_type = opportunity["opportunity_type"]
         if opportunity_type not in {
             "open_match",
+            "tournament",
             "player_match_availability",
             "opponent_request",
             "roster_vacancy",
@@ -2214,6 +2347,7 @@ def _validate_accepted_opportunity_facts(
     if opportunity_type not in {
         "open_match",
         "player_match_availability",
+        "tournament",
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
@@ -2224,6 +2358,9 @@ def _validate_accepted_opportunity_facts(
         return
     if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
         _validate_transfer_accepted_facts(facts, opportunity_type)
+        return
+    if opportunity_type == "tournament":
+        _validate_tournament_accepted_facts(facts)
         return
     _validate_open_match_accepted_facts(facts, opportunity_type)
 
@@ -2557,6 +2694,83 @@ def _validate_opponent_request_accepted_facts(
         if not isinstance(source_edited_at, str):
             raise TypeError("opponent-request source_edited_at must be text or null")
         _required_iso_datetime(facts, "source_edited_at")
+
+
+def _validate_tournament_accepted_facts(facts: dict[str, JsonValue]) -> None:
+    """Validate the canonical accepted facts for one published Tournament."""
+    base_required = {
+        "start_local_date",
+        "end_local_date",
+        "exact_local_time",
+        "day_part",
+        "iana_timezone",
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "location_verified_disjoint_place_ids",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "team_formats",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "payment_amount",
+        "payment_currency",
+        "source_posted_at",
+        "open_participation",
+    }
+    optional = {
+        "schedule",
+        "registration_deadline",
+        "structure",
+        "capacity",
+        "prizes",
+        "source_edited_at",
+    }
+    if set(facts) - base_required - optional or not base_required.issubset(facts):
+        raise ValueError("tournament accepted facts are incomplete")
+    if facts["open_participation"] is not True:
+        raise ValueError("tournament open participation must be true")
+    base_facts = {
+        key: facts[key] for key in base_required if key != "open_participation"
+    }
+    base_facts["open_places"] = None
+    base_facts["positions"] = None
+    _validate_open_match_accepted_facts(base_facts)
+    for field_name in optional:
+        if field_name == "source_edited_at":
+            if field_name in facts:
+                _required_iso_datetime(facts, field_name)
+            continue
+        if field_name in facts and not _valid_tournament_json_fact(facts[field_name]):
+            raise ValueError(f"tournament {field_name} is invalid")
+
+
+def _valid_tournament_json_fact(value: JsonValue) -> bool:
+    """Accept bounded non-empty JSON values for source-bound optional facts."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, list):
+        return bool(value) and all(_valid_tournament_json_fact(item) for item in value)
+    if isinstance(value, dict):
+        return bool(value) and all(
+            isinstance(key, str) and bool(key) and _valid_tournament_json_fact(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 def _validate_transfer_accepted_facts(

@@ -65,9 +65,9 @@ class CanonicalPropositionEdge:
 class CanonicalPropositionGraph:
     """The complete typed graph used by Application authority checks.
 
-    The wire contract remains ``source-proposition-evidence-v1``. This is an
-    internal typed interpretation of that existing shape, so no v1/v2
-    compatibility or replay lineage is changed by the semantic gate.
+    The wire contract is selected by the caller's immutable classifier
+    artifact version. This is an internal typed interpretation of that shape,
+    so no older replay lineage is changed by the semantic gate.
     """
 
     root: CanonicalPropositionNode
@@ -129,6 +129,8 @@ def canonical_proposition_graph_from_wire(
     evidence: Mapping[str, object],
     routes: Sequence[object],
     meaning: str = "open_match",
+    opportunity_type: str | None = None,
+    proposition_version: str = "source-proposition-evidence-v1",
 ) -> CanonicalPropositionGraph | None:
     """Convert the already schema-checked v1 graph into typed values.
 
@@ -139,7 +141,7 @@ def canonical_proposition_graph_from_wire(
 
     if not isinstance(value, Mapping) or not body:
         return None
-    if value.get("contract_version") != "source-proposition-evidence-v1":
+    if value.get("contract_version") != proposition_version:
         return None
     if value.get("coverage") != "complete_source_revision":
         return None
@@ -201,10 +203,13 @@ def canonical_proposition_graph_from_wire(
     raw_root = value.get("root")
     if not isinstance(raw_root, Mapping):
         return None
+    effective_opportunity_type = (
+        meaning if opportunity_type is None else opportunity_type
+    )
     if (
         raw_root.get("proposition_id") != candidate_key
         or raw_root.get("domain") != "football_match"
-        or raw_root.get("meaning") != meaning
+        or raw_root.get("meaning") != effective_opportunity_type
     ):
         return None
     root = node_from("root", raw_root, expected_text=body)
