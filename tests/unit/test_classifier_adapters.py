@@ -11,6 +11,7 @@ import pytest
 from modules.codex_classification_adapter import (
     CodexCliClassifierAdapter,
     SubprocessCodexRunner,
+    _codex_jsonl_result,
 )
 from modules.ports import (
     ClassifierAuthenticationError,
@@ -147,6 +148,8 @@ events = (
     },
     {
         "type": "turn.completed",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
         "usage": {"input_tokens": 12, "output_tokens": 8},
     },
 )
@@ -167,6 +170,22 @@ for event in events:
     assert result["effective_reasoning_effort"] == "high"
     assert result["input_tokens"] == 12
     assert result["output_tokens"] == 8
+
+
+def test_codex_jsonl_result_preserves_provider_effective_metadata() -> None:
+    stdout = "\n".join(
+        (
+            '{"type":"item.completed","item":{"type":"agent_message",'
+            '"text":"{\\"disposition\\":\\"irrelevant\\"}"}}',
+            '{"type":"turn.completed","effective_model":"provider-model",'
+            '"effective_reasoning_effort":"low","usage":{}}',
+        )
+    )
+
+    result = _codex_jsonl_result(stdout)
+
+    assert result["effective_model"] == "provider-model"
+    assert result["effective_reasoning_effort"] == "low"
 
 
 def test_codex_adapter_maps_provider_5xx_and_retry_after_without_body(
@@ -260,12 +279,13 @@ def test_codex_adapter_enforces_isolation_and_180_second_timeout(
 @dataclass(slots=True)
 class RecordingResponsesTransport:
     calls: list[tuple[dict[str, object], int]] = field(default_factory=list)
+    effective_reasoning_effort: str | None = "high"
 
     def create_response(
         self, payload: dict[str, object], *, timeout_seconds: int
     ) -> dict[str, object]:
         self.calls.append((payload, timeout_seconds))
-        return {
+        response: dict[str, object] = {
             "output": {
                 "schema_version": "source-message-classification-v2",
                 "disposition": "irrelevant",
@@ -280,6 +300,9 @@ class RecordingResponsesTransport:
             "output_tokens": 8,
             "duration_ms": 40,
         }
+        if self.effective_reasoning_effort is not None:
+            response["effective_reasoning_effort"] = self.effective_reasoning_effort
+        return response
 
 
 @dataclass(slots=True)
@@ -507,6 +530,70 @@ def test_classifier_adapters_bind_the_exact_prompt_artifact_for_each_pass(
             )
 
 
+@pytest.mark.parametrize("adapter_kind", ("codex_cli", "responses_api"))
+def test_classifier_adapters_require_explicit_transfer_artifact_activation(
+    adapter_kind: str, tmp_path: Path
+) -> None:
+    prompt_paths = {
+        "open-match-primary-v2": tmp_path / "primary-v2.prompt.md",
+        "open-match-primary-v3": tmp_path / "primary-v3.prompt.md",
+        "open-match-ambiguity-v2": tmp_path / "ambiguity-v2.prompt.md",
+        "open-match-semantic-proof-v2": tmp_path / "semantic-proof-v2.prompt.md",
+    }
+    schema_paths = {
+        "source-message-classification-v2": tmp_path / "classification-v2.json",
+        "source-message-classification-v3": tmp_path / "classification-v3.json",
+        "source-semantic-proof-v2": tmp_path / "semantic-proof-v2.json",
+    }
+    for path in (*prompt_paths.values(), *schema_paths.values()):
+        path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="explicit"):
+        if adapter_kind == "codex_cli":
+            CodexCliClassifierAdapter(
+                codex_executable=Path("/opt/classifier/bin/codex"),
+                codex_home=tmp_path / "codex-home",
+                workspace=tmp_path / "workspace",
+                schema_paths=schema_paths,
+                prompt_paths=prompt_paths,
+                runner=PromptRecordingProcessRunner(),
+                codex_version="codex-test-version",
+                adapter_version="codex-classifier-v1",
+            )
+        else:
+            ResponsesClassifierAdapter(
+                transport=RecordingResponsesTransport(),
+                schemas={version: {} for version in schema_paths},
+                prompt_paths=prompt_paths,
+                adapter_version="responses-classifier-v1",
+            )
+
+    if adapter_kind == "codex_cli":
+        adapter: CodexCliClassifierAdapter | ResponsesClassifierAdapter = (
+            CodexCliClassifierAdapter(
+                codex_executable=Path("/opt/classifier/bin/codex"),
+                codex_home=tmp_path / "codex-home",
+                workspace=tmp_path / "workspace",
+                schema_paths=schema_paths,
+                prompt_paths=prompt_paths,
+                runner=PromptRecordingProcessRunner(),
+                codex_version="codex-test-version",
+                adapter_version="codex-classifier-v1",
+                primary_schema_version="source-message-classification-v3",
+            )
+        )
+    else:
+        adapter = ResponsesClassifierAdapter(
+            transport=RecordingResponsesTransport(),
+            schemas={version: {} for version in schema_paths},
+            prompt_paths=prompt_paths,
+            adapter_version="responses-classifier-v1",
+            primary_schema_version="source-message-classification-v3",
+        )
+
+    assert adapter.primary_schema_version == "source-message-classification-v3"
+
+
 @dataclass(slots=True)
 class TimeoutResponsesTransport:
     timeout_seconds: int | None = None
@@ -572,6 +659,30 @@ def test_responses_adapter_is_stateless_tool_free_and_schema_strict(
     assert result.effective_model == "gpt-5.6-sol"
     assert result.effective_reasoning_effort == "high"
     assert result.codex_version == "not_applicable"
+
+
+@pytest.mark.parametrize(
+    ("provider_reasoning", "expected_reasoning"),
+    (("low", "low"), (None, "")),
+)
+def test_responses_adapter_preserves_provider_reasoning_metadata(
+    tmp_path: Path, provider_reasoning: str | None, expected_reasoning: str
+) -> None:
+    transport = RecordingResponsesTransport(
+        effective_reasoning_effort=provider_reasoning
+    )
+    prompt = tmp_path / "primary.prompt.md"
+    prompt.write_text("primary prompt", encoding="utf-8")
+    adapter = ResponsesClassifierAdapter(
+        transport=transport,
+        schemas={"source-message-classification-v2": {}},
+        prompt_paths={"open-match-primary-v2": prompt},
+        adapter_version="responses-classifier-v1",
+    )
+
+    result = adapter.classify(_request())
+
+    assert result.effective_reasoning_effort == expected_reasoning
 
 
 def _request() -> ClassifierRequest:

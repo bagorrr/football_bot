@@ -901,6 +901,7 @@ class ControlledModelAdapter:
     second_pass_requests: list[ClassifierRequest] = field(default_factory=list)
     proof_requests: list[ClassifierRequest] = field(default_factory=list)
     primary_schema_version: str = "source-message-classification-v1"
+    primary_prompt_version: str = "open-match-primary-v1"
     smoke_test_passes: bool = True
 
     @property
@@ -938,10 +939,12 @@ class ControlledModelAdapter:
     def enable_primary_v2(self) -> None:
         """Opt the controlled model boundary into the additive v2 output."""
         self.primary_schema_version = "source-message-classification-v2"
+        self.primary_prompt_version = "open-match-primary-v2"
 
     def enable_primary_v3(self) -> None:
         """Opt the controlled model boundary into the additive Player release."""
         self.primary_schema_version = "source-message-classification-v3"
+        self.primary_prompt_version = "player-match-primary-v1"
 
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
@@ -1166,6 +1169,8 @@ def _build_test_semantic_proof(
         "open_match",
         "player_match_availability",
         "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
     }:
         return {}
 
@@ -1250,8 +1255,14 @@ def _build_test_semantic_proof(
                 "span": {"start": 0, "end": len(body), "text": body},
             }
         )
+    contract_version = (
+        "source-semantic-proof-v2"
+        if opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+        and proof_version == "source-semantic-proof-v1"
+        else proof_version
+    )
     return {
-        "contract_version": proof_version,
+        "contract_version": contract_version,
         "source_message_revision_reference": source_message_revision_reference,
         "candidate_key": candidate_key,
         "coverage": "complete_source_revision",
@@ -2628,6 +2639,7 @@ class AcceptanceSpine:
         game_search_details: dict[str, list[str]] | None = None,
         number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
+        transfer_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2641,6 +2653,7 @@ class AcceptanceSpine:
             game_search_details=game_search_details,
             number_of_players=number_of_players,
             opponent_search_details=opponent_search_details,
+            transfer_search_details=transfer_search_details,
         )
 
     def open_game_search_details(
@@ -2884,6 +2897,111 @@ class AcceptanceSpine:
     ) -> None:
         """Leave an Opponent Search detail submenu or hub."""
         self._conversation_onboarding().back_from_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the long-term transfer Details hub."""
+        self._conversation_onboarding().open_transfer_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one long-term transfer detail submenu."""
+        self._conversation_onboarding().open_transfer_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_transfer_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one temporary transfer detail value."""
+        self._conversation_onboarding().toggle_transfer_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit one transfer detail submenu through Done."""
+        self._conversation_onboarding().commit_transfer_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_transfer_search_seasonal_timing(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Select a temporary ready-now Seasonal Timing value."""
+        self._conversation_onboarding().select_transfer_search_seasonal_timing(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_seasonal_timing_start_date(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the transfer local-start-date prompt."""
+        self._conversation_onboarding().open_transfer_search_seasonal_timing_start_date(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_transfer_search_seasonal_timing_start_date_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit the transfer local-start-date prompt."""
+        self._conversation_onboarding().submit_transfer_search_seasonal_timing_start_date_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_transfer_search_seasonal_timing_season(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the transfer named-season prompt."""
+        self._conversation_onboarding().open_transfer_search_seasonal_timing_season(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_transfer_search_seasonal_timing_season_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit the transfer named-season prompt."""
+        self._conversation_onboarding().submit_transfer_search_seasonal_timing_season_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_transfer_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from a transfer detail submenu or hub."""
+        self._conversation_onboarding().back_from_transfer_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
@@ -3541,7 +3659,9 @@ def boot_acceptance_spine(
                 else None
             ),
             timezone_data=(
-                installed_timezone_data if role is RuntimeRole.BOT_ASSISTANT else None
+                installed_timezone_data
+                if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
+                else None
             ),
             telegram_admin_user_id=(
                 telegram_admin_user_id

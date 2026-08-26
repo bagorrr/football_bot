@@ -658,6 +658,14 @@ _OPPONENT_SEARCH_DETAIL_VALUES = {
     "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
     "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
 }
+_TRANSFER_SEARCH_DETAIL_VALUES = {
+    "positions": _GAME_SEARCH_DETAIL_VALUES["positions"],
+    "playing_levels": _GAME_SEARCH_DETAIL_VALUES["playing_levels"],
+    "team_formats": _GAME_SEARCH_DETAIL_VALUES["team_formats"],
+    "venue_settings": _GAME_SEARCH_DETAIL_VALUES["venue_settings"],
+    "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
+    "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
+}
 
 SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
     {
@@ -697,6 +705,7 @@ def _validate_run_search(
             "game_search_details",
             "number_of_players",
             "opponent_search_details",
+            "transfer_search_details",
         }
         if not required_fields <= set(payload) or set(payload) - allowed_fields:
             raise ValueError("RunSearch v2 contains unsupported or missing facts")
@@ -790,6 +799,10 @@ def _validate_run_search(
     if whole_city == bool(area_ids):
         raise ValueError("RunSearch requires exactly one Search Area mode")
     required_date = payload.get("required_date")
+    if user_intent in {"new_team_search", "transfer_player_search"} and (
+        required_date is not None
+    ):
+        raise ValueError("RunSearch transfer Search cannot include required_date")
     if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
         _validate_required_date(
             required_date,
@@ -853,6 +866,58 @@ def _validate_run_search(
             for key, values in opponent_details.items()
         ):
             raise ValueError("RunSearch has invalid Opponent Search details")
+    transfer_details = payload.get("transfer_search_details")
+    if transfer_details is not None:
+        if user_intent not in {
+            "new_team_search",
+            "transfer_player_search",
+        } or not isinstance(transfer_details, dict):
+            raise ValueError("RunSearch details require a transfer Search")
+        if set(transfer_details) - {"seasonal_timing"} - set(
+            _TRANSFER_SEARCH_DETAIL_VALUES
+        ) or not all(
+            isinstance(values, list)
+            and (
+                (key == "seasonal_timing" and len(values) <= 1)
+                or key != "seasonal_timing"
+            )
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and (
+                    value in _TRANSFER_SEARCH_DETAIL_VALUES.get(key, ())
+                    or (
+                        key == "seasonal_timing"
+                        and _valid_transfer_seasonal_timing(value)
+                    )
+                )
+                for value in values
+            )
+            for key, values in transfer_details.items()
+        ):
+            raise ValueError("RunSearch has invalid transfer Search details")
+
+
+def _valid_transfer_seasonal_timing(value: str) -> bool:
+    """Validate the language-neutral Seasonal Timing detail encoding."""
+    if value == "ready_now":
+        return True
+    kind, separator, raw_value = value.partition(":")
+    if not separator or not raw_value:
+        return False
+    if kind == "start_local_date":
+        try:
+            parsed = date.fromisoformat(raw_value)
+        except ValueError:
+            return False
+        return parsed.isoformat() == raw_value
+    return (
+        kind == "stated_season"
+        and len(raw_value) <= 80
+        and raw_value == raw_value.casefold()
+        and raw_value == raw_value.strip()
+    )
 
 
 def _validate_required_date(value: JsonValue, *, exact_fields: bool) -> None:
@@ -1496,9 +1561,11 @@ def _validate_classification_proposal(
             raise TypeError(
                 f"ClassificationProposal requires non-negative {field_name}"
             )
-    player_release = payload.get("schema_version") == "source-message-classification-v3"
-    pinned = (
-        {
+    player_release = (
+        payload.get("routing_policy_version") == "classifier-routing-player-v1"
+    )
+    if envelope.contract_version < 4:
+        pinned = {
             "requested_model": "gpt-5.6-sol",
             "effective_model": "gpt-5.6-sol",
             "requested_reasoning_effort": "high",
@@ -1510,30 +1577,42 @@ def _validate_classification_proposal(
             "routing_policy_version": "classifier-routing-v1",
             "context_bundle_version": "primary-classifier-context-v1",
         }
-        if envelope.contract_version < 4
-        else {
+    else:
+        schema_version = payload.get("schema_version")
+        if not isinstance(schema_version, str):
+            raise ValueError("ClassificationProposal primary schema is invalid")
+        active_artifacts = (
+            (
+                "player-match-primary-v1",
+                "player-match-ambiguity-v1",
+            )
+            if player_release
+            else {
+                "source-message-classification-v2": (
+                    "open-match-primary-v2",
+                    "open-match-ambiguity-v1",
+                ),
+                "source-message-classification-v3": (
+                    "open-match-primary-v3",
+                    "open-match-ambiguity-v2",
+                ),
+            }.get(schema_version)
+        )
+        if active_artifacts is None:
+            raise ValueError("ClassificationProposal primary artifact is unsupported")
+        if player_release and schema_version != "source-message-classification-v3":
+            raise ValueError("ClassificationProposal player artifact is unsupported")
+        pinned = {
             "requested_model": "gpt-5.6-sol",
             "effective_model": "gpt-5.6-sol",
             "requested_reasoning_effort": "high",
             "effective_reasoning_effort": "high",
             "prompt_version": (
-                (
-                    "player-match-ambiguity-v1"
-                    if payload["pass_number"] == 2
-                    else "player-match-primary-v1"
-                )
-                if player_release
-                else (
-                    "open-match-ambiguity-v1"
-                    if payload["pass_number"] == 2
-                    else "open-match-primary-v2"
-                )
+                active_artifacts[1]
+                if payload["pass_number"] == 2
+                else active_artifacts[0]
             ),
-            "schema_version": (
-                "source-message-classification-v3"
-                if player_release
-                else "source-message-classification-v2"
-            ),
+            "schema_version": schema_version,
             "glossary_version": "football-opportunity-glossary-v1",
             "context_policy_version": "classifier-context-v1",
             "routing_policy_version": (
@@ -1543,7 +1622,6 @@ def _validate_classification_proposal(
             ),
             "context_bundle_version": "primary-classifier-context-v1",
         }
-    )
     if any(payload[field_name] != value for field_name, value in pinned.items()):
         raise ValueError("ClassificationProposal provenance version is unsupported")
     if re.fullmatch(r"[0-9a-f]{64}", str(payload["input_manifest_hash"])) is None:
@@ -1581,9 +1659,14 @@ def _validate_classification_proposal_v4(
     payload: dict[str, JsonValue], *, body: str
 ) -> None:
     """Validate multi-candidate proof and one-way ambiguity-pass provenance."""
-    player_release = payload.get("schema_version") == "source-message-classification-v3"
+    player_release = (
+        payload.get("routing_policy_version") == "classifier-routing-player-v1"
+    )
     proof_version = (
-        "source-semantic-proof-v2" if player_release else "source-semantic-proof-v1"
+        "source-semantic-proof-v2"
+        if player_release
+        or payload.get("schema_version") == "source-message-classification-v3"
+        else "source-semantic-proof-v1"
     )
     output = payload["output"]
     assert isinstance(output, dict)
@@ -1744,21 +1827,33 @@ def _validate_ambiguity_pass_execution(
         _required_text(value, field_name)
     if value["status"] != "succeeded":
         raise ValueError("ambiguity-pass execution status is invalid")
-    expected_prompt = (
-        "player-match-ambiguity-v1" if player_release else "open-match-ambiguity-v1"
-    )
-    expected_schema = (
-        "source-message-classification-v3"
-        if player_release
-        else "source-message-classification-v2"
-    )
     expected_routing = (
         "classifier-routing-player-v1" if player_release else "classifier-routing-v1"
     )
+    if player_release:
+        expected_prompt = "player-match-ambiguity-v1"
+        expected_schema = "source-message-classification-v3"
+    elif value["prompt_version"] == "open-match-ambiguity-v2":
+        expected_prompt = "open-match-ambiguity-v2"
+        expected_schema = "source-message-classification-v3"
+    else:
+        expected_prompt = "open-match-ambiguity-v1"
+        expected_schema = "source-message-classification-v2"
     if value["prompt_version"] != expected_prompt:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
     if value["schema_version"] != expected_schema:
         raise ValueError("ambiguity-pass schema provenance is invalid")
+    if value["prompt_version"] not in {
+        "player-match-ambiguity-v1",
+        "open-match-ambiguity-v1",
+        "open-match-ambiguity-v2",
+    }:
+        raise ValueError("ambiguity-pass prompt provenance is invalid")
+    if value["schema_version"] not in {
+        "source-message-classification-v2",
+        "source-message-classification-v3",
+    }:
+        raise ValueError("ambiguity-pass prompt and schema versions disagree")
     if value["context_bundle_version"] != "primary-classifier-context-v1":
         raise ValueError("ambiguity-pass context provenance is invalid")
     if (
@@ -1848,7 +1943,7 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
             raise TypeError(
                 f"semantic-proof execution requires non-negative {field_name}"
             )
-    player_release = value["schema_version"] == "source-semantic-proof-v2"
+    player_release = value["routing_policy_version"] == "classifier-routing-player-v1"
     pinned = {
         "requested_model": "gpt-5.6-sol",
         "effective_model": "gpt-5.6-sol",
@@ -1857,11 +1952,13 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         "prompt_version": (
             "player-match-semantic-proof-v1"
             if player_release
-            else "open-match-semantic-proof-v1"
+            else (
+                "open-match-semantic-proof-v2"
+                if value["schema_version"] == "source-semantic-proof-v2"
+                else "open-match-semantic-proof-v1"
+            )
         ),
-        "schema_version": (
-            "source-semantic-proof-v2" if player_release else "source-semantic-proof-v1"
-        ),
+        "schema_version": value["schema_version"],
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "semantic-proof-context-v1",
         "routing_policy_version": (
@@ -1871,6 +1968,11 @@ def _validate_semantic_proof_execution(value: JsonValue) -> None:
         ),
         "context_bundle_version": "semantic-proof-context-v1",
     }
+    if value["schema_version"] not in {
+        "source-semantic-proof-v1",
+        "source-semantic-proof-v2",
+    }:
+        raise ValueError("semantic-proof schema provenance is unsupported")
     if any(value[field_name] != expected for field_name, expected in pinned.items()):
         raise ValueError("semantic-proof execution provenance is not pinned")
     if re.fullmatch(r"[0-9a-f]{64}", str(value["input_manifest_hash"])) is None:
@@ -1908,6 +2010,8 @@ def _validate_opportunity_publication_changed(
         "open_match",
         "player_match_availability",
         "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
     }:
         raise ValueError("Opportunity type is invalid")
     identity_type = str(opportunity_type)
@@ -2033,11 +2137,13 @@ def _validate_opportunity_publication_batch_changed(
             "open_match",
             "player_match_availability",
             "opponent_request",
+            "roster_vacancy",
+            "player_transfer_availability",
         }:
             raise ValueError("OpportunityPublicationChanged v3 item type is invalid")
         if (
             re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request):(?:candidate|proposition):[0-9a-f]{{16}}",
+                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request|roster_vacancy|player_transfer_availability):(?:candidate|proposition):[0-9a-f]{{16}}",
                 opportunity_id,
             )
             is None
@@ -2109,10 +2215,15 @@ def _validate_accepted_opportunity_facts(
         "open_match",
         "player_match_availability",
         "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
     }:
         raise ValueError("opportunity type is invalid")
     if opportunity_type == "opponent_request":
         _validate_opponent_request_accepted_facts(facts)
+        return
+    if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
+        _validate_transfer_accepted_facts(facts, opportunity_type)
         return
     _validate_open_match_accepted_facts(facts, opportunity_type)
 
@@ -2284,6 +2395,7 @@ def _validate_open_match_accepted_facts(
         if values is not None and (
             not isinstance(values, list)
             or not values
+            or not all(isinstance(value, str) for value in values)
             or len(values) != len(set(cast(list[str], values)))
             or not all(isinstance(value, str) and value in allowed for value in values)
         ):
@@ -2445,6 +2557,172 @@ def _validate_opponent_request_accepted_facts(
         if not isinstance(source_edited_at, str):
             raise TypeError("opponent-request source_edited_at must be text or null")
         _required_iso_datetime(facts, "source_edited_at")
+
+
+def _validate_transfer_accepted_facts(
+    facts: dict[str, JsonValue], opportunity_type: str
+) -> None:
+    """Validate one evidence-backed long-term transfer fact snapshot."""
+    if opportunity_type not in {"roster_vacancy", "player_transfer_availability"}:
+        raise ValueError("transfer opportunity type is invalid")
+    required = {
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "location_verified_disjoint_place_ids",
+        "iana_timezone",
+        "timezone_data_version",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "positions",
+        "playing_levels",
+        "team_formats",
+        "seasonal_timing",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "payment_amount",
+        "payment_currency",
+        "source_posted_at",
+        "source_edited_at",
+        "source_qualifying_assertion_at",
+        opportunity_type,
+    }
+    if set(facts) != required:
+        raise ValueError("transfer accepted facts are incomplete")
+    for field_name in (
+        "country_id",
+        "city_id",
+        "place_id",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "iana_timezone",
+        "timezone_data_version",
+    ):
+        _required_text(facts, field_name)
+    if _required_text(facts, "location_geographic_type") not in {
+        "country",
+        "city",
+        *SUB_CITY_GEOGRAPHIC_TYPES,
+    }:
+        raise ValueError("transfer geographic type is invalid")
+    parent_ids = facts["location_parent_ids"]
+    if (
+        not isinstance(parent_ids, list)
+        or not parent_ids
+        or not all(isinstance(value, str) and value for value in parent_ids)
+    ):
+        raise TypeError("transfer location parents are invalid")
+    disjoint_ids = facts["location_verified_disjoint_place_ids"]
+    if (
+        not isinstance(disjoint_ids, list)
+        or len(disjoint_ids) > 128
+        or not all(isinstance(value, str) and value for value in disjoint_ids)
+        or len(disjoint_ids) != len(set(disjoint_ids))
+        or facts["place_id"] in disjoint_ids
+        or bool(set(parent_ids).intersection(disjoint_ids))
+    ):
+        raise TypeError("transfer location disjoint proof is invalid")
+    if facts[opportunity_type] is not True:
+        raise ValueError("transfer opportunity fact is required")
+    list_allowlists = {
+        "positions": set(_GAME_SEARCH_DETAIL_VALUES["positions"]),
+        "playing_levels": set(_GAME_SEARCH_DETAIL_VALUES["playing_levels"]),
+        "team_formats": set(_GAME_SEARCH_DETAIL_VALUES["team_formats"]),
+        "venue_settings": set(_GAME_SEARCH_DETAIL_VALUES["venue_settings"]),
+        "playing_surfaces": set(_GAME_SEARCH_DETAIL_VALUES["playing_surfaces"]),
+    }
+    for field_name, allowed in list_allowlists.items():
+        values = facts[field_name]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(cast(list[str], values)))
+            or not all(isinstance(value, str) and value in allowed for value in values)
+        ):
+            raise ValueError(f"transfer {field_name} is invalid")
+    _validate_transfer_seasonal_timing_fact(facts["seasonal_timing"])
+    if facts["payment"] not in {None, "free", "paid"}:
+        raise ValueError("transfer payment is invalid")
+    payment_amount = facts["payment_amount"]
+    payment_currency = facts["payment_currency"]
+    if (payment_amount is None) != (payment_currency is None) or (
+        payment_amount is not None
+        and (
+            facts["payment"] != "paid"
+            or not isinstance(payment_amount, str)
+            or not payment_amount
+            or not isinstance(payment_currency, str)
+            or not payment_currency
+        )
+    ):
+        raise ValueError("transfer payment details are invalid")
+    source_posted_at = _required_iso_datetime(facts, "source_posted_at")
+    source_qualifying_assertion_at = _required_iso_datetime(
+        facts, "source_qualifying_assertion_at"
+    )
+    posted = datetime.fromisoformat(source_posted_at)
+    qualifying = datetime.fromisoformat(source_qualifying_assertion_at)
+    if qualifying < posted:
+        raise ValueError("transfer qualifying assertion predates publication")
+    source_edited_at = facts["source_edited_at"]
+    if source_edited_at is not None:
+        if not isinstance(source_edited_at, str):
+            raise TypeError("transfer source_edited_at must be text or null")
+        edited = datetime.fromisoformat(
+            _required_iso_datetime(facts, "source_edited_at")
+        )
+        if qualifying > edited:
+            raise ValueError("transfer qualifying assertion is after edit")
+    elif qualifying != posted:
+        raise ValueError("transfer qualifying assertion requires an edit")
+
+
+def _validate_transfer_seasonal_timing_fact(value: JsonValue) -> None:
+    """Validate the normalized optional Seasonal Timing object."""
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"kind", "value"}:
+        raise ValueError("transfer Seasonal Timing is incomplete")
+    kind = value["kind"]
+    raw_value = value["value"]
+    if kind == "ready_now":
+        if raw_value is not None:
+            raise ValueError("ready_now Seasonal Timing cannot carry a value")
+        return
+    if not isinstance(raw_value, str) or not raw_value:
+        raise ValueError("transfer Seasonal Timing value is invalid")
+    if kind == "start_local_date":
+        try:
+            parsed = date.fromisoformat(raw_value)
+        except ValueError as error:
+            raise ValueError("transfer Seasonal Timing date is invalid") from error
+        if parsed.isoformat() != raw_value:
+            raise ValueError("transfer Seasonal Timing date is not normalized")
+        return
+    if kind == "stated_season":
+        if (
+            len(raw_value) > 80
+            or raw_value != raw_value.casefold()
+            or raw_value != raw_value.strip()
+        ):
+            raise ValueError("transfer Seasonal Timing season is not normalized")
+        return
+    raise ValueError("transfer Seasonal Timing kind is invalid")
 
 
 def _validate_protected_content_skip(

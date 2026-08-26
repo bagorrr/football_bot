@@ -38,11 +38,82 @@ class ResponsesClassifierAdapter:
         prompt_paths: Mapping[str, Path],
         adapter_version: str,
         smoke_test: Callable[[], bool] | None = None,
+        primary_schema_version: str | None = None,
     ) -> None:
         self._transport = transport
         self._schemas = dict(schemas)
         self._prompt_paths = dict(prompt_paths)
         self._adapter_version = adapter_version
+        v2_primary_available = (
+            "source-message-classification-v2" in self._schemas
+            and "open-match-primary-v2" in self._prompt_paths
+        )
+        player_v3_artifacts_complete = (
+            "source-message-classification-v3" in self._schemas
+            and "player-match-primary-v1" in self._prompt_paths
+            and "player-match-ambiguity-v1" in self._prompt_paths
+            and "source-semantic-proof-v2" in self._schemas
+            and "player-match-semantic-proof-v1" in self._prompt_paths
+        )
+        open_v3_artifacts_complete = (
+            "source-message-classification-v3" in self._schemas
+            and "open-match-primary-v3" in self._prompt_paths
+            and "open-match-ambiguity-v2" in self._prompt_paths
+            and "source-semantic-proof-v2" in self._schemas
+            and "open-match-semantic-proof-v2" in self._prompt_paths
+        )
+        v3_artifacts_complete = (
+            player_v3_artifacts_complete or open_v3_artifacts_complete
+        )
+        if primary_schema_version is None:
+            available_versions = [
+                version
+                for version, available in (
+                    ("source-message-classification-v2", v2_primary_available),
+                    ("source-message-classification-v3", v3_artifacts_complete),
+                )
+                if available
+            ]
+            if len(available_versions) > 1:
+                raise ValueError(
+                    "classifier artifact version requires explicit activation"
+                )
+            # A proof-only adapter is a supported narrow seam: it can be
+            # constructed with only semantic-proof artifacts and used through
+            # ``semantic_proof`` without advertising a primary release.
+            primary_schema_version = (
+                available_versions[0]
+                if available_versions
+                else "source-message-classification-v1"
+            )
+        if primary_schema_version == "source-message-classification-v3" and not (
+            v3_artifacts_complete
+        ):
+            raise ValueError("incomplete v3 classifier artifact set")
+        if primary_schema_version == "source-message-classification-v2" and not (
+            v2_primary_available
+        ):
+            raise ValueError("incomplete v2 classifier artifact set")
+        self._primary_schema_version = primary_schema_version
+        if self._primary_schema_version not in {
+            "source-message-classification-v1",
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise ValueError("unsupported primary classifier schema version")
+        self._primary_prompt_version = (
+            "player-match-primary-v1"
+            if self._primary_schema_version == "source-message-classification-v3"
+            and player_v3_artifacts_complete
+            and not open_v3_artifacts_complete
+            else (
+                "open-match-primary-v3"
+                if self._primary_schema_version == "source-message-classification-v3"
+                else "open-match-primary-v2"
+                if self._primary_schema_version == "source-message-classification-v2"
+                else "open-match-primary-v1"
+            )
+        )
         self._smoke_test = smoke_test
 
     @property
@@ -51,17 +122,12 @@ class ResponsesClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
-        if (
-            "source-message-classification-v3" in self._schemas
-            and "player-match-primary-v1" in self._prompt_paths
-        ):
-            return "source-message-classification-v3"
-        if (
-            "source-message-classification-v2" in self._schemas
-            and "open-match-primary-v2" in self._prompt_paths
-        ):
-            return "source-message-classification-v2"
-        return "source-message-classification-v1"
+        return self._primary_schema_version
+
+    @property
+    def primary_prompt_version(self) -> str:
+        """Return the primary prompt artifact selected by this adapter."""
+        return self._primary_prompt_version
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False
@@ -123,7 +189,9 @@ class ResponsesClassifierAdapter:
         return ClassifierAdapterResult(
             output=cast(dict[str, JsonValue], output),
             effective_model=str(response.get("effective_model", "")),
-            effective_reasoning_effort="high",
+            effective_reasoning_effort=str(
+                response.get("effective_reasoning_effort", "")
+            ),
             codex_version="not_applicable",
             adapter_kind=self.adapter_kind,
             adapter_version=self._adapter_version,

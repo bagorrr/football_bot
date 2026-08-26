@@ -314,6 +314,7 @@ class ControlledResponsesTransport:
         return {
             "output": _copy_json_object(raw_output),
             "effective_model": _MODEL,
+            "effective_reasoning_effort": _REASONING,
             "duration_ms": 1,
             "input_tokens": 0,
             "output_tokens": 0,
