@@ -33,6 +33,8 @@ from modules.domain import (
     DateInterpretationQuery,
     DateInterpretationResolution,
     DiscoveryDraft,
+    ExactRepostCluster,
+    ExactRepostClusterMember,
     GeographyConfirmation,
     GeographyConfirmationEvent,
     GeographySuggestion,
@@ -994,6 +996,16 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically accept a compound candidate batch and publish one state change."""
         ...
 
+    def moderate_exact_repost_cluster(
+        self,
+        *,
+        exact_repost_cluster_id: str,
+        decision: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Apply one application-owned moderation decision to a cluster."""
+        ...
+
     def project_opportunity(
         self,
         *,
@@ -1248,6 +1260,20 @@ class AcceptanceObserver(Protocol):
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
+        ...
+
+    def recommendation_opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe the Recommendation projection of accepted Opportunities."""
+        ...
+
+    def exact_repost_clusters(self) -> tuple[ExactRepostCluster, ...]:
+        """Observe application-owned Exact Repost Cluster state."""
+        ...
+
+    def exact_repost_cluster_members(
+        self, exact_repost_cluster_id: str
+    ) -> tuple[ExactRepostClusterMember, ...]:
+        """Observe one cluster's linked Source Message lineage."""
         ...
 
     def opportunity_publication_contracts(

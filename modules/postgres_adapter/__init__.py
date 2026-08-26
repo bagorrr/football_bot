@@ -47,6 +47,8 @@ from modules.domain import (
     ConversationStage,
     ConversationState,
     DiscoveryDraft,
+    ExactRepostCluster,
+    ExactRepostClusterMember,
     GeographicType,
     GeographyConfirmation,
     GeographyConfirmationEvent,
@@ -95,6 +97,8 @@ from modules.domain import (
     evaluate_player_search,
     evaluate_tournament_search,
     evaluate_transfer_search,
+    normalize_exact_repost_text,
+    source_publisher_id_from_metadata,
     tournament_publication_state_as_of,
 )
 from modules.ports import (
@@ -135,6 +139,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0023_tournament_discovery.sql",
     "0024_long_term_transfer_opportunities.sql",
     "0025_player_match_availability.sql",
+    "0026_exact_repost_clusters.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -164,6 +169,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "6cde9a66b0dc40e58189c3e4e6c0251e290aaa41eb559f897d043b420143dd55",
     "680c189420c71e3aa452a51cbee1a6ba786885d726cd1ad983a79fe891b5b5d9",
     "97d9f94ce319ba0fffdc6d7af64af7ae9422abe4ca1bbbc855a911a42ae764aa",
+    "7856483bc640ecb0d84b6f137a150ccaef971e393d2390d933d5df133187e764",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -644,6 +650,8 @@ class PostgresAcceptanceObserver:
                      football_runtime.classification_proof_work,
                      football_runtime.classification_routing_outcomes,
                      football_runtime.application_proposition_identities,
+                     football_runtime.application_exact_repost_cluster_members,
+                     football_runtime.application_exact_repost_clusters,
                      football_runtime.application_opportunities,
                      football_runtime.recommendation_opportunities,
                      football_runtime.source_message_revisions,
@@ -1116,7 +1124,8 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT opportunity_id, opportunity_revision_id,
                        source_message_revision_id,
-                       opportunity_type, publication_state, response_route
+                       opportunity_type, publication_state, response_route,
+                       publication_reason
                 FROM football_runtime.application_opportunities
                 ORDER BY accepted_at, opportunity_id
                 """
@@ -1132,9 +1141,95 @@ class PostgresAcceptanceObserver:
                     kind=row["response_route"]["kind"],
                     value=row["response_route"]["value"],
                 ),
+                publication_reason=row["publication_reason"],
             )
             for row in rows
         )
+
+    def recommendation_opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Recommendation's durable projection without table leakage."""
+        with psycopg.connect(
+            self._admin_database_url, row_factory=dict_row
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT recommendation.opportunity_id,
+                       recommendation.opportunity_revision_id,
+                       application.source_message_revision_id,
+                       recommendation.opportunity_type,
+                       recommendation.publication_state,
+                       recommendation.response_route,
+                       recommendation.publication_reason
+                FROM football_runtime.recommendation_opportunities AS recommendation
+                LEFT JOIN football_runtime.application_opportunities AS application
+                  ON application.opportunity_id =
+                     recommendation.opportunity_id
+                ORDER BY recommendation.published_at,
+                         recommendation.opportunity_id,
+                         recommendation.opportunity_revision_id
+                """
+            ).fetchall()
+        return tuple(
+            Opportunity(
+                opportunity_id=row["opportunity_id"],
+                opportunity_revision_id=row["opportunity_revision_id"],
+                source_message_revision_id=(
+                    row["source_message_revision_id"] or "unknown"
+                ),
+                opportunity_type=row["opportunity_type"],
+                publication_state=row["publication_state"],
+                response_route=OpportunityResponseRoute(
+                    kind=row["response_route"]["kind"],
+                    value=row["response_route"]["value"],
+                ),
+                publication_reason=row["publication_reason"],
+            )
+            for row in rows
+        )
+
+    def exact_repost_clusters(self) -> tuple[ExactRepostCluster, ...]:
+        """Observe durable Exact Repost Cluster state through the testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT exact_repost_cluster_id, cluster_key,
+                       source_chat_reference, source_publisher_id,
+                       normalized_body, resolved_event_date, opportunity_type,
+                       representative_opportunity_id,
+                       representative_source_message_id,
+                       representative_source_message_revision_id,
+                       publication_state, moderation_state,
+                       freshness_renewed_at, created_at, updated_at
+                FROM football_runtime.application_exact_repost_clusters
+                ORDER BY exact_repost_cluster_id
+                """
+            ).fetchall()
+        return tuple(ExactRepostCluster(**row) for row in rows)
+
+    def exact_repost_cluster_members(
+        self, exact_repost_cluster_id: str
+    ) -> tuple[ExactRepostClusterMember, ...]:
+        """Observe one cluster's current source lineage and publication roles."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT exact_repost_cluster_id, opportunity_id,
+                       source_message_id, source_message_revision_id,
+                       publication_state, publication_reason,
+                       is_representative, linked_at
+                FROM football_runtime.application_exact_repost_cluster_members
+                WHERE exact_repost_cluster_id = %s
+                ORDER BY source_message_id, opportunity_id
+                """,
+                (exact_repost_cluster_id,),
+            ).fetchall()
+        return tuple(ExactRepostClusterMember(**row) for row in rows)
 
     def completed_search_opportunity_revision_inputs(
         self, completed_search_id: str
@@ -3292,6 +3387,14 @@ class PostgresRoleStore:
                 )
                 for suppression_outgoing in source_suppression_outgoings:
                     _insert_outbox(connection, suppression_outgoing)
+                cluster_outgoings = _reconcile_exact_repost_clusters_for_source_message(
+                    connection,
+                    source_message_id=incoming.subject_id,
+                    incoming=incoming,
+                    recorded_at=received_at,
+                )
+                for cluster_outgoing in cluster_outgoings:
+                    _insert_outbox(connection, cluster_outgoing)
             if outgoing is not None:
                 _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
@@ -4628,13 +4731,14 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.application_opportunities (
                     opportunity_id, opportunity_revision_id,
                     source_message_revision_id, opportunity_type,
-                    publication_state, accepted_facts, evidence, response_route,
-                    accepted_at
-                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                    publication_state, publication_reason, accepted_facts,
+                    evidence, response_route, accepted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
                 ON CONFLICT (opportunity_id) DO UPDATE
                 SET opportunity_revision_id = EXCLUDED.opportunity_revision_id,
                     source_message_revision_id = EXCLUDED.source_message_revision_id,
                     publication_state = EXCLUDED.publication_state,
+                    publication_reason = EXCLUDED.publication_reason,
                     accepted_facts = EXCLUDED.accepted_facts,
                     evidence = EXCLUDED.evidence,
                     response_route = EXCLUDED.response_route,
@@ -4658,6 +4762,7 @@ class PostgresRoleStore:
                     opportunity["source_message_revision_id"],
                     opportunity["opportunity_type"],
                     opportunity["publication_state"],
+                    opportunity.get("publication_reason"),
                     json.dumps(opportunity["accepted_facts"]),
                     json.dumps(opportunity["evidence"]),
                     json.dumps(opportunity["response_route"]),
@@ -4669,9 +4774,32 @@ class PostgresRoleStore:
                 suppressed_opportunities=suppressed_opportunities,
                 recorded_at=received_at,
             )
+            cluster_outgoings, cluster_state, cluster_reason, cluster_transition = (
+                _reconcile_exact_repost_for_opportunity(
+                    connection,
+                    opportunity=opportunity,
+                    incoming=incoming,
+                    recorded_at=received_at,
+                    exclude_opportunity_id=opportunity_id,
+                )
+            )
+            if cluster_transition is not None:
+                outgoing = _publication_envelope_for_state(
+                    outgoing,
+                    publication_state=cluster_state,
+                    publication_reason=cluster_reason,
+                    transition_revision=(
+                        cluster_transition
+                        if cluster_state != opportunity.get("publication_state")
+                        or cluster_reason != opportunity.get("publication_reason")
+                        else None
+                    ),
+                )
             _insert_outbox(connection, outgoing)
             for additional_outgoing in additional_outgoings:
                 _insert_outbox(connection, additional_outgoing)
+            for cluster_outgoing in cluster_outgoings:
+                _insert_outbox(connection, cluster_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -4757,14 +4885,18 @@ class PostgresRoleStore:
                     INSERT INTO football_runtime.application_opportunities (
                         opportunity_id, opportunity_revision_id,
                         source_message_revision_id, opportunity_type,
-                        publication_state, accepted_facts, evidence, response_route,
-                        accepted_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+                        publication_state, publication_reason, accepted_facts,
+                        evidence, response_route, accepted_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s::jsonb,
+                        %s::jsonb, %s::jsonb, %s
+                    )
                     ON CONFLICT (opportunity_id) DO UPDATE
                     SET opportunity_revision_id = EXCLUDED.opportunity_revision_id,
                         source_message_revision_id =
                             EXCLUDED.source_message_revision_id,
                         publication_state = EXCLUDED.publication_state,
+                        publication_reason = EXCLUDED.publication_reason,
                         accepted_facts = EXCLUDED.accepted_facts,
                         evidence = EXCLUDED.evidence,
                         response_route = EXCLUDED.response_route,
@@ -4788,6 +4920,7 @@ class PostgresRoleStore:
                         opportunity["source_message_revision_id"],
                         opportunity["opportunity_type"],
                         opportunity["publication_state"],
+                        opportunity.get("publication_reason"),
                         json.dumps(opportunity["accepted_facts"]),
                         json.dumps(opportunity["evidence"]),
                         json.dumps(opportunity["response_route"]),
@@ -4802,8 +4935,81 @@ class PostgresRoleStore:
             _insert_outbox(connection, outgoing)
             for additional_outgoing in additional_outgoings:
                 _insert_outbox(connection, additional_outgoing)
+            for opportunity in opportunities:
+                cluster_outgoings, _, _, _ = _reconcile_exact_repost_for_opportunity(
+                    connection,
+                    opportunity=opportunity,
+                    incoming=incoming,
+                    recorded_at=received_at,
+                )
+                for cluster_outgoing in cluster_outgoings:
+                    _insert_outbox(connection, cluster_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
+
+    def moderate_exact_repost_cluster(
+        self,
+        *,
+        exact_repost_cluster_id: str,
+        decision: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Apply one durable moderation decision to every cluster member."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        moderation_state_by_decision = {
+            "approve": "approved",
+            "hold": "held_for_review",
+            "suppress": "suppressed",
+        }
+        moderation_state = moderation_state_by_decision.get(decision)
+        if moderation_state is None:
+            raise ValueError("exact repost moderation decision is invalid")
+        with psycopg.connect(self._database_url) as connection:
+            current = connection.execute(
+                """
+                SELECT moderation_state, publication_transition_revision
+                FROM football_runtime.application_exact_repost_clusters
+                WHERE exact_repost_cluster_id = %s
+                FOR UPDATE
+            """,
+                (exact_repost_cluster_id,),
+            ).fetchone()
+            if current is None:
+                raise LookupError(exact_repost_cluster_id)
+            if current[0] == moderation_state:
+                return False
+            causation_seed = uuid5(
+                NAMESPACE_URL,
+                "football-bot:exact-repost-moderation:"
+                f"{exact_repost_cluster_id}:{decision}:{current[1] + 1}",
+            )
+            correlation_id = causation_seed
+            connection.execute(
+                """
+                UPDATE football_runtime.application_exact_repost_clusters
+                SET moderation_state = %s, updated_at = %s
+                WHERE exact_repost_cluster_id = %s
+                """,
+                (moderation_state, recorded_at, exact_repost_cluster_id),
+            )
+            changes, transition_revision = _reconcile_exact_repost_cluster(
+                connection,
+                exact_repost_cluster_id=exact_repost_cluster_id,
+                causation_seed=causation_seed,
+                correlation_id=correlation_id,
+                recorded_at=recorded_at,
+            )
+            for cluster_outgoing in _exact_repost_changes_to_outgoings(
+                changes=changes,
+                cluster_id=exact_repost_cluster_id,
+                transition_revision=transition_revision,
+                causation_seed=causation_seed,
+                correlation_id=correlation_id,
+                recorded_at=recorded_at,
+            ):
+                _insert_outbox(connection, cluster_outgoing)
+        return True
 
     def project_opportunity(
         self,
@@ -4846,13 +5052,14 @@ class PostgresRoleStore:
                         """
                         INSERT INTO football_runtime.recommendation_opportunities (
                             opportunity_id, opportunity_revision_id, opportunity_type,
-                            publication_state, accepted_facts, response_route,
-                            published_at
-                        ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                            publication_state, publication_reason, accepted_facts,
+                            response_route, published_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
                         ON CONFLICT (opportunity_revision_id) DO UPDATE
                         SET opportunity_id = EXCLUDED.opportunity_id,
                             opportunity_type = EXCLUDED.opportunity_type,
                             publication_state = EXCLUDED.publication_state,
+                            publication_reason = EXCLUDED.publication_reason,
                             accepted_facts = EXCLUDED.accepted_facts,
                             response_route = EXCLUDED.response_route,
                             published_at = EXCLUDED.published_at
@@ -4864,6 +5071,7 @@ class PostgresRoleStore:
                             opportunity["opportunity_revision_id"],
                             opportunity["opportunity_type"],
                             payload["publication_state"],
+                            payload.get("publication_reason"),
                             json.dumps(opportunity["accepted_facts"]),
                             json.dumps(opportunity["response_route"]),
                             received_at,
@@ -4874,12 +5082,14 @@ class PostgresRoleStore:
                     f"""
                     INSERT INTO football_runtime.recommendation_opportunities (
                         opportunity_id, opportunity_revision_id, opportunity_type,
-                        publication_state, accepted_facts, response_route, published_at
-                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+                        publication_state, publication_reason, accepted_facts,
+                        response_route, published_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
                         ON CONFLICT (opportunity_revision_id) DO UPDATE
                         SET opportunity_id = EXCLUDED.opportunity_id,
                             opportunity_type = EXCLUDED.opportunity_type,
                             publication_state = EXCLUDED.publication_state,
+                            publication_reason = EXCLUDED.publication_reason,
                             accepted_facts = EXCLUDED.accepted_facts,
                             response_route = EXCLUDED.response_route,
                             published_at = EXCLUDED.published_at
@@ -4892,6 +5102,7 @@ class PostgresRoleStore:
                         payload["opportunity_revision_id"],
                         payload["opportunity_type"],
                         payload["publication_state"],
+                        payload.get("publication_reason"),
                         json.dumps(payload["accepted_facts"]),
                         json.dumps(payload["response_route"]),
                         received_at,
@@ -8193,6 +8404,12 @@ def _suppress_source_event_opportunities(
     recorded_at: datetime,
 ) -> tuple[ContractEnvelope, ...]:
     """Suppress every prior derived identity while accepting an edit or delete."""
+    incoming_payload = incoming.payload
+    event_kind = (
+        incoming_payload.get("event_kind")
+        if isinstance(incoming_payload, dict)
+        else None
+    )
     current_revision = connection.execute(
         """
         SELECT current_revision
@@ -8295,6 +8512,11 @@ def _suppress_source_event_opportunities(
             "opportunity_type": row[3],
             "source_publication_state": row[4],
             "publication_state": "suppressed",
+            "publication_reason": (
+                "source_deleted"
+                if event_kind == SourceEventKind.DELETE.value
+                else "source_revision_superseded"
+            ),
             "accepted_facts": row[5],
             "evidence": row[6],
             "response_route": row[7],
@@ -8374,6 +8596,7 @@ def _suppress_source_event_opportunities(
                     "opportunity_revision_id": opportunity_revision_id,
                     "source_message_revision_id": source_message_revision_id,
                     "publication_state": "suppressed",
+                    "publication_reason": item["publication_reason"],
                     "opportunity_type": item["opportunity_type"],
                     "accepted_facts": item["accepted_facts"],
                     "response_route": item["response_route"],
@@ -8459,6 +8682,693 @@ def _insert_outbox(
     )
 
 
+_EXACT_REPOST_PUBLICATION_REASONS = frozenset(
+    {
+        "source_revision_superseded",
+        "source_deleted",
+        "exact_repost_superseded",
+        "moderation_held",
+        "moderation_suppressed",
+    }
+)
+
+
+def _exact_repost_resolved_event_date(
+    accepted_facts: Mapping[str, JsonValue],
+) -> str | None:
+    """Return the application-resolved calendar identity used for clustering."""
+    start = accepted_facts.get("start_local_date")
+    end = accepted_facts.get("end_local_date")
+    if isinstance(start, str) and isinstance(end, str):
+        try:
+            parsed_start = date.fromisoformat(start)
+            parsed_end = date.fromisoformat(end)
+        except ValueError:
+            return None
+        if parsed_start > parsed_end:
+            return None
+        return f"{parsed_start.isoformat()}/{parsed_end.isoformat()}"
+    for field_name in ("event_date", "local_date", "date"):
+        value = accepted_facts.get(field_name)
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value).isoformat()
+            except ValueError:
+                continue
+    return None
+
+
+def _exact_repost_source_chat_reference(source_message_id: str) -> str | None:
+    scope, separator, _ = source_message_id.partition(":generation:")
+    return scope if separator and scope else None
+
+
+def _exact_repost_key(
+    *,
+    source_chat_reference: str,
+    source_publisher_id: str,
+    normalized_body: str,
+    resolved_event_date: str,
+) -> str:
+    material = json.dumps(
+        {
+            "resolved_event_date": resolved_event_date,
+            "source_chat_reference": source_chat_reference,
+            "source_publisher_id": source_publisher_id,
+            "normalized_body": normalized_body,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
+def _exact_repost_candidate_is_fresh(
+    opportunity_type: str,
+    accepted_facts: Mapping[str, Any],
+    *,
+    as_of: datetime,
+) -> bool:
+    """Apply the publication freshness cutoff to a cluster candidate."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return False
+    if opportunity_type in {
+        "roster_vacancy",
+        "player_transfer_availability",
+    }:
+        qualifying_text = accepted_facts.get("source_qualifying_assertion_at")
+        if not isinstance(qualifying_text, str):
+            qualifying_text = accepted_facts.get("source_posted_at")
+        if not isinstance(qualifying_text, str):
+            return False
+        try:
+            qualifying_at = datetime.fromisoformat(qualifying_text)
+        except ValueError:
+            return False
+        return (
+            qualifying_at.tzinfo is not None
+            and qualifying_at.utcoffset() is not None
+            and as_of < qualifying_at + timedelta(days=30)
+        )
+    try:
+        start = date.fromisoformat(str(accepted_facts["start_local_date"]))
+        end = date.fromisoformat(str(accepted_facts["end_local_date"]))
+        timezone = ZoneInfo(str(accepted_facts["iana_timezone"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if end < start:
+        return False
+    exact_time = accepted_facts.get("exact_local_time")
+    if isinstance(exact_time, str) and start == end:
+        try:
+            expiry = datetime.combine(
+                start,
+                datetime.strptime(exact_time, "%H:%M").time(),
+                tzinfo=timezone,
+            )
+        except ValueError:
+            return False
+    else:
+        expiry = datetime.combine(
+            end + timedelta(days=1), datetime.min.time(), tzinfo=timezone
+        )
+    return as_of.astimezone(timezone) < expiry
+
+
+def _publication_envelope_for_state(
+    outgoing: ContractEnvelope,
+    *,
+    publication_state: str,
+    publication_reason: str | None,
+    transition_revision: int | None = None,
+) -> ContractEnvelope:
+    """Adjust a publication handoff after durable cluster arbitration."""
+    payload = outgoing.payload
+    if not isinstance(payload, dict):
+        raise TypeError("publication envelope payload must be an object")
+    adjusted_payload = dict(payload)
+    adjusted_payload["publication_state"] = publication_state
+    if publication_reason is None:
+        adjusted_payload.pop("publication_reason", None)
+    else:
+        adjusted_payload["publication_reason"] = publication_reason
+    idempotency_key = outgoing.idempotency_key
+    if transition_revision is not None and transition_revision > 0:
+        opportunity_revision_id = adjusted_payload.get("opportunity_revision_id")
+        if not isinstance(opportunity_revision_id, str) or not opportunity_revision_id:
+            raise ValueError("publication envelope revision identity is incomplete")
+        idempotency_key = (
+            "opportunity-publication-exact-repost:"
+            f"{opportunity_revision_id}:{publication_state}:{transition_revision}"
+        )
+    return replace(
+        outgoing,
+        idempotency_key=idempotency_key,
+        payload=cast(JsonValue, adjusted_payload),
+    )
+
+
+def _exact_repost_publication_outgoing(
+    *,
+    change: Mapping[str, Any],
+    cluster_id: str,
+    transition_revision: int,
+    causation_seed: UUID,
+    correlation_id: UUID,
+    recorded_at: datetime,
+) -> ContractEnvelope:
+    """Build one durable publication transition emitted by cluster arbitration."""
+    opportunity_id = change["opportunity_id"]
+    opportunity_revision_id = change["opportunity_revision_id"]
+    source_message_revision_id = change["source_message_revision_id"]
+    opportunity_type = change["opportunity_type"]
+    publication_state = change["publication_state"]
+    publication_reason = change["publication_reason"]
+    revision_text = opportunity_revision_id.rsplit(":revision:", 1)[-1]
+    if not revision_text.isdigit() or int(revision_text) < 1:
+        raise ValueError("exact repost opportunity revision is invalid")
+    if (
+        publication_reason is not None
+        and publication_reason not in _EXACT_REPOST_PUBLICATION_REASONS
+    ):
+        raise ValueError("exact repost publication reason is invalid")
+    transition_causation_id = uuid5(
+        NAMESPACE_URL,
+        (
+            f"football-bot:{causation_seed}:exact-repost:{cluster_id}:"
+            f"{transition_revision}:{opportunity_id}:{publication_state}"
+        ),
+    )
+    payload: dict[str, JsonValue] = {
+        "opportunity_id": opportunity_id,
+        "opportunity_revision_id": opportunity_revision_id,
+        "source_message_revision_id": source_message_revision_id,
+        "publication_state": publication_state,
+        "opportunity_type": opportunity_type,
+        "accepted_facts": change["accepted_facts"],
+        "response_route": change["response_route"],
+    }
+    if publication_reason is not None:
+        payload["publication_reason"] = publication_reason
+    return ContractEnvelope(
+        contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        contract_version=2,
+        message_id=derive_contract_message_id(
+            transition_causation_id,
+            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        ),
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.RECOMMENDATION,
+        subject_id=opportunity_id,
+        subject_revision=int(revision_text),
+        idempotency_key=(
+            "opportunity-publication-exact-repost:"
+            f"{opportunity_revision_id}:{publication_state}:{transition_revision}"
+        ),
+        causation_id=transition_causation_id,
+        correlation_id=correlation_id,
+        recorded_at=recorded_at,
+        payload=payload,
+    )
+
+
+def _reconcile_exact_repost_cluster(
+    connection: psycopg.Connection[Any],
+    *,
+    exact_repost_cluster_id: str,
+    causation_seed: UUID,
+    correlation_id: UUID,
+    recorded_at: datetime,
+) -> tuple[tuple[dict[str, Any], ...], int]:
+    """Select one current representative and persist every member transition."""
+    cluster = connection.execute(
+        """
+        SELECT exact_repost_cluster_id, moderation_state,
+               representative_opportunity_id,
+               representative_source_message_id,
+               representative_source_message_revision_id,
+               publication_state, publication_transition_revision
+        FROM football_runtime.application_exact_repost_clusters
+        WHERE exact_repost_cluster_id = %s
+        FOR UPDATE
+        """,
+        (exact_repost_cluster_id,),
+    ).fetchone()
+    if cluster is None:
+        return (), 0
+    rows = connection.execute(
+        """
+        SELECT member.opportunity_id, member.source_message_id,
+               member.source_message_revision_id AS member_source_revision_id,
+               member.publication_state AS member_publication_state,
+               member.publication_reason AS member_publication_reason,
+               member.is_representative,
+               opportunity.opportunity_revision_id,
+               opportunity.source_message_revision_id AS opportunity_source_revision_id,
+               opportunity.opportunity_type,
+               opportunity.publication_state,
+               opportunity.publication_reason,
+               opportunity.accepted_facts, opportunity.response_route,
+               source.current_revision, source.tombstoned, source.event_time,
+               source.recorded_at, source.telegram_message_id,
+               current_revision.source_message_revision_id AS current_source_revision_id
+        FROM football_runtime.application_exact_repost_cluster_members AS member
+        JOIN football_runtime.application_opportunities AS opportunity
+          ON opportunity.opportunity_id = member.opportunity_id
+        JOIN football_runtime.source_messages AS source
+          ON source.source_message_id = member.source_message_id
+        JOIN football_runtime.source_message_revisions AS current_revision
+          ON current_revision.source_message_id = source.source_message_id
+         AND current_revision.revision = source.current_revision
+        WHERE member.exact_repost_cluster_id = %s
+        ORDER BY member.opportunity_id
+        FOR UPDATE OF member, opportunity
+        """,
+        (exact_repost_cluster_id,),
+    ).fetchall()
+    moderation_state = cluster[1]
+    live_candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            not row[14]
+            and row[7] == row[18]
+            and row[9] in {"active", "held_for_review", "suppressed"}
+            and row[10]
+            in {
+                None,
+                "exact_repost_superseded",
+                "moderation_held",
+                "moderation_suppressed",
+            }
+            and _exact_repost_candidate_is_fresh(
+                row[8],
+                row[11],
+                as_of=recorded_at,
+            )
+        ):
+            live_candidates.append(
+                {
+                    "opportunity_id": row[0],
+                    "source_message_id": row[1],
+                    "opportunity_revision_id": row[6],
+                    "source_message_revision_id": row[18],
+                    "opportunity_type": row[8],
+                    "accepted_facts": row[11],
+                    "response_route": row[12],
+                    "event_time": row[15],
+                    "recorded_at": row[16],
+                    "telegram_message_id": row[17],
+                }
+            )
+    selected: dict[str, Any] | None = None
+    if moderation_state not in {"held_for_review", "suppressed"}:
+        selected = max(
+            live_candidates,
+            key=lambda item: (
+                item["event_time"],
+                item["recorded_at"],
+                item["telegram_message_id"],
+                item["opportunity_id"],
+            ),
+            default=None,
+        )
+    changes: list[dict[str, Any]] = []
+    for row in rows:
+        opportunity_id = row[0]
+        is_deleted = bool(row[14])
+        is_current = row[7] == row[18]
+        if is_deleted:
+            desired_state = "suppressed"
+            desired_reason = "source_deleted"
+        elif moderation_state == "held_for_review":
+            desired_state = "held_for_review"
+            desired_reason = "moderation_held"
+        elif moderation_state == "suppressed":
+            desired_state = "suppressed"
+            desired_reason = "moderation_suppressed"
+        elif selected is not None and selected["opportunity_id"] == opportunity_id:
+            desired_state = "active"
+            desired_reason = None
+        elif is_current and not _exact_repost_candidate_is_fresh(
+            row[8],
+            row[11],
+            as_of=recorded_at,
+        ):
+            desired_state = "expired"
+            desired_reason = None
+        elif row[10] == "source_revision_superseded":
+            desired_state = "suppressed"
+            desired_reason = "source_revision_superseded"
+        elif is_current and (
+            row[9] in {"active", "held_for_review", "suppressed"}
+            and row[10]
+            in {
+                None,
+                "exact_repost_superseded",
+                "moderation_held",
+                "moderation_suppressed",
+            }
+        ):
+            desired_state = "suppressed"
+            desired_reason = "exact_repost_superseded"
+        else:
+            desired_state = row[9]
+            desired_reason = row[10]
+        changed = (
+            row[9] != desired_state
+            or row[10] != desired_reason
+            or row[2] != row[18]
+            or row[3] != desired_state
+            or row[4] != desired_reason
+            or row[5]
+            != (selected is not None and selected["opportunity_id"] == opportunity_id)
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_opportunities
+            SET publication_state = %s, publication_reason = %s
+            WHERE opportunity_id = %s
+            """,
+            (desired_state, desired_reason, opportunity_id),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_exact_repost_cluster_members
+            SET source_message_revision_id = %s,
+                publication_state = %s,
+                publication_reason = %s,
+                is_representative = %s
+            WHERE exact_repost_cluster_id = %s
+              AND opportunity_id = %s
+            """,
+            (
+                row[18],
+                desired_state,
+                desired_reason,
+                selected is not None and selected["opportunity_id"] == opportunity_id,
+                exact_repost_cluster_id,
+                opportunity_id,
+            ),
+        )
+        if changed:
+            changes.append(
+                {
+                    "opportunity_id": opportunity_id,
+                    "opportunity_revision_id": row[6],
+                    "source_message_revision_id": row[18],
+                    "opportunity_type": row[8],
+                    "accepted_facts": row[11],
+                    "response_route": row[12],
+                    "publication_state": desired_state,
+                    "publication_reason": desired_reason,
+                }
+            )
+    if moderation_state == "held_for_review" and any(not row[14] for row in rows):
+        publication_state = "held_for_review"
+    elif selected is not None:
+        publication_state = "active"
+    elif rows and all(
+        row[14]
+        or not _exact_repost_candidate_is_fresh(row[8], row[11], as_of=recorded_at)
+        for row in rows
+    ):
+        publication_state = "expired"
+    else:
+        publication_state = "suppressed"
+    representative = selected
+    cluster_changed = (
+        cluster[2] != (representative["opportunity_id"] if representative else None)
+        or cluster[3]
+        != (representative["source_message_id"] if representative else None)
+        or cluster[4]
+        != (representative["source_message_revision_id"] if representative else None)
+        or cluster[5] != publication_state
+        or bool(changes)
+    )
+    transition_revision = cluster[6]
+    if cluster_changed and changes:
+        transition_revision += 1
+    connection.execute(
+        """
+        UPDATE football_runtime.application_exact_repost_clusters
+        SET representative_opportunity_id = %s,
+            representative_source_message_id = %s,
+            representative_source_message_revision_id = %s,
+            publication_state = %s,
+            publication_transition_revision = %s,
+            updated_at = %s
+        WHERE exact_repost_cluster_id = %s
+        """,
+        (
+            representative["opportunity_id"] if representative else None,
+            representative["source_message_id"] if representative else None,
+            representative["source_message_revision_id"] if representative else None,
+            publication_state,
+            transition_revision,
+            recorded_at,
+            exact_repost_cluster_id,
+        ),
+    )
+    return tuple(changes), transition_revision
+
+
+def _exact_repost_changes_to_outgoings(
+    *,
+    changes: Iterable[dict[str, Any]],
+    cluster_id: str,
+    transition_revision: int,
+    causation_seed: UUID,
+    correlation_id: UUID,
+    recorded_at: datetime,
+    exclude_opportunity_id: str | None = None,
+) -> tuple[ContractEnvelope, ...]:
+    if transition_revision < 1:
+        return ()
+    return tuple(
+        _exact_repost_publication_outgoing(
+            change=change,
+            cluster_id=cluster_id,
+            transition_revision=transition_revision,
+            causation_seed=causation_seed,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+        )
+        for change in changes
+        if change["opportunity_id"] != exclude_opportunity_id
+    )
+
+
+def _reconcile_exact_repost_for_opportunity(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity: Mapping[str, JsonValue],
+    incoming: ContractEnvelope,
+    recorded_at: datetime,
+    exclude_opportunity_id: str | None = None,
+) -> tuple[tuple[ContractEnvelope, ...], str, str | None, int | None]:
+    """Apply durable exact-repost arbitration after Application accepted a row."""
+    opportunity_id = opportunity.get("opportunity_id")
+    source_revision_id = opportunity.get("source_message_revision_id")
+    opportunity_type = opportunity.get("opportunity_type")
+    accepted_facts = opportunity.get("accepted_facts")
+    if not all(
+        isinstance(value, str) and value
+        for value in (opportunity_id, source_revision_id, opportunity_type)
+    ) or not isinstance(accepted_facts, dict):
+        raise ValueError("exact repost opportunity identity is incomplete")
+    source = connection.execute(
+        """
+        SELECT source_message_id, body, bounded_metadata
+        FROM football_runtime.source_message_revisions
+        WHERE source_message_revision_id = %s
+        """,
+        (source_revision_id,),
+    ).fetchone()
+    if source is None or not isinstance(source[1], str):
+        return (), "active", None, None
+    source_chat_reference = _exact_repost_source_chat_reference(source[0])
+    publisher_id = source_publisher_id_from_metadata(source[2])
+    resolved_event_date = _exact_repost_resolved_event_date(accepted_facts)
+    normalized_body = normalize_exact_repost_text(source[1])
+    if (
+        source_chat_reference is None
+        or publisher_id is None
+        or not normalized_body
+        or resolved_event_date is None
+    ):
+        return (), "active", None, None
+    cluster_key = _exact_repost_key(
+        source_chat_reference=source_chat_reference,
+        source_publisher_id=publisher_id,
+        normalized_body=normalized_body,
+        resolved_event_date=resolved_event_date,
+    )
+    cluster_id = f"exact-repost-cluster:{cluster_key}"
+    old_cluster_ids = tuple(
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT exact_repost_cluster_id
+            FROM football_runtime.application_exact_repost_cluster_members
+            WHERE opportunity_id = %s
+            FOR UPDATE
+            """,
+            (opportunity_id,),
+        ).fetchall()
+    )
+    outgoings: list[ContractEnvelope] = []
+    for old_cluster_id in old_cluster_ids:
+        if old_cluster_id == cluster_id:
+            continue
+        connection.execute(
+            """
+            DELETE FROM football_runtime.application_exact_repost_cluster_members
+            WHERE opportunity_id = %s
+              AND exact_repost_cluster_id = %s
+            """,
+            (opportunity_id, old_cluster_id),
+        )
+        old_changes, old_transition = _reconcile_exact_repost_cluster(
+            connection,
+            exact_repost_cluster_id=old_cluster_id,
+            causation_seed=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+        )
+        outgoings.extend(
+            _exact_repost_changes_to_outgoings(
+                changes=old_changes,
+                cluster_id=old_cluster_id,
+                transition_revision=old_transition,
+                causation_seed=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+            )
+        )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.application_exact_repost_clusters (
+            exact_repost_cluster_id, cluster_key, source_chat_reference,
+            source_publisher_id, normalized_body, resolved_event_date,
+            opportunity_type, publication_state, moderation_state,
+            freshness_renewed_at, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', 'none', %s, %s, %s)
+        ON CONFLICT (cluster_key) DO UPDATE
+        SET freshness_renewed_at = GREATEST(
+                application_exact_repost_clusters.freshness_renewed_at,
+                EXCLUDED.freshness_renewed_at
+            ),
+            updated_at = EXCLUDED.updated_at
+        """,
+        (
+            cluster_id,
+            cluster_key,
+            source_chat_reference,
+            publisher_id,
+            normalized_body,
+            resolved_event_date,
+            opportunity_type,
+            recorded_at,
+            recorded_at,
+            recorded_at,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.application_exact_repost_cluster_members (
+            exact_repost_cluster_id, opportunity_id, source_message_id,
+            source_message_revision_id, publication_state, publication_reason,
+            is_representative, linked_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, false, %s)
+        ON CONFLICT (exact_repost_cluster_id, opportunity_id) DO UPDATE
+        SET source_message_id = EXCLUDED.source_message_id,
+            source_message_revision_id = EXCLUDED.source_message_revision_id,
+            publication_state = EXCLUDED.publication_state,
+            publication_reason = EXCLUDED.publication_reason,
+            linked_at = EXCLUDED.linked_at
+        """,
+        (
+            cluster_id,
+            opportunity_id,
+            source[0].rsplit(":revision:", 1)[0]
+            if ":revision:" in source[0]
+            else source[0],
+            source_revision_id,
+            opportunity.get("publication_state", "active"),
+            opportunity.get("publication_reason"),
+            recorded_at,
+        ),
+    )
+    changes, transition_revision = _reconcile_exact_repost_cluster(
+        connection,
+        exact_repost_cluster_id=cluster_id,
+        causation_seed=incoming.message_id,
+        correlation_id=incoming.correlation_id,
+        recorded_at=recorded_at,
+    )
+    current_state = "active"
+    current_reason: str | None = None
+    for change in changes:
+        if change["opportunity_id"] == opportunity_id:
+            current_state = change["publication_state"]
+            current_reason = change["publication_reason"]
+    outgoings.extend(
+        _exact_repost_changes_to_outgoings(
+            changes=changes,
+            cluster_id=cluster_id,
+            transition_revision=transition_revision,
+            causation_seed=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+            exclude_opportunity_id=exclude_opportunity_id,
+        )
+    )
+    return tuple(outgoings), current_state, current_reason, transition_revision or None
+
+
+def _reconcile_exact_repost_clusters_for_source_message(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+    incoming: ContractEnvelope,
+    recorded_at: datetime,
+) -> tuple[ContractEnvelope, ...]:
+    """Re-elect a cluster after a Source Message edit or deletion."""
+    cluster_ids = tuple(
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT exact_repost_cluster_id
+            FROM football_runtime.application_exact_repost_cluster_members
+            WHERE source_message_id = %s
+            ORDER BY exact_repost_cluster_id
+            """,
+            (source_message_id,),
+        ).fetchall()
+    )
+    outgoings: list[ContractEnvelope] = []
+    for cluster_id in cluster_ids:
+        changes, transition_revision = _reconcile_exact_repost_cluster(
+            connection,
+            exact_repost_cluster_id=cluster_id,
+            causation_seed=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+        )
+        outgoings.extend(
+            _exact_repost_changes_to_outgoings(
+                changes=changes,
+                cluster_id=cluster_id,
+                transition_revision=transition_revision,
+                causation_seed=incoming.message_id,
+                correlation_id=incoming.correlation_id,
+                recorded_at=recorded_at,
+            )
+        )
+    return tuple(outgoings)
+
+
 def _suppress_application_opportunities(
     connection: psycopg.Connection[Any],
     *,
@@ -8479,6 +9389,7 @@ def _suppress_application_opportunities(
         accepted_facts = opportunity.get("accepted_facts")
         evidence = opportunity.get("evidence")
         response_route = opportunity.get("response_route")
+        publication_reason = opportunity.get("publication_reason")
         if not all(
             isinstance(value, str) and value
             for value in (
@@ -8506,6 +9417,8 @@ def _suppress_application_opportunities(
             or not storage_opportunity_revision_id
         ):
             raise ValueError("suppressed opportunity storage identity is incomplete")
+        if publication_reason is not None and not isinstance(publication_reason, str):
+            raise ValueError("suppressed opportunity publication reason is invalid")
         assert isinstance(source_message_revision_id, str)
         if current_source_message_revision_id is None:
             current_revision_guard = """
@@ -8552,6 +9465,7 @@ def _suppress_application_opportunities(
                 source_message_revision_id = %s,
                 opportunity_type = %s,
                 publication_state = 'suppressed',
+                publication_reason = %s,
                 accepted_facts = %s::jsonb,
                 evidence = %s::jsonb,
                 response_route = %s::jsonb,
@@ -8563,6 +9477,7 @@ def _suppress_application_opportunities(
                 storage_opportunity_revision_id,
                 source_message_revision_id,
                 opportunity_type,
+                publication_reason,
                 json.dumps(accepted_facts),
                 json.dumps(evidence),
                 json.dumps(response_route),

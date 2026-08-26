@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
@@ -401,6 +402,35 @@ def empty_bounded_source_metadata() -> dict[str, Any]:
     }
 
 
+def normalize_exact_repost_text(value: str) -> str:
+    """Normalize only decorative variation allowed by Exact Repost matching.
+
+    Exact repost identity deliberately keeps words, numbers, dates, handles,
+    URLs, and other source punctuation intact.  It only applies Unicode
+    compatibility normalization, case folding, whitespace collapsing,
+    repeated punctuation collapsing, and removal of standalone pictographs.
+    """
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character) != "So"
+        and character not in {"\ufe0e", "\ufe0f", "\u200d"}
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return re.sub(r"([^\w\s])\1+", r"\1", normalized, flags=re.UNICODE)
+
+
+def source_publisher_id_from_metadata(
+    metadata: Mapping[str, Any],
+) -> str | None:
+    """Read the stable visible-publisher identity, if the source supplied one."""
+    value = metadata.get("source_publisher_id")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
 def is_valid_source_chat_address(
     address: str,
     *,
@@ -625,6 +655,11 @@ class SourceMessage:
     )
     reply_to_telegram_message_id: int | None = None
 
+    @property
+    def source_publisher_id(self) -> str | None:
+        """Return the source-visible publisher identity carried by metadata."""
+        return source_publisher_id_from_metadata(self.bounded_metadata)
+
 
 @dataclass(frozen=True, slots=True)
 class SourceEventRecord:
@@ -644,6 +679,11 @@ class SourceEventRecord:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+
+    @property
+    def source_publisher_id(self) -> str | None:
+        """Return the source-visible publisher identity carried by metadata."""
+        return source_publisher_id_from_metadata(self.bounded_metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,6 +726,46 @@ class SourceMessageRevision:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+
+    @property
+    def source_publisher_id(self) -> str | None:
+        """Return the source-visible publisher identity carried by metadata."""
+        return source_publisher_id_from_metadata(self.bounded_metadata)
+
+
+@dataclass(frozen=True, slots=True)
+class ExactRepostCluster:
+    """Durable application-owned grouping of exact repost Source Messages."""
+
+    exact_repost_cluster_id: str
+    cluster_key: str
+    source_chat_reference: str
+    source_publisher_id: str
+    normalized_body: str
+    resolved_event_date: str
+    opportunity_type: str
+    representative_opportunity_id: str | None
+    representative_source_message_id: str | None
+    representative_source_message_revision_id: str | None
+    publication_state: str
+    moderation_state: str
+    freshness_renewed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ExactRepostClusterMember:
+    """One current Source Message lineage link retained by an exact cluster."""
+
+    exact_repost_cluster_id: str
+    opportunity_id: str
+    source_message_id: str
+    source_message_revision_id: str
+    publication_state: str
+    publication_reason: str | None
+    is_representative: bool
+    linked_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -2147,6 +2227,7 @@ class Opportunity:
     opportunity_type: str
     publication_state: str
     response_route: OpportunityResponseRoute
+    publication_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

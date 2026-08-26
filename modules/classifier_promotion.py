@@ -31,7 +31,7 @@ PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT = 15
 PLAYER_REQUIRED_REPLAYS = 3
 PLAYER_REQUESTED_MODEL = "gpt-5.6-sol"
 PLAYER_REQUESTED_REASONING_EFFORT = "high"
-PLAYER_PROMOTION_EXECUTION_VERSION = "player-controlled-execution-v5"
+PLAYER_PROMOTION_EXECUTION_VERSION = "player-controlled-execution-v6"
 CONTROLLED_PLAYER_CLASSIFIER_VERSION = "player-controlled-classifier-v2"
 CONTROLLED_RESPONSE_FIXTURE_VERSION = "player-match-controlled-responses-v1"
 PLAYER_REQUIRED_FAILURE_MODES = (
@@ -63,6 +63,78 @@ PLAYER_REQUIRED_CASE_FAMILIES = (
     "safety",
     "polarity",
 )
+_REPOST_EXPECTED_FIELDS = {
+    "repost": frozenset(
+        {
+            "cluster_count",
+            "member_count",
+            "distinct_source_messages",
+            "representative_count",
+            "representative_source",
+            "publication_state",
+            "projection_consistent",
+            "freshness_renewed",
+            "superseded_count",
+            "superseded_reason",
+        }
+    ),
+    "repost_replay": frozenset(
+        {
+            "unchanged",
+            "replay_ignored",
+            "cluster_count",
+            "member_count",
+            "representative_count",
+            "publication_state",
+            "projection_consistent",
+        }
+    ),
+    "repost_delete": frozenset(
+        {
+            "member_count",
+            "representative_count",
+            "representative_source",
+            "publication_state",
+            "deleted_reason",
+            "fallback_representative",
+            "projection_consistent",
+        }
+    ),
+    "repost_moderation_hold": frozenset(
+        {
+            "moderation_state",
+            "publication_state",
+            "representative_count",
+            "whole_cluster_held",
+            "projection_consistent",
+        }
+    ),
+    "repost_moderation_approve": frozenset(
+        {
+            "moderation_state",
+            "publication_state",
+            "representative_source",
+            "representative_count",
+            "whole_cluster_approved",
+            "projection_consistent",
+        }
+    ),
+    "repost_moderation_suppress": frozenset(
+        {
+            "moderation_state",
+            "publication_state",
+            "representative_count",
+            "whole_cluster_suppressed",
+            "projection_consistent",
+        }
+    ),
+}
+_REPOST_OPERATION_FIELDS = {
+    "repost": frozenset({"kind", "source", "expected"}),
+    "repost_replay": frozenset({"kind", "expected"}),
+    "repost_delete": frozenset({"kind", "expected"}),
+    "repost_moderation": frozenset({"kind", "decision", "expected"}),
+}
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _CONTRACT_PATH = (
@@ -320,9 +392,30 @@ def _validate_suite_case(
     operations: list[dict[str, JsonValue]] = []
     for raw_operation in raw_operations:
         operation = _json_object(raw_operation, description=f"{case_id} operation")
-        _text(operation.get("kind"), description=f"{case_id} operation kind")
+        kind = _text(operation.get("kind"), description=f"{case_id} operation kind")
         if "expected" not in operation:
             raise ValueError(f"{case_id} operation has no expected outcome")
+        if family == "reposts":
+            if kind not in {
+                "repost",
+                "repost_replay",
+                "repost_delete",
+                "repost_moderation",
+            }:
+                raise ValueError(f"{case_id} has an unsupported repost operation")
+            if frozenset(operation) != _REPOST_OPERATION_FIELDS[kind]:
+                raise ValueError(f"{case_id} accepts no caller-supplied repost labels")
+            expected = _json_object(
+                operation.get("expected"), description=f"{case_id} repost expected"
+            )
+            expected_key = kind
+            if kind == "repost_moderation":
+                decision = operation.get("decision")
+                expected_key = f"{kind}_{decision}"
+                if expected_key not in _REPOST_EXPECTED_FIELDS:
+                    raise ValueError(f"{case_id} repost moderation decision is invalid")
+            if frozenset(expected) != _REPOST_EXPECTED_FIELDS[expected_key]:
+                raise ValueError(f"{case_id} repost expectation is not semantic")
         operations.append(operation)
     return case_id, family, tuple(operations)
 

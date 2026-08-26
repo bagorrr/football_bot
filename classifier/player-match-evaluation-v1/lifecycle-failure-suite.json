@@ -1,5 +1,5 @@
 {
-  "suite_version": "player-match-lifecycle-failure-v4",
+  "suite_version": "player-match-lifecycle-failure-v6",
   "status": "reviewed",
   "scope": "Specification #38 executable controlled lifecycle and failure testing",
   "families": [
@@ -175,22 +175,92 @@
       "operations": [
         {
           "kind": "repost",
-          "previous_revision": "r1",
-          "current_revision": "r3",
+          "source": "⚽ Open match in Saint Petersburg on 2026-12-01. Need one place! Contact @controlled_open_match.",
           "expected": {
-            "active_revision": "r3",
-            "suppressed_revision": "r1",
-            "representative_count": 1
+            "cluster_count": 1,
+            "member_count": 1,
+            "distinct_source_messages": true,
+            "representative_count": 1,
+            "representative_source": "first",
+            "publication_state": "active",
+            "projection_consistent": true,
+            "freshness_renewed": true,
+            "superseded_count": 0,
+            "superseded_reason": null
           }
         },
         {
           "kind": "repost",
-          "previous_revision": "r3",
-          "current_revision": "r3",
+          "source": "Open match in Saint Petersburg on 2026-12-01.   Need one place! Contact @controlled_open_match. ⚽",
           "expected": {
-            "active_revision": "r3",
-            "suppressed_revision": "r3",
-            "representative_count": 0
+            "cluster_count": 1,
+            "member_count": 2,
+            "distinct_source_messages": true,
+            "representative_count": 1,
+            "representative_source": "second",
+            "publication_state": "active",
+            "projection_consistent": true,
+            "freshness_renewed": true,
+            "superseded_count": 1,
+            "superseded_reason": "exact_repost_superseded"
+          }
+        },
+        {
+          "kind": "repost_replay",
+          "expected": {
+            "unchanged": true,
+            "replay_ignored": true,
+            "cluster_count": 1,
+            "member_count": 2,
+            "representative_count": 1,
+            "publication_state": "active",
+            "projection_consistent": true
+          }
+        },
+        {
+          "kind": "repost_delete",
+          "expected": {
+            "member_count": 2,
+            "representative_count": 1,
+            "representative_source": "first",
+            "publication_state": "active",
+            "deleted_reason": "source_deleted",
+            "fallback_representative": true,
+            "projection_consistent": true
+          }
+        },
+        {
+          "kind": "repost_moderation",
+          "decision": "hold",
+          "expected": {
+            "moderation_state": "held_for_review",
+            "publication_state": "held_for_review",
+            "representative_count": 0,
+            "whole_cluster_held": true,
+            "projection_consistent": true
+          }
+        },
+        {
+          "kind": "repost_moderation",
+          "decision": "approve",
+          "expected": {
+            "moderation_state": "approved",
+            "publication_state": "active",
+            "representative_source": "first",
+            "representative_count": 1,
+            "whole_cluster_approved": true,
+            "projection_consistent": true
+          }
+        },
+        {
+          "kind": "repost_moderation",
+          "decision": "suppress",
+          "expected": {
+            "moderation_state": "suppressed",
+            "publication_state": "suppressed",
+            "representative_count": 0,
+            "whole_cluster_suppressed": true,
+            "projection_consistent": true
           }
         }
       ]

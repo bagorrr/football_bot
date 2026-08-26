@@ -56,6 +56,8 @@ from modules.domain import (
     DateInterpretationQuery,
     DateInterpretationResolution,
     DiscoveryDraft,
+    ExactRepostCluster,
+    ExactRepostClusterMember,
     GeographicType,
     GeographyConfirmationEvent,
     IngestionFailure,
@@ -415,9 +417,20 @@ class ControlledTelegramIngestionAdapter:
         reply_route_url: str | None = None,
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
+        source_publisher_id: str | None = None,
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
+        bounded_metadata = {
+            "message_language": message_language,
+            "attachment_types": list(attachment_types),
+            "source_author_dm_url": source_author_dm_url,
+            "reply_route_url": reply_route_url,
+            "source_message_url": source_message_url,
+            "source_message_reply_capable": source_message_reply_capable,
+        }
+        if source_publisher_id is not None:
+            bounded_metadata["source_publisher_id"] = source_publisher_id
         self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
@@ -429,14 +442,7 @@ class ControlledTelegramIngestionAdapter:
             body=body,
             event_time=event_time,
             registry_generation=registry_generation,
-            bounded_metadata={
-                "message_language": message_language,
-                "attachment_types": list(attachment_types),
-                "source_author_dm_url": source_author_dm_url,
-                "reply_route_url": reply_route_url,
-                "source_message_url": source_message_url,
-                "source_message_reply_capable": source_message_reply_capable,
-            },
+            bounded_metadata=bounded_metadata,
             reply_to_telegram_message_id=reply_to_telegram_message_id,
         )
 
@@ -575,9 +581,20 @@ class ControlledTelegramIngestionAdapter:
         reply_route_url: str | None = None,
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
+        source_publisher_id: str | None = None,
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
+        bounded_metadata = {
+            "message_language": message_language,
+            "attachment_types": list(attachment_types),
+            "source_author_dm_url": source_author_dm_url,
+            "reply_route_url": reply_route_url,
+            "source_message_url": source_message_url,
+            "source_message_reply_capable": source_message_reply_capable,
+        }
+        if source_publisher_id is not None:
+            bounded_metadata["source_publisher_id"] = source_publisher_id
         self._channel_difference_events[(identity, from_checkpoint)] = (
             TelegramDifferenceEvent(
                 source_chat_identity=identity,
@@ -589,14 +606,7 @@ class ControlledTelegramIngestionAdapter:
                 kind=kind,
                 body=body,
                 event_time=event_time,
-                bounded_metadata={
-                    "message_language": message_language,
-                    "attachment_types": list(attachment_types),
-                    "source_author_dm_url": source_author_dm_url,
-                    "reply_route_url": reply_route_url,
-                    "source_message_url": source_message_url,
-                    "source_message_reply_capable": source_message_reply_capable,
-                },
+                bounded_metadata=bounded_metadata,
                 reply_to_telegram_message_id=reply_to_telegram_message_id,
             )
         )
@@ -2265,6 +2275,31 @@ class AcceptanceSpine:
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()
+
+    def recommendation_opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Recommendation's durable publication projection."""
+        return self._observer.recommendation_opportunities()
+
+    def exact_repost_clusters(self) -> tuple[ExactRepostCluster, ...]:
+        """Observe durable Exact Repost Clusters through the public testkit."""
+        return self._observer.exact_repost_clusters()
+
+    def exact_repost_cluster_members(
+        self, exact_repost_cluster_id: str
+    ) -> tuple[ExactRepostClusterMember, ...]:
+        """Observe one cluster's source provenance and representative lineage."""
+        return self._observer.exact_repost_cluster_members(exact_repost_cluster_id)
+
+    def moderate_exact_repost_cluster(
+        self, *, exact_repost_cluster_id: str, decision: str
+    ) -> bool:
+        """Apply a moderation decision through the Application public seam."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.moderate_exact_repost_cluster(
+            exact_repost_cluster_id=exact_repost_cluster_id,
+            decision=decision,
+            recorded_at=application.clock.now(),
+        )
 
     def opportunity_publication_contracts(
         self, source_message_revision_id: str

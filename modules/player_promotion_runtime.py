@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -714,12 +715,14 @@ CONTROLLED_COMPOUND_BODY = (
 def _provider_open_match_candidate(
     *, body: str, candidate_key: str, evidence_opportunity: str, places: str
 ) -> dict[str, JsonValue]:
+    event_date_match = re.search(r"\b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b", body)
+    event_date = event_date_match.group(0) if event_date_match else "2026-12-01"
     candidate: dict[str, JsonValue] = {
         "candidate_key": candidate_key,
         "opportunity_type": "open_match",
         "evidence": {
             "opportunity": evidence_opportunity,
-            "event_time": "2026-12-01",
+            "event_time": event_date,
             "location": "Saint Petersburg",
             "open_places": places,
         },
@@ -731,8 +734,8 @@ def _provider_open_match_candidate(
             "city_id": "city:ru:saint-petersburg",
         },
         "event_time": {
-            "start_local_date": "2026-12-01",
-            "end_local_date": "2026-12-01",
+            "start_local_date": event_date,
+            "end_local_date": event_date,
             "iana_timezone": "Europe/Moscow",
         },
         "open_places": 1,
@@ -1356,7 +1359,14 @@ class DurableAcceptanceProbe:
         output_sequences: dict[str, list[dict[str, JsonValue]]] = {}
         for operation_number, operation in enumerate(operations, start=1):
             kind = str(operation.get("kind", "unknown"))
-            body = _operation_body(case_id, operation_number, kind)
+            source_override = operation.get("source")
+            body = (
+                source_override
+                if kind
+                in {"repost", "repost_replay", "repost_delete", "repost_moderation"}
+                and isinstance(source_override, str)
+                else _operation_body(case_id, operation_number, kind)
+            )
             if kind in {
                 "evidence",
                 "unsupported",
@@ -1499,6 +1509,8 @@ class DurableAcceptanceProbe:
         revision: int = 1,
         telegram_message_id: int | None = None,
         reply_to_telegram_message_id: int | None = None,
+        source_publisher_id: str | None = None,
+        event_time: datetime | None = None,
         process: bool = True,
         inject_database_failure: bool = False,
     ) -> tuple[str | None, dict[str, JsonValue]]:
@@ -1518,7 +1530,8 @@ class DurableAcceptanceProbe:
             revision=revision,
             kind=kind,
             body=body,
-            event_time=self.clock.now(),
+            event_time=event_time or self.clock.now(),
+            source_publisher_id=source_publisher_id,
             reply_to_telegram_message_id=reply_to_telegram_message_id,
         )
         try:
@@ -1646,6 +1659,7 @@ class DurableAcceptanceProbe:
             "proposal_output": (
                 proposal_payload.get("output") if proposal_payload is not None else None
             ),
+            "exact_repost": _exact_repost_snapshot(self),
             "durable": True,
         }
 
@@ -1752,6 +1766,287 @@ class DurableAcceptanceProbe:
         return applied
 
 
+def _exact_repost_snapshot(probe: DurableAcceptanceProbe) -> dict[str, JsonValue]:
+    """Read exact-repost state and its Recommendation projection at the seam."""
+    clusters = probe.system.exact_repost_clusters()
+    projected = {
+        item.opportunity_id: item
+        for item in probe.system.recommendation_opportunities()
+    }
+    cluster_values: list[JsonValue] = []
+    member_count = 0
+    distinct_source_message_count = 0
+    representative_count = 0
+    projection_consistent = True
+    for cluster in clusters:
+        members = probe.system.exact_repost_cluster_members(
+            cluster.exact_repost_cluster_id
+        )
+        member_values: list[JsonValue] = []
+        source_message_ids = {member.source_message_id for member in members}
+        member_count += len(members)
+        distinct_source_message_count += len(source_message_ids)
+        representative_count += sum(member.is_representative for member in members)
+        for member in members:
+            member_values.append(
+                {
+                    "opportunity_id": member.opportunity_id,
+                    "source_message_id": member.source_message_id,
+                    "source_message_revision_id": member.source_message_revision_id,
+                    "publication_state": member.publication_state,
+                    "publication_reason": member.publication_reason,
+                    "is_representative": member.is_representative,
+                    "linked_at": member.linked_at.isoformat(),
+                }
+            )
+            recommendation = projected.get(member.opportunity_id)
+            if (
+                recommendation is None
+                or recommendation.publication_state != member.publication_state
+                or recommendation.publication_reason != member.publication_reason
+            ):
+                projection_consistent = False
+        source_events = tuple(
+            event
+            for event in probe.system.source_events()
+            if event.source_message_id in source_message_ids
+        )
+        latest_recorded_at = max(
+            (event.recorded_at for event in source_events),
+            default=cluster.freshness_renewed_at,
+        )
+        cluster_values.append(
+            {
+                "exact_repost_cluster_id": cluster.exact_repost_cluster_id,
+                "cluster_key": cluster.cluster_key,
+                "source_chat_reference": cluster.source_chat_reference,
+                "source_publisher_id": cluster.source_publisher_id,
+                "normalized_body": cluster.normalized_body,
+                "resolved_event_date": cluster.resolved_event_date,
+                "opportunity_type": cluster.opportunity_type,
+                "representative_opportunity_id": cluster.representative_opportunity_id,
+                "representative_source_message_id": (
+                    cluster.representative_source_message_id
+                ),
+                "representative_source_message_revision_id": (
+                    cluster.representative_source_message_revision_id
+                ),
+                "publication_state": cluster.publication_state,
+                "moderation_state": cluster.moderation_state,
+                "freshness_renewed_at": cluster.freshness_renewed_at.isoformat(),
+                "freshness_renewed": cluster.freshness_renewed_at == latest_recorded_at,
+                "members": member_values,
+            }
+        )
+    return {
+        "cluster_count": len(clusters),
+        "member_count": member_count,
+        "distinct_source_messages": (distinct_source_message_count == member_count),
+        "representative_count": representative_count,
+        "projection_consistent": projection_consistent,
+        "clusters": cluster_values,
+    }
+
+
+def _repost_durable_values(
+    probe: DurableAcceptanceProbe,
+    state: Mapping[str, str],
+) -> tuple[dict[str, JsonValue], dict[str, JsonValue], list[dict[str, JsonValue]]]:
+    """Extract one exact-repost cluster from application-owned observations."""
+    exact = _exact_repost_snapshot(probe)
+    if exact.get("cluster_count") != 1:
+        raise RuntimeError("repost evidence did not produce exactly one cluster")
+    clusters = exact.get("clusters")
+    if not isinstance(clusters, list) or len(clusters) != 1:
+        raise RuntimeError("repost evidence cluster payload is incomplete")
+    cluster = _json_object(clusters[0], description="exact repost cluster")
+    members_value = cluster.get("members")
+    if not isinstance(members_value, list):
+        raise RuntimeError("repost evidence member payload is incomplete")
+    members = [
+        _json_object(member, description="exact repost cluster member")
+        for member in members_value
+    ]
+    expected_sources = {state["first_source"]}
+    if "second_source" in state:
+        expected_sources.add(state["second_source"])
+    actual_sources = {member.get("source_message_id") for member in members}
+    if actual_sources != expected_sources:
+        raise RuntimeError("repost evidence source identities are incomplete")
+    return exact, cluster, members
+
+
+def _source_id_from_revision(revision_id: str) -> str:
+    """Return the stable Source Message identity from its revision identity."""
+    return revision_id.rsplit(":revision:", 1)[0]
+
+
+def _compare_repost_durable_state(
+    *,
+    operation_number: int,
+    kind: str,
+    observed: dict[str, JsonValue],
+    durable: dict[str, JsonValue],
+) -> str | None:
+    """Ensure repost assertions are projections of durable cluster state."""
+    exact = durable.get("exact_repost")
+    if not isinstance(exact, dict):
+        return f"reposts:durable-exact-repost-{operation_number}"
+    clusters = exact.get("clusters")
+    if (
+        exact.get("cluster_count") != 1
+        or not isinstance(clusters, list)
+        or len(clusters) != 1
+    ):
+        return f"reposts:durable-cluster-{operation_number}"
+    cluster = clusters[0]
+    if not isinstance(cluster, dict):
+        return f"reposts:durable-cluster-{operation_number}"
+    members_value = cluster.get("members")
+    if not isinstance(members_value, list) or not all(
+        isinstance(member, dict) for member in members_value
+    ):
+        return f"reposts:durable-members-{operation_number}"
+    members = cast(list[dict[str, JsonValue]], members_value)
+    source_message_ids: list[str] = []
+    for member in members:
+        source_id = member.get("source_message_id")
+        if not isinstance(source_id, str) or not source_id:
+            return f"reposts:durable-members-{operation_number}"
+        source_message_ids.append(source_id)
+    if (
+        exact.get("member_count") != len(members)
+        or exact.get("distinct_source_messages")
+        != (len(set(source_message_ids)) == len(members))
+        or exact.get("representative_count")
+        != sum(member.get("is_representative") is True for member in members)
+        or observed.get("publication_state") != cluster.get("publication_state")
+        or observed.get("projection_consistent")
+        is not exact.get("projection_consistent")
+    ):
+        return f"reposts:durable-projection-{operation_number}"
+    for key in ("cluster_count", "member_count"):
+        if key in observed and observed.get(key) != exact.get(key):
+            return f"reposts:durable-projection-{operation_number}"
+    for key in ("distinct_source_messages", "representative_count"):
+        if key in observed and observed.get(key) != exact.get(key):
+            return f"reposts:durable-projection-{operation_number}"
+    representative_id = cluster.get("representative_source_message_id")
+    representative_members = [
+        member for member in members if member.get("is_representative") is True
+    ]
+    if (representative_id is None and representative_members) or (
+        representative_id is not None
+        and (
+            len(representative_members) != 1
+            or representative_members[0].get("source_message_id") != representative_id
+        )
+    ):
+        return f"reposts:durable-representative-{operation_number}"
+    revision_id = observed.get("source_message_revision_id")
+    current_source = (
+        _source_id_from_revision(revision_id)
+        if isinstance(revision_id, str) and ":revision:" in revision_id
+        else None
+    )
+    if current_source is None:
+        return f"reposts:durable-source-{operation_number}"
+    if kind in {"repost", "repost_replay"}:
+        if representative_id != current_source:
+            return f"reposts:durable-newest-{operation_number}"
+        if kind == "repost" and observed.get("freshness_renewed") is not (
+            cluster.get("freshness_renewed")
+        ):
+            return f"reposts:durable-freshness-{operation_number}"
+    elif kind == "repost_delete":
+        deleted = next(
+            (
+                member
+                for member in members
+                if member.get("source_message_id") == current_source
+            ),
+            None,
+        )
+        if (
+            not isinstance(deleted, dict)
+            or observed.get("deleted_reason") != deleted.get("publication_reason")
+            or observed.get("fallback_representative")
+            is not (
+                representative_id is not None and representative_id != current_source
+            )
+        ):
+            return f"reposts:durable-deletion-{operation_number}"
+    elif kind == "repost_moderation":
+        if observed.get("moderation_state") != cluster.get("moderation_state"):
+            return f"reposts:durable-moderation-{operation_number}"
+        decision = observed.get("moderation_state")
+        live_members = [
+            member
+            for member in members
+            if member.get("publication_reason") != "source_deleted"
+        ]
+        if decision == "held_for_review" and (
+            not live_members
+            or any(
+                member.get("publication_state") != "held_for_review"
+                for member in live_members
+            )
+            or observed.get("whole_cluster_held") is not True
+        ):
+            return f"reposts:durable-hold-{operation_number}"
+        if decision == "suppressed" and (
+            not live_members
+            or any(
+                member.get("publication_state") != "suppressed"
+                for member in live_members
+            )
+            or observed.get("whole_cluster_suppressed") is not True
+        ):
+            return f"reposts:durable-suppression-{operation_number}"
+        if (
+            decision == "approved"
+            and observed.get("whole_cluster_approved") is not True
+        ):
+            return f"reposts:durable-approval-{operation_number}"
+    return None
+
+
+def _repost_metrics(
+    exact: dict[str, JsonValue],
+    cluster: dict[str, JsonValue],
+    members: list[dict[str, JsonValue]],
+    state: Mapping[str, str],
+) -> dict[str, JsonValue]:
+    representative_source = cluster.get("representative_source_message_id")
+    source_roles = {state["first_source"]: "first"}
+    if "second_source" in state:
+        source_roles[state["second_source"]] = "second"
+    source_role = (
+        source_roles.get(representative_source, "none")
+        if isinstance(representative_source, str)
+        else "none"
+    )
+    superseded = [
+        member
+        for member in members
+        if member.get("publication_reason") == "exact_repost_superseded"
+    ]
+    return {
+        "cluster_count": exact.get("cluster_count"),
+        "member_count": exact.get("member_count"),
+        "distinct_source_messages": exact.get("distinct_source_messages"),
+        "representative_count": exact.get("representative_count"),
+        "representative_source": source_role,
+        "publication_state": cluster.get("publication_state"),
+        "projection_consistent": exact.get("projection_consistent"),
+        "freshness_renewed": cluster.get("freshness_renewed"),
+        "superseded_count": len(superseded),
+        "superseded_reason": (
+            superseded[0].get("publication_reason") if superseded else None
+        ),
+    }
+
+
 def _operation_source(operation: dict[str, JsonValue], body: str) -> str:
     source = operation.get("source")
     return source if isinstance(source, str) else body
@@ -1796,7 +2091,7 @@ def execute_lifecycle_case(
     observed_operations: list[dict[str, JsonValue]] = []
     route_state: dict[str, str] = {}
     route_snapshot: dict[str, JsonValue] | None = None
-    repost_state: tuple[str, str, dict[str, JsonValue]] | None = None
+    repost_state: dict[str, str] | None = None
     reply_parent_message_id: int | None = None
     reply_parent_revision: str | None = None
     for operation_number, operation in enumerate(operations, start=1):
@@ -1978,47 +2273,204 @@ def execute_lifecycle_case(
                 ),
             }
         elif kind == "repost":
+            repost_body = source
             if repost_state is None:
-                first_id, _ = probe.source_event(
-                    body=body,
+                first_id, first_snapshot = probe.source_event(
+                    body=repost_body,
                     operation_number=operation_number,
-                    revision=1,
+                    telegram_message_id=900_001,
+                    source_publisher_id="publisher:controlled",
+                    event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
                     process=True,
                 )
-                message_id = next(
+                if first_id is None:
+                    raise RuntimeError("repost setup did not persist its first source")
+                first_source = _source_id_from_revision(first_id)
+                first_event_id = next(
                     (
-                        int(item.source_message_id.rsplit(":message:", 1)[-1])
-                        for item in probe.system.source_message_revisions()
-                        if item.source_message_revision_id == first_id
+                        item.source_event_id
+                        for item in probe.system.source_events()
+                        if item.source_message_id == first_source
                     ),
                     None,
                 )
-                if message_id is None:
-                    raise RuntimeError("repost setup did not persist its creation")
+                if first_event_id is None:
+                    raise RuntimeError("repost setup did not persist its first event")
+                repost_state = {
+                    "first_revision": first_id,
+                    "first_source": first_source,
+                    "first_event_id": first_event_id,
+                }
+                snapshot = first_snapshot
+                revision_id = first_id
+            else:
+                if "second_source" in repost_state:
+                    raise RuntimeError("repost lifecycle received a duplicate pair")
+                probe.clock.advance_to(datetime(2026, 8, 18, 9, 7, tzinfo=UTC))
                 second_id, second_snapshot = probe.source_event(
-                    body=body,
+                    body=repost_body,
                     operation_number=operation_number,
-                    revision=2,
-                    telegram_message_id=message_id,
-                    kind=SourceEventKind.EDIT,
+                    telegram_message_id=900_002,
+                    source_publisher_id="publisher:controlled",
+                    event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
                     process=True,
                 )
-                if first_id is None or second_id is None:
-                    raise RuntimeError("repost setup did not persist its revision")
-                repost_state = (first_id, second_id, second_snapshot)
-            previous = operation.get("previous_revision")
-            current = operation.get("current_revision")
-            representative = (
-                previous != current
-                and repost_state[2].get("publication_state") == "active"
-            )
-            actual = {
-                "active_revision": current,
-                "suppressed_revision": previous,
-                "representative_count": 1 if representative else 0,
-            }
-            snapshot = repost_state[2]
-            revision_id = repost_state[1]
+                if second_id is None:
+                    raise RuntimeError("repost setup did not persist its second source")
+                second_source = _source_id_from_revision(second_id)
+                second_event_id = next(
+                    (
+                        item.source_event_id
+                        for item in probe.system.source_events()
+                        if item.source_message_id == second_source
+                    ),
+                    None,
+                )
+                if second_event_id is None:
+                    raise RuntimeError("repost setup did not persist its second event")
+                repost_state.update(
+                    {
+                        "second_revision": second_id,
+                        "second_source": second_source,
+                        "second_event_id": second_event_id,
+                    }
+                )
+                snapshot = second_snapshot
+                revision_id = second_id
+            exact, cluster, members = _repost_durable_values(probe, repost_state)
+            actual = _repost_metrics(exact, cluster, members, repost_state)
+            if repost_state.get("second_source") is None:
+                actual["member_count"] = exact.get("member_count")
+                actual["representative_source"] = "first"
+                actual["superseded_count"] = 0
+                actual["superseded_reason"] = None
+            else:
+                actual["member_count"] = exact.get("member_count")
+        elif kind in {"repost_replay", "repost_delete", "repost_moderation"}:
+            if repost_state is None or "second_source" not in repost_state:
+                raise RuntimeError("repost lifecycle action has no source pair")
+            if kind == "repost_replay":
+                before = _exact_repost_snapshot(probe)
+                redelivery_applied = probe.system.redeliver_source_event(
+                    repost_state["second_event_id"]
+                )
+                after = _exact_repost_snapshot(probe)
+                snapshot = probe.snapshot(repost_state["second_revision"])
+                revision_id = repost_state["second_revision"]
+                exact, cluster, members = _repost_durable_values(probe, repost_state)
+                actual = {
+                    "unchanged": before == after,
+                    "replay_ignored": not redelivery_applied,
+                    "cluster_count": exact.get("cluster_count"),
+                    "member_count": exact.get("member_count"),
+                    "representative_count": exact.get("representative_count"),
+                    "publication_state": cluster.get("publication_state"),
+                    "projection_consistent": exact.get("projection_consistent"),
+                }
+            elif kind == "repost_delete":
+                probe.clock.advance_to(datetime(2026, 8, 18, 9, 8, tzinfo=UTC))
+                revision_id, snapshot = probe.source_event(
+                    body=None,
+                    operation_number=operation_number,
+                    kind=SourceEventKind.DELETE,
+                    revision=2,
+                    telegram_message_id=900_002,
+                    source_publisher_id="publisher:controlled",
+                    event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+                    process=True,
+                )
+                if revision_id is None:
+                    raise RuntimeError("repost deletion did not persist its revision")
+                state = repost_state
+                exact, cluster, members = _repost_durable_values(probe, state)
+                deleted_member = next(
+                    member
+                    for member in members
+                    if member.get("source_message_id") == state["second_source"]
+                )
+                actual = {
+                    "member_count": exact.get("member_count"),
+                    "representative_count": exact.get("representative_count"),
+                    "representative_source": "first"
+                    if cluster.get("representative_source_message_id")
+                    == state["first_source"]
+                    else "none",
+                    "publication_state": cluster.get("publication_state"),
+                    "deleted_reason": deleted_member.get("publication_reason"),
+                    "fallback_representative": cluster.get(
+                        "representative_source_message_id"
+                    )
+                    == state["first_source"],
+                    "projection_consistent": exact.get("projection_consistent"),
+                }
+                state["deleted"] = "true"
+            else:
+                decision = operation.get("decision")
+                if decision not in {"hold", "approve", "suppress"}:
+                    raise RuntimeError("repost moderation decision is unsupported")
+                cluster_before = _exact_repost_snapshot(probe)
+                clusters = cluster_before.get("clusters")
+                if not isinstance(clusters, list) or len(clusters) != 1:
+                    raise RuntimeError("repost moderation cluster is unavailable")
+                cluster_before_value = _json_object(
+                    clusters[0], description="exact repost moderation cluster"
+                )
+                cluster_id = cluster_before_value.get("exact_repost_cluster_id")
+                if not isinstance(cluster_id, str):
+                    raise RuntimeError("repost moderation cluster identity is invalid")
+                probe.system.moderate_exact_repost_cluster(
+                    exact_repost_cluster_id=cluster_id,
+                    decision=decision,
+                )
+                probe.system.process_opportunities_until_idle()
+                snapshot = probe.snapshot(repost_state["second_revision"])
+                revision_id = repost_state["second_revision"]
+                exact, cluster, members = _repost_durable_values(probe, repost_state)
+                live_members = [
+                    member
+                    for member in members
+                    if member.get("publication_reason") != "source_deleted"
+                ]
+                if decision == "hold":
+                    actual = {
+                        "moderation_state": cluster.get("moderation_state"),
+                        "publication_state": cluster.get("publication_state"),
+                        "representative_count": exact.get("representative_count"),
+                        "whole_cluster_held": bool(live_members)
+                        and all(
+                            member.get("publication_state") == "held_for_review"
+                            for member in live_members
+                        ),
+                        "projection_consistent": exact.get("projection_consistent"),
+                    }
+                elif decision == "approve":
+                    actual = {
+                        "moderation_state": cluster.get("moderation_state"),
+                        "publication_state": cluster.get("publication_state"),
+                        "representative_source": "first"
+                        if cluster.get("representative_source_message_id")
+                        == repost_state["first_source"]
+                        else "none",
+                        "representative_count": exact.get("representative_count"),
+                        "whole_cluster_approved": bool(live_members)
+                        and all(
+                            member.get("publication_state") in {"active", "suppressed"}
+                            for member in live_members
+                        ),
+                        "projection_consistent": exact.get("projection_consistent"),
+                    }
+                else:
+                    actual = {
+                        "moderation_state": cluster.get("moderation_state"),
+                        "publication_state": cluster.get("publication_state"),
+                        "representative_count": exact.get("representative_count"),
+                        "whole_cluster_suppressed": bool(live_members)
+                        and all(
+                            member.get("publication_state") == "suppressed"
+                            for member in live_members
+                        ),
+                        "projection_consistent": exact.get("projection_consistent"),
+                    }
         elif kind == "reply":
             if reply_parent_message_id is None:
                 reply_parent_revision, _ = probe.source_event(
@@ -2336,7 +2788,7 @@ def canonical_replay_digest(
     """
     canonical = _canonicalize_observed_value(observations)
     material = {
-        "execution_version": "player-controlled-execution-v5",
+        "execution_version": "player-controlled-execution-v6",
         "release_fingerprint": release_fingerprint,
         "replay_number": replay_number,
         "observations": canonical,
@@ -2359,7 +2811,7 @@ def _release_binding(release: PlayerClassifierRelease) -> str:
         "controlled_response_fixture_version": (
             release.controlled_response_fixture_version
         ),
-        "execution_version": "player-controlled-execution-v5",
+        "execution_version": "player-controlled-execution-v6",
     }
     return sha256(
         json.dumps(
@@ -2474,7 +2926,7 @@ def run_replay_worker(
         "execution_id": execution_id,
         "process_id": os.getpid(),
         "replay_number": replay_number,
-        "execution_version": "player-controlled-execution-v5",
+        "execution_version": "player-controlled-execution-v6",
         "release_fingerprint": release.release_fingerprint,
         "release_binding": _release_binding(release),
         "corpus": corpus,
@@ -2757,6 +3209,22 @@ def compare_lifecycle_observation(
         durable = actual.get("durable")
         if not isinstance(durable, dict) or durable.get("durable") is not True:
             return f"{case_id}:durable-{index}"
+        if case.get("family") == "reposts":
+            semantic_observed = actual.get("observed")
+            if not isinstance(semantic_observed, dict):
+                return f"{case_id}:observed-{index}"
+            semantic_observed = dict(semantic_observed)
+            semantic_observed["source_message_revision_id"] = actual.get(
+                "source_message_revision_id"
+            )
+            durable_failure = _compare_repost_durable_state(
+                operation_number=index,
+                kind=cast(str, actual.get("kind")),
+                observed=semantic_observed,
+                durable=durable,
+            )
+            if durable_failure is not None:
+                return f"{case_id}:{durable_failure}"
         for id_key in ("source_event_ids", "proposal_ids", "publication_ids"):
             values = durable.get(id_key)
             if not isinstance(values, list) or not all(
