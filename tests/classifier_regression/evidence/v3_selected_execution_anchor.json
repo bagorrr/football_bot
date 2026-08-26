@@ -1,0 +1,29 @@
+{
+  "anchor_purpose": "Externally anchor the real selected Codex child-process protocol separately from recorded v3 replay evidence.",
+  "anchor_version": "open-match-classifier-regression-v3-selected-execution-anchor-v1",
+  "contract": {
+    "adapter_kind": "codex_cli",
+    "adapter_version": "classifier-hermetic-execution-v2",
+    "codex_version": "hermetic-codex-execution-v2",
+    "requested_model": "gpt-5.6-sol",
+    "requested_reasoning_effort": "high",
+    "timeout_seconds": 180,
+    "requires_child_process": true,
+    "requires_exit_status": true,
+    "requires_stdout_stderr_digests": true,
+    "requires_input_output_evidence": true
+  },
+  "fixture": {
+    "path": "tests/classifier_regression/hermetic-codex",
+    "sha256": "2c1f80ce40ca4ff9db132f70ba512487edd1783a1abe6b76d98095ad0f1f643c"
+  },
+  "expected": {
+    "execution_count": 58,
+    "successful_execution_count": 54,
+    "failed_execution_count": 4,
+    "semantic_proof_execution_count": 4,
+    "output_artifact_sha256": "92b937d3525ac25aa943d595715a5293c0fbcec14a50c21340062acc9b3e4337",
+    "protocol_artifact_sha256": "73fda499e962bae50ccf2c7b47c358e50be3c0d8cc571f42dfe476cef6b25398",
+    "execution_artifact_sha256": "262eda04e2dce815607e08ab42c29342dc40b4bac33b74505796aa24b2b88b4f"
+  }
+}

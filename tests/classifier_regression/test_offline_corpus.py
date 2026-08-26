@@ -8,20 +8,26 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
+
+import pytest
 
 from modules.application import (
     _body_establishes_current_open_match,
     _classifier_input_manifest_hash,
     _event_time_is_supported,
     _location_mention_is_authoritative,
+    _opaque_classifier_reference,
     _open_places_are_supported,
     _optional_values_are_supported,
     _select_response_route,
@@ -33,7 +39,12 @@ from modules.classifier_contract import (
     classifier_output_is_schema_valid,
     semantic_proof_is_schema_valid,
 )
-from modules.codex_classification_adapter import CodexCliClassifierAdapter
+from modules.codex_classification_adapter import (
+    CodexCliClassifierAdapter,
+    _codex_jsonl_failure,
+    _codex_jsonl_result,
+    _request_payload,
+)
 from modules.contracts import JsonValue
 from modules.domain import (
     ConversationStage,
@@ -202,12 +213,14 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
 
 
 _V3_EVIDENCE_ROOT = Path(__file__).with_name("evidence")
+_HERMETIC_EXECUTABLE = Path(__file__).with_name("hermetic-codex")
 _V3_EVIDENCE_FILENAMES = {
     "case_manifest": "v3_case_manifest.json",
     "recorded_evidence": "v3_recorded_evidence.json",
     "request_manifests": "v3_input_manifests.json",
     "artifact_manifest": "v3_artifact_manifest.json",
     "semantic_proofs": "v3_semantic_proofs.json",
+    "selected_execution_anchor": "v3_selected_execution_anchor.json",
 }
 
 
@@ -272,6 +285,7 @@ def _load_reviewed_v3_contract() -> dict[str, Any]:
     request_manifests = evidence["request_manifests"]
     artifact_manifest = evidence["artifact_manifest"]
     semantic_proofs = evidence["semantic_proofs"]
+    selected_execution_anchor = evidence["selected_execution_anchor"]
     corpus["cases"] = case_manifest["cases"]
     corpus["recorded_outputs"] = recorded_evidence["recorded_outputs"]
     corpus["recorded_promotion_fixtures"] = recorded_evidence[
@@ -297,6 +311,7 @@ def _load_reviewed_v3_contract() -> dict[str, Any]:
         "artifacts": artifact_manifest["artifacts"],
         "artifact_records_sha256": artifact_manifest["artifact_records_sha256"],
         "execution": anchor["artifact_execution"],
+        "selected_execution": selected_execution_anchor,
     }
     return corpus
 
@@ -425,17 +440,6 @@ def _request_manifest_hash(request: ClassifierRequest) -> str:
     return manifest_hash
 
 
-def _recorded_v3_output(
-    corpus: dict[str, Any], *, case_id: str, pass_name: str
-) -> dict[str, JsonValue]:
-    recorded_cases = {str(case["case_id"]): case for case in corpus["recorded_outputs"]}
-    recorded = recorded_cases.get(case_id)
-    assert isinstance(recorded, dict)
-    output = recorded.get(f"{pass_name}_output")
-    assert isinstance(output, dict)
-    return cast(dict[str, JsonValue], deepcopy(output))
-
-
 def _classifier_case_id(source_message_revision_id: str) -> str:
     """Extract the opaque reviewed case key used by the hermetic model."""
     reviewed_id = source_message_revision_id.removeprefix("reviewed:")
@@ -443,91 +447,28 @@ def _classifier_case_id(source_message_revision_id: str) -> str:
 
 
 @dataclass(slots=True)
-class _HermeticSelectedClassifierProgram:
-    """Run the selected structured classifier against offline reviewed inputs.
-
-    This is a provider-local evaluation model, not a production parser or a
-    replacement runtime policy.  The production Codex adapter still builds
-    the exact pinned request and owns the structured port; the program only
-    supplies the hermetic provider response required by ordinary PR tests.
-    """
-
-    corpus: dict[str, Any]
-
-    def classify(self, request: dict[str, Any]) -> dict[str, JsonValue]:
-        body = request.get("body")
-        revision_id = request.get("source_message_revision_id")
-        pass_kind = request.get("pass_kind")
-        if not isinstance(body, str) or not isinstance(revision_id, str):
-            raise ValueError("hermetic classifier request is incomplete")
-        if pass_kind == "semantic_proof":
-            return self._semantic_proof(request)
-        if not isinstance(pass_kind, str):
-            raise ValueError("hermetic classifier pass kind is missing")
-        case_id = _classifier_case_id(revision_id)
-        recorded_cases = self.corpus["recorded_outputs"]
-        assert isinstance(recorded_cases, list)
-        for recorded_case in recorded_cases:
-            if recorded_case.get("case_id") == case_id:
-                return _recorded_v3_output(
-                    self.corpus,
-                    case_id=case_id,
-                    pass_name=(
-                        "second_pass"
-                        if pass_kind == "ambiguity_second_pass"
-                        else "primary"
-                    ),
-                )
-
-        promotion_fixtures = self.corpus["recorded_promotion_fixtures"]
-        assert isinstance(promotion_fixtures, dict)
-        for fixture in promotion_fixtures.values():
-            if isinstance(fixture, dict) and fixture.get("source") == body:
-                output = fixture.get("primary_output")
-                assert isinstance(output, dict)
-                return cast(dict[str, JsonValue], deepcopy(output))
-        return {
-            "schema_version": "source-message-classification-v3",
-            "disposition": "irrelevant",
-            "candidates": [],
-            "routing": {
-                "reason_code": "irrelevant",
-                "required_context": "none",
-            },
-        }
-
-    def _semantic_proof(self, request: dict[str, Any]) -> dict[str, JsonValue]:
-        candidate_key = request.get("proof_candidate_key")
-        body = request.get("body")
-        if not isinstance(candidate_key, str) or not isinstance(body, str):
-            raise ValueError("hermetic semantic-proof request is incomplete")
-        semantic_evidence = self.corpus["_v3_semantic_proofs"]
-        assert isinstance(semantic_evidence, dict)
-        records = semantic_evidence["records"]
-        assert isinstance(records, list)
-        for record in records:
-            if record.get("candidate_key") != candidate_key:
-                continue
-            proof = record.get("proof")
-            assert isinstance(proof, dict)
-            return cast(dict[str, JsonValue], deepcopy(proof))
-        raise ValueError(f"hermetic semantic proof is missing for {candidate_key}")
-
-
-@dataclass(slots=True)
 class _HermeticCodexProcessRunner:
-    """Offline process transport used by the selected Codex CLI adapter."""
+    """Real child-process transport used by the selected Codex CLI adapter."""
 
-    program: _HermeticSelectedClassifierProgram
     run_id: str
     process_id: int
-    codex_version: str = "hermetic-codex-evaluation-v1"
+    codex_version: str = "hermetic-codex-execution-v2"
     execution_records: list[dict[str, Any]] = field(default_factory=list)
-    _failures: dict[str, BaseException] = field(default_factory=dict)
+    _failures: dict[str, str] = field(default_factory=dict)
 
     def fail_for(self, *, case_id: str, error: BaseException) -> None:
-        """Inject one body-free adapter failure for a named evaluation case."""
-        self._failures[case_id] = error
+        """Ask the real fixture child to return one controlled failure."""
+        if isinstance(error, TimeoutError):
+            failure_kind = "timeout"
+        elif isinstance(error, ClassifierQuotaError):
+            failure_kind = "429"
+        elif isinstance(error, ClassifierAuthenticationError):
+            failure_kind = "auth"
+        elif isinstance(error, InjectedClassifierCrash):
+            failure_kind = "crash"
+        else:
+            raise TypeError(f"unsupported hermetic failure: {type(error).__name__}")
+        self._failures[case_id] = failure_kind
 
     def execute(
         self,
@@ -538,7 +479,6 @@ class _HermeticCodexProcessRunner:
         input_text: str,
         timeout_seconds: int,
     ) -> dict[str, object]:
-        del argv, cwd, environment, timeout_seconds
         envelope = json.loads(input_text)
         assert isinstance(envelope, dict)
         request = envelope.get("request")
@@ -547,67 +487,321 @@ class _HermeticCodexProcessRunner:
         assert isinstance(revision_id, str)
         case_id = _classifier_case_id(revision_id)
         request_digest = _canonical_digest(request)
-        execution_number = len(self.execution_records) + 1
-        execution_id = (
-            f"{self.run_id}:pid-{self.process_id}:execution-{execution_number}:"
-            f"{request_digest[:16]}"
-        )
-        failure = self._failures.pop(case_id, None)
-        if failure is not None:
-            self.execution_records.append(
-                {
-                    "execution_id": execution_id,
-                    "run_id": self.run_id,
-                    "process_id": self.process_id,
-                    "case_id": case_id,
-                    "source_message_revision_id": revision_id,
-                    "pass_kind": request.get("pass_kind"),
-                    "request_sha256": request_digest,
-                    "adapter_kind": "codex_cli",
-                    "adapter_version": "classifier-hermetic-evaluation-v1",
-                    "codex_version": self.codex_version,
-                    "status": "failed",
-                    "failure_kind": type(failure).__name__,
-                }
-            )
-            raise failure
-
-        output = self.program.classify(request)
-        output_digest = _canonical_digest(output)
         prompt = envelope.get("instruction")
         assert isinstance(prompt, str)
-        output_text = json.dumps(output, ensure_ascii=False, sort_keys=True)
-        self.execution_records.append(
+        child_environment = dict(environment)
+        child_environment.update(
             {
-                "execution_id": execution_id,
-                "run_id": self.run_id,
-                "process_id": self.process_id,
-                "case_id": case_id,
-                "source_message_revision_id": revision_id,
-                "pass_kind": request.get("pass_kind"),
-                "request_sha256": request_digest,
-                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-                "output_sha256": output_digest,
-                "adapter_kind": "codex_cli",
-                "adapter_version": "classifier-hermetic-evaluation-v1",
-                "codex_version": self.codex_version,
-                "effective_model": "gpt-5.6-sol",
-                "effective_reasoning_effort": "high",
+                "HERMETIC_RUN_ID": self.run_id,
+                "HERMETIC_PARENT_PROCESS_ID": str(self.process_id),
+                "HERMETIC_ENV_MARKER": f"{self.run_id}:{case_id}",
+            }
+        )
+        failure_kind = self._failures.pop(case_id, None)
+        if failure_kind is not None:
+            child_environment["HERMETIC_FAILURE_KIND"] = failure_kind
+        started = monotonic()
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=child_environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            start_new_session=True,
+        )
+        child_process_id = process.pid
+        timed_out = False
+        try:
+            stdout, stderr = process.communicate(
+                input=input_text,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            with suppress(ProcessLookupError):
+                os.killpg(child_process_id, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        duration_ms = max(1, int((monotonic() - started) * 1000))
+        metadata = _hermetic_execution_metadata(stdout)
+        self._assert_child_contract(
+            metadata,
+            argv=argv,
+            cwd=cwd,
+            environment=child_environment,
+            child_process_id=child_process_id,
+            request_digest=request_digest,
+        )
+        execution_id = metadata["execution_id"]
+        assert isinstance(execution_id, str)
+        record: dict[str, Any] = {
+            "execution_id": execution_id,
+            "run_id": self.run_id,
+            "process_id": self.process_id,
+            "child_process_id": child_process_id,
+            "case_id": case_id,
+            "source_message_revision_id": revision_id,
+            "pass_kind": request.get("pass_kind"),
+            "request_sha256": request_digest,
+            "input_sha256": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "argv": list(argv),
+            "cwd": str(cwd.resolve()),
+            "environment": child_environment,
+            "timeout_seconds": timeout_seconds,
+            "stdout_sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+            "stdout_protocol_sha256": _hermetic_protocol_digest(
+                stdout,
+                repository_root=cwd,
+            ),
+            "exit_code": process.returncode,
+            "duration_ms": duration_ms,
+            "adapter_kind": "codex_cli",
+            "adapter_version": "classifier-hermetic-execution-v2",
+            "codex_version": self.codex_version,
+        }
+        if timed_out:
+            record.update({"status": "failed", "failure_kind": "process_timeout"})
+            self.execution_records.append(record)
+            raise TimeoutError
+        if process.returncode != 0:
+            record.update(
+                {
+                    "status": "failed",
+                    "failure_kind": failure_kind or "child_process_error",
+                }
+            )
+            self.execution_records.append(record)
+            raise self._failure_for_child(
+                failure_kind,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        try:
+            execution = _codex_jsonl_result(stdout, argv=argv)
+        except BaseException:
+            record.update({"status": "failed", "failure_kind": "protocol_error"})
+            self.execution_records.append(record)
+            raise
+        output = execution.get("output")
+        assert isinstance(output, dict)
+        record.update(
+            {
+                "output_sha256": _canonical_digest(output),
+                "effective_model": execution.get("effective_model"),
+                "effective_reasoning_effort": execution.get(
+                    "effective_reasoning_effort"
+                ),
+                "input_tokens": execution.get("input_tokens"),
+                "output_tokens": execution.get("output_tokens"),
                 "status": "succeeded",
             }
         )
-        return {
-            "output": output,
-            "effective_model": "gpt-5.6-sol",
-            "effective_reasoning_effort": "high",
-            "duration_ms": max(1, (len(input_text) + len(output_text)) // 100),
-            "input_tokens": max(1, len(input_text.split())),
-            "output_tokens": max(1, len(output_text.split())),
+        self.execution_records.append(record)
+        execution["duration_ms"] = duration_ms
+        return execution
+
+    def _assert_child_contract(
+        self,
+        metadata: dict[str, object],
+        *,
+        argv: tuple[str, ...],
+        cwd: Path,
+        environment: dict[str, str],
+        child_process_id: int,
+        request_digest: str,
+    ) -> None:
+        execution_id = metadata.get("execution_id")
+        assert isinstance(execution_id, str) and execution_id
+        assert metadata.get("child_process_id") == child_process_id
+        assert metadata.get("parent_process_id") == self.process_id
+        assert metadata.get("run_id") == self.run_id
+        assert metadata.get("argv") == list(argv)
+        assert metadata.get("cwd") == str(cwd.resolve())
+        assert metadata.get("codex_home") == environment["CODEX_HOME"]
+        assert metadata.get("environment_marker") == environment["HERMETIC_ENV_MARKER"]
+        assert metadata.get("input_sha256") == request_digest
+
+    def _failure_for_child(
+        self,
+        failure_kind: str | None,
+        *,
+        stdout: str,
+        stderr: str,
+    ) -> BaseException:
+        if failure_kind == "timeout":
+            return TimeoutError()
+        if failure_kind == "429":
+            return ClassifierQuotaError(retry_after_seconds=240)
+        if failure_kind == "auth":
+            return ClassifierAuthenticationError()
+        if failure_kind == "crash":
+            return InjectedClassifierCrash()
+        failure = _codex_jsonl_failure(stdout) or RuntimeError(
+            stderr.strip() or "hermetic Codex child failed"
+        )
+        return failure
+
+
+def _hermetic_execution_metadata(stdout: str) -> dict[str, object]:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "thread.started":
+            continue
+        metadata = event.get("hermetic_execution")
+        if isinstance(metadata, dict):
+            return metadata
+    return {}
+
+
+def _relative_process_path(value: str, *, repository_root: Path) -> str:
+    path = Path(value)
+    try:
+        return str(path.resolve().relative_to(repository_root.resolve()))
+    except ValueError:
+        return path.name if path.is_absolute() else value
+
+
+def _stable_hermetic_argv(
+    argv: list[str] | tuple[str, ...], *, repository_root: Path
+) -> list[str]:
+    stable: list[str] = []
+    for value in argv:
+        if value.startswith("/"):
+            stable.append(
+                _relative_process_path(value, repository_root=repository_root)
+            )
+        else:
+            stable.append(value)
+    return stable
+
+
+def _hermetic_protocol_digest(stdout: str, *, repository_root: Path) -> str:
+    """Hash protocol evidence after replacing only run-local identities."""
+    normalized_events: list[dict[str, object]] = []
+    for line in stdout.splitlines():
+        event = json.loads(line)
+        assert isinstance(event, dict)
+        normalized = deepcopy(event)
+        if event.get("type") == "thread.started":
+            metadata = normalized.get("hermetic_execution")
+            assert isinstance(metadata, dict)
+            metadata["execution_id"] = "<execution_id>"
+            metadata["run_id"] = "<run_id>"
+            metadata["child_process_id"] = 0
+            metadata["parent_process_id"] = 0
+            metadata["argv"] = _stable_hermetic_argv(
+                cast(list[str], metadata["argv"]),
+                repository_root=repository_root,
+            )
+            metadata["cwd"] = "."
+            metadata["codex_home"] = ".hermetic-codex-home"
+            metadata["environment_marker"] = "<environment_marker>"
+        normalized_events.append(normalized)
+    return _canonical_digest(normalized_events)
+
+
+def _selected_execution_artifacts(
+    runner: _HermeticCodexProcessRunner,
+    *,
+    repository_root: Path,
+) -> dict[str, Any]:
+    """Return path-independent, externally anchorable selected-run digests."""
+    successful = [
+        record for record in runner.execution_records if record["status"] == "succeeded"
+    ]
+    output_records = [
+        {
+            "case_id": record["case_id"],
+            "pass_kind": record["pass_kind"],
+            "output_sha256": record["output_sha256"],
+            "status": record["status"],
         }
+        for record in successful
+    ]
+    execution_records: list[dict[str, Any]] = []
+    for record in runner.execution_records:
+        environment = record["environment"]
+        stable_environment = {
+            "CODEX_HOME": _relative_process_path(
+                str(environment["CODEX_HOME"]),
+                repository_root=repository_root,
+            ),
+            **(
+                {"HERMETIC_FAILURE_KIND": environment["HERMETIC_FAILURE_KIND"]}
+                if environment.get("HERMETIC_FAILURE_KIND")
+                else {}
+            ),
+        }
+        stable_record = {
+            "case_id": record["case_id"],
+            "pass_kind": record["pass_kind"],
+            "request_sha256": record["request_sha256"],
+            "input_sha256": record["input_sha256"],
+            "prompt_sha256": record["prompt_sha256"],
+            "argv": _stable_hermetic_argv(
+                cast(list[str], record["argv"]),
+                repository_root=repository_root,
+            ),
+            "cwd": ".",
+            "environment": stable_environment,
+            "timeout_seconds": record["timeout_seconds"],
+            "exit_code": record["exit_code"],
+            "stdout_protocol_sha256": record["stdout_protocol_sha256"],
+            "stderr_sha256": record["stderr_sha256"],
+            "adapter_kind": record["adapter_kind"],
+            "adapter_version": record["adapter_version"],
+            "codex_version": record["codex_version"],
+            "status": record["status"],
+        }
+        if record["status"] == "succeeded":
+            stable_record.update(
+                {
+                    "effective_model": record["effective_model"],
+                    "effective_reasoning_effort": record["effective_reasoning_effort"],
+                    "input_tokens": record["input_tokens"],
+                    "output_tokens": record["output_tokens"],
+                    "output_sha256": record["output_sha256"],
+                }
+            )
+        else:
+            stable_record["failure_kind"] = record["failure_kind"]
+        execution_records.append(stable_record)
+    return {
+        "output_records": output_records,
+        "output_artifact_sha256": _canonical_digest(output_records),
+        "protocol_records": [
+            {
+                "case_id": record["case_id"],
+                "pass_kind": record["pass_kind"],
+                "stdout_protocol_sha256": record["stdout_protocol_sha256"],
+                "stderr_sha256": record["stderr_sha256"],
+            }
+            for record in runner.execution_records
+        ],
+        "protocol_artifact_sha256": _canonical_digest(
+            [
+                {
+                    "case_id": record["case_id"],
+                    "pass_kind": record["pass_kind"],
+                    "stdout_protocol_sha256": record["stdout_protocol_sha256"],
+                    "stderr_sha256": record["stderr_sha256"],
+                }
+                for record in runner.execution_records
+            ]
+        ),
+        "execution_records": execution_records,
+        "execution_artifact_sha256": _canonical_digest(execution_records),
+    }
 
 
 def _selected_classifier_adapter(
-    corpus: dict[str, Any],
     *,
     run_id: str,
     process_id: int,
@@ -616,12 +810,11 @@ def _selected_classifier_adapter(
     repository_root = Path(__file__).parents[2]
     artifact_root = repository_root / "classifier"
     runner = _HermeticCodexProcessRunner(
-        program=_HermeticSelectedClassifierProgram(corpus),
         run_id=run_id,
         process_id=process_id,
     )
     adapter = CodexCliClassifierAdapter(
-        codex_executable=Path("hermetic-codex"),
+        codex_executable=_HERMETIC_EXECUTABLE,
         codex_home=repository_root / ".hermetic-codex-home",
         workspace=repository_root,
         schema_paths={
@@ -649,7 +842,7 @@ def _selected_classifier_adapter(
         },
         runner=runner,
         codex_version=runner.codex_version,
-        adapter_version="classifier-hermetic-evaluation-v1",
+        adapter_version="classifier-hermetic-execution-v2",
     )
     return adapter, runner
 
@@ -665,7 +858,7 @@ def _assert_selected_execution_provenance(
     assert result.effective_reasoning_effort == "high"
     assert result.codex_version == runner.codex_version
     assert result.adapter_kind == "codex_cli"
-    assert result.adapter_version == "classifier-hermetic-evaluation-v1"
+    assert result.adapter_version == "classifier-hermetic-execution-v2"
     assert result.duration_ms > 0
     assert result.input_tokens > 0
     assert result.output_tokens > 0
@@ -674,6 +867,19 @@ def _assert_selected_execution_provenance(
     assert record["source_message_revision_id"] == request.source_message_revision_id
     assert record["case_id"] == _classifier_case_id(request.source_message_revision_id)
     assert record["pass_kind"] == request.pass_kind
+    assert isinstance(record["child_process_id"], int)
+    assert record["child_process_id"] != record["process_id"]
+    assert record["exit_code"] == 0
+    assert record["duration_ms"] > 0
+    assert len(record["input_sha256"]) == 64
+    assert len(record["stdout_sha256"]) == 64
+    assert len(record["stderr_sha256"]) == 64
+    assert record["argv"][0] == str(_HERMETIC_EXECUTABLE)
+    assert record["cwd"] == str(_HERMETIC_EXECUTABLE.parents[2])
+    assert record["environment"]["CODEX_HOME"] == str(
+        _HERMETIC_EXECUTABLE.parents[2] / ".hermetic-codex-home"
+    )
+    assert record["timeout_seconds"] == 180
     assert record["output_sha256"] == _canonical_digest(result.output)
 
 
@@ -711,14 +917,16 @@ def _assert_semantic_proofs_for_output(
             and record.get("candidate_key") == candidate_key
         ]
         assert len(matching_records) == 1
-        proof = matching_records[0].get("proof")
-        assert isinstance(proof, dict)
-        source_reference = proof.get("source_message_revision_reference")
-        assert isinstance(source_reference, str)
+        recorded_proof = matching_records[0].get("proof")
+        assert isinstance(recorded_proof, dict)
+        recorded_source_reference = recorded_proof.get(
+            "source_message_revision_reference"
+        )
+        assert isinstance(recorded_source_reference, str)
         assert semantic_proof_is_schema_valid(
-            proof,
+            recorded_proof,
             body=body,
-            source_message_revision_reference=source_reference,
+            source_message_revision_reference=recorded_source_reference,
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
@@ -727,26 +935,6 @@ def _assert_semantic_proofs_for_output(
         )
         validated.add((case_id, pass_name, candidate_key))
     return validated
-
-
-def _reviewed_semantic_proof(
-    corpus: dict[str, Any], *, case_id: str, candidate_key: str
-) -> dict[str, JsonValue]:
-    """Return the one independently anchored proof for a candidate."""
-    semantic_evidence = corpus["_v3_semantic_proofs"]
-    assert isinstance(semantic_evidence, dict)
-    records = semantic_evidence["records"]
-    assert isinstance(records, list)
-    matching_records = [
-        record
-        for record in records
-        if record.get("case_id") == case_id
-        and record.get("candidate_key") == candidate_key
-    ]
-    assert len(matching_records) == 1
-    proof = matching_records[0].get("proof")
-    assert isinstance(proof, dict)
-    return cast(dict[str, JsonValue], deepcopy(proof))
 
 
 def _execute_selected_semantic_proofs(
@@ -759,6 +947,7 @@ def _execute_selected_semantic_proofs(
     body: str,
     request: ClassifierRequest,
     output: dict[str, JsonValue],
+    proof_outputs: dict[str, dict[str, JsonValue]] | None = None,
 ) -> set[tuple[str, str, str]]:
     """Execute and validate every candidate's semantic-proof port request."""
     validated = _assert_semantic_proofs_for_output(
@@ -795,24 +984,24 @@ def _execute_selected_semantic_proofs(
             request=proof_request,
             runner=runner,
         )
-        expected_proof = _reviewed_semantic_proof(
-            corpus,
-            case_id=case_id,
-            candidate_key=candidate_key,
+        selected_proof = proof_result.output
+        source_reference = selected_proof.get("source_message_revision_reference")
+        assert source_reference == _opaque_classifier_reference(
+            proof_request.source_message_revision_id,
+            kind="revision",
         )
-        assert proof_result.output == expected_proof
         assert semantic_proof_is_schema_valid(
-            proof_result.output,
+            selected_proof,
             body=body,
-            source_message_revision_reference=str(
-                expected_proof["source_message_revision_reference"]
-            ),
+            source_message_revision_reference=str(source_reference),
             candidate_key=candidate_key,
             evidence=evidence,
             routes=routes,
             opportunity_type=opportunity_type,
             semantic_proof_version=corpus["semantic_proof_version"],
         )
+        if proof_outputs is not None:
+            proof_outputs[candidate_key] = deepcopy(selected_proof)
     return validated
 
 
@@ -856,20 +1045,16 @@ class _RecordedTournamentResolver:
         )
 
 
-def _recorded_tournament_payload(
+def _tournament_promotion_payload(
     corpus: dict[str, Any],
-) -> tuple[dict[str, JsonValue], str, dict[str, JsonValue], dict[str, JsonValue]]:
+) -> tuple[dict[str, JsonValue], str]:
     fixture = corpus["recorded_promotion_fixtures"]["tournament-current-registration"]
     assert isinstance(fixture, dict)
     body = fixture["source"]
-    output = fixture["primary_output"]
-    semantic_proof = fixture["semantic_proof_output"]
     assert isinstance(body, str)
-    assert isinstance(output, dict)
-    assert isinstance(semantic_proof, dict)
     execution = _evaluation_provenance(corpus)["execution"]
     assert isinstance(execution, dict)
-    revision_id = "reviewed:promotion:revision:1"
+    revision_id = "reviewed:promotion:tournament-current-registration:revision:1"
     payload: dict[str, JsonValue] = {
         "source_message_revision_id": revision_id,
         "body": body,
@@ -901,8 +1086,8 @@ def _recorded_tournament_payload(
         "input_tokens": execution["input_tokens"],
         "output_tokens": execution["output_tokens"],
         "classification_status": "succeeded",
-        "semantic_proof": semantic_proof,
-        "output": output,
+        "semantic_proof": None,
+        "output": None,
     }
     manifest_hash = _classifier_input_manifest_hash(
         payload,
@@ -919,12 +1104,7 @@ def _recorded_tournament_payload(
     )
     assert manifest_hash is not None
     payload["input_manifest_hash"] = manifest_hash
-    return (
-        payload,
-        body,
-        cast(dict[str, JsonValue], output),
-        cast(dict[str, JsonValue], semantic_proof),
-    )
+    return payload, body
 
 
 @dataclass
@@ -953,7 +1133,7 @@ class _EvaluationPersistence:
         self.staged.clear()
 
 
-def _run_recorded_evaluation(
+def _run_selected_evaluation(
     adapter: ModelAdapter,
     request: ClassifierRequest,
     *,
@@ -1003,6 +1183,7 @@ def _validate_reviewed_provenance(
         "request_manifests",
         "artifact_manifest",
         "semantic_proofs",
+        "selected_execution_anchor",
     }
     expected_raw_keys.update(
         f"artifact:{directory}:{field_name}"
@@ -1094,6 +1275,103 @@ def _validate_reviewed_provenance(
     return artifact_records
 
 
+def _validate_selected_execution_anchor(
+    corpus: dict[str, Any],
+    *,
+    runner: _HermeticCodexProcessRunner,
+    repository_root: Path,
+) -> dict[str, Any]:
+    """Validate real selected execution evidence against a committed anchor."""
+    anchor = _evaluation_provenance(corpus).get("selected_execution")
+    assert isinstance(anchor, dict)
+    assert anchor["anchor_version"] == (
+        "open-match-classifier-regression-v3-selected-execution-anchor-v1"
+    )
+    fixture = anchor["fixture"]
+    assert isinstance(fixture, dict)
+    external_anchor = corpus["_v3_anchor"].get("selected_execution")
+    assert isinstance(external_anchor, dict)
+    assert external_anchor == anchor
+    fixture_path = repository_root / str(fixture["path"])
+    assert fixture_path == _HERMETIC_EXECUTABLE
+    assert fixture_path.is_file()
+    assert os.access(fixture_path, os.X_OK)
+    assert hashlib.sha256(fixture_path.read_bytes()).hexdigest() == fixture["sha256"]
+
+    contract = anchor["contract"]
+    assert isinstance(contract, dict)
+    assert contract == {
+        "adapter_kind": "codex_cli",
+        "adapter_version": "classifier-hermetic-execution-v2",
+        "codex_version": "hermetic-codex-execution-v2",
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "timeout_seconds": 180,
+        "requires_child_process": True,
+        "requires_exit_status": True,
+        "requires_stdout_stderr_digests": True,
+        "requires_input_output_evidence": True,
+    }
+    records = runner.execution_records
+    assert records
+    child_process_ids = [record.get("child_process_id") for record in records]
+    assert all(isinstance(child_id, int) for child_id in child_process_ids)
+    assert len(set(child_process_ids)) == len(records)
+    assert all(child_id != runner.process_id for child_id in child_process_ids)
+    execution_ids = [record.get("execution_id") for record in records]
+    assert all(isinstance(execution_id, str) for execution_id in execution_ids)
+    assert len(set(execution_ids)) == len(records)
+    assert all(record["run_id"] == runner.run_id for record in records)
+    assert all(record["process_id"] == runner.process_id for record in records)
+    assert all(record["timeout_seconds"] == 180 for record in records)
+    assert all(
+        record["adapter_kind"] == contract["adapter_kind"]
+        and record["adapter_version"] == contract["adapter_version"]
+        and record["codex_version"] == contract["codex_version"]
+        for record in records
+    )
+    assert all(
+        all(
+            isinstance(record.get(field_name), str)
+            and len(str(record[field_name])) == 64
+            for field_name in (
+                "request_sha256",
+                "input_sha256",
+                "prompt_sha256",
+                "stdout_sha256",
+                "stderr_sha256",
+                "stdout_protocol_sha256",
+            )
+        )
+        and isinstance(record.get("exit_code"), int)
+        and isinstance(record.get("duration_ms"), int)
+        and record["duration_ms"] > 0
+        for record in records
+    )
+    expected = anchor["expected"]
+    assert isinstance(expected, dict)
+    successful_count = sum(record["status"] == "succeeded" for record in records)
+    failed_count = sum(record["status"] == "failed" for record in records)
+    semantic_proof_count = sum(
+        record["status"] == "succeeded" and record["pass_kind"] == "semantic_proof"
+        for record in records
+    )
+    assert len(records) == expected["execution_count"]
+    assert successful_count == expected["successful_execution_count"]
+    assert failed_count == expected["failed_execution_count"]
+    assert semantic_proof_count == expected["semantic_proof_execution_count"]
+    artifacts = _selected_execution_artifacts(
+        runner,
+        repository_root=repository_root,
+    )
+    assert artifacts["output_artifact_sha256"] == expected["output_artifact_sha256"]
+    assert artifacts["protocol_artifact_sha256"] == expected["protocol_artifact_sha256"]
+    assert (
+        artifacts["execution_artifact_sha256"] == expected["execution_artifact_sha256"]
+    )
+    return artifacts
+
+
 def _run_v3_evaluation_gate(
     corpus: dict[str, Any], *, run_id: str = "standalone", process_id: int | None = None
 ) -> str:
@@ -1170,7 +1448,6 @@ def _run_v3_evaluation_gate(
     assert semantic_contract["record_count"] == len(semantic_records)
     validated_semantic_records: set[tuple[str, str, str]] = set()
     adapter, runner = _selected_classifier_adapter(
-        corpus,
         run_id=run_id,
         process_id=process_id,
     )
@@ -1185,11 +1462,6 @@ def _run_v3_evaluation_gate(
             == source_case["expected_pipeline_disposition"]
         )
         body = source_case["source"]
-        primary_output = _recorded_v3_output(
-            corpus,
-            case_id=case_id,
-            pass_name="primary",
-        )
         request = _gate_request(case_id=case_id, body=body)
         result = adapter.classify(request)
         _assert_selected_execution_provenance(
@@ -1197,7 +1469,6 @@ def _run_v3_evaluation_gate(
             request=request,
             runner=runner,
         )
-        assert result.output == primary_output
         assert classifier_output_is_schema_valid(result.output, body=body)
         validated_semantic_records.update(
             _execute_selected_semantic_proofs(
@@ -1231,11 +1502,6 @@ def _run_v3_evaluation_gate(
             "primary": result.output,
         }
         if expected_disposition == "needs_second_pass":
-            second_output = _recorded_v3_output(
-                corpus,
-                case_id=case_id,
-                pass_name="second_pass",
-            )
             second_request = _gate_request(
                 case_id=case_id,
                 body=body,
@@ -1248,7 +1514,6 @@ def _run_v3_evaluation_gate(
                 request=second_request,
                 runner=runner,
             )
-            assert second_result.output == second_output
             assert classifier_output_is_schema_valid(second_result.output, body=body)
             validated_semantic_records.update(
                 _execute_selected_semantic_proofs(
@@ -1276,13 +1541,12 @@ def _run_v3_evaluation_gate(
     recorded_promotion_fixtures = corpus["recorded_promotion_fixtures"]
     assert isinstance(recorded_promotion_fixtures, dict)
     promotion_results: dict[str, ClassifierAdapterResult] = {}
+    promotion_proofs: dict[str, dict[str, JsonValue]] = {}
     for fixture_name in corpus["promotion_fixtures"]:
         fixture = recorded_promotion_fixtures[fixture_name]
         assert isinstance(fixture, dict)
         body = fixture["source"]
-        output = fixture["primary_output"]
         assert isinstance(body, str)
-        assert isinstance(output, dict)
         assert fixture_name in corpus["promotion_fixtures"]
         request = _gate_request(
             case_id=f"promotion:{fixture_name}",
@@ -1294,7 +1558,6 @@ def _run_v3_evaluation_gate(
             request=request,
             runner=runner,
         )
-        assert result.output == output
         assert classifier_output_is_schema_valid(result.output, body=body)
         promotion_results[fixture_name] = result
         validated_semantic_records.update(
@@ -1307,6 +1570,7 @@ def _run_v3_evaluation_gate(
                 body=body,
                 request=request,
                 output=result.output,
+                proof_outputs=promotion_proofs,
             )
         )
         if result.output["disposition"] == "accepted":
@@ -1331,16 +1595,10 @@ def _run_v3_evaluation_gate(
             assert isinstance(candidate_key, str)
             assert isinstance(evidence, dict)
 
-    promotion_payload, promotion_body, promotion_output, promotion_proof = (
-        _recorded_tournament_payload(corpus)
-    )
+    promotion_payload, promotion_body = _tournament_promotion_payload(corpus)
     promotion_result = promotion_results["tournament-current-registration"]
     promotion_output = promotion_result.output
-    promotion_proof = _reviewed_semantic_proof(
-        corpus,
-        case_id="promotion:tournament-current-registration",
-        candidate_key="tournament-current-registration",
-    )
+    promotion_proof = promotion_proofs["tournament-current-registration"]
     promotion_payload["output"] = promotion_output
     promotion_payload["semantic_proof"] = promotion_proof
     for field_name in (
@@ -1430,7 +1688,7 @@ def _run_v3_evaluation_gate(
         rejected_payload["output"] = normalized_output
         return _validated_tournament_proposal(rejected_payload, resolver=resolver)
 
-    normalization_outcome = _run_recorded_evaluation(
+    normalization_outcome = _run_selected_evaluation(
         adapter,
         _gate_request(case_id="normalization-rejection", body=promotion_body),
         effect_key="normalization-rejection",
@@ -1446,12 +1704,9 @@ def _run_v3_evaluation_gate(
     ]
     assert isinstance(unpublished_fixture, dict)
     unpublished_body = unpublished_fixture["source"]
-    unpublished_output = unpublished_fixture["primary_output"]
     assert isinstance(unpublished_body, str)
-    assert isinstance(unpublished_output, dict)
-    assert unpublished_output["disposition"] != "accepted"
     unpublished_persistence = _EvaluationPersistence()
-    unpublished_outcome = _run_recorded_evaluation(
+    unpublished_outcome = _run_selected_evaluation(
         adapter,
         _gate_request(case_id="unpublished-persistence", body=unpublished_body),
         effect_key="unpublished-persistence",
@@ -1471,7 +1726,7 @@ def _run_v3_evaluation_gate(
         runner.fail_for(case_id=name, error=error)
         failure_persistence = _EvaluationPersistence()
         try:
-            _run_recorded_evaluation(
+            _run_selected_evaluation(
                 adapter,
                 _gate_request(case_id=name, body="failure fixture"),
                 effect_key=name,
@@ -1488,7 +1743,7 @@ def _run_v3_evaluation_gate(
     replay_persistence = _EvaluationPersistence()
     replay_request = _gate_request(case_id="replay", body=replay_body)
     assert (
-        _run_recorded_evaluation(
+        _run_selected_evaluation(
             adapter,
             replay_request,
             effect_key="tournament-current-registration",
@@ -1497,7 +1752,7 @@ def _run_v3_evaluation_gate(
         == "published"
     )
     assert (
-        _run_recorded_evaluation(
+        _run_selected_evaluation(
             adapter,
             replay_request,
             effect_key="tournament-current-registration",
@@ -1526,7 +1781,7 @@ def _run_v3_evaluation_gate(
     rollback_persistence = _EvaluationPersistence(fail_next_commit=True)
     rollback_request = _gate_request(case_id="rollback", body=promotion_body)
     try:
-        _run_recorded_evaluation(
+        _run_selected_evaluation(
             adapter,
             rollback_request,
             effect_key="tournament-current-registration",
@@ -1540,7 +1795,7 @@ def _run_v3_evaluation_gate(
     assert rollback_persistence.staged == {}
     assert rollback_persistence.started == ["tournament-current-registration"]
     assert (
-        _run_recorded_evaluation(
+        _run_selected_evaluation(
             adapter,
             rollback_request,
             effect_key="tournament-current-registration",
@@ -1597,6 +1852,11 @@ def _run_v3_evaluation_gate(
     assert {record["case_id"] for record in runner.execution_records}.issuperset(
         set(corpus["failure_suite"])
     )
+    selected_artifacts = _validate_selected_execution_anchor(
+        corpus,
+        runner=runner,
+        repository_root=repository_root,
+    )
     output_records = [
         {
             key: record[key]
@@ -1617,7 +1877,7 @@ def _run_v3_evaluation_gate(
         "run_id": run_id,
         "process_id": process_id,
         "adapter_kind": adapter.adapter_kind,
-        "adapter_version": "classifier-hermetic-evaluation-v1",
+        "adapter_version": "classifier-hermetic-execution-v2",
         "codex_version": runner.codex_version,
         "execution_count": len(runner.execution_records),
         "successful_execution_count": len(successful_execution_records),
@@ -1649,6 +1909,15 @@ def _run_v3_evaluation_gate(
             ]
         ),
         "evidence_digest": _canonical_digest(runner.execution_records),
+        "canonical_output_artifact_sha256": selected_artifacts[
+            "output_artifact_sha256"
+        ],
+        "canonical_protocol_artifact_sha256": selected_artifacts[
+            "protocol_artifact_sha256"
+        ],
+        "canonical_execution_artifact_sha256": selected_artifacts[
+            "execution_artifact_sha256"
+        ],
         "output_records": output_records,
         "execution_records": runner.execution_records,
     }
@@ -1717,11 +1986,11 @@ def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -
     selected_runs = [summary["selected_classifier"] for summary in run_summaries]
     assert all(selected["adapter_kind"] == "codex_cli" for selected in selected_runs)
     assert all(
-        selected["adapter_version"] == "classifier-hermetic-evaluation-v1"
+        selected["adapter_version"] == "classifier-hermetic-execution-v2"
         for selected in selected_runs
     )
     assert all(
-        selected["codex_version"] == "hermetic-codex-evaluation-v1"
+        selected["codex_version"] == "hermetic-codex-execution-v2"
         for selected in selected_runs
     )
     assert all(selected["execution_count"] == 58 for selected in selected_runs)
@@ -1732,14 +2001,52 @@ def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -
     assert all(
         selected["semantic_proof_execution_count"] == 4 for selected in selected_runs
     )
+    selected_anchor = _evaluation_provenance(corpus)["selected_execution"]
+    assert isinstance(selected_anchor, dict)
+    selected_expected = selected_anchor["expected"]
+    assert isinstance(selected_expected, dict)
+    assert all(
+        selected["canonical_output_artifact_sha256"]
+        == selected_expected["output_artifact_sha256"]
+        for selected in selected_runs
+    )
+    assert all(
+        selected["canonical_execution_artifact_sha256"]
+        == selected_expected["execution_artifact_sha256"]
+        for selected in selected_runs
+    )
+    assert all(
+        selected["canonical_protocol_artifact_sha256"]
+        == selected_expected["protocol_artifact_sha256"]
+        for selected in selected_runs
+    )
     assert len({selected["output_digest"] for selected in selected_runs}) == 3
     assert len({selected["provenance_digest"] for selected in selected_runs}) == 3
     assert len({selected["evidence_digest"] for selected in selected_runs}) == 3
     for selected in selected_runs:
         records = selected["execution_records"]
         assert len({record["execution_id"] for record in records}) == 58
+        assert len({record["child_process_id"] for record in records}) == 58
+        assert all(
+            record["child_process_id"] != selected["process_id"] for record in records
+        )
         assert all(record["run_id"] == selected["run_id"] for record in records)
         assert all(record["process_id"] == selected["process_id"] for record in records)
+        assert all(
+            record["exit_code"] == 0
+            for record in records
+            if record["status"] == "succeeded"
+        )
+        assert all(
+            record["exit_code"] != 0
+            for record in records
+            if record["status"] == "failed"
+        )
+        assert all(record["duration_ms"] > 0 for record in records)
+        assert all(
+            record["input_sha256"] and record["stdout_sha256"] for record in records
+        )
+        assert all(record["stderr_sha256"] for record in records)
         assert {
             record["case_id"] for record in records if record["status"] == "failed"
         } == {"timeout", "429", "auth", "crash"}
@@ -1770,6 +2077,216 @@ def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -
     assert (
         summary["publication_outcomes"]
         == expected_provenance["expected_publication_outcomes"]
+    )
+
+
+def test_selected_classifier_uses_a_real_process_and_not_recorded_v3_output() -> None:
+    """The selected gate must execute its configured fixture outside this process."""
+    repository_root = Path(__file__).parents[2]
+    executable = Path(__file__).with_name("hermetic-codex")
+    assert executable.is_file()
+    assert os.access(executable, os.X_OK)
+
+    corpus = _load_reviewed_v3_contract()
+    source_cases = _load_reviewed_source_cases()
+    request = _gate_request(case_id="sm-001", body=source_cases["sm-001"]["source"])
+    adapter, runner = _selected_classifier_adapter(
+        run_id="process-contract",
+        process_id=os.getpid(),
+    )
+    original = adapter.classify(request)
+
+    recorded_cases = corpus["recorded_outputs"]
+    assert isinstance(recorded_cases, list)
+    recorded_cases[0]["primary_output"] = {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+        "candidates": [],
+    }
+    changed_corpus_adapter, changed_corpus_runner = _selected_classifier_adapter(
+        run_id="process-contract-mutated-corpus",
+        process_id=os.getpid(),
+    )
+    changed_corpus_result = changed_corpus_adapter.classify(request)
+
+    assert changed_corpus_result.output == original.output
+    record = runner.execution_records[-1]
+    changed_record = changed_corpus_runner.execution_records[-1]
+    assert record["status"] == "succeeded"
+    assert isinstance(record["child_process_id"], int)
+    assert record["child_process_id"] != os.getpid()
+    assert record["child_process_id"] != record["process_id"]
+    assert record["argv"][0] == str(executable)
+    assert record["cwd"] == str(repository_root)
+    assert record["environment"]["CODEX_HOME"] == str(
+        repository_root / ".hermetic-codex-home"
+    )
+    assert record["timeout_seconds"] == 180
+    assert record["stdout_sha256"]
+    assert record["stderr_sha256"]
+    assert record["request_sha256"] == _canonical_digest(_request_payload(request))
+    assert len(record["input_sha256"]) == 64
+    assert isinstance(changed_record["child_process_id"], int)
+    assert changed_record["child_process_id"] != record["child_process_id"]
+
+
+def test_selected_execution_digest_anchor_is_external_to_selected_summary() -> None:
+    """The selected run cannot redefine its own expected digest anchor."""
+    corpus = _load_reviewed_v3_contract()
+    selected_anchor = _evaluation_provenance(corpus)["selected_execution"]
+    assert isinstance(selected_anchor, dict)
+    selected_expected = selected_anchor["expected"]
+    assert isinstance(selected_expected, dict)
+    selected_expected["output_artifact_sha256"] = "0" * 64
+
+    with pytest.raises(AssertionError):
+        _validate_selected_execution_anchor(
+            corpus,
+            runner=_HermeticCodexProcessRunner(
+                run_id="external-anchor-contract",
+                process_id=os.getpid(),
+            ),
+            repository_root=Path(__file__).parents[2],
+        )
+
+
+def test_selected_process_runner_honors_child_environment_and_timeout() -> None:
+    """A real sleeping child must be terminated by the supplied deadline."""
+    repository_root = Path(__file__).parents[2]
+    schema_path = (
+        repository_root
+        / "classifier"
+        / "open-match-primary-v3"
+        / "source-message-classification-v3.schema.json"
+    )
+    prompt_path = repository_root / "classifier" / "open-match-primary-v3" / "prompt.md"
+    request = _gate_request(case_id="timeout-contract", body="timeout contract")
+    input_text = json.dumps(
+        {
+            "instruction": prompt_path.read_text(encoding="utf-8"),
+            "request": _request_payload(request),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    runner = _HermeticCodexProcessRunner(
+        run_id="timeout-contract",
+        process_id=os.getpid(),
+    )
+    argv = (
+        str(_HERMETIC_EXECUTABLE),
+        "exec",
+        "--ephemeral",
+        "--json",
+        "--output-schema",
+        str(schema_path),
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--fixture-argv-marker",
+        "argv-contract",
+        "--sandbox",
+        "read-only",
+        "-",
+    )
+    try:
+        runner.execute(
+            argv,
+            cwd=Path("/tmp"),
+            environment={
+                "CODEX_HOME": str(repository_root / ".hermetic-codex-home"),
+                "HERMETIC_SLEEP_SECONDS": "2",
+            },
+            input_text=input_text,
+            timeout_seconds=1,
+        )
+    except TimeoutError:
+        pass
+    else:
+        raise AssertionError("sleeping hermetic child exceeded its deadline")
+    record = runner.execution_records[-1]
+    assert record["status"] == "failed"
+    assert record["failure_kind"] == "process_timeout"
+    assert record["exit_code"] != 0
+    assert isinstance(record["child_process_id"], int)
+    assert record["cwd"] == str(Path("/tmp").resolve())
+    assert record["environment"]["HERMETIC_SLEEP_SECONDS"] == "2"
+    assert record["timeout_seconds"] == 1
+
+
+def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
+    """Recorded v3 outputs stay anchored independently of selected execution."""
+    corpus = _load_reviewed_v3_contract()
+    repository_root = Path(__file__).parents[2]
+    artifact_records = _validate_reviewed_provenance(
+        corpus,
+        repository_root=repository_root,
+    )
+    source_cases = _load_reviewed_source_cases()
+    manifest_cases = {str(case["case_id"]): case for case in corpus["cases"]}
+    recorded_cases = {str(case["case_id"]): case for case in corpus["recorded_outputs"]}
+    for case_id, recorded_case in recorded_cases.items():
+        body = source_cases[case_id]["source"]
+        primary = recorded_case["primary_output"]
+        assert isinstance(primary, dict)
+        assert classifier_output_is_schema_valid(primary, body=body)
+        expected_disposition = manifest_cases[case_id]["expected_pipeline_disposition"]
+        if expected_disposition == "unresolved" and not set(
+            manifest_cases[case_id]["opportunity_types"]
+        ).intersection({"open_match", "tournament"}):
+            expected_disposition = "needs_review"
+        assert primary["disposition"] == expected_disposition
+        _assert_semantic_proofs_for_output(
+            corpus,
+            case_id=case_id,
+            pass_name="primary",
+            body=body,
+            output=primary,
+        )
+        second = recorded_case.get("second_pass_output")
+        if isinstance(second, dict):
+            assert classifier_output_is_schema_valid(second, body=body)
+            _assert_semantic_proofs_for_output(
+                corpus,
+                case_id=case_id,
+                pass_name="second_pass",
+                body=body,
+                output=second,
+            )
+    recorded_fixtures = corpus["recorded_promotion_fixtures"]
+    assert isinstance(recorded_fixtures, dict)
+    for fixture_name, fixture in recorded_fixtures.items():
+        assert isinstance(fixture, dict)
+        body = fixture["source"]
+        output = fixture["primary_output"]
+        assert isinstance(body, str)
+        assert isinstance(output, dict)
+        assert classifier_output_is_schema_valid(output, body=body)
+        _assert_semantic_proofs_for_output(
+            corpus,
+            case_id=f"promotion:{fixture_name}",
+            pass_name="promotion",
+            body=body,
+            output=output,
+        )
+    provenance = _evaluation_provenance(corpus)
+    recorded_execution = provenance["execution"]
+    selected_execution = provenance["selected_execution"]
+    assert recorded_execution["adapter_kind"] == "recorded_corpus"
+    assert recorded_execution["codex_version"] == "reviewed-offline"
+    assert selected_execution["anchor_version"] == (
+        "open-match-classifier-regression-v3-selected-execution-anchor-v1"
+    )
+    assert _canonical_digest(artifact_records) == provenance["artifact_records_sha256"]
+    assert (
+        _canonical_digest(corpus["recorded_outputs"])
+        == corpus["_v3_anchor"]["canonical_digests"]["recorded_outputs_sha256"]
     )
 
 

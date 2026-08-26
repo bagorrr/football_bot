@@ -40,6 +40,7 @@
     "request_manifests": "tests/classifier_regression/evidence/v3_input_manifests.json",
     "artifact_manifest": "tests/classifier_regression/evidence/v3_artifact_manifest.json",
     "semantic_proofs": "tests/classifier_regression/evidence/v3_semantic_proofs.json",
+    "selected_execution_anchor": "tests/classifier_regression/evidence/v3_selected_execution_anchor.json",
     "anchor": "tests/classifier_regression/evidence/v3_anchor.json"
   }
 }
