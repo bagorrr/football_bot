@@ -11,6 +11,7 @@ import pytest
 from modules.codex_classification_adapter import (
     CodexCliClassifierAdapter,
     SubprocessCodexRunner,
+    _codex_jsonl_result,
 )
 from modules.ports import (
     ClassifierAuthenticationError,
@@ -147,6 +148,8 @@ events = (
     },
     {
         "type": "turn.completed",
+        "effective_model": "gpt-5.6-sol",
+        "effective_reasoning_effort": "high",
         "usage": {"input_tokens": 12, "output_tokens": 8},
     },
 )
@@ -167,6 +170,22 @@ for event in events:
     assert result["effective_reasoning_effort"] == "high"
     assert result["input_tokens"] == 12
     assert result["output_tokens"] == 8
+
+
+def test_codex_jsonl_result_preserves_provider_effective_metadata() -> None:
+    stdout = "\n".join(
+        (
+            '{"type":"item.completed","item":{"type":"agent_message",'
+            '"text":"{\\"disposition\\":\\"irrelevant\\"}"}}',
+            '{"type":"turn.completed","effective_model":"provider-model",'
+            '"effective_reasoning_effort":"low","usage":{}}',
+        )
+    )
+
+    result = _codex_jsonl_result(stdout)
+
+    assert result["effective_model"] == "provider-model"
+    assert result["effective_reasoning_effort"] == "low"
 
 
 def test_codex_adapter_maps_provider_5xx_and_retry_after_without_body(

@@ -77,7 +77,7 @@ class SubprocessCodexRunner:
             if failure is not None:
                 raise failure
             raise RuntimeError("isolated Codex classifier process failed")
-        payload = _codex_jsonl_result(stdout, argv=argv)
+        payload = _codex_jsonl_result(stdout)
         payload.setdefault("duration_ms", int((monotonic() - started) * 1000))
         return payload
 
@@ -253,10 +253,12 @@ def _integer_metric(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, object]:
+def _codex_jsonl_result(stdout: str) -> dict[str, object]:
     """Extract the final structured message and usage from Codex JSONL."""
     final_text: str | None = None
     usage: dict[str, object] = {}
+    effective_model = ""
+    effective_reasoning_effort = ""
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -278,8 +280,29 @@ def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, obje
             and isinstance(item.get("text"), str)
         ):
             final_text = cast(str, item["text"])
-        if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
-            usage = cast(dict[str, object], event["usage"])
+        if event_type == "turn.completed":
+            if isinstance(event.get("usage"), dict):
+                usage = cast(dict[str, object], event["usage"])
+            for key in ("effective_model", "model"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    effective_model = value
+                    break
+            for key in ("effective_reasoning_effort", "reasoning_effort"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip():
+                    effective_reasoning_effort = value
+                    break
+            provider_metadata = event.get("provider_metadata")
+            if isinstance(provider_metadata, dict):
+                if not effective_model:
+                    value = provider_metadata.get("effective_model")
+                    if isinstance(value, str) and value.strip():
+                        effective_model = value
+                if not effective_reasoning_effort:
+                    value = provider_metadata.get("effective_reasoning_effort")
+                    if isinstance(value, str) and value.strip():
+                        effective_reasoning_effort = value
     if final_text is None:
         raise RuntimeError("Codex classifier emitted no final agent message")
     try:
@@ -288,16 +311,10 @@ def _codex_jsonl_result(stdout: str, *, argv: tuple[str, ...]) -> dict[str, obje
         raise RuntimeError("Codex classifier final message is not JSON") from error
     if not isinstance(output, dict):
         raise RuntimeError("Codex classifier final output is not an object")
-    try:
-        model = argv[argv.index("--model") + 1]
-    except (ValueError, IndexError) as error:
-        raise RuntimeError(
-            "Codex classifier command omitted its pinned model"
-        ) from error
     return {
         "output": output,
-        "effective_model": model,
-        "effective_reasoning_effort": "high",
+        "effective_model": effective_model,
+        "effective_reasoning_effort": effective_reasoning_effort,
         "input_tokens": _integer_metric(usage.get("input_tokens")),
         "output_tokens": _integer_metric(usage.get("output_tokens")),
     }
