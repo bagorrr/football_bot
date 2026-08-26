@@ -592,6 +592,14 @@ def _validate_reviewed_provenance(
         _canonical_digest(corpus["recorded_promotion_fixtures"])
         == provenance["promotion_fixtures_sha256"]
     )
+    expected_request_manifests = provenance.get("request_manifests")
+    assert isinstance(expected_request_manifests, list)
+    expected_digests = provenance.get("expected_digests")
+    assert isinstance(expected_digests, dict)
+    assert (
+        _canonical_digest(expected_request_manifests)
+        == expected_digests["request_manifests_sha256"]
+    )
 
     expected_artifacts = provenance.get("artifacts")
     assert isinstance(expected_artifacts, dict)
@@ -1011,6 +1019,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         json.dumps(failure_results, sort_keys=True).encode("utf-8")
     ).hexdigest()
     request_manifest_digest = _canonical_digest(request_manifests)
+    assert request_manifests == provenance["request_manifests"]
     expected_digests = provenance["expected_digests"]
     assert isinstance(expected_digests, dict)
     assert (
