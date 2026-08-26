@@ -717,6 +717,18 @@ def test_transfer_source_start_date_is_current_or_future_in_place_timezone(
             "player_transfer_availability",
             True,
         ),
+        (
+            "Available for Saturday's match. Looking for a long-term team in "
+            "Saint Petersburg.",
+            "player_transfer_availability",
+            True,
+        ),
+        (
+            "Need a goalkeeper for Saturday's match. Long-term roster vacancy "
+            "in Saint Petersburg.",
+            "roster_vacancy",
+            True,
+        ),
     ),
 )
 def test_transfer_opportunity_boundary_excludes_one_off_match_requests(

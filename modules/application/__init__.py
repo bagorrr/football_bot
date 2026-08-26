@@ -16214,7 +16214,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     )
     one_off = one_off_pattern.search(normalized)
     if opportunity_type == "roster_vacancy":
-        long_term = re.search(
+        long_term_pattern = re.compile(
             r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
             r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
             r"(?:the\s+)?(?:roster|squad)|join\s+(?:our\s+)?(?:roster|squad)|"
@@ -16225,25 +16225,26 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"команд\w*\s+ищ\w*|"
             r"plantilla\s+(?:vacante|abierta)|temporad\w*|effectif\s+vacant|"
             r"saison\w*)\b",
-            normalized,
         )
     else:
-        long_term = re.search(
+        long_term_pattern = re.compile(
             r"\b(?:transfer|available\s+for\s+(?:a\s+)?move|looking\s+for\s+"
             r"a\s+team|seeking\s+a\s+team|join\s+(?:a\s+)?team|long[- ]term|season|"
             r"campaign\w*|"
             r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
             r"сезон\w*|постоян\w*|долгосроч\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
             r"equip\w*|transfert|cherche\w*\s+une\s+équipe)\b",
-            normalized,
         )
+    long_term = long_term_pattern.search(normalized)
     if long_term is None:
         return False
     # A one-off game mention is allowed only when the same source also makes
     # the long-term or seasonal nature explicit. A bare "season" in a phrase
     # such as "this season's Saturday match" is not enough.
     if one_off is not None:
-        clauses = re.split(r"[.!?;\n]+", normalized)
+        clauses = tuple(
+            clause for clause in re.split(r"[.!?;\n]+", normalized) if clause.strip()
+        )
         one_off_only_pattern = re.compile(
             r"\b(?:for|on|at|this|the)\b[^.!?;\n]{0,40}"
             r"\b(?:match(?:es)?|game(?:s)?|fixture(?:s)?|opponent|"
@@ -16254,12 +16255,6 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"encuentro\w*|rencontre\w*)\b[^.!?;\n]{0,20}"
             r"\b(?:only|just|exclusiv\w*|только|лишь|solo|seulement)\b"
         )
-        if any(
-            one_off_pattern.search(clause) is not None
-            and one_off_only_pattern.search(clause) is not None
-            for clause in clauses
-        ):
-            return False
         explicit_long_term_pattern = re.compile(
             r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
             r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
@@ -16276,12 +16271,20 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"plantilla\s+(?:vacante|abierta)|transfert|cherche\w*\s+une\s+"
             r"équipe|effectif\s+vacant)\b",
         )
-        explicit_long_term = explicit_long_term_pattern.search(normalized)
-        if explicit_long_term is None or not any(
-            one_off_pattern.search(clause) is not None
+        has_independent_long_term_clause = any(
+            long_term_pattern.search(clause) is not None
+            and one_off_pattern.search(clause) is None
+            and one_off_only_pattern.search(clause) is None
+            for clause in clauses
+        )
+        has_explicit_long_term_same_clause = any(
+            long_term_pattern.search(clause) is not None
+            and one_off_pattern.search(clause) is not None
+            and one_off_only_pattern.search(clause) is None
             and explicit_long_term_pattern.search(clause) is not None
             for clause in clauses
-        ):
+        )
+        if not (has_independent_long_term_clause or has_explicit_long_term_same_clause):
             return False
     return True
 
