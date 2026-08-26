@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from modules.classifier_contract import (
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_provenance,
     classifier_output_is_schema_valid,
     semantic_proof_is_schema_valid,
 )
@@ -1547,7 +1549,19 @@ def _validate_classification_proposal(
         raise ValueError("ClassificationProposal status is invalid")
     if not isinstance(payload["output"], dict):
         raise TypeError("ClassificationProposal output must be an object")
-    if not classifier_output_is_schema_valid(payload["output"], body=body):
+    artifact_descriptor = classifier_artifact_descriptor_for_provenance(
+        prompt_version=_required_text(payload, "prompt_version"),
+        schema_version=_required_text(payload, "schema_version"),
+        routing_policy_version=_required_text(payload, "routing_policy_version"),
+        contract_envelope_version=envelope.contract_version,
+    )
+    if artifact_descriptor is None:
+        raise ValueError("ClassificationProposal artifact provenance is unsupported")
+    if not classifier_output_is_schema_valid(
+        payload["output"],
+        body=body,
+        artifact_descriptor=artifact_descriptor,
+    ):
         raise ValueError("ClassificationProposal output violates its public schema")
     if envelope.contract_version == 3:
         if payload["output"].get("disposition") != "accepted":
@@ -1583,9 +1597,14 @@ def _validate_classification_proposal(
             evidence=evidence,
             routes=routes,
             meaning=candidate_meaning,
+            artifact_descriptor=artifact_descriptor,
         ):
             raise ValueError("ClassificationProposal v3 semantic proof is invalid")
-        _validate_semantic_proof_execution(payload["semantic_proof_execution"])
+        _validate_semantic_proof_execution(
+            payload["semantic_proof_execution"],
+            meaning=candidate_meaning,
+            artifact_descriptor=artifact_descriptor,
+        )
     if envelope.contract_version in {4, 5}:
         _validate_adjacent_context(
             payload["adjacent_context"],
@@ -1601,21 +1620,7 @@ def _validate_classification_proposal(
         _validate_classification_proposal_v4(
             payload,
             body=body,
-            semantic_proof_version=(
-                "source-semantic-proof-v2"
-                if envelope.contract_version == 5
-                else "source-semantic-proof-v1"
-            ),
-            ambiguity_prompt_version=(
-                "open-match-ambiguity-v2"
-                if envelope.contract_version == 5
-                else "open-match-ambiguity-v1"
-            ),
-            ambiguity_schema_version=(
-                "source-message-classification-v3"
-                if envelope.contract_version == 5
-                else "source-message-classification-v2"
-            ),
+            artifact_descriptor=artifact_descriptor,
         )
     for field_name in ("pass_number", "attempt_number"):
         metric = payload[field_name]
@@ -1627,9 +1632,6 @@ def _validate_classification_proposal(
             raise TypeError(
                 f"ClassificationProposal requires non-negative {field_name}"
             )
-    player_release = (
-        payload.get("routing_policy_version") == "classifier-routing-player-v1"
-    )
     if envelope.contract_version < 4:
         pinned = {
             "requested_model": "gpt-5.6-sol",
@@ -1644,77 +1646,22 @@ def _validate_classification_proposal(
             "context_bundle_version": "primary-classifier-context-v1",
         }
     else:
-        schema_version = payload.get("schema_version")
-        if not isinstance(schema_version, str):
-            raise ValueError("ClassificationProposal primary schema is invalid")
-        active_artifacts = (
-            (
-                "player-match-primary-v1",
-                "player-match-ambiguity-v1",
-            )
-            if player_release
-            else {
-                "source-message-classification-v2": (
-                    "open-match-primary-v2",
-                    "open-match-ambiguity-v1",
-                ),
-                "source-message-classification-v3": (
-                    "open-match-primary-v3",
-                    "open-match-ambiguity-v2",
-                ),
-            }.get(schema_version)
-        )
-        if active_artifacts is None:
-            raise ValueError("ClassificationProposal primary artifact is unsupported")
-        if player_release and schema_version != "source-message-classification-v3":
-            raise ValueError("ClassificationProposal player artifact is unsupported")
+        if artifact_descriptor.ambiguity_prompt_version is None:
+            raise ValueError("ClassificationProposal ambiguity artifact is unsupported")
         pinned = {
             "requested_model": "gpt-5.6-sol",
             "effective_model": "gpt-5.6-sol",
             "requested_reasoning_effort": "high",
             "effective_reasoning_effort": "high",
             "prompt_version": (
-                active_artifacts[1]
+                artifact_descriptor.ambiguity_prompt_version
                 if payload["pass_number"] == 2
-                else active_artifacts[0]
+                else artifact_descriptor.primary_prompt_version
             ),
-            "schema_version": schema_version,
+            "schema_version": artifact_descriptor.primary_schema_version,
             "glossary_version": "football-opportunity-glossary-v1",
             "context_policy_version": "classifier-context-v1",
-            "routing_policy_version": (
-                "classifier-routing-player-v1"
-                if player_release
-                else "classifier-routing-v1"
-            ),
-            "context_bundle_version": "primary-classifier-context-v1",
-        }
-    if envelope.contract_version == 5:
-        pinned = {
-            "requested_model": "gpt-5.6-sol",
-            "effective_model": "gpt-5.6-sol",
-            "requested_reasoning_effort": "high",
-            "effective_reasoning_effort": "high",
-            "prompt_version": (
-                (
-                    "player-match-ambiguity-v1"
-                    if payload["pass_number"] == 2
-                    else "player-match-primary-v1"
-                )
-                if player_release
-                else (
-                    "open-match-ambiguity-v2"
-                    if payload["pass_number"] == 2
-                    else "open-match-primary-v3"
-                )
-            ),
-            "schema_version": "source-message-classification-v3",
-            "glossary_version": "football-opportunity-glossary-v1",
-            "context_policy_version": "classifier-context-v1",
-            "routing_policy_version": (
-                "classifier-routing-player-v1"
-                if player_release
-                else "classifier-routing-v1"
-            ),
+            "routing_policy_version": artifact_descriptor.routing_policy_version,
             "context_bundle_version": "primary-classifier-context-v1",
         }
     if any(payload[field_name] != value for field_name, value in pinned.items()):
@@ -1754,20 +1701,9 @@ def _validate_classification_proposal_v4(
     payload: dict[str, JsonValue],
     *,
     body: str,
-    semantic_proof_version: str = "source-semantic-proof-v1",
-    ambiguity_prompt_version: str = "open-match-ambiguity-v1",
-    ambiguity_schema_version: str = "source-message-classification-v2",
+    artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> None:
     """Validate multi-candidate proof and one-way ambiguity-pass provenance."""
-    player_release = (
-        payload.get("routing_policy_version") == "classifier-routing-player-v1"
-    )
-    proof_version = (
-        "source-semantic-proof-v2"
-        if player_release
-        or payload.get("schema_version") == "source-message-classification-v3"
-        else "source-semantic-proof-v1"
-    )
     output = payload["output"]
     assert isinstance(output, dict)
     candidates = output.get("candidates")
@@ -1822,6 +1758,9 @@ def _validate_classification_proposal_v4(
         candidate_proof_meaning = candidate.get("opportunity_type")
         if not isinstance(candidate_proof_meaning, str):
             candidate_proof_meaning = "open_match"
+        candidate_proof_version = artifact_descriptor.semantic_proof_version_for(
+            candidate_proof_meaning
+        )
         if not semantic_proof_is_schema_valid(
             proof,
             body=body,
@@ -1830,7 +1769,8 @@ def _validate_classification_proposal_v4(
             evidence=evidence,
             routes=routes,
             meaning=candidate_proof_meaning,
-            proof_version=proof_version,
+            proof_version=candidate_proof_version,
+            artifact_descriptor=artifact_descriptor,
         ):
             raise ValueError("ClassificationProposal v4 semantic proof is invalid")
         proof_keys.add(candidate_key)
@@ -1854,18 +1794,20 @@ def _validate_classification_proposal_v4(
             or "candidate_target_manifest_hash" not in execution
         ):
             raise ValueError("ClassificationProposal v4 target manifest is incomplete")
+        candidate = candidate_by_key[candidate_key]
+        candidate_meaning = candidate.get("opportunity_type")
+        if not isinstance(candidate_meaning, str):
+            candidate_meaning = "open_match"
         _validate_semantic_proof_execution(
             execution,
-            prompt_version=(
-                "player-match-semantic-proof-v1"
-                if player_release
-                else (
-                    "open-match-semantic-proof-v2"
-                    if semantic_proof_version == "source-semantic-proof-v2"
-                    else "open-match-semantic-proof-v1"
-                )
+            prompt_version=artifact_descriptor.semantic_proof_prompt_version_for(
+                candidate_meaning
             ),
-            schema_version=semantic_proof_version,
+            schema_version=artifact_descriptor.semantic_proof_version_for(
+                candidate_meaning
+            ),
+            meaning=candidate_meaning,
+            artifact_descriptor=artifact_descriptor,
         )
         execution_keys.add(candidate_key)
     if output.get("disposition") == "accepted" and (
@@ -1888,9 +1830,9 @@ def _validate_classification_proposal_v4(
     if ambiguity_execution is not None:
         _validate_ambiguity_pass_execution(
             ambiguity_execution,
-            prompt_version=ambiguity_prompt_version,
-            schema_version=ambiguity_schema_version,
-            player_release=player_release,
+            prompt_version=artifact_descriptor.ambiguity_prompt_version,
+            schema_version=artifact_descriptor.primary_schema_version,
+            artifact_descriptor=artifact_descriptor,
         )
 
 
@@ -1900,6 +1842,7 @@ def _validate_ambiguity_pass_execution(
     prompt_version: str | None = None,
     schema_version: str | None = None,
     player_release: bool = False,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> None:
     """Validate the one allowed semantic ambiguity-pass execution."""
     fields = {
@@ -1945,10 +1888,14 @@ def _validate_ambiguity_pass_execution(
         _required_text(value, field_name)
     if value["status"] != "succeeded":
         raise ValueError("ambiguity-pass execution status is invalid")
-    expected_routing = (
-        "classifier-routing-player-v1" if player_release else "classifier-routing-v1"
-    )
-    if player_release:
+    if artifact_descriptor is not None:
+        expected_routing = artifact_descriptor.routing_policy_version
+        expected_prompt = artifact_descriptor.ambiguity_prompt_version
+        expected_schema = artifact_descriptor.primary_schema_version
+        if expected_prompt is None:
+            raise ValueError("ambiguity-pass artifact is not configured")
+    elif player_release:
+        expected_routing = "classifier-routing-player-v1"
         expected_prompt = "player-match-ambiguity-v1"
         expected_schema = "source-message-classification-v3"
     else:
@@ -2012,6 +1959,8 @@ def _validate_semantic_proof_execution(
     *,
     prompt_version: str | None = None,
     schema_version: str | None = None,
+    meaning: str = "open_match",
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> None:
     """Validate the pinned bounded semantic-proof pass provenance."""
     fields = {
@@ -2071,32 +2020,46 @@ def _validate_semantic_proof_execution(
             raise TypeError(
                 f"semantic-proof execution requires non-negative {field_name}"
             )
-    player_release = value["routing_policy_version"] == "classifier-routing-player-v1"
+    if artifact_descriptor is not None:
+        expected_prompt = artifact_descriptor.semantic_proof_prompt_version_for(meaning)
+        expected_schema = artifact_descriptor.semantic_proof_version_for(meaning)
+        expected_routing = artifact_descriptor.routing_policy_version
+        if (prompt_version is not None and prompt_version != expected_prompt) or (
+            schema_version is not None and schema_version != expected_schema
+        ):
+            raise ValueError("semantic-proof descriptor arguments disagree")
+    else:
+        player_release = (
+            value["routing_policy_version"] == "classifier-routing-player-v1"
+        )
+        raw_schema_version = value["schema_version"]
+        if not isinstance(raw_schema_version, str):
+            raise ValueError("semantic-proof schema provenance is invalid")
+        expected_prompt = prompt_version or (
+            "player-match-semantic-proof-v1"
+            if player_release
+            else (
+                "open-match-semantic-proof-v2"
+                if value["schema_version"] == "source-semantic-proof-v2"
+                else "open-match-semantic-proof-v1"
+            )
+        )
+        expected_schema = schema_version or raw_schema_version
+        expected_routing = (
+            "classifier-routing-player-v1"
+            if player_release
+            else "classifier-routing-v1"
+        )
     pinned = {
         "requested_model": "gpt-5.6-sol",
         "effective_model": "gpt-5.6-sol",
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
-        "prompt_version": (
-            prompt_version
-            or (
-                "player-match-semantic-proof-v1"
-                if player_release
-                else (
-                    "open-match-semantic-proof-v2"
-                    if value["schema_version"] == "source-semantic-proof-v2"
-                    else "open-match-semantic-proof-v1"
-                )
-            )
-        ),
-        "schema_version": value["schema_version"],
+        "prompt_version": expected_prompt,
+        "schema_version": expected_schema,
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "semantic-proof-context-v1",
-        "routing_policy_version": (
-            "classifier-routing-player-v1"
-            if player_release
-            else "classifier-routing-v1"
-        ),
+        "routing_policy_version": expected_routing,
         "context_bundle_version": "semantic-proof-context-v1",
     }
     if value["schema_version"] not in {

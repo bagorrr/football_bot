@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import date
 from typing import TypeAlias
 from urllib.parse import urlsplit
@@ -173,6 +174,182 @@ PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
 PROPOSITION_EVIDENCE_V2_VERSION = "source-proposition-evidence-v2"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
 SEMANTIC_PROOF_V2_VERSION = "source-semantic-proof-v2"
+
+
+@dataclass(frozen=True, slots=True)
+class ClassifierArtifactDescriptor:
+    """Immutable execution contract selected by the classifier adapter."""
+
+    release_name: str
+    artifact_family: str
+    primary_prompt_version: str
+    primary_schema_version: str
+    ambiguity_prompt_version: str | None
+    semantic_proof_prompt_version: str
+    proposition_evidence_version: str
+    semantic_proof_version: str
+    routing_policy_version: str
+    contract_envelope_versions: tuple[int, ...]
+
+    @property
+    def contract_envelope_version(self) -> int:
+        """Return the primary envelope version for single-version call sites."""
+        return self.contract_envelope_versions[-1]
+
+    def proposition_version_for(self, opportunity_type: str) -> str:
+        """Return the trusted graph version for one application candidate type."""
+        if self.artifact_family == "player_match_availability":
+            return PROPOSITION_EVIDENCE_VERSION
+        if opportunity_type in {"open_match", "tournament"}:
+            return self.proposition_evidence_version
+        # Opponent and transfer contracts are already published independently
+        # of the additive Tournament graph and retain their v1 graph.
+        return PROPOSITION_EVIDENCE_VERSION
+
+    def semantic_proof_version_for(self, opportunity_type: str) -> str:
+        """Return the trusted proof schema for one candidate meaning."""
+        if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
+            return SEMANTIC_PROOF_V2_VERSION
+        return self.semantic_proof_version
+
+    def semantic_proof_prompt_version_for(self, opportunity_type: str) -> str:
+        """Return the trusted proof prompt for one candidate meaning."""
+        if (
+            self.semantic_proof_version_for(opportunity_type)
+            == SEMANTIC_PROOF_V2_VERSION
+            and self.semantic_proof_version == SEMANTIC_PROOF_VERSION
+        ):
+            return "open-match-semantic-proof-v2"
+        return self.semantic_proof_prompt_version
+
+
+OPEN_MATCH_V1_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="open-match-primary-v1",
+    artifact_family="open_match",
+    primary_prompt_version="open-match-primary-v1",
+    primary_schema_version="source-message-classification-v1",
+    ambiguity_prompt_version=None,
+    semantic_proof_prompt_version="open-match-semantic-proof-v1",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_VERSION,
+    routing_policy_version="classifier-routing-v1",
+    contract_envelope_versions=(2, 3),
+)
+OPEN_MATCH_V2_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="open-match-primary-v2",
+    artifact_family="open_match",
+    primary_prompt_version="open-match-primary-v2",
+    primary_schema_version="source-message-classification-v2",
+    ambiguity_prompt_version="open-match-ambiguity-v1",
+    semantic_proof_prompt_version="open-match-semantic-proof-v1",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_VERSION,
+    routing_policy_version="classifier-routing-v1",
+    contract_envelope_versions=(4,),
+)
+OPEN_MATCH_V3_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="open-match-primary-v3",
+    artifact_family="open_match",
+    primary_prompt_version="open-match-primary-v3",
+    primary_schema_version="source-message-classification-v3",
+    ambiguity_prompt_version="open-match-ambiguity-v2",
+    semantic_proof_prompt_version="open-match-semantic-proof-v2",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_V2_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_V2_VERSION,
+    routing_policy_version="classifier-routing-v1",
+    contract_envelope_versions=(5,),
+)
+PLAYER_MATCH_AVAILABILITY_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="player-match-primary-v1",
+    artifact_family="player_match_availability",
+    primary_prompt_version="player-match-primary-v1",
+    primary_schema_version="source-message-classification-v3",
+    ambiguity_prompt_version="player-match-ambiguity-v1",
+    semantic_proof_prompt_version="player-match-semantic-proof-v1",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_V2_VERSION,
+    routing_policy_version="classifier-routing-player-v1",
+    contract_envelope_versions=(4,),
+)
+_TRUSTED_ARTIFACT_DESCRIPTORS = (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    OPEN_MATCH_V2_DESCRIPTOR,
+    OPEN_MATCH_V3_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+)
+
+
+def _is_trusted_artifact_descriptor(
+    descriptor: ClassifierArtifactDescriptor,
+) -> bool:
+    """Accept only one of the immutable descriptors shipped with this release."""
+    return descriptor in _TRUSTED_ARTIFACT_DESCRIPTORS
+
+
+def classifier_artifact_descriptor_is_trusted(
+    descriptor: ClassifierArtifactDescriptor,
+) -> bool:
+    """Return whether a descriptor is one of the shipped release contracts."""
+    return _is_trusted_artifact_descriptor(descriptor)
+
+
+def classifier_artifact_descriptor_for_primary(
+    primary_schema_version: str,
+    *,
+    primary_prompt_version: str | None = None,
+) -> ClassifierArtifactDescriptor | None:
+    """Resolve only an exact adapter-selected primary artifact identity."""
+    descriptors = {
+        OPEN_MATCH_V1_DESCRIPTOR.primary_schema_version: OPEN_MATCH_V1_DESCRIPTOR,
+        OPEN_MATCH_V2_DESCRIPTOR.primary_schema_version: OPEN_MATCH_V2_DESCRIPTOR,
+    }
+    if primary_schema_version in descriptors:
+        descriptor = descriptors[primary_schema_version]
+        return (
+            descriptor
+            if primary_prompt_version == descriptor.primary_prompt_version
+            else None
+        )
+    if primary_schema_version != "source-message-classification-v3":
+        return None
+    if (
+        primary_prompt_version
+        == PLAYER_MATCH_AVAILABILITY_DESCRIPTOR.primary_prompt_version
+    ):
+        return PLAYER_MATCH_AVAILABILITY_DESCRIPTOR
+    if primary_prompt_version == OPEN_MATCH_V3_DESCRIPTOR.primary_prompt_version:
+        return OPEN_MATCH_V3_DESCRIPTOR
+    return None
+
+
+def classifier_artifact_descriptor_for_provenance(
+    *,
+    prompt_version: str,
+    schema_version: str,
+    routing_policy_version: str,
+    contract_envelope_version: int | None = None,
+) -> ClassifierArtifactDescriptor | None:
+    """Resolve one descriptor from exact trusted execution provenance."""
+    matches = tuple(
+        descriptor
+        for descriptor in _TRUSTED_ARTIFACT_DESCRIPTORS
+        if (
+            descriptor.primary_schema_version == schema_version
+            and descriptor.routing_policy_version == routing_policy_version
+            and prompt_version
+            in {
+                descriptor.primary_prompt_version,
+                descriptor.ambiguity_prompt_version,
+            }
+            and (
+                contract_envelope_version is None
+                or contract_envelope_version in descriptor.contract_envelope_versions
+            )
+        )
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
 _SEMANTIC_PROOF_VERSIONS = {SEMANTIC_PROOF_VERSION, SEMANTIC_PROOF_V2_VERSION}
 _PROPOSITION_DOMAINS = {"football_match"}
 _PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
@@ -204,17 +381,30 @@ _UNRESOLVED_OPPORTUNITY_TYPES = {
 
 
 def classifier_output_is_schema_valid(
-    output: dict[str, JsonValue], *, body: str
+    output: dict[str, JsonValue],
+    *,
+    body: str,
+    artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate strict structure and exact evidence before normalization."""
-    if output.get("schema_version") == "source-message-classification-v2":
-        return _classifier_output_v2_is_schema_valid(output, body=body)
-    if output.get("schema_version") == "source-message-classification-v3":
+    if not _is_trusted_artifact_descriptor(artifact_descriptor):
+        return False
+    descriptor = artifact_descriptor
+    if output.get("schema_version") != descriptor.primary_schema_version:
+        return False
+    if descriptor.primary_schema_version == "source-message-classification-v2":
+        return _classifier_output_v2_is_schema_valid(
+            output, body=body, artifact_descriptor=descriptor
+        )
+    if descriptor.primary_schema_version == "source-message-classification-v3":
         return _classifier_output_v2_is_schema_valid(
             output,
             body=body,
+            artifact_descriptor=descriptor,
             allow_tournament=True,
-            allow_player_match_availability=True,
+            allow_player_match_availability=(
+                descriptor.artifact_family == "player_match_availability"
+            ),
             allow_fact_observations=True,
         )
     if (
@@ -234,17 +424,20 @@ def classifier_output_is_schema_valid(
     candidate = candidates[0]
     if candidate.get("opportunity_type") == "player_match_availability":
         return False
-    field_sets = _candidate_field_sets(candidate, require_source_context=False)
-    if field_sets is None:
-        return False
-    if candidate.get("opportunity_type") in _TRANSFER_OPPORTUNITY_TYPES:
-        return _accepted_transfer_candidate_is_schema_valid(
-            candidate, body=body, require_source_context=False
-        )
-    required_fields, optional_fields, structured_fields = field_sets
     opportunity_type = candidate.get("opportunity_type")
     if not isinstance(opportunity_type, str):
         return False
+    field_sets = _candidate_field_sets(candidate, require_source_context=False)
+    if field_sets is None:
+        return False
+    if opportunity_type in _TRANSFER_OPPORTUNITY_TYPES:
+        return _accepted_transfer_candidate_is_schema_valid(
+            candidate,
+            body=body,
+            require_source_context=False,
+            proposition_version=descriptor.proposition_version_for(opportunity_type),
+        )
+    required_fields, optional_fields, structured_fields = field_sets
     player_candidate = opportunity_type == "player_match_availability"
     is_opponent_request = opportunity_type == "opponent_request"
     if (
@@ -369,6 +562,7 @@ def classifier_output_is_schema_valid(
         evidence=evidence,
         routes=routes,
         meaning=opportunity_type,
+        artifact_descriptor=descriptor,
     )
 
 
@@ -379,8 +573,14 @@ def _classifier_output_v2_is_schema_valid(
     allow_tournament: bool = False,
     allow_player_match_availability: bool = False,
     allow_fact_observations: bool = False,
+    artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate the additive multi-candidate and alternatives contract."""
+    descriptor = artifact_descriptor
+    if not _is_trusted_artifact_descriptor(descriptor):
+        return False
+    if descriptor.primary_schema_version != output.get("schema_version"):
+        return False
     required_keys = {"schema_version", "disposition", "candidates", "routing"}
     allowed_keys = required_keys | ({"facts"} if allow_fact_observations else set())
     if not required_keys.issubset(output) or not set(output).issubset(allowed_keys):
@@ -430,16 +630,13 @@ def _classifier_output_v2_is_schema_valid(
                     candidate,
                     body=body,
                     allow_player_match_availability=allow_player_match_availability,
+                    artifact_descriptor=descriptor,
                 )
                 if allow_tournament
                 else _accepted_candidate_is_schema_valid(
                     candidate,
                     body=body,
-                    proposition_version=(
-                        PROPOSITION_EVIDENCE_V2_VERSION
-                        if allow_player_match_availability
-                        else PROPOSITION_EVIDENCE_VERSION
-                    ),
+                    artifact_descriptor=descriptor,
                     allow_player_match_availability=allow_player_match_availability,
                 )
             )
@@ -576,22 +773,34 @@ def _accepted_candidate_is_schema_valid(
     candidate: dict[str, JsonValue],
     *,
     body: str,
-    proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
     allow_player_match_availability: bool = False,
+    artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
+    if not _is_trusted_artifact_descriptor(artifact_descriptor):
+        return False
     allowed_types = {"open_match", "opponent_request", *_TRANSFER_OPPORTUNITY_TYPES}
     if allow_player_match_availability:
         allowed_types.add("player_match_availability")
     opportunity_type = candidate.get("opportunity_type")
     if not isinstance(opportunity_type, str) or opportunity_type not in allowed_types:
         return False
+    if (
+        artifact_descriptor.artifact_family == "player_match_availability"
+        and opportunity_type not in {"open_match", "player_match_availability"}
+    ):
+        return False
     field_sets = _candidate_field_sets(candidate, require_source_context=True)
     if field_sets is None:
         return False
     if candidate.get("opportunity_type") in _TRANSFER_OPPORTUNITY_TYPES:
         return _accepted_transfer_candidate_is_schema_valid(
-            candidate, body=body, require_source_context=True
+            candidate,
+            body=body,
+            require_source_context=True,
+            proposition_version=artifact_descriptor.proposition_version_for(
+                opportunity_type
+            ),
         )
     required_fields, optional_fields, structured_fields = field_sets
     player_candidate = opportunity_type == "player_match_availability"
@@ -701,7 +910,7 @@ def _accepted_candidate_is_schema_valid(
         evidence=evidence,
         routes=routes,
         meaning=opportunity_type,
-        proposition_version=proposition_version,
+        artifact_descriptor=artifact_descriptor,
     )
 
 
@@ -710,35 +919,38 @@ def _accepted_candidate_v3_is_schema_valid(
     *,
     body: str,
     allow_player_match_availability: bool = False,
+    artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate one v3 candidate while retaining the v2 open-match contract."""
+    if not _is_trusted_artifact_descriptor(artifact_descriptor):
+        return False
+    descriptor = artifact_descriptor
+    opportunity_type = candidate.get("opportunity_type")
+    if descriptor.artifact_family == "player_match_availability":
+        if opportunity_type not in {"open_match", "player_match_availability"}:
+            return False
+    elif opportunity_type == "player_match_availability":
+        return False
     if candidate.get("opportunity_type") == "tournament":
         return _tournament_candidate_is_schema_valid(
             candidate,
             body=body,
             require_source_context=True,
+            proposition_version=descriptor.proposition_version_for("tournament"),
         )
     if candidate.get("opportunity_type") in _TRANSFER_OPPORTUNITY_TYPES:
         return _accepted_transfer_candidate_is_schema_valid(
             candidate,
             body=body,
             require_source_context=True,
+            proposition_version=descriptor.proposition_version_for(
+                str(opportunity_type)
+            ),
         )
-    proposition_evidence = candidate.get("proposition_evidence")
-    # The Player release reuses the v3 envelope but deliberately retains its
-    # published v1 proposition graph.  Main's Tournament/open-match v3
-    # artifacts use the additive v2 graph.  Select the validator from the
-    # immutable graph marker so both published artifact sets remain valid.
-    proposition_version = (
-        PROPOSITION_EVIDENCE_VERSION
-        if isinstance(proposition_evidence, dict)
-        and proposition_evidence.get("contract_version") == PROPOSITION_EVIDENCE_VERSION
-        else PROPOSITION_EVIDENCE_V2_VERSION
-    )
     return _accepted_candidate_is_schema_valid(
         candidate,
         body=body,
-        proposition_version=proposition_version,
+        artifact_descriptor=descriptor,
         allow_player_match_availability=allow_player_match_availability,
     )
 
@@ -748,6 +960,7 @@ def _tournament_candidate_is_schema_valid(
     *,
     body: str,
     require_source_context: bool,
+    proposition_version: str = PROPOSITION_EVIDENCE_V2_VERSION,
 ) -> bool:
     """Validate a v3 Tournament candidate with source-bound facts."""
     structured_fields = (
@@ -876,7 +1089,7 @@ def _tournament_candidate_is_schema_valid(
         evidence=evidence,
         routes=routes,
         opportunity_type="tournament",
-        proposition_version=PROPOSITION_EVIDENCE_V2_VERSION,
+        proposition_version=proposition_version,
     )
 
 
@@ -903,6 +1116,7 @@ def _accepted_transfer_candidate_is_schema_valid(
     *,
     body: str,
     require_source_context: bool,
+    proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
 ) -> bool:
     """Validate one proposal for a long-term transfer Opportunity."""
     field_sets = _candidate_field_sets(
@@ -982,6 +1196,7 @@ def _accepted_transfer_candidate_is_schema_valid(
         evidence=evidence,
         routes=routes,
         meaning=opportunity_type,
+        proposition_version=proposition_version,
     )
 
 
@@ -1017,6 +1232,7 @@ def proposition_evidence_is_schema_valid(
     meaning: str = "open_match",
     opportunity_type: str | None = None,
     proposition_version: str = PROPOSITION_EVIDENCE_VERSION,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Validate the versioned source-proposition/evidence wire contract.
 
@@ -1026,6 +1242,12 @@ def proposition_evidence_is_schema_valid(
     current, positive, non-competing, and publishable.
     """
     effective_meaning = opportunity_type if opportunity_type is not None else meaning
+    if artifact_descriptor is not None:
+        if not _is_trusted_artifact_descriptor(artifact_descriptor):
+            return False
+        proposition_version = artifact_descriptor.proposition_version_for(
+            effective_meaning
+        )
     if not isinstance(value, dict) or set(value) != {
         "contract_version",
         "coverage",
@@ -1197,6 +1419,7 @@ def semantic_proof_is_schema_valid(
     opportunity_type: str | None = None,
     semantic_proof_version: str | None = None,
     proof_version: str | None = None,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Validate the strict, source-bound semantic-proof representation.
 
@@ -1205,11 +1428,34 @@ def semantic_proof_is_schema_valid(
     decision and the explicit coverage needed before Application can consider
     any fact publishable.
     """
-    expected_semantic_proof_version = semantic_proof_version or proof_version
-    if expected_semantic_proof_version is None and isinstance(value, dict):
-        raw_semantic_proof_version = value.get("contract_version")
-        if isinstance(raw_semantic_proof_version, str):
-            expected_semantic_proof_version = raw_semantic_proof_version
+    if artifact_descriptor is not None and not _is_trusted_artifact_descriptor(
+        artifact_descriptor
+    ):
+        return False
+    effective_meaning = opportunity_type if opportunity_type is not None else meaning
+    expected_semantic_proof_version = (
+        artifact_descriptor.semantic_proof_version_for(effective_meaning)
+        if artifact_descriptor is not None
+        else semantic_proof_version
+        or proof_version
+        or (
+            SEMANTIC_PROOF_V2_VERSION
+            if effective_meaning
+            in {"player_match_availability", *_TRANSFER_OPPORTUNITY_TYPES}
+            else SEMANTIC_PROOF_VERSION
+        )
+    )
+    if artifact_descriptor is not None and (
+        (
+            semantic_proof_version is not None
+            and semantic_proof_version != expected_semantic_proof_version
+        )
+        or (
+            proof_version is not None
+            and proof_version != expected_semantic_proof_version
+        )
+    ):
+        return False
     if (
         not isinstance(value, dict)
         or set(value)
@@ -1443,6 +1689,7 @@ def semantic_proof_is_authoritative(
     opportunity_type: str | None = None,
     semantic_proof_version: str | None = None,
     proof_version: str | None = None,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Accept only a complete current-positive proof with clean coverage."""
     if not semantic_proof_is_schema_valid(
@@ -1456,6 +1703,7 @@ def semantic_proof_is_authoritative(
         semantic_proof_version=semantic_proof_version,
         meaning=meaning,
         proof_version=proof_version,
+        artifact_descriptor=artifact_descriptor,
     ):
         return False
     assert isinstance(value, dict)

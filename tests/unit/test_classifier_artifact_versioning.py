@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 from typing import cast
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    classifier_output_is_schema_valid,
+)
 from modules.contracts import JsonValue
 
 
@@ -100,4 +103,8 @@ def test_old_recorded_schema_id_does_not_replay_as_player_behavior() -> None:
             "candidates": [candidate],
         },
     )
-    assert not classifier_output_is_schema_valid(output, body=body)
+    assert not classifier_output_is_schema_valid(
+        output,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )

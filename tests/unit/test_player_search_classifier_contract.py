@@ -1,7 +1,14 @@
 from typing import cast
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    OPEN_MATCH_V2_DESCRIPTOR,
+    OPEN_MATCH_V3_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    classifier_output_is_schema_valid,
+)
 from modules.contracts import JsonValue
+from modules.testkit import _add_test_proposition_evidence
 
 BODY = (
     "We are 4 players available; between 2 and 6 players are available for "
@@ -79,13 +86,19 @@ def test_player_count_requires_v3_release() -> None:
         available_player_count=4,
     )
     assert classifier_output_is_schema_valid(
-        _output(candidate, version="source-message-classification-v3"), body=BODY
+        _output(candidate, version="source-message-classification-v3"),
+        body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     )
     assert not classifier_output_is_schema_valid(
-        _output(candidate, version="source-message-classification-v1"), body=BODY
+        _output(candidate, version="source-message-classification-v1"),
+        body=BODY,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     assert not classifier_output_is_schema_valid(
-        _output(candidate, version="source-message-classification-v2"), body=BODY
+        _output(candidate, version="source-message-classification-v2"),
+        body=BODY,
+        artifact_descriptor=OPEN_MATCH_V2_DESCRIPTOR,
     )
 
 
@@ -103,10 +116,14 @@ def test_player_availability_range_and_unknown_counts_are_valid() -> None:
     )
     unknown = _candidate()
     assert classifier_output_is_schema_valid(
-        _output(ranged, version="source-message-classification-v3"), body=BODY
+        _output(ranged, version="source-message-classification-v3"),
+        body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     )
     assert classifier_output_is_schema_valid(
-        _output(unknown, version="source-message-classification-v3"), body=BODY
+        _output(unknown, version="source-message-classification-v3"),
+        body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     )
 
 
@@ -135,8 +152,58 @@ def test_classifier_contract_rejects_cross_type_quantity_fields() -> None:
     assert not classifier_output_is_schema_valid(
         _output(player_with_open_places, version="source-message-classification-v3"),
         body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     )
     assert not classifier_output_is_schema_valid(
         _output(open_with_player_count, version="source-message-classification-v3"),
         body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    )
+
+
+def test_v3_validator_uses_trusted_descriptor_not_output_graph_marker() -> None:
+    candidate = _candidate(
+        evidence={
+            "opportunity": "We are 4 players available",
+            "event_time": "2026-09-01",
+            "location": "Moscow",
+        },
+    )
+    _add_test_proposition_evidence(candidate, body=BODY)
+    output = _output(candidate, version="source-message-classification-v3")
+
+    assert classifier_output_is_schema_valid(
+        output,
+        body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    )
+    assert not classifier_output_is_schema_valid(
+        output,
+        body=BODY,
+        artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+    )
+
+
+def test_v3_validator_rejects_open_match_graph_v2_under_player_release() -> None:
+    candidate = _candidate(
+        opportunity_type="open_match",
+        evidence={
+            "opportunity": "We are 4 players available",
+            "event_time": "2026-09-01",
+            "location": "Moscow",
+            "open_places": "4 players",
+        },
+        open_places=4,
+    )
+    _add_test_proposition_evidence(
+        candidate,
+        body=BODY,
+        proposition_version="source-proposition-evidence-v2",
+    )
+    output = _output(candidate, version="source-message-classification-v3")
+
+    assert not classifier_output_is_schema_valid(
+        output,
+        body=BODY,
+        artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     )

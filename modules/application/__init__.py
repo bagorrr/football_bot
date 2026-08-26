@@ -18,8 +18,11 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.classifier_contract import (
-    PROPOSITION_EVIDENCE_V2_VERSION,
-    SEMANTIC_PROOF_V2_VERSION,
+    OPEN_MATCH_V1_DESCRIPTOR,
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_primary,
+    classifier_artifact_descriptor_for_provenance,
+    classifier_artifact_descriptor_is_trusted,
     classifier_output_is_schema_valid,
     proposition_evidence_is_schema_valid,
     semantic_proof_is_authoritative,
@@ -11188,28 +11191,25 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
+        artifact_descriptor = self.model.artifact_descriptor
+        if (
+            not classifier_artifact_descriptor_is_trusted(artifact_descriptor)
+            or artifact_descriptor.primary_schema_version
+            != self.model.primary_schema_version
+        ):
+            raise RuntimeError("classifier adapter exposes an incoherent artifact")
         if self.model.primary_schema_version in {
             "source-message-classification-v2",
             "source-message-classification-v3",
         }:
             self._classify_source_message_v2(
                 incoming,
-                artifact_version=(
-                    "v3"
-                    if self.model.primary_schema_version
-                    == "source-message-classification-v3"
-                    else "v2"
-                ),
-                player_release=(
-                    self.model.primary_schema_version
-                    == "source-message-classification-v3"
-                    and _classifier_model_uses_player_release(self.model)
-                ),
+                artifact_descriptor=artifact_descriptor,
             )
             return
-        if self.model.primary_schema_version != "source-message-classification-v1":
+        if artifact_descriptor != OPEN_MATCH_V1_DESCRIPTOR:
             raise RuntimeError(
-                "classifier adapter exposes an unsupported primary schema version"
+                "classifier adapter exposes an unsupported trusted artifact"
             )
         payload = incoming.payload
         if not isinstance(payload, dict):
@@ -11244,11 +11244,11 @@ class RuntimeApplication:
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
-            prompt_version="open-match-primary-v1",
-            schema_version="source-message-classification-v1",
+            prompt_version=artifact_descriptor.primary_prompt_version,
+            schema_version=artifact_descriptor.primary_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
-            routing_policy_version="classifier-routing-v1",
+            routing_policy_version=artifact_descriptor.routing_policy_version,
         )
         prior_attempts = self.store.classification_attempts_for_revision(revision_id)
         primary_attempt_number = (
@@ -11385,7 +11385,9 @@ class RuntimeApplication:
             and result.effective_reasoning_effort == "high"
         )
         primary_output_is_valid = classifier_output_is_schema_valid(
-            result.output, body=body
+            result.output,
+            body=body,
+            artifact_descriptor=artifact_descriptor,
         )
         if not provenance_complete or not primary_output_is_valid:
             recorded_result = replace(
@@ -11453,15 +11455,11 @@ class RuntimeApplication:
             proof_meaning = proof_candidate.get("opportunity_type")
             if not isinstance(proof_meaning, str):
                 proof_meaning = "open_match"
-            proof_schema_version = (
-                "source-semantic-proof-v2"
-                if proof_meaning in {"roster_vacancy", "player_transfer_availability"}
-                else "source-semantic-proof-v1"
+            proof_schema_version = artifact_descriptor.semantic_proof_version_for(
+                proof_meaning
             )
             proof_prompt_version = (
-                "open-match-semantic-proof-v2"
-                if proof_schema_version == "source-semantic-proof-v2"
-                else "open-match-semantic-proof-v1"
+                artifact_descriptor.semantic_proof_prompt_version_for(proof_meaning)
             )
             semantic_proof_request = replace(
                 request,
@@ -11621,7 +11619,7 @@ class RuntimeApplication:
                     str, proof_candidate.get("opportunity_type", "open_match")
                 ),
                 meaning=proof_meaning,
-                proof_version=semantic_proof_request.schema_version,
+                artifact_descriptor=artifact_descriptor,
             )
             semantic_proof_attempt = _classification_attempt_from_result(
                 semantic_proof_recorded_result,
@@ -11823,51 +11821,30 @@ class RuntimeApplication:
         self,
         incoming: ContractEnvelope,
         *,
-        artifact_version: str | None = None,
-        player_release: bool = False,
+        artifact_descriptor: ClassifierArtifactDescriptor | None = None,
     ) -> None:
         """Run the additive multi-candidate classifier and one-way ambiguity pass."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError(
                 "only Classification executes the multi-candidate classifier"
             )
-        if artifact_version is None:
-            primary_schema_version = str(self.model.primary_schema_version)
-            artifact_versions = _classifier_artifact_versions(
-                primary_schema_version, player_release=player_release
-            )
-            if artifact_versions is None:
-                raise RuntimeError("classifier adapter exposes unsupported artifacts")
-            primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
-                artifact_versions
-            )
-            classification_schema_version = primary_schema_version
-            semantic_proof_prompt_version, semantic_proof_schema_version = (
-                semantic_proof_version
-            )
-            is_v3 = primary_schema_version == "source-message-classification-v3"
-        else:
-            if artifact_version not in {"v2", "v3"}:
-                raise RuntimeError("unsupported additive classifier artifact version")
-            is_v3 = artifact_version == "v3"
-            classification_schema_version = (
-                "source-message-classification-v3"
-                if is_v3
-                else "source-message-classification-v2"
-            )
-            artifact_versions = _classifier_artifact_versions(
-                classification_schema_version, player_release=player_release
-            )
-            if artifact_versions is None:
-                raise RuntimeError("classifier adapter exposes unsupported artifacts")
-            primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
-                artifact_versions
-            )
-            semantic_proof_prompt_version, semantic_proof_schema_version = (
-                semantic_proof_version
-            )
-            primary_schema_version = classification_schema_version
-        proposal_contract_version = 5 if is_v3 else 4
+        descriptor = artifact_descriptor or self.model.artifact_descriptor
+        if (
+            not classifier_artifact_descriptor_is_trusted(descriptor)
+            or descriptor.primary_schema_version != self.model.primary_schema_version
+        ):
+            raise RuntimeError("classifier adapter exposes an incoherent artifact")
+        if descriptor.primary_schema_version not in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise RuntimeError("classifier adapter exposes unsupported artifacts")
+        if descriptor.ambiguity_prompt_version is None:
+            raise RuntimeError("additive classifier artifact has no ambiguity prompt")
+        classification_schema_version = descriptor.primary_schema_version
+        primary_prompt_version = descriptor.primary_prompt_version
+        ambiguity_prompt_version = descriptor.ambiguity_prompt_version
+        proposal_contract_version = descriptor.contract_envelope_version
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -11876,14 +11853,7 @@ class RuntimeApplication:
         if not isinstance(revision_id, str) or not isinstance(body, str):
             raise ValueError("classifier command requires revision identity and body")
 
-        semantic_proof_prompt_version, semantic_proof_schema_version = (
-            semantic_proof_version
-        )
-        routing_policy_version = (
-            "classifier-routing-player-v1"
-            if player_release
-            else "classifier-routing-v1"
-        )
+        routing_policy_version = descriptor.routing_policy_version
         request = ClassifierRequest(
             source_message_revision_id=_opaque_classifier_reference(
                 revision_id, kind="revision"
@@ -11970,7 +11940,11 @@ class RuntimeApplication:
                 _classifier_adapter_result_has_complete_provenance(result)
                 and result.effective_model == "gpt-5.6-sol"
                 and result.effective_reasoning_effort == "high"
-                and classifier_output_is_schema_valid(result.output, body=body)
+                and classifier_output_is_schema_valid(
+                    result.output,
+                    body=body,
+                    artifact_descriptor=descriptor,
+                )
                 and result.output.get("schema_version") == classification_schema_version
             )
 
@@ -12348,7 +12322,11 @@ class RuntimeApplication:
                 _classifier_adapter_result_has_complete_provenance(second_result)
                 and second_result.effective_model == "gpt-5.6-sol"
                 and second_result.effective_reasoning_effort == "high"
-                and classifier_output_is_schema_valid(second_result.output, body=body)
+                and classifier_output_is_schema_valid(
+                    second_result.output,
+                    body=body,
+                    artifact_descriptor=descriptor,
+                )
                 and second_result.output.get("schema_version")
                 == classification_schema_version
             )
@@ -12569,7 +12547,11 @@ class RuntimeApplication:
         semantic_proof_provider_retry_at: datetime | None = None
         if final_output.get(
             "disposition"
-        ) == "accepted" and classifier_output_is_schema_valid(final_output, body=body):
+        ) == "accepted" and classifier_output_is_schema_valid(
+            final_output,
+            body=body,
+            artifact_descriptor=descriptor,
+        ):
             candidates = final_output.get("candidates")
             if isinstance(candidates, list):
                 for candidate in candidates:
@@ -12587,12 +12569,18 @@ class RuntimeApplication:
                     proof_meaning = candidate.get("opportunity_type")
                     if not isinstance(proof_meaning, str):
                         proof_meaning = "open_match"
+                    proof_prompt_version = descriptor.semantic_proof_prompt_version_for(
+                        proof_meaning
+                    )
+                    proof_schema_version = descriptor.semantic_proof_version_for(
+                        proof_meaning
+                    )
                     if candidate_key in stored_proof_keys:
                         continue
                     proof_request = replace(
                         final_request,
-                        prompt_version=semantic_proof_prompt_version,
-                        schema_version=semantic_proof_schema_version,
+                        prompt_version=proof_prompt_version,
+                        schema_version=proof_schema_version,
                         context_bundle_version="semantic-proof-context-v1",
                         context_policy_version="semantic-proof-context-v1",
                         pass_kind="semantic_proof",
@@ -12691,7 +12679,7 @@ class RuntimeApplication:
                             evidence=evidence,
                             routes=routes,
                             meaning=proof_meaning,
-                            semantic_proof_version=semantic_proof_schema_version,
+                            artifact_descriptor=descriptor,
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -13322,6 +13310,22 @@ class RuntimeApplication:
             )
             return
         if incoming.contract_version in {4, 5}:
+            artifact_descriptor = _classifier_artifact_descriptor_for_payload(
+                authoritative_payload,
+                contract_envelope_version=incoming.contract_version,
+            )
+            if artifact_descriptor is None:
+                self._record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
             if not isinstance(v4_output, dict):
@@ -13387,6 +13391,7 @@ class RuntimeApplication:
                 revision_id=revision_id,
                 body=source_revision.body,
                 artifact_version=("v3" if incoming.contract_version == 5 else "v2"),
+                artifact_descriptor=artifact_descriptor,
             ):
                 self._record_classification_routing_outcome(
                     incoming=incoming,
@@ -15347,6 +15352,9 @@ def _classifier_proposal_has_pinned_provenance(
         "source-message-classification-v2",
         "source-message-classification-v3",
     }:
+        descriptor = _classifier_artifact_descriptor_for_payload(payload)
+        if descriptor is None:
+            return False
         return _v2_classifier_proposal_has_pinned_provenance(
             payload,
             revision_id=revision_id,
@@ -15356,9 +15364,7 @@ def _classifier_proposal_has_pinned_provenance(
                 if payload.get("schema_version") == "source-message-classification-v3"
                 else "v2"
             ),
-            player_release=(
-                payload.get("routing_policy_version") == "classifier-routing-player-v1"
-            ),
+            artifact_descriptor=descriptor,
         )
     attempt_number = payload.get("attempt_number")
     if (
@@ -15435,43 +15441,68 @@ def _classifier_proposal_has_pinned_provenance(
 
 
 def _classifier_model_uses_player_release(model: ModelAdapter) -> bool:
-    """Identify the additive Player artifact set without changing the model port."""
-    prompt_version = getattr(model, "primary_prompt_version", None)
-    if isinstance(prompt_version, str):
-        return prompt_version == "player-match-primary-v1"
-    return (
-        model.__class__.__name__
-        in {
-            "ControlledModelAdapter",
-            "ControlledPlayerClassifierAdapter",
-        }
-        and model.primary_schema_version == "source-message-classification-v3"
+    """Identify the Player artifact set from the adapter's trusted descriptor."""
+    return model.artifact_descriptor.artifact_family == "player_match_availability"
+
+
+def _classifier_artifact_descriptor_for_payload(
+    payload: Mapping[str, JsonValue],
+    *,
+    contract_envelope_version: int | None = None,
+) -> ClassifierArtifactDescriptor | None:
+    """Recover one exact immutable descriptor from persisted execution metadata."""
+    prompt_version = payload.get("prompt_version")
+    schema_version = payload.get("schema_version")
+    routing_policy_version = payload.get("routing_policy_version")
+    if not all(
+        isinstance(value, str)
+        for value in (prompt_version, schema_version, routing_policy_version)
+    ):
+        return None
+    assert isinstance(prompt_version, str)
+    assert isinstance(schema_version, str)
+    assert isinstance(routing_policy_version, str)
+    return classifier_artifact_descriptor_for_provenance(
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        routing_policy_version=routing_policy_version,
+        contract_envelope_version=contract_envelope_version,
     )
 
 
 def _classifier_artifact_versions(
     primary_schema_version: JsonValue, *, player_release: bool = False
 ) -> tuple[str, str, tuple[str, str]] | None:
-    """Return the immutable prompt/schema identities for one primary version."""
-    if primary_schema_version == "source-message-classification-v2":
-        return (
-            "open-match-primary-v2",
-            "open-match-ambiguity-v1",
-            ("open-match-semantic-proof-v1", "source-semantic-proof-v1"),
-        )
-    if primary_schema_version == "source-message-classification-v3":
-        if player_release:
-            return (
-                "player-match-primary-v1",
-                "player-match-ambiguity-v1",
-                ("player-match-semantic-proof-v1", "source-semantic-proof-v2"),
+    """Return immutable artifact identities for an adapter-selected release."""
+    descriptor = classifier_artifact_descriptor_for_primary(
+        str(primary_schema_version),
+        primary_prompt_version=(
+            "player-match-primary-v1"
+            if player_release
+            and primary_schema_version == "source-message-classification-v3"
+            else (
+                "open-match-primary-v3"
+                if primary_schema_version == "source-message-classification-v3"
+                else None
             )
+        ),
+    )
+    if descriptor is None:
+        return None
+    if descriptor.ambiguity_prompt_version is None:
         return (
-            "open-match-primary-v3",
-            "open-match-ambiguity-v2",
-            ("open-match-semantic-proof-v2", "source-semantic-proof-v2"),
+            descriptor.primary_prompt_version,
+            descriptor.primary_prompt_version,
+            (
+                descriptor.semantic_proof_prompt_version,
+                descriptor.semantic_proof_version,
+            ),
         )
-    return None
+    return (
+        descriptor.primary_prompt_version,
+        descriptor.ambiguity_prompt_version,
+        (descriptor.semantic_proof_prompt_version, descriptor.semantic_proof_version),
+    )
 
 
 def _v2_classifier_proposal_has_pinned_provenance(
@@ -15481,16 +15512,20 @@ def _v2_classifier_proposal_has_pinned_provenance(
     body: str,
     artifact_version: str = "v2",
     player_release: bool = False,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Validate v2 final-pass provenance and its deterministic input manifest."""
-    artifact_versions = _classifier_artifact_versions(
-        payload.get("schema_version"), player_release=player_release
+    descriptor = artifact_descriptor or _classifier_artifact_descriptor_for_payload(
+        payload
     )
-    if artifact_versions is None:
+    if descriptor is None:
         return False
-    primary_prompt_version, ambiguity_prompt_version, _ = artifact_versions
+    primary_prompt_version = descriptor.primary_prompt_version
+    ambiguity_prompt_version = descriptor.ambiguity_prompt_version
     pass_number = payload.get("pass_number")
     if pass_number not in {1, 2}:
+        return False
+    if pass_number == 2 and ambiguity_prompt_version is None:
         return False
     attempt_number = payload.get("attempt_number")
     if (
@@ -15512,14 +15547,10 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
         "prompt_version": prompt_version,
-        "schema_version": payload["schema_version"],
+        "schema_version": descriptor.primary_schema_version,
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "classifier-context-v1",
-        "routing_policy_version": (
-            "classifier-routing-player-v1"
-            if player_release
-            else "classifier-routing-v1"
-        ),
+        "routing_policy_version": descriptor.routing_policy_version,
         "context_bundle_version": "primary-classifier-context-v1",
     }
     manifest = {
@@ -15760,26 +15791,17 @@ def _v4_classifier_provenance_is_current(
     revision_id: str,
     body: str,
     artifact_version: str = "v2",
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Require current ambiguity and distinct proof execution per candidate."""
-    player_release = (
-        payload.get("routing_policy_version") == "classifier-routing-player-v1"
+    descriptor = artifact_descriptor or _classifier_artifact_descriptor_for_payload(
+        payload
     )
-    artifact_versions = _classifier_artifact_versions(
-        payload.get("schema_version"), player_release=player_release
-    )
-    if artifact_versions is None:
+    if descriptor is None or descriptor.ambiguity_prompt_version is None:
         return False
-    _, ambiguity_prompt_version, semantic_proof_version = artifact_versions
-    primary_schema_version = payload.get("schema_version")
-    if not isinstance(primary_schema_version, str):
-        return False
-    semantic_proof_prompt_version, semantic_proof_schema_version = (
-        semantic_proof_version
-    )
-    routing_policy_version = (
-        "classifier-routing-player-v1" if player_release else "classifier-routing-v1"
-    )
+    ambiguity_prompt_version = descriptor.ambiguity_prompt_version
+    primary_schema_version = descriptor.primary_schema_version
+    routing_policy_version = descriptor.routing_policy_version
     output = payload.get("output")
     if (
         not isinstance(output, dict)
@@ -15789,7 +15811,7 @@ def _v4_classifier_provenance_is_current(
             revision_id=revision_id,
             body=body,
             artifact_version=artifact_version,
-            player_release=player_release,
+            artifact_descriptor=descriptor,
         )
     ):
         return False
@@ -15878,6 +15900,18 @@ def _v4_classifier_provenance_is_current(
             return False
         candidate_key = wrapper.get("candidate_key")
         execution = wrapper.get("execution")
+        candidate = (
+            candidate_by_key.get(candidate_key)
+            if isinstance(candidate_key, str)
+            else None
+        )
+        candidate_meaning = (
+            candidate.get("opportunity_type")
+            if isinstance(candidate, dict)
+            else "open_match"
+        )
+        if not isinstance(candidate_meaning, str):
+            candidate_meaning = "open_match"
         proof_attempt_number = (
             execution.get("attempt_number") if isinstance(execution, dict) else None
         )
@@ -15894,15 +15928,17 @@ def _v4_classifier_provenance_is_current(
                 payload=payload,
                 revision_id=revision_id,
                 body=body,
-                prompt_version=semantic_proof_prompt_version,
-                schema_version=semantic_proof_schema_version,
+                prompt_version=descriptor.semantic_proof_prompt_version_for(
+                    candidate_meaning
+                ),
+                schema_version=descriptor.semantic_proof_version_for(candidate_meaning),
                 context_bundle_version="semantic-proof-context-v1",
                 context_policy_version="semantic-proof-context-v1",
                 routing_policy_version=routing_policy_version,
                 pass_kind="semantic_proof",
                 pass_number=proof_pass_number,
                 attempt_number=proof_attempt_number,
-                candidate=candidate_by_key[candidate_key],
+                candidate=candidate,
             )
         ):
             return False
@@ -16038,23 +16074,17 @@ def _proposition_evidence_is_authoritative(
     source_message_revision_reference: str | None = None,
     meaning: str = "open_match",
     opportunity_type: str | None = None,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
-    semantic_proof_version = (
-        SEMANTIC_PROOF_V2_VERSION
-        if isinstance(semantic_proof, dict)
-        and semantic_proof.get("contract_version") == SEMANTIC_PROOF_V2_VERSION
-        else "source-semantic-proof-v1"
-    )
-    proposition_version = (
-        PROPOSITION_EVIDENCE_V2_VERSION
-        if isinstance(value, dict)
-        and value.get("contract_version") == PROPOSITION_EVIDENCE_V2_VERSION
-        else "source-proposition-evidence-v1"
-    )
+    descriptor = artifact_descriptor or OPEN_MATCH_V1_DESCRIPTOR
     effective_opportunity_type = (
         meaning if opportunity_type is None else opportunity_type
     )
+    semantic_proof_version = descriptor.semantic_proof_version_for(
+        effective_opportunity_type
+    )
+    proposition_version = descriptor.proposition_version_for(effective_opportunity_type)
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
         semantic_proof,
         body=body,
@@ -16064,6 +16094,7 @@ def _proposition_evidence_is_authoritative(
         routes=routes,
         opportunity_type=effective_opportunity_type,
         semantic_proof_version=semantic_proof_version,
+        artifact_descriptor=descriptor,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -16074,6 +16105,7 @@ def _proposition_evidence_is_authoritative(
         routes=routes,
         opportunity_type=effective_opportunity_type,
         proposition_version=proposition_version,
+        artifact_descriptor=descriptor,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -17034,6 +17066,7 @@ def _validated_opportunity_proposal(
     revision_id = payload_value.get("source_message_revision_id")
     output = payload_value.get("output")
     semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
@@ -17044,7 +17077,10 @@ def _validated_opportunity_proposal(
             body=body,
         )
         or not isinstance(output, dict)
-        or not classifier_output_is_schema_valid(output, body=body)
+        or artifact_descriptor is None
+        or not classifier_output_is_schema_valid(
+            output, body=body, artifact_descriptor=artifact_descriptor
+        )
         or output.get("disposition") != "accepted"
     ):
         return None
@@ -17167,6 +17203,7 @@ def _validated_opportunity_proposal(
             revision_id, kind="revision"
         ),
         meaning=opportunity_type,
+        artifact_descriptor=artifact_descriptor,
     ):
         return None
     if route is None:
@@ -17499,6 +17536,7 @@ def _validated_tournament_proposal(
     revision_id = payload_value.get("source_message_revision_id")
     output = payload_value.get("output")
     semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
@@ -17509,7 +17547,10 @@ def _validated_tournament_proposal(
             body=body,
         )
         or not isinstance(output, dict)
-        or not classifier_output_is_schema_valid(output, body=body)
+        or artifact_descriptor is None
+        or not classifier_output_is_schema_valid(
+            output, body=body, artifact_descriptor=artifact_descriptor
+        )
         or output.get("disposition") != "accepted"
     ):
         return None
@@ -17590,6 +17631,7 @@ def _validated_tournament_proposal(
                 revision_id, kind="revision"
             ),
             opportunity_type="tournament",
+            artifact_descriptor=artifact_descriptor,
         )
         or route is None
     ):
@@ -17880,10 +17922,12 @@ def _validated_transfer_proposal(
     body = payload_value.get("body")
     revision_id = payload_value.get("source_message_revision_id")
     semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
     opportunity_type = candidate.get("opportunity_type")
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
+        or artifact_descriptor is None
         or opportunity_type not in {"roster_vacancy", "player_transfer_availability"}
     ):
         return None
@@ -17955,6 +17999,7 @@ def _validated_transfer_proposal(
             revision_id, kind="revision"
         ),
         meaning=opportunity_type,
+        artifact_descriptor=artifact_descriptor,
     ):
         return None
     if route is None:

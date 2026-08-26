@@ -22,6 +22,10 @@ from modules.application import (
     RuntimeApplication,
     RuntimeProcessingError,
 )
+from modules.classifier_contract import (
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_primary,
+)
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
     describe_player_classifier_release,
@@ -909,6 +913,19 @@ class ControlledModelAdapter:
         """Identify the isolated controlled adapter without a provider call."""
         return "controlled_recording"
 
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the immutable descriptor for the configured test release."""
+        descriptor = classifier_artifact_descriptor_for_primary(
+            self.primary_schema_version,
+            primary_prompt_version=self.primary_prompt_version,
+        )
+        if descriptor is None:
+            raise RuntimeError(
+                "controlled classifier has no trusted artifact descriptor"
+            )
+        return descriptor
+
     def schema_smoke_test(self) -> bool:
         """Return the configured synthetic schema-smoke result."""
         return self.smoke_test_passes
@@ -946,6 +963,11 @@ class ControlledModelAdapter:
         self.primary_schema_version = "source-message-classification-v3"
         self.primary_prompt_version = "player-match-primary-v1"
 
+    def enable_open_match_primary_v3(self) -> None:
+        """Opt the controlled model boundary into the Tournament/open release."""
+        self.primary_schema_version = "source-message-classification-v3"
+        self.primary_prompt_version = "open-match-primary-v3"
+
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
         self._classify_failures.setdefault(pass_kind, []).append(error)
@@ -974,6 +996,7 @@ class ControlledModelAdapter:
             output=_ensure_test_proposition_evidence(
                 result.output,
                 body=request.body,
+                artifact_descriptor=self.artifact_descriptor,
             ),
         )
 
@@ -998,7 +1021,11 @@ class ControlledModelAdapter:
                     "controlled classifier result is not configured"
                 ) from error
             output = _build_test_semantic_proof(
-                _ensure_test_proposition_evidence(primary.output, body=request.body),
+                _ensure_test_proposition_evidence(
+                    primary.output,
+                    body=request.body,
+                    artifact_descriptor=self.artifact_descriptor,
+                ),
                 body=request.body,
                 source_message_revision_reference=request.source_message_revision_id,
                 proof_version=(
@@ -1021,7 +1048,10 @@ class ControlledModelAdapter:
 
 
 def _ensure_test_proposition_evidence(
-    output: dict[str, JsonValue], *, body: str
+    output: dict[str, JsonValue],
+    *,
+    body: str,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> dict[str, JsonValue]:
     """Give legacy controlled fixtures the current structured model shape."""
     enriched = deepcopy(output)
@@ -1030,14 +1060,19 @@ def _ensure_test_proposition_evidence(
     candidates = enriched.get("candidates")
     if not isinstance(candidates, list):
         return enriched
-    proposition_version = (
-        "source-proposition-evidence-v2"
-        if enriched.get("schema_version") == "source-message-classification-v3"
-        else "source-proposition-evidence-v1"
-    )
     for candidate in candidates:
         if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
             continue
+        opportunity_type = candidate.get("opportunity_type")
+        proposition_version = (
+            artifact_descriptor.proposition_version_for(opportunity_type)
+            if artifact_descriptor is not None and isinstance(opportunity_type, str)
+            else (
+                "source-proposition-evidence-v2"
+                if enriched.get("schema_version") == "source-message-classification-v3"
+                else "source-proposition-evidence-v1"
+            )
+        )
         _add_test_proposition_evidence(
             candidate,
             body=body,

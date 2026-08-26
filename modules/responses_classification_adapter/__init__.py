@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from modules.classifier_adapter import classifier_provider_error_from_metadata
+from modules.classifier_contract import (
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_primary,
+)
 from modules.contracts import JsonValue
 from modules.ports import (
     ClassifierAdapterResult,
@@ -130,6 +134,17 @@ class ResponsesClassifierAdapter:
     def primary_prompt_version(self) -> str:
         """Return the primary prompt artifact selected by this adapter."""
         return self._primary_prompt_version
+
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the immutable release selected during adapter activation."""
+        descriptor = classifier_artifact_descriptor_for_primary(
+            self._primary_schema_version,
+            primary_prompt_version=self._primary_prompt_version,
+        )
+        if descriptor is None:
+            raise RuntimeError("classifier adapter has no trusted artifact descriptor")
+        return descriptor
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False

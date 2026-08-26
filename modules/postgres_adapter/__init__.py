@@ -132,9 +132,9 @@ _LEGACY_MIGRATION_NAMES = (
     "0021_classification_proof_work.sql",
     "0022_classifier_execution_recovery.sql",
     "0023_opponent_requests.sql",
-    "0023_player_match_availability.sql",
     "0023_tournament_discovery.sql",
     "0024_long_term_transfer_opportunities.sql",
+    "0025_player_match_availability.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -161,8 +161,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "553ccb94da752b55d28d197bdd2ed86236ef02e202a2b63143a54fdd1cb6181f",
     "0315157b15c682039beb369dba0523ff770900a674be50d3b449dfbc2d019747",
     "f469b7ef0dea58eb9f767571f33a3005385bc74c1ffcaf33117f2060c510cc05",
-    "7757ee26f21ec9453badb15679582e716d9b1d4231b60eb45b173c49b0079d1e",
-    "bc5493be3bcb9b6665f3f4768cfcecb1cacba1c4eaa2c74c83eeacb41697becd",
+    "6cde9a66b0dc40e58189c3e4e6c0251e290aaa41eb559f897d043b420143dd55",
+    "680c189420c71e3aa452a51cbee1a6ba786885d726cd1ad983a79fe891b5b5d9",
     "97d9f94ce319ba0fffdc6d7af64af7ae9422abe4ca1bbbc855a911a42ae764aa",
 )
 

@@ -36,6 +36,9 @@ from modules.application import (
     _validated_tournament_proposal,
 )
 from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    OPEN_MATCH_V3_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     PROPOSITION_EVIDENCE_VERSION,
     classifier_output_is_schema_valid,
     semantic_proof_is_schema_valid,
@@ -147,6 +150,7 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
         assert classifier_output_is_schema_valid(
             result.output,
             body=case["source"],
+            artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
         )
         expected = case["expected"]
         assert result.output["disposition"] == expected["disposition"]
@@ -203,6 +207,7 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     assert not classifier_output_is_schema_valid(
         invalid_output,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     unsupported_evidence = deepcopy(cases[0]["recorded_output"])
     unsupported_evidence["candidates"][0]["evidence"]["open_places"] = (
@@ -211,18 +216,21 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     assert not classifier_output_is_schema_valid(
         unsupported_evidence,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     malformed_route = deepcopy(cases[0]["recorded_output"])
     malformed_route["candidates"][0]["response_routes"][0]["unexpected"] = True
     assert not classifier_output_is_schema_valid(
         malformed_route,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     invalid_domain_value = deepcopy(cases[0]["recorded_output"])
     invalid_domain_value["candidates"][0]["positions"] = ["sweeper"]
     assert not classifier_output_is_schema_valid(
         invalid_domain_value,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
 
 
@@ -1483,7 +1491,11 @@ def _run_v3_evaluation_gate(
             request=request,
             runner=runner,
         )
-        assert classifier_output_is_schema_valid(result.output, body=body)
+        assert classifier_output_is_schema_valid(
+            result.output,
+            body=body,
+            artifact_descriptor=adapter.artifact_descriptor,
+        )
         validated_semantic_records.update(
             _execute_selected_semantic_proofs(
                 adapter,
@@ -1528,7 +1540,11 @@ def _run_v3_evaluation_gate(
                 request=second_request,
                 runner=runner,
             )
-            assert classifier_output_is_schema_valid(second_result.output, body=body)
+            assert classifier_output_is_schema_valid(
+                second_result.output,
+                body=body,
+                artifact_descriptor=adapter.artifact_descriptor,
+            )
             validated_semantic_records.update(
                 _execute_selected_semantic_proofs(
                     adapter,
@@ -1572,7 +1588,11 @@ def _run_v3_evaluation_gate(
             request=request,
             runner=runner,
         )
-        assert classifier_output_is_schema_valid(result.output, body=body)
+        assert classifier_output_is_schema_valid(
+            result.output,
+            body=body,
+            artifact_descriptor=adapter.artifact_descriptor,
+        )
         promotion_results[fixture_name] = result
         validated_semantic_records.update(
             _execute_selected_semantic_proofs(
@@ -2249,7 +2269,11 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
         body = source_cases[case_id]["source"]
         primary = recorded_case["primary_output"]
         assert isinstance(primary, dict)
-        assert classifier_output_is_schema_valid(primary, body=body)
+        assert classifier_output_is_schema_valid(
+            primary,
+            body=body,
+            artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+        )
         expected_disposition = manifest_cases[case_id]["expected_pipeline_disposition"]
         if expected_disposition == "unresolved" and not set(
             manifest_cases[case_id]["opportunity_types"]
@@ -2265,7 +2289,11 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
         )
         second = recorded_case.get("second_pass_output")
         if isinstance(second, dict):
-            assert classifier_output_is_schema_valid(second, body=body)
+            assert classifier_output_is_schema_valid(
+                second,
+                body=body,
+                artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+            )
             _assert_semantic_proofs_for_output(
                 corpus,
                 case_id=case_id,
@@ -2281,7 +2309,11 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
         output = fixture["primary_output"]
         assert isinstance(body, str)
         assert isinstance(output, dict)
-        assert classifier_output_is_schema_valid(output, body=body)
+        assert classifier_output_is_schema_valid(
+            output,
+            body=body,
+            artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+        )
         _assert_semantic_proofs_for_output(
             corpus,
             case_id=f"promotion:{fixture_name}",
@@ -2419,7 +2451,11 @@ def test_player_release_replays_offline_with_offering_semantics() -> None:
                 routing_policy_version="classifier-routing-player-v1",
             )
         )
-        assert classifier_output_is_schema_valid(result.output, body=source)
+        assert classifier_output_is_schema_valid(
+            result.output,
+            body=source,
+            artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+        )
         candidates = result.output.get("candidates")
         assert isinstance(candidates, list)
         if disposition == "accepted":
@@ -3681,7 +3717,11 @@ def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:
         }
     ]
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_offline_authority_boundary_rejects_non_authoritative_facts() -> None:
@@ -3755,7 +3795,11 @@ def test_classifier_contract_accepts_an_evidence_backed_url_route() -> None:
         }
     ]
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_classifier_contract_leaves_source_metadata_fallback_to_application() -> None:
@@ -3765,7 +3809,11 @@ def test_classifier_contract_leaves_source_metadata_fallback_to_application() ->
     source = corpus["cases"][0]["source"].replace(" Пишите @sample_contact", "")
     output["candidates"][0]["response_routes"] = []
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_classifier_contract_preserves_unknown_optional_open_place_count() -> None:
@@ -3780,7 +3828,11 @@ def test_classifier_contract_preserves_unknown_optional_open_place_count() -> No
     candidate["evidence"]["open_places"] = "Ищем защитника"
     candidate["open_places"] = None
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_classifier_contract_accepts_a_source_stated_day_part() -> None:
@@ -3795,4 +3847,8 @@ def test_classifier_contract_accepts_a_source_stated_day_part() -> None:
     del candidate["event_time"]["exact_local_time"]
     candidate["event_time"]["day_part"] = "evening"
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )

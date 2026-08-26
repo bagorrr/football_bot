@@ -6,7 +6,10 @@ import hashlib
 from pathlib import Path
 from typing import cast
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    classifier_output_is_schema_valid,
+)
 from modules.contracts import JsonValue
 from modules.ports import ClassifierRequest
 from modules.testkit import ControlledModelAdapter
@@ -102,7 +105,11 @@ def test_opponent_request_survives_controlled_adapter_and_schema_boundary() -> N
             routing_policy_version="classifier-routing-v1",
         )
     )
-    assert classifier_output_is_schema_valid(observed.output, body=body)
+    assert classifier_output_is_schema_valid(
+        observed.output,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
     observed_candidates = cast(list[JsonValue], observed.output["candidates"])
     observed_candidate = cast(dict[str, object], observed_candidates[0])
     assert observed_candidate["opportunity_type"] == "opponent_request"

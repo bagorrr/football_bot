@@ -27,7 +27,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
-from modules.classifier_contract import classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    ClassifierArtifactDescriptor,
+    classifier_output_is_schema_valid,
+)
 from modules.contracts import (
     JsonValue,
     RuntimeRole,
@@ -1026,6 +1030,11 @@ class ControlledPlayerClassifierAdapter:
         return _PRIMARY_SCHEMA
 
     @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the reviewed Player artifact contract selected at construction."""
+        return PLAYER_MATCH_AVAILABILITY_DESCRIPTOR
+
+    @property
     def adapter_kind(self) -> str:
         return "responses_api"
 
@@ -1076,7 +1085,11 @@ class ControlledPlayerClassifierAdapter:
         if self._adapter is None:
             raise RuntimeError("controlled Responses adapter was not initialized")
         result = self._adapter.classify(request)
-        if not classifier_output_is_schema_valid(result.output, body=source):
+        if not classifier_output_is_schema_valid(
+            result.output,
+            body=source,
+            artifact_descriptor=self.artifact_descriptor,
+        ):
             raise ValueError("controlled Responses output failed schema validation")
         output = _copy_json_object(result.output)
         raw_facts = output.get("facts")
@@ -2508,7 +2521,11 @@ def compare_recorded_observation(
         if not isinstance(expected_types, list):
             return f"{case_id}:annotation"
         if (
-            not classifier_output_is_schema_valid(output, body=source)
+            not classifier_output_is_schema_valid(
+                output,
+                body=source,
+                artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+            )
             or output.get("disposition") != expected.get("disposition")
             or not isinstance(candidates, list)
             or len(candidates) != expected.get("candidate_count")

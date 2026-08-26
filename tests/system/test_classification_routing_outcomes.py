@@ -15,6 +15,7 @@ from typing import cast
 import psycopg
 import pytest
 
+from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.codex_classification_adapter import CodexCliClassifierAdapter
 from modules.contracts import ContractName, JsonValue, RuntimeRole
 from modules.domain import (
@@ -130,6 +131,10 @@ class _BlockingModelAdapter:
     @property
     def primary_schema_version(self) -> str:
         return self.delegate.primary_schema_version
+
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        return self.delegate.artifact_descriptor
 
     @property
     def adapter_kind(self) -> str:
@@ -1826,6 +1831,7 @@ def _exercise_legacy_v1_invalid_primary_execution(
 ) -> None:
     """Exercise v1 invalid executions on an already booted acceptance spine."""
     classifier.primary_schema_version = "source-message-classification-v1"
+    classifier.primary_prompt_version = "open-match-primary-v1"
     for offset, invalid_kind in enumerate(("schema", "metadata", "exception")):
         body = f"Legacy v1 invalid primary {invalid_kind} must remain retryable."
         if invalid_kind == "exception":

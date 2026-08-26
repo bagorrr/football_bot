@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.contracts import (
     ContractEnvelope,
     ContractName,
@@ -191,6 +192,11 @@ class ModelAdapter(Protocol):
     @property
     def primary_schema_version(self) -> str:
         """Return the primary classifier schema selected by this adapter."""
+        ...
+
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the immutable artifact contract selected by this adapter."""
         ...
 
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:

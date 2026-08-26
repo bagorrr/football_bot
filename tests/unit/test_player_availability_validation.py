@@ -215,6 +215,36 @@ def test_player_ranges_support_long_endpoints_and_localized_connectors(
     )
 
 
+@pytest.mark.parametrize(
+    "text",
+    (
+        "2 to 5 players are available for the match.",
+        "от 2 до 5 игроков доступны для матча.",
+        "de 2 a 5 jugadores disponibles para el partido.",
+        "de 2 à 5 joueurs disponibles pour le match.",
+    ),
+)
+def test_player_range_is_bound_to_the_same_source_offering_clause(text: str) -> None:
+    assert _player_availability_is_supported(
+        None,
+        2,
+        5,
+        text,
+        authoritative_body=text,
+    )
+
+
+def test_player_range_is_not_borrowed_from_an_unrelated_source_clause() -> None:
+    text = "The post says 2 to 5 players. Our group is available to play."
+    assert not _player_availability_is_supported(
+        None,
+        2,
+        5,
+        text,
+        authoritative_body=text,
+    )
+
+
 def test_player_quantity_values_must_share_one_compatible_offering_clause() -> None:
     contradictory = (
         "We are 6 players available for the match; between 2 and 5 players "
