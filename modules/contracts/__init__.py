@@ -2587,7 +2587,11 @@ def _validate_transfer_seasonal_timing_fact(value: JsonValue) -> None:
             raise ValueError("transfer Seasonal Timing date is not normalized")
         return
     if kind == "stated_season":
-        if len(raw_value) > 80 or raw_value != raw_value.casefold():
+        if (
+            len(raw_value) > 80
+            or raw_value != raw_value.casefold()
+            or raw_value != raw_value.strip()
+        ):
             raise ValueError("transfer Seasonal Timing season is not normalized")
         return
     raise ValueError("transfer Seasonal Timing kind is invalid")

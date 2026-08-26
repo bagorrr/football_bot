@@ -13196,6 +13196,10 @@ def _transfer_assertion_signature(
         r"доступ\w*|ищ\w*|нужн\w*|"
         r"location|city|country|place|место|город|стран\w*|"
         r"payment|оплат\w*|pago|paiement|campaign\w*|кампан\w*|"
+        r"format|level|venue|surface|формат|уров\w*|площад\w*|покрыт\w*|"
+        r"niveau\w*|terrain\w*|nivel\w*|pista\w*|"
+        r"indoor|outdoor|covered|grass|turf|parquet|"
+        r"5x5|6x6|7x7|8x8|9x9|10x10|11x11|"
         r"recruit\w*|набор\w*|"
         r"@[a-z0-9_]{3,}|https?://|[\w.+-]+@[\w.-]+\.[a-z]{2,}|"
         r"\+?[0-9][0-9 ()-]{5,}[0-9])",

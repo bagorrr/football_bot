@@ -80,6 +80,13 @@ def test_transfer_accepted_facts_reject_noncanonical_start_date() -> None:
         )
 
 
+def test_transfer_accepted_facts_reject_untrimmed_named_season() -> None:
+    with pytest.raises(ValueError, match="season is not normalized"):
+        _validate_transfer_seasonal_timing_fact(
+            {"kind": "stated_season", "value": " 2026-2027"}
+        )
+
+
 def test_transfer_search_rejects_required_date() -> None:
     payload = _run_search_payload(details={})
     payload["required_date"] = {

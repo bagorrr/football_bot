@@ -502,6 +502,48 @@ def test_transfer_freshness_tracks_payment_changes() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("Team format: 5x5", "Team format: 7x7"),
+        ("Venue: outdoor", "Venue: indoor"),
+        ("Surface: artificial turf", "Surface: natural grass"),
+        ("Playing level: average", "Playing level: high"),
+    ),
+)
+def test_transfer_freshness_tracks_optional_attribute_changes(
+    before: str, after: str
+) -> None:
+    created = SourceMessageRevision(
+        source_message_revision_id="source:revision:1",
+        source_message_id="source",
+        source_event_id="event:1",
+        revision=1,
+        event_kind=SourceEventKind.CREATE,
+        body=f"Long-term roster vacancy for a goalkeeper. {before}.",
+        event_time=datetime(2026, 7, 18, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 7, 18, 8, tzinfo=UTC),
+    )
+    edited = SourceMessageRevision(
+        source_message_revision_id="source:revision:2",
+        source_message_id="source",
+        source_event_id="event:2",
+        revision=2,
+        event_kind=SourceEventKind.EDIT,
+        body=f"Long-term roster vacancy for a goalkeeper. {after}.",
+        event_time=datetime(2026, 8, 1, 8, tzinfo=UTC),
+        recorded_at=datetime(2026, 8, 1, 8, tzinfo=UTC),
+    )
+    assert (
+        _source_transfer_qualifying_assertion_at(
+            edited,
+            (created, edited),
+            "roster_vacancy",
+        )
+        == edited.event_time
+    )
+
+
 def test_transfer_unrelated_prose_edit_does_not_renew_source_assertion() -> None:
     created = SourceMessageRevision(
         source_message_revision_id="source:revision:1",

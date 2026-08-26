@@ -15,7 +15,7 @@
     "root": {"$ref": "#/$defs/root"},
     "facts": {
       "type": "object",
-      "minProperties": 4,
+      "minProperties": 3,
       "additionalProperties": {"$ref": "#/$defs/assertion"}
     },
     "routes": {

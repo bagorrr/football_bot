@@ -508,7 +508,7 @@ def test_classifier_adapters_bind_the_exact_prompt_artifact_for_each_pass(
 
 
 @pytest.mark.parametrize("adapter_kind", ("codex_cli", "responses_api"))
-def test_classifier_adapters_select_the_newest_complete_transfer_artifact_set(
+def test_classifier_adapters_require_explicit_transfer_artifact_activation(
     adapter_kind: str, tmp_path: Path
 ) -> None:
     prompt_paths = {
@@ -525,6 +525,26 @@ def test_classifier_adapters_select_the_newest_complete_transfer_artifact_set(
     for path in (*prompt_paths.values(), *schema_paths.values()):
         path.write_text("{}", encoding="utf-8")
 
+    with pytest.raises(ValueError, match="explicit"):
+        if adapter_kind == "codex_cli":
+            CodexCliClassifierAdapter(
+                codex_executable=Path("/opt/classifier/bin/codex"),
+                codex_home=tmp_path / "codex-home",
+                workspace=tmp_path / "workspace",
+                schema_paths=schema_paths,
+                prompt_paths=prompt_paths,
+                runner=PromptRecordingProcessRunner(),
+                codex_version="codex-test-version",
+                adapter_version="codex-classifier-v1",
+            )
+        else:
+            ResponsesClassifierAdapter(
+                transport=RecordingResponsesTransport(),
+                schemas={version: {} for version in schema_paths},
+                prompt_paths=prompt_paths,
+                adapter_version="responses-classifier-v1",
+            )
+
     if adapter_kind == "codex_cli":
         adapter: CodexCliClassifierAdapter | ResponsesClassifierAdapter = (
             CodexCliClassifierAdapter(
@@ -536,6 +556,7 @@ def test_classifier_adapters_select_the_newest_complete_transfer_artifact_set(
                 runner=PromptRecordingProcessRunner(),
                 codex_version="codex-test-version",
                 adapter_version="codex-classifier-v1",
+                primary_schema_version="source-message-classification-v3",
             )
         )
     else:
@@ -544,6 +565,7 @@ def test_classifier_adapters_select_the_newest_complete_transfer_artifact_set(
             schemas={version: {} for version in schema_paths},
             prompt_paths=prompt_paths,
             adapter_version="responses-classifier-v1",
+            primary_schema_version="source-message-classification-v3",
         )
 
     assert adapter.primary_schema_version == "source-message-classification-v3"

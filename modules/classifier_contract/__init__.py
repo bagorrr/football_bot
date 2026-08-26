@@ -852,6 +852,17 @@ def semantic_proof_is_schema_valid(
     ):
         return False
 
+    contract_version = value["contract_version"]
+    allowed_meanings = (
+        {"open_match", "opponent_request"}
+        if contract_version == SEMANTIC_PROOF_VERSION
+        else {
+            "open_match",
+            "opponent_request",
+            "roster_vacancy",
+            "player_transfer_availability",
+        }
+    )
     assertion_target_ids = {"root"}
     root = value.get("root")
     if not isinstance(root, dict) or set(root) != {
@@ -865,6 +876,7 @@ def semantic_proof_is_schema_valid(
     if (
         root.get("target_id") != "root"
         or root.get("domain") != "football_match"
+        or root.get("meaning") not in allowed_meanings
         or root.get("meaning") != meaning
         or root.get("state") not in _SEMANTIC_PROOF_STATES
         or not _valid_source_span(root.get("span"), body, expected_text=body)
