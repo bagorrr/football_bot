@@ -13145,9 +13145,10 @@ def _transfer_assertion_signature(
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
         r"portero\w*|defensa\w*|centrocampista\w*|delantero\w*|"
         r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*|"
-        r"available|seeking|looking|need\w*|join\w*|team|команд\w*|"
-        r"доступ\w*|ищ\w*|нужн\w*|message|contact|reply|email|phone|"
-        r"whatsapp|telegram|@[a-z0-9_]{3,}|https?://)",
+        r"available|seeking|looking|need\w*|join\w*|команд\w*|"
+        r"доступ\w*|ищ\w*|нужн\w*|"
+        r"@[a-z0-9_]{3,}|https?://|[\w.+-]+@[\w.-]+\.[a-z]{2,}|"
+        r"\+?[0-9][0-9 ()-]{5,}[0-9])",
         re.IGNORECASE,
     )
     clauses = tuple(
@@ -15654,12 +15655,14 @@ def _validated_transfer_proposal(
     expected_evidence = {"opportunity", "location", opportunity_type} | (
         set(candidate) & optional
     )
+    validation_body = source_context if isinstance(source_context, str) else body
     if (
         not isinstance(candidate_key, str)
         or not isinstance(evidence, dict)
         or set(evidence) != expected_evidence
         or not all(
-            isinstance(value, str) and value in body for value in evidence.values()
+            isinstance(value, str) and value in validation_body
+            for value in evidence.values()
         )
         or not isinstance(location, dict)
         or not isinstance(routes, list)
@@ -15671,7 +15674,6 @@ def _validated_transfer_proposal(
         or candidate.get(opportunity_type) is not True
     ):
         return None
-    validation_body = source_context if isinstance(source_context, str) else body
     route = _select_response_route(
         body=validation_body,
         proposed_routes=routes,
@@ -15772,7 +15774,9 @@ def _validated_transfer_proposal(
             str(evidence["seasonal_timing"]) if "seasonal_timing" in evidence else None,
             authoritative_body=validation_body,
         )
+        or not _body_establishes_transfer_opportunity(body, opportunity_type)
         or not _body_establishes_transfer_opportunity(validation_body, opportunity_type)
+        or not _transfer_offer_is_single_player(body, opportunity_type)
         or not _transfer_offer_is_single_player(validation_body, opportunity_type)
     ):
         return None
@@ -16081,18 +16085,20 @@ def _seasonal_timing_is_supported(
 def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> bool:
     """Keep long-term transfer propositions separate from one-off requests."""
     normalized = body.casefold()
-    one_off = re.search(
-        r"\b(?:match|game|fixture|opponent|матч|игр\w*|соперник|partid\w*|"
-        r"encuentro\w*|rencontre\w*)\b",
-        normalized,
+    one_off_pattern = re.compile(
+        r"\b(?:match|game|fixture|opponent|матч\w*|"
+        r"игр(?:а|ы|у|е|ой)|соперник|partid\w*|encuentro\w*|rencontre\w*)\b"
     )
+    one_off = one_off_pattern.search(normalized)
     if opportunity_type == "roster_vacancy":
         long_term = re.search(
             r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
             r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
             r"(?:the\s+)?(?:roster|squad)|join\s+(?:our\s+)?(?:roster|squad)|"
             r"squad\s+(?:vacanc\w*|opening|spot)|season(?:al)?|long[- ]term|"
-            r"набор\w*|нужн\w*\s+игрок\w*|сезон\w*|команд\w*\s+ищ\w*|"
+            r"набор\w*|нужн\w*\s+игрок\w*|требу\w*|постоян\w*|"
+            r"долгосроч\w*|перспектив\w*|усилен\w*|сезон\w*|"
+            r"команд\w*\s+ищ\w*|"
             r"plantilla\s+(?:vacante|abierta)|temporad\w*|effectif\s+vacant|"
             r"saison\w*)\b",
             normalized,
@@ -16102,7 +16108,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"\b(?:transfer|available\s+for\s+(?:a\s+)?move|looking\s+for\s+"
             r"a\s+team|seeking\s+a\s+team|join\s+(?:a\s+)?team|long[- ]term|season|"
             r"доступ\w*\s+для\s+переход\w*|ищ\w*\s+команд\w*|переход\w*|"
-            r"сезон\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
+            r"сезон\w*|постоян\w*|долгосроч\w*|disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+"
             r"equip\w*|transfert|cherche\w*\s+une\s+équipe)\b",
             normalized,
         )
@@ -16112,7 +16118,7 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     # the long-term or seasonal nature explicit. A bare "season" in a phrase
     # such as "this season's Saturday match" is not enough.
     if one_off is not None:
-        explicit_long_term = re.search(
+        explicit_long_term_pattern = re.compile(
             r"\b(?:roster\s+(?:vacanc\w*|open\w*|spot|position|opening)|"
             r"(?:vacanc\w*|open\w*|spot|position|opening)\s+(?:in|on|for)\s+"
             r"(?:the\s+)?(?:roster|squad)|squad\s+(?:vacanc\w*|opening|spot)|"
@@ -16126,9 +16132,14 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
             r"disponible\s+para\s+(?:un\s+)?traspaso|busc\w*\s+equip\w*|"
             r"plantilla\s+(?:vacante|abierta)|transfert|cherche\w*\s+une\s+"
             r"équipe|effectif\s+vacant)\b",
-            normalized,
         )
-        if explicit_long_term is None:
+        explicit_long_term = explicit_long_term_pattern.search(normalized)
+        clauses = re.split(r"[.!?;\n]+", normalized)
+        if explicit_long_term is None or not any(
+            one_off_pattern.search(clause) is not None
+            and explicit_long_term_pattern.search(clause) is not None
+            for clause in clauses
+        ):
             return False
     return True
 
@@ -16142,7 +16153,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
         r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
         r"gardien\w*|d[ée]fenseur\w*|milieu\w*|attaquant\w*)\b"
-        r"\s+(?:and|&|y|et|и|plus|más)\s+"
+        r"(?:\s+(?:and|&|y|et|и|plus|más)\s+|\s*[/;]\s*)"
         r"\b(?:goalkeeper|defender|midfielder|forward|striker|"
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
         r"portero\w*|defensa|centrocampista\w*|delantero\w*|"
@@ -16155,7 +16166,7 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"\b(?:un|una)\s+\w+(?:\s+\w+){0,2}\s+y\s+(?:un|una)\s+\w+|"
         r"\b(?:un|une)\s+\w+(?:\s+\w+){0,2}\s+et\s+(?:un|une)\s+\w+|"
         r"\b(?:один|одна)\s+\w+(?:\s+\w+){0,2}\s+и\s+(?:один|одна)\s+\w+|"
-        r"\b(?:a|an|one|un|una|un|une|один|одна)\s+\w+(?:\s+\w+){0,2},\s*"
+        r"\b(?:a|an|one|un|una|un|une|один|одна)\s+\w+(?:\s+\w+){0,2}\s*[,;/]\s*"
         r"(?:a|an|one|un|una|un|une|один|одна)\s+\w+|"
         r"\b(?:another|otro|otra|un\s+autre|une\s+autre|ещё\s+один|"
         r"еще\s+один)\s+\w+",
@@ -16165,17 +16176,26 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"\b(?:\d+|two|three|four|five|several|multiple|many|"
         r"два|три|четыре|несколько|много|dos|tres|varios|plusieurs|deux|trois)\s+"
         r"(?:goalkeepers?|defenders?|midfielders?|forwards?|strikers?|"
+        r"players?|footballers?|teammates?|"
         r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"футболист\w*|товарищ\w*|"
         r"porteros?|defensas?|centrocampistas?|delanteros?|"
-        r"gardiens?|défenseurs?|milieux?|attaquants?)\b|"
+        r"futbolistas?|compañeros?|gardiens?|défenseurs?|milieux?|"
+        r"attaquants?|footballeurs?|coéquipiers?)\b|"
         r"\b(?:goalkeepers|defenders|midfielders|forwards|strikers|"
+        r"players|footballers|teammates|"
         r"вратари|вратарей|защитники|защитников|полузащитники|"
-        r"полузащитников|нападающие|нападающих|porteros|defensas|"
-        r"centrocampistas|delanteros|gardiens|défenseurs|milieux|attaquants)\b",
+        r"полузащитников|нападающие|нападающих|"
+        r"футболист(?:ы|ов|ами|ам|ах)|товарищ(?:и|ей|ами|ам|ах)|"
+        r"porteros|defensas|centrocampistas|delanteros|futbolistas|"
+        r"compañeros|gardiens|défenseurs|milieux|attaquants|"
+        r"footballeurs|coéquipiers)\b",
         body.casefold(),
     )
     named_multiple_players = re.search(
         r"\b[A-ZА-ЯЁ][\w'’-]+\s+(?:and|&|y|et|и)\s+"
+        r"[A-ZА-ЯЁ][\w'’-]+\b|"
+        r"\b[A-ZА-ЯЁ][\w'’-]+\s*[,;/]\s*"
         r"[A-ZА-ЯЁ][\w'’-]+\b",
         body,
     )
@@ -16185,14 +16205,21 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         and plural_position_or_count is None
         and named_multiple_players is None
         and re.search(
-            r"\b(?:players|several\s+players|multiple\s+players|two\s+players|"
-            r"three\s+players|four\s+players|pair\s+of\s+players|"
-            r"group\s+of\s+players|игроки|игроков|игроками|несколько\s+игрок\w*|"
+            r"\b(?:players|footballers|teammates|several\s+(?:players|footballers|teammates)|"
+            r"multiple\s+(?:players|footballers|teammates)|two\s+(?:players|footballers|teammates)|"
+            r"three\s+(?:players|footballers|teammates)|four\s+(?:players|footballers|teammates)|"
+            r"pair\s+of\s+(?:players|footballers|teammates)|"
+            r"group\s+of\s+(?:players|footballers|teammates)|игроки|игроков|игроками|"
+            r"футболист(?:ы|ов|ами|ам|ах)|товарищ(?:и|ей|ами|ам|ах)|"
+            r"несколько\s+игрок\w*|"
             r"два\s+игрок\w*|три\s+игрок\w*|пара\s+игрок\w*|"
-            r"jugadores|varios\s+jugador\w*|m[úu]ltiples\s+jugador\w*|"
+            r"jugadores|futbolistas|compañeros|varios\s+(?:jugador\w*|futbolist\w*)|"
+            r"m[úu]ltiples\s+(?:jugador\w*|futbolist\w*)|"
             r"dos\s+jugador\w*|grupo\s+de\s+jugador\w*|"
-            r"joueurs|plusieurs\s+joueur\w*|deux\s+joueur\w*|"
-            r"groupe\s+de\s+joueur\w*)\b",
+            r"joueurs|footballeurs|coéquipiers|plusieurs\s+(?:joueur\w*|footballeur\w*)|"
+            r"deux\s+(?:joueur\w*|footballeur\w*)|"
+            r"groupe\s+de\s+(?:joueur\w*|footballeur\w*)|"
+            r"groupe\s+de\s+coéquipier\w*)\b",
             body.casefold(),
         )
         is None

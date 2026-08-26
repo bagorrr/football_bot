@@ -1,5 +1,7 @@
 """Deterministic long-term transfer matching."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual transfer evidence is intentional.
+
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import cast
@@ -388,7 +390,7 @@ def test_transfer_unrelated_prose_edit_does_not_renew_source_assertion() -> None
         source_event_id="event:2",
         revision=2,
         event_kind=SourceEventKind.EDIT,
-        body=f"{created.body} Unrelated note.",
+        body=f"{created.body} Unrelated note about the team.",
         event_time=datetime(2026, 8, 2, 8, tzinfo=UTC),
         recorded_at=datetime(2026, 8, 2, 8, tzinfo=UTC),
     )
@@ -453,6 +455,22 @@ def test_transfer_source_start_date_is_current_or_future_in_place_timezone(
             True,
         ),
         (
+            "Нужен постоянный вратарь в команду. Играем по выходным в формате 5х5.",
+            "roster_vacancy",
+            True,
+        ),
+        (
+            "В команду нужны игроки. Цель на сезон — место в середине таблицы.",
+            "roster_vacancy",
+            True,
+        ),
+        (
+            "В дружный коллектив на усиление требуются игроки на постоянную "
+            "перспективу.",
+            "roster_vacancy",
+            True,
+        ),
+        (
             "Need a player in Saint Petersburg.",
             "roster_vacancy",
             False,
@@ -479,6 +497,10 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
     ("body", "expected"),
     (
         ("A player is available for a long-term transfer.", True),
+        ("A footballer is available for a long-term transfer.", True),
+        ("A teammate is available for a long-term transfer.", True),
+        ("Футболист доступен для перехода.", True),
+        ("Товарищ по команде доступен для перехода.", True),
         ("Two players are available for a long-term transfer.", False),
         ("Two goalkeepers are available for a long-term transfer.", False),
         ("2 goalkeepers are available for a long-term transfer.", False),
@@ -488,10 +510,18 @@ def test_transfer_opportunity_boundary_excludes_one_off_match_requests(
         ("Dos porteros están disponibles para un traspaso de temporada.", False),
         ("2 porteros están disponibles para un traspaso de temporada.", False),
         ("Alex and Ben are available for a long-term transfer.", False),
+        ("Alex / Ben are available for a long-term transfer.", False),
         ("A goalkeeper and a defender are available for a transfer.", False),
         ("A goalkeeper and defender are available for a transfer.", False),
         ("One goalkeeper plus one defender are available for a transfer.", False),
         ("A goalkeeper, a defender are available for a transfer.", False),
+        ("A goalkeeper; a defender are available for a transfer.", False),
+        ("A goalkeeper / a defender are available for a transfer.", False),
+        ("Goalkeeper/defender available for a transfer.", False),
+        ("Two footballers are available for a long-term transfer.", False),
+        ("Several teammates are available for a long-term transfer.", False),
+        ("Footballers are available for a long-term transfer.", False),
+        ("Teammates are available for a long-term transfer.", False),
         ("Another goalkeeper is available for a transfer.", False),
         ("Dos jugadores están disponibles para un traspaso de temporada.", False),
         ("Deux joueurs sont disponibles pour un transfert durable.", False),
