@@ -16267,7 +16267,8 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
     """Reject plural Player Transfer Availability offers as one Player."""
     if opportunity_type != "player_transfer_availability":
         return True
-    candidate_body = "; ".join(_transfer_directional_clauses(body, opportunity_type))
+    candidate_clauses = _transfer_directional_clauses(body, opportunity_type)
+    candidate_body = "; ".join(candidate_clauses)
     normalized_body = candidate_body.casefold()
     multiple_position_terms = re.search(
         r"\b(?:goalkeeper|defender|midfielder|forward|striker|"
@@ -16313,18 +16314,21 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         r"footballeurs|coéquipiers)\b",
         normalized_body,
     )
-    named_multiple_players = re.search(
+    named_multiple_players_pattern = re.compile(
         r"\b[A-ZА-ЯЁ][\w'’-]+\s+(?:and|&|y|et|и)\s+"
         r"[A-ZА-ЯЁ][\w'’-]+\b|"
         r"\b[A-ZА-ЯЁ][\w'’-]+\s*[,;/]\s*"
         r"[A-ZА-ЯЁ][\w'’-]+\b",
-        candidate_body,
+    )
+    named_multiple_players = any(
+        named_multiple_players_pattern.search(clause) is not None
+        for clause in candidate_clauses
     )
     return (
         multiple_position_terms is None
         and explicit_multiple_players is None
         and plural_position_or_count is None
-        and named_multiple_players is None
+        and not named_multiple_players
         and re.search(
             r"\b(?:players|footballers|teammates|several\s+(?:players|footballers|teammates)|"
             r"multiple\s+(?:players|footballers|teammates)|two\s+(?:players|footballers|teammates)|"

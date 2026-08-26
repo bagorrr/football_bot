@@ -635,6 +635,11 @@ def test_transfer_ready_now_evidence_requires_current_timing(
             "one goalkeeper available.",
             True,
         ),
+        (
+            "Long-term player transfer availability: need a goalkeeper for "
+            "the 2026-2027 season on Petrogradskaya. Message @transfer_contact",
+            True,
+        ),
         ("Футболист доступен для перехода.", True),
         ("Товарищ по команде доступен для перехода.", True),
         ("Two players are available for a long-term transfer.", False),
