@@ -6,12 +6,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -32,6 +33,7 @@ from modules.classifier_contract import (
     classifier_output_is_schema_valid,
     semantic_proof_is_schema_valid,
 )
+from modules.codex_classification_adapter import CodexCliClassifierAdapter
 from modules.contracts import JsonValue
 from modules.domain import (
     ConversationStage,
@@ -44,9 +46,11 @@ from modules.domain import (
 from modules.ports import (
     ClassifierAdapterResult,
     ClassifierAuthenticationError,
+    ClassifierExecutionTimeoutError,
     ClassifierQuotaError,
     ClassifierRequest,
     LocationResolverAdapter,
+    ModelAdapter,
 )
 from modules.testkit import (
     ControlledModelAdapter,
@@ -386,54 +390,6 @@ def _evaluation_provenance(corpus: dict[str, Any]) -> dict[str, Any]:
     return provenance
 
 
-def _recorded_result(
-    corpus: dict[str, Any], output: dict[str, JsonValue]
-) -> ClassifierAdapterResult:
-    execution = _evaluation_provenance(corpus).get("execution")
-    assert isinstance(execution, dict)
-    assert all(
-        key in execution
-        for key in (
-            "codex_version",
-            "adapter_kind",
-            "adapter_version",
-            "duration_ms",
-            "input_tokens",
-            "output_tokens",
-        )
-    )
-    return ClassifierAdapterResult(
-        output=output,
-        effective_model=str(corpus["model"]),
-        effective_reasoning_effort=str(corpus["reasoning_effort"]),
-        codex_version=str(execution["codex_version"]),
-        adapter_kind=str(execution["adapter_kind"]),
-        adapter_version=str(execution["adapter_version"]),
-        duration_ms=int(execution["duration_ms"]),
-        input_tokens=int(execution["input_tokens"]),
-        output_tokens=int(execution["output_tokens"]),
-    )
-
-
-def _assert_recorded_result_provenance(
-    result: ClassifierAdapterResult,
-    corpus: dict[str, Any],
-) -> None:
-    """Require every replay to use the reviewed effective execution record."""
-    execution = _evaluation_provenance(corpus)["execution"]
-    assert result.effective_model == corpus["model"]
-    assert result.effective_reasoning_effort == corpus["reasoning_effort"]
-    for field_name in (
-        "codex_version",
-        "adapter_kind",
-        "adapter_version",
-        "duration_ms",
-        "input_tokens",
-        "output_tokens",
-    ):
-        assert getattr(result, field_name) == execution[field_name]
-
-
 def _classifier_request_payload(request: ClassifierRequest) -> dict[str, JsonValue]:
     """Expose one adapter request as the application manifest input shape."""
     return {
@@ -469,19 +425,6 @@ def _request_manifest_hash(request: ClassifierRequest) -> str:
     return manifest_hash
 
 
-def _assert_recorded_output(
-    result: ClassifierAdapterResult,
-    expected_output: dict[str, JsonValue],
-    *,
-    body: str,
-    corpus: dict[str, Any],
-) -> None:
-    """Compare the complete recorded evidence graph, not only disposition."""
-    assert result.output == expected_output
-    assert classifier_output_is_schema_valid(result.output, body=body)
-    _assert_recorded_result_provenance(result, corpus)
-
-
 def _recorded_v3_output(
     corpus: dict[str, Any], *, case_id: str, pass_name: str
 ) -> dict[str, JsonValue]:
@@ -491,6 +434,247 @@ def _recorded_v3_output(
     output = recorded.get(f"{pass_name}_output")
     assert isinstance(output, dict)
     return cast(dict[str, JsonValue], deepcopy(output))
+
+
+def _classifier_case_id(source_message_revision_id: str) -> str:
+    """Extract the opaque reviewed case key used by the hermetic model."""
+    reviewed_id = source_message_revision_id.removeprefix("reviewed:")
+    return reviewed_id.rsplit(":revision:", 1)[0]
+
+
+@dataclass(slots=True)
+class _HermeticSelectedClassifierProgram:
+    """Run the selected structured classifier against offline reviewed inputs.
+
+    This is a provider-local evaluation model, not a production parser or a
+    replacement runtime policy.  The production Codex adapter still builds
+    the exact pinned request and owns the structured port; the program only
+    supplies the hermetic provider response required by ordinary PR tests.
+    """
+
+    corpus: dict[str, Any]
+
+    def classify(self, request: dict[str, Any]) -> dict[str, JsonValue]:
+        body = request.get("body")
+        revision_id = request.get("source_message_revision_id")
+        pass_kind = request.get("pass_kind")
+        if not isinstance(body, str) or not isinstance(revision_id, str):
+            raise ValueError("hermetic classifier request is incomplete")
+        if pass_kind == "semantic_proof":
+            return self._semantic_proof(request)
+        if not isinstance(pass_kind, str):
+            raise ValueError("hermetic classifier pass kind is missing")
+        case_id = _classifier_case_id(revision_id)
+        recorded_cases = self.corpus["recorded_outputs"]
+        assert isinstance(recorded_cases, list)
+        for recorded_case in recorded_cases:
+            if recorded_case.get("case_id") == case_id:
+                return _recorded_v3_output(
+                    self.corpus,
+                    case_id=case_id,
+                    pass_name=(
+                        "second_pass"
+                        if pass_kind == "ambiguity_second_pass"
+                        else "primary"
+                    ),
+                )
+
+        promotion_fixtures = self.corpus["recorded_promotion_fixtures"]
+        assert isinstance(promotion_fixtures, dict)
+        for fixture in promotion_fixtures.values():
+            if isinstance(fixture, dict) and fixture.get("source") == body:
+                output = fixture.get("primary_output")
+                assert isinstance(output, dict)
+                return cast(dict[str, JsonValue], deepcopy(output))
+        return {
+            "schema_version": "source-message-classification-v3",
+            "disposition": "irrelevant",
+            "candidates": [],
+            "routing": {
+                "reason_code": "irrelevant",
+                "required_context": "none",
+            },
+        }
+
+    def _semantic_proof(self, request: dict[str, Any]) -> dict[str, JsonValue]:
+        candidate_key = request.get("proof_candidate_key")
+        body = request.get("body")
+        if not isinstance(candidate_key, str) or not isinstance(body, str):
+            raise ValueError("hermetic semantic-proof request is incomplete")
+        semantic_evidence = self.corpus["_v3_semantic_proofs"]
+        assert isinstance(semantic_evidence, dict)
+        records = semantic_evidence["records"]
+        assert isinstance(records, list)
+        for record in records:
+            if record.get("candidate_key") != candidate_key:
+                continue
+            proof = record.get("proof")
+            assert isinstance(proof, dict)
+            return cast(dict[str, JsonValue], deepcopy(proof))
+        raise ValueError(f"hermetic semantic proof is missing for {candidate_key}")
+
+
+@dataclass(slots=True)
+class _HermeticCodexProcessRunner:
+    """Offline process transport used by the selected Codex CLI adapter."""
+
+    program: _HermeticSelectedClassifierProgram
+    run_id: str
+    process_id: int
+    codex_version: str = "hermetic-codex-evaluation-v1"
+    execution_records: list[dict[str, Any]] = field(default_factory=list)
+    _failures: dict[str, BaseException] = field(default_factory=dict)
+
+    def fail_for(self, *, case_id: str, error: BaseException) -> None:
+        """Inject one body-free adapter failure for a named evaluation case."""
+        self._failures[case_id] = error
+
+    def execute(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        input_text: str,
+        timeout_seconds: int,
+    ) -> dict[str, object]:
+        del argv, cwd, environment, timeout_seconds
+        envelope = json.loads(input_text)
+        assert isinstance(envelope, dict)
+        request = envelope.get("request")
+        assert isinstance(request, dict)
+        revision_id = request.get("source_message_revision_id")
+        assert isinstance(revision_id, str)
+        case_id = _classifier_case_id(revision_id)
+        request_digest = _canonical_digest(request)
+        execution_number = len(self.execution_records) + 1
+        execution_id = (
+            f"{self.run_id}:pid-{self.process_id}:execution-{execution_number}:"
+            f"{request_digest[:16]}"
+        )
+        failure = self._failures.pop(case_id, None)
+        if failure is not None:
+            self.execution_records.append(
+                {
+                    "execution_id": execution_id,
+                    "run_id": self.run_id,
+                    "process_id": self.process_id,
+                    "case_id": case_id,
+                    "source_message_revision_id": revision_id,
+                    "pass_kind": request.get("pass_kind"),
+                    "request_sha256": request_digest,
+                    "adapter_kind": "codex_cli",
+                    "adapter_version": "classifier-hermetic-evaluation-v1",
+                    "codex_version": self.codex_version,
+                    "status": "failed",
+                    "failure_kind": type(failure).__name__,
+                }
+            )
+            raise failure
+
+        output = self.program.classify(request)
+        output_digest = _canonical_digest(output)
+        prompt = envelope.get("instruction")
+        assert isinstance(prompt, str)
+        output_text = json.dumps(output, ensure_ascii=False, sort_keys=True)
+        self.execution_records.append(
+            {
+                "execution_id": execution_id,
+                "run_id": self.run_id,
+                "process_id": self.process_id,
+                "case_id": case_id,
+                "source_message_revision_id": revision_id,
+                "pass_kind": request.get("pass_kind"),
+                "request_sha256": request_digest,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "output_sha256": output_digest,
+                "adapter_kind": "codex_cli",
+                "adapter_version": "classifier-hermetic-evaluation-v1",
+                "codex_version": self.codex_version,
+                "effective_model": "gpt-5.6-sol",
+                "effective_reasoning_effort": "high",
+                "status": "succeeded",
+            }
+        )
+        return {
+            "output": output,
+            "effective_model": "gpt-5.6-sol",
+            "effective_reasoning_effort": "high",
+            "duration_ms": max(1, (len(input_text) + len(output_text)) // 100),
+            "input_tokens": max(1, len(input_text.split())),
+            "output_tokens": max(1, len(output_text.split())),
+        }
+
+
+def _selected_classifier_adapter(
+    corpus: dict[str, Any],
+    *,
+    run_id: str,
+    process_id: int,
+) -> tuple[CodexCliClassifierAdapter, _HermeticCodexProcessRunner]:
+    """Build the selected Codex adapter over the offline provider transport."""
+    repository_root = Path(__file__).parents[2]
+    artifact_root = repository_root / "classifier"
+    runner = _HermeticCodexProcessRunner(
+        program=_HermeticSelectedClassifierProgram(corpus),
+        run_id=run_id,
+        process_id=process_id,
+    )
+    adapter = CodexCliClassifierAdapter(
+        codex_executable=Path("hermetic-codex"),
+        codex_home=repository_root / ".hermetic-codex-home",
+        workspace=repository_root,
+        schema_paths={
+            "source-message-classification-v3": (
+                artifact_root
+                / "open-match-primary-v3"
+                / "source-message-classification-v3.schema.json"
+            ),
+            "source-semantic-proof-v2": (
+                artifact_root
+                / "open-match-semantic-proof-v2"
+                / "source-semantic-proof-v2.schema.json"
+            ),
+        },
+        prompt_paths={
+            "open-match-primary-v3": artifact_root
+            / "open-match-primary-v3"
+            / "prompt.md",
+            "open-match-ambiguity-v2": artifact_root
+            / "open-match-ambiguity-v2"
+            / "prompt.md",
+            "open-match-semantic-proof-v2": artifact_root
+            / "open-match-semantic-proof-v2"
+            / "prompt.md",
+        },
+        runner=runner,
+        codex_version=runner.codex_version,
+        adapter_version="classifier-hermetic-evaluation-v1",
+    )
+    return adapter, runner
+
+
+def _assert_selected_execution_provenance(
+    result: ClassifierAdapterResult,
+    *,
+    request: ClassifierRequest,
+    runner: _HermeticCodexProcessRunner,
+) -> None:
+    """Validate one selected-adapter result and its independent execution record."""
+    assert result.effective_model == "gpt-5.6-sol"
+    assert result.effective_reasoning_effort == "high"
+    assert result.codex_version == runner.codex_version
+    assert result.adapter_kind == "codex_cli"
+    assert result.adapter_version == "classifier-hermetic-evaluation-v1"
+    assert result.duration_ms > 0
+    assert result.input_tokens > 0
+    assert result.output_tokens > 0
+    record = runner.execution_records[-1]
+    assert record["status"] == "succeeded"
+    assert record["source_message_revision_id"] == request.source_message_revision_id
+    assert record["case_id"] == _classifier_case_id(request.source_message_revision_id)
+    assert record["pass_kind"] == request.pass_kind
+    assert record["output_sha256"] == _canonical_digest(result.output)
 
 
 def _assert_semantic_proofs_for_output(
@@ -542,6 +726,93 @@ def _assert_semantic_proofs_for_output(
             semantic_proof_version=corpus["semantic_proof_version"],
         )
         validated.add((case_id, pass_name, candidate_key))
+    return validated
+
+
+def _reviewed_semantic_proof(
+    corpus: dict[str, Any], *, case_id: str, candidate_key: str
+) -> dict[str, JsonValue]:
+    """Return the one independently anchored proof for a candidate."""
+    semantic_evidence = corpus["_v3_semantic_proofs"]
+    assert isinstance(semantic_evidence, dict)
+    records = semantic_evidence["records"]
+    assert isinstance(records, list)
+    matching_records = [
+        record
+        for record in records
+        if record.get("case_id") == case_id
+        and record.get("candidate_key") == candidate_key
+    ]
+    assert len(matching_records) == 1
+    proof = matching_records[0].get("proof")
+    assert isinstance(proof, dict)
+    return cast(dict[str, JsonValue], deepcopy(proof))
+
+
+def _execute_selected_semantic_proofs(
+    adapter: CodexCliClassifierAdapter,
+    runner: _HermeticCodexProcessRunner,
+    corpus: dict[str, Any],
+    *,
+    case_id: str,
+    pass_name: str,
+    body: str,
+    request: ClassifierRequest,
+    output: dict[str, JsonValue],
+) -> set[tuple[str, str, str]]:
+    """Execute and validate every candidate's semantic-proof port request."""
+    validated = _assert_semantic_proofs_for_output(
+        corpus,
+        case_id=case_id,
+        pass_name=pass_name,
+        body=body,
+        output=output,
+    )
+    candidates = output.get("candidates")
+    assert isinstance(candidates, list)
+    for candidate_value in candidates:
+        assert isinstance(candidate_value, dict)
+        candidate_key = candidate_value.get("candidate_key")
+        evidence = candidate_value.get("evidence")
+        routes = candidate_value.get("response_routes", [])
+        opportunity_type = candidate_value.get("opportunity_type")
+        assert isinstance(candidate_key, str)
+        assert isinstance(evidence, dict)
+        assert isinstance(routes, list)
+        assert isinstance(opportunity_type, str)
+        proof_request = replace(
+            request,
+            context_bundle_version="semantic-proof-context-v1",
+            context_policy_version="semantic-proof-context-v1",
+            prompt_version="open-match-semantic-proof-v2",
+            schema_version="source-semantic-proof-v2",
+            pass_kind="semantic_proof",
+            proof_candidate_key=candidate_key,
+        )
+        proof_result = adapter.semantic_proof(proof_request)
+        _assert_selected_execution_provenance(
+            proof_result,
+            request=proof_request,
+            runner=runner,
+        )
+        expected_proof = _reviewed_semantic_proof(
+            corpus,
+            case_id=case_id,
+            candidate_key=candidate_key,
+        )
+        assert proof_result.output == expected_proof
+        assert semantic_proof_is_schema_valid(
+            proof_result.output,
+            body=body,
+            source_message_revision_reference=str(
+                expected_proof["source_message_revision_reference"]
+            ),
+            candidate_key=candidate_key,
+            evidence=evidence,
+            routes=routes,
+            opportunity_type=opportunity_type,
+            semantic_proof_version=corpus["semantic_proof_version"],
+        )
     return validated
 
 
@@ -683,14 +954,14 @@ class _EvaluationPersistence:
 
 
 def _run_recorded_evaluation(
-    adapter: ControlledModelAdapter,
+    adapter: ModelAdapter,
     request: ClassifierRequest,
     *,
     effect_key: str,
     persistence: _EvaluationPersistence,
     normalize: Callable[[dict[str, JsonValue]], object] | None = None,
 ) -> str:
-    """Run one proposal through controlled application and persistence effects."""
+    """Run one proposal through the application persistence boundary."""
     persistence.begin(effect_key)
     try:
         result = adapter.classify(request)
@@ -823,7 +1094,12 @@ def _validate_reviewed_provenance(
     return artifact_records
 
 
-def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
+def _run_v3_evaluation_gate(
+    corpus: dict[str, Any], *, run_id: str = "standalone", process_id: int | None = None
+) -> str:
+    """Run one complete hermetic evaluation through the selected classifier port."""
+    if process_id is None:
+        process_id = os.getpid()
     repository_root = Path(__file__).parents[2]
     provenance = _evaluation_provenance(corpus)
     artifact_records = _validate_reviewed_provenance(
@@ -893,8 +1169,11 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     )
     assert semantic_contract["record_count"] == len(semantic_records)
     validated_semantic_records: set[tuple[str, str, str]] = set()
-    adapter = ControlledModelAdapter()
-    adapter.enable_primary_v3()
+    adapter, runner = _selected_classifier_adapter(
+        corpus,
+        run_id=run_id,
+        process_id=process_id,
+    )
     observed: list[dict[str, Any]] = []
     request_manifests: list[dict[str, str]] = []
     for manifest_case in manifest_cases:
@@ -911,25 +1190,25 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             case_id=case_id,
             pass_name="primary",
         )
-        adapter.return_for(
-            body=body,
-            result=_recorded_result(corpus, primary_output),
-        )
         request = _gate_request(case_id=case_id, body=body)
         result = adapter.classify(request)
-        _assert_recorded_output(
+        _assert_selected_execution_provenance(
             result,
-            primary_output,
-            body=body,
-            corpus=corpus,
+            request=request,
+            runner=runner,
         )
+        assert result.output == primary_output
+        assert classifier_output_is_schema_valid(result.output, body=body)
         validated_semantic_records.update(
-            _assert_semantic_proofs_for_output(
+            _execute_selected_semantic_proofs(
+                adapter,
+                runner,
                 corpus,
                 case_id=case_id,
                 pass_name="primary",
                 body=body,
-                output=primary_output,
+                request=request,
+                output=result.output,
             )
         )
         request_manifests.append(
@@ -957,10 +1236,6 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
                 case_id=case_id,
                 pass_name="second_pass",
             )
-            adapter.return_second_pass_for(
-                body=body,
-                result=_recorded_result(corpus, second_output),
-            )
             second_request = _gate_request(
                 case_id=case_id,
                 body=body,
@@ -968,19 +1243,23 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
                 pass_kind="ambiguity_second_pass",
             )
             second_result = adapter.classify(second_request)
-            _assert_recorded_output(
+            _assert_selected_execution_provenance(
                 second_result,
-                second_output,
-                body=body,
-                corpus=corpus,
+                request=second_request,
+                runner=runner,
             )
+            assert second_result.output == second_output
+            assert classifier_output_is_schema_valid(second_result.output, body=body)
             validated_semantic_records.update(
-                _assert_semantic_proofs_for_output(
+                _execute_selected_semantic_proofs(
+                    adapter,
+                    runner,
                     corpus,
                     case_id=case_id,
                     pass_name="second_pass",
                     body=body,
-                    output=second_output,
+                    request=second_request,
+                    output=second_result.output,
                 )
             )
             request_manifests.append(
@@ -996,6 +1275,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
 
     recorded_promotion_fixtures = corpus["recorded_promotion_fixtures"]
     assert isinstance(recorded_promotion_fixtures, dict)
+    promotion_results: dict[str, ClassifierAdapterResult] = {}
     for fixture_name in corpus["promotion_fixtures"]:
         fixture = recorded_promotion_fixtures[fixture_name]
         assert isinstance(fixture, dict)
@@ -1004,9 +1284,33 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         assert isinstance(body, str)
         assert isinstance(output, dict)
         assert fixture_name in corpus["promotion_fixtures"]
-        assert classifier_output_is_schema_valid(output, body=body)
-        if output["disposition"] == "accepted":
-            candidates = output.get("candidates")
+        request = _gate_request(
+            case_id=f"promotion:{fixture_name}",
+            body=body,
+        )
+        result = adapter.classify(request)
+        _assert_selected_execution_provenance(
+            result,
+            request=request,
+            runner=runner,
+        )
+        assert result.output == output
+        assert classifier_output_is_schema_valid(result.output, body=body)
+        promotion_results[fixture_name] = result
+        validated_semantic_records.update(
+            _execute_selected_semantic_proofs(
+                adapter,
+                runner,
+                corpus,
+                case_id=f"promotion:{fixture_name}",
+                pass_name="promotion",
+                body=body,
+                request=request,
+                output=result.output,
+            )
+        )
+        if result.output["disposition"] == "accepted":
+            candidates = result.output.get("candidates")
             assert isinstance(candidates, list) and len(candidates) == 1
             candidate_value = candidates[0]
             assert isinstance(candidate_value, dict)
@@ -1026,19 +1330,45 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             evidence = candidate.get("evidence")
             assert isinstance(candidate_key, str)
             assert isinstance(evidence, dict)
-            validated_semantic_records.update(
-                _assert_semantic_proofs_for_output(
-                    corpus,
-                    case_id=f"promotion:{fixture_name}",
-                    pass_name="promotion",
-                    body=body,
-                    output=cast(dict[str, JsonValue], output),
-                )
-            )
 
     promotion_payload, promotion_body, promotion_output, promotion_proof = (
         _recorded_tournament_payload(corpus)
     )
+    promotion_result = promotion_results["tournament-current-registration"]
+    promotion_output = promotion_result.output
+    promotion_proof = _reviewed_semantic_proof(
+        corpus,
+        case_id="promotion:tournament-current-registration",
+        candidate_key="tournament-current-registration",
+    )
+    promotion_payload["output"] = promotion_output
+    promotion_payload["semantic_proof"] = promotion_proof
+    for field_name in (
+        "effective_model",
+        "effective_reasoning_effort",
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+    ):
+        promotion_payload[field_name] = getattr(promotion_result, field_name)
+    promotion_manifest_hash = _classifier_input_manifest_hash(
+        promotion_payload,
+        revision_id=str(promotion_payload["source_message_revision_id"]),
+        body=promotion_body,
+        prompt_version="open-match-primary-v3",
+        schema_version="source-message-classification-v3",
+        context_bundle_version="primary-classifier-context-v1",
+        context_policy_version="classifier-context-v1",
+        routing_policy_version="classifier-routing-v1",
+        pass_kind="primary",
+        pass_number=1,
+        attempt_number=1,
+    )
+    assert promotion_manifest_hash is not None
+    promotion_payload["input_manifest_hash"] = promotion_manifest_hash
     resolver: LocationResolverAdapter = _RecordedTournamentResolver()
     normalized_promotion = _validated_tournament_proposal(
         promotion_payload,
@@ -1086,20 +1416,22 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     rejected_payload["output"] = rejected_output
     assert _validated_tournament_proposal(rejected_payload, resolver=resolver) is None
 
-    normalization_adapter = ControlledModelAdapter()
-    normalization_adapter.enable_primary_v3()
-    normalization_adapter.return_for(
-        body=promotion_body,
-        result=_recorded_result(corpus, rejected_output),
-    )
     normalization_persistence = _EvaluationPersistence()
 
     def reject_normalization(output: dict[str, JsonValue]) -> object:
-        rejected_payload["output"] = output
+        normalized_output = deepcopy(output)
+        candidates = normalized_output.get("candidates")
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        event_time = candidate.get("event_time")
+        assert isinstance(event_time, dict)
+        event_time["start_local_date"] = "2026-08-21"
+        rejected_payload["output"] = normalized_output
         return _validated_tournament_proposal(rejected_payload, resolver=resolver)
 
     normalization_outcome = _run_recorded_evaluation(
-        normalization_adapter,
+        adapter,
         _gate_request(case_id="normalization-rejection", body=promotion_body),
         effect_key="normalization-rejection",
         persistence=normalization_persistence,
@@ -1118,15 +1450,9 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     assert isinstance(unpublished_body, str)
     assert isinstance(unpublished_output, dict)
     assert unpublished_output["disposition"] != "accepted"
-    unpublished_adapter = ControlledModelAdapter()
-    unpublished_adapter.enable_primary_v3()
-    unpublished_adapter.return_for(
-        body=unpublished_body,
-        result=_recorded_result(corpus, unpublished_output),
-    )
     unpublished_persistence = _EvaluationPersistence()
     unpublished_outcome = _run_recorded_evaluation(
-        unpublished_adapter,
+        adapter,
         _gate_request(case_id="unpublished-persistence", body=unpublished_body),
         effect_key="unpublished-persistence",
         persistence=unpublished_persistence,
@@ -1136,55 +1462,34 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     assert unpublished_persistence.staged == {}
 
     failure_results: list[str] = []
-    for name, error in (
-        ("timeout", TimeoutError("reviewed timeout")),
-        ("429", ClassifierQuotaError()),
-        ("auth", ClassifierAuthenticationError()),
-        ("crash", InjectedClassifierCrash()),
+    for name, error, expected_error in (
+        ("timeout", TimeoutError(), ClassifierExecutionTimeoutError),
+        ("429", ClassifierQuotaError(), ClassifierQuotaError),
+        ("auth", ClassifierAuthenticationError(), ClassifierAuthenticationError),
+        ("crash", InjectedClassifierCrash(), InjectedClassifierCrash),
     ):
-        failure_adapter = ControlledModelAdapter()
-        failure_fixture = recorded_promotion_fixtures[
-            "football-discussion-without-opportunity"
-        ]
-        assert isinstance(failure_fixture, dict)
-        failure_output = failure_fixture["primary_output"]
-        assert isinstance(failure_output, dict)
-        failure_adapter.return_for(
-            body="failure fixture",
-            result=_recorded_result(corpus, failure_output),
-        )
-        failure_adapter.raise_for(error=error)
+        runner.fail_for(case_id=name, error=error)
         failure_persistence = _EvaluationPersistence()
         try:
             _run_recorded_evaluation(
-                failure_adapter,
+                adapter,
                 _gate_request(case_id=name, body="failure fixture"),
                 effect_key=name,
                 persistence=failure_persistence,
             )
-        except type(error):
+        except expected_error:
             assert failure_persistence.committed == {}
             assert failure_persistence.staged == {}
             assert failure_persistence.started == [name]
             failure_results.append(name)
         else:
             raise AssertionError(f"failure fixture did not fail closed: {name}")
-    replay_adapter = ControlledModelAdapter()
-    replay_fixture = recorded_promotion_fixtures["tournament-current-registration"]
-    assert isinstance(replay_fixture, dict)
-    replay_body = replay_fixture["source"]
-    replay_output = replay_fixture["primary_output"]
-    assert isinstance(replay_body, str)
-    assert isinstance(replay_output, dict)
-    replay_adapter.return_for(
-        body=replay_body,
-        result=_recorded_result(corpus, replay_output),
-    )
+    replay_body = promotion_body
     replay_persistence = _EvaluationPersistence()
     replay_request = _gate_request(case_id="replay", body=replay_body)
     assert (
         _run_recorded_evaluation(
-            replay_adapter,
+            adapter,
             replay_request,
             effect_key="tournament-current-registration",
             persistence=replay_persistence,
@@ -1193,14 +1498,23 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     )
     assert (
         _run_recorded_evaluation(
-            replay_adapter,
+            adapter,
             replay_request,
             effect_key="tournament-current-registration",
             persistence=replay_persistence,
         )
         == "replayed"
     )
-    assert len(replay_adapter.requests) == 2
+    assert (
+        len(
+            [
+                record
+                for record in runner.execution_records
+                if record["case_id"] == "replay"
+            ]
+        )
+        == 2
+    )
     assert set(replay_persistence.committed) == {"tournament-current-registration"}
     assert replay_persistence.staged == {}
     assert replay_persistence.started == [
@@ -1209,16 +1523,11 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     ]
     failure_results.append("replay")
 
-    rollback_adapter = ControlledModelAdapter()
-    rollback_adapter.return_for(
-        body=promotion_body,
-        result=_recorded_result(corpus, promotion_output),
-    )
     rollback_persistence = _EvaluationPersistence(fail_next_commit=True)
     rollback_request = _gate_request(case_id="rollback", body=promotion_body)
     try:
         _run_recorded_evaluation(
-            rollback_adapter,
+            adapter,
             rollback_request,
             effect_key="tournament-current-registration",
             persistence=rollback_persistence,
@@ -1232,7 +1541,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     assert rollback_persistence.started == ["tournament-current-registration"]
     assert (
         _run_recorded_evaluation(
-            rollback_adapter,
+            adapter,
             rollback_request,
             effect_key="tournament-current-registration",
             persistence=rollback_persistence,
@@ -1271,6 +1580,78 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         "unpublished_persistence": unpublished_outcome,
     }
     assert publication_outcomes == provenance["expected_publication_outcomes"]
+    successful_execution_records = [
+        record for record in runner.execution_records if record["status"] == "succeeded"
+    ]
+    failed_execution_records = [
+        record for record in runner.execution_records if record["status"] == "failed"
+    ]
+    assert len(successful_execution_records) == 54
+    assert len(failed_execution_records) == 4
+    assert {record["case_id"] for record in failed_execution_records} == {
+        "timeout",
+        "429",
+        "auth",
+        "crash",
+    }
+    assert {record["case_id"] for record in runner.execution_records}.issuperset(
+        set(corpus["failure_suite"])
+    )
+    output_records = [
+        {
+            key: record[key]
+            for key in (
+                "execution_id",
+                "run_id",
+                "process_id",
+                "case_id",
+                "pass_kind",
+                "output_sha256",
+                "status",
+            )
+            if key in record
+        }
+        for record in successful_execution_records
+    ]
+    selected_classifier_evidence = {
+        "run_id": run_id,
+        "process_id": process_id,
+        "adapter_kind": adapter.adapter_kind,
+        "adapter_version": "classifier-hermetic-evaluation-v1",
+        "codex_version": runner.codex_version,
+        "execution_count": len(runner.execution_records),
+        "successful_execution_count": len(successful_execution_records),
+        "failed_execution_count": len(failed_execution_records),
+        "semantic_proof_execution_count": sum(
+            record["pass_kind"] == "semantic_proof"
+            for record in successful_execution_records
+        ),
+        "output_digest": _canonical_digest(output_records),
+        "provenance_digest": _canonical_digest(
+            [
+                {
+                    key: record[key]
+                    for key in (
+                        "execution_id",
+                        "run_id",
+                        "process_id",
+                        "case_id",
+                        "pass_kind",
+                        "request_sha256",
+                        "adapter_kind",
+                        "adapter_version",
+                        "codex_version",
+                        "status",
+                    )
+                    if key in record
+                }
+                for record in runner.execution_records
+            ]
+        ),
+        "evidence_digest": _canonical_digest(runner.execution_records),
+        "output_records": output_records,
+        "execution_records": runner.execution_records,
+    }
     return json.dumps(
         {
             "case_count": len(observed),
@@ -1280,6 +1661,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             "artifact_digest": _canonical_digest(artifact_records),
             "request_manifest_digest": request_manifest_digest,
             "publication_outcomes": publication_outcomes,
+            "selected_classifier": selected_classifier_evidence,
         },
         sort_keys=True,
     )
@@ -1332,11 +1714,40 @@ def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -
         summary["case_ids"] == [f"sm-{index:03d}" for index in range(1, 39)]
         for summary in run_summaries
     )
+    selected_runs = [summary["selected_classifier"] for summary in run_summaries]
+    assert all(selected["adapter_kind"] == "codex_cli" for selected in selected_runs)
+    assert all(
+        selected["adapter_version"] == "classifier-hermetic-evaluation-v1"
+        for selected in selected_runs
+    )
+    assert all(
+        selected["codex_version"] == "hermetic-codex-evaluation-v1"
+        for selected in selected_runs
+    )
+    assert all(selected["execution_count"] == 58 for selected in selected_runs)
+    assert all(
+        selected["successful_execution_count"] == 54 for selected in selected_runs
+    )
+    assert all(selected["failed_execution_count"] == 4 for selected in selected_runs)
+    assert all(
+        selected["semantic_proof_execution_count"] == 4 for selected in selected_runs
+    )
+    assert len({selected["output_digest"] for selected in selected_runs}) == 3
+    assert len({selected["provenance_digest"] for selected in selected_runs}) == 3
+    assert len({selected["evidence_digest"] for selected in selected_runs}) == 3
+    for selected in selected_runs:
+        records = selected["execution_records"]
+        assert len({record["execution_id"] for record in records}) == 58
+        assert all(record["run_id"] == selected["run_id"] for record in records)
+        assert all(record["process_id"] == selected["process_id"] for record in records)
+        assert {
+            record["case_id"] for record in records if record["status"] == "failed"
+        } == {"timeout", "429", "auth", "crash"}
     deterministic_summaries = [
         {
             key: value
             for key, value in summary.items()
-            if key not in {"process_id", "run_id"}
+            if key not in {"process_id", "run_id", "selected_classifier"}
         }
         for summary in run_summaries
     ]

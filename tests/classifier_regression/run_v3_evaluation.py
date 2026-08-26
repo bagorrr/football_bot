@@ -19,8 +19,15 @@ from tests.classifier_regression.test_offline_corpus import (  # noqa: E402
 
 def main() -> None:
     run_id = sys.argv[1] if len(sys.argv) == 2 else "unspecified"
-    summary = json.loads(_run_v3_evaluation_gate(_load_reviewed_v3_contract()))
-    summary["process_id"] = os.getpid()
+    process_id = os.getpid()
+    summary = json.loads(
+        _run_v3_evaluation_gate(
+            _load_reviewed_v3_contract(),
+            run_id=run_id,
+            process_id=process_id,
+        )
+    )
+    summary["process_id"] = process_id
     summary["run_id"] = run_id
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 

@@ -46,8 +46,16 @@ AS $$
                )
                ELSE '{}'::jsonb
            END,
-           opportunity.response_route ->> 'kind',
-           opportunity.response_route ->> 'value'
+           CASE
+               WHEN opportunity.publication_state = 'active'
+               THEN opportunity.response_route ->> 'kind'
+               ELSE NULL
+           END,
+           CASE
+               WHEN opportunity.publication_state = 'active'
+               THEN opportunity.response_route ->> 'value'
+               ELSE NULL
+           END
     FROM football_runtime.recommendation_opportunities AS opportunity
     WHERE SESSION_USER = 'football_bot_assistant'
       AND requested_opportunity_id <> ''
