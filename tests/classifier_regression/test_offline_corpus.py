@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -274,18 +275,118 @@ def _gate_request(
     )
 
 
-def _recorded_result(output: dict[str, JsonValue]) -> ClassifierAdapterResult:
+def _canonical_digest(value: object) -> str:
+    """Hash one reviewed JSON value with the corpus' canonical encoding."""
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _evaluation_provenance(corpus: dict[str, Any]) -> dict[str, Any]:
+    provenance = corpus.get("evaluation_provenance")
+    assert isinstance(provenance, dict)
+    return provenance
+
+
+def _recorded_result(
+    corpus: dict[str, Any], output: dict[str, JsonValue]
+) -> ClassifierAdapterResult:
+    execution = _evaluation_provenance(corpus).get("execution")
+    assert isinstance(execution, dict)
+    assert all(
+        key in execution
+        for key in (
+            "codex_version",
+            "adapter_kind",
+            "adapter_version",
+            "duration_ms",
+            "input_tokens",
+            "output_tokens",
+        )
+    )
     return ClassifierAdapterResult(
         output=output,
-        effective_model="gpt-5.6-sol",
-        effective_reasoning_effort="high",
-        codex_version="reviewed-offline",
-        adapter_kind="recorded_corpus",
-        adapter_version="open-match-classifier-regression-v3-reviewed-v2",
-        duration_ms=0,
-        input_tokens=0,
-        output_tokens=0,
+        effective_model=str(corpus["model"]),
+        effective_reasoning_effort=str(corpus["reasoning_effort"]),
+        codex_version=str(execution["codex_version"]),
+        adapter_kind=str(execution["adapter_kind"]),
+        adapter_version=str(execution["adapter_version"]),
+        duration_ms=int(execution["duration_ms"]),
+        input_tokens=int(execution["input_tokens"]),
+        output_tokens=int(execution["output_tokens"]),
     )
+
+
+def _assert_recorded_result_provenance(
+    result: ClassifierAdapterResult,
+    corpus: dict[str, Any],
+) -> None:
+    """Require every replay to use the reviewed effective execution record."""
+    execution = _evaluation_provenance(corpus)["execution"]
+    assert result.effective_model == corpus["model"]
+    assert result.effective_reasoning_effort == corpus["reasoning_effort"]
+    for field_name in (
+        "codex_version",
+        "adapter_kind",
+        "adapter_version",
+        "duration_ms",
+        "input_tokens",
+        "output_tokens",
+    ):
+        assert getattr(result, field_name) == execution[field_name]
+
+
+def _classifier_request_payload(request: ClassifierRequest) -> dict[str, JsonValue]:
+    """Expose one adapter request as the application manifest input shape."""
+    return {
+        "source_message_revision_id": request.source_message_revision_id,
+        "body": request.body,
+        "source_event_time": request.source_event_time,
+        "context_bundle_version": request.context_bundle_version,
+        "source_chat_reference": request.source_chat_reference,
+        "source_chat_timezone": request.source_chat_timezone,
+        "source_chat_geography": request.source_chat_geography,
+        "bounded_metadata": request.bounded_metadata,
+        "eligible_reply_context": request.eligible_reply_context,
+        "adjacent_context": list(request.adjacent_context),
+    }
+
+
+def _request_manifest_hash(request: ClassifierRequest) -> str:
+    """Recompute the application-owned manifest for one controlled request."""
+    manifest_hash = _classifier_input_manifest_hash(
+        _classifier_request_payload(request),
+        revision_id=request.source_message_revision_id,
+        body=request.body,
+        prompt_version=request.prompt_version,
+        schema_version=request.schema_version,
+        context_bundle_version=request.context_bundle_version,
+        context_policy_version=request.context_policy_version,
+        routing_policy_version=request.routing_policy_version,
+        pass_kind=request.pass_kind,
+        pass_number=2 if request.pass_kind == "ambiguity_second_pass" else 1,
+        attempt_number=1,
+    )
+    assert manifest_hash is not None
+    return manifest_hash
+
+
+def _assert_recorded_output(
+    result: ClassifierAdapterResult,
+    expected_output: dict[str, JsonValue],
+    *,
+    body: str,
+    corpus: dict[str, Any],
+) -> None:
+    """Compare the complete recorded evidence graph, not only disposition."""
+    assert result.output == expected_output
+    assert classifier_output_is_schema_valid(result.output, body=body)
+    _assert_recorded_result_provenance(result, corpus)
 
 
 def _recorded_v3_output(
@@ -350,6 +451,8 @@ def _recorded_tournament_payload(
     assert isinstance(body, str)
     assert isinstance(output, dict)
     assert isinstance(semantic_proof, dict)
+    execution = _evaluation_provenance(corpus)["execution"]
+    assert isinstance(execution, dict)
     revision_id = "reviewed:promotion:revision:1"
     payload: dict[str, JsonValue] = {
         "source_message_revision_id": revision_id,
@@ -364,23 +467,23 @@ def _recorded_tournament_payload(
         "bounded_metadata": {"message_language": "en", "attachment_types": []},
         "eligible_reply_context": None,
         "adjacent_context": [],
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "high",
-        "effective_reasoning_effort": "high",
-        "prompt_version": "open-match-primary-v3",
-        "schema_version": "source-message-classification-v3",
-        "glossary_version": "football-opportunity-glossary-v1",
-        "context_policy_version": "classifier-context-v1",
-        "routing_policy_version": "classifier-routing-v1",
-        "codex_version": "recorded-offline",
-        "adapter_kind": "recorded_corpus",
-        "adapter_version": corpus["corpus_version"],
+        "requested_model": corpus["model"],
+        "effective_model": corpus["model"],
+        "requested_reasoning_effort": corpus["reasoning_effort"],
+        "effective_reasoning_effort": corpus["reasoning_effort"],
+        "prompt_version": corpus["prompt_version"],
+        "schema_version": corpus["schema_version"],
+        "glossary_version": corpus["glossary_version"],
+        "context_policy_version": corpus["context_policy_version"],
+        "routing_policy_version": corpus["routing_policy_version"],
+        "codex_version": execution["codex_version"],
+        "adapter_kind": execution["adapter_kind"],
+        "adapter_version": execution["adapter_version"],
         "pass_number": 1,
         "attempt_number": 1,
-        "duration_ms": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
+        "duration_ms": execution["duration_ms"],
+        "input_tokens": execution["input_tokens"],
+        "output_tokens": execution["output_tokens"],
         "classification_status": "succeeded",
         "semantic_proof": semantic_proof,
         "output": output,
@@ -440,12 +543,16 @@ def _run_recorded_evaluation(
     *,
     effect_key: str,
     persistence: _EvaluationPersistence,
+    normalize: Callable[[dict[str, JsonValue]], object] | None = None,
 ) -> str:
     """Run one proposal through controlled application and persistence effects."""
     persistence.begin(effect_key)
     try:
         result = adapter.classify(request)
         if result.output.get("disposition") != "accepted":
+            persistence.rollback()
+            return "unpublished"
+        if normalize is not None and normalize(result.output) is None:
             persistence.rollback()
             return "unpublished"
         if effect_key in persistence.committed:
@@ -459,8 +566,80 @@ def _run_recorded_evaluation(
     return "published"
 
 
+def _validate_reviewed_provenance(
+    corpus: dict[str, Any],
+    *,
+    repository_root: Path,
+) -> list[dict[str, Any]]:
+    """Pin source, case-manifest, fixture, and classifier-artifact inputs."""
+    provenance = _evaluation_provenance(corpus)
+    source_path = repository_root / str(corpus["source_corpus"])
+    source_provenance_path = repository_root / str(corpus["source_corpus_provenance"])
+    assert (
+        hashlib.sha256(source_path.read_bytes()).hexdigest()
+        == provenance["source_corpus_sha256"]
+    )
+    assert (
+        hashlib.sha256(source_provenance_path.read_bytes()).hexdigest()
+        == (provenance["source_corpus_provenance_sha256"])
+    )
+    assert _canonical_digest(corpus["cases"]) == provenance["case_manifest_sha256"]
+    assert (
+        _canonical_digest(corpus["recorded_outputs"])
+        == provenance["recorded_outputs_sha256"]
+    )
+    assert (
+        _canonical_digest(corpus["recorded_promotion_fixtures"])
+        == provenance["promotion_fixtures_sha256"]
+    )
+
+    expected_artifacts = provenance.get("artifacts")
+    assert isinstance(expected_artifacts, dict)
+    assert set(expected_artifacts) == {
+        "open-match-primary-v3",
+        "open-match-ambiguity-v2",
+        "open-match-semantic-proof-v2",
+    }
+    artifact_records: list[dict[str, Any]] = []
+    for directory, expected in expected_artifacts.items():
+        assert isinstance(expected, dict)
+        artifact_root = repository_root / "classifier" / directory
+        prompt_path = artifact_root / str(expected["prompt_filename"])
+        schema_path = artifact_root / str(expected["schema_filename"])
+        provenance_path = artifact_root / str(expected["provenance_filename"])
+        prompt_sha256 = hashlib.sha256(prompt_path.read_bytes()).hexdigest()
+        schema_sha256 = hashlib.sha256(schema_path.read_bytes()).hexdigest()
+        provenance_sha256 = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        artifact_provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        assert prompt_path.read_text(encoding="utf-8").strip()
+        assert schema["$id"] == expected["schema_id"]
+        assert schema["additionalProperties"] is False
+        assert artifact_provenance == expected["provenance"]
+        assert prompt_sha256 == expected["prompt_sha256"]
+        assert schema_sha256 == expected["schema_sha256"]
+        assert provenance_sha256 == expected["provenance_sha256"]
+        artifact_records.append(
+            {
+                "directory": directory,
+                "prompt_sha256": prompt_sha256,
+                "schema_sha256": schema_sha256,
+                "provenance_sha256": provenance_sha256,
+                "schema_id": schema["$id"],
+                "provenance": artifact_provenance,
+            }
+        )
+    assert _canonical_digest(artifact_records) == provenance["artifact_records_sha256"]
+    return artifact_records
+
+
 def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     repository_root = Path(__file__).parents[2]
+    provenance = _evaluation_provenance(corpus)
+    artifact_records = _validate_reviewed_provenance(
+        corpus,
+        repository_root=repository_root,
+    )
     source_cases = _load_reviewed_source_cases()
     manifest_cases = corpus["cases"]
     assert len(manifest_cases) == corpus["source_corpus_case_count"] == 38
@@ -492,6 +671,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     adapter = ControlledModelAdapter()
     adapter.enable_primary_v3()
     observed: list[dict[str, Any]] = []
+    request_manifests: list[dict[str, str]] = []
     for manifest_case in manifest_cases:
         case_id = manifest_case["case_id"]
         source_case = source_cases[case_id]
@@ -506,9 +686,25 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             case_id=case_id,
             pass_name="primary",
         )
-        adapter.return_for(body=body, result=_recorded_result(primary_output))
-        result = adapter.classify(_gate_request(case_id=case_id, body=body))
-        assert classifier_output_is_schema_valid(result.output, body=body)
+        adapter.return_for(
+            body=body,
+            result=_recorded_result(corpus, primary_output),
+        )
+        request = _gate_request(case_id=case_id, body=body)
+        result = adapter.classify(request)
+        _assert_recorded_output(
+            result,
+            primary_output,
+            body=body,
+            corpus=corpus,
+        )
+        request_manifests.append(
+            {
+                "case_id": case_id,
+                "pass_kind": request.pass_kind,
+                "input_manifest_hash": _request_manifest_hash(request),
+            }
+        )
         expected_disposition = manifest_case["expected_pipeline_disposition"]
         if expected_disposition == "unresolved" and not set(
             manifest_case["opportunity_types"]
@@ -529,17 +725,28 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
             )
             adapter.return_second_pass_for(
                 body=body,
-                result=_recorded_result(second_output),
+                result=_recorded_result(corpus, second_output),
             )
-            second_result = adapter.classify(
-                _gate_request(
-                    case_id=case_id,
-                    body=body,
-                    prompt_version="open-match-ambiguity-v2",
-                    pass_kind="ambiguity_second_pass",
-                )
+            second_request = _gate_request(
+                case_id=case_id,
+                body=body,
+                prompt_version="open-match-ambiguity-v2",
+                pass_kind="ambiguity_second_pass",
             )
-            assert classifier_output_is_schema_valid(second_result.output, body=body)
+            second_result = adapter.classify(second_request)
+            _assert_recorded_output(
+                second_result,
+                second_output,
+                body=body,
+                corpus=corpus,
+            )
+            request_manifests.append(
+                {
+                    "case_id": case_id,
+                    "pass_kind": second_request.pass_kind,
+                    "input_manifest_hash": _request_manifest_hash(second_request),
+                }
+            )
             assert second_result.output["disposition"] != "accepted"
             record["second_pass"] = second_result.output
         observed.append(record)
@@ -629,47 +836,66 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         semantic_proof_version=corpus["semantic_proof_version"],
     )
 
-    artifact_specs = (
-        ("open-match-primary-v3", "open-match-primary-v3", corpus["schema_version"]),
-        (
-            "open-match-ambiguity-v2",
-            "open-match-ambiguity-v2",
-            corpus["schema_version"],
-        ),
-        (
-            "open-match-semantic-proof-v2",
-            "open-match-semantic-proof-v2",
-            corpus["semantic_proof_version"],
-        ),
+    rejected_output = deepcopy(promotion_output)
+    rejected_candidates = rejected_output.get("candidates")
+    assert isinstance(rejected_candidates, list) and len(rejected_candidates) == 1
+    rejected_candidate = rejected_candidates[0]
+    assert isinstance(rejected_candidate, dict)
+    rejected_event_time = rejected_candidate.get("event_time")
+    assert isinstance(rejected_event_time, dict)
+    rejected_event_time["start_local_date"] = "2026-08-21"
+    rejected_payload = deepcopy(promotion_payload)
+    rejected_payload["output"] = rejected_output
+    assert _validated_tournament_proposal(rejected_payload, resolver=resolver) is None
+
+    normalization_adapter = ControlledModelAdapter()
+    normalization_adapter.enable_primary_v3()
+    normalization_adapter.return_for(
+        body=promotion_body,
+        result=_recorded_result(corpus, rejected_output),
     )
-    artifact_records: list[dict[str, Any]] = []
-    for directory, prompt_version, schema_version in artifact_specs:
-        artifact_root = repository_root / "classifier" / directory
-        schema = json.loads(
-            (
-                artifact_root
-                / next(path.name for path in artifact_root.glob("*.schema.json"))
-            ).read_text(encoding="utf-8")
-        )
-        provenance = json.loads(
-            (artifact_root / "provenance.json").read_text(encoding="utf-8")
-        )
-        prompt_path = artifact_root / "prompt.md"
-        assert prompt_path.read_text(encoding="utf-8").strip()
-        assert schema["$id"] == schema_version
-        assert schema["additionalProperties"] is False
-        assert provenance["requested_model"] == corpus["model"]
-        assert provenance["requested_reasoning_effort"] == corpus["reasoning_effort"]
-        assert provenance["prompt_version"] == prompt_version
-        assert provenance["schema_version"] == schema_version
-        artifact_records.append(
-            {
-                "directory": directory,
-                "prompt_sha256": hashlib.sha256(prompt_path.read_bytes()).hexdigest(),
-                "schema_id": schema["$id"],
-                "provenance": provenance,
-            }
-        )
+    normalization_persistence = _EvaluationPersistence()
+
+    def reject_normalization(output: dict[str, JsonValue]) -> object:
+        rejected_payload["output"] = output
+        return _validated_tournament_proposal(rejected_payload, resolver=resolver)
+
+    normalization_outcome = _run_recorded_evaluation(
+        normalization_adapter,
+        _gate_request(case_id="normalization-rejection", body=promotion_body),
+        effect_key="normalization-rejection",
+        persistence=normalization_persistence,
+        normalize=reject_normalization,
+    )
+    assert normalization_outcome == "unpublished"
+    assert normalization_persistence.committed == {}
+    assert normalization_persistence.staged == {}
+
+    unpublished_fixture = recorded_promotion_fixtures[
+        "football-discussion-without-opportunity"
+    ]
+    assert isinstance(unpublished_fixture, dict)
+    unpublished_body = unpublished_fixture["source"]
+    unpublished_output = unpublished_fixture["primary_output"]
+    assert isinstance(unpublished_body, str)
+    assert isinstance(unpublished_output, dict)
+    assert unpublished_output["disposition"] != "accepted"
+    unpublished_adapter = ControlledModelAdapter()
+    unpublished_adapter.enable_primary_v3()
+    unpublished_adapter.return_for(
+        body=unpublished_body,
+        result=_recorded_result(corpus, unpublished_output),
+    )
+    unpublished_persistence = _EvaluationPersistence()
+    unpublished_outcome = _run_recorded_evaluation(
+        unpublished_adapter,
+        _gate_request(case_id="unpublished-persistence", body=unpublished_body),
+        effect_key="unpublished-persistence",
+        persistence=unpublished_persistence,
+    )
+    assert unpublished_outcome == "unpublished"
+    assert unpublished_persistence.committed == {}
+    assert unpublished_persistence.staged == {}
 
     failure_results: list[str] = []
     for name, error in (
@@ -687,7 +913,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
         assert isinstance(failure_output, dict)
         failure_adapter.return_for(
             body="failure fixture",
-            result=_recorded_result(failure_output),
+            result=_recorded_result(corpus, failure_output),
         )
         failure_adapter.raise_for(error=error)
         failure_persistence = _EvaluationPersistence()
@@ -712,7 +938,10 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     replay_output = replay_fixture["primary_output"]
     assert isinstance(replay_body, str)
     assert isinstance(replay_output, dict)
-    replay_adapter.return_for(body=replay_body, result=_recorded_result(replay_output))
+    replay_adapter.return_for(
+        body=replay_body,
+        result=_recorded_result(corpus, replay_output),
+    )
     replay_persistence = _EvaluationPersistence()
     replay_request = _gate_request(case_id="replay", body=replay_body)
     assert (
@@ -745,7 +974,7 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     rollback_adapter = ControlledModelAdapter()
     rollback_adapter.return_for(
         body=promotion_body,
-        result=_recorded_result(promotion_output),
+        result=_recorded_result(corpus, promotion_output),
     )
     rollback_persistence = _EvaluationPersistence(fail_next_commit=True)
     rollback_request = _gate_request(case_id="rollback", body=promotion_body)
@@ -781,16 +1010,28 @@ def _run_v3_evaluation_gate(corpus: dict[str, Any]) -> str:
     failure_digest = hashlib.sha256(
         json.dumps(failure_results, sort_keys=True).encode("utf-8")
     ).hexdigest()
-    artifact_digest = hashlib.sha256(
-        json.dumps(artifact_records, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    request_manifest_digest = _canonical_digest(request_manifests)
+    expected_digests = provenance["expected_digests"]
+    assert isinstance(expected_digests, dict)
+    assert (
+        _canonical_digest(artifact_records)
+        == expected_digests["artifact_records_sha256"]
+    )
+    assert request_manifest_digest == expected_digests["request_manifests_sha256"]
+    publication_outcomes = {
+        "normalization_rejection": normalization_outcome,
+        "unpublished_persistence": unpublished_outcome,
+    }
+    assert publication_outcomes == provenance["expected_publication_outcomes"]
     return json.dumps(
         {
             "case_count": len(observed),
             "case_ids": [record["case_id"] for record in observed],
             "output_digest": output_digest,
             "failure_digest": failure_digest,
-            "artifact_digest": artifact_digest,
+            "artifact_digest": _canonical_digest(artifact_records),
+            "request_manifest_digest": request_manifest_digest,
+            "publication_outcomes": publication_outcomes,
         },
         sort_keys=True,
     )
@@ -824,6 +1065,18 @@ def test_reviewed_v3_corpus_gate_runs_three_complete_independent_evaluations() -
     assert len(set(runs)) == 1
     summary = json.loads(runs[0])
     assert summary["case_count"] == 38
+    expected_provenance = _evaluation_provenance(corpus)
+    expected_digests = expected_provenance["expected_digests"]
+    assert isinstance(expected_digests, dict)
+    assert summary["artifact_digest"] == expected_digests["artifact_records_sha256"]
+    assert (
+        summary["request_manifest_digest"]
+        == expected_digests["request_manifests_sha256"]
+    )
+    assert (
+        summary["publication_outcomes"]
+        == expected_provenance["expected_publication_outcomes"]
+    )
 
 
 def test_v2_provider_schemas_match_strict_application_evidence_contract() -> None:
