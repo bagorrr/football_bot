@@ -7,6 +7,10 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from modules.classifier_adapter import classifier_provider_error_from_metadata
+from modules.classifier_contract import (
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_primary,
+)
 from modules.contracts import JsonValue
 from modules.ports import (
     ClassifierAdapterResult,
@@ -48,12 +52,22 @@ class ResponsesClassifierAdapter:
             "source-message-classification-v2" in self._schemas
             and "open-match-primary-v2" in self._prompt_paths
         )
-        v3_artifacts_complete = (
+        player_v3_artifacts_complete = (
+            "source-message-classification-v3" in self._schemas
+            and "player-match-primary-v1" in self._prompt_paths
+            and "player-match-ambiguity-v1" in self._prompt_paths
+            and "source-semantic-proof-v2" in self._schemas
+            and "player-match-semantic-proof-v1" in self._prompt_paths
+        )
+        open_v3_artifacts_complete = (
             "source-message-classification-v3" in self._schemas
             and "open-match-primary-v3" in self._prompt_paths
             and "open-match-ambiguity-v2" in self._prompt_paths
             and "source-semantic-proof-v2" in self._schemas
             and "open-match-semantic-proof-v2" in self._prompt_paths
+        )
+        v3_artifacts_complete = (
+            player_v3_artifacts_complete or open_v3_artifacts_complete
         )
         if primary_schema_version is None:
             available_versions = [
@@ -64,13 +78,18 @@ class ResponsesClassifierAdapter:
                 )
                 if available
             ]
-            if not available_versions:
-                raise ValueError("no complete primary classifier artifact set")
             if len(available_versions) > 1:
                 raise ValueError(
                     "classifier artifact version requires explicit activation"
                 )
-            primary_schema_version = available_versions[0]
+            # A proof-only adapter is a supported narrow seam: it can be
+            # constructed with only semantic-proof artifacts and used through
+            # ``semantic_proof`` without advertising a primary release.
+            primary_schema_version = (
+                available_versions[0]
+                if available_versions
+                else "source-message-classification-v1"
+            )
         if primary_schema_version == "source-message-classification-v3" and not (
             v3_artifacts_complete
         ):
@@ -81,10 +100,24 @@ class ResponsesClassifierAdapter:
             raise ValueError("incomplete v2 classifier artifact set")
         self._primary_schema_version = primary_schema_version
         if self._primary_schema_version not in {
+            "source-message-classification-v1",
             "source-message-classification-v2",
             "source-message-classification-v3",
         }:
             raise ValueError("unsupported primary classifier schema version")
+        self._primary_prompt_version = (
+            "player-match-primary-v1"
+            if self._primary_schema_version == "source-message-classification-v3"
+            and player_v3_artifacts_complete
+            and not open_v3_artifacts_complete
+            else (
+                "open-match-primary-v3"
+                if self._primary_schema_version == "source-message-classification-v3"
+                else "open-match-primary-v2"
+                if self._primary_schema_version == "source-message-classification-v2"
+                else "open-match-primary-v1"
+            )
+        )
         self._smoke_test = smoke_test
 
     @property
@@ -96,6 +129,22 @@ class ResponsesClassifierAdapter:
         # v3 remains evaluation-only until its promotion gate is accepted;
         # v2 is the compatible runtime contract for opponent_request.
         return self._primary_schema_version
+
+    @property
+    def primary_prompt_version(self) -> str:
+        """Return the primary prompt artifact selected by this adapter."""
+        return self._primary_prompt_version
+
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the immutable release selected during adapter activation."""
+        descriptor = classifier_artifact_descriptor_for_primary(
+            self._primary_schema_version,
+            primary_prompt_version=self._primary_prompt_version,
+        )
+        if descriptor is None:
+            raise RuntimeError("classifier adapter has no trusted artifact descriptor")
+        return descriptor
 
     def schema_smoke_test(self) -> bool:
         return self._smoke_test() if self._smoke_test is not None else False

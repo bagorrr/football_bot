@@ -10,10 +10,11 @@ from modules.application import (
     _opponent_search_details_hub_message,
 )
 from modules.classifier_contract import (
-    JsonValue as ClassifierJsonValue,
+    OPEN_MATCH_V1_DESCRIPTOR,
+    classifier_output_is_schema_valid,
 )
 from modules.classifier_contract import (
-    classifier_output_is_schema_valid,
+    JsonValue as ClassifierJsonValue,
 )
 from modules.domain import (
     CompletedSearch,
@@ -376,7 +377,11 @@ def test_classifier_publication_candidate_requires_event_time_and_request_fact()
         "disposition": "accepted",
         "candidates": [candidate],
     }
-    assert classifier_output_is_schema_valid(accepted, body=body)
+    assert classifier_output_is_schema_valid(
+        accepted,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
     missing_event_time = {
         **accepted,
@@ -385,7 +390,9 @@ def test_classifier_publication_candidate_requires_event_time_and_request_fact()
         ],
     }
     assert not classifier_output_is_schema_valid(
-        cast(dict[str, ClassifierJsonValue], missing_event_time), body=body
+        cast(dict[str, ClassifierJsonValue], missing_event_time),
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
 
     missing_request = {
@@ -393,5 +400,7 @@ def test_classifier_publication_candidate_requires_event_time_and_request_fact()
         "candidates": [{**candidate, "opponent_request": False}],
     }
     assert not classifier_output_is_schema_valid(
-        cast(dict[str, ClassifierJsonValue], missing_request), body=body
+        cast(dict[str, ClassifierJsonValue], missing_request),
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )

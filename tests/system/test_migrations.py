@@ -23,7 +23,11 @@ from modules.domain import (
     empty_bounded_source_metadata,
 )
 from modules.ports import ClassifierAdapterResult
-from modules.postgres_adapter import PostgresAcceptanceMigrator, runtime_database_url
+from modules.postgres_adapter import (
+    PostgresAcceptanceMigrator,
+    _ensure_application_proposition_identity_mapping,
+    runtime_database_url,
+)
 from modules.testkit import (
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
@@ -980,6 +984,585 @@ def test_migrate_adopts_untracked_current_schema_without_replaying(
         (migration_path.name, sha256(migration_path.read_bytes()).hexdigest())
         for migration_path in _migration_paths()
     ]
+
+
+def test_player_migration_upgrades_exact_main_ledger_transactionally(
+    fresh_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upgrade the published #53/#54/#55 schema without replay or data loss."""
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=25)
+    recorded_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    opportunity_rows = (
+        (
+            "opportunity:ticket-53:tournament",
+            "tournament",
+            "source-chat:ticket-53:message:1:revision:1",
+        ),
+        (
+            "opportunity:ticket-54:opponent-request",
+            "opponent_request",
+            "source-chat:ticket-54:message:1:revision:1",
+        ),
+        (
+            "opportunity:ticket-55:roster-vacancy",
+            "roster_vacancy",
+            "source-chat:ticket-55:message:1:revision:1",
+        ),
+        (
+            "opportunity:ticket-55:player-transfer",
+            "player_transfer_availability",
+            "source-chat:ticket-55:message:2:revision:1",
+        ),
+        (
+            "opportunity:legacy:open-match",
+            "open_match",
+            "source-chat:legacy:message:1:revision:1",
+        ),
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at
+                ) VALUES (%s, %s, %s, %s, 'active', %s, %s, %s, %s)
+                """,
+                [
+                    (
+                        opportunity_id,
+                        f"{opportunity_id}:revision:1",
+                        source_revision,
+                        opportunity_type,
+                        json.dumps({"fixture": opportunity_type}),
+                        json.dumps({"fixture": opportunity_type}),
+                        json.dumps(
+                            {"kind": "source_message", "value": source_revision}
+                        ),
+                        recorded_at,
+                    )
+                    for (
+                        opportunity_id,
+                        opportunity_type,
+                        source_revision,
+                    ) in opportunity_rows
+                ],
+            )
+            cursor.executemany(
+                """
+                INSERT INTO football_runtime.recommendation_opportunities (
+                    opportunity_id, opportunity_revision_id, opportunity_type,
+                    publication_state, accepted_facts, response_route, published_at
+                ) VALUES (%s, %s, %s, 'active', %s, %s, %s)
+                """,
+                [
+                    (
+                        opportunity_id,
+                        f"{opportunity_id}:recommendation:revision:1",
+                        opportunity_type,
+                        json.dumps({"fixture": opportunity_type}),
+                        json.dumps(
+                            {"kind": "source_message", "value": source_revision}
+                        ),
+                        recorded_at,
+                    )
+                    for (
+                        opportunity_id,
+                        opportunity_type,
+                        source_revision,
+                    ) in opportunity_rows
+                ],
+            )
+            cursor.execute(
+                """
+                INSERT INTO football_runtime.recommendation_completed_searches (
+                    completed_search_id, telegram_user_id, search_update_id,
+                    user_intent, country_id, city_id, sub_city_area_ids,
+                    whole_city, required_date, completed_at
+                ) VALUES (
+                    'completed-search:ticket-52-migration', 52052,
+                    'search-update:ticket-52-migration', 'tournament_search',
+                    'country:ru', 'city:moscow', '[]', true, NULL, %s
+                )
+                """,
+                (recorded_at,),
+            )
+            cursor.execute(
+                """
+                INSERT INTO football_runtime.recommendation_results (
+                    result_id, completed_search_id, absolute_position, result_class
+                ) VALUES (
+                    'result:ticket-53:tournament',
+                    'completed-search:ticket-52-migration', 1, 'confirmed_match'
+                )
+                """,
+            )
+        before_application = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_type, accepted_facts, response_route
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_id LIKE 'opportunity:ticket-%'
+               OR opportunity_id = 'opportunity:legacy:open-match'
+            ORDER BY opportunity_id
+            """,
+        ).fetchall()
+        before_recommendations = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_type, accepted_facts, response_route
+            FROM football_runtime.recommendation_opportunities
+            WHERE opportunity_id LIKE 'opportunity:ticket-%'
+               OR opportunity_id = 'opportunity:legacy:open-match'
+            ORDER BY opportunity_id
+            """,
+        ).fetchall()
+
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes_with_player_failure(path: Path) -> bytes:
+        migration = original_read_bytes(path)
+        if path.name == "0025_player_match_availability.sql":
+            return migration + b"\nSELECT missing_player_migration_function();\n"
+        return migration
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_with_player_failure)
+    with pytest.raises(psycopg.errors.UndefinedFunction):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        failed_state = connection.execute(
+            """
+            SELECT to_regnamespace('football_migrations'),
+                   to_regclass('football_runtime.bot_discovery_drafts'),
+                   EXISTS (
+                       SELECT 1
+                       FROM information_schema.columns
+                       WHERE table_schema = 'football_runtime'
+                         AND table_name = 'bot_discovery_drafts'
+                         AND column_name = 'number_of_players'
+                   )
+            """,
+        ).fetchone()
+        failed_application = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_type, accepted_facts, response_route
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_id LIKE 'opportunity:ticket-%'
+               OR opportunity_id = 'opportunity:legacy:open-match'
+            ORDER BY opportunity_id
+            """,
+        ).fetchall()
+
+    assert failed_state == (None, "football_runtime.bot_discovery_drafts", False)
+    assert failed_application == before_application
+
+    monkeypatch.undo()
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type,
+                publication_state, accepted_facts, evidence,
+                response_route, accepted_at
+            ) VALUES (
+                'opportunity:ticket-52:player',
+                'opportunity:ticket-52:player:revision:1',
+                'source-chat:ticket-52:message:1:revision:1',
+                'player_match_availability', 'active',
+                '{"available_player_count": 4}',
+                '{"available_player_count": "4 players"}',
+                '{"kind": "source_message", "value": '
+                '"source-chat:ticket-52:message:1"}',
+                %s
+            )
+            """,
+            (recorded_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (
+                'opportunity:ticket-52:player',
+                'opportunity:ticket-52:player:recommendation:revision:1',
+                'player_match_availability', 'active',
+                '{"available_player_count": 4}',
+                '{"kind": "source_message", "value": '
+                '"source-chat:ticket-52:message:1"}',
+                %s
+            )
+            """,
+            (recorded_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_results (
+                result_id, completed_search_id, absolute_position, result_class
+            ) VALUES (
+                'result:ticket-52:partial',
+                'completed-search:ticket-52-migration', 2, 'partial_result'
+            )
+            """,
+        )
+        upgraded_application = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_type, accepted_facts, response_route
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_id LIKE 'opportunity:ticket-%'
+               OR opportunity_id = 'opportunity:legacy:open-match'
+            ORDER BY opportunity_id
+            """,
+        ).fetchall()
+        upgraded_recommendations = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_type, accepted_facts, response_route
+            FROM football_runtime.recommendation_opportunities
+            WHERE opportunity_id LIKE 'opportunity:ticket-%'
+               OR opportunity_id = 'opportunity:legacy:open-match'
+            ORDER BY opportunity_id
+            """,
+        ).fetchall()
+        result_classes = connection.execute(
+            """
+            SELECT result_class
+            FROM football_runtime.recommendation_results
+            WHERE result_id IN (
+                'result:ticket-53:tournament', 'result:ticket-52:partial'
+            )
+            ORDER BY result_id
+            """,
+        ).fetchall()
+        player_columns = connection.execute(
+            """
+            SELECT table_name, column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'football_runtime'
+              AND (
+                  (table_name = 'bot_discovery_drafts' AND column_name IN (
+                      'number_of_players', 'player_search_number_prompt'
+                  ))
+                  OR (
+                      table_name = 'recommendation_completed_searches'
+                      AND column_name = 'number_of_players'
+                  )
+              )
+            ORDER BY table_name, column_name
+            """,
+        ).fetchall()
+        history_after_upgrade = connection.execute(
+            """
+            SELECT migration_name, checksum, applied_at
+            FROM football_migrations.applied_migrations
+            ORDER BY migration_name
+            """,
+        ).fetchall()
+
+    assert [
+        row for row in upgraded_application if row[0] != "opportunity:ticket-52:player"
+    ] == before_application
+    assert [
+        row
+        for row in upgraded_recommendations
+        if row[0] != "opportunity:ticket-52:player"
+    ] == before_recommendations
+    assert {row[1] for row in upgraded_application} == {
+        "open_match",
+        "player_match_availability",
+        "opponent_request",
+        "tournament",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }
+    assert {row[1] for row in upgraded_recommendations} == {
+        "open_match",
+        "player_match_availability",
+        "opponent_request",
+        "tournament",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }
+    assert result_classes == [("partial_result",), ("confirmed_match",)]
+    assert player_columns == [
+        ("bot_discovery_drafts", "number_of_players"),
+        ("bot_discovery_drafts", "player_search_number_prompt"),
+        ("recommendation_completed_searches", "number_of_players"),
+    ]
+    assert [(name, checksum) for name, checksum, _ in history_after_upgrade] == [
+        (migration_path.name, sha256(migration_path.read_bytes()).hexdigest())
+        for migration_path in _migration_paths()
+    ]
+
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        history_after_repeat = connection.execute(
+            """
+            SELECT migration_name, checksum, applied_at
+            FROM football_migrations.applied_migrations
+            ORDER BY migration_name
+            """,
+        ).fetchall()
+    assert history_after_repeat == history_after_upgrade
+
+
+def test_classifier_promotion_attestation_migration_is_transactional_and_private(
+    fresh_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upgrade, retry, rollback, and protect the Application attestation table."""
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=26)
+    preserved_message_id = "00000000-0000-0000-0000-000000000101"
+    recorded_at = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'application', NULL, 'RunSearch', 1,
+                'migration-compatibility', 1, 'migration-compatibility',
+                '00000000-0000-0000-0000-000000000102',
+                '00000000-0000-0000-0000-000000000103', %s,
+                '{"preserved": true}'
+            )
+            """,
+            (preserved_message_id, recorded_at),
+        )
+
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes_with_attestation_failure(path: Path) -> bytes:
+        migration = original_read_bytes(path)
+        if path.name == "0027_classifier_promotion_attestations.sql":
+            return migration + b"\nSELECT missing_attestation_migration_function();\n"
+        return migration
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_with_attestation_failure)
+    with pytest.raises(psycopg.errors.UndefinedFunction):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        rollback_state = connection.execute(
+            """
+            SELECT to_regnamespace('football_migrations'),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_attestations'
+                   ),
+                   EXISTS (
+                       SELECT 1
+                       FROM football_runtime.contract_outbox
+                       WHERE message_id = %s
+                   )
+            """,
+            (preserved_message_id,),
+        ).fetchone()
+    assert rollback_state == (None, None, True)
+
+    monkeypatch.undo()
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+
+    passwords = {role: "promotion-attestation-migration-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    with psycopg.connect(fresh_database_url) as connection:
+        table_state = connection.execute(
+            """
+            SELECT relation.relrowsecurity, relation.relforcerowsecurity,
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'INSERT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'UPDATE,DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_classification',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'SELECT'
+                   ),
+                   (
+                       SELECT bool_and(relation.relrowsecurity)
+                       FROM pg_class AS relation
+                       WHERE relation.oid IN (
+                           'football_runtime.application_classifier_promotion_gate_runs'::regclass,
+                           'football_runtime.application_classifier_promotion_replays'::regclass
+                       )
+                   ),
+                   (
+                       SELECT bool_and(relation.relforcerowsecurity)
+                       FROM pg_class AS relation
+                       WHERE relation.oid IN (
+                           'football_runtime.application_classifier_promotion_gate_runs'::regclass,
+                           'football_runtime.application_classifier_promotion_replays'::regclass
+                       )
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_gate_runs',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_gate_runs',
+                       'INSERT,UPDATE,DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_classification',
+                       'football_runtime.application_classifier_promotion_gate_runs',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_replays',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_replays',
+                       'INSERT,UPDATE,DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_classification',
+                       'football_runtime.application_classifier_promotion_replays',
+                       'SELECT'
+                   ),
+                   EXISTS (
+                       SELECT 1
+                       FROM football_runtime.contract_outbox
+                       WHERE message_id = %s
+                   )
+            FROM pg_class AS relation
+            WHERE relation.oid = (
+                'football_runtime.application_classifier_promotion_attestations'::regclass
+            )
+            """,
+            (preserved_message_id,),
+        ).fetchone()
+    assert table_state == (
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+    )
+
+    application_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.APPLICATION,
+        passwords[RuntimeRole.APPLICATION],
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_classifier_promotion_attestations (
+                attestation_id, approval_message_id, release_name,
+                contract_version, release_fingerprint, gate_run_id,
+                execution_version, base_database_binding, database_binding,
+                replay_execution_ids, release_binding, replay_database_bindings,
+                canonical_replay_digests, replay_digests,
+                failure_mode_observations, lifecycle_observations, evidence,
+                recorded_at
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000104',
+                '00000000-0000-0000-0000-000000000105',
+                'migration-attestation', 'contract-v1', 'fingerprint',
+                '00000000-0000-0000-0000-000000000106', 'execution-v1',
+                repeat('a', 64), repeat('b', 64), '[]', 'migration-binding',
+                '[]', '[]', '[]', '[]', '[]', '{}', %s
+            )
+            """,
+            (recorded_at,),
+        )
+    with psycopg.connect(application_url) as connection:
+        visible_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_classifier_promotion_attestations
+            """
+        ).fetchone()
+    assert visible_count == (1,)
+
+
+def test_classifier_promotion_execution_records_migration_rolls_back_and_retries(
+    fresh_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The privileged execution-record migration is atomic and retry-safe."""
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=27)
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes_with_execution_record_failure(path: Path) -> bytes:
+        migration = original_read_bytes(path)
+        if path.name == "0028_classifier_promotion_execution_records.sql":
+            return migration + b"\nSELECT missing_execution_record_function();\n"
+        return migration
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_with_execution_record_failure)
+    with pytest.raises(psycopg.errors.UndefinedFunction):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        rollback_state = connection.execute(
+            """
+            SELECT to_regnamespace('football_migrations'),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_gate_runs'
+                   ),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_replays'
+                   )
+            """
+        ).fetchone()
+    assert rollback_state == (None, None, None)
+
+    monkeypatch.undo()
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        retry_state = connection.execute(
+            """
+            SELECT count(*),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_gate_runs'
+                   ),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_replays'
+                   )
+            FROM football_migrations.applied_migrations
+            """
+        ).fetchone()
+    assert retry_state == (
+        len(_migration_paths()),
+        "football_runtime.application_classifier_promotion_gate_runs",
+        "football_runtime.application_classifier_promotion_replays",
+    )
 
 
 def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
@@ -2315,3 +2898,68 @@ def test_migrate_rejects_history_without_runtime_schema(
 
     assert runtime_schema == (None,)
     assert preserved_history == expected_migrations
+
+
+def test_application_identity_mapping_is_idempotent_across_type_reclassification(
+    fresh_database_url: str,
+) -> None:
+    """A durable slot may change target type without forking its identity."""
+    PostgresAcceptanceMigrator(fresh_database_url).migrate()
+    recorded_at = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    source_message_id = "source-chat:player-reclassification:message:1"
+    open_match_id = (
+        f"opportunity:{source_message_id}:open_match:proposition:0123456789abcdef"
+    )
+    player_match_id = (
+        f"opportunity:{source_message_id}:player_match_availability:proposition:"
+        "fedcba9876543210"
+    )
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_proposition_identities (
+                source_message_id, proposition_slot, opportunity_id,
+                proposition_discriminator, created_at
+            ) VALUES (%s, 1, %s, %s, %s)
+            """,
+            (source_message_id, open_match_id, "open-lineage", recorded_at),
+        )
+
+        for requested_id in (player_match_id, player_match_id, open_match_id):
+            _ensure_application_proposition_identity_mapping(
+                connection,
+                source_message_id=source_message_id,
+                proposition_slot=1,
+                opportunity_id=requested_id,
+                proposition_discriminator="reclassified-lineage",
+                created_at=recorded_at,
+            )
+
+        mapping = connection.execute(
+            """
+            SELECT identity.opportunity_id,
+                   COALESCE(compatibility.canonical_opportunity_id,
+                            identity.opportunity_id),
+                   identity.proposition_discriminator
+            FROM football_runtime.application_proposition_identities AS identity
+            LEFT JOIN
+                football_runtime.application_legacy_proposition_identity_compatibility
+                AS compatibility
+              ON compatibility.legacy_opportunity_id = identity.opportunity_id
+            WHERE identity.source_message_id = %s
+              AND identity.proposition_slot = 1
+            """,
+            (source_message_id,),
+        ).fetchone()
+        aliases = connection.execute(
+            """
+            SELECT legacy_opportunity_id, canonical_opportunity_id
+            FROM football_runtime.application_legacy_proposition_identity_compatibility
+            WHERE source_message_id = %s
+            """,
+            (source_message_id,),
+        ).fetchall()
+
+    assert mapping == (open_match_id, player_match_id, "reclassified-lineage")
+    assert aliases == [(open_match_id, player_match_id)]

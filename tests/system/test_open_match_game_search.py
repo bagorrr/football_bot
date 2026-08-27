@@ -137,7 +137,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
     """Publish a Tournament only after both required facts are accepted."""
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()
-    classifier.enable_primary_v3()
+    classifier.enable_open_match_primary_v3()
     resolver = ControlledLocationResolverAdapter()
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     dates = ControlledDateInterpretationAdapter()

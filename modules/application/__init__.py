@@ -18,12 +18,20 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from modules.classifier_contract import (
-    PROPOSITION_EVIDENCE_V2_VERSION,
-    SEMANTIC_PROOF_V2_VERSION,
+    OPEN_MATCH_V1_DESCRIPTOR,
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_primary,
+    classifier_artifact_descriptor_for_provenance,
+    classifier_artifact_descriptor_is_trusted,
     classifier_output_is_schema_valid,
     proposition_evidence_is_schema_valid,
     semantic_proof_is_authoritative,
     semantic_proof_is_schema_valid,
+)
+from modules.classifier_promotion import (
+    PLAYER_CLASSIFIER_RELEASE_NAME,
+    player_classifier_promotion_is_approved,
+    player_classifier_proposal_contains_player,
 )
 from modules.contracts import (
     SUB_CITY_GEOGRAPHIC_TYPES,
@@ -1171,6 +1179,72 @@ _GAME_SEARCH_DETAIL_HEADINGS = {
         "🌱 Sélectionnez le revêtement.",
         "💳 Sélectionnez le type de paiement.",
     ),
+}
+_PLAYER_SEARCH_DETAIL_KEYS = (
+    "times",
+    "number_of_players",
+    "team_formats",
+    "positions",
+    "playing_levels",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
+_PLAYER_SEARCH_DETAIL_NAMES = {
+    "en": (
+        "Time",
+        "Number of players",
+        "Team format",
+        "Positions",
+        "Playing levels",
+        "Venue type",
+        "Playing surface",
+        "Payment",
+    ),
+    "ru": (
+        "Время",
+        "Количество игроков",
+        "Формат команд",
+        "Позиции",
+        "Уровни игры",
+        "Тип площадки",
+        "Покрытие",
+        "Оплата",
+    ),
+    "es": (
+        "Hora",
+        "Número de jugadores",
+        "Formato de equipos",
+        "Posiciones",
+        "Niveles de juego",
+        "Tipo de recinto",
+        "Superficie de juego",
+        "Pago",
+    ),
+    "fr": (
+        "Heure",
+        "Nombre de joueurs",
+        "Format des équipes",
+        "Postes",
+        "Niveaux de jeu",
+        "Type de terrain",
+        "Revêtement",
+        "Paiement",
+    ),
+}
+_PLAYER_SEARCH_DETAIL_HEADINGS = {
+    "en": {
+        "number_of_players": "👥 How many players?",
+    },
+    "ru": {
+        "number_of_players": "👥 Сколько игроков?",
+    },
+    "es": {
+        "number_of_players": "👥 ¿Cuántos jugadores?",
+    },
+    "fr": {
+        "number_of_players": "👥 Combien de joueurs ?",
+    },
 }
 _GAME_SEARCH_VALUE_COPY = {
     "en": {
@@ -2630,6 +2704,7 @@ class ConversationOnboarding:
         screen_revision: int,
         game_search_details: dict[str, list[str]] | None = None,
         tournament_search_details: dict[str, list[str]] | None = None,
+        number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
     ) -> None:
@@ -2694,6 +2769,7 @@ class ConversationOnboarding:
                 > 1
             ):
                 raise ValueError("Search cannot contain both detail families")
+            selected_number_of_players: int | None = None
             if draft.user_intent is UserIntent.OPPONENT_SEARCH:
                 selected_details = (
                     opponent_search_details
@@ -2736,6 +2812,22 @@ class ConversationOnboarding:
                     }
                 )
                 details_payload_key = "game_search_details"
+                selected_number_of_players = (
+                    number_of_players
+                    if number_of_players is not None
+                    else draft.number_of_players
+                )
+                if selected_number_of_players is not None and (
+                    draft.user_intent is not UserIntent.PLAYER_SEARCH
+                    or isinstance(selected_number_of_players, bool)
+                    or not isinstance(selected_number_of_players, int)
+                    or selected_number_of_players < 1
+                ):
+                    raise ValueError("Number of Players must be a positive integer")
+            changed_draft = replace(
+                changed_draft,
+                number_of_players=selected_number_of_players,
+            )
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
                 contract_version=2,
@@ -2770,6 +2862,11 @@ class ConversationOnboarding:
                     **(
                         {details_payload_key: cast(JsonValue, selected_details)}
                         if selected_details
+                        else {}
+                    ),
+                    **(
+                        {"number_of_players": selected_number_of_players}
+                        if selected_number_of_players is not None
                         else {}
                     ),
                 },
@@ -2906,11 +3003,90 @@ class ConversationOnboarding:
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
         """Discard submenu edits, or leave the hub while preserving criteria."""
+        draft = self._store.discovery_draft(telegram_user_id)
+        user_intent = (
+            UserIntent.PLAYER_SEARCH
+            if draft is not None and draft.user_intent is UserIntent.PLAYER_SEARCH
+            else UserIntent.GAME_SEARCH
+        )
         self._change_game_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="back",
+            user_intent=user_intent,
+        )
+
+    def open_player_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Open the durable Player Search details hub."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
+    def open_player_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one Player Search detail submenu."""
+        if detail_key not in _PLAYER_SEARCH_DETAIL_KEYS:
+            raise ValueError("Player Search detail key must be canonical")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
+    def submit_player_search_number_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and commit one positive whole-player count."""
+        if re.fullmatch(r"[1-9][0-9]*", text) is None:
+            raise ValueError("Number of Players must be a positive integer")
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_number",
+            value=text,
+            user_intent=UserIntent.PLAYER_SEARCH,
+        )
+
+    def clear_player_search_number(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> None:
+        """Clear the optional Player Search quantity criterion."""
+        self._change_game_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_number",
+            user_intent=UserIntent.PLAYER_SEARCH,
         )
 
     def open_opponent_search_details(
@@ -3839,6 +4015,7 @@ class ConversationOnboarding:
         operation: str,
         detail_key: str | None = None,
         value: str | None = None,
+        user_intent: UserIntent = UserIntent.GAME_SEARCH,
     ) -> None:
         with self._store.serialize_conversation_update(
             update_id=update_id,
@@ -3853,7 +4030,7 @@ class ConversationOnboarding:
             if (
                 current.stage is not ConversationStage.POST_CORE
                 or draft.stage is not ConversationStage.POST_CORE
-                or draft.user_intent is not UserIntent.GAME_SEARCH
+                or draft.user_intent is not user_intent
                 or draft.screen_revision != screen_revision
             ):
                 self._queue_current_view(update_id=update_id, state=current)
@@ -3862,13 +4039,27 @@ class ConversationOnboarding:
             editing = draft.editing_game_search_detail
             temporary = list(draft.game_search_detail_draft)
             exact_time_prompt = draft.game_search_exact_time_prompt
+            number_prompt = draft.player_search_number_prompt
+            draft_number = draft.number_of_players
             target = "hub"
+            detail_keys = (
+                _PLAYER_SEARCH_DETAIL_KEYS
+                if user_intent is UserIntent.PLAYER_SEARCH
+                else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+            )
             if operation == "open_detail":
                 assert detail_key is not None
+                if detail_key not in detail_keys:
+                    raise ValueError("Search detail key must be canonical")
                 editing = detail_key
-                temporary = list(details.get(detail_key, ()))
+                temporary = (
+                    []
+                    if detail_key == "number_of_players"
+                    else list(details.get(detail_key, ()))
+                )
                 exact_time_prompt = False
-                target = "submenu"
+                number_prompt = detail_key == "number_of_players"
+                target = "number_prompt" if number_prompt else "submenu"
             elif operation == "toggle":
                 if editing is None or editing == "times":
                     raise RuntimeError("No multi-select Game Search detail is open")
@@ -3899,6 +4090,23 @@ class ConversationOnboarding:
                 editing = None
                 temporary = []
                 exact_time_prompt = False
+            elif operation == "submit_number":
+                if user_intent is not UserIntent.PLAYER_SEARCH or not number_prompt:
+                    raise RuntimeError("Player Search number prompt is not open")
+                if value is None or re.fullmatch(r"[1-9][0-9]*", value) is None:
+                    raise ValueError("Number of Players must be a positive integer")
+                draft_number = int(value)
+                editing = None
+                temporary = []
+                number_prompt = False
+                target = "hub"
+            elif operation == "select_number":
+                if user_intent is not UserIntent.PLAYER_SEARCH:
+                    raise RuntimeError("Number of Players requires Player Search")
+                draft_number = None
+                editing = None
+                temporary = []
+                number_prompt = False
             elif operation == "submit_exact_time":
                 if editing != "times" or not exact_time_prompt:
                     raise RuntimeError("Game Search exact-time prompt is not open")
@@ -3914,7 +4122,11 @@ class ConversationOnboarding:
                 exact_time_prompt = True
                 target = "exact_time_prompt"
             elif operation == "back":
-                if exact_time_prompt and editing == "times":
+                if number_prompt and editing == "number_of_players":
+                    number_prompt = False
+                    editing = None
+                    target = "hub"
+                elif exact_time_prompt and editing == "times":
                     exact_time_prompt = False
                     target = "submenu"
                 elif editing is None:
@@ -3941,9 +4153,15 @@ class ConversationOnboarding:
                 revision=draft.revision + 1,
                 last_activity_at=now,
                 game_search_details=tuple(sorted(details.items())),
+                number_of_players=(
+                    draft_number
+                    if operation in {"submit_number", "select_number"}
+                    else draft.number_of_players
+                ),
                 editing_game_search_detail=editing,
                 game_search_detail_draft=tuple(temporary),
                 game_search_exact_time_prompt=exact_time_prompt,
+                player_search_number_prompt=number_prompt,
             )
             if target == "submenu":
                 assert editing is not None
@@ -3957,6 +4175,13 @@ class ConversationOnboarding:
                 )
             elif target == "exact_time_prompt":
                 message = _game_search_exact_time_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=current.locale or "en",
+                    screen_revision=state.screen_revision,
+                )
+            elif target == "number_prompt":
+                message = _player_search_number_message(
                     update_id=update_id,
                     telegram_user_id=telegram_user_id,
                     locale=current.locale or "en",
@@ -3983,6 +4208,8 @@ class ConversationOnboarding:
                     locale=current.locale or "en",
                     screen_revision=state.screen_revision,
                     details=details,
+                    user_intent=user_intent,
+                    number_of_players=changed_draft.number_of_players,
                 )
             self._store.commit_conversation_update(
                 update_id=update_id,
@@ -6852,6 +7079,8 @@ def _game_search_details_hub_message(
     locale: str,
     screen_revision: int,
     details: dict[str, tuple[str, ...]],
+    user_intent: UserIntent = UserIntent.GAME_SEARCH,
+    number_of_players: int | None = None,
 ) -> TelegramMessage:
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     introduction, not_set, back_label, search_label = {
@@ -6870,12 +7099,25 @@ def _game_search_details_hub_message(
             "Rechercher",
         ),
     }[copy_locale]
-    keys = tuple(_GAME_SEARCH_DETAIL_OPTIONS)
-    names = _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+    player_search = user_intent is UserIntent.PLAYER_SEARCH
+    keys = (
+        _PLAYER_SEARCH_DETAIL_KEYS
+        if player_search
+        else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+    )
+    names = (
+        _PLAYER_SEARCH_DETAIL_NAMES[copy_locale]
+        if player_search
+        else _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+    )
     summaries = tuple(
-        ", ".join(
-            _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
-            for value in details.get(key, ())
+        (
+            str(number_of_players)
+            if key == "number_of_players" and number_of_players is not None
+            else ", ".join(
+                _GAME_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+                for value in details.get(key, ())
+            )
         )
         or not_set
         for key in keys
@@ -7000,6 +7242,33 @@ def _game_search_exact_time_message(
         screen_revision=screen_revision,
         text=text,
         button_rows=(((back_label, f"details:back:{screen_revision}"),),),
+    )
+
+
+def _player_search_number_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+) -> TelegramMessage:
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    prompt, any_label, back_label = {
+        "en": ("Send one whole number greater than zero.", "Any", "⬅️ Back"),
+        "ru": ("Отправьте одно целое число больше нуля.", "Неважно", "⬅️ Назад"),
+        "es": ("Envía un número entero mayor que cero.", "Cualquiera", "⬅️ Atrás"),
+        "fr": ("Envoyez un nombre entier supérieur à zéro.", "Peu importe", "⬅️ Retour"),
+    }[copy_locale]
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=f"{_PLAYER_SEARCH_DETAIL_HEADINGS[copy_locale]['number_of_players']}\n\n{prompt}",
+        button_rows=(
+            ((any_label, f"details:number:any:{screen_revision}"),),
+            ((back_label, f"details:back:{screen_revision}"),),
+        ),
     )
 
 
@@ -8255,6 +8524,7 @@ def _open_match_result_message(
 ) -> TelegramMessage:
     """Render one Result Card only from its immutable accepted-fact snapshot."""
     facts = dict(result.card_facts)
+    player_result = facts.get("opportunity_type") == "player_match_availability"
     if facts.get("opportunity_type") == "tournament":
         return _tournament_result_message(
             delivery_id=delivery_id,
@@ -8331,7 +8601,7 @@ def _open_match_result_message(
     }[copy_locale]
     labels = {
         "en": (
-            "Open Match",
+            "Player Match Availability" if player_result else "Open Match",
             "Matches",
             "Needs clarification",
             "Posted",
@@ -8341,9 +8611,10 @@ def _open_match_result_message(
             "Questions? Message me. I can explain the card or help refine your search.",
             "Additional",
             "No exact match was found.",
+            "Partially matches",
         ),
         "ru": (
-            "Открытая игра",
+            "Наличие игроков для матча" if player_result else "Открытая игра",
             "Подходит",
             "Нужно уточнить",
             "Пост",
@@ -8354,9 +8625,10 @@ def _open_match_result_message(
             "или помогу уточнить поиск.",
             "Дополнительно",
             "Точного совпадения не найдено.",
+            "Частично подходит",
         ),
         "es": (
-            "Partido abierto",
+            "Disponibilidad de jugadores" if player_result else "Partido abierto",
             "Coincide",
             "Falta confirmar",
             "Publicado",
@@ -8367,9 +8639,10 @@ def _open_match_result_message(
             "o le ayudaré a ajustar la búsqueda.",
             "Información adicional",
             "No se encontró una coincidencia exacta.",
+            "Coincide parcialmente",
         ),
         "fr": (
-            "Match ouvert",
+            "Disponibilité de joueurs" if player_result else "Match ouvert",
             "Correspond",
             "À préciser",
             "Publié",
@@ -8380,6 +8653,7 @@ def _open_match_result_message(
             "ou vous aider à affiner votre recherche.",
             "Informations complémentaires",
             "Aucune correspondance exacte n’a été trouvée.",
+            "Correspond partiellement",
         ),
     }[copy_locale]
     match_states = json.loads(facts.get("match_states", "{}"))
@@ -8389,7 +8663,7 @@ def _open_match_result_message(
     team_formats = json.loads(facts.get("team_formats", "[]"))
     title = f"⚽ {labels[0]}" + (
         f" {', '.join(team_formats)}"
-        if team_formats and "team_formats" in confirmed_keys
+        if team_formats and "team_formats" in confirmed_keys and not player_result
         else ""
     )
     if event_date == event_end_date:
@@ -8463,6 +8737,34 @@ def _open_match_result_message(
             + " libre"
             + ("s" if open_places != 1 else ""),
         }[copy_locale]
+    available_player_copy = None
+    if player_result:
+        exact_count = facts.get("available_player_count")
+        minimum_count = facts.get("available_player_count_min")
+        maximum_count = facts.get("available_player_count_max")
+        if exact_count is not None:
+            count_copy = str(exact_count)
+            available_player_copy = {
+                "en": f"{count_copy} player"
+                + ("" if count_copy == "1" else "s")
+                + " available",
+                "ru": f"Игроков доступно: {count_copy}",
+                "es": f"{count_copy} jugador"
+                + ("" if count_copy == "1" else "es")
+                + " disponible"
+                + ("" if count_copy == "1" else "s"),
+                "fr": f"{count_copy} joueur"
+                + ("" if count_copy == "1" else "s")
+                + " disponible"
+                + ("" if count_copy == "1" else "s"),
+            }[copy_locale]
+        elif minimum_count is not None and maximum_count is not None:
+            available_player_copy = {
+                "en": f"{minimum_count}–{maximum_count} players available",
+                "ru": f"Игроков доступно: {minimum_count}–{maximum_count}",
+                "es": f"{minimum_count}–{maximum_count} jugadores disponibles",
+                "fr": f"{minimum_count}–{maximum_count} joueurs disponibles",
+            }[copy_locale]
     value_copy = {
         "en": {
             "goalkeeper": "Goalkeeper",
@@ -8560,8 +8862,16 @@ def _open_match_result_message(
     value_copy = _GAME_SEARCH_VALUE_COPY[copy_locale]
     detail_names = dict(
         zip(
-            _GAME_SEARCH_DETAIL_OPTIONS,
-            _GAME_SEARCH_DETAIL_NAMES[copy_locale],
+            (
+                _PLAYER_SEARCH_DETAIL_KEYS
+                if player_result
+                else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+            ),
+            (
+                _PLAYER_SEARCH_DETAIL_NAMES[copy_locale]
+                if player_result
+                else _GAME_SEARCH_DETAIL_NAMES[copy_locale]
+            ),
             strict=True,
         )
     )
@@ -8585,7 +8895,13 @@ def _open_match_result_message(
         if "payment_amount" in facts and "payment_currency" in facts:
             payment_copy += f" ({facts['payment_amount']} {facts['payment_currency']})"
         known_values["payment"] = payment_copy
-    detail_values = [open_place_copy] if open_place_copy is not None else []
+    detail_values = (
+        ([available_player_copy] if available_player_copy is not None else [])
+        if player_result
+        else ([open_place_copy] if open_place_copy is not None else [])
+    )
+    if player_result and "team_formats" in confirmed_keys and facts.get("team_formats"):
+        detail_values.append(known_values["team_formats"])
     detail_values.extend(
         known_values[key]
         for key in (
@@ -8612,6 +8928,7 @@ def _open_match_result_message(
             "playing_surfaces": "playing surface",
             "payment": "payment",
             "search_area": "search area",
+            "number_of_players": "number of players",
         },
         "ru": {
             "times": "время",
@@ -8622,6 +8939,7 @@ def _open_match_result_message(
             "playing_surfaces": "покрытие",
             "payment": "оплата",
             "search_area": "район поиска",
+            "number_of_players": "количество игроков",
         },
         "es": {
             "times": "hora",
@@ -8632,6 +8950,7 @@ def _open_match_result_message(
             "playing_surfaces": "superficie",
             "payment": "pago",
             "search_area": "zona de búsqueda",
+            "number_of_players": "número de jugadores",
         },
         "fr": {
             "times": "heure",
@@ -8642,12 +8961,13 @@ def _open_match_result_message(
             "playing_surfaces": "surface",
             "payment": "paiement",
             "search_area": "zone de recherche",
+            "number_of_players": "nombre de joueurs",
         },
     }[copy_locale]
     selected_confirmed = sorted(
         criterion_copy.get(key, key.replace("_", " "))
         for key, state in match_states.items()
-        if state == "confirmed" and key != "search_area"
+        if state == "confirmed" and key not in {"search_area", "number_of_players"}
     )
     selected_unknown = sorted(
         criterion_copy.get(key, key.replace("_", " "))
@@ -8664,9 +8984,23 @@ def _open_match_result_message(
         if match_states.get("search_area") == "confirmed"
         else labels[6]
     )
-    match_lines = [
-        f"{labels[1]}: " + ", ".join((confirmed_core, *selected_confirmed)) + "."
-    ]
+    if player_result and result.result_class == "partial_result":
+        contribution = facts.get("available_player_contribution", "")
+        if "/" in contribution:
+            provided, requested = contribution.split("/", 1)
+            contribution_copy = {
+                "en": f"{provided} of {requested} players",
+                "ru": f"{provided} из {requested} игроков",
+                "es": f"{provided} de {requested} jugadores",
+                "fr": f"{provided} sur {requested} joueurs",
+            }[copy_locale]
+        else:
+            contribution_copy = contribution
+        match_lines = [f"{labels[10]}: {contribution_copy}."]
+    else:
+        match_lines = [
+            f"{labels[1]}: " + ", ".join((confirmed_core, *selected_confirmed)) + "."
+        ]
     if selected_unknown:
         match_lines.append(f"{labels[2]}: {', '.join(selected_unknown)}.")
     match_copy = "\n".join(match_lines)
@@ -8675,17 +9009,22 @@ def _open_match_result_message(
     )
     additional = " · ".join(
         f"{detail_names[key]}: {known_values[key]}"
-        for key in _GAME_SEARCH_DETAIL_OPTIONS
+        for key in (
+            _PLAYER_SEARCH_DETAIL_KEYS
+            if player_result
+            else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
+        )
         if key not in confirmed_keys and known_values.get(key)
     )
     additional_copy = f"\n{labels[8]}: {additional}\n" if additional else ""
+    detail_line = f"{details}\n" if details else ""
     route_copy = render_response_route(
         facts["response_route_kind"],
         facts["response_route_value"],
         copy_locale,
     )
     text = (
-        f"{title}\n{when}\n{where}\n{details}\n\n"
+        f"{title}\n{when}\n{where}\n{detail_line}\n"
         f"{possible_copy}{match_copy}\n{additional_copy}\n"
         f"{labels[3]}: {posted}\n"
         f"{labels[4]}: {route_copy}\n\n"
@@ -10434,6 +10773,21 @@ class RuntimeApplication:
         )
         return result is ConsumeResult.APPLIED
 
+    def redeliver_contract(self, incoming: RawContractEnvelope) -> bool:
+        """Replay an owned durable contract through its idempotency boundary."""
+        if incoming.consumer is not self.role:
+            raise RuntimeError("runtime role cannot consume another owner's contract")
+        if incoming.contract_version not in self.versions_for(incoming.contract_name):
+            raise ValueError("contract version is unsupported by this runtime")
+        envelope = ContractEnvelope.from_raw(incoming)
+        result = self.store.consume(
+            incoming=envelope,
+            supported_versions=self.versions_for(incoming.contract_name),
+            received_at=self.clock.now(),
+            outgoing=None,
+        )
+        return result is ConsumeResult.APPLIED
+
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
         claimed = self.store.claim_next(
@@ -10837,23 +11191,25 @@ class RuntimeApplication:
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
+        artifact_descriptor = self.model.artifact_descriptor
+        if (
+            not classifier_artifact_descriptor_is_trusted(artifact_descriptor)
+            or artifact_descriptor.primary_schema_version
+            != self.model.primary_schema_version
+        ):
+            raise RuntimeError("classifier adapter exposes an incoherent artifact")
         if self.model.primary_schema_version in {
             "source-message-classification-v2",
             "source-message-classification-v3",
         }:
             self._classify_source_message_v2(
                 incoming,
-                artifact_version=(
-                    "v3"
-                    if self.model.primary_schema_version
-                    == "source-message-classification-v3"
-                    else "v2"
-                ),
+                artifact_descriptor=artifact_descriptor,
             )
             return
-        if self.model.primary_schema_version != "source-message-classification-v1":
+        if artifact_descriptor != OPEN_MATCH_V1_DESCRIPTOR:
             raise RuntimeError(
-                "classifier adapter exposes an unsupported primary schema version"
+                "classifier adapter exposes an unsupported trusted artifact"
             )
         payload = incoming.payload
         if not isinstance(payload, dict):
@@ -10888,11 +11244,11 @@ class RuntimeApplication:
             ),
             requested_model="gpt-5.6-sol",
             requested_reasoning_effort="high",
-            prompt_version="open-match-primary-v1",
-            schema_version="source-message-classification-v1",
+            prompt_version=artifact_descriptor.primary_prompt_version,
+            schema_version=artifact_descriptor.primary_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
-            routing_policy_version="classifier-routing-v1",
+            routing_policy_version=artifact_descriptor.routing_policy_version,
         )
         prior_attempts = self.store.classification_attempts_for_revision(revision_id)
         primary_attempt_number = (
@@ -11029,7 +11385,9 @@ class RuntimeApplication:
             and result.effective_reasoning_effort == "high"
         )
         primary_output_is_valid = classifier_output_is_schema_valid(
-            result.output, body=body
+            result.output,
+            body=body,
+            artifact_descriptor=artifact_descriptor,
         )
         if not provenance_complete or not primary_output_is_valid:
             recorded_result = replace(
@@ -11094,11 +11452,20 @@ class RuntimeApplication:
             ):
                 raise RuntimeError("accepted v1 output has no proof-bound candidate")
             proof_candidate_key = cast(str, proof_candidate["candidate_key"])
+            proof_meaning = proof_candidate.get("opportunity_type")
+            if not isinstance(proof_meaning, str):
+                proof_meaning = "open_match"
+            proof_schema_version = artifact_descriptor.semantic_proof_version_for(
+                proof_meaning
+            )
+            proof_prompt_version = (
+                artifact_descriptor.semantic_proof_prompt_version_for(proof_meaning)
+            )
             semantic_proof_request = replace(
                 request,
                 context_bundle_version="semantic-proof-context-v1",
-                prompt_version="open-match-semantic-proof-v1",
-                schema_version="source-semantic-proof-v1",
+                prompt_version=proof_prompt_version,
+                schema_version=proof_schema_version,
                 context_policy_version="semantic-proof-context-v1",
                 pass_kind="semantic_proof",
                 proof_candidate_key=proof_candidate_key,
@@ -11251,6 +11618,8 @@ class RuntimeApplication:
                 opportunity_type=cast(
                     str, proof_candidate.get("opportunity_type", "open_match")
                 ),
+                meaning=proof_meaning,
+                artifact_descriptor=artifact_descriptor,
             )
             semantic_proof_attempt = _classification_attempt_from_result(
                 semantic_proof_recorded_result,
@@ -11449,55 +11818,33 @@ class RuntimeApplication:
         )
 
     def _classify_source_message_v2(
-        self, incoming: ContractEnvelope, *, artifact_version: str | None = None
+        self,
+        incoming: ContractEnvelope,
+        *,
+        artifact_descriptor: ClassifierArtifactDescriptor | None = None,
     ) -> None:
-        """Run the active classifier, with an explicit evaluation artifact override."""
+        """Run the additive multi-candidate classifier and one-way ambiguity pass."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError(
                 "only Classification executes the multi-candidate classifier"
             )
-        if artifact_version is None:
-            primary_schema_version = str(self.model.primary_schema_version)
-            artifact_versions = _classifier_artifact_versions(primary_schema_version)
-            if artifact_versions is None:
-                raise RuntimeError("classifier adapter exposes unsupported artifacts")
-            primary_prompt_version, ambiguity_prompt_version, semantic_proof_version = (
-                artifact_versions
-            )
-            classification_schema_version = primary_schema_version
-            semantic_proof_prompt_version, semantic_proof_schema_version = (
-                semantic_proof_version
-            )
-            is_v3 = primary_schema_version == "source-message-classification-v3"
-        else:
-            if artifact_version not in {"v2", "v3"}:
-                raise RuntimeError("unsupported additive classifier artifact version")
-            is_v3 = artifact_version == "v3"
-            primary_prompt_version = (
-                "open-match-primary-v3" if is_v3 else "open-match-primary-v2"
-            )
-            classification_schema_version = (
-                "source-message-classification-v3"
-                if is_v3
-                else "source-message-classification-v2"
-            )
-            ambiguity_prompt_version = (
-                "open-match-ambiguity-v2" if is_v3 else "open-match-ambiguity-v1"
-            )
-            semantic_proof_prompt_version = (
-                "open-match-semantic-proof-v2"
-                if is_v3
-                else "open-match-semantic-proof-v1"
-            )
-            semantic_proof_schema_version = (
-                "source-semantic-proof-v2" if is_v3 else "source-semantic-proof-v1"
-            )
-            semantic_proof_version = (
-                semantic_proof_prompt_version,
-                semantic_proof_schema_version,
-            )
-            primary_schema_version = classification_schema_version
-        proposal_contract_version = 5 if is_v3 else 4
+        descriptor = artifact_descriptor or self.model.artifact_descriptor
+        if (
+            not classifier_artifact_descriptor_is_trusted(descriptor)
+            or descriptor.primary_schema_version != self.model.primary_schema_version
+        ):
+            raise RuntimeError("classifier adapter exposes an incoherent artifact")
+        if descriptor.primary_schema_version not in {
+            "source-message-classification-v2",
+            "source-message-classification-v3",
+        }:
+            raise RuntimeError("classifier adapter exposes unsupported artifacts")
+        if descriptor.ambiguity_prompt_version is None:
+            raise RuntimeError("additive classifier artifact has no ambiguity prompt")
+        classification_schema_version = descriptor.primary_schema_version
+        primary_prompt_version = descriptor.primary_prompt_version
+        ambiguity_prompt_version = descriptor.ambiguity_prompt_version
+        proposal_contract_version = descriptor.contract_envelope_version
         payload = incoming.payload
         if not isinstance(payload, dict):
             raise TypeError("ClassifySourceMessageRevision payload must be an object")
@@ -11506,6 +11853,7 @@ class RuntimeApplication:
         if not isinstance(revision_id, str) or not isinstance(body, str):
             raise ValueError("classifier command requires revision identity and body")
 
+        routing_policy_version = descriptor.routing_policy_version
         request = ClassifierRequest(
             source_message_revision_id=_opaque_classifier_reference(
                 revision_id, kind="revision"
@@ -11536,7 +11884,7 @@ class RuntimeApplication:
             schema_version=classification_schema_version,
             glossary_version="football-opportunity-glossary-v1",
             context_policy_version="classifier-context-v1",
-            routing_policy_version="classifier-routing-v1",
+            routing_policy_version=routing_policy_version,
             pass_kind="primary",
         )
 
@@ -11592,7 +11940,11 @@ class RuntimeApplication:
                 _classifier_adapter_result_has_complete_provenance(result)
                 and result.effective_model == "gpt-5.6-sol"
                 and result.effective_reasoning_effort == "high"
-                and classifier_output_is_schema_valid(result.output, body=body)
+                and classifier_output_is_schema_valid(
+                    result.output,
+                    body=body,
+                    artifact_descriptor=descriptor,
+                )
                 and result.output.get("schema_version") == classification_schema_version
             )
 
@@ -11970,7 +12322,11 @@ class RuntimeApplication:
                 _classifier_adapter_result_has_complete_provenance(second_result)
                 and second_result.effective_model == "gpt-5.6-sol"
                 and second_result.effective_reasoning_effort == "high"
-                and classifier_output_is_schema_valid(second_result.output, body=body)
+                and classifier_output_is_schema_valid(
+                    second_result.output,
+                    body=body,
+                    artifact_descriptor=descriptor,
+                )
                 and second_result.output.get("schema_version")
                 == classification_schema_version
             )
@@ -12191,7 +12547,11 @@ class RuntimeApplication:
         semantic_proof_provider_retry_at: datetime | None = None
         if final_output.get(
             "disposition"
-        ) == "accepted" and classifier_output_is_schema_valid(final_output, body=body):
+        ) == "accepted" and classifier_output_is_schema_valid(
+            final_output,
+            body=body,
+            artifact_descriptor=descriptor,
+        ):
             candidates = final_output.get("candidates")
             if isinstance(candidates, list):
                 for candidate in candidates:
@@ -12206,12 +12566,21 @@ class RuntimeApplication:
                         or not isinstance(routes, list)
                     ):
                         continue
+                    proof_meaning = candidate.get("opportunity_type")
+                    if not isinstance(proof_meaning, str):
+                        proof_meaning = "open_match"
+                    proof_prompt_version = descriptor.semantic_proof_prompt_version_for(
+                        proof_meaning
+                    )
+                    proof_schema_version = descriptor.semantic_proof_version_for(
+                        proof_meaning
+                    )
                     if candidate_key in stored_proof_keys:
                         continue
                     proof_request = replace(
                         final_request,
-                        prompt_version=semantic_proof_version[0],
-                        schema_version=semantic_proof_version[1],
+                        prompt_version=proof_prompt_version,
+                        schema_version=proof_schema_version,
                         context_bundle_version="semantic-proof-context-v1",
                         context_policy_version="semantic-proof-context-v1",
                         pass_kind="semantic_proof",
@@ -12309,12 +12678,8 @@ class RuntimeApplication:
                             candidate_key=candidate_key,
                             evidence=evidence,
                             routes=routes,
-                            meaning=(
-                                cast(str, candidate["opportunity_type"])
-                                if isinstance(candidate.get("opportunity_type"), str)
-                                else "open_match"
-                            ),
-                            semantic_proof_version=semantic_proof_version[1],
+                            meaning=proof_meaning,
+                            artifact_descriptor=descriptor,
                         )
                         proof_attempt = _classification_attempt_from_result(
                             proof_recorded_result,
@@ -12922,7 +13287,45 @@ class RuntimeApplication:
                 is not None
             },
         }
+        if (
+            incoming.contract_version not in {4, 5}
+            and player_classifier_proposal_contains_player(authoritative_payload)
+            and not player_classifier_promotion_is_approved(
+                self.store.classifier_release_promotion(
+                    release_name=PLAYER_CLASSIFIER_RELEASE_NAME
+                ),
+                proposal=authoritative_payload,
+            )
+        ):
+            self._record_classification_routing_outcome(
+                incoming=incoming,
+                outcome=_classification_routing_outcome(
+                    authoritative_payload,
+                    source_message_revision_id=revision_id,
+                    reason_code="application_validation_failed",
+                    recorded_at=self.clock.now(),
+                    pass_number=_classification_pass_number(authoritative_payload),
+                ),
+                received_at=self.clock.now(),
+            )
+            return
         if incoming.contract_version in {4, 5}:
+            artifact_descriptor = _classifier_artifact_descriptor_for_payload(
+                authoritative_payload,
+                contract_envelope_version=incoming.contract_version,
+            )
+            if artifact_descriptor is None:
+                self._record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
             v4_output = authoritative_payload.get("output")
             v4_pass_number = authoritative_payload.get("pass_number")
             if not isinstance(v4_output, dict):
@@ -12988,6 +13391,7 @@ class RuntimeApplication:
                 revision_id=revision_id,
                 body=source_revision.body,
                 artifact_version=("v3" if incoming.contract_version == 5 else "v2"),
+                artifact_descriptor=artifact_descriptor,
             ):
                 self._record_classification_routing_outcome(
                     incoming=incoming,
@@ -12995,6 +13399,30 @@ class RuntimeApplication:
                         authoritative_payload,
                         source_message_revision_id=revision_id,
                         reason_code="provenance_invalid",
+                        recorded_at=self.clock.now(),
+                        pass_number=(
+                            v4_pass_number if isinstance(v4_pass_number, int) else 1
+                        ),
+                    ),
+                    received_at=self.clock.now(),
+                )
+                return
+            if player_classifier_proposal_contains_player(
+                authoritative_payload
+            ) and not (
+                player_classifier_promotion_is_approved(
+                    self.store.classifier_release_promotion(
+                        release_name=PLAYER_CLASSIFIER_RELEASE_NAME
+                    ),
+                    proposal=authoritative_payload,
+                )
+            ):
+                self._record_classification_routing_outcome(
+                    incoming=incoming,
+                    outcome=_classification_routing_outcome(
+                        authoritative_payload,
+                        source_message_revision_id=revision_id,
+                        reason_code="application_validation_failed",
                         recorded_at=self.clock.now(),
                         pass_number=(
                             v4_pass_number if isinstance(v4_pass_number, int) else 1
@@ -13060,7 +13488,7 @@ class RuntimeApplication:
                         candidate=candidate,
                         proof=proof,
                     )
-                    accepted_candidate = _validated_classification_proposal(
+                    accepted_candidate = _validated_opportunity_proposal(
                         candidate_payload,
                         resolver=self.location_resolver,
                         timezone_data=self.timezone_data,
@@ -13228,7 +13656,7 @@ class RuntimeApplication:
                 candidate=candidate,
                 proof=proof,
             )
-        accepted = _validated_classification_proposal(
+        accepted = _validated_opportunity_proposal(
             authoritative_payload,
             resolver=self.location_resolver,
             timezone_data=self.timezone_data,
@@ -13884,12 +14312,20 @@ class RuntimeApplication:
         area_types = payload.get("sub_city_area_geographic_types", [])
         area_parent_ids = payload.get("sub_city_area_verified_parent_ids", [])
         whole_city = payload.get("whole_city")
+        number_of_players = payload.get("number_of_players")
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("RunSearch requires telegram_user_id")
         if not isinstance(search_update_id, str) or not search_update_id:
             raise ValueError("RunSearch requires search_update_id")
         if not isinstance(user_intent, str):
             raise TypeError("RunSearch requires user_intent")
+        if number_of_players is not None and (
+            user_intent != UserIntent.PLAYER_SEARCH.value
+            or not isinstance(number_of_players, int)
+            or isinstance(number_of_players, bool)
+            or number_of_players < 1
+        ):
+            raise ValueError("Number of Players must be a positive integer")
         if not isinstance(country_id, str) or not country_id:
             raise ValueError("RunSearch requires country_id")
         if not isinstance(city_id, str) or not city_id:
@@ -13999,6 +14435,7 @@ class RuntimeApplication:
                 tuple(value for value in parent_ids if isinstance(value, str))
                 for parent_ids in typed_area_parent_ids
             ),
+            number_of_players=number_of_players,
         )
         outgoing = ContractEnvelope(
             contract_name=ContractName.SEARCH_COMPLETED,
@@ -14915,6 +15352,9 @@ def _classifier_proposal_has_pinned_provenance(
         "source-message-classification-v2",
         "source-message-classification-v3",
     }:
+        descriptor = _classifier_artifact_descriptor_for_payload(payload)
+        if descriptor is None:
+            return False
         return _v2_classifier_proposal_has_pinned_provenance(
             payload,
             revision_id=revision_id,
@@ -14924,6 +15364,7 @@ def _classifier_proposal_has_pinned_provenance(
                 if payload.get("schema_version") == "source-message-classification-v3"
                 else "v2"
             ),
+            artifact_descriptor=descriptor,
         )
     attempt_number = payload.get("attempt_number")
     if (
@@ -14999,23 +15440,69 @@ def _classifier_proposal_has_pinned_provenance(
     )
 
 
+def _classifier_model_uses_player_release(model: ModelAdapter) -> bool:
+    """Identify the Player artifact set from the adapter's trusted descriptor."""
+    return model.artifact_descriptor.artifact_family == "player_match_availability"
+
+
+def _classifier_artifact_descriptor_for_payload(
+    payload: Mapping[str, JsonValue],
+    *,
+    contract_envelope_version: int | None = None,
+) -> ClassifierArtifactDescriptor | None:
+    """Recover one exact immutable descriptor from persisted execution metadata."""
+    prompt_version = payload.get("prompt_version")
+    schema_version = payload.get("schema_version")
+    routing_policy_version = payload.get("routing_policy_version")
+    if not all(
+        isinstance(value, str)
+        for value in (prompt_version, schema_version, routing_policy_version)
+    ):
+        return None
+    assert isinstance(prompt_version, str)
+    assert isinstance(schema_version, str)
+    assert isinstance(routing_policy_version, str)
+    return classifier_artifact_descriptor_for_provenance(
+        prompt_version=prompt_version,
+        schema_version=schema_version,
+        routing_policy_version=routing_policy_version,
+        contract_envelope_version=contract_envelope_version,
+    )
+
+
 def _classifier_artifact_versions(
-    primary_schema_version: JsonValue,
+    primary_schema_version: JsonValue, *, player_release: bool = False
 ) -> tuple[str, str, tuple[str, str]] | None:
-    """Return the immutable prompt/schema identities for one primary version."""
-    if primary_schema_version == "source-message-classification-v2":
+    """Return immutable artifact identities for an adapter-selected release."""
+    descriptor = classifier_artifact_descriptor_for_primary(
+        str(primary_schema_version),
+        primary_prompt_version=(
+            "player-match-primary-v1"
+            if player_release
+            and primary_schema_version == "source-message-classification-v3"
+            else (
+                "open-match-primary-v3"
+                if primary_schema_version == "source-message-classification-v3"
+                else None
+            )
+        ),
+    )
+    if descriptor is None:
+        return None
+    if descriptor.ambiguity_prompt_version is None:
         return (
-            "open-match-primary-v2",
-            "open-match-ambiguity-v1",
-            ("open-match-semantic-proof-v1", "source-semantic-proof-v1"),
+            descriptor.primary_prompt_version,
+            descriptor.primary_prompt_version,
+            (
+                descriptor.semantic_proof_prompt_version,
+                descriptor.semantic_proof_version,
+            ),
         )
-    if primary_schema_version == "source-message-classification-v3":
-        return (
-            "open-match-primary-v3",
-            "open-match-ambiguity-v2",
-            ("open-match-semantic-proof-v2", "source-semantic-proof-v2"),
-        )
-    return None
+    return (
+        descriptor.primary_prompt_version,
+        descriptor.ambiguity_prompt_version,
+        (descriptor.semantic_proof_prompt_version, descriptor.semantic_proof_version),
+    )
 
 
 def _v2_classifier_proposal_has_pinned_provenance(
@@ -15024,14 +15511,21 @@ def _v2_classifier_proposal_has_pinned_provenance(
     revision_id: str,
     body: str,
     artifact_version: str = "v2",
+    player_release: bool = False,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Validate v2 final-pass provenance and its deterministic input manifest."""
-    artifact_versions = _classifier_artifact_versions(payload.get("schema_version"))
-    if artifact_versions is None:
+    descriptor = artifact_descriptor or _classifier_artifact_descriptor_for_payload(
+        payload
+    )
+    if descriptor is None:
         return False
-    primary_prompt_version, ambiguity_prompt_version, _ = artifact_versions
+    primary_prompt_version = descriptor.primary_prompt_version
+    ambiguity_prompt_version = descriptor.ambiguity_prompt_version
     pass_number = payload.get("pass_number")
     if pass_number not in {1, 2}:
+        return False
+    if pass_number == 2 and ambiguity_prompt_version is None:
         return False
     attempt_number = payload.get("attempt_number")
     if (
@@ -15053,10 +15547,10 @@ def _v2_classifier_proposal_has_pinned_provenance(
         "requested_reasoning_effort": "high",
         "effective_reasoning_effort": "high",
         "prompt_version": prompt_version,
-        "schema_version": payload["schema_version"],
+        "schema_version": descriptor.primary_schema_version,
         "glossary_version": "football-opportunity-glossary-v1",
         "context_policy_version": "classifier-context-v1",
-        "routing_policy_version": "classifier-routing-v1",
+        "routing_policy_version": descriptor.routing_policy_version,
         "context_bundle_version": "primary-classifier-context-v1",
     }
     manifest = {
@@ -15297,12 +15791,17 @@ def _v4_classifier_provenance_is_current(
     revision_id: str,
     body: str,
     artifact_version: str = "v2",
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Require current ambiguity and distinct proof execution per candidate."""
-    artifact_versions = _classifier_artifact_versions(payload.get("schema_version"))
-    if artifact_versions is None:
+    descriptor = artifact_descriptor or _classifier_artifact_descriptor_for_payload(
+        payload
+    )
+    if descriptor is None or descriptor.ambiguity_prompt_version is None:
         return False
-    _, ambiguity_prompt_version, semantic_proof_version = artifact_versions
+    ambiguity_prompt_version = descriptor.ambiguity_prompt_version
+    primary_schema_version = descriptor.primary_schema_version
+    routing_policy_version = descriptor.routing_policy_version
     output = payload.get("output")
     if (
         not isinstance(output, dict)
@@ -15312,6 +15811,7 @@ def _v4_classifier_provenance_is_current(
             revision_id=revision_id,
             body=body,
             artifact_version=artifact_version,
+            artifact_descriptor=descriptor,
         )
     ):
         return False
@@ -15337,10 +15837,10 @@ def _v4_classifier_provenance_is_current(
             revision_id=revision_id,
             body=body,
             prompt_version=ambiguity_prompt_version,
-            schema_version=str(payload["schema_version"]),
+            schema_version=primary_schema_version,
             context_bundle_version="primary-classifier-context-v1",
             context_policy_version="classifier-context-v1",
-            routing_policy_version="classifier-routing-v1",
+            routing_policy_version=routing_policy_version,
             pass_kind="ambiguity_second_pass",
             pass_number=2,
             attempt_number=ambiguity_attempt_number,
@@ -15400,6 +15900,18 @@ def _v4_classifier_provenance_is_current(
             return False
         candidate_key = wrapper.get("candidate_key")
         execution = wrapper.get("execution")
+        candidate = (
+            candidate_by_key.get(candidate_key)
+            if isinstance(candidate_key, str)
+            else None
+        )
+        candidate_meaning = (
+            candidate.get("opportunity_type")
+            if isinstance(candidate, dict)
+            else "open_match"
+        )
+        if not isinstance(candidate_meaning, str):
+            candidate_meaning = "open_match"
         proof_attempt_number = (
             execution.get("attempt_number") if isinstance(execution, dict) else None
         )
@@ -15416,15 +15928,17 @@ def _v4_classifier_provenance_is_current(
                 payload=payload,
                 revision_id=revision_id,
                 body=body,
-                prompt_version=semantic_proof_version[0],
-                schema_version=semantic_proof_version[1],
+                prompt_version=descriptor.semantic_proof_prompt_version_for(
+                    candidate_meaning
+                ),
+                schema_version=descriptor.semantic_proof_version_for(candidate_meaning),
                 context_bundle_version="semantic-proof-context-v1",
                 context_policy_version="semantic-proof-context-v1",
-                routing_policy_version="classifier-routing-v1",
+                routing_policy_version=routing_policy_version,
                 pass_kind="semantic_proof",
                 pass_number=proof_pass_number,
                 attempt_number=proof_attempt_number,
-                candidate=candidate_by_key[candidate_key],
+                candidate=candidate,
             )
         ):
             return False
@@ -15560,23 +16074,17 @@ def _proposition_evidence_is_authoritative(
     source_message_revision_reference: str | None = None,
     meaning: str = "open_match",
     opportunity_type: str | None = None,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> bool:
     """Accept one graph only when the Application semantic-proof boundary passes."""
-    semantic_proof_version = (
-        SEMANTIC_PROOF_V2_VERSION
-        if isinstance(semantic_proof, dict)
-        and semantic_proof.get("contract_version") == SEMANTIC_PROOF_V2_VERSION
-        else "source-semantic-proof-v1"
-    )
-    proposition_version = (
-        PROPOSITION_EVIDENCE_V2_VERSION
-        if isinstance(value, dict)
-        and value.get("contract_version") == PROPOSITION_EVIDENCE_V2_VERSION
-        else "source-proposition-evidence-v1"
-    )
+    descriptor = artifact_descriptor or OPEN_MATCH_V1_DESCRIPTOR
     effective_opportunity_type = (
         meaning if opportunity_type is None else opportunity_type
     )
+    semantic_proof_version = descriptor.semantic_proof_version_for(
+        effective_opportunity_type
+    )
+    proposition_version = descriptor.proposition_version_for(effective_opportunity_type)
     if source_message_revision_reference is None or not semantic_proof_is_authoritative(
         semantic_proof,
         body=body,
@@ -15586,6 +16094,7 @@ def _proposition_evidence_is_authoritative(
         routes=routes,
         opportunity_type=effective_opportunity_type,
         semantic_proof_version=semantic_proof_version,
+        artifact_descriptor=descriptor,
     ):
         return False
     if not proposition_evidence_is_schema_valid(
@@ -15596,6 +16105,7 @@ def _proposition_evidence_is_authoritative(
         routes=routes,
         opportunity_type=effective_opportunity_type,
         proposition_version=proposition_version,
+        artifact_descriptor=descriptor,
     ):
         return False
     graph = canonical_proposition_graph_from_wire(
@@ -15691,8 +16201,22 @@ def _proposition_evidence_is_authoritative(
 _MANDATORY_OPEN_MATCH_FACTS = frozenset(
     {"opportunity", "event_time", "location", "open_places"}
 )
+_MANDATORY_PLAYER_MATCH_FACTS = frozenset({"opportunity", "event_time", "location"})
 _OPTIONAL_OPEN_MATCH_FACTS = frozenset(
     {
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+    }
+)
+_OPTIONAL_PLAYER_MATCH_FACTS = frozenset(
+    {
+        "available_player_count",
+        "available_player_count_min",
+        "available_player_count_max",
         "team_formats",
         "positions",
         "playing_levels",
@@ -15923,9 +16447,7 @@ def _proposition_lineage_features(
         or not isinstance(response_route, dict)
     ):
         raise ValueError("proposition lineage target is incomplete")
-    features: dict[str, JsonValue] = {
-        "opportunity_type": value.get("opportunity_type"),
-    }
+    features: dict[str, JsonValue] = {}
     for key in _PROPOSITION_LINEAGE_FACT_KEYS:
         features[f"fact:{key}"] = accepted_facts.get(key)
     for key in _PROPOSITION_LINEAGE_EVIDENCE_KEYS:
@@ -15933,6 +16455,22 @@ def _proposition_lineage_features(
         features[f"evidence:{key}"] = (
             evidence_value if isinstance(evidence_value, str) else None
         )
+    if value.get("opportunity_type") == "player_match_availability":
+        for key in (
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        ):
+            features[f"fact:{key}"] = accepted_facts.get(key)
+        for key in (
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        ):
+            evidence_value = evidence.get(key)
+            features[f"evidence:{key}"] = (
+                evidence_value if isinstance(evidence_value, str) else None
+            )
     if value.get("opportunity_type") == "opponent_request":
         features["fact:opponent_request"] = accepted_facts.get("opponent_request")
         features["fact:venue_provision"] = accepted_facts.get("venue_provision")
@@ -15974,6 +16512,7 @@ def _proposition_opportunity_id(
         "open_match",
         "opponent_request",
         "tournament",
+        "player_match_availability",
         "roster_vacancy",
         "player_transfer_availability",
     }:
@@ -15987,7 +16526,7 @@ def _legacy_candidate_alias_for_canonical(
     *,
     source_message_id: str,
     opportunity_id: str,
-    opportunity_type: str = "open_match",
+    opportunity_type: str | None = None,
 ) -> str | None:
     """Return the exact historical candidate alias for one proposition id."""
     prefix = f"opportunity:{source_message_id}:{opportunity_type}:proposition:"
@@ -15997,6 +16536,7 @@ def _legacy_candidate_alias_for_canonical(
             "opponent_request",
             "tournament",
             "roster_vacancy",
+            "player_match_availability",
             "player_transfer_availability",
         ):
             candidate_prefix = (
@@ -16026,37 +16566,62 @@ def _canonicalize_legacy_proposition_records(
     """Reconcile legacy candidate rows into the canonical Application lineage."""
     canonical_records: list[dict[str, JsonValue]] = []
     seen_opportunity_ids: set[str] = set()
+    allowed_types = {
+        "open_match",
+        "player_match_availability",
+        "opponent_request",
+        "tournament",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }
     for record in persisted_records:
         opportunity_id = record.get("opportunity_id")
         if not isinstance(opportunity_id, str) or not opportunity_id:
             canonical_records.append(dict(record))
             continue
         record_type = record.get("opportunity_type", "open_match")
-        if not isinstance(record_type, str) or record_type not in {
-            "open_match",
-            "opponent_request",
-            "tournament",
-            "roster_vacancy",
-            "player_transfer_availability",
-        }:
+        if not isinstance(record_type, str) or record_type not in allowed_types:
             return None
-        legacy_prefix = f"opportunity:{source_message_id}:{record_type}:candidate:"
         if ":candidate:" in opportunity_id:
+            legacy_prefix = f"opportunity:{source_message_id}:"
             if not opportunity_id.startswith(legacy_prefix):
                 return None
-            candidate_hash = opportunity_id.removeprefix(legacy_prefix)
+            legacy_type, candidate_hash = opportunity_id.removeprefix(
+                legacy_prefix
+            ).split(":candidate:", 1)
+            canonical_type = (
+                record_type if record_type in allowed_types else legacy_type
+            )
+            if canonical_type not in allowed_types:
+                return None
             if len(candidate_hash) != 16 or any(
                 character not in "0123456789abcdef" for character in candidate_hash
             ):
                 return None
             opportunity_id = (
-                f"opportunity:{source_message_id}:{record_type}:proposition:"
+                f"opportunity:{source_message_id}:{canonical_type}:proposition:"
                 f"{candidate_hash}"
             )
-        elif ":proposition:" in opportunity_id and not opportunity_id.startswith(
-            f"opportunity:{source_message_id}:{record_type}:proposition:"
-        ):
-            return None
+        elif ":proposition:" in opportunity_id:
+            canonical_prefix = f"opportunity:{source_message_id}:"
+            if not opportunity_id.startswith(canonical_prefix):
+                return None
+            stored_type, proposition_hash = opportunity_id.removeprefix(
+                canonical_prefix
+            ).split(":proposition:", 1)
+            if (
+                stored_type not in allowed_types
+                or len(proposition_hash) != 16
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in proposition_hash
+                )
+            ):
+                return None
+            opportunity_id = (
+                f"opportunity:{source_message_id}:{stored_type}:proposition:"
+                f"{proposition_hash}"
+            )
         if opportunity_id in seen_opportunity_ids:
             return None
         seen_opportunity_ids.add(opportunity_id)
@@ -16160,10 +16725,6 @@ def _reconcile_proposition_lineages(
     def score(candidate_index: int, record_index: int) -> int:
         candidate_values = candidate_features[candidate_index]
         record_values = record_features[record_index]
-        if candidate_values.get("opportunity_type") != record_values.get(
-            "opportunity_type"
-        ):
-            return -1
         return sum(
             candidate_values[key] == record_values[key]
             for key in candidate_values.keys() & record_values.keys()
@@ -16405,6 +16966,10 @@ def _proposition_graph_has_closed_target_set(
         )
         expected_mandatory = _MANDATORY_TOURNAMENT_FACTS | participation_ids
         allowed_facts = _MANDATORY_TOURNAMENT_FACTS | _OPTIONAL_TOURNAMENT_FACTS
+    elif effective_meaning == "player_match_availability":
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_PLAYER_MATCH_FACTS
+        allowed_facts = _MANDATORY_PLAYER_MATCH_FACTS | _OPTIONAL_PLAYER_MATCH_FACTS
     elif effective_meaning == "opponent_request":
         participation_ids = set()
         expected_mandatory = _MANDATORY_OPPONENT_REQUEST_FACTS
@@ -16487,10 +17052,11 @@ def _source_player_participation_is_current(body: str) -> bool:
     )
 
 
-def _validated_open_match_proposal(
+def _validated_opportunity_proposal(
     payload_value: JsonValue,
     *,
     resolver: LocationResolverAdapter,
+    expected_opportunity_type: str | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
 ) -> dict[str, JsonValue] | None:
     """Accept only schema-, evidence-, domain-, route-, and location-valid facts."""
@@ -16500,6 +17066,7 @@ def _validated_open_match_proposal(
     revision_id = payload_value.get("source_message_revision_id")
     output = payload_value.get("output")
     semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
@@ -16510,7 +17077,10 @@ def _validated_open_match_proposal(
             body=body,
         )
         or not isinstance(output, dict)
-        or not classifier_output_is_schema_valid(output, body=body)
+        or artifact_descriptor is None
+        or not classifier_output_is_schema_valid(
+            output, body=body, artifact_descriptor=artifact_descriptor
+        )
         or output.get("disposition") != "accepted"
     ):
         return None
@@ -16523,11 +17093,21 @@ def _validated_open_match_proposal(
     opportunity_type = candidate.get("opportunity_type")
     if not isinstance(opportunity_type, str) or opportunity_type not in {
         "open_match",
+        "player_match_availability",
         "opponent_request",
+        "tournament",
         "roster_vacancy",
         "player_transfer_availability",
     }:
         return None
+    if (
+        expected_opportunity_type is not None
+        and opportunity_type != expected_opportunity_type
+    ):
+        return None
+    if opportunity_type == "tournament":
+        return _validated_tournament_proposal(payload_value, resolver=resolver)
+    is_player_match = opportunity_type == "player_match_availability"
     if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
         return _validated_transfer_proposal(
             payload_value,
@@ -16536,6 +17116,7 @@ def _validated_open_match_proposal(
             timezone_data=timezone_data,
         )
     is_opponent_request = opportunity_type == "opponent_request"
+    player_candidate = is_player_match
     required = {
         "candidate_key",
         "opportunity_type",
@@ -16544,7 +17125,10 @@ def _validated_open_match_proposal(
         "event_time",
         "response_routes",
     }
-    required.add("opponent_request" if is_opponent_request else "open_places")
+    if is_opponent_request:
+        required.add("opponent_request")
+    elif not player_candidate:
+        required.add("open_places")
     optional = {
         "team_formats",
         "playing_levels",
@@ -16552,7 +17136,18 @@ def _validated_open_match_proposal(
         "playing_surfaces",
         "payment",
     }
-    optional.add("venue_provision" if is_opponent_request else "positions")
+    if is_opponent_request:
+        optional.add("venue_provision")
+    else:
+        optional.add("positions")
+    if player_candidate:
+        optional.update(
+            {
+                "available_player_count",
+                "available_player_count_min",
+                "available_player_count_max",
+            }
+        )
     structured = {"proposition_evidence", "source_context"}
     if (
         not required.issubset(candidate)
@@ -16568,7 +17163,8 @@ def _validated_open_match_proposal(
     expected_evidence = (
         {"opportunity", "event_time", "location", "opponent_request"}
         if is_opponent_request
-        else {"opportunity", "event_time", "location", "open_places"}
+        else {"opportunity", "event_time", "location"}
+        | ({"open_places"} if not player_candidate else set())
     ) | (set(candidate) & optional)
     if (
         not isinstance(candidate_key, str)
@@ -16607,6 +17203,7 @@ def _validated_open_match_proposal(
             revision_id, kind="revision"
         ),
         meaning=opportunity_type,
+        artifact_descriptor=artifact_descriptor,
     ):
         return None
     if route is None:
@@ -16658,7 +17255,20 @@ def _validated_open_match_proposal(
     )
     if len(places) != 1:
         return None
-    open_places = None if is_opponent_request else candidate.get("open_places")
+    open_places = (
+        candidate.get("open_places")
+        if not is_opponent_request and not player_candidate
+        else None
+    )
+    available_player_count = (
+        candidate.get("available_player_count") if player_candidate else None
+    )
+    available_player_count_min = (
+        candidate.get("available_player_count_min") if player_candidate else None
+    )
+    available_player_count_max = (
+        candidate.get("available_player_count_max") if player_candidate else None
+    )
     team_formats = candidate.get("team_formats")
     positions = candidate.get("positions")
     levels = candidate.get("playing_levels")
@@ -16668,11 +17278,23 @@ def _validated_open_match_proposal(
     payment = candidate.get("payment")
     if (
         (
-            open_places is not None
-            and (
-                not isinstance(open_places, int)
-                or isinstance(open_places, bool)
-                or open_places < 1
+            (player_candidate and open_places is not None)
+            or (
+                not player_candidate
+                and open_places is not None
+                and (
+                    not isinstance(open_places, int)
+                    or isinstance(open_places, bool)
+                    or open_places < 1
+                )
+            )
+        )
+        or (
+            player_candidate
+            and not _player_availability_count_is_valid(
+                available_player_count,
+                available_player_count_min,
+                available_player_count_max,
             )
         )
         or not _optional_canonical_list(
@@ -16764,9 +17386,20 @@ def _validated_open_match_proposal(
         or mention not in str(evidence["location"])
         or not _location_mention_is_authoritative(validation_body, mention)
         or (
-            not is_opponent_request
+            player_candidate
+            and not _player_availability_is_supported(
+                available_player_count,
+                available_player_count_min,
+                available_player_count_max,
+                _player_availability_evidence_text(evidence),
+                authoritative_body=validation_body,
+            )
+        )
+        or (
+            not player_candidate
+            and not is_opponent_request
             and not _open_places_are_supported(
-                open_places,
+                open_places if isinstance(open_places, int) else None,
                 f"{evidence['opportunity']}. {evidence['open_places']}",
                 authoritative_body=validation_body,
             )
@@ -16856,6 +17489,9 @@ def _validated_open_match_proposal(
                 "payment": None if payment == "unknown" else payment,
             }
         ),
+        "available_player_count": available_player_count,
+        "available_player_count_min": available_player_count_min,
+        "available_player_count_max": available_player_count_max,
         "payment_amount": payment_details[0] if payment_details is not None else None,
         "payment_currency": (
             payment_details[1] if payment_details is not None else None
@@ -16863,6 +17499,15 @@ def _validated_open_match_proposal(
         "source_posted_at": publication_posted_at,
         **({"source_edited_at": publication_edited_at} if is_opponent_request else {}),
     }
+    if player_candidate:
+        accepted_facts.pop("open_places", None)
+    else:
+        for count_key in (
+            "available_player_count",
+            "available_player_count_min",
+            "available_player_count_max",
+        ):
+            accepted_facts.pop(count_key, None)
     return {
         "opportunity_id": (
             f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:{opportunity_type}"
@@ -16891,6 +17536,7 @@ def _validated_tournament_proposal(
     revision_id = payload_value.get("source_message_revision_id")
     output = payload_value.get("output")
     semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
@@ -16901,7 +17547,10 @@ def _validated_tournament_proposal(
             body=body,
         )
         or not isinstance(output, dict)
-        or not classifier_output_is_schema_valid(output, body=body)
+        or artifact_descriptor is None
+        or not classifier_output_is_schema_valid(
+            output, body=body, artifact_descriptor=artifact_descriptor
+        )
         or output.get("disposition") != "accepted"
     ):
         return None
@@ -16982,6 +17631,7 @@ def _validated_tournament_proposal(
                 revision_id, kind="revision"
             ),
             opportunity_type="tournament",
+            artifact_descriptor=artifact_descriptor,
         )
         or route is None
     ):
@@ -17246,6 +17896,21 @@ def _validated_tournament_proposal(
     }
 
 
+def _validated_open_match_proposal(
+    payload_value: JsonValue,
+    *,
+    resolver: LocationResolverAdapter,
+    timezone_data: TimezoneDataAdapter | None = None,
+) -> dict[str, JsonValue] | None:
+    """Keep the established Open Match validation seam explicit."""
+    return _validated_opportunity_proposal(
+        payload_value,
+        resolver=resolver,
+        expected_opportunity_type="open_match",
+        timezone_data=timezone_data,
+    )
+
+
 def _validated_transfer_proposal(
     payload_value: dict[str, JsonValue],
     *,
@@ -17257,10 +17922,12 @@ def _validated_transfer_proposal(
     body = payload_value.get("body")
     revision_id = payload_value.get("source_message_revision_id")
     semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
     opportunity_type = candidate.get("opportunity_type")
     if (
         not isinstance(body, str)
         or not isinstance(revision_id, str)
+        or artifact_descriptor is None
         or opportunity_type not in {"roster_vacancy", "player_transfer_availability"}
     ):
         return None
@@ -17332,6 +17999,7 @@ def _validated_transfer_proposal(
             revision_id, kind="revision"
         ),
         meaning=opportunity_type,
+        artifact_descriptor=artifact_descriptor,
     ):
         return None
     if route is None:
@@ -20020,10 +20688,252 @@ def _open_places_are_supported(
     )
 
 
+def _player_availability_count_is_valid(
+    exact: JsonValue,
+    minimum: JsonValue,
+    maximum: JsonValue,
+) -> bool:
+    """Validate one exact, bounded, or unknown available-player count."""
+    if exact is not None:
+        return (
+            isinstance(exact, int)
+            and not isinstance(exact, bool)
+            and exact > 0
+            and minimum is None
+            and maximum is None
+        )
+    if minimum is None and maximum is None:
+        return True
+    return (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and minimum > 0
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and maximum >= minimum
+    )
+
+
+def _player_availability_evidence_text(evidence: dict[str, JsonValue]) -> str:
+    """Combine count evidence without duplicating one source clause."""
+    parts: list[str] = []
+    for key in (
+        "opportunity",
+        "available_player_count",
+        "available_player_count_min",
+        "available_player_count_max",
+    ):
+        value = evidence.get(key)
+        if not isinstance(value, str):
+            continue
+        if any(value == part or value in part for part in parts):
+            continue
+        parts.append(value)
+    return ". ".join(parts)
+
+
+def _player_availability_is_supported(
+    exact: JsonValue,
+    minimum: JsonValue,
+    maximum: JsonValue,
+    evidence: str,
+    *,
+    authoritative_body: str | None = None,
+) -> bool:
+    """Require one source clause offering a jointly available Player group.
+
+    This parser is deliberately narrow. The model proposes evidence and counts;
+    this Application-owned gate only accepts a count when the same source clause
+    states that the group is available to play. Organizer requests are a
+    different proposition and never satisfy this gate.
+    """
+    if authoritative_body is not None:
+        return _player_availability_is_supported(
+            exact,
+            minimum,
+            maximum,
+            evidence,
+        ) and _player_availability_is_supported(
+            exact,
+            minimum,
+            maximum,
+            authoritative_body,
+        )
+    if not _player_availability_count_is_valid(exact, minimum, maximum):
+        return False
+    if _source_player_opening_state(evidence) is not PropositionState.CURRENT_POSITIVE:
+        return False
+
+    normalized = re.sub(r"['’]", " ", evidence.casefold())
+    player_or_group = re.compile(
+        r"\b(?:players?|player group|group|"
+        r"игрок\w*|групп\w*|"
+        r"jugadores?|grupo|"
+        r"joueurs?|groupe|"
+        r"goalkeepers?|defenders?|midfielders?|forwards?|"
+        r"вратар\w*|защитник\w*|полузащитник\w*|нападающ\w*|"
+        r"porteros?|defensas?|centrocampistas?|delanteros?|"
+        r"gardiens?|défenseurs?|milieux?|attaquants?)\b"
+    )
+    offering_language = re.compile(
+        r"\b(?:available|free\s+to\s+play|can\s+play|can\s+join|"
+        r"ready\s+to\s+play|we\s+are|we're|our\s+group|"
+        r"доступн\w*|готов\w*|можем\s+играть|могут\s+играть|"
+        r"мы\s+играем|"
+        r"disponible\w*|podemos\s+jugar|pueden\s+jugar|estamos\s+disponible\w*|"
+        r"disponible\w*|pouvons\s+jouer|peuvent\s+jouer|nous\s+sommes\s+disponible\w*)\b"
+    )
+    request_language = re.compile(
+        r"\b(?:need\w*|look(?:ing)?\s+for|seek(?:ing)?|wanted|require\w*|"
+        r"recruit\w*|needed|"
+        r"нуж\w*|ищ\w*|треб\w*|набор\w*|"
+        r"necesit\w*|busc\w*|hace\w*\s+falta|"
+        r"cherch\w*|recherch\w*|besoin\w*|recrut\w*)\b"
+    )
+    range_patterns = (
+        re.compile(
+            r"(?<![\d-])(?P<minimum>\d+)\s*[-–—]\s*"
+            r"(?P<maximum>\d+)(?![\d-])"
+        ),
+        re.compile(
+            r"(?<!\d)(?P<minimum>\d+)\s+(?:to|through)\s+"
+            r"(?P<maximum>\d+)(?!\d)"
+        ),
+        re.compile(r"\bbetween\s+(?P<minimum>\d+)\s+and\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bfrom\s+(?P<minimum>\d+)\s+to\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bот\s+(?P<minimum>\d+)\s+до\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bde\s+(?P<minimum>\d+)\s+(?:a|à)\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bentre\s+(?P<minimum>\d+)\s+y\s+(?P<maximum>\d+)\b"),
+        re.compile(r"\bentre\s+(?P<minimum>\d+)\s+et\s+(?P<maximum>\d+)\b"),
+    )
+    clauses = tuple(
+        clause.strip()
+        for clause in re.split(r"[.!?;\n]+", normalized)
+        if clause.strip()
+    )
+
+    def clause_offers_players(clause: str) -> bool:
+        return (
+            request_language.search(clause) is None
+            and player_or_group.search(clause) is not None
+            and offering_language.search(clause) is not None
+        )
+
+    quantity_clauses: list[tuple[tuple[tuple[int, int], ...], tuple[int, ...]]] = []
+    offering_clauses: list[tuple[tuple[tuple[int, int], ...], tuple[int, ...]]] = []
+    for clause in clauses:
+        ranges_with_spans = [
+            (
+                (int(match.group("minimum")), int(match.group("maximum"))),
+                match.span(),
+            )
+            for pattern in range_patterns
+            for match in pattern.finditer(clause)
+        ]
+        ranges = tuple(dict.fromkeys(pair for pair, _ in ranges_with_spans))
+        exact_matches = tuple(
+            int(match.group(1))
+            for match in re.finditer(
+                r"(?<!\d)(\d+)(?!\d)\s+"
+                r"(?:players?|игрок\w*|jugadores?|joueurs?)\b",
+                clause,
+            )
+            if not any(
+                range_start < match.end() and match.start() < range_end
+                for _, (range_start, range_end) in ranges_with_spans
+            )
+        )
+        if ranges or exact_matches:
+            quantity = (ranges, exact_matches)
+            quantity_clauses.append(quantity)
+            if clause_offers_players(clause):
+                offering_clauses.append(quantity)
+
+    # A source revision may contain several football sentences, but one
+    # published Player proposition must not combine quantity claims from them.
+    # Reject contradictory exact/range evidence even when punctuation splits the
+    # claims into separate clauses.
+    if any(ranges and exact_matches for ranges, exact_matches in quantity_clauses):
+        return False
+    if len(offering_clauses) > 1:
+        return False
+
+    if exact is not None:
+        return offering_clauses == [((), (exact,))]
+    if minimum is not None and maximum is not None:
+        return offering_clauses == [(((minimum, maximum),), ())]
+    return bool(offering_clauses) or (
+        not quantity_clauses
+        and any(clause_offers_players(clause) for clause in clauses)
+    )
+
+
 def _source_player_opening_state(body: str) -> PropositionState:
     """Classify the bounded current/closed state of a player opening."""
-    normalized = re.sub(r"['’]", " ", body.casefold())
+    normalized = body.casefold()
+    normalized = re.sub(
+        r"\b(aren|isn|wasn|weren|don|doesn|didn|can|couldn|won|wouldn|shouldn)\s*['’]\s*t\b",
+        r"\1 not",
+        normalized,
+    )
+    normalized = re.sub(r"['’]", " ", normalized)
     if _body_has_terminal_retraction(normalized):
+        return PropositionState.WITHDRAWN
+    negative_availability_patterns = (
+        r"\b(?:unavailable|not\s+available|not\s+free\s+to\s+play|"
+        r"not\s+ready\s+to\s+play|unable\s+to\s+(?:play|join|"
+        r"participate)|not\s+able\s+to\s+(?:play|join|participate)|"
+        r"not\s+capable\s+of\s+(?:playing|participating)|"
+        r"incapable\s+of\s+(?:playing|participating)|"
+        r"not\s+(?:playing|participating)|cannot\s+(?:play|join|"
+        r"participate)|can\s+not\s+(?:play|join|participate))\b",
+        r"\b(?:cannot|can\s+not|can\s+t|unable\s+to)\s+"
+        r"(?:play|join|participate|take\s+part)\b",
+        r"\b(?:no|zero)\s+(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
+        r"\b(?:available|free\s+to\s+play|ready\s+to\s+play|can\s+play)\b",
+        r"\b(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
+        r"\b(?:are|is|we\s+are|we\s+re)\s+not\s+"
+        r"(?:available|free\s+to\s+play|ready\s+to\s+play)\b",
+        r"\b(?:nobody|no\s+one|none)\s+(?:can|is\s+able\s+to)\s+"
+        r"(?:play|join|participate|take\s+part)\b",
+        r"\b(?:players?|player\s+group|group)\b[^.!?;\n]{0,50}"
+        r"\b(?:cannot|can\s+not|can\s+t|are\s+unable\s+to|"
+        r"are\s+not\s+able\s+to)\s+(?:play|join|participate|"
+        r"take\s+part)\b",
+        r"\b(?:недоступн\w*|не\s+доступн\w*|не\s+готов\w*|"
+        r"не\s+(?:могу|можем|может|могут)\s+играть|"
+        r"нет\s+(?:игрок\w*|групп\w*))\b",
+        r"\b(?:играть|участвовать|принять\s+участие)\s+не\s+"
+        r"(?:могу|можем|может|могут)|"
+        r"\bне\s+(?:могу|можем|может|могут|способ\w*)\s+"
+        r"(?:играть|участвовать|принять\s+участие)|"
+        r"\bне\s+в\s+состоянии\s+(?:играть|участвовать|принять\s+участие)|"
+        r"\b(?:никто|ни\s+один|ни\s+одного)\s+не\s+может\s+"
+        r"(?:играть|участвовать|принять\s+участие)\b",
+        r"\b(?:indisponible\w*|no\s+(?:estamos|están|son|pueden)\s+"
+        r"disponible\w*|no\s+disponible\w*|ningún\w*\s+"
+        r"(?:jugador\w*|grupo)|no\s+(?:podemos|pueden|puede|puedo)\s+"
+        r"(?:jugar|participar)|no\s+hay\s+(?:jugador\w*))\b",
+        r"\b(?:nadie|ningún\s+jugador|ningun\s+jugador|ninguno\s+de\s+ellos)\s+"
+        r"(?:puede|podemos|pueden)\s+(?:jugar|participar)\b|"
+        r"\b(?:no\s+(?:somos|son|es)\s+capaces\s+de|"
+        r"incapaz\w*\s+de|incapac\w*\s+de|no\s+podemos|no\s+pueden|"
+        r"no\s+puede|no\s+puedo)\s+(?:jugar|participar)\b",
+        r"\b(?:indisponible\w*|ne\s+(?:sommes|sont|peuvent)\s+pas\s+"
+        r"disponible\w*|ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+"
+        r"pas\s+(?:jouer|participer)|pas\s+disponible\w*|"
+        r"aucun\w*\s+(?:joueur\w*|groupe))\b",
+        r"\b(?:personne|aucun\s+joueur|aucune\s+équipe|aucun\s+d\s+entre\s+eux)\s+ne\s+"
+        r"peut\s+(?:jouer|participer)\b|"
+        r"\b(?:nous\s+ne\s+sommes\s+pas\s+capables\s+de|"
+        r"incapable\w*\s+de|impossible\s+de|"
+        r"ne\s+(?:pouvons|peuvent|peut|pouvez|peux)\s+pas)\s+"
+        r"(?:jouer|participer)\b",
+    )
+    if any(
+        re.search(pattern, normalized) is not None
+        for pattern in negative_availability_patterns
+    ):
         return PropositionState.WITHDRAWN
     closure_patterns = (
         r"\bvacanc(?:y|ies)\b[^.!?;\n]{0,40}"

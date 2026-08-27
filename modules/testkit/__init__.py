@@ -22,6 +22,14 @@ from modules.application import (
     RuntimeApplication,
     RuntimeProcessingError,
 )
+from modules.classifier_contract import (
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_primary,
+)
+from modules.classifier_promotion import (
+    PLAYER_CLASSIFIER_RELEASE_NAME,
+    describe_player_classifier_release,
+)
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
     ContractDefinition,
@@ -47,6 +55,8 @@ from modules.domain import (
     DateInterpretationQuery,
     DateInterpretationResolution,
     DiscoveryDraft,
+    ExactRepostCluster,
+    ExactRepostClusterMember,
     GeographicType,
     GeographyConfirmationEvent,
     IngestionFailure,
@@ -406,9 +416,20 @@ class ControlledTelegramIngestionAdapter:
         reply_route_url: str | None = None,
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
+        source_publisher_id: str | None = None,
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
+        bounded_metadata = {
+            "message_language": message_language,
+            "attachment_types": list(attachment_types),
+            "source_author_dm_url": source_author_dm_url,
+            "reply_route_url": reply_route_url,
+            "source_message_url": source_message_url,
+            "source_message_reply_capable": source_message_reply_capable,
+        }
+        if source_publisher_id is not None:
+            bounded_metadata["source_publisher_id"] = source_publisher_id
         self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
@@ -420,14 +441,7 @@ class ControlledTelegramIngestionAdapter:
             body=body,
             event_time=event_time,
             registry_generation=registry_generation,
-            bounded_metadata={
-                "message_language": message_language,
-                "attachment_types": list(attachment_types),
-                "source_author_dm_url": source_author_dm_url,
-                "reply_route_url": reply_route_url,
-                "source_message_url": source_message_url,
-                "source_message_reply_capable": source_message_reply_capable,
-            },
+            bounded_metadata=bounded_metadata,
             reply_to_telegram_message_id=reply_to_telegram_message_id,
         )
 
@@ -566,9 +580,20 @@ class ControlledTelegramIngestionAdapter:
         reply_route_url: str | None = None,
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
+        source_publisher_id: str | None = None,
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
+        bounded_metadata = {
+            "message_language": message_language,
+            "attachment_types": list(attachment_types),
+            "source_author_dm_url": source_author_dm_url,
+            "reply_route_url": reply_route_url,
+            "source_message_url": source_message_url,
+            "source_message_reply_capable": source_message_reply_capable,
+        }
+        if source_publisher_id is not None:
+            bounded_metadata["source_publisher_id"] = source_publisher_id
         self._channel_difference_events[(identity, from_checkpoint)] = (
             TelegramDifferenceEvent(
                 source_chat_identity=identity,
@@ -580,14 +605,7 @@ class ControlledTelegramIngestionAdapter:
                 kind=kind,
                 body=body,
                 event_time=event_time,
-                bounded_metadata={
-                    "message_language": message_language,
-                    "attachment_types": list(attachment_types),
-                    "source_author_dm_url": source_author_dm_url,
-                    "reply_route_url": reply_route_url,
-                    "source_message_url": source_message_url,
-                    "source_message_reply_capable": source_message_reply_capable,
-                },
+                bounded_metadata=bounded_metadata,
                 reply_to_telegram_message_id=reply_to_telegram_message_id,
             )
         )
@@ -896,12 +914,26 @@ class ControlledModelAdapter:
     second_pass_requests: list[ClassifierRequest] = field(default_factory=list)
     proof_requests: list[ClassifierRequest] = field(default_factory=list)
     primary_schema_version: str = "source-message-classification-v1"
+    primary_prompt_version: str = "open-match-primary-v1"
     smoke_test_passes: bool = True
 
     @property
     def adapter_kind(self) -> str:
         """Identify the isolated controlled adapter without a provider call."""
         return "controlled_recording"
+
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the immutable descriptor for the configured test release."""
+        descriptor = classifier_artifact_descriptor_for_primary(
+            self.primary_schema_version,
+            primary_prompt_version=self.primary_prompt_version,
+        )
+        if descriptor is None:
+            raise RuntimeError(
+                "controlled classifier has no trusted artifact descriptor"
+            )
+        return descriptor
 
     def schema_smoke_test(self) -> bool:
         """Return the configured synthetic schema-smoke result."""
@@ -933,10 +965,17 @@ class ControlledModelAdapter:
     def enable_primary_v2(self) -> None:
         """Opt the controlled model boundary into the additive v2 output."""
         self.primary_schema_version = "source-message-classification-v2"
+        self.primary_prompt_version = "open-match-primary-v2"
 
     def enable_primary_v3(self) -> None:
-        """Opt the controlled model boundary into the tournament-capable v3 output."""
+        """Opt the controlled model boundary into the additive Player release."""
         self.primary_schema_version = "source-message-classification-v3"
+        self.primary_prompt_version = "player-match-primary-v1"
+
+    def enable_open_match_primary_v3(self) -> None:
+        """Opt the controlled model boundary into the Tournament/open release."""
+        self.primary_schema_version = "source-message-classification-v3"
+        self.primary_prompt_version = "open-match-primary-v3"
 
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
@@ -966,6 +1005,7 @@ class ControlledModelAdapter:
             output=_ensure_test_proposition_evidence(
                 result.output,
                 body=request.body,
+                artifact_descriptor=self.artifact_descriptor,
             ),
         )
 
@@ -990,9 +1030,18 @@ class ControlledModelAdapter:
                     "controlled classifier result is not configured"
                 ) from error
             output = _build_test_semantic_proof(
-                _ensure_test_proposition_evidence(primary.output, body=request.body),
+                _ensure_test_proposition_evidence(
+                    primary.output,
+                    body=request.body,
+                    artifact_descriptor=self.artifact_descriptor,
+                ),
                 body=request.body,
                 source_message_revision_reference=request.source_message_revision_id,
+                proof_version=(
+                    "source-semantic-proof-v2"
+                    if request.schema_version == "source-semantic-proof-v2"
+                    else "source-semantic-proof-v1"
+                ),
             )
             return replace(primary, output=output)
         output = deepcopy(result.output)
@@ -1008,7 +1057,10 @@ class ControlledModelAdapter:
 
 
 def _ensure_test_proposition_evidence(
-    output: dict[str, JsonValue], *, body: str
+    output: dict[str, JsonValue],
+    *,
+    body: str,
+    artifact_descriptor: ClassifierArtifactDescriptor | None = None,
 ) -> dict[str, JsonValue]:
     """Give legacy controlled fixtures the current structured model shape."""
     enriched = deepcopy(output)
@@ -1017,14 +1069,19 @@ def _ensure_test_proposition_evidence(
     candidates = enriched.get("candidates")
     if not isinstance(candidates, list):
         return enriched
-    proposition_version = (
-        "source-proposition-evidence-v2"
-        if enriched.get("schema_version") == "source-message-classification-v3"
-        else "source-proposition-evidence-v1"
-    )
     for candidate in candidates:
         if not isinstance(candidate, dict) or "proposition_evidence" in candidate:
             continue
+        opportunity_type = candidate.get("opportunity_type")
+        proposition_version = (
+            artifact_descriptor.proposition_version_for(opportunity_type)
+            if artifact_descriptor is not None and isinstance(opportunity_type, str)
+            else (
+                "source-proposition-evidence-v2"
+                if enriched.get("schema_version") == "source-message-classification-v3"
+                else "source-proposition-evidence-v1"
+            )
+        )
         _add_test_proposition_evidence(
             candidate,
             body=body,
@@ -1047,6 +1104,7 @@ def _add_test_proposition_evidence(
         return
     if opportunity_type not in {
         "open_match",
+        "player_match_availability",
         "opponent_request",
         "tournament",
         "roster_vacancy",
@@ -1149,6 +1207,7 @@ def _build_test_semantic_proof(
     fact_state: str = "current_positive",
     route_state: str = "current_positive",
     check_state: str = "none",
+    proof_version: str = "source-semantic-proof-v1",
 ) -> dict[str, JsonValue]:
     """Build a complete proof fixture for controlled acceptance tests."""
     candidates = output.get("candidates")
@@ -1169,11 +1228,22 @@ def _build_test_semantic_proof(
         not in {
             "open_match",
             "tournament",
+            "player_match_availability",
             "opponent_request",
             "roster_vacancy",
             "player_transfer_availability",
         }
     ):
+        return {}
+    meaning = opportunity_type
+    if meaning not in {
+        "open_match",
+        "tournament",
+        "player_match_availability",
+        "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
+    }:
         return {}
 
     def span(text: str) -> dict[str, JsonValue]:
@@ -1257,14 +1327,12 @@ def _build_test_semantic_proof(
                 "span": {"start": 0, "end": len(body), "text": body},
             }
         )
-    semantic_proof_version = (
-        "source-semantic-proof-v2"
-        if (
-            output.get("schema_version") == "source-message-classification-v3"
-            or opportunity_type in {"roster_vacancy", "player_transfer_availability"}
-        )
-        else "source-semantic-proof-v1"
-    )
+    semantic_proof_version = proof_version
+    if semantic_proof_version == "source-semantic-proof-v1" and (
+        output.get("schema_version") == "source-message-classification-v3"
+        or opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+    ):
+        semantic_proof_version = "source-semantic-proof-v2"
     return {
         "contract_version": semantic_proof_version,
         "source_message_revision_reference": source_message_revision_reference,
@@ -1295,21 +1363,24 @@ def semantic_proof_result_for(
     *,
     output: dict[str, JsonValue],
     body: str,
+    source_message_revision_reference: str = "controlled-revision-reference",
     root_state: str = "current_positive",
     fact_state: str = "current_positive",
     route_state: str = "current_positive",
     check_state: str = "none",
+    proof_version: str = "source-semantic-proof-v1",
 ) -> ClassifierAdapterResult:
     """Return a proof adapter result for adversarial controlled tests."""
     return ClassifierAdapterResult(
         output=_build_test_semantic_proof(
             output,
             body=body,
-            source_message_revision_reference="controlled-revision-reference",
+            source_message_revision_reference=source_message_revision_reference,
             root_state=root_state,
             fact_state=fact_state,
             route_state=route_state,
             check_state=check_state,
+            proof_version=proof_version,
         ),
         effective_model="gpt-5.6-sol",
         effective_reasoning_effort="high",
@@ -1874,11 +1945,13 @@ class AcceptanceSpine:
         observer: AcceptanceObserver,
         restart_role: Callable[[RuntimeRole], AcceptanceRole],
         clock: Clock,
+        admin_database_url: str,
     ) -> None:
         self._roles = dict(roles)
         self._observer = observer
         self._restart_role = restart_role
         self._clock = clock
+        self._admin_database_url = admin_database_url
 
     def restart(self, role: RuntimeRole) -> AcceptanceSpine:
         """Reconnect exactly one runtime role without replacing the others."""
@@ -2096,6 +2169,40 @@ class AcceptanceSpine:
         """Observe durable primary-classifier provenance."""
         return self._observer.classification_attempts()
 
+    def classification_proposals_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Classification's serialized proposal at the public seam."""
+        return self._observer.classification_proposals_for_revision(
+            source_message_revision_id
+        )
+
+    def classifier_commands_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe Classification commands emitted by Application."""
+        return self._observer.classifier_commands_for_revision(
+            source_message_revision_id
+        )
+
+    def redeliver_classifier_command(self, source_message_revision_id: str) -> bool:
+        """Redeliver one durable classifier command through Classification."""
+        commands = self.classifier_commands_for_revision(source_message_revision_id)
+        if len(commands) != 1:
+            raise ValueError("expected exactly one classifier command")
+        return self._roles[RuntimeRole.CLASSIFICATION].redeliver_contract(commands[0])
+
+    def redeliver_classification_proposal(
+        self, source_message_revision_id: str
+    ) -> bool:
+        """Redeliver one serialized proposal through Application."""
+        proposals = self.classification_proposals_for_revision(
+            source_message_revision_id
+        )
+        if not proposals:
+            raise ValueError("classification proposal does not exist")
+        return self._roles[RuntimeRole.APPLICATION].redeliver_contract(proposals[-1])
+
     def classification_queue_health(self) -> ClassificationQueueHealth:
         """Observe low-cardinality classifier operations at the public seam."""
         role = self._roles[RuntimeRole.CLASSIFICATION]
@@ -2118,9 +2225,77 @@ class AcceptanceSpine:
         """Observe body-free Application classifier routing state."""
         return self._observer.classification_routing_outcomes()
 
+    def record_player_classifier_promotion(
+        self,
+        *,
+        release_fingerprint: str | None = None,
+        state: str = "approved",
+    ) -> None:
+        """Run and record the exact Player promotion gate through Application."""
+        release = describe_player_classifier_release()
+        if (
+            release_fingerprint is not None
+            and release_fingerprint != release.release_fingerprint
+        ):
+            raise ValueError("promotion fingerprint must match the reviewed release")
+        promotion: dict[str, JsonValue] = {
+            "release_name": PLAYER_CLASSIFIER_RELEASE_NAME,
+            "contract_version": release.contract_version,
+            "release_fingerprint": release.release_fingerprint,
+            "state": state,
+        }
+        application = self._roles[RuntimeRole.APPLICATION]
+        try:
+            application.store.record_classifier_release_promotion(
+                release=promotion,
+                recorded_at=application.clock.now(),
+            )
+        finally:
+            # Replay workers provision the same cluster-global runtime role
+            # names on their isolated databases.  Restore this spine's
+            # credentials before the caller continues using its other stores.
+            from modules.postgres_adapter import PostgresAcceptanceMigrator
+
+            passwords = _TESTKIT_RUNTIME_PASSWORDS.get(self._admin_database_url)
+            if passwords is not None:
+                PostgresAcceptanceMigrator(
+                    self._admin_database_url
+                ).provision_runtime_credentials(passwords)
+
+    def player_classifier_promotion(self) -> dict[str, JsonValue] | None:
+        """Observe durable Player promotion evidence through Application."""
+        return self._roles[RuntimeRole.APPLICATION].store.classifier_release_promotion(
+            release_name=PLAYER_CLASSIFIER_RELEASE_NAME
+        )
+
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()
+
+    def recommendation_opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe Recommendation's durable publication projection."""
+        return self._observer.recommendation_opportunities()
+
+    def exact_repost_clusters(self) -> tuple[ExactRepostCluster, ...]:
+        """Observe durable Exact Repost Clusters through the public testkit."""
+        return self._observer.exact_repost_clusters()
+
+    def exact_repost_cluster_members(
+        self, exact_repost_cluster_id: str
+    ) -> tuple[ExactRepostClusterMember, ...]:
+        """Observe one cluster's source provenance and representative lineage."""
+        return self._observer.exact_repost_cluster_members(exact_repost_cluster_id)
+
+    def moderate_exact_repost_cluster(
+        self, *, exact_repost_cluster_id: str, decision: str
+    ) -> bool:
+        """Apply a moderation decision through the Application public seam."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.moderate_exact_repost_cluster(
+            exact_repost_cluster_id=exact_repost_cluster_id,
+            decision=decision,
+            recorded_at=application.clock.now(),
+        )
 
     def opportunity_publication_contracts(
         self, source_message_revision_id: str
@@ -2558,6 +2733,7 @@ class AcceptanceSpine:
         telegram_user_id: int,
         screen_revision: int | None = None,
         game_search_details: dict[str, list[str]] | None = None,
+        number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         tournament_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
@@ -2572,6 +2748,7 @@ class AcceptanceSpine:
                 else self.discovery_draft(telegram_user_id).screen_revision
             ),
             game_search_details=game_search_details,
+            number_of_players=number_of_players,
             opponent_search_details=opponent_search_details,
             tournament_search_details=tournament_search_details,
             transfer_search_details=transfer_search_details,
@@ -2686,6 +2863,16 @@ class AcceptanceSpine:
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
+    def open_player_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Player Search Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_player_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
     def open_opponent_search_details(
         self, *, update_id: str, telegram_user_id: int
     ) -> None:
@@ -2693,6 +2880,17 @@ class AcceptanceSpine:
         self._conversation_onboarding().open_opponent_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_player_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Player Search detail submenu."""
+        self._conversation_onboarding().open_player_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
@@ -2725,6 +2923,17 @@ class AcceptanceSpine:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_player_search_number_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Drive one Player Search quantity answer."""
+        self._conversation_onboarding().submit_player_search_number_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
@@ -2810,6 +3019,16 @@ class AcceptanceSpine:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def clear_player_search_number(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Clear the optional Player Search quantity."""
+        self._conversation_onboarding().clear_player_search_number(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
@@ -3566,6 +3785,7 @@ def boot_acceptance_spine(
         return boot_acceptance_role(
             role=role,
             database_url=role_urls[role],
+            promotion_gate_database_url=admin_database_url,
             clock=clock,
             telegram_ingestion=(
                 controlled_ingestion if role is RuntimeRole.INGESTION else None
@@ -3606,6 +3826,7 @@ def boot_acceptance_spine(
         observer=PostgresAcceptanceObserver(admin_database_url),
         restart_role=restart_role,
         clock=clock,
+        admin_database_url=admin_database_url,
     )
 
 

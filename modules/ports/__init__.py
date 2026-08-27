@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
+from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.contracts import (
     ContractEnvelope,
     ContractName,
@@ -32,6 +33,8 @@ from modules.domain import (
     DateInterpretationQuery,
     DateInterpretationResolution,
     DiscoveryDraft,
+    ExactRepostCluster,
+    ExactRepostClusterMember,
     GeographyConfirmation,
     GeographyConfirmationEvent,
     GeographySuggestion,
@@ -191,6 +194,11 @@ class ModelAdapter(Protocol):
     @property
     def primary_schema_version(self) -> str:
         """Return the primary classifier schema selected by this adapter."""
+        ...
+
+    @property
+    def artifact_descriptor(self) -> ClassifierArtifactDescriptor:
+        """Return the immutable artifact contract selected by this adapter."""
         ...
 
     def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
@@ -915,6 +923,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read protected candidate state for a retryable semantic-proof pass."""
         ...
 
+    def classifier_release_promotion(
+        self, *, release_name: str
+    ) -> dict[str, JsonValue] | None:
+        """Read the latest durable promotion state for one classifier release."""
+        ...
+
+    def record_classifier_release_promotion(
+        self,
+        *,
+        release: dict[str, JsonValue],
+        recorded_at: datetime,
+    ) -> None:
+        """Run and record an Application-owned classifier promotion attestation."""
+        ...
+
     def proposition_opportunity_ids(
         self, source_message_id: str
     ) -> tuple[tuple[int, str], ...]:
@@ -971,6 +994,16 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         additional_outgoings: tuple[ContractEnvelope, ...] = (),
     ) -> ConsumeResult:
         """Atomically accept a compound candidate batch and publish one state change."""
+        ...
+
+    def moderate_exact_repost_cluster(
+        self,
+        *,
+        exact_repost_cluster_id: str,
+        decision: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Apply one application-owned moderation decision to a cluster."""
         ...
 
     def project_opportunity(
@@ -1201,6 +1234,18 @@ class AcceptanceObserver(Protocol):
         """Observe durable classifier execution provenance."""
         ...
 
+    def classification_proposals_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe real ClassificationProposal contracts for one revision."""
+        ...
+
+    def classifier_commands_for_revision(
+        self, source_message_revision_id: str
+    ) -> tuple[RawContractEnvelope, ...]:
+        """Observe real classifier command contracts for one revision."""
+        ...
+
     def classification_queue_health(
         self, observed_at: datetime
     ) -> ClassificationQueueHealth:
@@ -1215,6 +1260,20 @@ class AcceptanceObserver(Protocol):
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
+        ...
+
+    def recommendation_opportunities(self) -> tuple[Opportunity, ...]:
+        """Observe the Recommendation projection of accepted Opportunities."""
+        ...
+
+    def exact_repost_clusters(self) -> tuple[ExactRepostCluster, ...]:
+        """Observe application-owned Exact Repost Cluster state."""
+        ...
+
+    def exact_repost_cluster_members(
+        self, exact_repost_cluster_id: str
+    ) -> tuple[ExactRepostClusterMember, ...]:
+        """Observe one cluster's linked Source Message lineage."""
         ...
 
     def opportunity_publication_contracts(

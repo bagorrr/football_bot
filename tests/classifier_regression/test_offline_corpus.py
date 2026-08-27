@@ -1,4 +1,4 @@
-"""Deterministic, credential-free classifier regression gate."""
+"""Deterministic controlled classifier regression gate."""
 
 # ruff: noqa: RUF001 -- reviewed multilingual evidence is intentional.
 
@@ -30,14 +30,29 @@ from modules.application import (
     _opaque_classifier_reference,
     _open_places_are_supported,
     _optional_values_are_supported,
+    _player_availability_is_supported,
     _select_response_route,
     _stated_payment_amount_and_currency,
     _validated_tournament_proposal,
 )
 from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    OPEN_MATCH_V3_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     PROPOSITION_EVIDENCE_VERSION,
     classifier_output_is_schema_valid,
     semantic_proof_is_schema_valid,
+)
+from modules.classifier_promotion import (
+    PLAYER_REQUIRED_CASE_FAMILIES,
+    PLAYER_REQUIRED_FAILURE_MODES,
+    PLAYER_REVIEWED_CORPUS_CASE_COUNT,
+    ControlledPlayerClassifierAdapter,
+    ControlledPlayerLifecycleAdapter,
+    describe_player_classifier_release,
+    player_classifier_promotion_evidence,
+    player_classifier_promotion_is_approved,
+    run_player_classifier_promotion_gate,
 )
 from modules.codex_classification_adapter import (
     CodexCliClassifierAdapter,
@@ -63,9 +78,11 @@ from modules.ports import (
     LocationResolverAdapter,
     ModelAdapter,
 )
+from modules.responses_classification_adapter import ResponsesClassifierAdapter
 from modules.testkit import (
     ControlledModelAdapter,
     InjectedClassifierCrash,
+    semantic_proof_result_for,
 )
 
 
@@ -133,6 +150,7 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
         assert classifier_output_is_schema_valid(
             result.output,
             body=case["source"],
+            artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
         )
         expected = case["expected"]
         assert result.output["disposition"] == expected["disposition"]
@@ -189,6 +207,7 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     assert not classifier_output_is_schema_valid(
         invalid_output,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     unsupported_evidence = deepcopy(cases[0]["recorded_output"])
     unsupported_evidence["candidates"][0]["evidence"]["open_places"] = (
@@ -197,18 +216,21 @@ def test_versioned_redacted_classifier_corpus_replays_offline() -> None:
     assert not classifier_output_is_schema_valid(
         unsupported_evidence,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     malformed_route = deepcopy(cases[0]["recorded_output"])
     malformed_route["candidates"][0]["response_routes"][0]["unexpected"] = True
     assert not classifier_output_is_schema_valid(
         malformed_route,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
     invalid_domain_value = deepcopy(cases[0]["recorded_output"])
     invalid_domain_value["candidates"][0]["positions"] = ["sweeper"]
     assert not classifier_output_is_schema_valid(
         invalid_domain_value,
         body=cases[0]["source"],
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
     )
 
 
@@ -1469,7 +1491,11 @@ def _run_v3_evaluation_gate(
             request=request,
             runner=runner,
         )
-        assert classifier_output_is_schema_valid(result.output, body=body)
+        assert classifier_output_is_schema_valid(
+            result.output,
+            body=body,
+            artifact_descriptor=adapter.artifact_descriptor,
+        )
         validated_semantic_records.update(
             _execute_selected_semantic_proofs(
                 adapter,
@@ -1514,7 +1540,11 @@ def _run_v3_evaluation_gate(
                 request=second_request,
                 runner=runner,
             )
-            assert classifier_output_is_schema_valid(second_result.output, body=body)
+            assert classifier_output_is_schema_valid(
+                second_result.output,
+                body=body,
+                artifact_descriptor=adapter.artifact_descriptor,
+            )
             validated_semantic_records.update(
                 _execute_selected_semantic_proofs(
                     adapter,
@@ -1558,7 +1588,11 @@ def _run_v3_evaluation_gate(
             request=request,
             runner=runner,
         )
-        assert classifier_output_is_schema_valid(result.output, body=body)
+        assert classifier_output_is_schema_valid(
+            result.output,
+            body=body,
+            artifact_descriptor=adapter.artifact_descriptor,
+        )
         promotion_results[fixture_name] = result
         validated_semantic_records.update(
             _execute_selected_semantic_proofs(
@@ -2235,7 +2269,11 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
         body = source_cases[case_id]["source"]
         primary = recorded_case["primary_output"]
         assert isinstance(primary, dict)
-        assert classifier_output_is_schema_valid(primary, body=body)
+        assert classifier_output_is_schema_valid(
+            primary,
+            body=body,
+            artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+        )
         expected_disposition = manifest_cases[case_id]["expected_pipeline_disposition"]
         if expected_disposition == "unresolved" and not set(
             manifest_cases[case_id]["opportunity_types"]
@@ -2251,7 +2289,11 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
         )
         second = recorded_case.get("second_pass_output")
         if isinstance(second, dict):
-            assert classifier_output_is_schema_valid(second, body=body)
+            assert classifier_output_is_schema_valid(
+                second,
+                body=body,
+                artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+            )
             _assert_semantic_proofs_for_output(
                 corpus,
                 case_id=case_id,
@@ -2267,7 +2309,11 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
         output = fixture["primary_output"]
         assert isinstance(body, str)
         assert isinstance(output, dict)
-        assert classifier_output_is_schema_valid(output, body=body)
+        assert classifier_output_is_schema_valid(
+            output,
+            body=body,
+            artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+        )
         _assert_semantic_proofs_for_output(
             corpus,
             case_id=f"promotion:{fixture_name}",
@@ -2287,6 +2333,801 @@ def test_recorded_v3_replay_remains_a_separate_fixture_integrity_gate() -> None:
     assert (
         _canonical_digest(corpus["recorded_outputs"])
         == corpus["_v3_anchor"]["canonical_digests"]["recorded_outputs_sha256"]
+    )
+
+
+def test_player_release_replays_offline_with_offering_semantics() -> None:
+    """The additive v3 release has its own controlled evaluation cases."""
+    cases = (
+        {
+            "source": "We are 4 players available in Moscow on 2026-09-01.",
+            "opportunity": "We are 4 players available",
+            "count_evidence": {"available_player_count": "4 players"},
+            "counts": {"available_player_count": 4},
+            "expected_supported": True,
+        },
+        {
+            "source": "De 2 à 5 joueurs sont disponibles à Paris le 2026-09-01.",
+            "opportunity": "De 2 à 5 joueurs sont disponibles",
+            "count_evidence": {
+                "available_player_count_min": "De 2 à 5 joueurs",
+                "available_player_count_max": "De 2 à 5 joueurs",
+            },
+            "counts": {
+                "available_player_count_min": 2,
+                "available_player_count_max": 5,
+            },
+            "expected_supported": True,
+        },
+        {
+            "source": "Need 4 players for the match in Moscow on 2026-09-01.",
+            "opportunity": "Need 4 players for the match",
+            "count_evidence": {"available_player_count": "4 players"},
+            "counts": {"available_player_count": 4},
+            "expected_supported": False,
+        },
+    )
+    adapter = ControlledModelAdapter()
+    adapter.enable_primary_v3()
+    for case_number, case in enumerate(cases, start=1):
+        source = case["source"]
+        opportunity = case["opportunity"]
+        count_evidence = case["count_evidence"]
+        counts = case["counts"]
+        assert isinstance(source, str)
+        assert isinstance(opportunity, str)
+        assert isinstance(count_evidence, dict)
+        assert isinstance(counts, dict)
+        candidate = {
+            "candidate_key": f"player-regression-{case_number}",
+            "opportunity_type": "player_match_availability",
+            "evidence": {
+                "opportunity": opportunity,
+                "event_time": "2026-09-01",
+                "location": "Moscow" if "Moscow" in source else "Paris",
+                **count_evidence,
+            },
+            "source_context": source,
+            "location": {
+                "mention": "Moscow" if "Moscow" in source else "Paris",
+                "place_id": "place:city",
+                "country_id": "country:country",
+                "city_id": "city:city",
+            },
+            "event_time": {
+                "start_local_date": "2026-09-01",
+                "end_local_date": "2026-09-01",
+                "iana_timezone": "Europe/Paris",
+            },
+            "response_routes": [],
+            **counts,
+        }
+        disposition = "accepted" if case["expected_supported"] else "irrelevant"
+        output = cast(
+            dict[str, JsonValue],
+            {
+                "schema_version": "source-message-classification-v3",
+                "disposition": disposition,
+                "candidates": [candidate] if disposition == "accepted" else [],
+                "routing": {
+                    "reason_code": "accepted"
+                    if disposition == "accepted"
+                    else "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        )
+        adapter.return_for(
+            body=source,
+            result=ClassifierAdapterResult(
+                output=output,
+                effective_model="gpt-5.6-sol",
+                effective_reasoning_effort="high",
+                codex_version="controlled-regression",
+                adapter_kind="controlled_recording",
+                adapter_version="player-classifier-regression-v1",
+                duration_ms=0,
+                input_tokens=0,
+                output_tokens=0,
+            ),
+        )
+        result = adapter.classify(
+            ClassifierRequest(
+                source_message_revision_id=f"player-regression:{case_number}",
+                body=source,
+                source_event_time="2026-08-20T09:00:00+00:00",
+                context_bundle_version="primary-classifier-context-v1",
+                source_chat_reference="controlled:chat",
+                source_chat_timezone="Europe/Paris",
+                source_chat_geography={"country_id": None, "city_id": None},
+                bounded_metadata={"message_language": None, "attachment_types": []},
+                eligible_reply_context=None,
+                requested_model="gpt-5.6-sol",
+                requested_reasoning_effort="high",
+                prompt_version="player-match-primary-v1",
+                schema_version="source-message-classification-v3",
+                glossary_version="football-opportunity-glossary-v1",
+                context_policy_version="classifier-context-v1",
+                routing_policy_version="classifier-routing-player-v1",
+            )
+        )
+        assert classifier_output_is_schema_valid(
+            result.output,
+            body=source,
+            artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+        )
+        candidates = result.output.get("candidates")
+        assert isinstance(candidates, list)
+        if disposition == "accepted":
+            validated_candidate = candidates[0]
+            assert isinstance(validated_candidate, dict)
+            validated_evidence = validated_candidate.get("evidence")
+            assert isinstance(validated_evidence, dict)
+            opportunity_evidence = validated_evidence.get("opportunity")
+            assert isinstance(opportunity_evidence, str)
+            assert _player_availability_is_supported(
+                validated_candidate.get("available_player_count"),
+                validated_candidate.get("available_player_count_min"),
+                validated_candidate.get("available_player_count_max"),
+                opportunity_evidence,
+                authoritative_body=source,
+            )
+        else:
+            assert not candidates
+        assert adapter.requests[-1].schema_version == "source-message-classification-v3"
+        assert adapter.requests[-1].prompt_version == "player-match-primary-v1"
+
+
+def test_player_promotion_inputs_cover_the_complete_reviewed_corpus_and_suite() -> None:
+    release = describe_player_classifier_release()
+
+    assert release.reviewed_corpus_case_count == PLAYER_REVIEWED_CORPUS_CASE_COUNT
+    assert release.reviewed_corpus_case_ids == tuple(
+        f"sm-{case_number:03d}"
+        for case_number in range(1, PLAYER_REVIEWED_CORPUS_CASE_COUNT + 1)
+    )
+    assert release.required_case_families == PLAYER_REQUIRED_CASE_FAMILIES
+    assert release.lifecycle_failure_suite_families == PLAYER_REQUIRED_CASE_FAMILIES
+    assert release.required_replays == 3
+    assert release.requested_model == "gpt-5.6-sol"
+    assert release.requested_reasoning_effort == "high"
+    assert release.proposal_only is True
+
+    gate = run_player_classifier_promotion_gate(release)
+    assert gate.passed
+    assert gate.reviewed_case_count == 38
+    assert gate.reviewed_case_ids == release.reviewed_corpus_case_ids
+    assert gate.lifecycle_case_count == len(release.lifecycle_failure_suite_cases)
+    assert gate.failure_mode_case_ids == tuple(
+        case["case_id"] for case in release.failure_mode_cases
+    )
+    assert len(gate.failure_mode_case_ids) == len(PLAYER_REQUIRED_FAILURE_MODES)
+    assert gate.failed_case_ids == ()
+    assert len(gate.replay_digests) == release.required_replays
+    assert len(set(gate.replay_digests)) == release.required_replays
+    evidence = player_classifier_promotion_evidence(release)
+    assert evidence["replay_digests"] == list(gate.replay_digests)
+    approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": evidence,
+    }
+    assert player_classifier_promotion_is_approved(approval)
+    proposal: dict[str, JsonValue] = {
+        "requested_model": "gpt-5.6-sol",
+        "effective_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "high",
+        "effective_reasoning_effort": "high",
+        "prompt_version": "player-match-primary-v1",
+        "schema_version": "source-message-classification-v3",
+        "glossary_version": "football-opportunity-glossary-v1",
+        "context_policy_version": "classifier-context-v1",
+        "routing_policy_version": "classifier-routing-player-v1",
+        "classification_status": "succeeded",
+    }
+    assert player_classifier_promotion_is_approved(approval, proposal=proposal)
+    assert not player_classifier_promotion_is_approved(
+        approval,
+        proposal={**proposal, "schema_version": "source-message-classification-v2"},
+    )
+    assert not player_classifier_promotion_is_approved(None)
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "release_fingerprint": "0" * 64}
+    )
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "release_name": "wrong-player-release"}
+    )
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "contract_version": "wrong-player-contract-version"}
+    )
+
+
+def test_player_promotion_rejects_fake_digest_and_exact_version_mismatch() -> None:
+    release = describe_player_classifier_release()
+    with pytest.raises(ValueError, match="replay digests"):
+        player_classifier_promotion_evidence(
+            release,
+            replay_digests=("0" * 64,) * release.required_replays,
+        )
+    evidence = player_classifier_promotion_evidence(release)
+    approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": evidence,
+    }
+    fake_evidence = deepcopy(evidence)
+    fake_evidence["replay_digests"] = ["0" * 64] * release.required_replays
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "evidence": fake_evidence}
+    )
+    assert not player_classifier_promotion_is_approved(
+        {**approval, "release_fingerprint": "0" * 64}
+    )
+    assert not player_classifier_promotion_is_approved({**approval, "state": "revoked"})
+
+
+def test_player_classifier_adapter_executes_all_raw_corpus_cases() -> None:
+    release = describe_player_classifier_release()
+    adapter = ControlledPlayerClassifierAdapter()
+
+    for case_number, case in enumerate(release.reviewed_corpus_cases, start=1):
+        record = adapter.observe(
+            source=cast(str, case["source"]),
+            source_revision_id=f"controlled:{case['case_id']}:revision:1",
+            execution_id=f"test-run:{case_number}",
+        )
+        assert "expected" not in record
+        assert "observed_output" in record
+        assert "observed_facts" in record
+
+    evidence = player_classifier_promotion_evidence(release)
+    assert evidence["canonical_replay_digests"] == list(
+        release.canonical_replay_digests
+    )
+    assert evidence["failure_mode_case_count"] == len(PLAYER_REQUIRED_FAILURE_MODES)
+    assert evidence["failed_case_ids"] == []
+
+
+def _expected_facts(case: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    expected = cast(dict[str, JsonValue], case["expected"])
+    return cast(dict[str, JsonValue], expected["facts"])
+
+
+def test_player_promotion_validates_candidate_type_and_every_classifier_fact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = describe_player_classifier_release()
+    expected_types = {"sm-010": "opponent_request", "sm-026": "referee_request"}
+    adapter = ControlledPlayerClassifierAdapter()
+
+    for case_id, expected_type in expected_types.items():
+        expected = next(
+            case for case in release.reviewed_corpus_cases if case["case_id"] == case_id
+        )
+        record = adapter.observe(
+            source=cast(str, expected["source"]),
+            source_revision_id=f"controlled:{case_id}:revision:1",
+            execution_id=f"fact-test:{case_id}",
+        )
+        output = cast(dict[str, JsonValue], record["observed_output"])
+        candidate = cast(
+            dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+        )
+        facts = cast(dict[str, JsonValue], record["observed_facts"])
+        expected_facts = _expected_facts(expected)
+        assert candidate["opportunity_type"] == expected_type
+        assert facts["opportunity_types"] == [expected_type]
+        assert facts["source_evidence"] == expected_facts["source_evidence"]
+        assert facts["normalized"] == expected_facts["normalized"]
+
+    original_observe = ControlledPlayerClassifierAdapter.observe
+
+    def change_type(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "товарищеского" in source.casefold():
+            output = cast(dict[str, JsonValue], record["observed_output"])
+            candidate = cast(
+                dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+            )
+            candidate["opportunity_type"] = "open_match"
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_type)
+    type_gate = run_player_classifier_promotion_gate(release)
+    assert "sm-010:candidate-opportunity-type" in type_gate.failed_case_ids
+
+    def change_facts(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "воскресень" in source.casefold():
+            facts = cast(dict[str, JsonValue], record["observed_facts"])
+            normalized = cast(dict[str, JsonValue], facts["normalized"])
+            normalized["weekday"] = "monday"
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_facts)
+    fact_gate = run_player_classifier_promotion_gate(release)
+    assert "sm-026:candidate-facts" in fact_gate.failed_case_ids
+
+    def change_evidence(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "товарищеского" in source.casefold():
+            output = cast(dict[str, JsonValue], record["observed_output"])
+            candidate = cast(
+                dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+            )
+            evidence = cast(dict[str, JsonValue], candidate["evidence"])
+            evidence["request"] = "Ищем соперника для"
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", change_evidence)
+    evidence_gate = run_player_classifier_promotion_gate(release)
+    assert "sm-010:candidate-evidence" in evidence_gate.failed_case_ids
+
+    def remove_facts(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if "судья" in source.casefold():
+            facts = cast(dict[str, JsonValue], record["observed_facts"])
+            facts.pop("normalized")
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", remove_facts)
+    malformed_gate = run_player_classifier_promotion_gate(release)
+    assert "sm-026:malformed" in malformed_gate.failed_case_ids
+
+
+def test_player_promotion_executes_each_failure_mode_with_distinct_evidence() -> None:
+    release = describe_player_classifier_release()
+    gate = run_player_classifier_promotion_gate(release)
+
+    observations = gate.failure_mode_observations
+    assert {observation["failure_mode"] for observation in observations} == set(
+        PLAYER_REQUIRED_FAILURE_MODES
+    )
+    assert len({observation["injection_path"] for observation in observations}) == len(
+        PLAYER_REQUIRED_FAILURE_MODES
+    )
+    assert len(
+        {observation["observed_outcome"] for observation in observations}
+    ) == len(PLAYER_REQUIRED_FAILURE_MODES)
+    assert all(
+        observation["fail_closed"] is True
+        and observation["publication_state"] == "suppressed"
+        and observation["publication_effects"] == 0
+        for observation in observations
+    )
+
+
+def test_player_classifier_execution_is_raw_source_bound_and_traced() -> None:
+    release = describe_player_classifier_release()
+    case = release.reviewed_corpus_cases[0]
+    source = cast(str, case["source"])
+    adapter = ControlledPlayerClassifierAdapter()
+
+    observation = adapter.observe(
+        source=source,
+        source_revision_id="controlled:sm-001:revision:1",
+        execution_id="controlled-run-1",
+    )
+
+    execution = cast(dict[str, JsonValue], observation["execution"])
+    trace = cast(dict[str, JsonValue], execution["trace"])
+    assert trace["input_source_sha256"]
+    assert trace["stages"] == [
+        "raw_source_request",
+        "controlled_model_transport",
+        "responses_schema_adapter",
+        "schema_validation",
+        "application_proposal_observation",
+        "fail_closed_publication_check",
+    ]
+    assert execution["execution_id"] == "controlled-run-1"
+    assert execution["source_revision_id"] == "controlled:sm-001:revision:1"
+    assert "recorded-observations.json" not in json.dumps(observation)
+
+    changed_source = source.replace("кипер", "защитник")
+    with pytest.raises(RuntimeError, match="no raw response"):
+        adapter.observe(
+            source=changed_source,
+            source_revision_id="controlled:sm-001:revision:2",
+            execution_id="controlled-run-1b",
+        )
+
+
+def test_player_lifecycle_gate_detects_changed_expected_operation_and_publication() -> (
+    None
+):
+    release = describe_player_classifier_release()
+    suites = deepcopy(list(release.lifecycle_failure_suite_cases))
+    target = next(
+        case for case in suites if case["case_id"] == "create-edit-delete-flow"
+    )
+    operations = cast(list[JsonValue], target["operations"])
+    first = cast(dict[str, JsonValue], operations[0])
+    first["expected"] = False
+    mutated = replace(release, lifecycle_failure_suite_cases=tuple(suites))
+
+    gate = run_player_classifier_promotion_gate(mutated)
+
+    assert "create-edit-delete-flow:operation-1" in gate.failed_case_ids
+    flow = next(
+        observation
+        for observation in gate.lifecycle_observations
+        if observation["case_id"] == "create-edit-delete-flow"
+    )
+    flow_operations = cast(list[JsonValue], flow["observations"])
+    assert cast(dict[str, JsonValue], flow_operations[0])["publication_effects"] == 1
+
+
+def test_player_failure_gate_rejects_removed_injection() -> None:
+    release = describe_player_classifier_release()
+    failures = deepcopy(list(release.failure_mode_cases))
+    operation = cast(dict[str, JsonValue], failures[0]["operation"])
+    operation.pop("failure_mode")
+    mutated = replace(release, failure_mode_cases=tuple(failures))
+
+    gate = run_player_classifier_promotion_gate(mutated)
+
+    assert "failure-schema:injection" in gate.failed_case_ids
+    assert any(
+        observation["case_id"] == "failure-schema"
+        and observation["publication_state"] == "suppressed"
+        and observation["publication_effects"] == 0
+        for observation in gate.failure_mode_observations
+    )
+
+
+def test_player_failure_gate_rejects_altered_observed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = describe_player_classifier_release()
+    original_execute = ControlledPlayerLifecycleAdapter.execute
+
+    def alter_timeout_result(
+        adapter: ControlledPlayerLifecycleAdapter,
+        operation: dict[str, JsonValue],
+    ) -> JsonValue:
+        observed = original_execute(adapter, operation)
+        if operation.get("failure_mode") == "timeout":
+            result = cast(dict[str, JsonValue], observed)
+            result["observed_outcome"] = "quota_circuit_opened"
+        return observed
+
+    monkeypatch.setattr(
+        ControlledPlayerLifecycleAdapter, "execute", alter_timeout_result
+    )
+    gate = run_player_classifier_promotion_gate(release)
+
+    assert "failure-timeout:observed-observed_outcome" in gate.failed_case_ids
+    assert all(
+        observation["publication_effects"] == 0
+        for observation in gate.failure_mode_observations
+    )
+
+
+def test_player_promotion_rejects_tampered_classifier_execution_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = describe_player_classifier_release()
+    original_observe = ControlledPlayerClassifierAdapter.observe
+
+    def alter_trace(
+        classifier: ControlledPlayerClassifierAdapter,
+        *,
+        source: str,
+        source_revision_id: str,
+        execution_id: str,
+    ) -> dict[str, JsonValue]:
+        record = original_observe(
+            classifier,
+            source=source,
+            source_revision_id=source_revision_id,
+            execution_id=execution_id,
+        )
+        if source == cast(str, release.reviewed_corpus_cases[0]["source"]):
+            execution = cast(dict[str, JsonValue], record["execution"])
+            trace = cast(dict[str, JsonValue], execution["trace"])
+            trace["adapted_facts_digest"] = "0" * 64
+        return record
+
+    monkeypatch.setattr(ControlledPlayerClassifierAdapter, "observe", alter_trace)
+    gate = run_player_classifier_promotion_gate(release)
+
+    assert "sm-001:execution-trace" in gate.failed_case_ids
+
+
+def test_player_promotion_replays_are_separate_execution_traces() -> None:
+    release = describe_player_classifier_release()
+    gate = run_player_classifier_promotion_gate(release)
+
+    assert len(gate.replay_execution_ids) == release.required_replays
+    assert len(set(gate.replay_execution_ids)) == release.required_replays
+    assert len(set(gate.replay_digests)) == release.required_replays
+
+
+def test_player_promotion_rejects_cross_file_annotation_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import modules.classifier_promotion as promotion
+
+    original_read_json = promotion._read_json
+
+    def mismatched_read_json(
+        path: Path, *, description: str
+    ) -> tuple[dict[str, JsonValue], str]:
+        value, raw = original_read_json(path, description=description)
+        if description == "reviewed Player corpus":
+            altered = deepcopy(value)
+            cases = cast(list[dict[str, JsonValue]], altered["cases"])
+            expected = cast(dict[str, JsonValue], cases[0]["expected"])
+            expected["reason_code"] = "irrelevant"
+            return altered, raw
+        return value, raw
+
+    monkeypatch.setattr(promotion, "_read_json", mismatched_read_json)
+    with pytest.raises(ValueError, match="annotations mismatch"):
+        promotion.describe_player_classifier_release()
+
+
+def test_player_promotion_contract_contains_executable_expected_facts() -> None:
+    """The contract stores outcomes/facts; the gate executes them, not just IDs."""
+    contract_path = (
+        Path(__file__).parents[2]
+        / "classifier"
+        / "player-match-evaluation-v1"
+        / "contract.json"
+    )
+    contract = cast(
+        dict[str, JsonValue],
+        json.loads(contract_path.read_text(encoding="utf-8")),
+    )
+    assert contract["contract_version"] == "player-match-evaluation-v1"
+    assert contract["review_status"] == "reviewed"
+    assert contract["reviewed_on"] == "2026-08-25"
+    assert contract["reviewed_by_role"] == "product_owner_and_independent_reviewer"
+    promotion_gate = cast(dict[str, JsonValue], contract["promotion_gate"])
+    assert promotion_gate["executes_reviewed_corpus"] is True
+    assert promotion_gate["executes_lifecycle_failure_suite"] is True
+    cases = cast(list[dict[str, JsonValue]], contract["cases"])
+    assert len(cases) == PLAYER_REVIEWED_CORPUS_CASE_COUNT
+    assert [case["case_id"] for case in cases] == [
+        f"sm-{number:03d}" for number in range(1, 39)
+    ]
+    for case in cases:
+        expected = cast(dict[str, JsonValue], case["expected"])
+        facts = cast(dict[str, JsonValue], expected["facts"])
+        assert expected["candidate_count"] in {0, 1}
+        assert facts["source_evidence"]
+        assert facts["normalized"]
+    suite_path = (
+        Path(__file__).parents[2]
+        / "classifier"
+        / "player-match-evaluation-v1"
+        / "lifecycle-failure-suite.json"
+    )
+    suite = cast(
+        dict[str, JsonValue], json.loads(suite_path.read_text(encoding="utf-8"))
+    )
+    suite_cases = cast(list[dict[str, JsonValue]], suite["cases"])
+    assert all(case["operations"] for case in suite_cases)
+    assert suite["controlled_event_sequences"] == [
+        {"sequence_id": "controlled-event-001", "events": ["create", "edit", "delete"]}
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "4 players available but are not able to play the match",
+        "4 players available but unable to participate in the match",
+        "4 players available, but nobody can play the match",
+        "4 players available but incapable of playing the match",
+        "4 игрока доступны, но играть не можем на матч",
+        "4 игрока доступны, но не можем участвовать в матче",
+        "4 игрока доступны, но не способны играть на матч",
+        "4 jugadores disponibles, pero nadie puede jugar el partido",
+        "4 jugadores disponibles pero no podemos participar en el partido",
+        "4 jugadores disponibles, pero son incapaces de jugar el partido",
+        "4 joueurs disponibles, mais personne ne peut jouer le match",
+        "4 joueurs disponibles mais nous ne pouvons pas participer au match",
+        "4 joueurs disponibles, mais incapables de jouer le match",
+    ],
+)
+def test_player_classifier_rejects_multilingual_negative_availability(
+    body: str,
+) -> None:
+    assert not _player_availability_is_supported(
+        4,
+        None,
+        None,
+        body,
+        authoritative_body=body,
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "4 players available and can play the match",
+        "4 игрока доступны и можем играть на матч",
+        "4 jugadores disponibles y podemos jugar el partido",
+        "4 joueurs disponibles et nous pouvons jouer le match",
+    ],
+)
+def test_player_classifier_keeps_multilingual_positive_availability(body: str) -> None:
+    assert _player_availability_is_supported(
+        4,
+        None,
+        None,
+        body,
+        authoritative_body=body,
+    )
+
+
+def test_player_semantic_proof_provider_path_allows_unknown_quantity() -> None:
+    """The provider receives the conditional v2 schema and a 3-fact proof."""
+
+    class RecordingTransport:
+        def __init__(self, output: dict[str, JsonValue]) -> None:
+            self.output = output
+            self.payload: dict[str, object] | None = None
+
+        def create_response(
+            self, payload: dict[str, object], *, timeout_seconds: int
+        ) -> dict[str, object]:
+            self.payload = payload
+            return {
+                "output": self.output,
+                "effective_model": "gpt-5.6-sol",
+                "duration_ms": 0,
+            }
+
+    body = "We are available to play as a group in Moscow on 2026-09-17."
+    evidence: dict[str, JsonValue] = {
+        "opportunity": "We are available to play as a group",
+        "event_time": "2026-09-17",
+        "location": "Moscow",
+    }
+    primary_output: dict[str, JsonValue] = {
+        "schema_version": "source-message-classification-v3",
+        "disposition": "accepted",
+        "candidates": [
+            {
+                "candidate_key": "provider-unknown-player-count",
+                "opportunity_type": "player_match_availability",
+                "evidence": evidence,
+                "source_context": body,
+                "location": {
+                    "mention": "Moscow",
+                    "place_id": "controlled:place",
+                    "country_id": "controlled:country",
+                    "city_id": "controlled:city",
+                },
+                "event_time": {
+                    "start_local_date": "2026-09-17",
+                    "end_local_date": "2026-09-17",
+                    "iana_timezone": "Europe/Moscow",
+                },
+                "response_routes": [],
+            }
+        ],
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+    }
+    source_revision = "source:provider-player:revision:1"
+    proof = semantic_proof_result_for(
+        output=primary_output,
+        body=body,
+        source_message_revision_reference=source_revision,
+        proof_version="source-semantic-proof-v2",
+    ).output
+    transport = RecordingTransport(proof)
+    repository_root = Path(__file__).parents[2]
+    schema = json.loads(
+        (
+            repository_root
+            / "classifier"
+            / "player-match-semantic-proof-v1"
+            / "source-semantic-proof-v2.schema.json"
+        ).read_text(encoding="utf-8")
+    )
+    adapter = ResponsesClassifierAdapter(
+        transport=transport,
+        schemas={"source-semantic-proof-v2": schema},
+        prompt_paths={
+            "player-match-semantic-proof-v1": repository_root
+            / "classifier"
+            / "player-match-semantic-proof-v1"
+            / "prompt.md"
+        },
+        adapter_version="controlled-provider-path",
+    )
+    request = ClassifierRequest(
+        source_message_revision_id=source_revision,
+        body=body,
+        source_event_time="2026-08-25T09:00:00+00:00",
+        context_bundle_version="semantic-proof-context-v1",
+        source_chat_reference="controlled:provider-path",
+        source_chat_timezone="Europe/Moscow",
+        source_chat_geography={"country_id": None, "city_id": None},
+        bounded_metadata={"message_language": None, "attachment_types": []},
+        eligible_reply_context=None,
+        requested_model="gpt-5.6-sol",
+        requested_reasoning_effort="high",
+        prompt_version="player-match-semantic-proof-v1",
+        schema_version="source-semantic-proof-v2",
+        glossary_version="football-opportunity-glossary-v1",
+        context_policy_version="semantic-proof-context-v1",
+        routing_policy_version="classifier-routing-player-v1",
+        pass_kind="semantic_proof",
+        proof_candidate_key="provider-unknown-player-count",
+    )
+    result = adapter.semantic_proof(request)
+    assert transport.payload is not None
+    provider_schema = cast(
+        dict[str, JsonValue],
+        cast(dict[str, object], transport.payload["text"])["format"],
+    )["schema"]
+    assert isinstance(provider_schema, dict)
+    facts_schema = cast(dict[str, JsonValue], provider_schema["properties"])["facts"]
+    assert isinstance(facts_schema, dict)
+    assert facts_schema["minProperties"] == 3
+    assert facts_schema["required"] == ["opportunity", "event_time", "location"]
+    assert semantic_proof_is_schema_valid(
+        result.output,
+        body=body,
+        source_message_revision_reference=source_revision,
+        candidate_key="provider-unknown-player-count",
+        evidence=evidence,
+        routes=[],
+        meaning="player_match_availability",
+        proof_version="source-semantic-proof-v2",
     )
 
 
@@ -2876,7 +3717,11 @@ def test_classifier_contract_accepts_an_evidence_backed_phone_route() -> None:
         }
     ]
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_offline_authority_boundary_rejects_non_authoritative_facts() -> None:
@@ -2950,7 +3795,11 @@ def test_classifier_contract_accepts_an_evidence_backed_url_route() -> None:
         }
     ]
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_classifier_contract_leaves_source_metadata_fallback_to_application() -> None:
@@ -2960,7 +3809,11 @@ def test_classifier_contract_leaves_source_metadata_fallback_to_application() ->
     source = corpus["cases"][0]["source"].replace(" Пишите @sample_contact", "")
     output["candidates"][0]["response_routes"] = []
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_classifier_contract_preserves_unknown_optional_open_place_count() -> None:
@@ -2975,7 +3828,11 @@ def test_classifier_contract_preserves_unknown_optional_open_place_count() -> No
     candidate["evidence"]["open_places"] = "Ищем защитника"
     candidate["open_places"] = None
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
 
 def test_classifier_contract_accepts_a_source_stated_day_part() -> None:
@@ -2990,4 +3847,8 @@ def test_classifier_contract_accepts_a_source_stated_day_part() -> None:
     del candidate["event_time"]["exact_local_time"]
     candidate["event_time"]["day_part"] = "evening"
 
-    assert classifier_output_is_schema_valid(output, body=source)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=source,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )

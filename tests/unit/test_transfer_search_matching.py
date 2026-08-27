@@ -17,7 +17,11 @@ from modules.application import (
     _transfer_offer_is_single_player,
     _transfer_seasonal_timing_is_current_or_future,
 )
-from modules.classifier_contract import JsonValue, classifier_output_is_schema_valid
+from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    JsonValue,
+    classifier_output_is_schema_valid,
+)
 from modules.domain import (
     CompletedSearch,
     MatchState,
@@ -910,7 +914,11 @@ def test_transfer_classifier_contract_is_proposal_only_and_directional() -> None
         "disposition": "accepted",
         "candidates": [candidate],
     }
-    assert classifier_output_is_schema_valid(output, body=body)
+    assert classifier_output_is_schema_valid(
+        output,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
 
     with_event_time = deepcopy(output)
     transfer_candidates = with_event_time["candidates"]
@@ -922,4 +930,8 @@ def test_transfer_classifier_contract_is_proposal_only_and_directional() -> None
         "end_local_date": "2026-08-20",
         "iana_timezone": "Europe/Moscow",
     }
-    assert not classifier_output_is_schema_valid(with_event_time, body=body)
+    assert not classifier_output_is_schema_valid(
+        with_event_time,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )

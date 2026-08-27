@@ -1,0 +1,10 @@
+{
+  "requested_model": "gpt-5.6-sol",
+  "requested_reasoning_effort": "high",
+  "prompt_version": "player-match-primary-v1",
+  "schema_version": "source-message-classification-v3",
+  "glossary_version": "football-opportunity-glossary-v1",
+  "context_policy_version": "classifier-context-v1",
+  "routing_policy_version": "classifier-routing-player-v1",
+  "evaluation_contract_version": "player-match-evaluation-v1"
+}
