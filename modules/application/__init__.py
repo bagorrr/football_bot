@@ -849,6 +849,13 @@ _TOURNAMENT_SEARCH_DETAIL_OPTIONS = {
     ),
     "payment": ("free", "paid"),
 }
+_REFEREEING_SEARCH_DETAIL_OPTIONS = {
+    "times": ("morning", "daytime", "evening", "night"),
+    "event_types": ("match", "tournament"),
+    "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
+    "referee_roles": ("head_referee", "assistant_referee", "var"),
+    "payment": ("free", "paid"),
+}
 _OPPONENT_SEARCH_DETAIL_NAMES = {
     "en": (
         "Time",
@@ -914,6 +921,24 @@ _TOURNAMENT_SEARCH_DETAIL_NAMES = {
         "Niveaux de jeu",
         "Type de terrain",
         "Revêtement",
+        "Paiement",
+    ),
+}
+_REFEREEING_SEARCH_DETAIL_NAMES = {
+    "en": ("Time", "Event type", "Team format", "Referee role", "Payment"),
+    "ru": ("Время", "Тип события", "Формат команд", "Роль судьи", "Оплата"),
+    "es": (
+        "Hora",
+        "Tipo de evento",
+        "Formato de equipos",
+        "Rol del árbitro",
+        "Pago",
+    ),
+    "fr": (
+        "Heure",
+        "Type d’événement",
+        "Format des équipes",
+        "Rôle de l’arbitre",
         "Paiement",
     ),
 }
@@ -990,6 +1015,36 @@ _TOURNAMENT_SEARCH_DETAIL_HEADINGS = {
         "⚽ Sélectionnez les niveaux de jeu.",
         "🏟 Sélectionnez le type de terrain.",
         "🌱 Sélectionnez le revêtement.",
+        "💳 Sélectionnez le type de paiement.",
+    ),
+}
+_REFEREEING_SEARCH_DETAIL_HEADINGS = {
+    "en": (
+        "🕒 What time?",
+        "⚽ Select event types.",
+        "👥 Select team formats.",
+        "⚖️ Select referee roles.",
+        "💳 Select the payment type.",
+    ),
+    "ru": (
+        "🕒 В какое время?",
+        "⚽ Выберите типы событий.",
+        "👥 Выберите форматы команд.",
+        "⚖️ Выберите роли судьи.",
+        "💳 Выберите тип оплаты.",
+    ),
+    "es": (
+        "🕒 ¿A qué hora?",
+        "⚽ Selecciona los tipos de evento.",
+        "👥 Selecciona los formatos de equipos.",
+        "⚖️ Selecciona los roles del árbitro.",
+        "💳 Selecciona el tipo de pago.",
+    ),
+    "fr": (
+        "🕒 À quelle heure ?",
+        "⚽ Sélectionnez les types d’événement.",
+        "👥 Sélectionnez les formats d’équipes.",
+        "⚖️ Sélectionnez les rôles de l’arbitre.",
         "💳 Sélectionnez le type de paiement.",
     ),
 }
@@ -1352,6 +1407,60 @@ _GAME_SEARCH_VALUE_COPY = {
         "artificial_turf": "Gazon synthétique",
         "hard_surface": "Surface dure",
         "wood_parquet": "Bois / parquet",
+        "free": "Gratuit",
+        "paid": "Payant",
+    },
+}
+_REFEREEING_SEARCH_VALUE_COPY = {
+    "en": {
+        "morning": "Morning",
+        "daytime": "Daytime",
+        "evening": "Evening",
+        "night": "Night",
+        "match": "Match",
+        "tournament": "Tournament",
+        "head_referee": "Head referee",
+        "assistant_referee": "Assistant referee",
+        "var": "VAR",
+        "free": "Free",
+        "paid": "Paid",
+    },
+    "ru": {
+        "morning": "Утро",
+        "daytime": "День",
+        "evening": "Вечер",
+        "night": "Ночь",
+        "match": "Матч",
+        "tournament": "Турнир",
+        "head_referee": "Главный",
+        "assistant_referee": "Ассистент",
+        "var": "VAR",
+        "free": "Бесплатно",
+        "paid": "Платно",
+    },
+    "es": {
+        "morning": "Mañana",
+        "daytime": "Día",
+        "evening": "Tarde",
+        "night": "Noche",
+        "match": "Partido",
+        "tournament": "Torneo",
+        "head_referee": "Árbitro principal",
+        "assistant_referee": "Árbitro asistente",
+        "var": "VAR",
+        "free": "Gratis",
+        "paid": "De pago",
+    },
+    "fr": {
+        "morning": "Matin",
+        "daytime": "Journée",
+        "evening": "Soir",
+        "night": "Nuit",
+        "match": "Match",
+        "tournament": "Tournoi",
+        "head_referee": "Arbitre principal",
+        "assistant_referee": "Arbitre assistant",
+        "var": "VAR",
         "free": "Gratuit",
         "paid": "Payant",
     },
@@ -2707,6 +2816,7 @@ class ConversationOnboarding:
         number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
+        refereeing_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2764,6 +2874,7 @@ class ConversationOnboarding:
                         opponent_search_details,
                         tournament_search_details,
                         transfer_search_details,
+                        refereeing_search_details,
                     )
                 )
                 > 1
@@ -2803,6 +2914,19 @@ class ConversationOnboarding:
                     }
                 )
                 details_payload_key = "transfer_search_details"
+            elif draft.user_intent in {
+                UserIntent.REFEREE_SEARCH,
+                UserIntent.REFEREEING_SERVICE_OFFER,
+            }:
+                selected_details = (
+                    refereeing_search_details
+                    if refereeing_search_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.refereeing_search_details
+                    }
+                )
+                details_payload_key = "refereeing_search_details"
             else:
                 selected_details = (
                     game_search_details
@@ -3291,6 +3415,300 @@ class ConversationOnboarding:
             screen_revision=screen_revision,
             operation="back",
         )
+
+    def open_refereeing_search_details(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the shared Referee Search and service-offer Details hub."""
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+        )
+
+    def open_refereeing_search_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one shared refereeing detail submenu."""
+        if detail_key not in _REFEREEING_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Refereeing Search detail key must be canonical")
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+        )
+
+    def toggle_refereeing_search_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one Referee Search detail value."""
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+        )
+
+    def commit_refereeing_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit one Referee Search detail submenu."""
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+        )
+
+    def select_refereeing_search_time(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str | None,
+    ) -> None:
+        """Commit one Referee Search time choice or clear it."""
+        if value is not None and not _canonical_game_search_time(value):
+            raise ValueError("Refereeing Search Time must be canonical")
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_time",
+            value=value,
+        )
+
+    def open_refereeing_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the Referee Search exact-time prompt."""
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="exact_time_prompt",
+        )
+
+    def submit_refereeing_search_exact_time_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and commit one exact Referee Search local time."""
+        if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text) is None:
+            raise ValueError("Refereeing Search exact time must be HH:MM")
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_exact_time",
+            value=text,
+        )
+
+    def back_from_refereeing_search_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard submenu edits or leave the shared refereeing Details hub."""
+        self._change_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+        )
+
+    def _change_refereeing_search_details(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        operation: str,
+        detail_key: str | None = None,
+        value: str | None = None,
+    ) -> None:
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            draft = self._store.discovery_draft(telegram_user_id)
+            if current is None or draft is None:
+                return
+            if (
+                current.stage is not ConversationStage.POST_CORE
+                or draft.stage is not ConversationStage.POST_CORE
+                or draft.user_intent
+                not in {
+                    UserIntent.REFEREE_SEARCH,
+                    UserIntent.REFEREEING_SERVICE_OFFER,
+                }
+                or draft.screen_revision != screen_revision
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+                return
+            details = dict(draft.refereeing_search_details)
+            editing = draft.editing_refereeing_search_detail
+            temporary = list(draft.refereeing_search_detail_draft)
+            exact_time_prompt = draft.refereeing_search_exact_time_prompt
+            target = "hub"
+            if operation == "open_hub":
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "open_detail":
+                if detail_key is None:
+                    raise RuntimeError("Refereeing Search detail key is missing")
+                editing = detail_key
+                temporary = list(details.get(detail_key, ()))
+                exact_time_prompt = False
+                target = "submenu"
+            elif operation == "toggle":
+                if editing is None or editing == "times":
+                    raise RuntimeError(
+                        "No multi-select Refereeing Search detail is open"
+                    )
+                if value not in _REFEREEING_SEARCH_DETAIL_OPTIONS[editing]:
+                    raise ValueError("Refereeing Search detail value must be canonical")
+                if value in temporary:
+                    temporary.remove(value)
+                else:
+                    temporary.append(value)
+                target = "submenu"
+            elif operation == "select_time":
+                if editing != "times":
+                    raise RuntimeError("Refereeing Search Time detail is not open")
+                if value is None:
+                    details.pop("times", None)
+                else:
+                    details["times"] = (value,)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "submit_exact_time":
+                if editing != "times" or not exact_time_prompt:
+                    raise RuntimeError(
+                        "Refereeing Search exact-time prompt is not open"
+                    )
+                if value is None or not _canonical_game_search_time(value):
+                    raise ValueError("Refereeing Search exact time must be canonical")
+                details["times"] = (value,)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "exact_time_prompt":
+                if editing != "times":
+                    raise RuntimeError("Refereeing Search Time detail is not open")
+                exact_time_prompt = True
+                target = "exact_time_prompt"
+            elif operation == "commit":
+                if editing is None or editing == "times":
+                    raise RuntimeError(
+                        "No multi-select Refereeing Search detail is open"
+                    )
+                if temporary:
+                    details[editing] = tuple(temporary)
+                else:
+                    details.pop(editing, None)
+                editing = None
+                temporary = []
+                exact_time_prompt = False
+            elif operation == "back":
+                if exact_time_prompt and editing == "times":
+                    exact_time_prompt = False
+                    target = "submenu"
+                elif editing is None:
+                    target = "post_core"
+                else:
+                    editing = None
+                    temporary = []
+                    exact_time_prompt = False
+            else:
+                raise RuntimeError("Unknown Refereeing Search detail operation")
+            now = self._clock.now()
+            state = replace(
+                current,
+                screen_revision=current.screen_revision + 1,
+                revision=current.revision + 1,
+            )
+            changed_draft = replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+                refereeing_search_details=tuple(sorted(details.items())),
+                editing_refereeing_search_detail=editing,
+                refereeing_search_detail_draft=tuple(temporary),
+                refereeing_search_exact_time_prompt=exact_time_prompt,
+            )
+            locale = current.locale or "en"
+            if target == "post_core":
+                if draft.country is None or draft.city is None:
+                    raise RuntimeError("Refereeing Search Details lost its Search Area")
+                message = _post_core_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    country=draft.country,
+                    city=draft.city,
+                    areas=draft.sub_city_areas,
+                    whole_city=draft.whole_city,
+                    user_intent=draft.user_intent,
+                )
+            elif target == "submenu":
+                assert editing is not None
+                message = _refereeing_search_detail_submenu_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    detail_key=editing,
+                    temporary=tuple(temporary),
+                )
+            elif target == "exact_time_prompt":
+                message = _game_search_exact_time_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                )
+            else:
+                message = _refereeing_search_details_hub_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    details=details,
+                )
+            self._store.commit_conversation_update(
+                update_id=update_id,
+                expected_revision=current.revision,
+                draft=changed_draft,
+                state=state,
+                message=message,
+                recorded_at=now,
+            )
+        self.deliver_pending()
 
     def _change_opponent_search_details(
         self,
@@ -4299,6 +4717,8 @@ class ConversationOnboarding:
                 else _transfer_search_result_message
                 if opportunity_type
                 in {"roster_vacancy", "player_transfer_availability"}
+                else _refereeing_result_message
+                if opportunity_type in {"referee_availability", "referee_request"}
                 else _open_match_result_message
             )
             message = renderer(
@@ -7053,6 +7473,9 @@ def _post_core_message(
     details_callback = (
         "opponent-details:hub"
         if user_intent is UserIntent.OPPONENT_SEARCH
+        else "refereeing-details:hub"
+        if user_intent
+        in {UserIntent.REFEREE_SEARCH, UserIntent.REFEREEING_SERVICE_OFFER}
         else "transfer-details:hub"
         if user_intent
         in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
@@ -7385,6 +7808,520 @@ def _opponent_search_detail_submenu_message(
             *rows,
             ((back_label, f"opponent-details:back:{screen_revision}"),),
         ),
+    )
+
+
+def _refereeing_search_details_hub_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    details: dict[str, tuple[str, ...]],
+) -> TelegramMessage:
+    """Render the shared Referee Search and service-offer Details hub."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    introduction, not_set, back_label, search_label = {
+        "en": ("You can choose the following settings:", "not set", "Back", "Search"),
+        "ru": ("Можно выбрать следующие настройки:", "не задано", "Назад", "Поиск"),
+        "es": (
+            "Puedes elegir las siguientes opciones:",
+            "sin definir",
+            "Atrás",
+            "Buscar",
+        ),
+        "fr": (
+            "Vous pouvez choisir les paramètres suivants :",
+            "non défini",
+            "Retour",
+            "Rechercher",
+        ),
+    }[copy_locale]
+    keys = tuple(_REFEREEING_SEARCH_DETAIL_OPTIONS)
+    names = _REFEREEING_SEARCH_DETAIL_NAMES[copy_locale]
+    summaries = tuple(
+        ", ".join(
+            _REFEREEING_SEARCH_VALUE_COPY[copy_locale].get(value, value)
+            for value in details.get(key, ())
+        )
+        or not_set
+        for key in keys
+    )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=introduction
+        + "\n\n"
+        + "\n".join(
+            f"- {name}: {summary}"
+            for name, summary in zip(names, summaries, strict=True)
+        ),
+        button_rows=(
+            *tuple(
+                (
+                    (
+                        f"{name}: {summary} ▸",
+                        f"refereeing-details:open:{key}:{screen_revision}",
+                    ),
+                )
+                for key, name, summary in zip(keys, names, summaries, strict=True)
+            ),
+            ((back_label, f"details:back:{screen_revision}"),),
+            ((search_label, f"search:submit:{screen_revision}"),),
+        ),
+    )
+
+
+def _refereeing_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    """Render one Referee Search multi-select detail submenu."""
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    keys = tuple(_REFEREEING_SEARCH_DETAIL_OPTIONS)
+    heading = _REFEREEING_SEARCH_DETAIL_HEADINGS[copy_locale][keys.index(detail_key)]
+    done_label, any_label, back_label, exact_label = {
+        "en": ("Done", "Any", "Back", "Enter exact time"),
+        "ru": ("Готово", "Неважно", "Назад", "Указать точное время"),
+        "es": ("Listo", "Cualquiera", "Atrás", "Indicar hora exacta"),
+        "fr": ("Valider", "Peu importe", "Retour", "Indiquer l’heure exacte"),
+    }[copy_locale]
+
+    def button(value: str) -> tuple[str, str]:
+        return (
+            f"{'✓ ' if value in temporary else ''}"
+            f"{_REFEREEING_SEARCH_VALUE_COPY[copy_locale].get(value, value)}",
+            (
+                f"refereeing-details:time:{value}:{screen_revision}"
+                if detail_key == "times"
+                else f"refereeing-details:toggle:{value}:{screen_revision}"
+            ),
+        )
+
+    rows: tuple[tuple[tuple[str, str], ...], ...]
+    if detail_key == "times":
+        rows = (
+            ((exact_label, f"refereeing-details:time:exact:{screen_revision}"),),
+            (button("morning"), button("daytime")),
+            (button("evening"), button("night")),
+            ((any_label, f"refereeing-details:time:any:{screen_revision}"),),
+        )
+    else:
+        options = _REFEREEING_SEARCH_DETAIL_OPTIONS[detail_key]
+        grouped_options: tuple[tuple[str, ...], ...] = {
+            "event_types": (options,),
+            "team_formats": (options[:3], options[3:6], options[6:]),
+            "referee_roles": (options,),
+            "payment": (options,),
+        }[detail_key]
+        rows = (
+            *tuple(tuple(button(value) for value in row) for row in grouped_options),
+            ((done_label, f"refereeing-details:done:{screen_revision}"),),
+        )
+    return TelegramMessage(
+        delivery_id=f"onboarding:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=heading,
+        button_rows=(
+            *rows,
+            ((back_label, f"refereeing-details:back:{screen_revision}"),),
+        ),
+    )
+
+
+def _refereeing_result_message(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+) -> TelegramMessage:
+    """Render a Referee Availability or Referee Request Result Card."""
+    facts = dict(result.card_facts)
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    is_request = facts.get("opportunity_type") == "referee_request"
+    labels = {
+        "en": {
+            "availability_title": "⚖️ Referee Availability",
+            "request_title": "⚖️ Referee Request",
+            "standing": "Standing availability",
+            "matches": "Matches",
+            "needs": "Needs clarification",
+            "additional": "Additional",
+            "posted": "Posted",
+            "edited": "Edited",
+            "contact": "Contact",
+            "at": "at",
+            "date": "date",
+            "date_and_search_area": "date and search area",
+            "search_area": "search area",
+            "no_exact": "No exact match was found.",
+            "invitation": (
+                "Questions? Message me. I can explain the card or help refine "
+                "your search."
+            ),
+        },
+        "ru": {
+            "availability_title": "⚖️ Доступность судьи",
+            "request_title": "⚖️ Запрос судьи",
+            "standing": "Постоянная доступность",
+            "matches": "Подходит",
+            "needs": "Нужно уточнить",
+            "additional": "Дополнительно",
+            "posted": "Пост",
+            "edited": "Изменён",
+            "contact": "Контакт",
+            "at": "в",
+            "date": "дата",
+            "date_and_search_area": "дата и район поиска",
+            "search_area": "район поиска",
+            "no_exact": "Точного совпадения не найдено.",
+            "invitation": (
+                "💬 Остались вопросы? Напишите, я объясню карточку или помогу "
+                "уточнить поиск."
+            ),
+        },
+        "es": {
+            "availability_title": "⚖️ Disponibilidad de árbitro",
+            "request_title": "⚖️ Solicitud de árbitro",
+            "standing": "Disponibilidad permanente",
+            "matches": "Coincide",
+            "needs": "Falta confirmar",
+            "additional": "Información adicional",
+            "posted": "Publicado",
+            "edited": "Modificado",
+            "contact": "Contacto",
+            "at": "a las",
+            "date": "fecha",
+            "date_and_search_area": "fecha y zona de búsqueda",
+            "search_area": "zona de búsqueda",
+            "no_exact": "No se encontró una coincidencia exacta.",
+            "invitation": (
+                "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha o le "
+                "ayudaré a ajustar la búsqueda."
+            ),
+        },
+        "fr": {
+            "availability_title": "⚖️ Disponibilité de l’arbitre",
+            "request_title": "⚖️ Demande d’arbitre",
+            "standing": "Disponibilité permanente",
+            "matches": "Correspond",
+            "needs": "À préciser",
+            "additional": "Informations complémentaires",
+            "posted": "Publié",
+            "edited": "Modifié",
+            "contact": "Contact",
+            "at": "à",
+            "date": "date",
+            "date_and_search_area": "date et zone de recherche",
+            "search_area": "zone de recherche",
+            "no_exact": "Aucune correspondance exacte n’a été trouvée.",
+            "invitation": (
+                "Une question ? Écrivez-moi. Je peux expliquer la fiche ou vous "
+                "aider à affiner votre recherche."
+            ),
+        },
+    }[copy_locale]
+    months = {
+        "en": (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        "ru": (
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ),
+        "es": (
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ),
+        "fr": (
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ),
+    }[copy_locale]
+
+    start_value = facts.get("start_local_date")
+    end_value = facts.get("end_local_date", start_value)
+    if start_value is None or end_value is None:
+        when = labels["standing"]
+    else:
+        event_date = date.fromisoformat(start_value)
+        event_end_date = date.fromisoformat(end_value)
+        if event_date == event_end_date:
+            date_copy = (
+                f"{event_date.day} {months[event_date.month - 1]} {event_date.year}"
+            )
+        elif (
+            event_date.year == event_end_date.year
+            and event_date.month == event_end_date.month
+        ):
+            date_copy = (
+                f"{event_date.day}–{event_end_date.day} "
+                f"{months[event_date.month - 1]} {event_date.year}"
+            )
+        else:
+            date_copy = (
+                f"{event_date.day} {months[event_date.month - 1]} {event_date.year}–"
+                f"{event_end_date.day} {months[event_end_date.month - 1]} "
+                f"{event_end_date.year}"
+            )
+        time_copy = facts.get("exact_local_time")
+        if time_copy is None:
+            day_part = facts.get("day_part")
+            time_copy = (
+                {
+                    "morning": {
+                        "en": "morning",
+                        "ru": "утром",
+                        "es": "por la mañana",
+                        "fr": "le matin",
+                    },
+                    "daytime": {
+                        "en": "daytime",
+                        "ru": "днём",
+                        "es": "de día",
+                        "fr": "l’après-midi",
+                    },
+                    "evening": {
+                        "en": "evening",
+                        "ru": "вечером",
+                        "es": "por la tarde",
+                        "fr": "le soir",
+                    },
+                    "night": {
+                        "en": "night",
+                        "ru": "ночью",
+                        "es": "por la noche",
+                        "fr": "la nuit",
+                    },
+                }.get(day_part, {}).get(copy_locale)
+                if isinstance(day_part, str)
+                else None
+            )
+        when = date_copy + (f", {time_copy}" if time_copy else "")
+
+    where = facts[f"city_display_{copy_locale}"]
+    if int(facts.get("location_specificity", "0")) > 1:
+        where += f", {facts[f'place_display_{copy_locale}']}"
+
+    def json_values(key: str) -> tuple[str, ...]:
+        raw = facts.get(key)
+        if not raw:
+            return ()
+        with suppress(TypeError, json.JSONDecodeError):
+            values = json.loads(raw)
+            if isinstance(values, list):
+                return tuple(value for value in values if isinstance(value, str))
+        return ()
+
+    value_copy = _REFEREEING_SEARCH_VALUE_COPY[copy_locale]
+    detail_names = dict(
+        zip(
+            _REFEREEING_SEARCH_DETAIL_OPTIONS,
+            _REFEREEING_SEARCH_DETAIL_NAMES[copy_locale],
+            strict=True,
+        )
+    )
+    known_values: dict[str, str] = {}
+    for key in ("event_types", "team_formats", "referee_roles"):
+        values = json_values(key)
+        if values:
+            known_values[key] = ", ".join(
+                value_copy.get(value, value) for value in values
+            )
+    if facts.get("payment") in value_copy:
+        payment_copy = value_copy[facts["payment"]]
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            payment_copy += f" ({facts['payment_amount']} {facts['payment_currency']})"
+        known_values["payment"] = payment_copy
+
+    match_states: dict[str, str] = {}
+    with suppress(TypeError, json.JSONDecodeError):
+        parsed_states = json.loads(facts.get("match_states", "{}"))
+        if isinstance(parsed_states, dict):
+            match_states = {
+                key: value
+                for key, value in parsed_states.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+    detail_order = ("event_types", "team_formats", "referee_roles", "payment")
+    detail_lines = tuple(
+        f"{detail_names[key]}: {known_values[key]}"
+        for key in detail_order
+        if match_states.get(key) == "confirmed" and key in known_values
+    )
+    additional = " · ".join(
+        f"{detail_names[key]}: {known_values[key]}"
+        for key in detail_order
+        if match_states.get(key) != "confirmed" and key in known_values
+    )
+    criterion_names = {
+        "times": {
+            "en": "time",
+            "ru": "время",
+            "es": "hora",
+            "fr": "heure",
+        },
+        "event_types": {
+            "en": "event type",
+            "ru": "тип события",
+            "es": "tipo de evento",
+            "fr": "type d’événement",
+        },
+        "team_formats": {
+            "en": "team format",
+            "ru": "формат команд",
+            "es": "formato de equipos",
+            "fr": "format d’équipes",
+        },
+        "referee_roles": {
+            "en": "referee role",
+            "ru": "роль судьи",
+            "es": "rol del árbitro",
+            "fr": "rôle de l’arbitre",
+        },
+        "payment": {
+            "en": "payment",
+            "ru": "оплата",
+            "es": "pago",
+            "fr": "paiement",
+        },
+        "search_area": {
+            "en": "search area",
+            "ru": "район поиска",
+            "es": "zona de búsqueda",
+            "fr": "zone de recherche",
+        },
+        "date": {
+            "en": "date",
+            "ru": "дата",
+            "es": "fecha",
+            "fr": "date",
+        },
+    }
+    confirmed_criteria: list[str] = []
+    if match_states.get("date") == "confirmed":
+        confirmed_criteria.append(
+            labels["date_and_search_area"]
+            if match_states.get("search_area") == "confirmed"
+            else labels["date"]
+        )
+    elif match_states.get("search_area") == "confirmed":
+        confirmed_criteria.append(labels["search_area"])
+    confirmed_criteria.extend(
+        criterion_names[key][copy_locale]
+        for key in ("times", *detail_order)
+        if match_states.get(key) == "confirmed"
+    )
+    unknown_criteria = [
+        criterion_names[key][copy_locale]
+        for key in ("date", "times", *detail_order, "search_area")
+        if match_states.get(key) == "unknown"
+    ]
+    match_lines = [
+        f"{labels['matches']}: "
+        f"{', '.join(confirmed_criteria or [labels['search_area']])}."
+    ]
+    if unknown_criteria:
+        match_lines.append(f"{labels['needs']}: {', '.join(unknown_criteria)}.")
+    if result.result_class == "possible_match":
+        possible_prefix = labels["no_exact"]
+    else:
+        possible_prefix = ""
+
+    source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
+        ZoneInfo(facts["iana_timezone"])
+    )
+    posted = (
+        f"{labels['posted']}: {source_time.day} {months[source_time.month - 1]} "
+        f"{source_time.year} {labels['at']} {source_time:%H:%M}"
+    )
+    edited = ""
+    if facts.get("source_edited_at"):
+        edited_time = datetime.fromisoformat(facts["source_edited_at"]).astimezone(
+            ZoneInfo(facts["iana_timezone"])
+        )
+        edited = (
+            f"{labels['edited']}: {edited_time.day} "
+            f"{months[edited_time.month - 1]} {edited_time.year} "
+            f"{labels['at']} {edited_time:%H:%M}"
+        )
+    route_copy = render_response_route(
+        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    )
+    sections = [
+        labels["request_title"] if is_request else labels["availability_title"],
+        when,
+        where,
+        *detail_lines,
+    ]
+    if possible_prefix:
+        sections.append(possible_prefix)
+    sections.append("\n".join(match_lines))
+    if additional:
+        sections.append(f"{labels['additional']}: {additional}")
+    sections.extend([posted, edited] if edited else [posted])
+    sections.extend([f"{labels['contact']}: {route_copy}", labels["invitation"]])
+    return TelegramMessage(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n\n".join(sections),
+        button_rows=(),
+        reply_button=_MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4],
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
 
 
@@ -10196,7 +11133,7 @@ class RuntimeApplication:
                         ContractName.CLASSIFICATION_PROPOSAL,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
-                    and definition.version in {2, 3, 4, 5}
+                    and definition.version in {2, 3, 4, 5, 6}
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -10828,7 +11765,7 @@ class RuntimeApplication:
                 if (
                     self.role is RuntimeRole.APPLICATION
                     and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-                    and incoming.contract_version in {4, 5}
+                    and incoming.contract_version in {4, 5, 6}
                 ):
                     invalid_payload = (
                         incoming.payload if isinstance(incoming.payload, dict) else {}
@@ -11042,7 +11979,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and incoming.contract_version in {2, 3, 4, 5}
+            and incoming.contract_version in {2, 3, 4, 5, 6}
             and supported_incoming is not None
         ):
             self._accept_classification_proposal(supported_incoming)
@@ -11201,6 +12138,7 @@ class RuntimeApplication:
         if self.model.primary_schema_version in {
             "source-message-classification-v2",
             "source-message-classification-v3",
+            "source-message-classification-v4",
         }:
             self._classify_source_message_v2(
                 incoming,
@@ -11837,6 +12775,7 @@ class RuntimeApplication:
         if descriptor.primary_schema_version not in {
             "source-message-classification-v2",
             "source-message-classification-v3",
+            "source-message-classification-v4",
         }:
             raise RuntimeError("classifier adapter exposes unsupported artifacts")
         if descriptor.ambiguity_prompt_version is None:
@@ -13211,7 +14150,7 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
-        if incoming.contract_version in {4, 5}:
+        if incoming.contract_version in {4, 5, 6}:
             adjacent_context = payload.get("adjacent_context")
             output = payload.get("output")
             routing = output.get("routing") if isinstance(output, dict) else None
@@ -13286,9 +14225,24 @@ class RuntimeApplication:
                 )
                 is not None
             },
+            "source_refereeing_qualifying_assertions": {
+                opportunity_type: assertion.isoformat()
+                for opportunity_type in (
+                    "referee_availability",
+                    "referee_request",
+                )
+                if (
+                    assertion := _source_refereeing_qualifying_assertion_at(
+                        source_revision,
+                        source_revision_history,
+                        opportunity_type,
+                    )
+                )
+                is not None
+            },
         }
         if (
-            incoming.contract_version not in {4, 5}
+            incoming.contract_version not in {4, 5, 6}
             and player_classifier_proposal_contains_player(authoritative_payload)
             and not player_classifier_promotion_is_approved(
                 self.store.classifier_release_promotion(
@@ -13309,7 +14263,7 @@ class RuntimeApplication:
                 received_at=self.clock.now(),
             )
             return
-        if incoming.contract_version in {4, 5}:
+        if incoming.contract_version in {4, 5, 6}:
             artifact_descriptor = _classifier_artifact_descriptor_for_payload(
                 authoritative_payload,
                 contract_envelope_version=incoming.contract_version,
@@ -13390,7 +14344,13 @@ class RuntimeApplication:
                 authoritative_payload,
                 revision_id=revision_id,
                 body=source_revision.body,
-                artifact_version=("v3" if incoming.contract_version == 5 else "v2"),
+                artifact_version=(
+                    "v4"
+                    if incoming.contract_version == 6
+                    else "v3"
+                    if incoming.contract_version == 5
+                    else "v2"
+                ),
                 artifact_descriptor=artifact_descriptor,
             ):
                 self._record_classification_routing_outcome(
@@ -14410,6 +15370,9 @@ class RuntimeApplication:
         tournament_search_details = _runtime_tournament_search_details(
             payload.get("tournament_search_details")
         )
+        refereeing_search_details = _runtime_refereeing_search_details(
+            payload.get("refereeing_search_details")
+        )
         transfer_search_details = _runtime_transfer_search_details(
             payload.get("transfer_search_details")
         )
@@ -14427,6 +15390,7 @@ class RuntimeApplication:
             game_search_details=tuple(sorted(game_search_details.items())),
             opponent_search_details=tuple(sorted(opponent_search_details.items())),
             tournament_search_details=tuple(sorted(tournament_search_details.items())),
+            refereeing_search_details=tuple(sorted(refereeing_search_details.items())),
             transfer_search_details=tuple(sorted(transfer_search_details.items())),
             sub_city_area_geographic_types=tuple(
                 value for value in area_types if isinstance(value, str)
@@ -14831,6 +15795,68 @@ def _source_transfer_qualifying_assertion_at(
         elif revision.event_kind is SourceEventKind.EDIT and (
             _source_transfer_edit_qualifies_freshness(
                 revision, previous, opportunity_type
+            )
+        ):
+            qualifying = revision.event_time
+    return qualifying
+
+
+def _source_refereeing_edit_qualifies_freshness(
+    current_revision: SourceMessageRevision,
+    previous_revision: SourceMessageRevision | None,
+    opportunity_type: str,
+) -> bool:
+    """Renew referee freshness only for a changed accepted source assertion."""
+    if current_revision.body is None or not _refereeing_opportunity_is_supported(
+        current_revision.body,
+        opportunity_type=opportunity_type,
+    ):
+        return False
+    if previous_revision is None or previous_revision.body is None:
+        return True
+    return _source_edit_qualifies_freshness(
+        current_revision,
+        (previous_revision,),
+    )
+
+
+def _source_refereeing_qualifying_assertion_at(
+    current_revision: SourceMessageRevision,
+    history: tuple[SourceMessageRevision, ...],
+    opportunity_type: str,
+) -> datetime | None:
+    """Return the last source revision that asserted a referee opportunity."""
+    ordered = tuple(
+        sorted(
+            (
+                revision
+                for revision in history
+                if revision.revision <= current_revision.revision
+            ),
+            key=lambda revision: revision.revision,
+        )
+    )
+    qualifying: datetime | None = None
+    for revision in ordered:
+        previous = next(
+            (
+                candidate
+                for candidate in reversed(ordered)
+                if candidate.revision < revision.revision
+            ),
+            None,
+        )
+        if revision.event_kind is SourceEventKind.CREATE:
+            if revision.body is not None and _refereeing_opportunity_is_supported(
+                revision.body,
+                opportunity_type=opportunity_type,
+            ):
+                qualifying = revision.event_time
+        elif revision.event_kind is SourceEventKind.EDIT and (
+            _source_refereeing_edit_qualifies_freshness(
+                revision,
+                previous,
+                opportunity_type,
             )
         ):
             qualifying = revision.event_time
@@ -15308,9 +16334,11 @@ def _is_explicit_children_only_game(body: str) -> bool:
     normalized = body.casefold().replace(" ", " ")
     patterns = (
         r"\b(?:children['’]?s|childrens|children|kids?['’]?(?:s)?)\s+"
-        r"(?:football\s+)?(?:games?|matches|tournaments?)\b",
-        r"\b(?:games?|matches|tournaments?)\s+(?:only\s+)?for\s+"
+        r"(?:football\s+)?(?:games?|match(?:es)?|tournaments?)\b",
+        r"\b(?:games?|match(?:es)?|tournaments?)\s+(?:only\s+)?for\s+"
         r"(?:children|kids?)\b",
+        r"\b(?:children|kids?)\s*[- ]only\s+"
+        r"(?:football\s+)?(?:games?|match(?:es)?|tournaments?)\b",
         r"\bдетск\w*\s+(?:футбольн\w*\s+)?"
         r"(?:игр\w*|матч\w*|турнир\w*)\b",
         r"\b(?:игра|матч|турнир)\s+(?:только\s+)?для\s+детей\b",
@@ -15351,6 +16379,7 @@ def _classifier_proposal_has_pinned_provenance(
     if payload.get("schema_version") in {
         "source-message-classification-v2",
         "source-message-classification-v3",
+        "source-message-classification-v4",
     }:
         descriptor = _classifier_artifact_descriptor_for_payload(payload)
         if descriptor is None:
@@ -15360,7 +16389,9 @@ def _classifier_proposal_has_pinned_provenance(
             revision_id=revision_id,
             body=body,
             artifact_version=(
-                "v3"
+                "v4"
+                if payload.get("schema_version") == "source-message-classification-v4"
+                else "v3"
                 if payload.get("schema_version") == "source-message-classification-v3"
                 else "v2"
             ),
@@ -15481,7 +16512,9 @@ def _classifier_artifact_versions(
             if player_release
             and primary_schema_version == "source-message-classification-v3"
             else (
-                "open-match-primary-v3"
+                "open-match-primary-v4"
+                if primary_schema_version == "source-message-classification-v4"
+                else "open-match-primary-v3"
                 if primary_schema_version == "source-message-classification-v3"
                 else None
             )
@@ -16267,6 +17300,10 @@ _OPTIONAL_TRANSFER_FACTS = frozenset(
         "payment",
     }
 )
+_MANDATORY_REFEREE_FACTS = frozenset({"opportunity", "location"})
+_OPTIONAL_REFEREE_FACTS = frozenset(
+    {"event_time", "event_types", "team_formats", "referee_roles", "payment"}
+)
 
 
 _CLASSIFICATION_ROUTING_ROUTES = {
@@ -16409,6 +17446,10 @@ _PROPOSITION_LINEAGE_FACT_KEYS = (
     "structure",
     "capacity",
     "prizes",
+    "referee_availability",
+    "referee_request",
+    "event_types",
+    "referee_roles",
 )
 _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "opportunity",
@@ -16431,6 +17472,10 @@ _PROPOSITION_LINEAGE_EVIDENCE_KEYS = (
     "structure",
     "capacity",
     "prizes",
+    "referee_availability",
+    "referee_request",
+    "event_types",
+    "referee_roles",
 )
 
 
@@ -16515,6 +17560,8 @@ def _proposition_opportunity_id(
         "player_match_availability",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
     }:
         raise ValueError("unsupported proposition opportunity type")
     return (
@@ -16538,6 +17585,8 @@ def _legacy_candidate_alias_for_canonical(
             "roster_vacancy",
             "player_match_availability",
             "player_transfer_availability",
+            "referee_availability",
+            "referee_request",
         ):
             candidate_prefix = (
                 f"opportunity:{source_message_id}:{candidate_type}:proposition:"
@@ -16573,6 +17622,8 @@ def _canonicalize_legacy_proposition_records(
         "tournament",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
     }
     for record in persisted_records:
         opportunity_id = record.get("opportunity_id")
@@ -16879,6 +17930,10 @@ def _candidate_target_manifest_hash(
             "structure",
             "capacity",
             "prizes",
+            "referee_availability",
+            "referee_request",
+            "event_types",
+            "referee_roles",
             "response_routes",
             "proposition_evidence",
             "source_context",
@@ -16975,6 +18030,20 @@ def _proposition_graph_has_closed_target_set(
         expected_mandatory = _MANDATORY_OPPONENT_REQUEST_FACTS
         allowed_facts = (
             _MANDATORY_OPPONENT_REQUEST_FACTS | _OPTIONAL_OPPONENT_REQUEST_FACTS
+        )
+    elif effective_meaning in {"referee_availability", "referee_request"}:
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_REFEREE_FACTS | {
+            effective_meaning,
+        }
+        if effective_meaning == "referee_request":
+            expected_mandatory = expected_mandatory | {"event_time"}
+        allowed_facts = (
+            _MANDATORY_REFEREE_FACTS
+            | _OPTIONAL_REFEREE_FACTS
+            | {
+                effective_meaning,
+            }
         )
     else:
         participation_ids = set()
@@ -17098,6 +18167,8 @@ def _validated_opportunity_proposal(
         "tournament",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
     }:
         return None
     if (
@@ -17107,6 +18178,13 @@ def _validated_opportunity_proposal(
         return None
     if opportunity_type == "tournament":
         return _validated_tournament_proposal(payload_value, resolver=resolver)
+    if opportunity_type in {"referee_availability", "referee_request"}:
+        return _validated_refereeing_proposal(
+            payload_value,
+            candidate=candidate,
+            resolver=resolver,
+            timezone_data=timezone_data,
+        )
     is_player_match = opportunity_type == "player_match_availability"
     if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
         return _validated_transfer_proposal(
@@ -18203,6 +19281,381 @@ def _validated_transfer_proposal(
     }
 
 
+def _validated_refereeing_proposal(
+    payload_value: dict[str, JsonValue],
+    *,
+    candidate: dict[str, JsonValue],
+    resolver: LocationResolverAdapter,
+    timezone_data: TimezoneDataAdapter | None,
+) -> dict[str, JsonValue] | None:
+    """Normalize one evidence-backed Referee Availability or Referee Request."""
+    body = payload_value.get("body")
+    revision_id = payload_value.get("source_message_revision_id")
+    semantic_proof = payload_value.get("semantic_proof")
+    artifact_descriptor = _classifier_artifact_descriptor_for_payload(payload_value)
+    opportunity_type = candidate.get("opportunity_type")
+    if (
+        not isinstance(body, str)
+        or not isinstance(revision_id, str)
+        or artifact_descriptor is None
+        or opportunity_type not in {"referee_availability", "referee_request"}
+        or timezone_data is None
+    ):
+        return None
+    assert isinstance(opportunity_type, str)
+    required = {
+        "candidate_key",
+        "opportunity_type",
+        "evidence",
+        "location",
+        "response_routes",
+        opportunity_type,
+    }
+    if opportunity_type == "referee_request":
+        required.add("event_time")
+    optional = {"event_types", "team_formats", "referee_roles", "payment"}
+    if opportunity_type == "referee_availability":
+        optional.add("event_time")
+    structured = {"proposition_evidence", "source_context"}
+    if (
+        not required.issubset(candidate)
+        or set(candidate) - required - optional - structured
+        or candidate.get(opportunity_type) is not True
+    ):
+        return None
+    candidate_key = candidate.get("candidate_key")
+    evidence = candidate.get("evidence")
+    location = candidate.get("location")
+    routes = candidate.get("response_routes")
+    source_context = candidate.get("source_context")
+    validation_body = source_context if isinstance(source_context, str) else body
+    expected_evidence = {"opportunity", "location", opportunity_type}
+    if opportunity_type == "referee_request":
+        expected_evidence.add("event_time")
+    if "event_time" in candidate:
+        expected_evidence.add("event_time")
+    expected_evidence |= set(candidate) & optional
+    if (
+        not isinstance(candidate_key, str)
+        or not candidate_key
+        or not isinstance(evidence, dict)
+        or set(evidence) != expected_evidence
+        or not all(
+            isinstance(value, str) and value in body for value in evidence.values()
+        )
+        or not isinstance(location, dict)
+        or not isinstance(routes, list)
+        or (
+            source_context is not None
+            and (not isinstance(source_context, str) or not source_context)
+        )
+        or (isinstance(source_context, str) and source_context not in body)
+    ):
+        return None
+    assert isinstance(candidate_key, str)
+    assert isinstance(evidence, dict)
+    assert isinstance(location, dict)
+    assert isinstance(routes, list)
+    route = _select_response_route(
+        body=validation_body,
+        proposed_routes=routes,
+        bounded_metadata=payload_value.get("bounded_metadata"),
+    )
+    if route is None or not _proposition_evidence_is_authoritative(
+        candidate.get("proposition_evidence"),
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+        semantic_proof=semantic_proof,
+        source_message_revision_reference=_opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
+        opportunity_type=opportunity_type,
+        artifact_descriptor=artifact_descriptor,
+    ):
+        return None
+    mention = location.get("mention")
+    country_id = location.get("country_id")
+    city_id = location.get("city_id")
+    place_id = location.get("place_id")
+    if not all(
+        isinstance(value, str) and value
+        for value in (mention, country_id, city_id, place_id)
+    ):
+        return None
+    assert isinstance(mention, str)
+    assert isinstance(country_id, str)
+    assert isinstance(city_id, str)
+    assert isinstance(place_id, str)
+    resolved_location = _resolve_source_location_across_supported_locales(
+        resolver,
+        mention=mention,
+        country_id=country_id,
+        city_id=city_id,
+    )
+    if resolved_location is None:
+        return None
+    resolved_place, city_display_labels = resolved_location
+    places = tuple(
+        place
+        for place in (resolved_place,)
+        if place.place_id == place_id
+        and place.country_id == country_id
+        and place.city_id == city_id
+        and country_id in place.verified_parent_ids
+        and _valid_location_disjointness(place)
+        and bool(place.resolver_version)
+        and bool(place.glossary_version)
+        and len(place.verified_parent_ids) == len(place.parent_display_names)
+        and all(place.parent_display_names)
+        and (
+            city_id in place.verified_parent_ids
+            or (
+                place.geographic_type is GeographicType.CITY
+                and place.place_id == city_id
+            )
+        )
+    )
+    if len(places) != 1:
+        return None
+    place = places[0]
+    timezone_name = place.iana_timezone
+    if not isinstance(timezone_name, str) or not timezone_name:
+        return None
+    try:
+        resolved_timezone = timezone_data.resolve(timezone_name)
+        event_timezone = ZoneInfo(timezone_name)
+        source_event_time = datetime.fromisoformat(
+            str(payload_value.get("source_event_time"))
+        )
+        validation_time = datetime.fromisoformat(
+            str(payload_value.get("validation_time"))
+        )
+    except (TimezoneDataError, ValueError, ZoneInfoNotFoundError):
+        return None
+    if (
+        resolved_timezone.iana_timezone != timezone_name
+        or not resolved_timezone.version
+        or source_event_time.tzinfo is None
+        or validation_time.tzinfo is None
+    ):
+        return None
+    event_time = candidate.get("event_time")
+    start_date: date | None = None
+    end_date: date | None = None
+    exact_time: str | None = None
+    day_part: str | None = None
+    if event_time is None:
+        if opportunity_type == "referee_request":
+            return None
+    elif not isinstance(event_time, dict):
+        return None
+    else:
+        if frozenset(event_time) not in {
+            frozenset({"start_local_date", "end_local_date", "iana_timezone"}),
+            frozenset(
+                {
+                    "start_local_date",
+                    "end_local_date",
+                    "exact_local_time",
+                    "iana_timezone",
+                }
+            ),
+            frozenset(
+                {
+                    "start_local_date",
+                    "end_local_date",
+                    "day_part",
+                    "iana_timezone",
+                }
+            ),
+        }:
+            return None
+        raw_start = event_time.get("start_local_date")
+        raw_end = event_time.get("end_local_date")
+        raw_timezone = event_time.get("iana_timezone")
+        exact_value = event_time.get("exact_local_time")
+        day_value = event_time.get("day_part")
+        if (
+            not isinstance(raw_start, str)
+            or not isinstance(raw_end, str)
+            or not isinstance(raw_timezone, str)
+            or (exact_value is not None and not isinstance(exact_value, str))
+            or (day_value is not None and not isinstance(day_value, str))
+            or raw_timezone != timezone_name
+        ):
+            return None
+        try:
+            start_date = date.fromisoformat(raw_start)
+            end_date = date.fromisoformat(raw_end)
+            if exact_value is not None:
+                datetime.strptime(exact_value, "%H:%M")
+        except ValueError:
+            return None
+        exact_time = exact_value
+        day_part = day_value
+        if (
+            start_date > end_date
+            or day_part not in {None, "morning", "daytime", "evening", "night"}
+            or (exact_time is not None and day_part is not None)
+            or not _event_time_is_supported(
+                start_date,
+                end_date,
+                exact_time,
+                str(evidence["event_time"]),
+                day_part=day_part,
+                source_event_time=source_event_time,
+                source_timezone=(
+                    str(payload_value.get("source_chat_timezone"))
+                    if payload_value.get("source_chat_timezone") is not None
+                    else None
+                ),
+                authoritative_body=validation_body,
+            )
+            or validation_time.astimezone(event_timezone)
+            >= _open_match_expiry(start_date, end_date, exact_time, event_timezone)
+        ):
+            return None
+    if (
+        not _refereeing_opportunity_is_supported(
+            body, opportunity_type=opportunity_type
+        )
+        or not _refereeing_opportunity_is_supported(
+            validation_body, opportunity_type=opportunity_type
+        )
+        or mention not in str(evidence["location"])
+        or not _location_mention_is_authoritative(validation_body, mention)
+        or not _optional_canonical_list(
+            candidate.get("event_types"), {"match", "tournament"}
+        )
+        or not _optional_canonical_list(
+            candidate.get("team_formats"),
+            {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"},
+        )
+        or not _optional_canonical_list(
+            candidate.get("referee_roles"),
+            {"head_referee", "assistant_referee", "var"},
+        )
+        or candidate.get("payment") not in {None, "free", "paid", "unknown"}
+        or not _refereeing_optional_values_are_supported(
+            candidate,
+            evidence,
+            authoritative_body=validation_body,
+        )
+    ):
+        return None
+    raw_posted_at = payload_value.get(
+        "source_posted_at", payload_value.get("source_event_time")
+    )
+    raw_edited_at = payload_value.get("source_edited_at")
+    try:
+        posted_at = datetime.fromisoformat(str(raw_posted_at))
+        edited_at = (
+            datetime.fromisoformat(str(raw_edited_at))
+            if raw_edited_at is not None
+            else None
+        )
+    except ValueError:
+        return None
+    if (
+        not isinstance(raw_posted_at, str)
+        or not raw_posted_at
+        or posted_at.tzinfo is None
+        or (
+            edited_at is not None
+            and (edited_at.tzinfo is None or edited_at < posted_at)
+        )
+        or (raw_edited_at is not None and not isinstance(raw_edited_at, str))
+    ):
+        return None
+    qualifying_assertions = payload_value.get("source_refereeing_qualifying_assertions")
+    qualifying_text = (
+        qualifying_assertions.get(opportunity_type)
+        if isinstance(qualifying_assertions, dict)
+        else None
+    )
+    if qualifying_text is not None and not isinstance(qualifying_text, str):
+        return None
+    try:
+        qualifying_assertion = (
+            datetime.fromisoformat(qualifying_text)
+            if isinstance(qualifying_text, str)
+            else (
+                edited_at
+                if payload_value.get("source_edit_qualifies_freshness")
+                and edited_at is not None
+                else posted_at
+            )
+        )
+    except ValueError:
+        return None
+    if (
+        qualifying_assertion.tzinfo is None
+        or qualifying_assertion < posted_at
+        or (edited_at is not None and qualifying_assertion > edited_at)
+        or (
+            opportunity_type == "referee_availability"
+            and start_date is None
+            and validation_time >= qualifying_assertion + timedelta(days=30)
+        )
+    ):
+        return None
+    payment = candidate.get("payment")
+    payment_details = (
+        _stated_payment_amount_and_currency(str(evidence["payment"]))
+        if payment == "paid"
+        else None
+    )
+    localized = dict(place.localized_display_names)
+    accepted_facts: dict[str, JsonValue] = {
+        "start_local_date": start_date.isoformat() if start_date is not None else None,
+        "end_local_date": end_date.isoformat() if end_date is not None else None,
+        "exact_local_time": exact_time,
+        "day_part": day_part,
+        "iana_timezone": timezone_name,
+        "timezone_data_version": resolved_timezone.version,
+        "country_id": country_id,
+        "city_id": city_id,
+        "place_id": place_id,
+        "location_geographic_type": place.geographic_type.value,
+        "location_parent_ids": list(place.verified_parent_ids),
+        "location_verified_disjoint_place_ids": list(place.verified_disjoint_place_ids),
+        **{
+            f"city_display_{locale}": label
+            for locale, label in city_display_labels.items()
+        },
+        **{
+            f"place_display_{locale}": localized.get(locale, place.display_name)
+            for locale in ("en", "ru", "es", "fr")
+        },
+        opportunity_type: True,
+        "event_types": candidate.get("event_types"),
+        "team_formats": candidate.get("team_formats"),
+        "referee_roles": candidate.get("referee_roles"),
+        "payment": None if payment in {None, "unknown"} else payment,
+        "payment_amount": payment_details[0] if payment_details is not None else None,
+        "payment_currency": payment_details[1] if payment_details is not None else None,
+        "source_posted_at": posted_at.isoformat(),
+        "source_edited_at": edited_at.isoformat() if edited_at is not None else None,
+        "source_qualifying_assertion_at": qualifying_assertion.isoformat(),
+    }
+    return {
+        "opportunity_id": (
+            f"opportunity:{revision_id.rsplit(':revision:', 1)[0]}:{opportunity_type}"
+        ),
+        "source_message_revision_id": revision_id,
+        "opportunity_type": opportunity_type,
+        "publication_state": "active",
+        "accepted_facts": accepted_facts,
+        "evidence": {
+            **evidence,
+            "proposition_evidence": candidate.get("proposition_evidence"),
+        },
+        "response_route": {"kind": route["kind"], "value": route["value"]},
+    }
+
+
 def _validated_classification_proposal(
     payload_value: JsonValue,
     *,
@@ -18220,6 +19673,16 @@ def _validated_classification_proposal(
         and candidate.get("opportunity_type") == "tournament"
     ):
         return _validated_tournament_proposal(payload_value, resolver=resolver)
+    if isinstance(candidate, dict) and candidate.get("opportunity_type") in {
+        "referee_availability",
+        "referee_request",
+    }:
+        return _validated_refereeing_proposal(
+            payload_value,
+            candidate=candidate,
+            resolver=resolver,
+            timezone_data=timezone_data,
+        )
     return _validated_open_match_proposal(
         payload_value,
         resolver=resolver,
@@ -19050,6 +20513,227 @@ def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:
         )
         is None
     )
+
+
+def _refereeing_opportunity_is_supported(body: str, *, opportunity_type: str) -> bool:
+    """Require an explicit current football referee offer or request direction."""
+    if opportunity_type not in {"referee_availability", "referee_request"}:
+        return False
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    if not normalized or _is_explicit_children_only_game(normalized):
+        return False
+    if _body_has_terminal_retraction(normalized):
+        return False
+    referee = (
+        r"\b(?:referee\w*|official\w*|arbitr(?:ator|e|al)\w*|"
+        r"судь\w*|арбитр\w*|[áa]rbitro\w*|arbitre\w*)\b"
+    )
+    football = r"\b(?:football|soccer|футбол\w*|f[úu]tbol\w*)\b"
+    offer = (
+        rf"(?:{referee})[^.!?;\n]{{0,80}}"
+        r"\b(?:available|offering|offers?|ready|can\s+officiate|"
+        r"доступ\w*|готов\w*|предлага\w*|свобод\w*|"
+        r"disponible|ofrezc\w*|listo\w*|propon\w*|"
+        r"disponible|pr[êe]t\w*|propos\w*)\b|"
+        rf"\b(?:available|offering|offers?|ready|"
+        r"доступ\w*|готов\w*|предлага\w*|свобод\w*|"
+        r"disponible|ofrezc\w*|listo\w*|propos\w*|pr[êe]t\w*)\b"
+        rf"[^.!?;\n]{{0,80}}(?:{referee})"
+    )
+    request = (
+        r"\b(?:need\w*|require\w*|want\w*|looking\s+for|seeking|"
+        r"нуж\w*|требу\w*|ищ\w*|"
+        r"necesit\w*|busc\w*|requier\w*|"
+        r"cherch\w*|recherch\w*|besoin)\b"
+        rf"[^.!?;\n]{{0,80}}(?:{referee})|"
+        rf"(?:{referee})[^.!?;\n]{{0,80}}"
+        r"\b(?:needed|required|wanted|нуж\w*|требу\w*|"
+        r"necesari\w*|requerid\w*|requis\w*)\b"
+    )
+    offer_match = re.search(offer, normalized) is not None
+    request_match = re.search(request, normalized) is not None
+    if offer_match == request_match:
+        return False
+    expected = (
+        offer_match if opportunity_type == "referee_availability" else request_match
+    )
+    return expected and re.search(football, normalized) is not None
+
+
+def _refereeing_optional_values_are_supported(
+    candidate: dict[str, JsonValue],
+    evidence: dict[str, JsonValue],
+    *,
+    authoritative_body: str | None = None,
+    _authoritative: bool = False,
+) -> bool:
+    """Bind referee detail values to affirmative football source evidence."""
+    if authoritative_body is not None:
+        authoritative_evidence: dict[str, JsonValue] = {
+            field_name: authoritative_body
+            for field_name in (
+                "event_types",
+                "team_formats",
+                "referee_roles",
+                "payment",
+            )
+            if candidate.get(field_name) is not None
+        }
+        return _refereeing_optional_values_are_supported(
+            candidate, evidence
+        ) and _refereeing_optional_values_are_supported(
+            candidate,
+            authoritative_evidence,
+            _authoritative=True,
+        )
+    lexicon: dict[str, dict[str, tuple[str, ...]]] = {
+        "event_types": {
+            "match": (
+                r"\b(?:football\s+)?(?:match(?:es)?|game(?:s)?|fixture(?:s)?)\b",
+                r"\b(?:футбольн\w*\s+)?(?:матч\w*|игр\w*)\b",
+                r"\b(?:partid\w*|jueg\w*)\b",
+                r"\b(?:match\w*|rencontre\w*)\b",
+            ),
+            "tournament": (
+                r"\b(?:football\s+)?(?:tournament\w*|cup|competition\w*)\b",
+                r"\b(?:футбольн\w*\s+)?(?:турнир\w*|кубок\w*|"
+                r"соревнован\w*)\b",
+                r"\b(?:torneo\w*|copa\w*|competici[oó]n\w*)\b",
+                r"\b(?:tournoi\w*|coupe\w*|comp[ée]tition\w*)\b",
+            ),
+        },
+        "referee_roles": {
+            "head_referee": (
+                r"\b(?:head|main|chief)\s+referee\b",
+                r"\bглавн\w*\s+(?:судь\w*|арбитр\w*)\b",
+                r"\b[áa]rbitro\s+principal\b",
+                r"\barbitre\s+principal\b",
+            ),
+            "assistant_referee": (
+                r"\b(?:assistant|line)\s+(?:referee|official)\b",
+                r"\b(?:ассистент\w*|помощник\w*|боков\w*)\s+"
+                r"(?:судь\w*|арбитр\w*)\b",
+                r"\b[áa]rbitro\s+asistente\b",
+                r"\barbitre\s+assistant\b",
+            ),
+            "var": (
+                r"\b(?:var|video\s+assistant\s+referee)\b",
+                r"\b(?:видеоарбитр\w*|арбитр\s+var)\b",
+                r"\b[áa]rbitro\s+var\b",
+                r"\barbitre\s+var\b",
+            ),
+        },
+        "payment": {
+            "free": (
+                r"\bfree\b",
+                r"\bбесплат\w*\b",
+                r"\bgratis\b",
+                r"\bgratuit\w*\b",
+            ),
+            "paid": (
+                r"\bpaid\b",
+                r"\b(?:pay|paid)\w*\b",
+                r"\bоплат\w*\b",
+                r"\b(?:платн\w*|гонорар\w*)\b",
+                r"\bpag\w*\b",
+                r"\bpayant\w*\b",
+                r"\b(?:r[ée]mun[ée]r[ée]|r[ée]tribu[ée])\w*\b",
+            ),
+            "unknown": (
+                r"\bunknown\b",
+                r"\b(?:not|no)\s+(?:specified|stated|indicated)\b",
+                r"\bне\s+указан\w*\b",
+                r"\bno\s+indicado\b",
+                r"\bnon\s+indiqu[ée]\w*\b",
+            ),
+        },
+    }
+    for field_name in ("event_types", "referee_roles"):
+        values = candidate.get(field_name)
+        if values is None:
+            continue
+        field_evidence = evidence.get(field_name)
+        if not isinstance(values, list) or not isinstance(field_evidence, str):
+            return False
+        normalized = field_evidence.casefold()
+        selected_values = {value for value in values if isinstance(value, str)}
+        mentioned_values = {
+            value
+            for value, patterns in lexicon[field_name].items()
+            if any(re.search(pattern, normalized) for pattern in patterns)
+        }
+        if (
+            mentioned_values - selected_values
+            or not selected_values.issubset(mentioned_values)
+            or (
+                len(mentioned_values) > 1
+                and re.search(r"\b(?:or|или|o|ou)\b", normalized) is not None
+            )
+        ):
+            return False
+        for value in values:
+            if not isinstance(value, str) or value not in lexicon[field_name]:
+                return False
+            if not _patterns_have_affirmative_clause_support(
+                normalized, lexicon[field_name][value]
+            ):
+                return False
+    team_formats = candidate.get("team_formats")
+    if team_formats is not None:
+        field_evidence = evidence.get("team_formats")
+        if not isinstance(team_formats, list) or not isinstance(field_evidence, str):
+            return False
+        normalized = field_evidence.casefold()
+        mentioned_values = {
+            value
+            for value in {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"}
+            if re.search(
+                rf"(?<!\w){value[0:-2]}\s*[xх×]\s*{value[-1]}(?!\w)",
+                normalized,
+            )
+        }
+        selected_values = {value for value in team_formats if isinstance(value, str)}
+        if mentioned_values - selected_values or not selected_values.issubset(
+            mentioned_values
+        ):
+            return False
+        for value in team_formats:
+            if not isinstance(value, str) or value not in {
+                "5x5",
+                "6x6",
+                "7x7",
+                "8x8",
+                "9x9",
+                "10x10",
+                "11x11",
+            }:
+                return False
+            if not re.search(
+                rf"(?<!\w){value[0:-2]}\s*[xх×]\s*{value[-1]}(?!\w)",
+                normalized,
+            ):
+                return False
+    payment = candidate.get("payment")
+    if payment is not None:
+        field_evidence = evidence.get("payment")
+        if not isinstance(payment, str) or not isinstance(field_evidence, str):
+            return False
+        if payment not in lexicon["payment"]:
+            return False
+        normalized = field_evidence.casefold()
+        if not _patterns_have_affirmative_clause_support(
+            normalized, lexicon["payment"][payment]
+        ):
+            return False
+        competing_values = {
+            value
+            for value, patterns in lexicon["payment"].items()
+            if value != payment
+            and any(re.search(pattern, normalized) for pattern in patterns)
+        }
+        if competing_values:
+            return False
+    return True
 
 
 def _body_establishes_current_open_match(body: str) -> bool:
@@ -21913,6 +23597,40 @@ def _runtime_tournament_search_details(
         ):
             raise TypeError("RunSearch Tournament Search details must be string lists")
         details[key] = tuple(item for item in raw if isinstance(item, str))
+    return details
+
+
+def _runtime_refereeing_search_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical Referee Search and service-offer detail criteria."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError("RunSearch refereeing_search_details must be an object")
+    allowed = set(_REFEREEING_SEARCH_DETAIL_OPTIONS)
+    if set(value) - allowed:
+        raise ValueError("RunSearch refereeing search details have unsupported keys")
+    details: dict[str, tuple[str, ...]] = {}
+    for key, raw in value.items():
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise TypeError("RunSearch Refereeing Search details must be string lists")
+        typed_raw = cast(list[str], raw)
+        valid = all(
+            _canonical_game_search_time(item)
+            if key == "times"
+            else item in _REFEREEING_SEARCH_DETAIL_OPTIONS[key]
+            for item in typed_raw
+        )
+        if (
+            not valid
+            or len(typed_raw) != len(set(typed_raw))
+            or (key == "times" and len(typed_raw) > 1)
+        ):
+            raise ValueError("RunSearch Refereeing Search details have invalid values")
+        details[key] = tuple(typed_raw)
     return details
 
 

@@ -977,6 +977,11 @@ class ControlledModelAdapter:
         self.primary_schema_version = "source-message-classification-v3"
         self.primary_prompt_version = "open-match-primary-v3"
 
+    def enable_open_match_primary_v4(self) -> None:
+        """Opt the controlled model boundary into the Refereeing release."""
+        self.primary_schema_version = "source-message-classification-v4"
+        self.primary_prompt_version = "open-match-primary-v4"
+
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
         self._classify_failures.setdefault(pass_kind, []).append(error)
@@ -1038,7 +1043,9 @@ class ControlledModelAdapter:
                 body=request.body,
                 source_message_revision_reference=request.source_message_revision_id,
                 proof_version=(
-                    "source-semantic-proof-v2"
+                    "source-semantic-proof-v3"
+                    if request.schema_version == "source-semantic-proof-v3"
+                    else "source-semantic-proof-v2"
                     if request.schema_version == "source-semantic-proof-v2"
                     else "source-semantic-proof-v1"
                 ),
@@ -1109,6 +1116,8 @@ def _add_test_proposition_evidence(
         "tournament",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
     }:
         return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
@@ -1232,6 +1241,8 @@ def _build_test_semantic_proof(
             "opponent_request",
             "roster_vacancy",
             "player_transfer_availability",
+            "referee_availability",
+            "referee_request",
         }
     ):
         return {}
@@ -1243,6 +1254,8 @@ def _build_test_semantic_proof(
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
     }:
         return {}
 
@@ -1328,11 +1341,14 @@ def _build_test_semantic_proof(
             }
         )
     semantic_proof_version = proof_version
-    if semantic_proof_version == "source-semantic-proof-v1" and (
-        output.get("schema_version") == "source-message-classification-v3"
-        or opportunity_type in {"roster_vacancy", "player_transfer_availability"}
-    ):
-        semantic_proof_version = "source-semantic-proof-v2"
+    if semantic_proof_version == "source-semantic-proof-v1":
+        if opportunity_type in {"referee_availability", "referee_request"}:
+            semantic_proof_version = "source-semantic-proof-v3"
+        elif output.get("schema_version") in {
+            "source-message-classification-v3",
+            "source-message-classification-v4",
+        } or opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
+            semantic_proof_version = "source-semantic-proof-v2"
     return {
         "contract_version": semantic_proof_version,
         "source_message_revision_reference": source_message_revision_reference,
@@ -2737,6 +2753,7 @@ class AcceptanceSpine:
         opponent_search_details: dict[str, list[str]] | None = None,
         tournament_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
+        refereeing_search_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2752,6 +2769,7 @@ class AcceptanceSpine:
             opponent_search_details=opponent_search_details,
             tournament_search_details=tournament_search_details,
             transfer_search_details=transfer_search_details,
+            refereeing_search_details=refereeing_search_details,
         )
 
     def open_game_search_details(
@@ -3037,6 +3055,90 @@ class AcceptanceSpine:
     ) -> None:
         """Leave an Opponent Search detail submenu or hub."""
         self._conversation_onboarding().back_from_opponent_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_refereeing_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the shared referee Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_refereeing_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_refereeing_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one shared referee detail submenu."""
+        self._conversation_onboarding().open_refereeing_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_refereeing_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one shared referee detail value."""
+        self._conversation_onboarding().toggle_refereeing_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_refereeing_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit the current shared referee detail submenu."""
+        self._conversation_onboarding().commit_refereeing_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_refereeing_search_time(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Select or clear one referee time criterion."""
+        self._conversation_onboarding().select_refereeing_search_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_refereeing_search_exact_time(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the referee exact-time prompt."""
+        self._conversation_onboarding().open_refereeing_search_exact_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_refereeing_search_exact_time_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit one referee exact-time answer."""
+        self._conversation_onboarding().submit_refereeing_search_exact_time_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_refereeing_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Leave a referee detail submenu or hub."""
+        self._conversation_onboarding().back_from_refereeing_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

@@ -102,6 +102,7 @@ from modules.domain import (
     evaluate_game_search,
     evaluate_opponent_search,
     evaluate_player_search,
+    evaluate_refereeing_search,
     evaluate_tournament_search,
     evaluate_transfer_search,
     normalize_exact_repost_text,
@@ -149,6 +150,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0026_exact_repost_clusters.sql",
     "0027_classifier_promotion_attestations.sql",
     "0028_classifier_promotion_execution_records.sql",
+    "0029_refereeing_opportunities.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -181,6 +183,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7856483bc640ecb0d84b6f137a150ccaef971e393d2390d933d5df133187e764",
     "460bb27388e10e836c8f1d8d3db37a01c2c2779a85bf7e5d114d68bcb1d018a9",
     "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
+    "5bea3081b515c2727db899902af62893e81b2d462625e04dce61999e924902f7",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1752,7 +1755,8 @@ class PostgresAcceptanceObserver:
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
                        opponent_search_details, tournament_search_details,
-                       transfer_search_details, number_of_players,
+                       refereeing_search_details, transfer_search_details,
+                       number_of_players,
                        completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE telegram_user_id = %s
@@ -5769,6 +5773,8 @@ class PostgresRoleStore:
             UserIntent.TOURNAMENT_SEARCH,
             UserIntent.NEW_TEAM_SEARCH,
             UserIntent.TRANSFER_PLAYER_SEARCH,
+            UserIntent.REFEREE_SEARCH,
+            UserIntent.REFEREEING_SERVICE_OFFER,
         }:
             return ()
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
@@ -5821,6 +5827,15 @@ class PostgresRoleStore:
                 transfer_search_details
                 if transfer_search_details is not None
                 else dict(completed_search.transfer_search_details),
+                projections,
+            )
+        if completed_search.user_intent in {
+            UserIntent.REFEREE_SEARCH,
+            UserIntent.REFEREEING_SERVICE_OFFER,
+        }:
+            return evaluate_refereeing_search(
+                completed_search,
+                dict(completed_search.refereeing_search_details),
                 projections,
             )
         return ()
@@ -5971,6 +5986,15 @@ class PostgresRoleStore:
                     dict(completed_search.transfer_search_details),
                     projections,
                 )
+            elif completed_search.user_intent in {
+                UserIntent.REFEREE_SEARCH,
+                UserIntent.REFEREEING_SERVICE_OFFER,
+            }:
+                results = evaluate_refereeing_search(
+                    completed_search,
+                    dict(completed_search.refereeing_search_details),
+                    projections,
+                )
             else:
                 results = ()
             outgoing_payload = outgoing.payload
@@ -5990,12 +6014,13 @@ class PostgresRoleStore:
                     sub_city_area_verified_parent_ids, whole_city, required_date,
                     game_search_details, opponent_search_details,
                     tournament_search_details,
-                    transfer_search_details, opportunity_revision_inputs,
+                    refereeing_search_details, transfer_search_details,
+                    opportunity_revision_inputs,
                     number_of_players, completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                     %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
                 )
                 """,
                 (
@@ -6013,6 +6038,7 @@ class PostgresRoleStore:
                     json.dumps(dict(completed_search.game_search_details)),
                     json.dumps(dict(completed_search.opponent_search_details)),
                     json.dumps(dict(completed_search.tournament_search_details)),
+                    json.dumps(dict(completed_search.refereeing_search_details)),
                     json.dumps(dict(completed_search.transfer_search_details)),
                     json.dumps(input_set),
                     completed_search.number_of_players,
@@ -6434,6 +6460,10 @@ class PostgresRoleStore:
                            tournament_search_details,
                            editing_tournament_search_detail,
                            tournament_search_detail_draft,
+                           refereeing_search_details,
+                           editing_refereeing_search_detail,
+                           refereeing_search_detail_draft,
+                           refereeing_search_exact_time_prompt,
                            transfer_search_details, editing_transfer_search_detail,
                            transfer_search_detail_draft,
                            transfer_search_seasonal_timing_prompt,
@@ -6488,6 +6518,15 @@ class PostgresRoleStore:
             ),
             editing_tournament_search_detail=row["editing_tournament_search_detail"],
             tournament_search_detail_draft=tuple(row["tournament_search_detail_draft"]),
+            refereeing_search_details=tuple(
+                (key, tuple(values))
+                for key, values in sorted(row["refereeing_search_details"].items())
+            ),
+            editing_refereeing_search_detail=row["editing_refereeing_search_detail"],
+            refereeing_search_detail_draft=tuple(row["refereeing_search_detail_draft"]),
+            refereeing_search_exact_time_prompt=row[
+                "refereeing_search_exact_time_prompt"
+            ],
             transfer_search_details=tuple(
                 (key, tuple(values))
                 for key, values in sorted(row["transfer_search_details"].items())
@@ -6665,6 +6704,10 @@ class PostgresRoleStore:
                     json.dumps(dict(draft.tournament_search_details)),
                     draft.editing_tournament_search_detail,
                     json.dumps(draft.tournament_search_detail_draft),
+                    json.dumps(dict(draft.refereeing_search_details)),
+                    draft.editing_refereeing_search_detail,
+                    json.dumps(draft.refereeing_search_detail_draft),
+                    draft.refereeing_search_exact_time_prompt,
                     json.dumps(dict(draft.transfer_search_details)),
                     draft.editing_transfer_search_detail,
                     json.dumps(draft.transfer_search_detail_draft),
@@ -6689,6 +6732,10 @@ class PostgresRoleStore:
                             tournament_search_details,
                             editing_tournament_search_detail,
                             tournament_search_detail_draft,
+                            refereeing_search_details,
+                            editing_refereeing_search_detail,
+                            refereeing_search_detail_draft,
+                            refereeing_search_exact_time_prompt,
                             transfer_search_details,
                             editing_transfer_search_detail,
                             transfer_search_detail_draft,
@@ -6699,6 +6746,7 @@ class PostgresRoleStore:
                             %s::jsonb, %s, %s, %s::jsonb, %s, %s,
                             %s::jsonb, %s, %s::jsonb, %s,
                             %s::jsonb, %s, %s::jsonb,
+                            %s::jsonb, %s, %s::jsonb, %s,
                             %s::jsonb, %s, %s::jsonb, %s,
                             %s
                         )
@@ -6735,6 +6783,10 @@ class PostgresRoleStore:
                             tournament_search_details = %s::jsonb,
                             editing_tournament_search_detail = %s,
                             tournament_search_detail_draft = %s::jsonb,
+                            refereeing_search_details = %s::jsonb,
+                            editing_refereeing_search_detail = %s,
+                            refereeing_search_detail_draft = %s::jsonb,
+                            refereeing_search_exact_time_prompt = %s,
                             transfer_search_details = %s::jsonb,
                             editing_transfer_search_detail = %s,
                             transfer_search_detail_draft = %s::jsonb,
@@ -7781,7 +7833,8 @@ class PostgresRoleStore:
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
                        opponent_search_details, tournament_search_details,
-                       transfer_search_details, number_of_players,
+                       refereeing_search_details, transfer_search_details,
+                       number_of_players,
                        completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
@@ -8522,6 +8575,10 @@ def _completed_search(row: dict[str, Any]) -> CompletedSearch:
             (key, tuple(values))
             for key, values in sorted(row["tournament_search_details"].items())
         ),
+        refereeing_search_details=tuple(
+            (key, tuple(values))
+            for key, values in sorted(row["refereeing_search_details"].items())
+        ),
         transfer_search_details=tuple(
             (key, tuple(values))
             for key, values in sorted(row["transfer_search_details"].items())
@@ -8628,6 +8685,8 @@ def _proposition_identity_parts(
             "roster_vacancy",
             "player_match_availability",
             "player_transfer_availability",
+            "referee_availability",
+            "referee_request",
         }:
             return None
         if len(identity_hash) != 16 or any(
@@ -8825,6 +8884,8 @@ def _legacy_candidate_alias_for_canonical(
         "roster_vacancy",
         "player_match_availability",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
     }:
         return None
     if len(candidate_hash) != 16 or any(

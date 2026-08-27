@@ -331,6 +331,31 @@ def transfer_search_result_sort_key(
     )
 
 
+def refereeing_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, str, int, str, int, str]:
+    """Order Referee Search results with standing availability last."""
+    facts = dict(result.card_facts)
+    canonical_local_time = facts.get("exact_local_time")
+    time_is_unknown = canonical_local_time is None and not facts.get("day_part")
+    if canonical_local_time is None:
+        canonical_local_time = {
+            "morning": "06:00",
+            "daytime": "12:00",
+            "evening": "18:00",
+            "night": "22:00",
+        }.get(facts.get("day_part") or "", "23:59")
+    return (
+        0 if result.result_class == "confirmed_match" else 1,
+        int(facts.get("unknown_criterion_count", "0")),
+        facts.get("sort_local_date", "9999-12-31"),
+        1 if time_is_unknown else 0,
+        canonical_local_time,
+        -int(facts.get("location_specificity", "0")),
+        facts["opportunity_id"],
+    )
+
+
 class IntentBranch(StrEnum):
     """A non-terminal onboarding group that can never be a User Intent."""
 
@@ -838,6 +863,10 @@ class DiscoveryDraft:
     tournament_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     editing_tournament_search_detail: str | None = None
     tournament_search_detail_draft: tuple[str, ...] = ()
+    refereeing_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_refereeing_search_detail: str | None = None
+    refereeing_search_detail_draft: tuple[str, ...] = ()
+    refereeing_search_exact_time_prompt: bool = False
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     editing_transfer_search_detail: str | None = None
     transfer_search_detail_draft: tuple[str, ...] = ()
@@ -1052,6 +1081,7 @@ class CompletedSearch:
     number_of_players: int | None = None
     opponent_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     tournament_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    refereeing_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
@@ -1098,6 +1128,16 @@ _TRANSFER_SEARCH_DETAIL_KEYS = (
     "playing_surfaces",
     "payment",
 )
+_REFEREEING_SEARCH_DETAIL_KEYS = (
+    "event_types",
+    "team_formats",
+    "referee_roles",
+    "payment",
+)
+_REFEREEING_OPPORTUNITY_TYPES = {
+    UserIntent.REFEREE_SEARCH: "referee_availability",
+    UserIntent.REFEREEING_SERVICE_OFFER: "referee_request",
+}
 _TRANSFER_OPPORTUNITY_TYPES = {
     UserIntent.NEW_TEAM_SEARCH: "roster_vacancy",
     UserIntent.TRANSFER_PLAYER_SEARCH: "player_transfer_availability",
@@ -1342,6 +1382,180 @@ def evaluate_opponent_search(
             )
         )
     matched.sort(key=game_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
+
+
+def evaluate_refereeing_search(
+    completed_search: CompletedSearch,
+    refereeing_search_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Classify Referee Search or service-offer results deterministically."""
+    opportunity_type = _REFEREEING_OPPORTUNITY_TYPES.get(completed_search.user_intent)
+    required = completed_search.required_date
+    if opportunity_type is None or required is None:
+        return ()
+
+    matched: list[SearchResult] = []
+    for opportunity in opportunities:
+        if (
+            opportunity.publication_state != "active"
+            or opportunity.opportunity_type != opportunity_type
+        ):
+            continue
+        facts = opportunity.accepted_facts
+        if facts.get(opportunity_type) is not True:
+            continue
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+        ):
+            continue
+
+        start_value = facts.get("start_local_date")
+        end_value = facts.get("end_local_date")
+        if start_value is None and end_value is None:
+            if opportunity_type != "referee_availability":
+                continue
+            try:
+                source_qualifying_assertion_at = datetime.fromisoformat(
+                    str(facts["source_qualifying_assertion_at"])
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                source_qualifying_assertion_at.tzinfo is None
+                or completed_search.completed_at.tzinfo is None
+                or completed_search.completed_at
+                >= source_qualifying_assertion_at + timedelta(days=30)
+            ):
+                continue
+            start = end = None
+            date_state = MatchState.UNKNOWN
+        elif start_value is None or end_value is None:
+            continue
+        else:
+            try:
+                start = date.fromisoformat(str(start_value))
+                end = date.fromisoformat(str(end_value))
+            except (TypeError, ValueError):
+                continue
+            if start > end or (
+                end < required.start_local_date or start > required.end_local_date
+            ):
+                continue
+            date_state = MatchState.CONFIRMED
+
+        detail_state_by_key: dict[str, MatchState] = {"date": date_state}
+        for key in _REFEREEING_SEARCH_DETAIL_KEYS:
+            requested = refereeing_search_details.get(key, ())
+            accepted = facts.get(key)
+            accepted_values: tuple[str, ...] | None
+            if key == "payment":
+                accepted_values = (
+                    (str(accepted),)
+                    if isinstance(accepted, str) and accepted in {"free", "paid"}
+                    else None
+                )
+            else:
+                accepted_values = (
+                    tuple(value for value in accepted if isinstance(value, str))
+                    if isinstance(accepted, list)
+                    else None
+                )
+            detail_state_by_key[key] = match_detail(requested, accepted_values)
+        detail_state_by_key["times"] = match_time_detail(
+            refereeing_search_details.get("times", ()),
+            str(facts["exact_local_time"]) if facts.get("exact_local_time") else None,
+            str(facts["day_part"]) if facts.get("day_part") else None,
+        )
+        detail_state_by_key["search_area"] = match_search_area(
+            whole_city=completed_search.whole_city,
+            selected_area_ids=completed_search.sub_city_area_ids,
+            selected_area_types=completed_search.sub_city_area_geographic_types,
+            selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+            country_id=completed_search.country_id,
+            city_id=completed_search.city_id,
+            facts=facts,
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+
+        route = opportunity.response_route
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "opportunity_type": opportunity_type,
+            opportunity_type: "true",
+            "sort_local_date": (
+                max(start, required.start_local_date).isoformat()
+                if start is not None
+                else "9999-12-31"
+            ),
+            "iana_timezone": str(facts.get("iana_timezone", required.iana_timezone)),
+            "source_posted_at": str(facts["source_posted_at"]),
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if refereeing_search_details.get(key)
+                    or (key == "date" and state is MatchState.UNKNOWN)
+                    or (key == "search_area" and not completed_search.whole_city)
+                },
+                sort_keys=True,
+            ),
+        }
+        if start is not None and end is not None:
+            card["start_local_date"] = start.isoformat()
+            card["end_local_date"] = end.isoformat()
+        for locale in ("en", "ru", "es", "fr"):
+            if facts.get(f"city_display_{locale}") is not None:
+                card[f"city_display_{locale}"] = str(facts[f"city_display_{locale}"])
+            if facts.get(f"place_display_{locale}") is not None:
+                card[f"place_display_{locale}"] = str(facts[f"place_display_{locale}"])
+        if facts.get("exact_local_time"):
+            card["exact_local_time"] = str(facts["exact_local_time"])
+        if facts.get("day_part"):
+            card["day_part"] = str(facts["day_part"])
+        for key in ("event_types", "team_formats", "referee_roles"):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key])
+        if facts.get("source_edited_at"):
+            card["source_edited_at"] = str(facts["source_edited_at"])
+        if facts.get("payment") in {"free", "paid"}:
+            card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
+        matched.append(
+            SearchResult(
+                result_id=(
+                    f"result:{completed_search.completed_search_id}:"
+                    f"{opportunity.opportunity_id}"
+                ),
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=(
+                    "possible_match"
+                    if MatchState.UNKNOWN in states
+                    else "confirmed_match"
+                ),
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=refereeing_search_result_sort_key)
     return tuple(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)

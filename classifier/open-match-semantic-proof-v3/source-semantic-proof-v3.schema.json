@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "source-semantic-proof-v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version", "source_message_revision_reference", "candidate_key",
+    "coverage", "root", "facts", "routes", "checks", "relations"
+  ],
+  "properties": {
+    "contract_version": {"const": "source-semantic-proof-v3"},
+    "source_message_revision_reference": {"type": "string", "minLength": 1},
+    "candidate_key": {"type": "string", "minLength": 1},
+    "coverage": {"const": "complete_source_revision"},
+    "root": {"$ref": "#/$defs/root"},
+    "facts": {
+      "type": "object",
+      "minProperties": 3,
+      "additionalProperties": {"$ref": "#/$defs/assertion"}
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"$ref": "#/$defs/route"}
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contradiction", "competition", "replacement", "closure"],
+      "properties": {
+        "contradiction": {"$ref": "#/$defs/check"},
+        "competition": {"$ref": "#/$defs/check"},
+        "replacement": {"$ref": "#/$defs/check"},
+        "closure": {"$ref": "#/$defs/check"}
+      }
+    },
+    "relations": {
+      "type": "array",
+      "minItems": 5,
+      "items": {"$ref": "#/$defs/relation"}
+    }
+  },
+  "$defs": {
+    "span": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "text"],
+      "properties": {
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 1},
+        "text": {"type": "string", "minLength": 1}
+      }
+    },
+    "state": {
+      "enum": [
+        "current_positive", "current_negative", "ambiguous", "withdrawn",
+        "superseded", "unknown"
+      ]
+    },
+    "root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "domain", "meaning", "state", "span"],
+      "properties": {
+        "target_id": {"const": "root"},
+        "domain": {"const": "football_match"},
+        "meaning": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "state": {"$ref": "#/$defs/state"},
+        "span": {"$ref": "#/$defs/span"}
+      }
+    },
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "state", "span"],
+      "properties": {
+        "target_id": {"type": "string", "minLength": 1},
+        "state": {"$ref": "#/$defs/state"},
+        "span": {"$ref": "#/$defs/span"}
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "target_id", "state", "span"],
+      "properties": {
+        "kind": {"enum": ["explicit_telegram_username", "explicit_phone", "explicit_url"]},
+        "value": {"type": "string", "minLength": 1},
+        "target_id": {"type": "string", "minLength": 1},
+        "state": {"$ref": "#/$defs/state"},
+        "span": {"$ref": "#/$defs/span"}
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "spans", "target_ids"],
+      "properties": {
+        "state": {"enum": ["none", "present", "ambiguous", "unknown"]},
+        "spans": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/span"}},
+        "target_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "direction", "source", "target", "span"],
+      "properties": {
+        "kind": {"enum": ["supports", "covers"]},
+        "direction": {"const": "outgoing"},
+        "source": {"const": "root"},
+        "target": {"type": "string", "minLength": 1},
+        "span": {"$ref": "#/$defs/span"}
+      }
+    }
+  }
+}

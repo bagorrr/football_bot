@@ -41,7 +41,18 @@ _TRANSFER_OPPORTUNITY_TYPES = {
     "roster_vacancy",
     "player_transfer_availability",
 }
+_REFEREE_OPPORTUNITY_TYPES = {
+    "referee_availability",
+    "referee_request",
+}
 _REQUIRED_TRANSFER_CANDIDATE_FIELDS = {
+    "candidate_key",
+    "opportunity_type",
+    "evidence",
+    "location",
+    "response_routes",
+}
+_REQUIRED_REFEREE_CANDIDATE_FIELDS = {
     "candidate_key",
     "opportunity_type",
     "evidence",
@@ -92,6 +103,12 @@ _OPTIONAL_TRANSFER_CANDIDATE_FIELDS = {
     "playing_surfaces",
     "payment",
 }
+_OPTIONAL_REFEREE_CANDIDATE_FIELDS = {
+    "event_types",
+    "team_formats",
+    "referee_roles",
+    "payment",
+}
 _STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence"}
 _V2_STRUCTURED_CANDIDATE_FIELDS = {"proposition_evidence", "source_context"}
 _CANONICAL_LISTS = {
@@ -114,6 +131,8 @@ _CANONICAL_LISTS = {
         "hard_surface",
         "wood_parquet",
     },
+    "event_types": {"match", "tournament"},
+    "referee_roles": {"head_referee", "assistant_referee", "var"},
 }
 
 
@@ -167,6 +186,20 @@ def _candidate_field_sets(
         if require_source_context:
             structured.add("source_context")
         return required, set(_OPTIONAL_TRANSFER_CANDIDATE_FIELDS), structured
+    if opportunity_type in _REFEREE_OPPORTUNITY_TYPES:
+        required = set(_REQUIRED_REFEREE_CANDIDATE_FIELDS)
+        required.add(opportunity_type)
+        if opportunity_type == "referee_request":
+            required.add("event_time")
+        if require_source_context:
+            required.add("source_context")
+        structured = {"proposition_evidence"}
+        if require_source_context:
+            structured.add("source_context")
+        optional = set(_OPTIONAL_REFEREE_CANDIDATE_FIELDS)
+        if opportunity_type == "referee_availability":
+            optional.add("event_time")
+        return required, optional, structured
     return None
 
 
@@ -174,6 +207,7 @@ PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
 PROPOSITION_EVIDENCE_V2_VERSION = "source-proposition-evidence-v2"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
 SEMANTIC_PROOF_V2_VERSION = "source-semantic-proof-v2"
+SEMANTIC_PROOF_V3_VERSION = "source-semantic-proof-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,7 +234,15 @@ class ClassifierArtifactDescriptor:
         """Return the trusted graph version for one application candidate type."""
         if self.artifact_family == "player_match_availability":
             return PROPOSITION_EVIDENCE_VERSION
-        if opportunity_type in {"open_match", "tournament"}:
+        if opportunity_type in {
+            "open_match",
+            "tournament",
+            "referee_availability",
+            "referee_request",
+        } and self.primary_schema_version in {
+            "source-message-classification-v3",
+            "source-message-classification-v4",
+        }:
             return self.proposition_evidence_version
         # Opponent and transfer contracts are already published independently
         # of the additive Tournament graph and retain their v1 graph.
@@ -259,6 +301,18 @@ OPEN_MATCH_V3_DESCRIPTOR = ClassifierArtifactDescriptor(
     routing_policy_version="classifier-routing-v1",
     contract_envelope_versions=(5,),
 )
+OPEN_MATCH_V4_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="open-match-primary-v4",
+    artifact_family="open_match",
+    primary_prompt_version="open-match-primary-v4",
+    primary_schema_version="source-message-classification-v4",
+    ambiguity_prompt_version="open-match-ambiguity-v3",
+    semantic_proof_prompt_version="open-match-semantic-proof-v3",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_V2_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_V3_VERSION,
+    routing_policy_version="classifier-routing-v1",
+    contract_envelope_versions=(6,),
+)
 PLAYER_MATCH_AVAILABILITY_DESCRIPTOR = ClassifierArtifactDescriptor(
     release_name="player-match-primary-v1",
     artifact_family="player_match_availability",
@@ -275,6 +329,7 @@ _TRUSTED_ARTIFACT_DESCRIPTORS = (
     OPEN_MATCH_V1_DESCRIPTOR,
     OPEN_MATCH_V2_DESCRIPTOR,
     OPEN_MATCH_V3_DESCRIPTOR,
+    OPEN_MATCH_V4_DESCRIPTOR,
     PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
 )
 
@@ -311,7 +366,13 @@ def classifier_artifact_descriptor_for_primary(
             else None
         )
     if primary_schema_version != "source-message-classification-v3":
-        return None
+        if primary_schema_version != OPEN_MATCH_V4_DESCRIPTOR.primary_schema_version:
+            return None
+        return (
+            OPEN_MATCH_V4_DESCRIPTOR
+            if primary_prompt_version == OPEN_MATCH_V4_DESCRIPTOR.primary_prompt_version
+            else None
+        )
     if (
         primary_prompt_version
         == PLAYER_MATCH_AVAILABILITY_DESCRIPTOR.primary_prompt_version
@@ -350,7 +411,11 @@ def classifier_artifact_descriptor_for_provenance(
     return matches[0] if len(matches) == 1 else None
 
 
-_SEMANTIC_PROOF_VERSIONS = {SEMANTIC_PROOF_VERSION, SEMANTIC_PROOF_V2_VERSION}
+_SEMANTIC_PROOF_VERSIONS = {
+    SEMANTIC_PROOF_VERSION,
+    SEMANTIC_PROOF_V2_VERSION,
+    SEMANTIC_PROOF_V3_VERSION,
+}
 _PROPOSITION_DOMAINS = {"football_match"}
 _PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
 _PROPOSITION_CURRENTNESS = {"current", "superseded", "withdrawn", "unknown"}
@@ -394,7 +459,9 @@ def classifier_output_is_schema_valid(
         return False
     if descriptor.primary_schema_version == "source-message-classification-v2":
         return _classifier_output_v2_is_schema_valid(
-            output, body=body, artifact_descriptor=descriptor
+            output,
+            body=body,
+            artifact_descriptor=descriptor,
         )
     if descriptor.primary_schema_version == "source-message-classification-v3":
         return _classifier_output_v2_is_schema_valid(
@@ -405,6 +472,15 @@ def classifier_output_is_schema_valid(
             allow_player_match_availability=(
                 descriptor.artifact_family == "player_match_availability"
             ),
+            allow_fact_observations=True,
+        )
+    if descriptor.primary_schema_version == "source-message-classification-v4":
+        return _classifier_output_v2_is_schema_valid(
+            output,
+            body=body,
+            artifact_descriptor=descriptor,
+            allow_tournament=True,
+            allow_refereeing=descriptor == OPEN_MATCH_V4_DESCRIPTOR,
             allow_fact_observations=True,
         )
     if (
@@ -429,6 +505,8 @@ def classifier_output_is_schema_valid(
         return False
     field_sets = _candidate_field_sets(candidate, require_source_context=False)
     if field_sets is None:
+        return False
+    if opportunity_type in _REFEREE_OPPORTUNITY_TYPES:
         return False
     if opportunity_type in _TRANSFER_OPPORTUNITY_TYPES:
         return _accepted_transfer_candidate_is_schema_valid(
@@ -571,6 +649,7 @@ def _classifier_output_v2_is_schema_valid(
     *,
     body: str,
     allow_tournament: bool = False,
+    allow_refereeing: bool = False,
     allow_player_match_availability: bool = False,
     allow_fact_observations: bool = False,
     artifact_descriptor: ClassifierArtifactDescriptor,
@@ -630,6 +709,7 @@ def _classifier_output_v2_is_schema_valid(
                     candidate,
                     body=body,
                     allow_player_match_availability=allow_player_match_availability,
+                    allow_refereeing=allow_refereeing,
                     artifact_descriptor=descriptor,
                 )
                 if allow_tournament
@@ -638,6 +718,7 @@ def _classifier_output_v2_is_schema_valid(
                     body=body,
                     artifact_descriptor=descriptor,
                     allow_player_match_availability=allow_player_match_availability,
+                    allow_refereeing=allow_refereeing,
                 )
             )
             for candidate in candidates
@@ -657,7 +738,11 @@ def _classifier_output_v2_is_schema_valid(
             candidate.get("opportunity_type")
             not in (
                 _UNRESOLVED_OPPORTUNITY_TYPES
-                if allow_tournament or allow_player_match_availability
+                if (
+                    allow_tournament
+                    or allow_refereeing
+                    or allow_player_match_availability
+                )
                 else {
                     "open_match",
                     "opponent_request",
@@ -769,17 +854,149 @@ def _player_count_fields_are_valid(
     )
 
 
+def _event_time_is_schema_valid(value: JsonValue) -> bool:
+    """Validate one optional or required canonical event-time object."""
+    if not isinstance(value, dict) or set(value) not in (
+        {"start_local_date", "end_local_date", "iana_timezone"},
+        {"start_local_date", "end_local_date", "exact_local_time", "iana_timezone"},
+        {"start_local_date", "end_local_date", "day_part", "iana_timezone"},
+    ):
+        return False
+    try:
+        start = date.fromisoformat(str(value["start_local_date"]))
+        end = date.fromisoformat(str(value["end_local_date"]))
+    except (KeyError, ValueError):
+        return False
+    exact_time = value.get("exact_local_time")
+    day_part = value.get("day_part")
+    return not (
+        start > end
+        or not isinstance(value.get("iana_timezone"), str)
+        or not value["iana_timezone"]
+        or (
+            exact_time is not None
+            and (
+                not isinstance(exact_time, str)
+                or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", exact_time) is None
+            )
+        )
+        or day_part not in {None, "morning", "daytime", "evening", "night"}
+        or (exact_time is not None and day_part is not None)
+    )
+
+
+def _accepted_refereeing_candidate_is_schema_valid(
+    candidate: dict[str, JsonValue],
+    *,
+    body: str,
+    require_source_context: bool,
+    artifact_descriptor: ClassifierArtifactDescriptor,
+) -> bool:
+    """Validate one bounded Referee Availability or Referee Request candidate."""
+    field_sets = _candidate_field_sets(
+        candidate, require_source_context=require_source_context
+    )
+    if field_sets is None:
+        return False
+    required_fields, optional_fields, structured_fields = field_sets
+    opportunity_type = candidate.get("opportunity_type")
+    if opportunity_type not in _REFEREE_OPPORTUNITY_TYPES:
+        return False
+    if (
+        not required_fields.issubset(candidate)
+        or set(candidate) - required_fields - optional_fields - structured_fields
+        or not isinstance(candidate.get("candidate_key"), str)
+        or not candidate["candidate_key"]
+        or candidate.get(opportunity_type) is not True
+    ):
+        return False
+    candidate_key = candidate["candidate_key"]
+    assert isinstance(candidate_key, str)
+    evidence = candidate.get("evidence")
+    expected_evidence = {"opportunity", "location", opportunity_type}
+    if opportunity_type == "referee_request":
+        expected_evidence.add("event_time")
+    if "event_time" in candidate:
+        expected_evidence.add("event_time")
+    expected_evidence |= set(candidate) & optional_fields
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != expected_evidence
+        or not all(
+            isinstance(value, str) and bool(value) and value in body
+            for value in evidence.values()
+        )
+    ):
+        return False
+    location = candidate.get("location")
+    routes = candidate.get("response_routes")
+    if (
+        not isinstance(location, dict)
+        or set(location) != {"mention", "place_id", "country_id", "city_id"}
+        or not all(isinstance(value, str) and value for value in location.values())
+        or not isinstance(routes, list)
+        or len(routes) > 8
+    ):
+        return False
+    if opportunity_type == "referee_request":
+        event_time = candidate.get("event_time")
+        if not _event_time_is_schema_valid(event_time):
+            return False
+    elif "event_time" in candidate and not _event_time_is_schema_valid(
+        candidate["event_time"]
+    ):
+        return False
+    for field_name in ("event_types", "team_formats", "referee_roles"):
+        values = candidate.get(field_name)
+        allowed = _CANONICAL_LISTS[field_name]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(item for item in values if isinstance(item, str)))
+            or not all(isinstance(item, str) and item in allowed for item in values)
+        ):
+            return False
+    if candidate.get("payment") not in {None, "free", "paid", "unknown"}:
+        return False
+    if not all(_valid_response_route(route, body=body) for route in routes):
+        return False
+    source_context = candidate.get("source_context")
+    if require_source_context and (
+        not isinstance(source_context, str)
+        or not source_context
+        or source_context not in body
+    ):
+        return False
+    proposition_evidence = candidate.get("proposition_evidence")
+    return proposition_evidence is None or proposition_evidence_is_schema_valid(
+        proposition_evidence,
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+        meaning=opportunity_type,
+        artifact_descriptor=artifact_descriptor,
+    )
+
+
 def _accepted_candidate_is_schema_valid(
     candidate: dict[str, JsonValue],
     *,
     body: str,
     allow_player_match_availability: bool = False,
+    allow_refereeing: bool = False,
     artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
     if not _is_trusted_artifact_descriptor(artifact_descriptor):
         return False
-    allowed_types = {"open_match", "opponent_request", *_TRANSFER_OPPORTUNITY_TYPES}
+    allowed_types = {
+        "open_match",
+        "opponent_request",
+        *_TRANSFER_OPPORTUNITY_TYPES,
+    }
+    if allow_refereeing:
+        allowed_types.update(_REFEREE_OPPORTUNITY_TYPES)
     if allow_player_match_availability:
         allowed_types.add("player_match_availability")
     opportunity_type = candidate.get("opportunity_type")
@@ -790,6 +1007,13 @@ def _accepted_candidate_is_schema_valid(
         and opportunity_type not in {"open_match", "player_match_availability"}
     ):
         return False
+    if opportunity_type in _REFEREE_OPPORTUNITY_TYPES:
+        return _accepted_refereeing_candidate_is_schema_valid(
+            candidate,
+            body=body,
+            require_source_context=True,
+            artifact_descriptor=artifact_descriptor,
+        )
     field_sets = _candidate_field_sets(candidate, require_source_context=True)
     if field_sets is None:
         return False
@@ -919,6 +1143,7 @@ def _accepted_candidate_v3_is_schema_valid(
     *,
     body: str,
     allow_player_match_availability: bool = False,
+    allow_refereeing: bool = False,
     artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate one v3 candidate while retaining the v2 open-match contract."""
@@ -931,6 +1156,15 @@ def _accepted_candidate_v3_is_schema_valid(
             return False
     elif opportunity_type == "player_match_availability":
         return False
+    if opportunity_type in _REFEREE_OPPORTUNITY_TYPES:
+        if not allow_refereeing:
+            return False
+        return _accepted_refereeing_candidate_is_schema_valid(
+            candidate,
+            body=body,
+            require_source_context=True,
+            artifact_descriptor=descriptor,
+        )
     if candidate.get("opportunity_type") == "tournament":
         return _tournament_candidate_is_schema_valid(
             candidate,
@@ -1285,8 +1519,15 @@ def proposition_evidence_is_schema_valid(
     facts = value.get("facts")
     if not isinstance(facts, dict) or set(facts) != set(evidence):
         return False
-    if effective_meaning in {"roster_vacancy", "player_transfer_availability"}:
+    if effective_meaning in {
+        "roster_vacancy",
+        "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
+    }:
         mandatory_fact_names = {"opportunity", "location", effective_meaning}
+        if effective_meaning == "referee_request":
+            mandatory_fact_names.add("event_time")
         if not mandatory_fact_names.issubset(facts):
             return False
     else:
@@ -1301,6 +1542,12 @@ def proposition_evidence_is_schema_valid(
             return False
     elif effective_meaning == "opponent_request":
         if "opponent_request" not in facts or len(facts) < 4:
+            return False
+    elif effective_meaning == "referee_request":
+        if "referee_request" not in facts or "event_time" not in facts:
+            return False
+    elif effective_meaning == "referee_availability":
+        if "referee_availability" not in facts or len(facts) < 3:
             return False
     elif effective_meaning in {
         "roster_vacancy",
@@ -1442,9 +1689,16 @@ def semantic_proof_is_schema_valid(
             SEMANTIC_PROOF_V2_VERSION
             if effective_meaning
             in {"player_match_availability", *_TRANSFER_OPPORTUNITY_TYPES}
+            else SEMANTIC_PROOF_V3_VERSION
+            if effective_meaning in _REFEREE_OPPORTUNITY_TYPES
             else SEMANTIC_PROOF_VERSION
         )
     )
+    if effective_meaning in _REFEREE_OPPORTUNITY_TYPES and (
+        artifact_descriptor is not None
+        and artifact_descriptor != OPEN_MATCH_V4_DESCRIPTOR
+    ):
+        return False
     if artifact_descriptor is not None and (
         (
             semantic_proof_version is not None
@@ -1485,8 +1739,15 @@ def semantic_proof_is_schema_valid(
         contract_version != SEMANTIC_PROOF_V2_VERSION
     ):
         return False
+    if meaning in _REFEREE_OPPORTUNITY_TYPES and (
+        contract_version != SEMANTIC_PROOF_V3_VERSION
+    ):
+        return False
     allowed_meanings = (
-        {"open_match", "opponent_request"}
+        {
+            "open_match",
+            "opponent_request",
+        }
         if contract_version == SEMANTIC_PROOF_VERSION
         else {
             "open_match",
@@ -1495,6 +1756,17 @@ def semantic_proof_is_schema_valid(
             "player_match_availability",
             "roster_vacancy",
             "player_transfer_availability",
+        }
+        if contract_version == SEMANTIC_PROOF_V2_VERSION
+        else {
+            "open_match",
+            "tournament",
+            "opponent_request",
+            "player_match_availability",
+            "roster_vacancy",
+            "player_transfer_availability",
+            "referee_availability",
+            "referee_request",
         }
     )
     assertion_target_ids = {"root"}
