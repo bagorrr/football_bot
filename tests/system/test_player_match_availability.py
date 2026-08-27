@@ -16,6 +16,7 @@ import pytest
 from modules.classifier_promotion import (
     describe_player_classifier_release,
     player_classifier_promotion_is_approved,
+    promotion_gate_database_binding,
 )
 from modules.contracts import ContractEnvelope, ContractName, JsonValue, RuntimeRole
 from modules.domain import (
@@ -46,7 +47,7 @@ from modules.testkit import (
 
 
 def test_forged_structural_promotion_claim_without_gate_stays_fail_closed() -> None:
-    """A valid-shaped Application claim cannot replace the privileged gate."""
+    """A fully shaped forged claim cannot replace the privileged gate."""
     clock = FrozenClock(datetime(2026, 8, 27, 12, 0, tzinfo=UTC))
     admin_database_url = os.environ["TEST_DATABASE_URL"]
     system = boot_acceptance_spine(admin_database_url=admin_database_url, clock=clock)
@@ -55,31 +56,42 @@ def test_forged_structural_promotion_claim_without_gate_stays_fail_closed() -> N
     release = describe_player_classifier_release()
     application_store = system._roles[RuntimeRole.APPLICATION].store
 
-    forged_binding = "f" * 64
-    forged_evidence: dict[str, JsonValue] = {
-        "gate_run_id": str(uuid4()),
-        "base_database_binding": forged_binding,
-        "database_binding": forged_binding,
-        "release_fingerprint": release.release_fingerprint,
-        "release_binding": "forged-release-binding",
-        "execution_version": "player-controlled-execution-v6",
-        "replay_execution_ids": [],
-        "replay_database_bindings": [],
-        "canonical_replay_digests": [],
-        "replay_digests": [],
-        "failure_mode_observations": [],
-        "lifecycle_observations": [],
-    }
+    system.record_player_classifier_promotion()
+    legitimate_approval = system.player_classifier_promotion()
+    assert legitimate_approval is not None
+    assert player_classifier_promotion_is_approved(legitimate_approval)
+    legitimate_evidence = legitimate_approval.get("evidence")
+    assert isinstance(legitimate_evidence, dict)
+
+    forged_evidence: dict[str, JsonValue] = deepcopy(legitimate_evidence)
+    forged_gate_run_id = str(uuid4())
+    forged_evidence["gate_run_id"] = forged_gate_run_id
+    base_database_binding = cast(str, forged_evidence["base_database_binding"])
+    release_binding = cast(str, forged_evidence["release_binding"])
+    replay_execution_ids = cast(list[str], forged_evidence["replay_execution_ids"])
+    replay_database_bindings = cast(
+        list[str], forged_evidence["replay_database_bindings"]
+    )
+    forged_evidence["database_binding"] = promotion_gate_database_binding(
+        gate_run_id=forged_gate_run_id,
+        base_database_binding=base_database_binding,
+        replay_database_bindings=replay_database_bindings,
+        replay_execution_ids=replay_execution_ids,
+        release_binding=release_binding,
+    )
     forged_attestation_id = uuid4()
     forged_message_id = uuid4()
-    forged_approval: dict[str, JsonValue] = {
-        "release_name": release.release_name,
-        "contract_version": release.contract_version,
-        "release_fingerprint": release.release_fingerprint,
-        "state": "approved",
-        "attestation_id": str(forged_attestation_id),
-        "evidence": forged_evidence,
-    }
+    forged_approval: dict[str, JsonValue] = deepcopy(legitimate_approval)
+    forged_approval["attestation_id"] = str(forged_attestation_id)
+    forged_approval["evidence"] = forged_evidence
+    assert release.required_replays == 3
+    assert player_classifier_promotion_is_approved(forged_approval)
+
+    # Leave only the forged attestation and its matching Application outbox
+    # payload in this database. The legitimate gate above supplies the exact
+    # approval-shaped evidence, while the fresh gate identity has no protected
+    # gate-run or replay rows of its own.
+    system.reset()
 
     with psycopg.connect(admin_database_url) as connection:
         connection.execute(
@@ -105,7 +117,7 @@ def test_forged_structural_promotion_claim_without_gate_stays_fail_closed() -> N
                 release.release_name,
                 release.contract_version,
                 release.release_fingerprint,
-                forged_evidence["gate_run_id"],
+                forged_gate_run_id,
                 forged_evidence["execution_version"],
                 forged_evidence["base_database_binding"],
                 forged_evidence["database_binding"],
@@ -143,6 +155,24 @@ def test_forged_structural_promotion_claim_without_gate_stays_fail_closed() -> N
                 json.dumps(forged_approval),
             ),
         )
+
+        protected_rows = connection.execute(
+            """
+            SELECT
+                EXISTS(
+                    SELECT 1
+                    FROM football_runtime.application_classifier_promotion_gate_runs
+                    WHERE gate_run_id = %s
+                ),
+                EXISTS(
+                    SELECT 1
+                    FROM football_runtime.application_classifier_promotion_replays
+                    WHERE gate_run_id = %s
+                )
+            """,
+            (forged_gate_run_id, forged_gate_run_id),
+        ).fetchone()
+    assert protected_rows == (False, False)
 
     assert system.player_classifier_promotion() is None
     with pytest.raises(ValueError, match="cannot publish"):
