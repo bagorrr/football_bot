@@ -20,10 +20,13 @@ from psycopg.rows import dict_row
 
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
+    canonical_replay_digest,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
     promotion_database_binding_for_url,
+    promotion_gate_database_binding,
+    promotion_release_binding,
 )
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
@@ -145,6 +148,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0025_player_match_availability.sql",
     "0026_exact_repost_clusters.sql",
     "0027_classifier_promotion_attestations.sql",
+    "0028_classifier_promotion_execution_records.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -176,6 +180,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "97d9f94ce319ba0fffdc6d7af64af7ae9422abe4ca1bbbc855a911a42ae764aa",
     "7856483bc640ecb0d84b6f137a150ccaef971e393d2390d933d5df133187e764",
     "460bb27388e10e836c8f1d8d3db37a01c2c2779a85bf7e5d114d68bcb1d018a9",
+    "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -664,6 +669,8 @@ class PostgresAcceptanceObserver:
                      football_runtime.classification_attempts,
                      football_runtime.classification_proof_work,
                      football_runtime.classification_routing_outcomes,
+                     football_runtime.application_classifier_promotion_replays,
+                     football_runtime.application_classifier_promotion_gate_runs,
                      football_runtime.application_classifier_promotion_attestations,
                      football_runtime.application_proposition_identities,
                      football_runtime.application_exact_repost_cluster_members,
@@ -4364,6 +4371,7 @@ class PostgresRoleStore:
                 """
                 SELECT outbox.payload,
                        outbox.message_id AS payload_message_id,
+                       outbox.contract_version AS payload_contract_version,
                        attestation.attestation_id,
                        attestation.approval_message_id,
                        attestation.owner_role,
@@ -4375,6 +4383,8 @@ class PostgresRoleStore:
                        attestation.base_database_binding,
                        attestation.database_binding,
                        attestation.replay_execution_ids,
+                       attestation.release_binding,
+                       attestation.replay_database_bindings,
                        attestation.canonical_replay_digests,
                        attestation.replay_digests,
                        attestation.failure_mode_observations,
@@ -4397,17 +4407,19 @@ class PostgresRoleStore:
                     release_name,
                 ),
             ).fetchall()
-        for row in rows:
-            if self._classifier_promotion_attestation_is_valid(row):
-                payload = row["payload"]
-                assert isinstance(payload, dict)
-                return cast(dict[str, JsonValue], payload)
+            for row in rows:
+                if self._classifier_promotion_attestation_is_valid(connection, row):
+                    payload = row["payload"]
+                    assert isinstance(payload, dict)
+                    return cast(dict[str, JsonValue], payload)
         return None
 
     def _classifier_promotion_attestation_is_valid(
-        self, row: Mapping[str, Any]
+        self,
+        connection: psycopg.Connection[Any],
+        row: Mapping[str, Any],
     ) -> bool:
-        """Verify the Application-owned gate record bound to one approval."""
+        """Verify one approval against the privileged durable gate records."""
         payload = row.get("payload")
         evidence = row.get("evidence")
         attestation_id = (
@@ -4418,6 +4430,7 @@ class PostgresRoleStore:
             or not isinstance(evidence, dict)
             or not isinstance(attestation_id, str)
             or row.get("payload_message_id") != row.get("approval_message_id")
+            or row.get("payload_contract_version") != 1
             or row.get("attestation_id") != _uuid_or_none(attestation_id)
             or row.get("owner_role") != RuntimeRole.APPLICATION.value
             or row.get("release_name") != payload.get("release_name")
@@ -4428,7 +4441,10 @@ class PostgresRoleStore:
             or evidence.get("execution_version") != row.get("execution_version")
             or evidence.get("base_database_binding") != row.get("base_database_binding")
             or evidence.get("database_binding") != row.get("database_binding")
+            or evidence.get("release_binding") != row.get("release_binding")
             or evidence.get("replay_execution_ids") != row.get("replay_execution_ids")
+            or evidence.get("replay_database_bindings")
+            != row.get("replay_database_bindings")
             or evidence.get("canonical_replay_digests")
             != row.get("canonical_replay_digests")
             or evidence.get("replay_digests") != row.get("replay_digests")
@@ -4440,6 +4456,162 @@ class PostgresRoleStore:
             != promotion_database_binding_for_url(self._database_url)
         ):
             return False
+
+        release = describe_player_classifier_release()
+        gate = connection.execute(
+            """
+            SELECT owner_role, gate_run_id, release_name, contract_version,
+                   release_fingerprint, contract_sha256, release_binding,
+                   execution_version, base_database_binding, database_binding,
+                   required_replays, replay_execution_ids,
+                   replay_database_bindings, canonical_replay_digests,
+                   replay_digests, failure_mode_observations,
+                   lifecycle_observations, recorded_at
+            FROM football_runtime.application_classifier_promotion_gate_runs
+            WHERE gate_run_id = %s
+            """,
+            (row.get("gate_run_id"),),
+        ).fetchone()
+        if gate is None:
+            return False
+
+        expected_release_binding = promotion_release_binding(release)
+        expected_database_binding = promotion_gate_database_binding(
+            gate_run_id=str(gate["gate_run_id"]),
+            base_database_binding=gate["base_database_binding"],
+            replay_database_bindings=gate["replay_database_bindings"],
+            replay_execution_ids=gate["replay_execution_ids"],
+            release_binding=gate["release_binding"],
+        )
+        if not (
+            gate["owner_role"] == RuntimeRole.APPLICATION.value
+            and str(gate["gate_run_id"]) == str(row["gate_run_id"])
+            and gate["release_name"] == release.release_name
+            and gate["contract_version"] == release.contract_version
+            and gate["release_fingerprint"] == release.release_fingerprint
+            and gate["contract_sha256"] == release.contract_sha256
+            and gate["release_binding"] == expected_release_binding
+            and gate["execution_version"] == evidence.get("execution_version")
+            and gate["base_database_binding"] == evidence.get("base_database_binding")
+            and gate["base_database_binding"]
+            == promotion_database_binding_for_url(self._database_url)
+            and gate["database_binding"] == evidence.get("database_binding")
+            and gate["required_replays"] == release.required_replays
+            and gate["replay_execution_ids"] == evidence.get("replay_execution_ids")
+            and gate["replay_database_bindings"]
+            == evidence.get("replay_database_bindings")
+            and gate["canonical_replay_digests"]
+            == evidence.get("canonical_replay_digests")
+            and gate["replay_digests"] == evidence.get("replay_digests")
+            and gate["failure_mode_observations"]
+            == evidence.get("failure_mode_observations")
+            and gate["lifecycle_observations"] == evidence.get("lifecycle_observations")
+            and gate["database_binding"] == expected_database_binding
+        ):
+            return False
+
+        replay_execution_ids = evidence.get("replay_execution_ids")
+        replay_database_bindings = evidence.get("replay_database_bindings")
+        canonical_replay_digests = evidence.get("canonical_replay_digests")
+        replay_digests = evidence.get("replay_digests")
+        replay_values = (
+            replay_execution_ids,
+            replay_database_bindings,
+            canonical_replay_digests,
+            replay_digests,
+        )
+        if not all(isinstance(value, list) for value in replay_values):
+            return False
+        if any(
+            len(cast(list[JsonValue], value)) != release.required_replays
+            for value in replay_values
+        ):
+            return False
+
+        replay_count = connection.execute(
+            """
+            SELECT count(*) AS replay_count
+            FROM football_runtime.application_classifier_promotion_replays
+            WHERE gate_run_id = %s
+            """,
+            (gate["gate_run_id"],),
+        ).fetchone()
+        if (
+            replay_count is None
+            or replay_count["replay_count"] != release.required_replays
+        ):
+            return False
+
+        for replay_number in range(1, release.required_replays + 1):
+            replay_row = connection.execute(
+                """
+                SELECT owner_role, gate_run_id, replay_number, execution_id,
+                       release_binding, execution_version,
+                       replay_database_binding, canonical_replay_digest,
+                       replay_digest, observations, recorded_at
+                FROM football_runtime.application_classifier_promotion_replays
+                WHERE gate_run_id = %s AND replay_number = %s
+                """,
+                (gate["gate_run_id"], replay_number),
+            ).fetchone()
+            if replay_row is None:
+                return False
+            observation_value = replay_row["observations"]
+            if not isinstance(observation_value, dict):
+                return False
+            observation = cast(dict[str, JsonValue], observation_value)
+            replay_id = cast(list[JsonValue], replay_execution_ids)[replay_number - 1]
+            replay_binding = cast(list[JsonValue], replay_database_bindings)[
+                replay_number - 1
+            ]
+            canonical_digest = cast(list[JsonValue], canonical_replay_digests)[
+                replay_number - 1
+            ]
+            replay_digest = cast(list[JsonValue], replay_digests)[replay_number - 1]
+            if not all(
+                isinstance(value, str)
+                for value in (
+                    replay_id,
+                    replay_binding,
+                    canonical_digest,
+                    replay_digest,
+                )
+            ):
+                return False
+            if (
+                replay_row["owner_role"] != RuntimeRole.APPLICATION.value
+                or str(replay_row["gate_run_id"]) != str(gate["gate_run_id"])
+                or replay_row["replay_number"] != replay_number
+                or str(replay_row["execution_id"]) != replay_id
+                or replay_row["release_binding"] != expected_release_binding
+                or replay_row["execution_version"] != evidence.get("execution_version")
+                or replay_row["replay_database_binding"] != replay_binding
+                or replay_row["canonical_replay_digest"] != canonical_digest
+                or replay_row["replay_digest"] != replay_digest
+                or replay_row["observations"] != observation
+                or observation.get("gate_run_id") != str(gate["gate_run_id"])
+                or observation.get("execution_id") != replay_id
+                or observation.get("replay_number") != replay_number
+                or observation.get("execution_version")
+                != evidence.get("execution_version")
+                or observation.get("release_fingerprint") != release.release_fingerprint
+                or observation.get("release_binding") != expected_release_binding
+                or observation.get("replay_database_binding") != replay_binding
+                or observation.get("canonical_digest") != replay_digest
+            ):
+                return False
+            recompute_input = dict(observation)
+            recompute_input.pop("canonical_digest", None)
+            if (
+                canonical_replay_digest(
+                    recompute_input,
+                    release_fingerprint=expected_release_binding,
+                    replay_number=replay_number,
+                )
+                != replay_digest
+            ):
+                return False
+
         return player_classifier_promotion_is_approved(payload)
 
     def _restore_application_promotion_credential(
@@ -4495,6 +4667,9 @@ class PostgresRoleStore:
             raise ValueError(
                 "Player promotion gate database does not match Application"
             )
+        gate_user = conninfo.conninfo_to_dict(gate_database_url).get("user")
+        if gate_user in _RUNTIME_DATABASE_ROLES:
+            raise ValueError("Player promotion gate requires a privileged database")
 
         existing = self.classifier_release_promotion(
             release_name=reviewed_release.release_name
@@ -4507,9 +4682,13 @@ class PostgresRoleStore:
                 reviewed_release,
                 database_url=gate_database_url,
                 force_fresh=True,
+                include_replay_observations=True,
             )
         finally:
             self._restore_application_promotion_credential(gate_database_url)
+        replay_observations = evidence.pop("replay_observations", None)
+        if not isinstance(replay_observations, list):
+            raise ValueError("Player promotion replay observations are incomplete")
         release_name = reviewed_release.release_name
         release_fingerprint = reviewed_release.release_fingerprint
         gate_run_id = evidence.get("gate_run_id")
@@ -4524,7 +4703,9 @@ class PostgresRoleStore:
         ):
             raise ValueError("Player promotion gate attestation binding is invalid")
 
+        release_binding = evidence.get("release_binding")
         replay_execution_ids = evidence.get("replay_execution_ids")
+        replay_database_bindings = evidence.get("replay_database_bindings")
         canonical_replay_digests = evidence.get("canonical_replay_digests")
         replay_digests = evidence.get("replay_digests")
         failure_mode_observations = evidence.get("failure_mode_observations")
@@ -4533,12 +4714,14 @@ class PostgresRoleStore:
             isinstance(value, list)
             for value in (
                 replay_execution_ids,
+                replay_database_bindings,
                 canonical_replay_digests,
                 replay_digests,
                 failure_mode_observations,
                 lifecycle_observations,
+                replay_observations,
             )
-        ):
+        ) or not isinstance(release_binding, str):
             raise ValueError("Player promotion gate observations are incomplete")
 
         attestation_id = uuid4()
@@ -4579,23 +4762,119 @@ class PostgresRoleStore:
             recorded_at=recorded_at,
             payload=approval_payload,
         )
-        with psycopg.connect(self._database_url) as connection:
-            inserted = connection.execute(
+        if len(replay_observations) != reviewed_release.required_replays:
+            raise ValueError("Player promotion replay observations are incomplete")
+        if (
+            promotion_gate_database_binding(
+                gate_run_id=gate_run_id,
+                base_database_binding=base_database_binding,
+                replay_database_bindings=cast(list[str], replay_database_bindings),
+                replay_execution_ids=cast(list[str], replay_execution_ids),
+                release_binding=release_binding,
+            )
+            != database_binding
+        ):
+            raise ValueError("Player promotion gate database binding is invalid")
+
+        with psycopg.connect(gate_database_url) as connection:
+            gate_inserted = connection.execute(
+                """
+                INSERT INTO
+                    football_runtime.application_classifier_promotion_gate_runs (
+                    gate_run_id, release_name, contract_version,
+                    release_fingerprint, contract_sha256, release_binding,
+                    execution_version, base_database_binding, database_binding,
+                    required_replays, replay_execution_ids,
+                    replay_database_bindings, canonical_replay_digests,
+                    replay_digests, failure_mode_observations,
+                    lifecycle_observations, recorded_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s
+                )
+                ON CONFLICT (release_name, release_fingerprint) DO NOTHING
+                RETURNING gate_run_id
+                """,
+                (
+                    gate_run_id,
+                    release_name,
+                    reviewed_release.contract_version,
+                    release_fingerprint,
+                    reviewed_release.contract_sha256,
+                    release_binding,
+                    evidence["execution_version"],
+                    base_database_binding,
+                    database_binding,
+                    reviewed_release.required_replays,
+                    json.dumps(replay_execution_ids),
+                    json.dumps(replay_database_bindings),
+                    json.dumps(canonical_replay_digests),
+                    json.dumps(replay_digests),
+                    json.dumps(failure_mode_observations),
+                    json.dumps(lifecycle_observations),
+                    recorded_at,
+                ),
+            ).fetchone()
+            if gate_inserted is None:
+                raise RuntimeError("classifier promotion gate already exists")
+
+            for replay_number, observation in enumerate(replay_observations, start=1):
+                if not isinstance(observation, dict):
+                    raise ValueError("Player promotion replay observation is malformed")
+                replay_observation = observation
+                replay_execution_id = cast(list[str], replay_execution_ids)[
+                    replay_number - 1
+                ]
+                replay_database_binding = cast(list[str], replay_database_bindings)[
+                    replay_number - 1
+                ]
+                canonical_replay_digest_value = cast(
+                    list[str], canonical_replay_digests
+                )[replay_number - 1]
+                replay_digest = cast(list[str], replay_digests)[replay_number - 1]
+                connection.execute(
+                    """
+                    INSERT INTO
+                        football_runtime.application_classifier_promotion_replays (
+                        gate_run_id, replay_number, execution_id,
+                        release_binding, execution_version,
+                        replay_database_binding, canonical_replay_digest,
+                        replay_digest, observations, recorded_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                    )
+                    """,
+                    (
+                        gate_run_id,
+                        replay_number,
+                        replay_execution_id,
+                        release_binding,
+                        evidence["execution_version"],
+                        replay_database_binding,
+                        canonical_replay_digest_value,
+                        replay_digest,
+                        json.dumps(replay_observation),
+                        recorded_at,
+                    ),
+                )
+
+            connection.execute(
                 """
                 INSERT INTO
                     football_runtime.application_classifier_promotion_attestations (
                     attestation_id, approval_message_id, release_name,
                     contract_version, release_fingerprint, gate_run_id,
                     execution_version, base_database_binding, database_binding,
-                    replay_execution_ids, canonical_replay_digests, replay_digests,
-                    failure_mode_observations, lifecycle_observations, evidence,
-                    recorded_at
+                    replay_execution_ids, release_binding,
+                    replay_database_bindings, canonical_replay_digests,
+                    replay_digests, failure_mode_observations,
+                    lifecycle_observations, evidence, recorded_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s
                 )
-                ON CONFLICT (release_name, release_fingerprint) DO NOTHING
-                RETURNING attestation_id
                 """,
                 (
                     attestation_id,
@@ -4608,6 +4887,8 @@ class PostgresRoleStore:
                     base_database_binding,
                     database_binding,
                     json.dumps(replay_execution_ids),
+                    release_binding,
+                    json.dumps(replay_database_bindings),
                     json.dumps(canonical_replay_digests),
                     json.dumps(replay_digests),
                     json.dumps(failure_mode_observations),
@@ -4615,37 +4896,7 @@ class PostgresRoleStore:
                     json.dumps(evidence),
                     recorded_at,
                 ),
-            ).fetchone()
-            if inserted is None:
-                existing_attestation_row = connection.execute(
-                    """
-                    SELECT attestation_id, approval_message_id
-                    FROM football_runtime.application_classifier_promotion_attestations
-                    WHERE release_name = %s AND release_fingerprint = %s
-                    FOR UPDATE
-                    """,
-                    (release_name, release_fingerprint),
-                ).fetchone()
-                if existing_attestation_row is None:
-                    raise RuntimeError("classifier promotion attestation disappeared")
-                existing_approval = connection.execute(
-                    """
-                    SELECT 1
-                    FROM football_runtime.contract_outbox
-                    WHERE message_id = %s
-                      AND producer_role = %s
-                      AND consumer_role IS NULL
-                      AND contract_name = %s
-                    """,
-                    (
-                        existing_attestation_row[1],
-                        RuntimeRole.APPLICATION.value,
-                        ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
-                    ),
-                ).fetchone()
-                if existing_approval is None:
-                    raise RuntimeError("classifier promotion approval is incomplete")
-                return
+            )
             connection.execute(
                 """
                 INSERT INTO football_runtime.contract_outbox (

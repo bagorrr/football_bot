@@ -1379,7 +1379,12 @@ def test_classifier_promotion_attestation_migration_is_transactional_and_private
                    has_table_privilege(
                        'football_application',
                        'football_runtime.application_classifier_promotion_attestations',
-                       'SELECT,INSERT'
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'INSERT'
                    ),
                    has_table_privilege(
                        'football_application',
@@ -1389,6 +1394,52 @@ def test_classifier_promotion_attestation_migration_is_transactional_and_private
                    has_table_privilege(
                        'football_classification',
                        'football_runtime.application_classifier_promotion_attestations',
+                       'SELECT'
+                   ),
+                   (
+                       SELECT bool_and(relation.relrowsecurity)
+                       FROM pg_class AS relation
+                       WHERE relation.oid IN (
+                           'football_runtime.application_classifier_promotion_gate_runs'::regclass,
+                           'football_runtime.application_classifier_promotion_replays'::regclass
+                       )
+                   ),
+                   (
+                       SELECT bool_and(relation.relforcerowsecurity)
+                       FROM pg_class AS relation
+                       WHERE relation.oid IN (
+                           'football_runtime.application_classifier_promotion_gate_runs'::regclass,
+                           'football_runtime.application_classifier_promotion_replays'::regclass
+                       )
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_gate_runs',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_gate_runs',
+                       'INSERT,UPDATE,DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_classification',
+                       'football_runtime.application_classifier_promotion_gate_runs',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_replays',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_replays',
+                       'INSERT,UPDATE,DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_classification',
+                       'football_runtime.application_classifier_promotion_replays',
                        'SELECT'
                    ),
                    EXISTS (
@@ -1403,21 +1454,38 @@ def test_classifier_promotion_attestation_migration_is_transactional_and_private
             """,
             (preserved_message_id,),
         ).fetchone()
-    assert table_state == (True, True, True, False, False, True)
+    assert table_state == (
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+    )
 
     application_url = runtime_database_url(
         fresh_database_url,
         RuntimeRole.APPLICATION,
         passwords[RuntimeRole.APPLICATION],
     )
-    with psycopg.connect(application_url) as connection:
+    with psycopg.connect(fresh_database_url) as connection:
         connection.execute(
             """
             INSERT INTO football_runtime.application_classifier_promotion_attestations (
                 attestation_id, approval_message_id, release_name,
                 contract_version, release_fingerprint, gate_run_id,
                 execution_version, base_database_binding, database_binding,
-                replay_execution_ids, canonical_replay_digests, replay_digests,
+                replay_execution_ids, release_binding, replay_database_bindings,
+                canonical_replay_digests, replay_digests,
                 failure_mode_observations, lifecycle_observations, evidence,
                 recorded_at
             ) VALUES (
@@ -1425,12 +1493,13 @@ def test_classifier_promotion_attestation_migration_is_transactional_and_private
                 '00000000-0000-0000-0000-000000000105',
                 'migration-attestation', 'contract-v1', 'fingerprint',
                 '00000000-0000-0000-0000-000000000106', 'execution-v1',
-                repeat('a', 64), repeat('b', 64), '[]', '[]', '[]', '[]', '[]',
-                '{}', %s
+                repeat('a', 64), repeat('b', 64), '[]', 'migration-binding',
+                '[]', '[]', '[]', '[]', '[]', '{}', %s
             )
             """,
             (recorded_at,),
         )
+    with psycopg.connect(application_url) as connection:
         visible_count = connection.execute(
             """
             SELECT count(*)
@@ -1438,6 +1507,62 @@ def test_classifier_promotion_attestation_migration_is_transactional_and_private
             """
         ).fetchone()
     assert visible_count == (1,)
+
+
+def test_classifier_promotion_execution_records_migration_rolls_back_and_retries(
+    fresh_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The privileged execution-record migration is atomic and retry-safe."""
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=27)
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes_with_execution_record_failure(path: Path) -> bytes:
+        migration = original_read_bytes(path)
+        if path.name == "0028_classifier_promotion_execution_records.sql":
+            return migration + b"\nSELECT missing_execution_record_function();\n"
+        return migration
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_with_execution_record_failure)
+    with pytest.raises(psycopg.errors.UndefinedFunction):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        rollback_state = connection.execute(
+            """
+            SELECT to_regnamespace('football_migrations'),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_gate_runs'
+                   ),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_replays'
+                   )
+            """
+        ).fetchone()
+    assert rollback_state == (None, None, None)
+
+    monkeypatch.undo()
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+    with psycopg.connect(fresh_database_url) as connection:
+        retry_state = connection.execute(
+            """
+            SELECT count(*),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_gate_runs'
+                   ),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_replays'
+                   )
+            FROM football_migrations.applied_migrations
+            """
+        ).fetchone()
+    assert retry_state == (
+        len(_migration_paths()),
+        "football_runtime.application_classifier_promotion_gate_runs",
+        "football_runtime.application_classifier_promotion_replays",
+    )
 
 
 def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(

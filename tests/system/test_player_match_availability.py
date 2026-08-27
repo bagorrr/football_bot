@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from copy import deepcopy
 from datetime import UTC, date, datetime
@@ -9,14 +10,14 @@ from types import SimpleNamespace
 from typing import cast
 from uuid import uuid4
 
+import psycopg
 import pytest
 
 from modules.classifier_promotion import (
     describe_player_classifier_release,
-    player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
 )
-from modules.contracts import ContractEnvelope, JsonValue, RuntimeRole
+from modules.contracts import ContractEnvelope, ContractName, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -42,6 +43,131 @@ from modules.testkit import (
     FrozenClock,
     boot_acceptance_spine,
 )
+
+
+def test_forged_structural_promotion_claim_without_gate_stays_fail_closed() -> None:
+    """A valid-shaped Application claim cannot replace the privileged gate."""
+    clock = FrozenClock(datetime(2026, 8, 27, 12, 0, tzinfo=UTC))
+    admin_database_url = os.environ["TEST_DATABASE_URL"]
+    system = boot_acceptance_spine(admin_database_url=admin_database_url, clock=clock)
+    system.reset()
+
+    release = describe_player_classifier_release()
+    application_store = system._roles[RuntimeRole.APPLICATION].store
+
+    forged_binding = "f" * 64
+    forged_evidence: dict[str, JsonValue] = {
+        "gate_run_id": str(uuid4()),
+        "base_database_binding": forged_binding,
+        "database_binding": forged_binding,
+        "release_fingerprint": release.release_fingerprint,
+        "release_binding": "forged-release-binding",
+        "execution_version": "player-controlled-execution-v6",
+        "replay_execution_ids": [],
+        "replay_database_bindings": [],
+        "canonical_replay_digests": [],
+        "replay_digests": [],
+        "failure_mode_observations": [],
+        "lifecycle_observations": [],
+    }
+    forged_attestation_id = uuid4()
+    forged_message_id = uuid4()
+    forged_approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "attestation_id": str(forged_attestation_id),
+        "evidence": forged_evidence,
+    }
+
+    with psycopg.connect(admin_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO
+                football_runtime.application_classifier_promotion_attestations (
+                attestation_id, approval_message_id, release_name,
+                contract_version, release_fingerprint, gate_run_id,
+                execution_version, base_database_binding, database_binding,
+                replay_execution_ids, release_binding, replay_database_bindings,
+                canonical_replay_digests, replay_digests,
+                failure_mode_observations, lifecycle_observations, evidence,
+                recorded_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                %s::jsonb, %s
+            )
+            """,
+            (
+                forged_attestation_id,
+                forged_message_id,
+                release.release_name,
+                release.contract_version,
+                release.release_fingerprint,
+                forged_evidence["gate_run_id"],
+                forged_evidence["execution_version"],
+                forged_evidence["base_database_binding"],
+                forged_evidence["database_binding"],
+                json.dumps(forged_evidence["replay_execution_ids"]),
+                forged_evidence["release_binding"],
+                json.dumps(forged_evidence["replay_database_bindings"]),
+                json.dumps(forged_evidence["canonical_replay_digests"]),
+                json.dumps(forged_evidence["replay_digests"]),
+                json.dumps(forged_evidence["failure_mode_observations"]),
+                json.dumps(forged_evidence["lifecycle_observations"]),
+                json.dumps(forged_evidence),
+                clock.now(),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision,
+                idempotency_key, causation_id, correlation_id, recorded_at,
+                payload, source_chat_admission_provenance_id
+            ) VALUES (%s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+            """,
+            (
+                forged_message_id,
+                RuntimeRole.APPLICATION.value,
+                ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
+                1,
+                release.release_name,
+                1,
+                f"forged-classifier-promotion:{forged_attestation_id}",
+                uuid4(),
+                uuid4(),
+                clock.now(),
+                json.dumps(forged_approval),
+            ),
+        )
+
+    assert system.player_classifier_promotion() is None
+    with pytest.raises(ValueError, match="cannot publish"):
+        application_store.publish_opportunity(
+            incoming=cast(
+                ContractEnvelope,
+                SimpleNamespace(
+                    payload={
+                        "requested_model": "gpt-5.6-sol",
+                        "effective_model": "gpt-5.6-sol",
+                        "requested_reasoning_effort": "high",
+                        "effective_reasoning_effort": "high",
+                        "prompt_version": "player-match-primary-v1",
+                        "schema_version": "source-message-classification-v3",
+                        "glossary_version": "football-opportunity-glossary-v1",
+                        "context_policy_version": "classifier-context-v1",
+                        "routing_policy_version": "classifier-routing-player-v1",
+                        "classification_status": "succeeded",
+                    }
+                ),
+            ),
+            opportunity={"opportunity_type": "player_match_availability"},
+            outgoing=cast(ContractEnvelope, SimpleNamespace()),
+            received_at=clock.now(),
+        )
 
 
 def test_player_search_publishes_confirmed_partial_and_possible_without_combining() -> (
@@ -188,26 +314,7 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
     assert system.player_classifier_promotion() is None
 
     release = describe_player_classifier_release()
-    evidence = player_classifier_promotion_evidence(release)
-    forged_replay_ids = [str(uuid4()) for _ in range(release.required_replays)]
-    forged_evidence = deepcopy(evidence)
-    forged_evidence["replay_ids"] = cast(list[JsonValue], forged_replay_ids)
-    forged_evidence["replay_execution_ids"] = cast(list[JsonValue], forged_replay_ids)
-    forged_approval: dict[str, JsonValue] = {
-        "release_name": release.release_name,
-        "contract_version": release.contract_version,
-        "release_fingerprint": release.release_fingerprint,
-        "state": "approved",
-        "evidence": forged_evidence,
-    }
-    assert player_classifier_promotion_is_approved(forged_approval)
     application_store = system._roles[RuntimeRole.APPLICATION].store
-    with pytest.raises(ValueError, match="Application-owned fresh gate"):
-        application_store.record_classifier_release_promotion(
-            release=forged_approval,
-            recorded_at=clock.now(),
-        )
-    assert system.player_classifier_promotion() is None
     with pytest.raises(ValueError, match="cannot publish"):
         application_store.publish_opportunity(
             incoming=cast(
@@ -236,6 +343,86 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
     first_approval = system.player_classifier_promotion()
     assert first_approval is not None
     assert player_classifier_promotion_is_approved(first_approval)
+
+    valid_evidence = cast(dict[str, JsonValue], first_approval["evidence"])
+    gate_run_id = valid_evidence["gate_run_id"]
+    assert isinstance(gate_run_id, str)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        replay_row = connection.execute(
+            """
+            SELECT execution_id, replay_database_binding, replay_digest, observations
+            FROM football_runtime.application_classifier_promotion_replays
+            WHERE gate_run_id = %s AND replay_number = 1
+            """,
+            (gate_run_id,),
+        ).fetchone()
+    assert replay_row is not None
+    (
+        original_execution_id,
+        original_database_binding,
+        original_digest,
+        original_observation,
+    ) = replay_row
+
+    tampered_observation = cast(dict[str, JsonValue], original_observation).copy()
+    tampered_observation["execution_id"] = str(uuid4())
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.application_classifier_promotion_replays
+            SET execution_id = %s,
+                replay_database_binding = %s,
+                replay_digest = %s,
+                observations = %s::jsonb
+            WHERE gate_run_id = %s AND replay_number = 1
+            """,
+            (
+                uuid4(),
+                "0" * 64,
+                "0" * 64,
+                json.dumps(tampered_observation),
+                gate_run_id,
+            ),
+        )
+    assert system.player_classifier_promotion() is None
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.application_classifier_promotion_replays
+            SET execution_id = %s,
+                replay_database_binding = %s,
+                replay_digest = %s,
+                observations = %s::jsonb
+            WHERE gate_run_id = %s AND replay_number = 1
+            """,
+            (
+                original_execution_id,
+                original_database_binding,
+                original_digest,
+                json.dumps(original_observation),
+                gate_run_id,
+            ),
+        )
+
+    assert system.player_classifier_promotion() == first_approval
+
+    forged_replay_ids = [str(uuid4()) for _ in range(release.required_replays)]
+    forged_evidence = deepcopy(valid_evidence)
+    forged_evidence["replay_ids"] = cast(list[JsonValue], forged_replay_ids)
+    forged_evidence["replay_execution_ids"] = cast(list[JsonValue], forged_replay_ids)
+    forged_approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": forged_evidence,
+    }
+    assert player_classifier_promotion_is_approved(forged_approval)
+    with pytest.raises(ValueError, match="Application-owned fresh gate"):
+        application_store.record_classifier_release_promotion(
+            release=forged_approval,
+            recorded_at=clock.now(),
+        )
     system.record_player_classifier_promotion()
     assert system.player_classifier_promotion() == first_approval
 

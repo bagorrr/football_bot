@@ -3001,11 +3001,13 @@ def _canonicalize_observed_value(value: JsonValue, *, key: str = "") -> JsonValu
             and not name.endswith("_ids")
             and name
             not in {
+                "gate_run_id",
                 "proposal_ids",
                 "publication_ids",
                 "attempt_ids",
                 "source_event_ids",
                 "opportunity_ids",
+                "replay_database_binding",
             }
         }
     if isinstance(value, list):
@@ -3048,8 +3050,11 @@ def run_replay_worker(
     release: PlayerClassifierRelease,
     execution_id: str,
     replay_number: int,
+    gate_run_id: str,
 ) -> dict[str, JsonValue]:
     """Execute one complete promotion run in a worker process."""
+    from modules.classifier_promotion import promotion_database_binding_for_url
+
     corpus_adapter = ControlledPlayerClassifierAdapter()
     corpus: list[JsonValue] = []
     failures: list[str] = []
@@ -3095,11 +3100,13 @@ def run_replay_worker(
     failure_values.extend(failures)
     observations: dict[str, JsonValue] = {
         "execution_id": execution_id,
+        "gate_run_id": gate_run_id,
         "process_id": os.getpid(),
         "replay_number": replay_number,
         "execution_version": "player-controlled-execution-v6",
         "release_fingerprint": release.release_fingerprint,
         "release_binding": _release_binding(release),
+        "replay_database_binding": promotion_database_binding_for_url(database_url),
         "corpus": corpus,
         "lifecycle": lifecycle,
         "failure_modes": failure_modes,
@@ -3551,7 +3558,7 @@ def compare_failure_observation(
 
 
 def replay_worker_main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[0] != "--replay-worker":
+    if len(argv) != 4 or argv[0] != "--replay-worker":
         return 2
     database_url = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
     if not database_url:
@@ -3563,11 +3570,13 @@ def replay_worker_main(argv: list[str]) -> int:
     release = describe_player_classifier_release()
     replay_number = int(argv[1])
     execution_id = argv[2]
+    gate_run_id = argv[3]
     output = run_replay_worker(
         database_url=database_url,
         release=release,
         execution_id=execution_id,
         replay_number=replay_number,
+        gate_run_id=gate_run_id,
     )
     print(
         "PLAYER_PROMOTION_REPLAY="

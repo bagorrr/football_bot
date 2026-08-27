@@ -255,6 +255,7 @@ class PlayerPromotionGateResult:
     base_database_binding: str
     database_binding: str
     release_fingerprint: str
+    release_binding: str
     reviewed_case_count: int
     lifecycle_case_count: int
     failure_mode_case_ids: tuple[str, ...]
@@ -265,6 +266,8 @@ class PlayerPromotionGateResult:
     failure_mode_observations: tuple[dict[str, JsonValue], ...]
     lifecycle_observations: tuple[dict[str, JsonValue], ...]
     replay_execution_ids: tuple[str, ...]
+    replay_database_bindings: tuple[str, ...]
+    replay_observations: tuple[dict[str, JsonValue], ...]
     execution_version: str
 
     @property
@@ -274,6 +277,7 @@ class PlayerPromotionGateResult:
             and _uuid_text(self.gate_run_id)
             and _HEX64.fullmatch(self.base_database_binding) is not None
             and _HEX64.fullmatch(self.database_binding) is not None
+            and _HEX64.fullmatch(self.release_binding) is not None
             and self.reviewed_case_count == PLAYER_REVIEWED_CORPUS_CASE_COUNT
             and self.lifecycle_case_count == PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT
             and len(self.failure_mode_case_ids) == len(PLAYER_REQUIRED_FAILURE_MODES)
@@ -281,6 +285,9 @@ class PlayerPromotionGateResult:
             and len(self.replay_digests) == PLAYER_REQUIRED_REPLAYS
             and len(self.replay_execution_ids) == PLAYER_REQUIRED_REPLAYS
             and len(set(self.replay_execution_ids)) == PLAYER_REQUIRED_REPLAYS
+            and len(self.replay_database_bindings) == PLAYER_REQUIRED_REPLAYS
+            and len(set(self.replay_database_bindings)) == PLAYER_REQUIRED_REPLAYS
+            and len(self.replay_observations) == PLAYER_REQUIRED_REPLAYS
             and len(set(self.replay_digests)) == PLAYER_REQUIRED_REPLAYS
         )
 
@@ -878,6 +885,12 @@ from modules.player_promotion_runtime import (  # noqa: E402
     run_replay_worker,
 )
 
+
+def promotion_release_binding(release: PlayerClassifierRelease) -> str:
+    """Return the versioned binding shared by workers and durable records."""
+    return _release_binding(release)
+
+
 __all__ = [
     "ControlledPlayerClassifierAdapter",
     "DurableAcceptanceProbe",
@@ -887,6 +900,7 @@ __all__ = [
     "compare_recorded_observation",
     "execute_failure_case",
     "execute_lifecycle_case",
+    "promotion_release_binding",
     "run_replay_worker",
 ]
 
@@ -959,6 +973,27 @@ def promotion_database_binding_for_url(database_url: str) -> str:
     }
     return sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def promotion_gate_database_binding(
+    *,
+    gate_run_id: str,
+    base_database_binding: str,
+    replay_database_bindings: tuple[str, ...] | list[str],
+    replay_execution_ids: tuple[str, ...] | list[str],
+    release_binding: str,
+) -> str:
+    """Bind one gate to its exact parent, workers, and database identities."""
+    material = {
+        "gate_run_id": gate_run_id,
+        "base_database_binding": base_database_binding,
+        "replay_database_bindings": list(replay_database_bindings),
+        "replay_execution_ids": list(replay_execution_ids),
+        "release_binding": release_binding,
+    }
+    return sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
@@ -1065,6 +1100,9 @@ def _check_worker_envelope(
     release: PlayerClassifierRelease,
     parent_pid: int,
     replay_number: int,
+    expected_gate_run_id: str,
+    expected_execution_id: str,
+    expected_replay_database_binding: str,
 ) -> tuple[str, ...]:
     failures: list[str] = []
     if output.get("execution_version") != PLAYER_PROMOTION_EXECUTION_VERSION:
@@ -1073,14 +1111,20 @@ def _check_worker_envelope(
         failures.append(f"replay-{replay_number}:release-fingerprint")
     if output.get("release_binding") != _release_binding(release):
         failures.append(f"replay-{replay_number}:release-binding")
+    if output.get("gate_run_id") != expected_gate_run_id:
+        failures.append(f"replay-{replay_number}:gate-run-id")
     process_id = output.get("process_id")
     if not isinstance(process_id, int) or process_id == parent_pid:
         failures.append(f"replay-{replay_number}:not-process-isolated")
     execution_id = output.get("execution_id")
+    if execution_id != expected_execution_id:
+        failures.append(f"replay-{replay_number}:execution-id-binding")
     if not _uuid_text(execution_id):
         failures.append(f"replay-{replay_number}:synthetic-execution-id")
     if output.get("replay_number") != replay_number:
         failures.append(f"replay-{replay_number}:replay-number")
+    if output.get("replay_database_binding") != expected_replay_database_binding:
+        failures.append(f"replay-{replay_number}:database-binding")
     return tuple(failures)
 
 
@@ -1175,6 +1219,7 @@ def run_player_classifier_promotion_gate(
     database_url = _database_url(database_url)
     gate_run_id = str(uuid4())
     base_database_binding = promotion_database_binding_for_url(database_url)
+    release_binding = _release_binding(release)
     failed: set[str] = set(_recorded_corpus_audit(release))
     classifier_seam_changed = (
         ControlledPlayerClassifierAdapter.observe is not _ORIGINAL_CLASSIFIER_OBSERVE
@@ -1190,6 +1235,7 @@ def run_player_classifier_promotion_gate(
             base_database_binding=base_database_binding,
             database_binding="",
             release_fingerprint=release.release_fingerprint,
+            release_binding=release_binding,
             reviewed_case_count=len(release.reviewed_corpus_cases),
             lifecycle_case_count=len(release.lifecycle_failure_suite_cases),
             failure_mode_case_ids=tuple(
@@ -1207,6 +1253,8 @@ def run_player_classifier_promotion_gate(
             failure_mode_observations=(),
             lifecycle_observations=(),
             replay_execution_ids=(),
+            replay_database_bindings=(),
+            replay_observations=(),
             execution_version=PLAYER_PROMOTION_EXECUTION_VERSION,
         )
 
@@ -1237,6 +1285,7 @@ def run_player_classifier_promotion_gate(
                 "--replay-worker",
                 str(replay_number),
                 execution_id,
+                gate_run_id,
             ],
             cwd=_REPOSITORY_ROOT,
             env=environment,
@@ -1259,6 +1308,11 @@ def run_player_classifier_promotion_gate(
                 release=release,
                 parent_pid=os.getpid(),
                 replay_number=replay_number,
+                expected_gate_run_id=gate_run_id,
+                expected_execution_id=execution_id,
+                expected_replay_database_binding=replay_database_bindings[
+                    replay_number - 1
+                ],
             )
         )
         failed.update(_compare_worker_to_release(output, release))
@@ -1270,14 +1324,14 @@ def run_player_classifier_promotion_gate(
         )
         recompute_input = dict(output)
         recompute_input.pop("canonical_digest", None)
-        release_binding = output.get("release_binding")
+        worker_release_binding = output.get("release_binding")
         recomputed_digest = (
             canonical_replay_digest(
                 recompute_input,
-                release_fingerprint=release_binding,
+                release_fingerprint=worker_release_binding,
                 replay_number=replay_number,
             )
-            if isinstance(release_binding, str)
+            if isinstance(worker_release_binding, str)
             else None
         )
         if (
@@ -1320,23 +1374,19 @@ def run_player_classifier_promotion_gate(
                 )
     failure_mode_observations = tuple(failure_mode_observations_list)
     lifecycle_observations = tuple(lifecycle_observations_list)
-    database_binding = sha256(
-        json.dumps(
-            {
-                "gate_run_id": gate_run_id,
-                "base_database_binding": base_database_binding,
-                "replay_database_bindings": replay_database_bindings,
-                "replay_execution_ids": replay_execution_ids,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    database_binding = promotion_gate_database_binding(
+        gate_run_id=gate_run_id,
+        base_database_binding=base_database_binding,
+        replay_database_bindings=replay_database_bindings,
+        replay_execution_ids=replay_execution_ids,
+        release_binding=release_binding,
+    )
     result = PlayerPromotionGateResult(
         gate_run_id=gate_run_id,
         base_database_binding=base_database_binding,
         database_binding=database_binding,
         release_fingerprint=release.release_fingerprint,
+        release_binding=release_binding,
         reviewed_case_count=len(release.reviewed_corpus_cases),
         lifecycle_case_count=len(release.lifecycle_failure_suite_cases),
         failure_mode_case_ids=tuple(
@@ -1353,6 +1403,8 @@ def run_player_classifier_promotion_gate(
         failure_mode_observations=failure_mode_observations,
         lifecycle_observations=lifecycle_observations,
         replay_execution_ids=tuple(replay_execution_ids),
+        replay_database_bindings=tuple(replay_database_bindings),
+        replay_observations=tuple(worker_outputs),
         execution_version=PLAYER_PROMOTION_EXECUTION_VERSION,
     )
     if result.passed:
@@ -1375,6 +1427,7 @@ def player_classifier_promotion_evidence(
     replay_digests: tuple[str, ...] | None = None,
     database_url: str | None = None,
     force_fresh: bool = False,
+    include_replay_observations: bool = False,
 ) -> dict[str, JsonValue]:
     """Build durable approval evidence only from a fresh exact replay."""
     result = run_player_classifier_promotion_gate(
@@ -1391,11 +1444,12 @@ def player_classifier_promotion_evidence(
         raise ValueError(
             "caller-supplied replay digests do not match controlled replay"
         )
-    return {
+    evidence: dict[str, JsonValue] = {
         "gate_run_id": result.gate_run_id,
         "base_database_binding": result.base_database_binding,
         "database_binding": result.database_binding,
         "release_fingerprint": release.release_fingerprint,
+        "release_binding": result.release_binding,
         "contract_sha256": release.contract_sha256,
         "reviewed_corpus_path": release.reviewed_corpus_path,
         "reviewed_corpus_version": release.reviewed_corpus_version,
@@ -1425,12 +1479,16 @@ def player_classifier_promotion_evidence(
         "canonical_replay_digests": list(release.canonical_replay_digests),
         "replay_digests": list(result.replay_digests),
         "replay_execution_ids": list(result.replay_execution_ids),
+        "replay_database_bindings": list(result.replay_database_bindings),
         "execution_version": result.execution_version,
         "adapter_kind": "responses_api",
         "requested_model": release.requested_model,
         "requested_reasoning_effort": release.requested_reasoning_effort,
         "proposal_only": release.proposal_only,
     }
+    if include_replay_observations:
+        evidence["replay_observations"] = list(result.replay_observations)
+    return evidence
 
 
 def _promotion_evidence_is_valid(
@@ -1453,6 +1511,7 @@ def _promotion_evidence_is_valid(
         "base_database_binding",
         "database_binding",
         "release_fingerprint",
+        "release_binding",
         "contract_sha256",
         "reviewed_corpus_path",
         "reviewed_corpus_version",
@@ -1480,6 +1539,7 @@ def _promotion_evidence_is_valid(
         "canonical_replay_digests",
         "replay_digests",
         "replay_execution_ids",
+        "replay_database_bindings",
         "execution_version",
         "adapter_kind",
         "requested_model",
@@ -1490,6 +1550,7 @@ def _promotion_evidence_is_valid(
         return False
     expected_scalars: dict[str, JsonValue] = {
         "release_fingerprint": release.release_fingerprint,
+        "release_binding": _release_binding(release),
         "contract_sha256": release.contract_sha256,
         "reviewed_corpus_path": release.reviewed_corpus_path,
         "reviewed_corpus_version": release.reviewed_corpus_version,
@@ -1521,6 +1582,8 @@ def _promotion_evidence_is_valid(
         or not _HEX64.fullmatch(cast(str, value["base_database_binding"]))
         or not isinstance(value.get("database_binding"), str)
         or not _HEX64.fullmatch(cast(str, value["database_binding"]))
+        or not isinstance(value.get("release_binding"), str)
+        or not _HEX64.fullmatch(cast(str, value["release_binding"]))
         or any(value.get(key) != expected for key, expected in expected_scalars.items())
     ):
         return False
@@ -1554,6 +1617,19 @@ def _promotion_evidence_is_valid(
         return False
     replay_id_texts = cast(list[str], replay_ids)
     if len(set(replay_id_texts)) != len(replay_id_texts):
+        return False
+
+    replay_database_bindings = value.get("replay_database_bindings")
+    if (
+        not isinstance(replay_database_bindings, list)
+        or len(replay_database_bindings) != release.required_replays
+        or not all(
+            isinstance(item, str) and _HEX64.fullmatch(item)
+            for item in replay_database_bindings
+        )
+        or len(set(cast(list[str], replay_database_bindings)))
+        != len(replay_database_bindings)
+    ):
         return False
 
     lifecycle_observations = value.get("lifecycle_observations")
