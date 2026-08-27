@@ -99,6 +99,7 @@ from modules.domain import (
     TelegramProtectionUnavailableEvent,
     UserIntent,
     empty_bounded_source_metadata,
+    evaluate_coaching_search,
     evaluate_game_search,
     evaluate_opponent_search,
     evaluate_player_search,
@@ -149,6 +150,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0026_exact_repost_clusters.sql",
     "0027_classifier_promotion_attestations.sql",
     "0028_classifier_promotion_execution_records.sql",
+    "0029_coaching_opportunities.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -181,6 +183,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7856483bc640ecb0d84b6f137a150ccaef971e393d2390d933d5df133187e764",
     "460bb27388e10e836c8f1d8d3db37a01c2c2779a85bf7e5d114d68bcb1d018a9",
     "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
+    "4a9356358f2e925659f0488b7185729b3a5d9498eaf55eb284e3d85e0de1c4d0",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1752,8 +1755,8 @@ class PostgresAcceptanceObserver:
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
                        opponent_search_details, tournament_search_details,
-                       transfer_search_details, number_of_players,
-                       completed_at
+                       transfer_search_details, coaching_search_details,
+                       number_of_players, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE telegram_user_id = %s
                 ORDER BY completed_at, completed_search_id
@@ -1805,7 +1808,10 @@ class PostgresAcceptanceObserver:
                            response_route ->> 'value' AS response_route_value
                     FROM football_runtime.recommendation_opportunities
                     WHERE opportunity_id = result.card_facts->>'opportunity_id'
-                      AND result.card_facts->>'opportunity_type' = 'tournament'
+                      AND opportunity_type = result.card_facts->>'opportunity_type'
+                      AND opportunity_type IN (
+                          'tournament', 'coach_availability', 'coach_request'
+                      )
                     ORDER BY CASE
                                  WHEN opportunity_revision_id ~ ':revision:[0-9]+$'
                                  THEN substring(
@@ -5758,6 +5764,7 @@ class PostgresRoleStore:
         completed_search: CompletedSearch,
         search_details: Mapping[str, tuple[str, ...]],
         transfer_search_details: Mapping[str, tuple[str, ...]] | None = None,
+        coaching_search_details: Mapping[str, Any] | None = None,
     ) -> tuple[SearchResult, ...]:
         """Load accepted projections and delegate deterministic evaluation."""
         if self._role is not RuntimeRole.RECOMMENDATION:
@@ -5769,6 +5776,8 @@ class PostgresRoleStore:
             UserIntent.TOURNAMENT_SEARCH,
             UserIntent.NEW_TEAM_SEARCH,
             UserIntent.TRANSFER_PLAYER_SEARCH,
+            UserIntent.COACH_SEARCH,
+            UserIntent.COACHING_SERVICE_OFFER,
         }:
             return ()
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
@@ -5821,6 +5830,17 @@ class PostgresRoleStore:
                 transfer_search_details
                 if transfer_search_details is not None
                 else dict(completed_search.transfer_search_details),
+                projections,
+            )
+        if completed_search.user_intent in {
+            UserIntent.COACH_SEARCH,
+            UserIntent.COACHING_SERVICE_OFFER,
+        }:
+            return evaluate_coaching_search(
+                completed_search,
+                coaching_search_details
+                if coaching_search_details is not None
+                else dict(completed_search.coaching_search_details),
                 projections,
             )
         return ()
@@ -5971,6 +5991,15 @@ class PostgresRoleStore:
                     dict(completed_search.transfer_search_details),
                     projections,
                 )
+            elif completed_search.user_intent in {
+                UserIntent.COACH_SEARCH,
+                UserIntent.COACHING_SERVICE_OFFER,
+            }:
+                results = evaluate_coaching_search(
+                    completed_search,
+                    dict(completed_search.coaching_search_details),
+                    projections,
+                )
             else:
                 results = ()
             outgoing_payload = outgoing.payload
@@ -5990,12 +6019,12 @@ class PostgresRoleStore:
                     sub_city_area_verified_parent_ids, whole_city, required_date,
                     game_search_details, opponent_search_details,
                     tournament_search_details,
-                    transfer_search_details, opportunity_revision_inputs,
-                    number_of_players, completed_at
+                    transfer_search_details, coaching_search_details,
+                    opportunity_revision_inputs, number_of_players, completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                     %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
                 )
                 """,
                 (
@@ -6014,6 +6043,7 @@ class PostgresRoleStore:
                     json.dumps(dict(completed_search.opponent_search_details)),
                     json.dumps(dict(completed_search.tournament_search_details)),
                     json.dumps(dict(completed_search.transfer_search_details)),
+                    json.dumps(dict(completed_search.coaching_search_details)),
                     json.dumps(input_set),
                     completed_search.number_of_players,
                     completed_search.completed_at,
@@ -6437,6 +6467,10 @@ class PostgresRoleStore:
                            transfer_search_details, editing_transfer_search_detail,
                            transfer_search_detail_draft,
                            transfer_search_seasonal_timing_prompt,
+                           coaching_search_details,
+                           editing_coaching_search_detail,
+                           coaching_search_detail_draft,
+                           coaching_search_schedule_prompt,
                            search_submission_update_id
                     FROM football_runtime.bot_discovery_drafts
                     WHERE telegram_user_id = %s
@@ -6497,6 +6531,13 @@ class PostgresRoleStore:
             transfer_search_seasonal_timing_prompt=row[
                 "transfer_search_seasonal_timing_prompt"
             ],
+            coaching_search_details=tuple(
+                (key, tuple(values) if isinstance(values, list) else values)
+                for key, values in sorted(row["coaching_search_details"].items())
+            ),
+            editing_coaching_search_detail=row["editing_coaching_search_detail"],
+            coaching_search_detail_draft=tuple(row["coaching_search_detail_draft"]),
+            coaching_search_schedule_prompt=row["coaching_search_schedule_prompt"],
             search_submission_update_id=row["search_submission_update_id"],
         )
 
@@ -6669,6 +6710,10 @@ class PostgresRoleStore:
                     draft.editing_transfer_search_detail,
                     json.dumps(draft.transfer_search_detail_draft),
                     draft.transfer_search_seasonal_timing_prompt,
+                    json.dumps(dict(draft.coaching_search_details)),
+                    draft.editing_coaching_search_detail,
+                    json.dumps(draft.coaching_search_detail_draft),
+                    draft.coaching_search_schedule_prompt,
                     recorded_at,
                 )
                 if draft.revision == 1:
@@ -6692,7 +6737,11 @@ class PostgresRoleStore:
                             transfer_search_details,
                             editing_transfer_search_detail,
                             transfer_search_detail_draft,
-                            transfer_search_seasonal_timing_prompt, updated_at
+                            transfer_search_seasonal_timing_prompt,
+                            coaching_search_details,
+                            editing_coaching_search_detail,
+                            coaching_search_detail_draft,
+                            coaching_search_schedule_prompt, updated_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s,
                             %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::jsonb,
@@ -6700,7 +6749,7 @@ class PostgresRoleStore:
                             %s::jsonb, %s, %s::jsonb, %s,
                             %s::jsonb, %s, %s::jsonb,
                             %s::jsonb, %s, %s::jsonb, %s,
-                            %s
+                            %s::jsonb, %s, %s::jsonb, %s, %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -6739,6 +6788,10 @@ class PostgresRoleStore:
                             editing_transfer_search_detail = %s,
                             transfer_search_detail_draft = %s::jsonb,
                             transfer_search_seasonal_timing_prompt = %s,
+                            coaching_search_details = %s::jsonb,
+                            editing_coaching_search_detail = %s,
+                            coaching_search_detail_draft = %s::jsonb,
+                            coaching_search_schedule_prompt = %s,
                             updated_at = %s
                         WHERE telegram_user_id = %s AND revision = %s
                         RETURNING revision
@@ -7781,8 +7834,8 @@ class PostgresRoleStore:
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
                        opponent_search_details, tournament_search_details,
-                       transfer_search_details, number_of_players,
-                       completed_at
+                       transfer_search_details, coaching_search_details,
+                       number_of_players, completed_at
                 FROM football_runtime.recommendation_completed_searches
                 WHERE completed_search_id = %s
                 """,
@@ -7806,10 +7859,12 @@ class PostgresRoleStore:
                 LEFT JOIN LATERAL (
                     SELECT opportunity_revision_id, publication_state,
                            current_facts, response_route_kind, response_route_value
-                    FROM football_runtime.read_current_tournament_result_projection(
+                    FROM football_runtime.read_current_opportunity_result_projection(
                         result.card_facts->>'opportunity_id'
                     )
-                    WHERE result.card_facts->>'opportunity_type' = 'tournament'
+                    WHERE result.card_facts->>'opportunity_type' IN (
+                        'tournament', 'coach_availability', 'coach_request'
+                    )
                     LIMIT 1
                 ) AS current_projection ON TRUE
                 WHERE result.completed_search_id = %s
@@ -8439,7 +8494,7 @@ def _result_card_facts_with_current_publication_state(
     *,
     as_of: datetime,
 ) -> dict[str, Any]:
-    """Overlay current Tournament facts while preserving immutable card history."""
+    """Overlay current mutable publication facts while preserving card history."""
     if card_facts.get("opportunity_type") == "tournament":
         current_facts = (
             current_projection.get("current_facts")
@@ -8454,6 +8509,33 @@ def _result_card_facts_with_current_publication_state(
                 current_publication_state=current_projection.get("publication_state"),
                 as_of=as_of,
             )
+        result = {
+            **card_facts,
+            "publication_state": publication_state,
+        }
+        if publication_state == "active":
+            assert current_projection is not None
+            route_kind = current_projection.get("response_route_kind")
+            route_value = current_projection.get("response_route_value")
+            if isinstance(route_kind, str) and isinstance(route_value, str):
+                result["response_route_kind"] = route_kind
+                result["response_route_value"] = route_value
+            else:
+                result.pop("response_route_kind", None)
+                result.pop("response_route_value", None)
+        else:
+            result.pop("response_route_kind", None)
+            result.pop("response_route_value", None)
+        return result
+    if card_facts.get("opportunity_type") in {
+        "coach_availability",
+        "coach_request",
+    }:
+        if current_projection is None:
+            publication_state = "suppressed"
+        else:
+            state = current_projection.get("publication_state")
+            publication_state = state if isinstance(state, str) else "suppressed"
         result = {
             **card_facts,
             "publication_state": publication_state,
@@ -8525,6 +8607,10 @@ def _completed_search(row: dict[str, Any]) -> CompletedSearch:
         transfer_search_details=tuple(
             (key, tuple(values))
             for key, values in sorted(row["transfer_search_details"].items())
+        ),
+        coaching_search_details=tuple(
+            (key, tuple(values) if isinstance(values, list) else values)
+            for key, values in sorted(row["coaching_search_details"].items())
         ),
     )
 
