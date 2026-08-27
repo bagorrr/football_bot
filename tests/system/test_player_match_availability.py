@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
+from typing import cast
+from uuid import uuid4
 
-from modules.contracts import JsonValue
+import pytest
+
+from modules.classifier_promotion import (
+    describe_player_classifier_release,
+    player_classifier_promotion_evidence,
+    player_classifier_promotion_is_approved,
+)
+from modules.contracts import ContractEnvelope, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -176,8 +187,57 @@ def test_player_search_publishes_confirmed_partial_and_possible_without_combinin
     )
     assert system.player_classifier_promotion() is None
 
+    release = describe_player_classifier_release()
+    evidence = player_classifier_promotion_evidence(release)
+    forged_replay_ids = [str(uuid4()) for _ in range(release.required_replays)]
+    forged_evidence = deepcopy(evidence)
+    forged_evidence["replay_ids"] = cast(list[JsonValue], forged_replay_ids)
+    forged_evidence["replay_execution_ids"] = cast(list[JsonValue], forged_replay_ids)
+    forged_approval: dict[str, JsonValue] = {
+        "release_name": release.release_name,
+        "contract_version": release.contract_version,
+        "release_fingerprint": release.release_fingerprint,
+        "state": "approved",
+        "evidence": forged_evidence,
+    }
+    assert player_classifier_promotion_is_approved(forged_approval)
+    application_store = system._roles[RuntimeRole.APPLICATION].store
+    with pytest.raises(ValueError, match="Application-owned fresh gate"):
+        application_store.record_classifier_release_promotion(
+            release=forged_approval,
+            recorded_at=clock.now(),
+        )
+    assert system.player_classifier_promotion() is None
+    with pytest.raises(ValueError, match="cannot publish"):
+        application_store.publish_opportunity(
+            incoming=cast(
+                ContractEnvelope,
+                SimpleNamespace(
+                    payload={
+                        "requested_model": "gpt-5.6-sol",
+                        "effective_model": "gpt-5.6-sol",
+                        "requested_reasoning_effort": "high",
+                        "effective_reasoning_effort": "high",
+                        "prompt_version": "player-match-primary-v1",
+                        "schema_version": "source-message-classification-v3",
+                        "glossary_version": "football-opportunity-glossary-v1",
+                        "context_policy_version": "classifier-context-v1",
+                        "routing_policy_version": "classifier-routing-player-v1",
+                        "classification_status": "succeeded",
+                    }
+                ),
+            ),
+            opportunity={"opportunity_type": "player_match_availability"},
+            outgoing=cast(ContractEnvelope, SimpleNamespace()),
+            received_at=clock.now(),
+        )
+
     system.record_player_classifier_promotion()
-    assert system.player_classifier_promotion() is not None
+    first_approval = system.player_classifier_promotion()
+    assert first_approval is not None
+    assert player_classifier_promotion_is_approved(first_approval)
+    system.record_player_classifier_promotion()
+    assert system.player_classifier_promotion() == first_approval
 
     cases = (
         (

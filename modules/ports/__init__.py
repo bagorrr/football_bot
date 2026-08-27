@@ -935,7 +935,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         release: dict[str, JsonValue],
         recorded_at: datetime,
     ) -> None:
-        """Record explicit versioned classifier promotion evidence."""
+        """Run and record an Application-owned classifier promotion attestation."""
         ...
 
     def proposition_opportunity_ids(

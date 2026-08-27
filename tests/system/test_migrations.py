@@ -1310,6 +1310,136 @@ def test_player_migration_upgrades_exact_main_ledger_transactionally(
     assert history_after_repeat == history_after_upgrade
 
 
+def test_classifier_promotion_attestation_migration_is_transactional_and_private(
+    fresh_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upgrade, retry, rollback, and protect the Application attestation table."""
+    _apply_untracked_repository_migrations(fresh_database_url, applied_count=26)
+    preserved_message_id = "00000000-0000-0000-0000-000000000101"
+    recorded_at = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'application', NULL, 'RunSearch', 1,
+                'migration-compatibility', 1, 'migration-compatibility',
+                '00000000-0000-0000-0000-000000000102',
+                '00000000-0000-0000-0000-000000000103', %s,
+                '{"preserved": true}'
+            )
+            """,
+            (preserved_message_id, recorded_at),
+        )
+
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes_with_attestation_failure(path: Path) -> bytes:
+        migration = original_read_bytes(path)
+        if path.name == "0027_classifier_promotion_attestations.sql":
+            return migration + b"\nSELECT missing_attestation_migration_function();\n"
+        return migration
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_with_attestation_failure)
+    with pytest.raises(psycopg.errors.UndefinedFunction):
+        PostgresAcceptanceMigrator(fresh_database_url).migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        rollback_state = connection.execute(
+            """
+            SELECT to_regnamespace('football_migrations'),
+                   to_regclass(
+                       'football_runtime.application_classifier_promotion_attestations'
+                   ),
+                   EXISTS (
+                       SELECT 1
+                       FROM football_runtime.contract_outbox
+                       WHERE message_id = %s
+                   )
+            """,
+            (preserved_message_id,),
+        ).fetchone()
+    assert rollback_state == (None, None, True)
+
+    monkeypatch.undo()
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    migrator.migrate()
+
+    passwords = {role: "promotion-attestation-migration-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    with psycopg.connect(fresh_database_url) as connection:
+        table_state = connection.execute(
+            """
+            SELECT relation.relrowsecurity, relation.relforcerowsecurity,
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'SELECT,INSERT'
+                   ),
+                   has_table_privilege(
+                       'football_application',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'UPDATE,DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_classification',
+                       'football_runtime.application_classifier_promotion_attestations',
+                       'SELECT'
+                   ),
+                   EXISTS (
+                       SELECT 1
+                       FROM football_runtime.contract_outbox
+                       WHERE message_id = %s
+                   )
+            FROM pg_class AS relation
+            WHERE relation.oid = (
+                'football_runtime.application_classifier_promotion_attestations'::regclass
+            )
+            """,
+            (preserved_message_id,),
+        ).fetchone()
+    assert table_state == (True, True, True, False, False, True)
+
+    application_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.APPLICATION,
+        passwords[RuntimeRole.APPLICATION],
+    )
+    with psycopg.connect(application_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_classifier_promotion_attestations (
+                attestation_id, approval_message_id, release_name,
+                contract_version, release_fingerprint, gate_run_id,
+                execution_version, base_database_binding, database_binding,
+                replay_execution_ids, canonical_replay_digests, replay_digests,
+                failure_mode_observations, lifecycle_observations, evidence,
+                recorded_at
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000104',
+                '00000000-0000-0000-0000-000000000105',
+                'migration-attestation', 'contract-v1', 'fingerprint',
+                '00000000-0000-0000-0000-000000000106', 'execution-v1',
+                repeat('a', 64), repeat('b', 64), '[]', '[]', '[]', '[]', '[]',
+                '{}', %s
+            )
+            """,
+            (recorded_at,),
+        )
+        visible_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.application_classifier_promotion_attestations
+            """
+        ).fetchone()
+    assert visible_count == (1,)
+
+
 def test_0018_backfills_both_legacy_v4_identity_formats_idempotently(
     fresh_database_url: str,
 ) -> None:

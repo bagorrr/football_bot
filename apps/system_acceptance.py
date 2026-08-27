@@ -23,6 +23,7 @@ def boot_acceptance_role(
     *,
     role: RuntimeRole,
     database_url: str,
+    promotion_gate_database_url: str | None = None,
     clock: Clock,
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
@@ -36,7 +37,11 @@ def boot_acceptance_role(
     """Boot exactly one role with its own least-privilege database credential."""
     return RuntimeApplication(
         role=role,
-        store=PostgresRoleStore(role, database_url),
+        store=PostgresRoleStore(
+            role,
+            database_url,
+            promotion_gate_database_url=promotion_gate_database_url,
+        ),
         clock=clock,
         telegram_ingestion=telegram_ingestion,
         telegram_delivery=telegram_delivery,

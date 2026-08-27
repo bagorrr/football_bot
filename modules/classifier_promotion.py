@@ -251,6 +251,9 @@ class PlayerClassifierRelease:
 class PlayerPromotionGateResult:
     """The result of three complete process-isolated controlled executions."""
 
+    gate_run_id: str
+    base_database_binding: str
+    database_binding: str
     release_fingerprint: str
     reviewed_case_count: int
     lifecycle_case_count: int
@@ -268,6 +271,9 @@ class PlayerPromotionGateResult:
     def passed(self) -> bool:
         return (
             self.execution_version == PLAYER_PROMOTION_EXECUTION_VERSION
+            and _uuid_text(self.gate_run_id)
+            and _HEX64.fullmatch(self.base_database_binding) is not None
+            and _HEX64.fullmatch(self.database_binding) is not None
             and self.reviewed_case_count == PLAYER_REVIEWED_CORPUS_CASE_COUNT
             and self.lifecycle_case_count == PLAYER_REQUIRED_LIFECYCLE_CASE_COUNT
             and len(self.failure_mode_case_ids) == len(PLAYER_REQUIRED_FAILURE_MODES)
@@ -930,13 +936,30 @@ class ControlledPlayerLifecycleAdapter:
 _ORIGINAL_LIFECYCLE_EXECUTE = ControlledPlayerLifecycleAdapter.execute
 
 
-def _database_url() -> str:
-    value = os.environ.get("TEST_DATABASE_URL") or os.environ.get("DATABASE_URL")
+def _database_url(database_url: str | None = None) -> str:
+    value = (
+        database_url
+        or os.environ.get("TEST_DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+    )
     if not value:
         raise RuntimeError(
             "TEST_DATABASE_URL is required for the durable Player promotion gate"
         )
     return value
+
+
+def promotion_database_binding_for_url(database_url: str) -> str:
+    """Bind a promotion gate to a database without retaining credentials."""
+    connection_info = conninfo.conninfo_to_dict(database_url)
+    identity = {
+        key: connection_info.get(key)
+        for key in ("host", "hostaddr", "port", "dbname", "sslmode")
+        if connection_info.get(key) is not None
+    }
+    return sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _fresh_replay_database_url(base_database_url: str, replay_number: int) -> str:
@@ -1144,9 +1167,14 @@ def _compare_worker_to_release(
 
 def run_player_classifier_promotion_gate(
     release: PlayerClassifierRelease,
+    *,
+    database_url: str | None = None,
+    force_fresh: bool = False,
 ) -> PlayerPromotionGateResult:
     """Run all cases in three fresh worker processes against durable state."""
-    database_url = _database_url()
+    database_url = _database_url(database_url)
+    gate_run_id = str(uuid4())
+    base_database_binding = promotion_database_binding_for_url(database_url)
     failed: set[str] = set(_recorded_corpus_audit(release))
     classifier_seam_changed = (
         ControlledPlayerClassifierAdapter.observe is not _ORIGINAL_CLASSIFIER_OBSERVE
@@ -1158,6 +1186,9 @@ def run_player_classifier_promotion_gate(
         failed.update(_durable_failure_audit(release, database_url))
     if classifier_seam_changed or lifecycle_seam_changed:
         return PlayerPromotionGateResult(
+            gate_run_id=gate_run_id,
+            base_database_binding=base_database_binding,
+            database_binding="",
             release_fingerprint=release.release_fingerprint,
             reviewed_case_count=len(release.reviewed_corpus_cases),
             lifecycle_case_count=len(release.lifecycle_failure_suite_cases),
@@ -1180,7 +1211,7 @@ def run_player_classifier_promotion_gate(
         )
 
     cache_key = (_promotion_release_cache_token(release), database_url)
-    if subprocess.run is _ORIGINAL_SUBPROCESS_RUN:
+    if not force_fresh and subprocess.run is _ORIGINAL_SUBPROCESS_RUN:
         cached = _PROMOTION_GATE_CACHE.get(cache_key)
         if cached is not None:
             return cached
@@ -1188,13 +1219,16 @@ def run_player_classifier_promotion_gate(
     worker_outputs: list[dict[str, JsonValue]] = []
     replay_digests: list[str] = []
     replay_execution_ids: list[str] = []
+    replay_database_bindings: list[str] = []
     for replay_number in range(1, release.required_replays + 1):
         execution_id = str(uuid4())
         replay_execution_ids.append(execution_id)
         environment = os.environ.copy()
-        environment["TEST_DATABASE_URL"] = _fresh_replay_database_url(
-            database_url, replay_number
+        replay_database_url = _fresh_replay_database_url(database_url, replay_number)
+        replay_database_bindings.append(
+            promotion_database_binding_for_url(replay_database_url)
         )
+        environment["TEST_DATABASE_URL"] = replay_database_url
         completed = subprocess.run(
             [
                 sys.executable,
@@ -1286,7 +1320,22 @@ def run_player_classifier_promotion_gate(
                 )
     failure_mode_observations = tuple(failure_mode_observations_list)
     lifecycle_observations = tuple(lifecycle_observations_list)
+    database_binding = sha256(
+        json.dumps(
+            {
+                "gate_run_id": gate_run_id,
+                "base_database_binding": base_database_binding,
+                "replay_database_bindings": replay_database_bindings,
+                "replay_execution_ids": replay_execution_ids,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     result = PlayerPromotionGateResult(
+        gate_run_id=gate_run_id,
+        base_database_binding=base_database_binding,
+        database_binding=database_binding,
         release_fingerprint=release.release_fingerprint,
         reviewed_case_count=len(release.reviewed_corpus_cases),
         lifecycle_case_count=len(release.lifecycle_failure_suite_cases),
@@ -1324,9 +1373,15 @@ def player_classifier_promotion_evidence(
     release: PlayerClassifierRelease,
     *,
     replay_digests: tuple[str, ...] | None = None,
+    database_url: str | None = None,
+    force_fresh: bool = False,
 ) -> dict[str, JsonValue]:
     """Build durable approval evidence only from a fresh exact replay."""
-    result = run_player_classifier_promotion_gate(release)
+    result = run_player_classifier_promotion_gate(
+        release,
+        database_url=database_url,
+        force_fresh=force_fresh,
+    )
     if not result.passed:
         raise ValueError(
             "controlled Player promotion gate failed: "
@@ -1337,6 +1392,9 @@ def player_classifier_promotion_evidence(
             "caller-supplied replay digests do not match controlled replay"
         )
     return {
+        "gate_run_id": result.gate_run_id,
+        "base_database_binding": result.base_database_binding,
+        "database_binding": result.database_binding,
         "release_fingerprint": release.release_fingerprint,
         "contract_sha256": release.contract_sha256,
         "reviewed_corpus_path": release.reviewed_corpus_path,
@@ -1391,6 +1449,9 @@ def _promotion_evidence_is_valid(
     if not isinstance(value, dict):
         return False
     required_keys = {
+        "gate_run_id",
+        "base_database_binding",
+        "database_binding",
         "release_fingerprint",
         "contract_sha256",
         "reviewed_corpus_path",
@@ -1453,7 +1514,15 @@ def _promotion_evidence_is_valid(
         "requested_reasoning_effort": release.requested_reasoning_effort,
         "proposal_only": True,
     }
-    if any(value.get(key) != expected for key, expected in expected_scalars.items()):
+    if (
+        not isinstance(value.get("gate_run_id"), str)
+        or not _uuid_text(value.get("gate_run_id"))
+        or not isinstance(value.get("base_database_binding"), str)
+        or not _HEX64.fullmatch(cast(str, value["base_database_binding"]))
+        or not isinstance(value.get("database_binding"), str)
+        or not _HEX64.fullmatch(cast(str, value["database_binding"]))
+        or any(value.get(key) != expected for key, expected in expected_scalars.items())
+    ):
         return False
 
     exact_lists: dict[str, list[JsonValue]] = {
@@ -1546,13 +1615,23 @@ def player_classifier_promotion_is_approved(
     """Validate an approval against the exact release and fresh evidence."""
     try:
         release = describe_player_classifier_release()
-        if not isinstance(approval, dict) or set(approval) != {
-            "release_name",
-            "contract_version",
-            "release_fingerprint",
-            "state",
-            "evidence",
-        }:
+        if not isinstance(approval, dict) or set(approval) not in (
+            {
+                "release_name",
+                "contract_version",
+                "release_fingerprint",
+                "state",
+                "evidence",
+            },
+            {
+                "release_name",
+                "contract_version",
+                "release_fingerprint",
+                "state",
+                "evidence",
+                "attestation_id",
+            },
+        ):
             return False
         if (
             approval.get("release_name") != release.release_name
@@ -1560,6 +1639,10 @@ def player_classifier_promotion_is_approved(
             or approval.get("release_fingerprint") != release.release_fingerprint
             or approval.get("state") != "approved"
             or not _promotion_evidence_is_valid(release, approval.get("evidence"))
+        ):
+            return False
+        if "attestation_id" in approval and not _uuid_text(
+            approval.get("attestation_id")
         ):
             return False
     except (OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -19,7 +20,10 @@ from psycopg.rows import dict_row
 
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
+    describe_player_classifier_release,
+    player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
+    promotion_database_binding_for_url,
 )
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
@@ -140,6 +144,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0024_long_term_transfer_opportunities.sql",
     "0025_player_match_availability.sql",
     "0026_exact_repost_clusters.sql",
+    "0027_classifier_promotion_attestations.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -170,6 +175,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "680c189420c71e3aa452a51cbee1a6ba786885d726cd1ad983a79fe891b5b5d9",
     "97d9f94ce319ba0fffdc6d7af64af7ae9422abe4ca1bbbc855a911a42ae764aa",
     "7856483bc640ecb0d84b6f137a150ccaef971e393d2390d933d5df133187e764",
+    "460bb27388e10e836c8f1d8d3db37a01c2c2779a85bf7e5d114d68bcb1d018a9",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -193,6 +199,15 @@ ALTER TABLE football_runtime.bot_message_outbox
 """
 
 _RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
+
+
+def _uuid_or_none(value: str) -> UUID | None:
+    """Parse a persisted UUID without allowing malformed attestations through."""
+    try:
+        return UUID(value)
+    except (AttributeError, ValueError):
+        return None
+
 
 _MATERIAL_SCHEMA_QUERY = """
 WITH runtime_roles AS (
@@ -649,6 +664,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.classification_attempts,
                      football_runtime.classification_proof_work,
                      football_runtime.classification_routing_outcomes,
+                     football_runtime.application_classifier_promotion_attestations,
                      football_runtime.application_proposition_identities,
                      football_runtime.application_exact_repost_cluster_members,
                      football_runtime.application_exact_repost_clusters,
@@ -1993,9 +2009,16 @@ class PostgresAcceptanceObserver:
 class PostgresRoleStore:
     """Persistence capability scoped to one runtime credential and owner."""
 
-    def __init__(self, role: RuntimeRole, database_url: str) -> None:
+    def __init__(
+        self,
+        role: RuntimeRole,
+        database_url: str,
+        *,
+        promotion_gate_database_url: str | None = None,
+    ) -> None:
         self._role = role
         self._database_url = database_url
+        self._promotion_gate_database_url = promotion_gate_database_url
         self._search_snapshot_hook: Callable[[], None] | None = None
 
     @property
@@ -4337,26 +4360,105 @@ class PostgresRoleStore:
             self._database_url,
             row_factory=dict_row,
         ) as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 """
-                SELECT payload
-                FROM football_runtime.contract_outbox
-                WHERE producer_role = %s
-                  AND consumer_role IS NULL
-                  AND contract_name = %s
-                  AND subject_id = %s
-                ORDER BY recorded_at DESC, message_id DESC
-                LIMIT 1
+                SELECT outbox.payload,
+                       outbox.message_id AS payload_message_id,
+                       attestation.attestation_id,
+                       attestation.approval_message_id,
+                       attestation.owner_role,
+                       attestation.release_name,
+                       attestation.contract_version,
+                       attestation.release_fingerprint,
+                       attestation.gate_run_id,
+                       attestation.execution_version,
+                       attestation.base_database_binding,
+                       attestation.database_binding,
+                       attestation.replay_execution_ids,
+                       attestation.canonical_replay_digests,
+                       attestation.replay_digests,
+                       attestation.failure_mode_observations,
+                       attestation.lifecycle_observations,
+                       attestation.evidence,
+                       attestation.recorded_at
+                FROM football_runtime.contract_outbox AS outbox
+                JOIN football_runtime.application_classifier_promotion_attestations
+                    AS attestation
+                  ON attestation.approval_message_id = outbox.message_id
+                WHERE outbox.producer_role = %s
+                  AND outbox.consumer_role IS NULL
+                  AND outbox.contract_name = %s
+                  AND outbox.subject_id = %s
+                ORDER BY outbox.recorded_at DESC, outbox.message_id DESC
                 """,
                 (
                     RuntimeRole.APPLICATION.value,
                     ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
                     release_name,
                 ),
-            ).fetchone()
-        if row is None or not isinstance(row["payload"], dict):
-            return None
-        return cast(dict[str, JsonValue], row["payload"])
+            ).fetchall()
+        for row in rows:
+            if self._classifier_promotion_attestation_is_valid(row):
+                payload = row["payload"]
+                assert isinstance(payload, dict)
+                return cast(dict[str, JsonValue], payload)
+        return None
+
+    def _classifier_promotion_attestation_is_valid(
+        self, row: Mapping[str, Any]
+    ) -> bool:
+        """Verify the Application-owned gate record bound to one approval."""
+        payload = row.get("payload")
+        evidence = row.get("evidence")
+        attestation_id = (
+            payload.get("attestation_id") if isinstance(payload, dict) else None
+        )
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(evidence, dict)
+            or not isinstance(attestation_id, str)
+            or row.get("payload_message_id") != row.get("approval_message_id")
+            or row.get("attestation_id") != _uuid_or_none(attestation_id)
+            or row.get("owner_role") != RuntimeRole.APPLICATION.value
+            or row.get("release_name") != payload.get("release_name")
+            or row.get("contract_version") != payload.get("contract_version")
+            or row.get("release_fingerprint") != payload.get("release_fingerprint")
+            or evidence != payload.get("evidence")
+            or evidence.get("gate_run_id") != str(row.get("gate_run_id"))
+            or evidence.get("execution_version") != row.get("execution_version")
+            or evidence.get("base_database_binding") != row.get("base_database_binding")
+            or evidence.get("database_binding") != row.get("database_binding")
+            or evidence.get("replay_execution_ids") != row.get("replay_execution_ids")
+            or evidence.get("canonical_replay_digests")
+            != row.get("canonical_replay_digests")
+            or evidence.get("replay_digests") != row.get("replay_digests")
+            or evidence.get("failure_mode_observations")
+            != row.get("failure_mode_observations")
+            or evidence.get("lifecycle_observations")
+            != row.get("lifecycle_observations")
+            or row.get("base_database_binding")
+            != promotion_database_binding_for_url(self._database_url)
+        ):
+            return False
+        return player_classifier_promotion_is_approved(payload)
+
+    def _restore_application_promotion_credential(
+        self, administrative_database_url: str
+    ) -> None:
+        """Restore this store's credential after isolated replay workers run."""
+        connection_info = conninfo.conninfo_to_dict(self._database_url)
+        password = connection_info.get("password")
+        if not isinstance(password, str) or not password:
+            return
+        with psycopg.connect(
+            administrative_database_url, autocommit=True
+        ) as connection:
+            connection.execute(
+                sql.SQL("ALTER ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(RuntimeRole.APPLICATION.database_role),
+                    sql.Literal(password),
+                ),
+            )
 
     def record_classifier_release_promotion(
         self,
@@ -4364,26 +4466,86 @@ class PostgresRoleStore:
         release: dict[str, JsonValue],
         recorded_at: datetime,
     ) -> None:
-        """Persist explicit versioned classifier promotion evidence."""
+        """Run and persist one Application-owned Player promotion attestation."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
-        if not player_classifier_promotion_is_approved(release):
-            raise ValueError("classifier release promotion evidence is not verifiable")
-        release_name = release.get("release_name")
-        release_fingerprint = release.get("release_fingerprint")
+        reviewed_release = describe_player_classifier_release()
+        expected_request: dict[str, JsonValue] = {
+            "release_name": reviewed_release.release_name,
+            "contract_version": reviewed_release.contract_version,
+            "release_fingerprint": reviewed_release.release_fingerprint,
+            "state": "approved",
+        }
+        if release != expected_request:
+            raise ValueError(
+                "classifier release promotion requires an Application-owned fresh gate"
+            )
+        gate_database_url = (
+            self._promotion_gate_database_url
+            or os.environ.get("TEST_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+        )
+        if not gate_database_url:
+            raise RuntimeError(
+                "TEST_DATABASE_URL is required for the durable Player promotion gate"
+            )
+        if promotion_database_binding_for_url(
+            gate_database_url
+        ) != promotion_database_binding_for_url(self._database_url):
+            raise ValueError(
+                "Player promotion gate database does not match Application"
+            )
+
+        existing = self.classifier_release_promotion(
+            release_name=reviewed_release.release_name
+        )
+        if existing is not None:
+            return
+
+        try:
+            evidence = player_classifier_promotion_evidence(
+                reviewed_release,
+                database_url=gate_database_url,
+                force_fresh=True,
+            )
+        finally:
+            self._restore_application_promotion_credential(gate_database_url)
+        release_name = reviewed_release.release_name
+        release_fingerprint = reviewed_release.release_fingerprint
+        gate_run_id = evidence.get("gate_run_id")
+        base_database_binding = evidence.get("base_database_binding")
+        database_binding = evidence.get("database_binding")
         if (
-            not isinstance(release_name, str)
-            or not release_name
-            or not isinstance(release_fingerprint, str)
-            or not release_fingerprint
+            not isinstance(gate_run_id, str)
+            or _uuid_or_none(gate_run_id) is None
+            or base_database_binding
+            != promotion_database_binding_for_url(self._database_url)
+            or not isinstance(database_binding, str)
         ):
-            raise ValueError("classifier release promotion identity is incomplete")
+            raise ValueError("Player promotion gate attestation binding is invalid")
+
+        replay_execution_ids = evidence.get("replay_execution_ids")
+        canonical_replay_digests = evidence.get("canonical_replay_digests")
+        replay_digests = evidence.get("replay_digests")
+        failure_mode_observations = evidence.get("failure_mode_observations")
+        lifecycle_observations = evidence.get("lifecycle_observations")
+        if not all(
+            isinstance(value, list)
+            for value in (
+                replay_execution_ids,
+                canonical_replay_digests,
+                replay_digests,
+                failure_mode_observations,
+                lifecycle_observations,
+            )
+        ):
+            raise ValueError("Player promotion gate observations are incomplete")
+
+        attestation_id = uuid4()
         message_id = uuid5(
             NAMESPACE_URL,
-            (
-                "football-bot:classifier-release-promotion:"
-                f"{release_name}:{release_fingerprint}"
-            ),
+            "football-bot:classifier-release-promotion:"
+            f"{release_name}:{release_fingerprint}:attestation:{attestation_id}",
         )
         causation_id = uuid5(
             NAMESPACE_URL,
@@ -4393,6 +4555,13 @@ class PostgresRoleStore:
             NAMESPACE_URL,
             f"football-bot:{message_id}:correlation",
         )
+        approval_payload: dict[str, JsonValue] = {
+            **expected_request,
+            "attestation_id": str(attestation_id),
+            "evidence": evidence,
+        }
+        if not player_classifier_promotion_is_approved(approval_payload):
+            raise ValueError("Player promotion gate produced invalid evidence")
         envelope = ContractEnvelope(
             contract_name=ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED,
             contract_version=1,
@@ -4402,14 +4571,81 @@ class PostgresRoleStore:
             subject_id=release_name,
             subject_revision=1,
             idempotency_key=(
-                f"classifier-release-promotion:{release_name}:{release_fingerprint}"
+                "classifier-release-promotion:"
+                f"{release_name}:{release_fingerprint}:attestation:{attestation_id}"
             ),
             causation_id=causation_id,
             correlation_id=correlation_id,
             recorded_at=recorded_at,
-            payload=release,
+            payload=approval_payload,
         )
         with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO
+                    football_runtime.application_classifier_promotion_attestations (
+                    attestation_id, approval_message_id, release_name,
+                    contract_version, release_fingerprint, gate_run_id,
+                    execution_version, base_database_binding, database_binding,
+                    replay_execution_ids, canonical_replay_digests, replay_digests,
+                    failure_mode_observations, lifecycle_observations, evidence,
+                    recorded_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s
+                )
+                ON CONFLICT (release_name, release_fingerprint) DO NOTHING
+                RETURNING attestation_id
+                """,
+                (
+                    attestation_id,
+                    message_id,
+                    release_name,
+                    reviewed_release.contract_version,
+                    release_fingerprint,
+                    gate_run_id,
+                    evidence["execution_version"],
+                    base_database_binding,
+                    database_binding,
+                    json.dumps(replay_execution_ids),
+                    json.dumps(canonical_replay_digests),
+                    json.dumps(replay_digests),
+                    json.dumps(failure_mode_observations),
+                    json.dumps(lifecycle_observations),
+                    json.dumps(evidence),
+                    recorded_at,
+                ),
+            ).fetchone()
+            if inserted is None:
+                existing_attestation_row = connection.execute(
+                    """
+                    SELECT attestation_id, approval_message_id
+                    FROM football_runtime.application_classifier_promotion_attestations
+                    WHERE release_name = %s AND release_fingerprint = %s
+                    FOR UPDATE
+                    """,
+                    (release_name, release_fingerprint),
+                ).fetchone()
+                if existing_attestation_row is None:
+                    raise RuntimeError("classifier promotion attestation disappeared")
+                existing_approval = connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.contract_outbox
+                    WHERE message_id = %s
+                      AND producer_role = %s
+                      AND consumer_role IS NULL
+                      AND contract_name = %s
+                    """,
+                    (
+                        existing_attestation_row[1],
+                        RuntimeRole.APPLICATION.value,
+                        ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
+                    ),
+                ).fetchone()
+                if existing_approval is None:
+                    raise RuntimeError("classifier promotion approval is incomplete")
+                return
             connection.execute(
                 """
                 INSERT INTO football_runtime.contract_outbox (

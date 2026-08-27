@@ -29,7 +29,6 @@ from modules.classifier_contract import (
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
     describe_player_classifier_release,
-    player_classifier_promotion_evidence,
 )
 from modules.contracts import (
     SUPPORTED_CONTRACTS,
@@ -2232,20 +2231,29 @@ class AcceptanceSpine:
         release_fingerprint: str | None = None,
         state: str = "approved",
     ) -> None:
-        """Record explicit controlled evidence for the exact Player release."""
+        """Run and record the exact Player promotion gate through Application."""
         release = describe_player_classifier_release()
         if (
             release_fingerprint is not None
             and release_fingerprint != release.release_fingerprint
         ):
             raise ValueError("promotion fingerprint must match the reviewed release")
+        promotion: dict[str, JsonValue] = {
+            "release_name": PLAYER_CLASSIFIER_RELEASE_NAME,
+            "contract_version": release.contract_version,
+            "release_fingerprint": release.release_fingerprint,
+            "state": state,
+        }
+        application = self._roles[RuntimeRole.APPLICATION]
         try:
-            evidence = player_classifier_promotion_evidence(release)
+            application.store.record_classifier_release_promotion(
+                release=promotion,
+                recorded_at=application.clock.now(),
+            )
         finally:
             # Replay workers provision the same cluster-global runtime role
             # names on their isolated databases.  Restore this spine's
-            # credentials before the caller continues using its application
-            # and recommendation stores.
+            # credentials before the caller continues using its other stores.
             from modules.postgres_adapter import PostgresAcceptanceMigrator
 
             passwords = _TESTKIT_RUNTIME_PASSWORDS.get(self._admin_database_url)
@@ -2253,18 +2261,6 @@ class AcceptanceSpine:
                 PostgresAcceptanceMigrator(
                     self._admin_database_url
                 ).provision_runtime_credentials(passwords)
-        promotion: dict[str, JsonValue] = {
-            "release_name": PLAYER_CLASSIFIER_RELEASE_NAME,
-            "contract_version": release.contract_version,
-            "release_fingerprint": release.release_fingerprint,
-            "state": state,
-            "evidence": evidence,
-        }
-        application = self._roles[RuntimeRole.APPLICATION]
-        application.store.record_classifier_release_promotion(
-            release=promotion,
-            recorded_at=application.clock.now(),
-        )
 
     def player_classifier_promotion(self) -> dict[str, JsonValue] | None:
         """Observe durable Player promotion evidence through Application."""
@@ -3789,6 +3785,7 @@ def boot_acceptance_spine(
         return boot_acceptance_role(
             role=role,
             database_url=role_urls[role],
+            promotion_gate_database_url=admin_database_url,
             clock=clock,
             telegram_ingestion=(
                 controlled_ingestion if role is RuntimeRole.INGESTION else None
