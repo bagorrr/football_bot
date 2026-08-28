@@ -85,6 +85,7 @@ from modules.domain import (
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
+    SourceMessageDeletionTombstone,
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramCallbackDeliveryClaim,
@@ -155,6 +156,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0028_classifier_promotion_execution_records.sql",
     "0029_refereeing_opportunities.sql",
     "0030_referee_source_chat_projection_gate.sql",
+    "0031_source_message_lifecycle.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -189,6 +191,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
     "f3dfa0e4dc25c72cf25076ae7b3fcde842e162b548d988a3a6a53b6fe7a6f65d",
     "85436cdbd933795eb6b27b20b1cfcc84338dbba14c59918b3c0a77d1243ad972",
+    "7fddc4d44988b3f0cfec72a370c13e92ff284ad2dafe747c4e4655a8f5bbc54a",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -220,6 +223,22 @@ def _uuid_or_none(value: str) -> UUID | None:
         return UUID(value)
     except (AttributeError, ValueError):
         return None
+
+
+def _response_route_from_json(value: Any) -> OpportunityResponseRoute:
+    """Keep redacted historical routes representable without exposing Contact."""
+    if isinstance(value, Mapping):
+        kind = value.get("kind")
+        route_value = value.get("value")
+        if isinstance(kind, str) and isinstance(route_value, str):
+            return OpportunityResponseRoute(kind=kind, value=route_value)
+    return OpportunityResponseRoute(kind="", value="")
+
+
+_UNAVAILABLE_RESPONSE_ROUTE: dict[str, JsonValue] = {
+    "kind": "unavailable",
+    "value": "",
+}
 
 
 _MATERIAL_SCHEMA_QUERY = """
@@ -685,6 +704,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.application_exact_repost_clusters,
                      football_runtime.application_opportunities,
                      football_runtime.recommendation_opportunities,
+                     football_runtime.application_source_message_tombstones,
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
@@ -886,6 +906,40 @@ class PostgresAcceptanceObserver:
             for row in rows
         )
 
+    def source_message_deletion_tombstones(
+        self,
+    ) -> tuple[SourceMessageDeletionTombstone, ...]:
+        """Observe bounded body-free deletion tombstones through the testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_message_id, peer_kind, telegram_chat_id,
+                       registry_generation, telegram_message_id,
+                       deleted_revision, source_event_id, deleted_at, expires_at
+                FROM football_runtime.application_source_message_tombstones
+                ORDER BY source_message_id
+                """
+            ).fetchall()
+        return tuple(
+            SourceMessageDeletionTombstone(
+                source_message_id=row["source_message_id"],
+                source_chat_identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                telegram_message_id=row["telegram_message_id"],
+                deleted_revision=row["deleted_revision"],
+                source_event_id=row["source_event_id"],
+                deleted_at=row["deleted_at"],
+                expires_at=row["expires_at"],
+            )
+            for row in rows
+        )
+
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
         """Observe body-free protected-event outcomes through the testkit."""
         with psycopg.connect(
@@ -1030,7 +1084,7 @@ class PostgresAcceptanceObserver:
                 """,
                 (source_message_revision_id,),
             ).fetchall()
-        return tuple(_row_to_envelope(row) for row in rows)
+        return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
 
     def classifier_commands_for_revision(
         self, source_message_revision_id: str
@@ -1049,7 +1103,7 @@ class PostgresAcceptanceObserver:
                 """,
                 (source_message_revision_id,),
             ).fetchall()
-        return tuple(_row_to_envelope(row) for row in rows)
+        return tuple(_row_to_envelope(row, validate_registered=False) for row in rows)
 
     def classification_queue_health(
         self, observed_at: datetime
@@ -1168,10 +1222,7 @@ class PostgresAcceptanceObserver:
                 source_message_revision_id=row["source_message_revision_id"],
                 opportunity_type=row["opportunity_type"],
                 publication_state=row["publication_state"],
-                response_route=OpportunityResponseRoute(
-                    kind=row["response_route"]["kind"],
-                    value=row["response_route"]["value"],
-                ),
+                response_route=_response_route_from_json(row["response_route"]),
                 publication_reason=row["publication_reason"],
             )
             for row in rows
@@ -1209,10 +1260,7 @@ class PostgresAcceptanceObserver:
                 ),
                 opportunity_type=row["opportunity_type"],
                 publication_state=row["publication_state"],
-                response_route=OpportunityResponseRoute(
-                    kind=row["response_route"]["kind"],
-                    value=row["response_route"]["value"],
-                ),
+                response_route=_response_route_from_json(row["response_route"]),
                 publication_reason=row["publication_reason"],
             )
             for row in rows
@@ -3081,6 +3129,57 @@ class PostgresRoleStore:
                     return False
             else:
                 raise TypeError("Telegram difference checkpoint scope is unsupported")
+            source_message_id = canonical_source_message_id(
+                peer_key, registry_generation, event.telegram_message_id
+            )
+            replay_barrier_active = False
+            if event.kind is not SourceEventKind.DELETE:
+                barrier_row = connection.execute(
+                    """
+                    SELECT football_runtime.source_message_replay_barrier(
+                        %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        event.telegram_message_id,
+                    ),
+                ).fetchone()
+                replay_barrier_active = (
+                    bool(barrier_row["source_message_replay_barrier"])
+                    if barrier_row
+                    else False
+                )
+            if isinstance(event, TelegramDifferenceEvent):
+                stored_body = (
+                    None
+                    if replay_barrier_active or event.kind is SourceEventKind.DELETE
+                    else event.body
+                )
+                stored_metadata = (
+                    empty_bounded_source_metadata()
+                    if replay_barrier_active or event.kind is SourceEventKind.DELETE
+                    else dict(event.bounded_metadata)
+                )
+                stored_reply_to_message_id = (
+                    None
+                    if replay_barrier_active or event.kind is SourceEventKind.DELETE
+                    else event.reply_to_telegram_message_id
+                )
+                if replay_barrier_active or event.kind is SourceEventKind.DELETE:
+                    stored_payload = dict(cast(dict[str, JsonValue], envelope.payload))
+                    stored_payload["body"] = stored_body
+                    stored_payload["bounded_metadata"] = stored_metadata
+                    stored_payload["reply_to_telegram_message_id"] = (
+                        stored_reply_to_message_id
+                    )
+                    stored_envelope = replace(envelope, payload=stored_payload)
+                else:
+                    stored_envelope = envelope
+            else:
+                stored_envelope = envelope
             known_transport_identity = event.kind is SourceEventKind.CREATE and (
                 channel_route or account_create_is_after_boundary
             )
@@ -3118,8 +3217,10 @@ class PostgresRoleStore:
                     ).fetchone()
                     is not None
                 )
-            if known_transport_identity and isinstance(
-                event, TelegramProtectedContentEvent
+            if (
+                known_transport_identity
+                and isinstance(event, TelegramProtectedContentEvent)
+                and not replay_barrier_active
             ):
                 inserted = connection.execute(
                     """
@@ -3161,8 +3262,10 @@ class PostgresRoleStore:
                     }
                     if existing is None or dict(existing) != expected_skip:
                         raise OutboxConflictError
-            elif known_transport_identity and isinstance(
-                event, TelegramDifferenceEvent
+            elif (
+                known_transport_identity
+                and isinstance(event, TelegramDifferenceEvent)
+                and not replay_barrier_active
             ):
                 inserted = connection.execute(
                     """
@@ -3188,15 +3291,24 @@ class PostgresRoleStore:
                         event.telegram_message_id,
                         event.revision,
                         event.kind.value,
-                        event.body,
+                        stored_body,
                         event.event_time,
                         recorded_at,
-                        json.dumps(dict(event.bounded_metadata)),
-                        event.reply_to_telegram_message_id,
+                        json.dumps(stored_metadata),
+                        stored_reply_to_message_id,
                     ),
                 ).fetchone()
                 if inserted is not None:
-                    _insert_outbox(connection, envelope)
+                    _insert_outbox(connection, stored_envelope)
+                    if replay_barrier_active or event.kind is SourceEventKind.DELETE:
+                        _scrub_ingestion_source_message_data(
+                            connection,
+                            peer_kind=identity.kind.value,
+                            telegram_chat_id=identity.telegram_id,
+                            registry_generation=registry_generation,
+                            telegram_message_id=event.telegram_message_id,
+                            source_message_id=source_message_id,
+                        )
                     if inject_database_failure:
                         raise OutboxConflictError
                 else:
@@ -3219,12 +3331,10 @@ class PostgresRoleStore:
                         "telegram_message_id": event.telegram_message_id,
                         "source_message_revision": event.revision,
                         "event_kind": event.kind.value,
-                        "body": event.body,
+                        "body": stored_body,
                         "event_time": event.event_time,
-                        "bounded_metadata": dict(event.bounded_metadata),
-                        "reply_to_telegram_message_id": (
-                            event.reply_to_telegram_message_id
-                        ),
+                        "bounded_metadata": stored_metadata,
+                        "reply_to_telegram_message_id": (stored_reply_to_message_id),
                     }
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError
@@ -3320,12 +3430,46 @@ class PostgresRoleStore:
             if payload.get("outcome") == "protected_content_skipped":
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
+            event_kind = payload.get("event_kind")
+            if event_kind not in {
+                SourceEventKind.CREATE.value,
+                SourceEventKind.EDIT.value,
+                SourceEventKind.DELETE.value,
+            }:
+                raise RuntimeError("this Source Event kind is not implemented")
+            existing_source_message = connection.execute(
+                """
+                SELECT tombstoned
+                FROM football_runtime.source_messages
+                WHERE source_message_id = %s
+                FOR UPDATE
+                """,
+                (incoming.subject_id,),
+            ).fetchone()
+            deletion_barrier = connection.execute(
+                """
+                SELECT football_runtime.source_message_deletion_barrier(%s)
+                """,
+                (incoming.subject_id,),
+            ).fetchone()
+            deletion_barrier_active = (
+                bool(deletion_barrier[0]) if deletion_barrier is not None else False
+            )
+            if event_kind != SourceEventKind.DELETE.value and (
+                (existing_source_message is not None and existing_source_message[0])
+                or deletion_barrier_active
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             event_time = datetime.fromisoformat(str(payload["event_time"]))
             bounded_metadata = payload.get(
                 "bounded_metadata", empty_bounded_source_metadata()
             )
             reply_to_message_id = payload.get("reply_to_telegram_message_id")
-            if payload["event_kind"] == SourceEventKind.CREATE.value:
+            if event_kind == SourceEventKind.DELETE.value:
+                bounded_metadata = empty_bounded_source_metadata()
+                reply_to_message_id = None
+            if event_kind == SourceEventKind.CREATE.value:
                 connection.execute(
                     """
                     INSERT INTO football_runtime.source_messages (
@@ -3354,7 +3498,7 @@ class PostgresRoleStore:
                         reply_to_message_id,
                     ),
                 )
-            elif payload["event_kind"] == SourceEventKind.EDIT.value:
+            elif event_kind == SourceEventKind.EDIT.value:
                 updated = connection.execute(
                     """
                     UPDATE football_runtime.source_messages
@@ -3416,7 +3560,7 @@ class PostgresRoleStore:
                                 reply_to_message_id,
                             ),
                         )
-            elif payload["event_kind"] == SourceEventKind.DELETE.value:
+            elif event_kind == SourceEventKind.DELETE.value:
                 updated = connection.execute(
                     """
                     UPDATE football_runtime.source_messages
@@ -3504,6 +3648,41 @@ class PostgresRoleStore:
                     reply_to_message_id,
                 ),
             )
+            if event_kind == SourceEventKind.DELETE.value:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.application_source_message_tombstones (
+                        source_message_id, peer_kind, telegram_chat_id,
+                        registry_generation, telegram_message_id,
+                        deleted_revision, source_event_id, deleted_at, expires_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                              %s + INTERVAL '90 days')
+                    ON CONFLICT (source_message_id) DO UPDATE
+                    SET peer_kind = EXCLUDED.peer_kind,
+                        telegram_chat_id = EXCLUDED.telegram_chat_id,
+                        registry_generation = EXCLUDED.registry_generation,
+                        telegram_message_id = EXCLUDED.telegram_message_id,
+                        deleted_revision = EXCLUDED.deleted_revision,
+                        source_event_id = EXCLUDED.source_event_id,
+                        deleted_at = EXCLUDED.deleted_at,
+                        expires_at = EXCLUDED.expires_at
+                    """,
+                    (
+                        incoming.subject_id,
+                        payload["telegram_peer_kind"],
+                        payload["telegram_chat_id"],
+                        payload["registry_generation"],
+                        payload["telegram_message_id"],
+                        incoming.subject_revision,
+                        payload["source_event_id"],
+                        received_at,
+                        received_at,
+                    ),
+                )
+                _scrub_application_source_message_data(
+                    connection,
+                    source_message_id=incoming.subject_id,
+                )
             if isinstance(source_message_revision_id, str):
                 source_suppression_outgoings = _suppress_source_event_opportunities(
                     connection,
@@ -3525,6 +3704,83 @@ class PostgresRoleStore:
                 _insert_outbox(connection, outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
+
+    def source_message_deletion_barrier(self, source_message_id: str) -> bool:
+        """Read the body-free deletion barrier through the role's SQL seam."""
+        if self._role not in {
+            RuntimeRole.INGESTION,
+            RuntimeRole.APPLICATION,
+            RuntimeRole.CLASSIFICATION,
+            RuntimeRole.RECOMMENDATION,
+        }:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.source_message_deletion_barrier(%s)
+                """,
+                (source_message_id,),
+            ).fetchone()
+        return bool(row[0]) if row is not None else False
+
+    def scrub_source_message_contracts(
+        self, source_message_id: str, *, recorded_at: datetime
+    ) -> None:
+        """Remove protected payload fields produced by this runtime."""
+        if self._role not in {
+            RuntimeRole.INGESTION,
+            RuntimeRole.APPLICATION,
+            RuntimeRole.CLASSIFICATION,
+        }:
+            raise ConversationAccessDeniedError
+        revision_pattern = f"{source_message_id}:revision:%"
+        with psycopg.connect(self._database_url) as connection:
+            if self._role is RuntimeRole.INGESTION:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.source_event_records
+                    SET body = NULL,
+                        bounded_metadata = %s::jsonb,
+                        reply_to_telegram_message_id = NULL
+                    WHERE peer_kind = split_part(%s, ':', 2)
+                      AND telegram_chat_id = split_part(%s, ':', 3)::bigint
+                      AND registry_generation = split_part(%s, ':', 5)::bigint
+                      AND telegram_message_id = split_part(%s, ':', 7)::bigint
+                    """,
+                    (
+                        json.dumps(empty_bounded_source_metadata()),
+                        source_message_id,
+                        source_message_id,
+                        source_message_id,
+                        source_message_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    SELECT football_runtime.scrub_source_message_outbox_contracts(%s)
+                    """,
+                    (source_message_id,),
+                )
+            elif self._role is RuntimeRole.APPLICATION:
+                _scrub_application_source_message_data(
+                    connection,
+                    source_message_id=source_message_id,
+                )
+            else:
+                connection.execute(
+                    """
+                    DELETE FROM football_runtime.classification_proof_work
+                    WHERE source_message_revision_id LIKE %s
+                    """,
+                    (revision_pattern,),
+                )
+                connection.execute(
+                    """
+                    SELECT football_runtime.scrub_source_message_outbox_contracts(%s)
+                    """,
+                    (source_message_id,),
+                )
+        del recorded_at
 
     def owned_source_events(self) -> tuple[SourceEventRecord, ...]:
         """Read Source Events through this runtime's database grants and RLS."""
@@ -5189,6 +5445,57 @@ class PostgresRoleStore:
             for row in rows
         )
 
+    def current_suppressed_opportunity_records(
+        self, source_message_id: str, source_message_revision_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read current edit rows awaiting a terminal routing outcome."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT opportunity.opportunity_id AS raw_opportunity_id,
+                       COALESCE(compatibility.canonical_opportunity_id,
+                                opportunity.opportunity_id) AS opportunity_id,
+                       opportunity.source_message_revision_id,
+                       opportunity.opportunity_type,
+                       opportunity.accepted_facts,
+                       opportunity.evidence,
+                       opportunity.response_route
+                FROM football_runtime.application_opportunities AS opportunity
+                LEFT JOIN
+                    football_runtime.application_legacy_proposition_identity_compatibility
+                    AS compatibility
+                  ON compatibility.legacy_opportunity_id =
+                     opportunity.opportunity_id
+                WHERE opportunity.source_message_revision_id = %s
+                  AND opportunity.source_message_revision_id LIKE %s
+                  AND opportunity.publication_state = 'suppressed'
+                  AND opportunity.publication_reason =
+                      'source_revision_superseded'
+                ORDER BY opportunity.opportunity_id
+                """,
+                (
+                    source_message_revision_id,
+                    f"{source_message_id}:revision:%",
+                ),
+            ).fetchall()
+        return tuple(
+            {
+                "raw_opportunity_id": row["raw_opportunity_id"],
+                "opportunity_id": row["opportunity_id"],
+                "source_message_revision_id": row["source_message_revision_id"],
+                "opportunity_type": row["opportunity_type"],
+                "accepted_facts": row["accepted_facts"],
+                "evidence": row["evidence"],
+                "response_route": row["response_route"],
+            }
+            for row in rows
+        )
+
     def record_classification_routing_outcome(
         self,
         *,
@@ -5197,6 +5504,7 @@ class PostgresRoleStore:
         received_at: datetime,
         suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
         additional_outgoings: tuple[ContractEnvelope, ...] = (),
+        current_source_message_revision_id: str | None = None,
     ) -> ConsumeResult:
         """Atomically retain one body-free Application routing outcome."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -5232,6 +5540,7 @@ class PostgresRoleStore:
                 connection,
                 suppressed_opportunities=suppressed_opportunities,
                 recorded_at=received_at,
+                current_source_message_revision_id=current_source_message_revision_id,
             )
             for additional_outgoing in additional_outgoings:
                 _insert_outbox(connection, additional_outgoing)
@@ -5607,16 +5916,31 @@ class PostgresRoleStore:
         if not isinstance(payload, dict):
             raise TypeError("OpportunityPublicationChanged payload must be an object")
         source_suppression_guard = ""
-        if incoming.idempotency_key.startswith(
-            "opportunity-publication-source-suppression:"
+        if (
+            incoming.idempotency_key.startswith(
+                "opportunity-publication-source-suppression:"
+            )
+            and payload.get("publication_reason") != "source_deleted"
         ) or (
             payload.get("publication_state") == "suppressed"
-            and payload.get("publication_reason") == "source_revision_superseded"
+            and payload.get("publication_reason")
+            in {"source_revision_superseded", "response_route_unavailable"}
         ):
             source_suppression_guard = """
                           AND recommendation_opportunities.publication_state <>
                               'active'
+                          AND recommendation_opportunities.publication_reason IS
+                              DISTINCT FROM 'response_route_unavailable'
             """
+        source_revision_id = payload.get("source_message_revision_id")
+        if incoming.contract_version == 3 and not isinstance(source_revision_id, str):
+            source_revision_id = None
+        source_message_id = (
+            source_revision_id.rsplit(":revision:", 1)[0]
+            if isinstance(source_revision_id, str)
+            and ":revision:" in source_revision_id
+            else None
+        )
         with psycopg.connect(self._database_url) as connection:
             if not _begin_owned_contract(
                 connection,
@@ -5625,6 +5949,15 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
+            source_deleted = False
+            if source_message_id is not None:
+                deleted_row = connection.execute(
+                    """
+                    SELECT football_runtime.source_message_deletion_barrier(%s)
+                    """,
+                    (source_message_id,),
+                ).fetchone()
+                source_deleted = bool(deleted_row[0]) if deleted_row else False
             if incoming.contract_version == 3:
                 batch = payload["opportunities"]
                 if not isinstance(batch, list):
@@ -5656,14 +5989,35 @@ class PostgresRoleStore:
                             opportunity["opportunity_id"],
                             opportunity["opportunity_revision_id"],
                             opportunity["opportunity_type"],
-                            payload["publication_state"],
-                            payload.get("publication_reason"),
+                            "suppressed"
+                            if source_deleted
+                            else payload["publication_state"],
+                            "source_deleted"
+                            if source_deleted
+                            else payload.get("publication_reason"),
                             json.dumps(opportunity["accepted_facts"]),
-                            json.dumps(opportunity["response_route"]),
+                            json.dumps(
+                                _UNAVAILABLE_RESPONSE_ROUTE
+                                if source_deleted
+                                else opportunity["response_route"]
+                            ),
                             received_at,
                         ),
                     )
             else:
+                publication_state = (
+                    "suppressed" if source_deleted else payload["publication_state"]
+                )
+                publication_reason = (
+                    "source_deleted"
+                    if source_deleted
+                    else payload.get("publication_reason")
+                )
+                response_route = (
+                    _UNAVAILABLE_RESPONSE_ROUTE
+                    if source_deleted
+                    else payload["response_route"]
+                )
                 connection.execute(
                     f"""
                     INSERT INTO football_runtime.recommendation_opportunities (
@@ -5687,10 +6041,10 @@ class PostgresRoleStore:
                         payload["opportunity_id"],
                         payload["opportunity_revision_id"],
                         payload["opportunity_type"],
-                        payload["publication_state"],
-                        payload.get("publication_reason"),
+                        publication_state,
+                        publication_reason,
                         json.dumps(payload["accepted_facts"]),
-                        json.dumps(payload["response_route"]),
+                        json.dumps(response_route),
                         received_at,
                     ),
                 )
@@ -9307,7 +9661,11 @@ def _suppress_source_event_opportunities(
             ),
             "accepted_facts": row[5],
             "evidence": row[6],
-            "response_route": row[7],
+            "response_route": (
+                _UNAVAILABLE_RESPONSE_ROUTE
+                if event_kind == SourceEventKind.DELETE.value
+                else row[7]
+            ),
         }
         suppressed_opportunities.append(item)
         target_ids = {canonical_opportunity_id, storage_opportunity_id}
@@ -9474,6 +9832,7 @@ _EXACT_REPOST_PUBLICATION_REASONS = frozenset(
     {
         "source_revision_superseded",
         "source_deleted",
+        "response_route_unavailable",
         "exact_repost_superseded",
         "moderation_held",
         "moderation_suppressed",
@@ -10363,7 +10722,7 @@ def _suppress_application_opportunities(
                     AND current_revision.source_message_revision_id = %s
                     AND current_revision.source_message_id =
                         stored_revision.source_message_id
-                    AND current_revision.revision > stored_revision.revision
+                    AND current_revision.revision >= stored_revision.revision
               )
             """
             current_revision_parameters = (
@@ -10398,6 +10757,89 @@ def _suppress_application_opportunities(
                 *current_revision_parameters,
             ),
         )
+
+
+def _scrub_application_source_message_data(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+) -> None:
+    """Apply Application-owned deletion scrubbing without crossing RLS owners."""
+    revision_pattern = f"{source_message_id}:revision:%"
+    empty_metadata = json.dumps(empty_bounded_source_metadata())
+    connection.execute(
+        """
+        UPDATE football_runtime.source_messages
+        SET body = NULL,
+            bounded_metadata = %s::jsonb,
+            reply_to_telegram_message_id = NULL
+        WHERE source_message_id = %s
+        """,
+        (empty_metadata, source_message_id),
+    )
+    connection.execute(
+        """
+        UPDATE football_runtime.source_message_revisions
+        SET body = NULL,
+            bounded_metadata = %s::jsonb,
+            reply_to_telegram_message_id = NULL
+        WHERE source_message_id = %s
+        """,
+        (empty_metadata, source_message_id),
+    )
+    connection.execute(
+        """
+        UPDATE football_runtime.application_opportunities
+        SET evidence = '{}'::jsonb,
+            response_route = '{}'::jsonb
+        WHERE source_message_revision_id LIKE %s
+        """,
+        (revision_pattern,),
+    )
+    connection.execute(
+        """
+        SELECT football_runtime.scrub_source_message_outbox_contracts(%s)
+        """,
+        (source_message_id,),
+    )
+
+
+def _scrub_ingestion_source_message_data(
+    connection: psycopg.Connection[Any],
+    *,
+    peer_kind: str,
+    telegram_chat_id: int,
+    registry_generation: int,
+    telegram_message_id: int,
+    source_message_id: str,
+) -> None:
+    """Scrub Ingestion-owned event history and source handoff payloads."""
+    empty_metadata = json.dumps(empty_bounded_source_metadata())
+    connection.execute(
+        """
+        UPDATE football_runtime.source_event_records
+        SET body = NULL,
+            bounded_metadata = %s::jsonb,
+            reply_to_telegram_message_id = NULL
+        WHERE peer_kind = %s
+          AND telegram_chat_id = %s
+          AND registry_generation = %s
+          AND telegram_message_id = %s
+        """,
+        (
+            empty_metadata,
+            peer_kind,
+            telegram_chat_id,
+            registry_generation,
+            telegram_message_id,
+        ),
+    )
+    connection.execute(
+        """
+        SELECT football_runtime.scrub_source_message_outbox_contracts(%s)
+        """,
+        (source_message_id,),
+    )
 
 
 def _accept_contract_inbox(

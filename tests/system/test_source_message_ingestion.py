@@ -17,6 +17,7 @@ from modules.domain import (
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
+    SourceMessageDeletionTombstone,
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
@@ -3126,6 +3127,127 @@ def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> N
     )
     assert system.source_events()[-1].body is None
     system.reset()
+
+
+def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    model = ControlledModelAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 15, 0, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_700_401,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_delete_replay_barrier",
+        identity=identity,
+        transport_boundary="channel-pts:4750",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=model,
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=47_004,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 15, 0, tzinfo=UTC),
+        administrator_id=47_004,
+        address="@synthetic_delete_replay_barrier",
+        update_suffix="delete-replay-barrier",
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4750),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4751),
+        source_event_id="source-event:delete-replay:create",
+        telegram_message_id=405,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Open training tomorrow. Contact @training_contact.",
+        source_author_dm_url="https://t.me/training_contact",
+        event_time=clock.now(),
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4751),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4752),
+        source_event_id="source-event:delete-replay:delete",
+        telegram_message_id=405,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=clock.now() + timedelta(minutes=1),
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    system.process_opportunities_until_idle()
+
+    telethon.add_protected_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4752),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4753),
+        source_event_id="source-event:delete-replay:protected-edit",
+        telegram_message_id=405,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        text="Protected replay must not be retained.",
+        caption=None,
+        attachment=None,
+        contact="@protected_replay_contact",
+        other_body=None,
+        event_time=clock.now() + timedelta(minutes=2),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_source_event()
+    assert system.protected_content_skips() == ()
+
+    source_message = system.source_messages()[0]
+    assert source_message.tombstoned
+    assert source_message.body is None
+    assert source_message.bounded_metadata == {
+        "message_language": None,
+        "attachment_types": [],
+        "source_author_dm_url": None,
+        "reply_route_url": None,
+        "source_message_url": None,
+        "source_message_reply_capable": False,
+    }
+    assert model.requests == []
+    assert all(event.body is None for event in system.source_events())
+    assert all(revision.body is None for revision in system.source_message_revisions())
+    assert not system.redeliver_classifier_command(
+        f"{source_message.source_message_id}:revision:1"
+    )
+    assert system.source_message_deletion_tombstones() == (
+        SourceMessageDeletionTombstone(
+            source_message_id=source_message.source_message_id,
+            source_chat_identity=identity,
+            registry_generation=1,
+            telegram_message_id=405,
+            deleted_revision=2,
+            source_event_id="source-event:delete-replay:delete",
+            deleted_at=clock.now(),
+            expires_at=clock.now() + timedelta(days=90),
+        ),
+    )
 
 
 def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> None:

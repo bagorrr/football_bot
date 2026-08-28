@@ -3879,6 +3879,208 @@ def test_source_edit_and_delete_immediately_suppress_all_prior_projections() -> 
     assert system.opportunity_publication_contracts(revision_one)
 
 
+def test_response_route_loss_suppresses_contact_and_recovers_on_later_edit() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_115
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_105,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4905",
+    )
+
+    def accepted_result(
+        *, body: str, route_value: str | None
+    ) -> ClassifierAdapterResult:
+        result = _v2_accepted_result(body=body, candidate_key="route-recovery")
+        output = deepcopy(result.output)
+        candidates = output["candidates"]
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        candidate["response_routes"] = (
+            []
+            if route_value is None
+            else [
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": route_value,
+                    "evidence": route_value,
+                }
+            ]
+        )
+        return replace_classifier_output(result, output)
+
+    initial_body = (
+        "20 August 2026 in whole city. Need one player. Contact @route_initial."
+    )
+    classifier.return_for(
+        body=initial_body,
+        result=accepted_result(body=initial_body, route_value="@route_initial"),
+    )
+    classifier.return_proof_for(
+        body=initial_body,
+        result=semantic_proof_result_for(
+            output=accepted_result(
+                body=initial_body, route_value="@route_initial"
+            ).output,
+            body=initial_body,
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        source_event_id="source-event:classification-routing:route-initial",
+        telegram_message_id=49005,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=initial_body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    source_message_id = "source-chat:channel:4900105:generation:1:message:49005"
+    initial_revision = f"{source_message_id}:revision:1"
+    initial_opportunity = system.opportunities()[0]
+    opportunity_id = initial_opportunity.opportunity_id
+    assert initial_opportunity.publication_state == "active"
+    assert initial_opportunity.response_route.value == "@route_initial"
+
+    route_lost_body = "20 August 2026 in whole city. Need one player."
+    route_lost_result = accepted_result(body=route_lost_body, route_value=None)
+    classifier.return_for(body=route_lost_body, result=route_lost_result)
+    classifier.return_proof_for(
+        body=route_lost_body,
+        result=semantic_proof_result_for(
+            output=route_lost_result.output,
+            body=route_lost_body,
+        ),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        source_event_id="source-event:classification-routing:route-lost",
+        telegram_message_id=49005,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=route_lost_body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    route_lost_revision = f"{source_message_id}:revision:2"
+    suppressed = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == opportunity_id
+    )
+    assert suppressed.publication_state == "suppressed"
+    assert suppressed.publication_reason == "response_route_unavailable"
+    assert suppressed.response_route.kind == "unavailable"
+    assert suppressed.response_route.value == ""
+    assert any(
+        outcome.source_message_revision_id == route_lost_revision
+        and outcome.reason_code == "response_route_unavailable"
+        for outcome in system.classification_routing_outcomes()
+    )
+    recommendation = next(
+        opportunity
+        for opportunity in system.recommendation_opportunities()
+        if opportunity.opportunity_id == opportunity_id
+        and opportunity.opportunity_revision_id.endswith(":revision:2")
+    )
+    assert recommendation.publication_state == "suppressed"
+    assert recommendation.publication_reason == "response_route_unavailable"
+    assert recommendation.response_route.kind == "unavailable"
+    assert recommendation.response_route.value == ""
+    assert system.opportunity_publication_contracts(initial_revision)
+
+    recovered_body = (
+        "20 August 2026 in whole city. Need one player. Contact @route_recovered."
+    )
+    recovered_result = accepted_result(
+        body=recovered_body, route_value="@route_recovered"
+    )
+    classifier.return_for(body=recovered_body, result=recovered_result)
+    classifier.return_proof_for(
+        body=recovered_body,
+        result=semantic_proof_result_for(
+            output=recovered_result.output,
+            body=recovered_body,
+        ),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4908),
+        source_event_id="source-event:classification-routing:route-recovered",
+        telegram_message_id=49005,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body=recovered_body,
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    recovered = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == opportunity_id
+    )
+    assert recovered.publication_state == "active"
+    assert recovered.response_route.value == "@route_recovered"
+    recovered_projection = next(
+        opportunity
+        for opportunity in system.recommendation_opportunities()
+        if opportunity.opportunity_id == opportunity_id
+        and opportunity.opportunity_revision_id.endswith(":revision:3")
+    )
+    assert recovered_projection.publication_state == "active"
+    assert recovered_projection.response_route.value == "@route_recovered"
+
+
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:
     telegram = ControlledTelegramIngestionAdapter()
     classifier = ControlledModelAdapter()

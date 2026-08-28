@@ -78,6 +78,7 @@ from modules.domain import (
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
+    SourceMessageDeletionTombstone,
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
@@ -2151,6 +2152,12 @@ class AcceptanceSpine:
     def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
         """Observe immutable Source Message revisions through the testkit."""
         return self._observer.source_message_revisions()
+
+    def source_message_deletion_tombstones(
+        self,
+    ) -> tuple[SourceMessageDeletionTombstone, ...]:
+        """Observe bounded body-free deletion tombstones through the testkit."""
+        return self._observer.source_message_deletion_tombstones()
 
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
         """Observe body-free Protected Content Skips through the testkit."""

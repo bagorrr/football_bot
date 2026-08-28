@@ -42,6 +42,7 @@ class ContractName(StrEnum):
     """Contract families exercised by the first cross-process round trip."""
 
     SOURCE_EVENT_RECORDED = "SourceEventRecorded"
+    SOURCE_MESSAGE_DELETED = "SourceMessageDeleted"
     SOURCE_STREAM_STOPPED = "SourceStreamStopped"
     CLASSIFY_SOURCE_MESSAGE_REVISION = "ClassifySourceMessageRevision"
     CLASSIFICATION_PROPOSAL = "ClassificationProposal"
@@ -172,6 +173,14 @@ SUPPORTED_CONTRACTS = (
         RuntimeRole.APPLICATION,
         "source_event_id",
         ("telegram_chat_id", "registry_generation"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_MESSAGE_DELETED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.CLASSIFICATION,
+        "source_message_id",
+        ("deleted_revision",),
     ),
     ContractDefinition(
         ContractName.SOURCE_STREAM_STOPPED,
@@ -487,6 +496,11 @@ class ContractEnvelope(RawContractEnvelope):
                 _validate_protected_content_skip(self, self.payload)
             else:
                 _validate_source_event_recorded(self, self.payload)
+        elif (
+            self.contract_name is ContractName.SOURCE_MESSAGE_DELETED
+            and self.contract_version == 1
+        ):
+            _validate_source_message_deleted(self, self.payload)
         elif self.contract_name is ContractName.SOURCE_STREAM_STOPPED:
             _validate_source_stream_stopped(self, self.payload)
         elif (
@@ -1197,6 +1211,50 @@ def _validate_source_event_recorded(
             or reply_to_message_id == telegram_message_id
         ):
             raise ValueError("SourceEventRecorded direct-reply identity is invalid")
+
+
+def _validate_source_message_deleted(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    """Validate the body-free Application-to-Classification deletion signal."""
+    allowed = {
+        "source_message_id",
+        "source_event_id",
+        "source_message_revision_id",
+        "deleted_revision",
+        "deleted_at",
+    }
+    if set(payload) != allowed:
+        raise ValueError("SourceMessageDeleted contains unsupported or missing facts")
+    source_message_id = _required_text(payload, "source_message_id")
+    if envelope.subject_id != source_message_id:
+        raise ValueError("SourceMessageDeleted subject is not its Source Message")
+    deleted_revision = payload["deleted_revision"]
+    if (
+        not isinstance(deleted_revision, int)
+        or isinstance(deleted_revision, bool)
+        or deleted_revision < 1
+        or envelope.subject_revision != deleted_revision
+    ):
+        raise ValueError("SourceMessageDeleted revision is inconsistent")
+    source_message_revision_id = _required_text(payload, "source_message_revision_id")
+    if source_message_revision_id != (
+        f"{source_message_id}:revision:{deleted_revision}"
+    ):
+        raise ValueError("SourceMessageDeleted revision identity is inconsistent")
+    _required_text(payload, "source_event_id")
+    _required_iso_datetime(payload, "deleted_at")
+    if envelope.message_id != derive_contract_message_id(
+        envelope.causation_id, ContractName.SOURCE_MESSAGE_DELETED
+    ):
+        raise ValueError("SourceMessageDeleted message identity is not canonical")
+    if envelope.idempotency_key != (
+        f"source-message-deleted:{source_message_id}:{deleted_revision}"
+    ):
+        raise ValueError("SourceMessageDeleted idempotency key is not canonical")
+    if envelope.causation_id == envelope.message_id:
+        raise ValueError("SourceMessageDeleted causation identity is invalid")
 
 
 _BOUNDED_METADATA_FIELDS = {
@@ -2237,6 +2295,7 @@ def _validate_opportunity_publication_changed(
         if publication_reason not in {
             "source_revision_superseded",
             "source_deleted",
+            "response_route_unavailable",
             "exact_repost_superseded",
             "moderation_held",
             "moderation_suppressed",
@@ -2261,26 +2320,39 @@ def _validate_opportunity_publication_changed(
         raise TypeError("response_route must contain kind and value")
     route_kind = route["kind"]
     route_value = route["value"]
-    valid_route = (
-        isinstance(route_value, str)
-        and bool(route_value)
-        and (
-            (
-                route_kind == "explicit_telegram_username"
-                and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
-            )
-            or (
-                route_kind == "explicit_phone"
-                and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value) is not None
-                and 7 <= sum(character.isdigit() for character in route_value) <= 15
-            )
-            or (route_kind == "explicit_url" and _is_safe_http_route(route_value))
-            or (
-                route_kind in {"direct_message", "reply_thread", "source_message"}
-                and _is_safe_telegram_route(route_value)
+    if (
+        payload["publication_state"] == "suppressed"
+        and payload.get("publication_reason")
+        in {
+            "source_revision_superseded",
+            "source_deleted",
+            "response_route_unavailable",
+        }
+        and route == {"kind": "unavailable", "value": ""}
+    ):
+        valid_route = True
+    else:
+        valid_route = (
+            isinstance(route_value, str)
+            and bool(route_value)
+            and (
+                (
+                    route_kind == "explicit_telegram_username"
+                    and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
+                )
+                or (
+                    route_kind == "explicit_phone"
+                    and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value)
+                    is not None
+                    and 7 <= sum(character.isdigit() for character in route_value) <= 15
+                )
+                or (route_kind == "explicit_url" and _is_safe_http_route(route_value))
+                or (
+                    route_kind in {"direct_message", "reply_thread", "source_message"}
+                    and _is_safe_telegram_route(route_value)
+                )
             )
         )
-    )
     if not valid_route:
         raise ValueError("response_route is invalid")
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
@@ -2385,7 +2457,10 @@ def _validate_opportunity_publication_batch_changed(
         route = opportunity["response_route"]
         if not isinstance(route, dict) or set(route) != {"kind", "value"}:
             raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
-        _validate_publication_response_route(route)
+        _validate_publication_response_route(
+            route,
+            allow_unavailable=publication_state == "suppressed",
+        )
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
     if envelope.idempotency_key != (
         f"opportunity-publication-batch:{source_revision_id}:"
@@ -2396,11 +2471,15 @@ def _validate_opportunity_publication_batch_changed(
         )
 
 
-def _validate_publication_response_route(route: dict[str, JsonValue]) -> None:
+def _validate_publication_response_route(
+    route: dict[str, JsonValue], *, allow_unavailable: bool = False
+) -> None:
     """Validate one response route shared by publication wire versions."""
     route_kind = route.get("kind")
     route_value = route.get("value")
     valid_route = (
+        allow_unavailable and route == {"kind": "unavailable", "value": ""}
+    ) or (
         isinstance(route_value, str)
         and bool(route_value)
         and (

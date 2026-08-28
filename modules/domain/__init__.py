@@ -787,6 +787,20 @@ class SourceMessageRevision:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceMessageDeletionTombstone:
+    """Bounded, body-free deletion state retained for replay protection."""
+
+    source_message_id: str
+    source_chat_identity: TelegramPeerIdentity
+    registry_generation: int
+    telegram_message_id: int
+    deleted_revision: int
+    source_event_id: str
+    deleted_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ExactRepostCluster:
     """Durable application-owned grouping of exact repost Source Messages."""
 
