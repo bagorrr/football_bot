@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -991,6 +991,106 @@ def test_bot_assistant_result_projection_follows_current_exact_repost_representa
               AND registry_generation = 1
             """
         )
+    failure_id = uuid4()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'ingestion', 'application', 'SourceStreamStopped', 1,
+                'source-chat:channel:5501:generation:1', 1, %s,
+                %s, %s, %s, %s
+            )
+            """,
+            (
+                failure_id,
+                f"source-stream-stop:{failure_id}",
+                uuid4(),
+                uuid4(),
+                recorded_at,
+                json.dumps(
+                    {
+                        "source_stream_failure_id": str(failure_id),
+                        "scope": "source_stream",
+                        "failure_reason": "protection_unavailable",
+                        "telegram_peer_kind": "channel",
+                        "telegram_chat_id": 5501,
+                        "registry_generation": 1,
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.ingestion_failures (
+                failure_id, scope, failure_reason, peer_kind,
+                telegram_chat_id, registry_generation, recorded_at
+            ) VALUES (
+                %s, 'source_stream', 'protection_unavailable', 'channel',
+                5501, 1, %s
+            )
+            """,
+            (failure_id, recorded_at),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        failed_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        failed_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert failed_gate == (False,)
+    assert failed_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.ingestion_failures
+            SET active = false
+            WHERE failure_id = %s
+            """,
+            (failure_id,),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        resolved_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        resolved_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert resolved_gate == (True,)
+    assert resolved_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "active",
+        route["kind"],
+        route["value"],
+    )
+    with psycopg.connect(fresh_database_url) as connection:
         connection.execute(
             """
             UPDATE football_runtime.recommendation_opportunities

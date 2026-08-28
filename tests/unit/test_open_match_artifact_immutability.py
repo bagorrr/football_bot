@@ -35,6 +35,33 @@ OPEN_MATCH_ARTIFACT_HASHES = {
     "classifier/open-match-primary-v2/source-message-classification-v2.schema.json": (
         "5e694ccb469e3f88e67f1f0f724bae3bffac9354b315e25011e8e1d555010681"
     ),
+    "classifier/open-match-primary-v4/prompt.md": (
+        "3028e86da0edf63fd9ee284a6e5662124a5a7acc57d1a047db19cd6a49d4e852"
+    ),
+    "classifier/open-match-primary-v4/provenance.json": (
+        "8a1e6f6d97ffc52f936ba137f1e588702163123bbd30d018a3b7412a85e51be1"
+    ),
+    "classifier/open-match-primary-v4/source-message-classification-v4.schema.json": (
+        "e012528fcc310d30a11d9657bc0aa74e02b4f81669b299cca9c3d21246ebc854"
+    ),
+    "classifier/open-match-ambiguity-v3/prompt.md": (
+        "44c8e03bbd0283812c554e1e156253b9600b550195ac97ac176096c38f7094e0"
+    ),
+    "classifier/open-match-ambiguity-v3/provenance.json": (
+        "08791062a9fa913be66140b8f0989fe6ae08b7174ae79950d93ac5c7628c7abf"
+    ),
+    "classifier/open-match-ambiguity-v3/source-message-classification-v4.schema.json": (
+        "a68cba4d6235bb4626c07d7f2dce4aa5e13b179f930d64b0a39c97b1050f2595"
+    ),
+    "classifier/open-match-semantic-proof-v3/prompt.md": (
+        "56356eb22276e07fa2a4a5ed8e223f60e62ea98a5338e659bd84355e85eae631"
+    ),
+    "classifier/open-match-semantic-proof-v3/provenance.json": (
+        "3e69105d5faba4440932b939477585a611566277a92e6ee0766abe4c59496b6a"
+    ),
+    "classifier/open-match-semantic-proof-v3/source-semantic-proof-v3.schema.json": (
+        "f3428af0b9dec24a5b8ad693c61ca0e752ee292f3e1082220cd70515608047e0"
+    ),
     "classifier/open-match-semantic-proof-v1/prompt.md": (
         "e63e8d2f303dda2d7808654f8936715ea943cc002b91371801e598a860db8c0c"
     ),

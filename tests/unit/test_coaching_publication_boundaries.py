@@ -239,14 +239,15 @@ def test_arbitrary_canonical_city_edit_renews_coaching_freshness() -> None:
     )
 
 
-def test_body_only_city_edit_renews_coaching_freshness() -> None:
+@pytest.mark.parametrize("separator", [" — ", ". ", "\n"])
+def test_body_only_city_edit_renews_coaching_freshness(separator: str) -> None:
     created = _coaching_revision(
         revision=1,
-        body="Moscow — in-person coach available Mondays. Message @coach",
+        body=(f"Moscow{separator}in-person coach available Mondays. Message @coach"),
     )
     edited = _coaching_revision(
         revision=2,
-        body="London — in-person coach available Mondays. Message @coach",
+        body=(f"London{separator}in-person coach available Mondays. Message @coach"),
     )
 
     assert _source_coaching_edit_qualifies_freshness(

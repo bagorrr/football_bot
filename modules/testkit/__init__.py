@@ -988,7 +988,8 @@ class ControlledModelAdapter:
 
     def enable_coaching_primary_v1(self) -> None:
         """Opt the controlled model boundary into the versioned coaching release."""
-        self.enable_open_match_primary_v4()
+        self.primary_schema_version = "source-message-classification-v5"
+        self.primary_prompt_version = "open-match-primary-v5"
 
     def enable_player_match_primary_v2(self) -> None:
         """Opt the controlled model boundary into the versioned Player release."""
@@ -1061,6 +1062,7 @@ class ControlledModelAdapter:
                     in {
                         "source-semantic-proof-v2",
                         "source-semantic-proof-v3",
+                        "source-semantic-proof-v4",
                     }
                     else "source-semantic-proof-v1"
                 ),
@@ -1368,7 +1370,9 @@ def _build_test_semantic_proof(
         )
     semantic_proof_version = proof_version
     if semantic_proof_version == "source-semantic-proof-v1":
-        if output.get("schema_version") == "source-message-classification-v4":
+        if output.get("schema_version") == "source-message-classification-v5":
+            semantic_proof_version = "source-semantic-proof-v4"
+        elif output.get("schema_version") == "source-message-classification-v4":
             semantic_proof_version = "source-semantic-proof-v3"
         elif output.get("schema_version") == "source-message-classification-v3" or (
             opportunity_type in {"roster_vacancy", "player_transfer_availability"}

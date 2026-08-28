@@ -10,11 +10,13 @@ from modules.classifier_contract import (
     OPEN_MATCH_V2_DESCRIPTOR,
     OPEN_MATCH_V3_DESCRIPTOR,
     OPEN_MATCH_V4_DESCRIPTOR,
+    OPEN_MATCH_V5_DESCRIPTOR,
     PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
     classifier_output_is_schema_valid,
+    semantic_proof_is_schema_valid,
 )
 from modules.contracts import JsonValue
-from modules.testkit import _add_test_proposition_evidence
+from modules.testkit import _add_test_proposition_evidence, semantic_proof_result_for
 
 STANDING_BODY = (
     "Referee available for a match, 7x7, head referee, paid, in Saint Petersburg. "
@@ -117,6 +119,7 @@ def _output(
             in {
                 "source-message-classification-v3",
                 "source-message-classification-v4",
+                "source-message-classification-v5",
             }
             else "source-proposition-evidence-v1"
         ),
@@ -211,4 +214,43 @@ def test_referee_candidates_reject_nonselectable_criteria_and_cross_release() ->
         ),
         body=STANDING_BODY,
         artifact_descriptor=PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    )
+
+
+def test_referee_candidates_remain_valid_in_the_new_open_match_release() -> None:
+    candidate = _candidate(
+        opportunity_type="referee_availability",
+        body=STANDING_BODY,
+        with_event_time=False,
+    )
+    output = _output(
+        candidate,
+        schema_version="source-message-classification-v5",
+        body=STANDING_BODY,
+    )
+    assert classifier_output_is_schema_valid(
+        output,
+        body=STANDING_BODY,
+        artifact_descriptor=OPEN_MATCH_V5_DESCRIPTOR,
+    )
+
+    candidate = cast(
+        dict[str, JsonValue], cast(list[JsonValue], output["candidates"])[0]
+    )
+    evidence = cast(dict[str, JsonValue], candidate["evidence"])
+    routes = cast(list[JsonValue], candidate["response_routes"])
+    proof = semantic_proof_result_for(
+        output=output,
+        body=STANDING_BODY,
+        source_message_revision_reference="revision:referee:1",
+    ).output
+    assert semantic_proof_is_schema_valid(
+        proof,
+        body=STANDING_BODY,
+        source_message_revision_reference="revision:referee:1",
+        candidate_key=str(candidate["candidate_key"]),
+        evidence=evidence,
+        routes=routes,
+        opportunity_type="referee_availability",
+        artifact_descriptor=OPEN_MATCH_V5_DESCRIPTOR,
     )

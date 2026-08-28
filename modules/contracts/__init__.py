@@ -237,6 +237,13 @@ SUPPORTED_CONTRACTS = (
         "proposal_id",
     ),
     ContractDefinition(
+        ContractName.CLASSIFICATION_PROPOSAL,
+        7,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.APPLICATION,
+        "proposal_id",
+    ),
+    ContractDefinition(
         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
         1,
         RuntimeRole.APPLICATION,
@@ -518,7 +525,7 @@ class ContractEnvelope(RawContractEnvelope):
             _validate_classify_source_message_revision(self, self.payload)
         elif (
             self.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and self.contract_version in {2, 3, 4, 5, 6}
+            and self.contract_version in {2, 3, 4, 5, 6, 7}
         ):
             _validate_classification_proposal(self, self.payload)
         elif (
@@ -1744,19 +1751,19 @@ def _validate_classification_proposal(
             "semantic_proof_executions",
             "ambiguity_pass_execution",
         }
-        if envelope.contract_version in {4, 5, 6}
+        if envelope.contract_version in {4, 5, 6, 7}
         else set()
     )
     proposal_context_fields = (
         context_fields | {"adjacent_context"}
-        if envelope.contract_version in {4, 5, 6}
+        if envelope.contract_version in {4, 5, 6, 7}
         else context_fields
     )
     allowed = (
         {"proposal_id", "source_message_revision_id", "body"}
         | proposal_context_fields
         | provenance_fields
-        | (semantic_fields if envelope.contract_version in {3, 4, 5, 6} else set())
+        | (semantic_fields if envelope.contract_version in {3, 4, 5, 6, 7} else set())
     )
     if set(payload) != allowed:
         raise ValueError("ClassificationProposal has incomplete semantics")
@@ -1848,7 +1855,7 @@ def _validate_classification_proposal(
             meaning=candidate_meaning,
             artifact_descriptor=artifact_descriptor,
         )
-    if envelope.contract_version in {4, 5, 6}:
+    if envelope.contract_version in {4, 5, 6, 7}:
         _validate_adjacent_context(
             payload["adjacent_context"],
             source_chat_reference=_required_text(payload, "source_chat_reference"),
@@ -2143,21 +2150,29 @@ def _validate_ambiguity_pass_execution(
         expected_schema = "source-message-classification-v3"
     else:
         expected_prompt = prompt_version or (
-            "open-match-ambiguity-v3"
-            if value["prompt_version"] == "open-match-ambiguity-v3"
+            "open-match-ambiguity-v4"
+            if value["prompt_version"] == "open-match-ambiguity-v4"
             else (
-                "open-match-ambiguity-v2"
-                if value["prompt_version"] == "open-match-ambiguity-v2"
-                else "open-match-ambiguity-v1"
+                "open-match-ambiguity-v3"
+                if value["prompt_version"] == "open-match-ambiguity-v3"
+                else (
+                    "open-match-ambiguity-v2"
+                    if value["prompt_version"] == "open-match-ambiguity-v2"
+                    else "open-match-ambiguity-v1"
+                )
             )
         )
         expected_schema = schema_version or (
-            "source-message-classification-v4"
-            if expected_prompt == "open-match-ambiguity-v3"
+            "source-message-classification-v5"
+            if expected_prompt == "open-match-ambiguity-v4"
             else (
-                "source-message-classification-v3"
-                if expected_prompt == "open-match-ambiguity-v2"
-                else "source-message-classification-v2"
+                "source-message-classification-v4"
+                if expected_prompt == "open-match-ambiguity-v3"
+                else (
+                    "source-message-classification-v3"
+                    if expected_prompt == "open-match-ambiguity-v2"
+                    else "source-message-classification-v2"
+                )
             )
         )
     if value["prompt_version"] != expected_prompt:
@@ -2169,12 +2184,14 @@ def _validate_ambiguity_pass_execution(
         "open-match-ambiguity-v1",
         "open-match-ambiguity-v2",
         "open-match-ambiguity-v3",
+        "open-match-ambiguity-v4",
     }:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
     if value["schema_version"] not in {
         "source-message-classification-v2",
         "source-message-classification-v3",
         "source-message-classification-v4",
+        "source-message-classification-v5",
     }:
         raise ValueError("ambiguity-pass prompt and schema versions disagree")
     if value["context_bundle_version"] != "primary-classifier-context-v1":
@@ -2292,12 +2309,16 @@ def _validate_semantic_proof_execution(
             "player-match-semantic-proof-v1"
             if player_release
             else (
-                "open-match-semantic-proof-v3"
-                if value["schema_version"] == "source-semantic-proof-v3"
+                "open-match-semantic-proof-v4"
+                if value["schema_version"] == "source-semantic-proof-v4"
                 else (
-                    "open-match-semantic-proof-v2"
-                    if value["schema_version"] == "source-semantic-proof-v2"
-                    else "open-match-semantic-proof-v1"
+                    "open-match-semantic-proof-v3"
+                    if value["schema_version"] == "source-semantic-proof-v3"
+                    else (
+                        "open-match-semantic-proof-v2"
+                        if value["schema_version"] == "source-semantic-proof-v2"
+                        else "open-match-semantic-proof-v1"
+                    )
                 )
             )
         )
@@ -2323,6 +2344,7 @@ def _validate_semantic_proof_execution(
         "source-semantic-proof-v1",
         "source-semantic-proof-v2",
         "source-semantic-proof-v3",
+        "source-semantic-proof-v4",
     }:
         raise ValueError("semantic-proof schema provenance is unsupported")
     if any(value[field_name] != expected for field_name, expected in pinned.items()):

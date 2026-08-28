@@ -12782,7 +12782,7 @@ class RuntimeApplication:
                         ContractName.CLASSIFICATION_PROPOSAL,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
-                    and definition.version in {2, 3, 4, 5, 6}
+                    and definition.version in {2, 3, 4, 5, 6, 7}
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -13414,7 +13414,7 @@ class RuntimeApplication:
                 if (
                     self.role is RuntimeRole.APPLICATION
                     and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-                    and incoming.contract_version in {4, 5, 6}
+                    and incoming.contract_version in {4, 5, 6, 7}
                 ):
                     invalid_payload = (
                         incoming.payload if isinstance(incoming.payload, dict) else {}
@@ -13628,7 +13628,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
-            and incoming.contract_version in {2, 3, 4, 5, 6}
+            and incoming.contract_version in {2, 3, 4, 5, 6, 7}
             and supported_incoming is not None
         ):
             self._accept_classification_proposal(supported_incoming)
@@ -13788,6 +13788,7 @@ class RuntimeApplication:
             "source-message-classification-v2",
             "source-message-classification-v3",
             "source-message-classification-v4",
+            "source-message-classification-v5",
         }:
             self._classify_source_message_v2(
                 incoming,
@@ -14425,6 +14426,7 @@ class RuntimeApplication:
             "source-message-classification-v2",
             "source-message-classification-v3",
             "source-message-classification-v4",
+            "source-message-classification-v5",
         }:
             raise RuntimeError("classifier adapter exposes unsupported artifacts")
         if descriptor.ambiguity_prompt_version is None:
@@ -15804,7 +15806,7 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
-        if incoming.contract_version in {4, 5, 6}:
+        if incoming.contract_version in {4, 5, 6, 7}:
             adjacent_context = payload.get("adjacent_context")
             output = payload.get("output")
             routing = output.get("routing") if isinstance(output, dict) else None
@@ -15911,7 +15913,7 @@ class RuntimeApplication:
             },
         }
         if (
-            incoming.contract_version not in {4, 5, 6}
+            incoming.contract_version not in {4, 5, 6, 7}
             and player_classifier_proposal_contains_player(authoritative_payload)
             and not player_classifier_promotion_is_approved(
                 self.store.classifier_release_promotion(
@@ -15932,7 +15934,7 @@ class RuntimeApplication:
                 received_at=self.clock.now(),
             )
             return
-        if incoming.contract_version in {4, 5, 6}:
+        if incoming.contract_version in {4, 5, 6, 7}:
             artifact_descriptor = _classifier_artifact_descriptor_for_payload(
                 authoritative_payload,
                 contract_envelope_version=incoming.contract_version,
@@ -16014,7 +16016,9 @@ class RuntimeApplication:
                 revision_id=revision_id,
                 body=source_revision.body,
                 artifact_version=(
-                    "v4"
+                    "v5"
+                    if incoming.contract_version == 7
+                    else "v4"
                     if incoming.contract_version == 6
                     else "v3"
                     if incoming.contract_version == 5
@@ -17698,7 +17702,7 @@ def _coaching_assertion_signature(
         re.IGNORECASE,
     )
     leading_location_clause = re.compile(
-        r"(?m)^\s*(?P<location>[^.!?;,\n:—–-]+?)\s*[,—–:-]\s*"
+        r"(?m)^\s*(?P<location>[^.!?;,\n:—–-]+?)\s*[,\.\n—–:-]\s*"
         r"(?=(?:the\s+)?(?:in[- ]person|face[- ]to[- ]face|on[- ]site|"
         r"offline|coach\w*|trainer\w*|coaching|training|"
         r"wanted|required|requested|needed|looking|seeking|want\w*|need\w*|"
@@ -18350,6 +18354,7 @@ def _classifier_proposal_has_pinned_provenance(
         "source-message-classification-v2",
         "source-message-classification-v3",
         "source-message-classification-v4",
+        "source-message-classification-v5",
     }:
         descriptor = _classifier_artifact_descriptor_for_payload(payload)
         if descriptor is None:
@@ -18359,13 +18364,18 @@ def _classifier_proposal_has_pinned_provenance(
             revision_id=revision_id,
             body=body,
             artifact_version=(
-                "v4"
-                if payload.get("schema_version") == "source-message-classification-v4"
+                "v5"
+                if payload.get("schema_version") == "source-message-classification-v5"
                 else (
-                    "v3"
+                    "v4"
                     if payload.get("schema_version")
-                    == "source-message-classification-v3"
-                    else "v2"
+                    == "source-message-classification-v4"
+                    else (
+                        "v3"
+                        if payload.get("schema_version")
+                        == "source-message-classification-v3"
+                        else "v2"
+                    )
                 )
             ),
             artifact_descriptor=descriptor,
@@ -18487,6 +18497,8 @@ def _classifier_artifact_versions(
         primary_prompt = "open-match-primary-v3"
     elif primary_schema == "source-message-classification-v4":
         primary_prompt = "open-match-primary-v4"
+    elif primary_schema == "source-message-classification-v5":
+        primary_prompt = "open-match-primary-v5"
     else:
         primary_prompt = None
     descriptor = classifier_artifact_descriptor_for_primary(

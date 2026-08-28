@@ -160,6 +160,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0032_coaching_exact_repost_clusters.sql",
     "0033_exact_repost_result_projection.sql",
     "0034_coaching_source_chat_projection_gate.sql",
+    "0035_coaching_source_chat_ingestion_failure_projection_gate.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -198,6 +199,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "198ac94c3f46c53ded9df4f94e5767514ad42fa389ef084af2834f16a9be2d7e",
     "a962802784545373f32833cbd8222e6e93a257cb690b397c2c3d485cc7ab5c1d",
     "d835cf5c9201c1b9b0628b3f13193814470b481746b82a98cc162f141a4a4f51",
+    "dc4f0f227a03128ee1f96b7c3a3e83f26fdea51626fa17c42b2cbd2efd22fab5",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {

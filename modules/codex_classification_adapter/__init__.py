@@ -143,6 +143,13 @@ class CodexCliClassifierAdapter:
             and "source-semantic-proof-v3" in self._schema_paths
             and "open-match-semantic-proof-v3" in self._prompt_paths
         )
+        open_v5_artifacts_complete = (
+            "source-message-classification-v5" in self._schema_paths
+            and "open-match-primary-v5" in self._prompt_paths
+            and "open-match-ambiguity-v4" in self._prompt_paths
+            and "source-semantic-proof-v4" in self._schema_paths
+            and "open-match-semantic-proof-v4" in self._prompt_paths
+        )
         v4_artifacts_complete = (
             player_v4_artifacts_complete or open_v4_artifacts_complete
         )
@@ -156,6 +163,7 @@ class CodexCliClassifierAdapter:
                     ("source-message-classification-v2", v2_primary_available),
                     ("source-message-classification-v3", v3_artifacts_complete),
                     ("source-message-classification-v4", v4_artifacts_complete),
+                    ("source-message-classification-v5", open_v5_artifacts_complete),
                 )
                 if available
             ]
@@ -180,6 +188,11 @@ class CodexCliClassifierAdapter:
             and not v4_artifacts_complete
         ):
             raise ValueError("incomplete v4 classifier artifact set")
+        if (
+            primary_schema_version == "source-message-classification-v5"
+            and not open_v5_artifacts_complete
+        ):
+            raise ValueError("incomplete v5 classifier artifact set")
         if primary_schema_version == "source-message-classification-v2" and not (
             v2_primary_available
         ):
@@ -190,9 +203,12 @@ class CodexCliClassifierAdapter:
             "source-message-classification-v2",
             "source-message-classification-v3",
             "source-message-classification-v4",
+            "source-message-classification-v5",
         }:
             raise ValueError("unsupported primary classifier schema version")
-        if self._primary_schema_version == "source-message-classification-v4":
+        if self._primary_schema_version == "source-message-classification-v5":
+            self._primary_prompt_version = "open-match-primary-v5"
+        elif self._primary_schema_version == "source-message-classification-v4":
             self._primary_prompt_version = (
                 "player-match-primary-v2"
                 if player_v4_artifacts_complete and not open_v4_artifacts_complete

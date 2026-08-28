@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "source-message-classification-v4",
+  "$id": "source-message-classification-v5",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "disposition", "candidates", "routing"],
   "properties": {
-    "schema_version": {"const": "source-message-classification-v4"},
+    "schema_version": {"const": "source-message-classification-v5"},
     "disposition": {"enum": ["accepted", "needs_second_pass", "needs_review", "irrelevant", "unresolved"]},
     "candidates": {"type": "array", "maxItems": 8},
     "routing": {"$ref": "#/$defs/routing"}
@@ -40,7 +40,7 @@
       "required": ["candidate_key", "opportunity_type", "evidence", "source_context", "location", "response_routes"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "coach_availability", "coach_request", "referee_availability", "referee_request"]},
         "evidence": {"$ref": "#/$defs/evidence"},
         "source_context": {"type": "string", "minLength": 1},
         "location": {"$ref": "#/$defs/location"},
@@ -54,6 +54,10 @@
         "player_transfer_availability": {"const": true},
         "referee_availability": {"const": true},
         "referee_request": {"const": true},
+        "coach_availability": {"const": true},
+        "coach_request": {"const": true},
+        "in_person": {"const": true},
+        "coaching_types": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["individual_training", "team_training", "goalkeeper_training", "fitness_training"]}},
         "response_routes": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/route"}},
         "team_formats": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"]}},
         "event_types": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["match", "tournament"]}},
@@ -167,6 +171,49 @@
             },
             "not": {"anyOf": [{"required": ["open_places"]}, {"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}, {"required": ["referee_availability"]}]}
           }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"enum": ["coach_availability", "coach_request"]}}},
+          "then": {
+            "required": ["in_person"],
+            "properties": {
+              "evidence": {
+                "required": ["opportunity", "location", "in_person"]
+              }
+            },
+            "not": {"anyOf": [
+              {"required": ["event_time"]},
+              {"required": ["open_places"]},
+              {"required": ["open_participation"]},
+              {"required": ["registration_open"]},
+              {"required": ["opponent_request"]},
+              {"required": ["roster_vacancy"]},
+              {"required": ["player_transfer_availability"]},
+              {"required": ["referee_availability"]},
+              {"required": ["referee_request"]}
+            ]}
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"enum": ["coach_availability", "coach_request"]}}},
+          "then": {
+            "properties": {
+              "proposition_evidence": {
+                "properties": {
+                  "contract_version": {"const": "source-proposition-evidence-v3"}
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "proposition_evidence": {
+                "properties": {
+                  "contract_version": {"const": "source-proposition-evidence-v2"}
+                }
+              }
+            }
+          }
         }
       ]
     },
@@ -187,6 +234,10 @@
         "player_transfer_availability": {"type": "string", "minLength": 1},
         "referee_availability": {"type": "string", "minLength": 1},
         "referee_request": {"type": "string", "minLength": 1},
+        "in_person": {"type": "string", "minLength": 1},
+        "coach_availability": {"type": "string", "minLength": 1},
+        "coach_request": {"type": "string", "minLength": 1},
+        "coaching_types": {"type": "string", "minLength": 1},
         "event_types": {"type": "string", "minLength": 1},
         "referee_roles": {"type": "string", "minLength": 1},
         "team_formats": {"type": "string", "minLength": 1},
@@ -287,7 +338,7 @@
       "properties": {
         "proposition_id": {"type": "string", "minLength": 1},
         "domain": {"enum": ["football_match"]},
-        "meaning": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "meaning": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "coach_availability", "coach_request", "referee_availability", "referee_request"]},
         "polarity": {"enum": ["positive", "negative", "ambiguous"]},
         "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
         "span": {"$ref": "#/$defs/sourceSpan"}
@@ -324,7 +375,7 @@
       "additionalProperties": false,
       "required": ["contract_version", "coverage", "root", "facts", "routes", "relations"],
       "properties": {
-        "contract_version": {"const": "source-proposition-evidence-v2"},
+        "contract_version": {"enum": ["source-proposition-evidence-v2", "source-proposition-evidence-v3"]},
         "coverage": {"const": "complete_source_revision"},
         "root": {"$ref": "#/$defs/propositionRoot"},
         "facts": {
@@ -350,7 +401,7 @@
       "required": ["candidate_key", "opportunity_type", "evidence", "alternatives"],
       "properties": {
         "candidate_key": {"type": "string", "minLength": 1},
-        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "coach_availability", "coach_request", "referee_availability", "referee_request"]},
         "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}},
         "alternatives": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["alternative_key", "evidence"], "properties": {"alternative_key": {"type": "string", "minLength": 1}, "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}}}}}
       }

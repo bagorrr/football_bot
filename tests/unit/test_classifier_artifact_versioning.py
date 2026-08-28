@@ -10,6 +10,7 @@ from modules.classifier_contract import (
     OPEN_MATCH_V1_DESCRIPTOR,
     OPEN_MATCH_V3_DESCRIPTOR,
     OPEN_MATCH_V4_DESCRIPTOR,
+    OPEN_MATCH_V5_DESCRIPTOR,
     PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR,
     ClassifierArtifactDescriptor,
     classifier_output_is_schema_valid,
@@ -120,7 +121,7 @@ def test_old_recorded_schema_id_does_not_replay_as_player_behavior() -> None:
     ("descriptor", "body", "opportunity_type"),
     (
         (
-            OPEN_MATCH_V4_DESCRIPTOR,
+            OPEN_MATCH_V5_DESCRIPTOR,
             "In-person coaching available in Moscow.",
             "coach_availability",
         ),
@@ -213,8 +214,8 @@ def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     open_schema = json.loads(
         (
             root
-            / "open-match-primary-v4"
-            / "source-message-classification-v4.schema.json"
+            / "open-match-primary-v5"
+            / "source-message-classification-v5.schema.json"
         ).read_text()
     )
     open_types = open_schema["$defs"]["acceptedCandidate"]["properties"][
@@ -222,6 +223,17 @@ def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     ]["enum"]
     assert {"coach_availability", "coach_request"} <= set(open_types)
     assert {"referee_availability", "referee_request"} <= set(open_types)
+    old_open_schema = json.loads(
+        (
+            root
+            / "open-match-primary-v4"
+            / "source-message-classification-v4.schema.json"
+        ).read_text()
+    )
+    old_open_types = old_open_schema["$defs"]["acceptedCandidate"]["properties"][
+        "opportunity_type"
+    ]["enum"]
+    assert not {"coach_availability", "coach_request"} & set(old_open_types)
     player_schema = json.loads(
         (
             root
@@ -236,7 +248,11 @@ def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     )
     assert (
         "coach_availability"
-        in (root / "open-match-primary-v4" / "prompt.md").read_text().casefold()
+        in (root / "open-match-primary-v5" / "prompt.md").read_text().casefold()
+    )
+    assert (
+        "coach_availability"
+        not in (root / "open-match-primary-v4" / "prompt.md").read_text().casefold()
     )
     assert (
         "coach_request"
@@ -246,11 +262,11 @@ def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     semantic_schema = json.loads(
         (
             root
-            / "open-match-semantic-proof-v3"
-            / "source-semantic-proof-v3.schema.json"
+            / "open-match-semantic-proof-v4"
+            / "source-semantic-proof-v4.schema.json"
         ).read_text()
     )
-    assert semantic_schema["$id"] == "source-semantic-proof-v3"
+    assert semantic_schema["$id"] == "source-semantic-proof-v4"
     assert (
         "coach_availability"
         in semantic_schema["$defs"]["root"]["properties"]["meaning"]["enum"]
@@ -276,4 +292,42 @@ def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     assert (
         "coach_request"
         in player_semantic_v3["$defs"]["root"]["properties"]["meaning"]["enum"]
+    )
+
+
+def test_open_match_v4_rejects_coaching_at_the_python_contract_boundary() -> None:
+    body = "In-person coaching available in Moscow."
+    candidate = {
+        "candidate_key": "coach-1",
+        "opportunity_type": "coach_availability",
+        "evidence": {
+            "opportunity": body,
+            "location": "Moscow",
+            "coach_availability": "In-person coaching available",
+            "in_person": "In-person",
+        },
+        "source_context": body,
+        "location": {
+            "mention": "Moscow",
+            "place_id": "place:moscow",
+            "country_id": "country:ru",
+            "city_id": "city:moscow",
+        },
+        "coach_availability": True,
+        "in_person": True,
+        "response_routes": [],
+    }
+    output = cast(
+        dict[str, JsonValue],
+        {
+            "schema_version": "source-message-classification-v4",
+            "disposition": "accepted",
+            "candidates": [candidate],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        },
+    )
+    assert not classifier_output_is_schema_valid(
+        output,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V4_DESCRIPTOR,
     )

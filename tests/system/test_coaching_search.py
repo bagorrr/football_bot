@@ -83,7 +83,7 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     classifier = ControlledModelAdapter()
-    classifier.enable_open_match_primary_v4()
+    classifier.enable_coaching_primary_v1()
     resolver = ControlledLocationResolverAdapter()
     date_interpretation = ControlledDateInterpretationAdapter()
     timezone_data = ControlledTimezoneDataAdapter()
@@ -210,7 +210,7 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
         "country_id": "country:ru",
         "city_id": "city:ru:saint-petersburg",
     }
-    result.output["schema_version"] = "source-message-classification-v4"
+    result.output["schema_version"] = "source-message-classification-v5"
     result.output["routing"] = {
         "reason_code": "accepted",
         "required_context": "none",
