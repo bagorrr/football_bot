@@ -22761,21 +22761,42 @@ def _body_establishes_transfer_opportunity(body: str, opportunity_type: str) -> 
     return True
 
 
-def _coaching_body_is_in_person(body: str) -> bool:
-    """Require a source-bound physical coaching signal, never online by default."""
+def _normalize_coaching_text(body: str) -> str:
+    """Normalize common English contractions before polarity checks."""
     normalized = body.casefold()
     for contraction, expansion in (
         ("isn't", "is not"),
         ("aren't", "are not"),
         ("wasn't", "was not"),
         ("weren't", "were not"),
+        ("doesn't", "does not"),
+        ("don't", "do not"),
+        ("didn't", "did not"),
+        ("can't", "cannot"),
+        ("couldn't", "could not"),
+        ("won't", "will not"),
+        ("wouldn't", "would not"),
+        ("shouldn't", "should not"),
         ("isn’t", "is not"),
         ("aren’t", "are not"),
         ("wasn’t", "was not"),
         ("weren’t", "were not"),
+        ("doesn’t", "does not"),
+        ("don’t", "do not"),
+        ("didn’t", "did not"),
+        ("can’t", "cannot"),
+        ("couldn’t", "could not"),
+        ("won’t", "will not"),
+        ("wouldn’t", "would not"),
+        ("shouldn’t", "should not"),
     ):
         normalized = normalized.replace(contraction, expansion)
-    normalized = re.sub(r"['’]", " ", normalized)
+    return re.sub(r"['’]", " ", normalized)
+
+
+def _coaching_body_is_in_person(body: str) -> bool:
+    """Require a source-bound physical coaching signal, never online by default."""
+    normalized = _normalize_coaching_text(body)
     online_only = re.search(
         r"\b(?:online[- ]only|only\s+online|exclusively\s+online|"
         r"remote[- ]only|only\s+remote|distance[- ]only|"
@@ -22800,7 +22821,14 @@ def _coaching_body_is_in_person(body: str) -> bool:
     )
     physical_negation_after = re.compile(
         r"^\s*(?:(?:[\w'-]+\s*)|[—–,.:;!?()\[\]/-]+\s*){0,12}?"
-        r"(?:not\s+(?:available|offered|possible|provided)|"
+        r"(?:not\s+(?:(?:be|being)\s+)?(?:available|offered|possible|"
+        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*)|"
+        r"(?:does|do|did|will|can|could)\s+not\s+(?:(?:be|being)\s+)?"
+        r"(?:available|offered|possible|provided|offer\w*|provide\w*|"
+        r"conduct\w*|teach\w*)|"
+        r"cannot\s+(?:(?:be|being)\s+)?(?:available|offered|possible|"
+        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*)|"
+        r"(?:no\s+longer|never)\s+(?:available|offered|possible|provided)|"
         r"unavailable|no\s+(?:availability|sessions?|coaching)|"
         r"не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
         r"no\s+disponible|indisponible|pas\s+disponible)\b"
@@ -22818,16 +22846,46 @@ def _coaching_body_is_in_person(body: str) -> bool:
     ):
         return False
 
-    def is_negated(match: re.Match[str]) -> bool:
+    negation_marker = re.compile(
+        r"\b(?:not|never|no|without|cannot|do\s+not|does\s+not|"
+        r"did\s+not|will\s+not)\b"
+    )
+    contrast_marker = re.compile(r"\b(?:but|however|although|yet|and)\b")
+
+    def is_negated(match: re.Match[str], clause: re.Match[str]) -> bool:
         before = normalized[max(0, match.start() - 64) : match.start()]
         after = normalized[match.end() : match.end() + 72]
-        return bool(
-            physical_negation_before.search(before)
-            or physical_negation_after.search(after)
-        )
+        if physical_negation_before.search(before) or physical_negation_after.search(
+            after
+        ):
+            return True
+
+        # Bind a preceding negative marker to this exact physical signal.
+        # This closes propositions such as "coaching is not available at the
+        # field" without treating a later affirmative clause after "but" as
+        # negated evidence.
+        prefix = normalized[clause.start() : match.end()]
+        suffix = normalized[match.end() : clause.end()]
+        for marker in negation_marker.finditer(prefix):
+            between = prefix[marker.end() :]
+            if any(
+                coaching_pattern.search(between[connector.end() :] + suffix) is not None
+                for connector in contrast_marker.finditer(between)
+            ):
+                continue
+            if len(re.findall(r"\b[\w'-]+\b", between)) > 12:
+                continue
+            physical_at_end = [
+                physical
+                for physical in physical_pattern.finditer(between)
+                if physical.end() == len(between)
+            ]
+            if physical_at_end:
+                return True
+        return False
 
     has_positive_physical = any(
-        not is_negated(match)
+        not is_negated(match, clause)
         for clause in proposition_clauses
         if coaching_pattern.search(clause.group(0)) is not None
         for match in physical_pattern.finditer(normalized, clause.start(), clause.end())
@@ -22890,11 +22948,25 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
     )
     has_request = request_pattern.search(normalized) is not None
     negated_request_pattern = re.compile(
-        r"\b(?:not|never|no|не|нет|без|sin|pas|sans)"
+        r"(?:"
+        r"\b(?:not|never|no|without|cannot|do\s+not|does\s+not|did\s+not|"
+        r"не|нет|без|sin|pas|sans)"
+        r"(?:\s|[,.:;—–-]){1,10}"
+        r"(?:look(?:ing)?|seek(?:ing)?|search(?:ing)?)\s+for\s+"
+        r"(?:an?\s+)?(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)\b|"
+        r"\b(?:not|never|no|without|cannot|do\s+not|does\s+not|did\s+not)"
+        r"(?:\s|[,.:;—–-]){1,10}"
+        r"(?:need(?:s|ed)?|want(?:s|ed)?|request(?:s|ed)?)\s+"
+        r"(?:an?\s+)?(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)\b|"
+        r"\b(?:not|never|no|without|не|нет|без|sin|pas|sans)"
         r"(?:\s|[,.:;—–-]){1,8}"
         r"(?:is\s+|are\s+|was\s+|were\s+)?"
         r"(?:(?:an?\s+)?(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)\s+)?"
+        r"(?:wanted|required|requested|needed)\b|"
+        r"\b(?:coach(?:ing)?|trainer)\b(?:\s|[,.:;—–-]){0,6}"
+        r"(?:not|never|no|without)\s+"
         r"(?:wanted|required|requested|needed)\b"
+        r")"
     )
     if negated_request_pattern.search(normalized) is not None:
         return False

@@ -603,3 +603,222 @@ def test_online_only_coaching_proposition_is_not_published() -> None:
         "Message @online_coach",
         "coach_request",
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "body",
+        "opportunity_type",
+        "directional_evidence",
+        "in_person_evidence",
+        "route_value",
+        "expected_active",
+    ),
+    (
+        (
+            "In-person coaching is not available at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "Not looking for a coach in person at the field. "
+            "Message @team_contact on Petrogradskaya.",
+            "coach_request",
+            "looking for a coach",
+            "in person",
+            "@team_contact",
+            False,
+        ),
+        (
+            "In-person coaching — not available at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching. Not available at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is available at the field; online-only sessions "
+            "are also available. Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching is available",
+            "In-person",
+            "@coach_contact",
+            True,
+        ),
+        (
+            "Online-only coaching is available; in-person coaching is not offered "
+            "at the field. Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "Online-only coaching is available",
+            "in-person coaching is not offered",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coach offers individual training at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "coach offers",
+            "In-person",
+            "@coach_contact",
+            True,
+        ),
+        (
+            "The team wants an in-person coach at the field. "
+            "Message @team_contact on Petrogradskaya.",
+            "coach_request",
+            "wants an in-person coach",
+            "in-person",
+            "@team_contact",
+            True,
+        ),
+    ),
+)
+def test_coaching_polarity_is_enforced_by_authoritative_acceptance(
+    body: str,
+    opportunity_type: str,
+    directional_evidence: str,
+    in_person_evidence: str,
+    route_value: str,
+    expected_active: bool,
+) -> None:
+    """Schema-valid coaching artifacts cannot publish negated propositions."""
+    telegram_ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_coaching_primary_v1()
+    resolver = ControlledLocationResolverAdapter()
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 56_004
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=5_600_200,
+    )
+    telegram_ingestion.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:5620",
+    )
+    result = _minimal_classifier_result(
+        candidate_key="coaching-polarity-candidate",
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": route_value,
+                "evidence": route_value,
+            }
+        ],
+        opportunity_evidence=directional_evidence,
+    )
+    candidates = result.output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    evidence = candidate["evidence"]
+    assert isinstance(evidence, dict)
+    candidate["opportunity_type"] = opportunity_type
+    candidate["source_context"] = body
+    candidate.pop("event_time", None)
+    candidate.pop("open_places", None)
+    candidate[opportunity_type] = True
+    candidate["in_person"] = True
+    evidence.clear()
+    evidence.update(
+        {
+            "opportunity": directional_evidence,
+            "location": "on Petrogradskaya",
+            opportunity_type: directional_evidence,
+            "in_person": in_person_evidence,
+        }
+    )
+    candidate["location"] = {
+        "mention": "on Petrogradskaya",
+        "place_id": "station:ru:spb:petrogradskaya",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+    }
+    result.output["schema_version"] = "source-message-classification-v5"
+    result.output["routing"] = {
+        "reason_code": "accepted",
+        "required_context": "none",
+    }
+    classifier.return_for(body=body, result=result)
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="on Petrogradskaya",
+        resolution=_transfer_location_resolution(),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram_ingestion,
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezone_data,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=5620),
+        to_checkpoint=TelegramChannelCheckpoint(pts=5621),
+        source_event_id="source-event:coaching-polarity:1",
+        telegram_message_id=5621,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    revision_id = "source-chat:channel:5600200:generation:1:message:5621:revision:1"
+    active_publications = [
+        publication.payload
+        for publication in system.opportunity_publication_contracts(revision_id)
+        if isinstance(publication.payload, dict)
+        and publication.payload.get("publication_state") == "active"
+    ]
+    if expected_active:
+        opportunities = system.opportunities()
+        assert len(opportunities) == 1
+        assert opportunities[0].opportunity_type == opportunity_type
+        assert len(active_publications) == 1
+        assert active_publications[0]["response_route"] == {
+            "kind": "explicit_telegram_username",
+            "value": route_value,
+        }
+    else:
+        assert system.opportunities() == ()
+        assert active_publications == []
+    system.reset()

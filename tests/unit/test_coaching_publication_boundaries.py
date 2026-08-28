@@ -418,6 +418,11 @@ def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -
             True,
         ),
         (
+            "No coach was found at the field, but in-person coaching is available.",
+            "coach_availability",
+            True,
+        ),
+        (
             "In-person field rental; online coaching available.",
             "coach_availability",
             False,
@@ -429,6 +434,31 @@ def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -
         ),
         (
             "In-person coaching is not available. Online-only sessions are offered.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is not available at the field. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "No in-person coaching is available at the field. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "Not looking for a coach in person at the field. Message @team.",
+            "coach_request",
+            False,
+        ),
+        (
+            "The team doesn't need an in-person coach at the field. Message @team.",
+            "coach_request",
+            False,
+        ),
+        (
+            "In-person coaching — not available at the field. Message @coach.",
             "coach_availability",
             False,
         ),
