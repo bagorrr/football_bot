@@ -1,0 +1,353 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "source-message-classification-v4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "disposition", "candidates", "routing"],
+  "properties": {
+    "schema_version": {"const": "source-message-classification-v4"},
+    "disposition": {"enum": ["accepted", "needs_second_pass", "needs_review", "irrelevant", "unresolved"]},
+    "candidates": {"type": "array", "maxItems": 8},
+    "routing": {"$ref": "#/$defs/routing"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"disposition": {"const": "accepted"}}},
+      "then": {"properties": {"candidates": {"minItems": 1, "items": {"$ref": "#/$defs/acceptedCandidate"}}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"const": "unresolved"}}},
+      "then": {"properties": {"candidates": {"minItems": 1, "maxItems": 1, "items": {"$ref": "#/$defs/unresolvedCandidate"}}}}
+    },
+    {
+      "if": {"properties": {"disposition": {"enum": ["needs_second_pass", "needs_review", "irrelevant"]}}},
+      "then": {"properties": {"candidates": {"maxItems": 0}}}
+    }
+  ],
+  "$defs": {
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason_code", "required_context"],
+      "properties": {
+        "reason_code": {"enum": ["accepted", "compound_propositions", "deterministic_ambiguity", "competing_interpretations", "irrelevant", "needs_review", "prompt_injection"]},
+        "required_context": {"enum": ["none", "refined_prompt", "direct_reply", "adjacent_revisions"]}
+      }
+    },
+    "acceptedCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_key", "opportunity_type", "evidence", "source_context", "location", "response_routes"],
+      "properties": {
+        "candidate_key": {"type": "string", "minLength": 1},
+        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "evidence": {"$ref": "#/$defs/evidence"},
+        "source_context": {"type": "string", "minLength": 1},
+        "location": {"$ref": "#/$defs/location"},
+        "event_time": {"$ref": "#/$defs/eventTime"},
+        "seasonal_timing": {"$ref": "#/$defs/seasonalTiming"},
+        "open_places": {"type": ["integer", "null"], "minimum": 1},
+        "open_participation": {"const": true},
+        "registration_open": {"const": true},
+        "opponent_request": {"const": true},
+        "roster_vacancy": {"const": true},
+        "player_transfer_availability": {"const": true},
+        "referee_availability": {"const": true},
+        "referee_request": {"const": true},
+        "response_routes": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/route"}},
+        "team_formats": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"]}},
+        "event_types": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["match", "tournament"]}},
+        "referee_roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["head_referee", "assistant_referee", "var"]}},
+        "positions": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["goalkeeper", "defender", "midfielder", "forward"]}},
+        "playing_levels": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["novice", "below_average", "average", "above_average", "high", "very_high", "master", "professional"]}},
+        "venue_settings": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["indoor", "outdoor", "covered_outdoor"]}},
+        "playing_surfaces": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["natural_grass", "artificial_turf", "hard_surface", "wood_parquet"]}},
+        "payment": {"enum": ["free", "paid", "unknown", null]},
+        "schedule": {"$ref": "#/$defs/tournament_fact"},
+        "registration_deadline": {"$ref": "#/$defs/tournament_fact"},
+        "structure": {"$ref": "#/$defs/tournament_fact"},
+        "capacity": {"$ref": "#/$defs/tournament_fact"},
+        "prizes": {"$ref": "#/$defs/tournament_fact"},
+        "venue_provision": {"enum": ["team_has_venue", "needs_opponent_venue", "arrange_jointly", "unknown", null]},
+        "proposition_evidence": {"$ref": "#/$defs/propositionEvidence"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"opportunity_type": {"const": "open_match"}}},
+          "then": {
+            "required": ["event_time", "open_places"],
+            "properties": {
+              "evidence": {
+                "required": ["event_time", "open_places"],
+                "not": {"required": ["opponent_request", "roster_vacancy", "player_transfer_availability"]}
+              }
+            },
+            "not": {"anyOf": [{"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"const": "tournament"}}},
+          "then": {
+            "required": ["event_time"],
+            "oneOf": [{"required": ["open_participation"]}, {"required": ["registration_open"]}],
+            "properties": {
+              "evidence": {
+                "required": ["event_time"],
+                "oneOf": [{"required": ["open_participation"]}, {"required": ["registration_open"]}],
+                "not": {"required": ["opponent_request", "roster_vacancy", "player_transfer_availability"]}
+              }
+            },
+            "not": {"anyOf": [{"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"const": "opponent_request"}}},
+          "then": {
+            "required": ["event_time", "opponent_request"],
+            "properties": {
+              "evidence": {
+                "required": ["event_time", "opponent_request"],
+                "not": {"required": ["open_places", "roster_vacancy", "player_transfer_availability"]}
+              }
+            },
+            "allOf": [
+              {"not": {"required": ["open_places"]}},
+              {"not": {"required": ["positions"]}}
+            ]
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"enum": ["roster_vacancy", "player_transfer_availability"]}}},
+          "then": {
+            "not": {"anyOf": [{"required": ["event_time"]}, {"required": ["open_places"]}, {"required": ["opponent_request"]}, {"required": ["venue_provision"]}]},
+            "properties": {
+              "evidence": {
+                "required": ["location"],
+                "not": {"required": ["event_time", "open_places", "opponent_request"]}
+              }
+            },
+            "allOf": [
+              {"if": {"properties": {"opportunity_type": {"const": "roster_vacancy"}}}, "then": {"required": ["roster_vacancy"]}},
+              {"if": {"properties": {"opportunity_type": {"const": "player_transfer_availability"}}}, "then": {"required": ["player_transfer_availability"]}},
+              {"if": {"required": ["seasonal_timing"]}, "then": {"properties": {"evidence": {"required": ["seasonal_timing"]}}}}
+            ]
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"const": "referee_availability"}}},
+          "then": {
+            "required": ["referee_availability"],
+            "properties": {
+              "evidence": {
+                "required": ["referee_availability"],
+                "not": {"required": ["open_places", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_request"]}
+              }
+            },
+            "not": {"anyOf": [{"required": ["open_places"]}, {"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}, {"required": ["referee_request"]}]},
+            "allOf": [
+              {"if": {"required": ["event_time"]}, "then": {"properties": {"evidence": {"required": ["event_time"]}}}}
+            ]
+          }
+        },
+        {
+          "if": {"properties": {"opportunity_type": {"const": "referee_request"}}},
+          "then": {
+            "required": ["event_time", "referee_request"],
+            "properties": {
+              "evidence": {
+                "required": ["event_time", "referee_request"],
+                "not": {"required": ["open_places", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability"]}
+              }
+            },
+            "not": {"anyOf": [{"required": ["open_places"]}, {"required": ["opponent_request"]}, {"required": ["roster_vacancy"]}, {"required": ["player_transfer_availability"]}, {"required": ["referee_availability"]}]}
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["opportunity", "location"],
+      "properties": {
+        "opportunity": {"type": "string", "minLength": 1},
+        "event_time": {"type": "string", "minLength": 1},
+        "location": {"type": "string", "minLength": 1},
+        "seasonal_timing": {"type": "string", "minLength": 1},
+        "open_places": {"type": "string", "minLength": 1},
+        "open_participation": {"type": "string", "minLength": 1},
+        "registration_open": {"type": "string", "minLength": 1},
+        "opponent_request": {"type": "string", "minLength": 1},
+        "roster_vacancy": {"type": "string", "minLength": 1},
+        "player_transfer_availability": {"type": "string", "minLength": 1},
+        "referee_availability": {"type": "string", "minLength": 1},
+        "referee_request": {"type": "string", "minLength": 1},
+        "event_types": {"type": "string", "minLength": 1},
+        "referee_roles": {"type": "string", "minLength": 1},
+        "team_formats": {"type": "string", "minLength": 1},
+        "positions": {"type": "string", "minLength": 1},
+        "playing_levels": {"type": "string", "minLength": 1},
+        "venue_provision": {"type": "string", "minLength": 1},
+        "venue_settings": {"type": "string", "minLength": 1},
+        "playing_surfaces": {"type": "string", "minLength": 1},
+        "payment": {"type": "string", "minLength": 1},
+        "schedule": {"type": "string", "minLength": 1},
+        "registration_deadline": {"type": "string", "minLength": 1},
+        "structure": {"type": "string", "minLength": 1},
+        "capacity": {"type": "string", "minLength": 1},
+        "prizes": {"type": "string", "minLength": 1}
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mention", "place_id", "country_id", "city_id"],
+      "properties": {
+        "mention": {"type": "string", "minLength": 1},
+        "place_id": {"type": "string", "minLength": 1},
+        "country_id": {"type": "string", "minLength": 1},
+        "city_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "eventTime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_local_date", "end_local_date", "iana_timezone"],
+      "not": {"required": ["exact_local_time", "day_part"]},
+      "properties": {
+        "start_local_date": {"type": "string", "format": "date"},
+        "end_local_date": {"type": "string", "format": "date"},
+        "exact_local_time": {"type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"},
+        "day_part": {"enum": ["morning", "daytime", "evening", "night"]},
+        "iana_timezone": {"type": "string", "minLength": 1}
+      }
+    },
+    "seasonalTiming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {"enum": ["ready_now", "start_local_date", "stated_season"]},
+        "value": {"type": ["string", "null"], "minLength": 1, "maxLength": 80}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "ready_now"}}}, "then": {"properties": {"value": {"const": null}}}},
+        {"if": {"properties": {"kind": {"const": "start_local_date"}}}, "then": {"properties": {"value": {"type": "string", "format": "date"}}}},
+        {"if": {"properties": {"kind": {"const": "stated_season"}}}, "then": {"properties": {"value": {"type": "string"}}}}
+      ]
+    },
+    "tournament_fact": {
+      "type": ["string", "number", "array", "object"],
+      "minLength": 1,
+      "minItems": 1,
+      "minProperties": 1
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "evidence"],
+      "properties": {
+        "kind": {"enum": ["explicit_telegram_username", "explicit_phone", "explicit_url"]},
+        "value": {"type": "string", "minLength": 1},
+        "evidence": {"type": "string", "minLength": 1}
+      }
+    },
+    "sourceSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end", "text"],
+      "properties": {
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 1},
+        "text": {"type": "string", "minLength": 1}
+      }
+    },
+    "propositionFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proposition_id", "polarity", "currentness", "span"],
+      "properties": {
+        "proposition_id": {"type": "string", "minLength": 1},
+        "polarity": {"enum": ["positive", "negative", "ambiguous"]},
+        "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
+        "span": {"$ref": "#/$defs/sourceSpan"}
+      }
+    },
+    "propositionRoot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proposition_id", "domain", "meaning", "polarity", "currentness", "span"
+      ],
+      "properties": {
+        "proposition_id": {"type": "string", "minLength": 1},
+        "domain": {"enum": ["football_match"]},
+        "meaning": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "polarity": {"enum": ["positive", "negative", "ambiguous"]},
+        "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
+        "span": {"$ref": "#/$defs/sourceSpan"}
+      }
+    },
+    "propositionRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "value", "proposition_id", "polarity", "currentness", "span"
+      ],
+      "properties": {
+        "kind": {"enum": ["explicit_telegram_username", "explicit_phone", "explicit_url"]},
+        "value": {"type": "string", "minLength": 1},
+        "proposition_id": {"type": "string", "minLength": 1},
+        "polarity": {"enum": ["positive", "negative", "ambiguous"]},
+        "currentness": {"enum": ["current", "superseded", "withdrawn", "unknown"]},
+        "span": {"$ref": "#/$defs/sourceSpan"}
+      }
+    },
+    "propositionRelation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "direction", "target", "span"],
+      "properties": {
+        "kind": {"enum": ["supports", "negates", "replaces", "competes_with"]},
+        "direction": {"enum": ["incoming", "outgoing"]},
+        "target": {"type": "string", "minLength": 1},
+        "span": {"$ref": "#/$defs/sourceSpan"}
+      }
+    },
+    "propositionEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "coverage", "root", "facts", "routes", "relations"],
+      "properties": {
+        "contract_version": {"const": "source-proposition-evidence-v2"},
+        "coverage": {"const": "complete_source_revision"},
+        "root": {"$ref": "#/$defs/propositionRoot"},
+        "facts": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/propositionFact"}
+        },
+        "routes": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {"$ref": "#/$defs/propositionRoute"}
+        },
+        "relations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {"$ref": "#/$defs/propositionRelation"}
+        }
+      }
+    },
+    "unresolvedCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_key", "opportunity_type", "evidence", "alternatives"],
+      "properties": {
+        "candidate_key": {"type": "string", "minLength": 1},
+        "opportunity_type": {"enum": ["open_match", "tournament", "opponent_request", "roster_vacancy", "player_transfer_availability", "referee_availability", "referee_request"]},
+        "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}},
+        "alternatives": {"type": "array", "minItems": 2, "maxItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["alternative_key", "evidence"], "properties": {"alternative_key": {"type": "string", "minLength": 1}, "evidence": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "minLength": 1}}}}}
+      }
+    }
+  }
+}

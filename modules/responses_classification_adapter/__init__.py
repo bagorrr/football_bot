@@ -66,6 +66,13 @@ class ResponsesClassifierAdapter:
             and "source-semantic-proof-v2" in self._schemas
             and "open-match-semantic-proof-v2" in self._prompt_paths
         )
+        open_v4_artifacts_complete = (
+            "source-message-classification-v4" in self._schemas
+            and "open-match-primary-v4" in self._prompt_paths
+            and "open-match-ambiguity-v3" in self._prompt_paths
+            and "source-semantic-proof-v3" in self._schemas
+            and "open-match-semantic-proof-v3" in self._prompt_paths
+        )
         v3_artifacts_complete = (
             player_v3_artifacts_complete or open_v3_artifacts_complete
         )
@@ -75,6 +82,7 @@ class ResponsesClassifierAdapter:
                 for version, available in (
                     ("source-message-classification-v2", v2_primary_available),
                     ("source-message-classification-v3", v3_artifacts_complete),
+                    ("source-message-classification-v4", open_v4_artifacts_complete),
                 )
                 if available
             ]
@@ -98,11 +106,16 @@ class ResponsesClassifierAdapter:
             v2_primary_available
         ):
             raise ValueError("incomplete v2 classifier artifact set")
+        if primary_schema_version == "source-message-classification-v4" and not (
+            open_v4_artifacts_complete
+        ):
+            raise ValueError("incomplete v4 classifier artifact set")
         self._primary_schema_version = primary_schema_version
         if self._primary_schema_version not in {
             "source-message-classification-v1",
             "source-message-classification-v2",
             "source-message-classification-v3",
+            "source-message-classification-v4",
         }:
             raise ValueError("unsupported primary classifier schema version")
         self._primary_prompt_version = (
@@ -113,6 +126,8 @@ class ResponsesClassifierAdapter:
             else (
                 "open-match-primary-v3"
                 if self._primary_schema_version == "source-message-classification-v3"
+                else "open-match-primary-v4"
+                if self._primary_schema_version == "source-message-classification-v4"
                 else "open-match-primary-v2"
                 if self._primary_schema_version == "source-message-classification-v2"
                 else "open-match-primary-v1"
