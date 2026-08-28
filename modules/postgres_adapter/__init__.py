@@ -9830,9 +9830,10 @@ def _exact_repost_key(
         "source_publisher_id": source_publisher_id,
         "normalized_body": normalized_body,
     }
-    if not resolved_event_date.startswith("undated:"):
-        if not isinstance(opportunity_type, str) or not opportunity_type:
-            raise ValueError("dated exact repost identity requires opportunity type")
+    if not resolved_event_date.startswith("undated:") and opportunity_type in {
+        "coach_availability",
+        "coach_request",
+    }:
         material_fields["opportunity_type"] = opportunity_type
     material = json.dumps(
         material_fields,

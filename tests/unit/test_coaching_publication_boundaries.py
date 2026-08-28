@@ -198,6 +198,24 @@ def test_dated_exact_repost_identity_partitions_coaching_directions() -> None:
     assert availability_repost == availability
 
 
+def test_dated_non_coaching_exact_repost_identity_keeps_legacy_digest() -> None:
+    common = {
+        "source_chat_reference": "source-chat:channel:123",
+        "source_publisher_id": "publisher:42",
+        "normalized_body": "in person coach available in moscow",
+        "resolved_event_date": "2026-08-20",
+    }
+    historical_digest = (
+        "24a5ebef7d7a78a02253965a2b399828d8ff333be08b1b58989de97b59e59f40"
+    )
+
+    assert _exact_repost_key(**common) == historical_digest
+    assert (
+        _exact_repost_key(**common, opportunity_type="player_match_availability")
+        == historical_digest
+    )
+
+
 def _coaching_revision(
     *,
     revision: int,
