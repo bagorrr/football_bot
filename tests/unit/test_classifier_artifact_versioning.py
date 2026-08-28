@@ -1,4 +1,4 @@
-"""Classifier artifact immutability and additive Player release coverage."""
+"""Classifier artifact immutability and additive coaching release coverage."""
 
 import json
 from pathlib import Path
@@ -210,22 +210,38 @@ def test_coaching_artifact_expansion_is_not_applied_to_the_old_v3_release() -> N
 
 def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     root = Path(__file__).parents[2] / "classifier"
-    for release_name, _prompt_name in (
-        ("open-match-primary-v4", "open-match-primary-v4"),
-        ("player-match-primary-v2", "player-match-primary-v2"),
-    ):
-        release = root / release_name
-        schema = json.loads(
-            (release / "source-message-classification-v4.schema.json").read_text()
-        )
-        prompt = (release / "prompt.md").read_text().casefold()
-        assert schema["$id"] == "source-message-classification-v4"
-        accepted_types = schema["$defs"]["acceptedCandidate"]["properties"][
-            "opportunity_type"
-        ]["enum"]
-        assert {"coach_availability", "coach_request"} <= set(accepted_types)
-        assert "coach_availability" in prompt
-        assert "coach_request" in prompt
+    open_schema = json.loads(
+        (
+            root
+            / "open-match-primary-v4"
+            / "source-message-classification-v4.schema.json"
+        ).read_text()
+    )
+    open_types = open_schema["$defs"]["acceptedCandidate"]["properties"][
+        "opportunity_type"
+    ]["enum"]
+    assert {"coach_availability", "coach_request"} <= set(open_types)
+    assert {"referee_availability", "referee_request"} <= set(open_types)
+    player_schema = json.loads(
+        (
+            root
+            / "player-match-primary-v2"
+            / "source-message-classification-v4.schema.json"
+        ).read_text()
+    )
+    assert {"coach_availability", "coach_request"} <= set(
+        player_schema["$defs"]["acceptedCandidate"]["properties"]["opportunity_type"][
+            "enum"
+        ]
+    )
+    assert (
+        "coach_availability"
+        in (root / "open-match-primary-v4" / "prompt.md").read_text().casefold()
+    )
+    assert (
+        "coach_request"
+        in (root / "player-match-primary-v2" / "prompt.md").read_text().casefold()
+    )
 
     semantic_schema = json.loads(
         (
@@ -238,4 +254,26 @@ def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
     assert (
         "coach_availability"
         in semantic_schema["$defs"]["root"]["properties"]["meaning"]["enum"]
+    )
+    semantic_v2 = json.loads(
+        (
+            root
+            / "open-match-semantic-proof-v2"
+            / "source-semantic-proof-v2.schema.json"
+        ).read_text()
+    )
+    assert (
+        "coach_availability"
+        not in semantic_v2["$defs"]["root"]["properties"]["meaning"]["enum"]
+    )
+    player_semantic_v3 = json.loads(
+        (
+            root
+            / "player-match-semantic-proof-v2"
+            / "source-semantic-proof-v3.schema.json"
+        ).read_text()
+    )
+    assert (
+        "coach_request"
+        in player_semantic_v3["$defs"]["root"]["properties"]["meaning"]["enum"]
     )

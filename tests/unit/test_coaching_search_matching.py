@@ -216,6 +216,31 @@ def test_start_date_is_directional_and_missing_date_is_unknown() -> None:
     )
 
 
+def test_undated_coaching_listing_does_not_expose_assertion_as_availability_date() -> (
+    None
+):
+    results = evaluate_coaching_search(
+        _search(UserIntent.COACH_SEARCH),
+        {},
+        (
+            _opportunity(
+                "coach_availability",
+                schedule={"weekdays": ["monday"], "day_parts": ["evening"]},
+            ),
+        ),
+    )
+
+    assert len(results) == 1
+    card = dict(results[0].card_facts)
+    assert "start_local_date" not in card
+    assert "end_local_date" not in card
+    assert "sort_local_date" not in card
+    assert json.loads(card["schedule"]) == {
+        "day_parts": ["evening"],
+        "weekdays": ["monday"],
+    }
+
+
 def test_date_only_schedule_is_rejected_at_matching_and_contract_boundaries() -> None:
     date_only: dict[str, JsonValue] = {"start_local_date": "2026-09-01"}
     states = match_coaching_schedule(

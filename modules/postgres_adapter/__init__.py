@@ -154,9 +154,11 @@ _LEGACY_MIGRATION_NAMES = (
     "0026_exact_repost_clusters.sql",
     "0027_classifier_promotion_attestations.sql",
     "0028_classifier_promotion_execution_records.sql",
-    "0029_coaching_opportunities.sql",
-    "0030_coaching_exact_repost_clusters.sql",
-    "0031_exact_repost_result_projection.sql",
+    "0029_refereeing_opportunities.sql",
+    "0030_referee_source_chat_projection_gate.sql",
+    "0031_coaching_opportunities.sql",
+    "0032_coaching_exact_repost_clusters.sql",
+    "0033_exact_repost_result_projection.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -189,9 +191,11 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7856483bc640ecb0d84b6f137a150ccaef971e393d2390d933d5df133187e764",
     "460bb27388e10e836c8f1d8d3db37a01c2c2779a85bf7e5d114d68bcb1d018a9",
     "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
-    "4a9356358f2e925659f0488b7185729b3a5d9498eaf55eb284e3d85e0de1c4d0",
-    "6de928289cef3754a109c4c3a92997b0d5a73e33309dc071f5ad59e86431ebbc",
-    "b563284e78139a97b8da8692ff75b0a91a017535b53b79b78628d62f4c5b063d",
+    "f3dfa0e4dc25c72cf25076ae7b3fcde842e162b548d988a3a6a53b6fe7a6f65d",
+    "85436cdbd933795eb6b27b20b1cfcc84338dbba14c59918b3c0a77d1243ad972",
+    "9be9f446dcd41fb57b213a4e65668de2fd020ba2c2102131511021330dca2f6f",
+    "198ac94c3f46c53ded9df4f94e5767514ad42fa389ef084af2834f16a9be2d7e",
+    "a962802784545373f32833cbd8222e6e93a257cb690b397c2c3d485cc7ab5c1d",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1763,6 +1767,7 @@ class PostgresAcceptanceObserver:
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
                        opponent_search_details, tournament_search_details,
+                       referee_search_details, refereeing_service_offer_details,
                        transfer_search_details, coaching_search_details,
                        number_of_players, completed_at
                 FROM football_runtime.recommendation_completed_searches
@@ -1797,63 +1802,142 @@ class PostgresAcceptanceObserver:
                        current_projection.response_route_value
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
-                    SELECT opportunity_id, opportunity_revision_id,
-                           publication_state,
-                           CASE
-                               WHEN opportunity_type = 'tournament'
-                               THEN jsonb_build_object(
-                                   'start_local_date',
-                                   accepted_facts -> 'start_local_date',
-                                   'end_local_date',
-                                   accepted_facts -> 'end_local_date',
-                                   'exact_local_time',
-                                   accepted_facts -> 'exact_local_time',
-                                   'day_part', accepted_facts -> 'day_part',
-                                   'iana_timezone', accepted_facts -> 'iana_timezone',
-                                   'open_participation',
-                                   accepted_facts -> 'open_participation'
-                               ) || CASE
-                                   WHEN accepted_facts ? 'registration_deadline'
-                                   THEN jsonb_build_object(
-                                       'registration_deadline',
-                                       accepted_facts -> 'registration_deadline'
-                                   )
-                                   ELSE '{}'::jsonb
-                               END
-                               ELSE accepted_facts
-                           END AS current_facts,
-                           response_route ->> 'kind' AS response_route_kind,
-                           response_route ->> 'value' AS response_route_value
-                    FROM football_runtime.recommendation_opportunities
-                    WHERE opportunity_id = COALESCE(
+                    SELECT projection.opportunity_id,
+                           projection.opportunity_revision_id,
+                           projection.publication_state,
+                           projection.current_facts,
+                           projection.response_route_kind,
+                           projection.response_route_value,
+                           projection.published_at
+                    FROM (
                         (
-                            SELECT cluster.representative_opportunity_id
-                            FROM football_runtime
-                                .application_exact_repost_cluster_members AS member
-                            JOIN football_runtime.application_exact_repost_clusters
-                                AS cluster
-                              ON cluster.exact_repost_cluster_id =
-                                 member.exact_repost_cluster_id
-                            WHERE member.opportunity_id =
-                                  result.card_facts->>'opportunity_id'
-                              AND cluster.representative_opportunity_id IS NOT NULL
-                        ),
-                        result.card_facts->>'opportunity_id'
-                    )
-                      AND opportunity_type = result.card_facts->>'opportunity_type'
-                      AND opportunity_type IN (
-                          'tournament', 'coach_availability', 'coach_request'
-                      )
+                            SELECT opportunity_id, opportunity_revision_id,
+                                   publication_state,
+                                   CASE
+                                       WHEN opportunity_type = 'tournament'
+                                       THEN jsonb_build_object(
+                                           'start_local_date',
+                                           accepted_facts -> 'start_local_date',
+                                           'end_local_date',
+                                           accepted_facts -> 'end_local_date',
+                                           'exact_local_time',
+                                           accepted_facts -> 'exact_local_time',
+                                           'day_part', accepted_facts -> 'day_part',
+                                           'iana_timezone',
+                                           accepted_facts -> 'iana_timezone',
+                                           'open_participation',
+                                           accepted_facts -> 'open_participation'
+                                       ) || CASE
+                                           WHEN accepted_facts ? 'registration_deadline'
+                                           THEN jsonb_build_object(
+                                               'registration_deadline',
+                                               accepted_facts -> 'registration_deadline'
+                                           )
+                                           ELSE '{}'::jsonb
+                                       END
+                                       ELSE accepted_facts
+                                   END AS current_facts,
+                                   response_route ->> 'kind' AS response_route_kind,
+                                   response_route ->> 'value' AS response_route_value,
+                                   published_at
+                            FROM football_runtime.recommendation_opportunities
+                            WHERE opportunity_id = COALESCE(
+                                (
+                                    SELECT cluster.representative_opportunity_id
+                                    FROM football_runtime
+                                        .application_exact_repost_cluster_members
+                                        AS member
+                                    JOIN football_runtime
+                                        .application_exact_repost_clusters AS cluster
+                                      ON cluster.exact_repost_cluster_id =
+                                         member.exact_repost_cluster_id
+                                    WHERE member.opportunity_id =
+                                          result.card_facts->>'opportunity_id'
+                                      AND cluster.representative_opportunity_id
+                                          IS NOT NULL
+                                ),
+                                result.card_facts->>'opportunity_id'
+                            )
+                              AND opportunity_type =
+                                  result.card_facts->>'opportunity_type'
+                              AND opportunity_type IN (
+                                  'tournament', 'coach_availability', 'coach_request'
+                              )
+                        )
+                        UNION ALL
+                        (
+                            SELECT recommendation.opportunity_id,
+                                   recommendation.opportunity_revision_id,
+                                   CASE
+                                       WHEN source_chat.source_chat_enabled
+                                       THEN recommendation.publication_state
+                                       ELSE 'suppressed'
+                                   END AS publication_state,
+                                   recommendation.accepted_facts AS current_facts,
+                                   CASE
+                                       WHEN recommendation.publication_state = 'active'
+                                        AND source_chat.source_chat_enabled
+                                       THEN recommendation.response_route ->> 'kind'
+                                       ELSE NULL
+                                   END AS response_route_kind,
+                                   CASE
+                                       WHEN recommendation.publication_state = 'active'
+                                        AND source_chat.source_chat_enabled
+                                       THEN recommendation.response_route ->> 'value'
+                                       ELSE NULL
+                                   END AS response_route_value,
+                                   recommendation.published_at
+                            FROM football_runtime.recommendation_opportunities
+                                AS recommendation
+                            CROSS JOIN LATERAL (
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM football_runtime.application_opportunities
+                                        AS application
+                                    JOIN football_runtime.source_message_revisions
+                                        AS revision
+                                      ON revision.source_message_revision_id =
+                                         application.source_message_revision_id
+                                    JOIN football_runtime.source_messages AS source
+                                      ON source.source_message_id =
+                                         revision.source_message_id
+                                    JOIN football_runtime.source_chat_registry
+                                        AS registry
+                                      ON registry.peer_kind = source.peer_kind
+                                     AND registry.telegram_chat_id =
+                                         source.telegram_chat_id
+                                     AND registry.registry_generation =
+                                         source.registry_generation
+                                    WHERE application.opportunity_id =
+                                        recommendation.opportunity_id
+                                      AND application.opportunity_type IN (
+                                          'referee_availability', 'referee_request'
+                                      )
+                                      AND registry.enabled
+                                      AND registry.initial_consent_attestation =
+                                          'confirmed'
+                                ) AS source_chat_enabled
+                            ) AS source_chat
+                            WHERE recommendation.opportunity_id =
+                                      result.card_facts->>'opportunity_id'
+                              AND recommendation.opportunity_type =
+                                      result.card_facts->>'opportunity_type'
+                              AND recommendation.opportunity_type IN (
+                                  'referee_availability', 'referee_request'
+                              )
+                        )
+                    ) AS projection
                     ORDER BY CASE
-                                 WHEN opportunity_revision_id ~ ':revision:[0-9]+$'
+                                 WHEN projection.opportunity_revision_id ~
+                                      ':revision:[0-9]+$'
                                  THEN substring(
-                                     opportunity_revision_id
+                                     projection.opportunity_revision_id
                                      FROM ':revision:([0-9]+)$'
                                  )::bigint
                                  ELSE 0
                              END DESC,
-                             published_at DESC,
-                             opportunity_revision_id DESC
+                             projection.published_at DESC,
+                             projection.opportunity_revision_id DESC
                     LIMIT 1
                 ) AS current_projection ON TRUE
                 WHERE result.completed_search_id = %s
@@ -5567,7 +5651,7 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
-            if incoming.contract_version == 3:
+            if incoming.contract_version in {3, 5}:
                 batch = payload["opportunities"]
                 if not isinstance(batch, list):
                     raise TypeError("OpportunityPublicationChanged v3 batch is invalid")
@@ -5808,6 +5892,8 @@ class PostgresRoleStore:
             UserIntent.TOURNAMENT_SEARCH,
             UserIntent.NEW_TEAM_SEARCH,
             UserIntent.TRANSFER_PLAYER_SEARCH,
+            UserIntent.REFEREE_SEARCH,
+            UserIntent.REFEREEING_SERVICE_OFFER,
             UserIntent.COACH_SEARCH,
             UserIntent.COACHING_SERVICE_OFFER,
         }:
@@ -5857,6 +5943,18 @@ class PostgresRoleStore:
             return evaluate_tournament_search(
                 completed_search,
                 dict(completed_search.tournament_search_details),
+                projections,
+            )
+        if completed_search.user_intent is UserIntent.REFEREE_SEARCH:
+            return evaluate_referee_search(
+                completed_search,
+                dict(completed_search.referee_search_details),
+                projections,
+            )
+        if completed_search.user_intent is UserIntent.REFEREEING_SERVICE_OFFER:
+            return evaluate_refereeing_service_offer(
+                completed_search,
+                dict(completed_search.refereeing_service_offer_details),
                 projections,
             )
         if completed_search.user_intent in {
@@ -6026,6 +6124,18 @@ class PostgresRoleStore:
                     dict(completed_search.tournament_search_details),
                     projections,
                 )
+            elif completed_search.user_intent is UserIntent.REFEREE_SEARCH:
+                results = evaluate_referee_search(
+                    completed_search,
+                    dict(completed_search.referee_search_details),
+                    projections,
+                )
+            elif completed_search.user_intent is UserIntent.REFEREEING_SERVICE_OFFER:
+                results = evaluate_refereeing_service_offer(
+                    completed_search,
+                    dict(completed_search.refereeing_service_offer_details),
+                    projections,
+                )
             elif completed_search.user_intent in {
                 UserIntent.NEW_TEAM_SEARCH,
                 UserIntent.TRANSFER_PLAYER_SEARCH,
@@ -6063,12 +6173,14 @@ class PostgresRoleStore:
                     sub_city_area_verified_parent_ids, whole_city, required_date,
                     game_search_details, opponent_search_details,
                     tournament_search_details,
+                    referee_search_details, refereeing_service_offer_details,
                     transfer_search_details, coaching_search_details,
                     opportunity_revision_inputs, number_of_players, completed_at
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                     %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb,
-                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s::jsonb, %s, %s
                 )
                 """,
                 (
@@ -6841,7 +6953,10 @@ class PostgresRoleStore:
                             %s::jsonb, %s, %s::jsonb, %s,
                             %s::jsonb, %s, %s::jsonb,
                             %s::jsonb, %s, %s::jsonb, %s,
-                            %s::jsonb, %s, %s::jsonb, %s, %s
+                            %s::jsonb, %s, %s::jsonb, %s,
+                            %s::jsonb, %s, %s::jsonb, %s,
+                            %s::jsonb, %s, %s::jsonb, %s,
+                            %s
                         )
                         ON CONFLICT DO NOTHING
                         RETURNING revision
@@ -7934,6 +8049,7 @@ class PostgresRoleStore:
                        sub_city_area_verified_parent_ids,
                        whole_city, required_date, game_search_details,
                        opponent_search_details, tournament_search_details,
+                       referee_search_details, refereeing_service_offer_details,
                        transfer_search_details, coaching_search_details,
                        number_of_players, completed_at
                 FROM football_runtime.recommendation_completed_searches
@@ -7967,6 +8083,16 @@ class PostgresRoleStore:
                     )
                     WHERE result.card_facts->>'opportunity_type' IN (
                         'tournament', 'coach_availability', 'coach_request'
+                    )
+                    UNION ALL
+                    SELECT opportunity_id, opportunity_revision_id,
+                           publication_state, current_facts,
+                           response_route_kind, response_route_value
+                    FROM football_runtime.read_current_referee_result_projection(
+                        result.card_facts->>'opportunity_id'
+                    )
+                    WHERE result.card_facts->>'opportunity_type' IN (
+                        'referee_availability', 'referee_request'
                     )
                     LIMIT 1
                 ) AS current_projection ON TRUE
@@ -8598,6 +8724,7 @@ def _result_card_facts_with_current_publication_state(
     as_of: datetime,
 ) -> dict[str, Any]:
     """Overlay current mutable publication facts while preserving card history."""
+    opportunity_type = card_facts.get("opportunity_type")
     if card_facts.get("opportunity_type") == "tournament":
         current_facts = (
             current_projection.get("current_facts")
@@ -9381,7 +9508,12 @@ def _suppress_source_event_opportunities(
         outgoings.append(
             ContractEnvelope(
                 contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                contract_version=2,
+                contract_version=(
+                    4
+                    if item.get("opportunity_type")
+                    in {"coach_availability", "coach_request"}
+                    else 2
+                ),
                 message_id=derive_contract_message_id(
                     causation_id,
                     ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
@@ -9554,6 +9686,23 @@ def _exact_repost_resolved_event_date(
     return None
 
 
+def _exact_repost_cluster_identity(
+    accepted_facts: Mapping[str, JsonValue],
+    *,
+    opportunity_type: str,
+) -> str | None:
+    """Return a stable cluster identity without inventing a calendar date."""
+    resolved_event_date = _exact_repost_resolved_event_date(
+        accepted_facts,
+        opportunity_type=opportunity_type,
+    )
+    if resolved_event_date is not None:
+        return resolved_event_date
+    if opportunity_type in {"coach_availability", "coach_request"}:
+        return f"undated:{opportunity_type}"
+    return None
+
+
 def _exact_repost_source_chat_reference(source_message_id: str) -> str | None:
     scope, separator, _ = source_message_id.partition(":generation:")
     return scope if separator and scope else None
@@ -9589,12 +9738,21 @@ def _exact_repost_candidate_is_fresh(
     """Apply the publication freshness cutoff to a cluster candidate."""
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         return False
-    if opportunity_type in {
-        "roster_vacancy",
-        "player_transfer_availability",
-        "coach_availability",
-        "coach_request",
-    }:
+    is_standing_referee_availability = (
+        opportunity_type == "referee_availability"
+        and accepted_facts.get("start_local_date") is None
+        and accepted_facts.get("end_local_date") is None
+    )
+    if (
+        opportunity_type
+        in {
+            "roster_vacancy",
+            "player_transfer_availability",
+            "coach_availability",
+            "coach_request",
+        }
+        or is_standing_referee_availability
+    ):
         qualifying_text = accepted_facts.get("source_qualifying_assertion_at")
         if not isinstance(qualifying_text, str):
             qualifying_text = accepted_facts.get("source_posted_at")
@@ -9711,7 +9869,9 @@ def _exact_repost_publication_outgoing(
         payload["publication_reason"] = publication_reason
     return ContractEnvelope(
         contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-        contract_version=2,
+        contract_version=(
+            4 if opportunity_type in {"coach_availability", "coach_request"} else 2
+        ),
         message_id=derive_contract_message_id(
             transition_causation_id,
             ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
@@ -10029,7 +10189,7 @@ def _reconcile_exact_repost_for_opportunity(
         return (), "active", None, None
     source_chat_reference = _exact_repost_source_chat_reference(source[0])
     publisher_id = source_publisher_id_from_metadata(source[2])
-    resolved_event_date = _exact_repost_resolved_event_date(
+    cluster_identity = _exact_repost_cluster_identity(
         accepted_facts,
         opportunity_type=opportunity_type,
     )
@@ -10038,14 +10198,14 @@ def _reconcile_exact_repost_for_opportunity(
         source_chat_reference is None
         or publisher_id is None
         or not normalized_body
-        or resolved_event_date is None
+        or cluster_identity is None
     ):
         return (), "active", None, None
     cluster_key = _exact_repost_key(
         source_chat_reference=source_chat_reference,
         source_publisher_id=publisher_id,
         normalized_body=normalized_body,
-        resolved_event_date=resolved_event_date,
+        resolved_event_date=cluster_identity,
     )
     cluster_id = f"exact-repost-cluster:{cluster_key}"
     old_cluster_ids = tuple(
@@ -10110,7 +10270,7 @@ def _reconcile_exact_repost_for_opportunity(
             source_chat_reference,
             publisher_id,
             normalized_body,
-            resolved_event_date,
+            cluster_identity,
             opportunity_type,
             recorded_at,
             recorded_at,
@@ -10250,7 +10410,7 @@ def _remove_stale_exact_repost_members_for_source_message(
         ).fetchall()
         stale = not accepted_fact_rows or any(
             not isinstance(row[0], Mapping)
-            or _exact_repost_resolved_event_date(row[0], opportunity_type=cluster[4])
+            or _exact_repost_cluster_identity(row[0], opportunity_type=cluster[4])
             != cluster[3]
             for row in accepted_fact_rows
         )

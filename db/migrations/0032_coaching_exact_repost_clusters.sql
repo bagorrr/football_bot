@@ -12,6 +12,8 @@ ALTER TABLE football_runtime.application_exact_repost_clusters
             'roster_vacancy',
             'player_transfer_availability',
             'coach_availability',
-            'coach_request'
+            'coach_request',
+            'referee_availability',
+            'referee_request'
         )
     );

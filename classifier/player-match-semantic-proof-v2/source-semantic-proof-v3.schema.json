@@ -41,70 +41,6 @@
       "items": {"$ref": "#/$defs/relation"}
     }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "root": {
-            "properties": {
-              "meaning": {"const": "open_match"}
-            }
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "facts": {
-            "minProperties": 4,
-            "required": ["opportunity", "event_time", "location", "open_places"]
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "root": {
-            "properties": {
-              "meaning": {"const": "player_match_availability"}
-            }
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "facts": {
-            "minProperties": 3,
-            "required": ["opportunity", "event_time", "location"],
-            "not": {"required": ["open_places"]}
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "root": {
-            "properties": {
-              "meaning": {"enum": ["coach_availability", "coach_request"]}
-            }
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "facts": {
-            "minProperties": 3,
-            "required": ["opportunity", "location", "in_person"],
-            "oneOf": [
-              {"required": ["coach_availability"]},
-              {"required": ["coach_request"]}
-            ]
-          }
-        }
-      }
-    }
-  ],
   "$defs": {
     "span": {
       "type": "object",
@@ -178,5 +114,68 @@
         "span": {"$ref": "#/$defs/span"}
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "root": {
+            "properties": {
+              "meaning": {"const": "open_match"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "facts": {
+            "minProperties": 4,
+            "required": ["opportunity", "event_time", "location", "open_places"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "root": {
+            "properties": {
+              "meaning": {"const": "player_match_availability"}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "facts": {
+            "minProperties": 3,
+            "required": ["opportunity", "event_time", "location"],
+            "not": {"required": ["open_places"]}
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "root": {
+            "properties": {
+              "meaning": {"enum": ["coach_availability", "coach_request"]}
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "facts": {
+            "required": ["opportunity", "location", "in_person"],
+            "oneOf": [
+              {"required": ["coach_availability"]},
+              {"required": ["coach_request"]}
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

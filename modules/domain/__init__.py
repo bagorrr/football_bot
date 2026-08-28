@@ -1166,6 +1166,16 @@ _TRANSFER_SEARCH_DETAIL_KEYS = (
     "playing_surfaces",
     "payment",
 )
+_REFEREE_DETAIL_KEYS = (
+    "event_types",
+    "team_formats",
+    "referee_roles",
+    "payment",
+)
+_REFEREEING_OPPORTUNITY_TYPES = {
+    UserIntent.REFEREE_SEARCH: "referee_availability",
+    UserIntent.REFEREEING_SERVICE_OFFER: "referee_request",
+}
 _COACHING_SEARCH_DETAIL_KEYS = (
     "coaching_types",
     "playing_levels",
@@ -2247,19 +2257,11 @@ def evaluate_coaching_search(
         )
         normalized_schedule = _coaching_schedule_mapping(accepted_schedule) or {}
         accepted_start = _coaching_schedule_date(normalized_schedule)
-        sort_date = (
-            accepted_start.isoformat()
-            if accepted_start is not None
-            else source_assertion_at_text[:10]
-        )
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
             "opportunity_type": opportunity_type,
             opportunity_type: "true",
-            "sort_local_date": sort_date,
-            "start_local_date": sort_date,
-            "end_local_date": sort_date,
             "iana_timezone": str(facts.get("iana_timezone", "UTC")),
             "timezone_data_version": str(facts.get("timezone_data_version", "")),
             "source_posted_at": source_posted_at_text,
@@ -2284,6 +2286,9 @@ def evaluate_coaching_search(
                 sort_keys=True,
             ),
         }
+        if accepted_start is not None:
+            card["sort_local_date"] = accepted_start.isoformat()
+            card["start_local_date"] = accepted_start.isoformat()
         for locale in ("en", "ru", "es", "fr"):
             card[f"city_display_{locale}"] = str(
                 facts.get(f"city_display_{locale}", "")

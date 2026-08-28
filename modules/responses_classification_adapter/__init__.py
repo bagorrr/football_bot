@@ -80,11 +80,11 @@ class ResponsesClassifierAdapter:
             and "source-semantic-proof-v3" in self._schemas
             and "open-match-semantic-proof-v3" in self._prompt_paths
         )
-        v3_artifacts_complete = (
-            player_v3_artifacts_complete or open_v3_artifacts_complete
-        )
         v4_artifacts_complete = (
             player_v4_artifacts_complete or open_v4_artifacts_complete
+        )
+        v3_artifacts_complete = (
+            player_v3_artifacts_complete or open_v3_artifacts_complete
         )
         if primary_schema_version is None:
             available_versions = [
@@ -112,18 +112,15 @@ class ResponsesClassifierAdapter:
             v3_artifacts_complete
         ):
             raise ValueError("incomplete v3 classifier artifact set")
-        if primary_schema_version == "source-message-classification-v4" and not (
-            v4_artifacts_complete
+        if (
+            primary_schema_version == "source-message-classification-v4"
+            and not v4_artifacts_complete
         ):
             raise ValueError("incomplete v4 classifier artifact set")
         if primary_schema_version == "source-message-classification-v2" and not (
             v2_primary_available
         ):
             raise ValueError("incomplete v2 classifier artifact set")
-        if primary_schema_version == "source-message-classification-v4" and not (
-            open_v4_artifacts_complete
-        ):
-            raise ValueError("incomplete v4 classifier artifact set")
         self._primary_schema_version = primary_schema_version
         if self._primary_schema_version not in {
             "source-message-classification-v1",

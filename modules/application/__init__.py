@@ -3041,6 +3041,8 @@ class ConversationOnboarding:
         number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
+        referee_search_details: dict[str, list[str]] | None = None,
+        refereeing_service_offer_details: dict[str, list[str]] | None = None,
         coaching_search_details: dict[str, JsonValue] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
@@ -3099,6 +3101,8 @@ class ConversationOnboarding:
                         opponent_search_details,
                         tournament_search_details,
                         transfer_search_details,
+                        referee_search_details,
+                        refereeing_service_offer_details,
                         coaching_search_details,
                     )
                 )
@@ -3153,6 +3157,26 @@ class ConversationOnboarding:
                     }
                 )
                 details_payload_key = "coaching_search_details"
+            elif draft.user_intent is UserIntent.REFEREE_SEARCH:
+                selected_details = (
+                    referee_search_details
+                    if referee_search_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.referee_search_details
+                    }
+                )
+                details_payload_key = "referee_search_details"
+            elif draft.user_intent is UserIntent.REFEREEING_SERVICE_OFFER:
+                selected_details = (
+                    refereeing_service_offer_details
+                    if refereeing_service_offer_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.refereeing_service_offer_details
+                    }
+                )
+                details_payload_key = "refereeing_service_offer_details"
             else:
                 selected_details = (
                     game_search_details
@@ -5104,6 +5128,8 @@ class ConversationOnboarding:
                 else _transfer_search_result_message
                 if opportunity_type
                 in {"roster_vacancy", "player_transfer_availability"}
+                else _refereeing_result_message
+                if opportunity_type in {"referee_availability", "referee_request"}
                 else _coaching_search_result_message
                 if opportunity_type in {"coach_availability", "coach_request"}
                 else _open_match_result_message
@@ -13609,7 +13635,7 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
-            and incoming.contract_version in {2, 3}
+            and incoming.contract_version in {2, 3, 4, 5}
             and supported_incoming is not None
         ):
             self.store.project_opportunity(
@@ -15627,7 +15653,12 @@ class RuntimeApplication:
                 suppression_outgoings.append(
                     ContractEnvelope(
                         contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                        contract_version=2,
+                        contract_version=(
+                            4
+                            if opportunity_type
+                            in {"coach_availability", "coach_request"}
+                            else 2
+                        ),
                         message_id=derive_contract_message_id(
                             suppression_causation_id,
                             ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
@@ -15856,6 +15887,21 @@ class RuntimeApplication:
                 )
                 if (
                     assertion := _source_coaching_qualifying_assertion_at(
+                        source_revision,
+                        source_revision_history,
+                        opportunity_type,
+                    )
+                )
+                is not None
+            },
+            "source_refereeing_qualifying_assertions": {
+                opportunity_type: assertion.isoformat()
+                for opportunity_type in (
+                    "referee_availability",
+                    "referee_request",
+                )
+                if (
+                    assertion := _source_refereeing_qualifying_assertion_at(
                         source_revision,
                         source_revision_history,
                         opportunity_type,
@@ -16158,9 +16204,18 @@ class RuntimeApplication:
                         retained_opportunity_ids=retained_opportunity_ids,
                     )
                 )
+                publication_contract_version = (
+                    5
+                    if any(
+                        item.get("opportunity_type")
+                        in {"coach_availability", "coach_request"}
+                        for item in publication_items
+                    )
+                    else 3
+                )
                 batch_outgoing = ContractEnvelope(
                     contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                    contract_version=3,
+                    contract_version=publication_contract_version,
                     message_id=derive_contract_message_id(
                         incoming.message_id,
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
@@ -16296,7 +16351,12 @@ class RuntimeApplication:
         )
         outgoing = ContractEnvelope(
             contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-            contract_version=2,
+            contract_version=(
+                4
+                if accepted.get("opportunity_type")
+                in {"coach_availability", "coach_request"}
+                else 2
+            ),
             message_id=derive_contract_message_id(
                 incoming.message_id, ContractName.OPPORTUNITY_PUBLICATION_CHANGED
             ),
@@ -17434,6 +17494,157 @@ def _source_transfer_qualifying_assertion_at(
     return qualifying
 
 
+_REFEREE_ACTIONABLE_TERM_PATTERN = re.compile(
+    r"(?:referee\w*|official\w*|arbitr(?:ator|e|al)\w*|"
+    r"судь\w*|арбитр\w*|[áa]rbitro\w*|arbitre\w*|"
+    r"available|offering|offers?|ready|officiat\w*|availability|"
+    r"доступ\w*|готов\w*|предлага\w*|свобод\w*|"
+    r"disponible|ofrezc\w*|listo\w*|propon\w*|pr[êe]t\w*|propos\w*|"
+    r"need\w*|require\w*|want\w*|looking|seeking|needed|required|wanted|"
+    r"нуж\w*|требу\w*|ищ\w*|"
+    r"necesit\w*|busc\w*|requier\w*|cherch\w*|recherch\w*|besoin|"
+    r"football\w*|soccer\w*|футбол\w*|f[úu]tbol\w*|"
+    r"match\w*|game\w*|fixture\w*|матч\w*|игр\w*|partid\w*|"
+    r"encuentro\w*|rencontre\w*|tournament\w*|cup\w*|competition\w*|"
+    r"турнир\w*|кубок\w*|соревнован\w*|torneo\w*|copa\w*|"
+    r"competici[oó]n\w*|tournoi\w*|coupe\w*|comp[ée]tition\w*|"
+    r"adult\w*|youth\w*|junior\w*|children\w*|kids?\b|"
+    r"взросл\w*|детск\w*|юнош\w*|молодёж\w*|молодеж\w*|"
+    r"head\b|main\b|chief\b|assistant\w*|line\b|video\b|var\b|"
+    r"главн\w*|ассистент\w*|помощник\w*|боков\w*|видео\w*|"
+    r"principal\w*|asistente\w*|videoarbit\w*|principal\w*|assistant\w*|"
+    r"free\b|paid\b|pay\w*|gratis\w*|gratuit\w*|"
+    r"бесплат\w*|платн\w*|гонорар\w*|оплат\w*|payant\w*|"
+    r"\d{1,2}\s*[xх×]\s*\d{1,2}|"
+    r"20\d{2}(?:[-/.]\d{1,2}){1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2}|"
+    r"\b\d{1,2}:\d{2}\b|"
+    r"@[a-z0-9_]{3,}|https?://[^\s]+|"
+    r"[\w.+-]+@[\w.-]+\.[a-z]{2,}|\+?[0-9][0-9 ()-]{5,}[0-9])",
+    re.IGNORECASE,
+)
+_REFEREE_LOCATION_CLAUSE_PATTERN = re.compile(
+    r"\b(?:in|at|near|around|from|within)\s+[^.!?;,\n]+|"
+    r"\b(?:в|на|из|около|рядом\s+с)\s+[^.!?;,\n]+|"
+    r"\b(?:en|cerca\s+de|desde)\s+[^.!?;,\n]+|"
+    r"\b(?:à|dans|près\s+de|depuis)\s+[^.!?;,\n]+",
+    re.IGNORECASE,
+)
+_REFEREE_EXPLICIT_RENEWAL_PATTERN = re.compile(
+    r"\b(?:renew\w*|re[- ]?post\w*|"
+    r"still\s+(?:available|offering)|"
+    r"availability\s+(?:renewed|extended)|"
+    r"обновл\w*|снова\s+(?:доступ\w*|готов\w*)|"
+    r"(?:disponible|disponibilidad)\s+(?:de\s+nuevo|renov\w*)|"
+    r"(?:disponible|offre)\s+(?:encore|à\s+nouveau))\b",
+    re.IGNORECASE,
+)
+
+
+def _referee_assertion_signature(body: str) -> tuple[str, ...]:
+    """Retain only terms that can change a referee source assertion."""
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    terms = [
+        token
+        for match in _REFEREE_ACTIONABLE_TERM_PATTERN.finditer(normalized)
+        for token in re.findall(r"[\w@]+", match.group(0), flags=re.UNICODE)
+    ]
+    for match in _REFEREE_LOCATION_CLAUSE_PATTERN.finditer(body):
+        terms.extend(re.findall(r"[\w@]+", match.group(0).casefold(), flags=re.UNICODE))
+    return tuple(sorted(terms))
+
+
+def _referee_bounded_response_route(
+    bounded_metadata: Mapping[str, object] | None,
+) -> tuple[str, str] | None:
+    """Return the currently selected fallback route from bounded metadata."""
+    if bounded_metadata is None:
+        return None
+    fallback_routes = (
+        ("direct_message", "source_author_dm_url"),
+        ("reply_thread", "reply_route_url"),
+        ("source_message", "source_message_url"),
+    )
+    for kind, key in fallback_routes:
+        value = bounded_metadata.get(key)
+        if (
+            (
+                key != "source_message_url"
+                or bounded_metadata.get("source_message_reply_capable") is True
+            )
+            and isinstance(value, str)
+            and _is_safe_telegram_response_url(value)
+        ):
+            return kind, value
+    return None
+
+
+def _source_refereeing_edit_qualifies_freshness(
+    current_revision: SourceMessageRevision,
+    previous_revision: SourceMessageRevision | None,
+    opportunity_type: str,
+) -> bool:
+    """Renew referee freshness only for a changed accepted source assertion."""
+    if current_revision.body is None or not _refereeing_opportunity_is_supported(
+        current_revision.body,
+        opportunity_type=opportunity_type,
+    ):
+        return False
+    if previous_revision is None or previous_revision.body is None:
+        return True
+    if _REFEREE_EXPLICIT_RENEWAL_PATTERN.search(current_revision.body):
+        return True
+    if _referee_assertion_signature(current_revision.body) != (
+        _referee_assertion_signature(previous_revision.body)
+    ):
+        return True
+    return _referee_bounded_response_route(
+        current_revision.bounded_metadata
+    ) != _referee_bounded_response_route(previous_revision.bounded_metadata)
+
+
+def _source_refereeing_qualifying_assertion_at(
+    current_revision: SourceMessageRevision,
+    history: tuple[SourceMessageRevision, ...],
+    opportunity_type: str,
+) -> datetime | None:
+    """Return the last source revision that asserted a referee opportunity."""
+    ordered = tuple(
+        sorted(
+            (
+                revision
+                for revision in history
+                if revision.revision <= current_revision.revision
+            ),
+            key=lambda revision: revision.revision,
+        )
+    )
+    qualifying: datetime | None = None
+    for revision in ordered:
+        previous = next(
+            (
+                candidate
+                for candidate in reversed(ordered)
+                if candidate.revision < revision.revision
+            ),
+            None,
+        )
+        if revision.event_kind is SourceEventKind.CREATE:
+            if revision.body is not None and _refereeing_opportunity_is_supported(
+                revision.body,
+                opportunity_type=opportunity_type,
+            ):
+                qualifying = revision.event_time
+        elif revision.event_kind is SourceEventKind.EDIT and (
+            _source_refereeing_edit_qualifies_freshness(
+                revision,
+                previous,
+                opportunity_type,
+            )
+        ):
+            qualifying = revision.event_time
+    return qualifying
+
+
 def _coaching_assertion_signature(
     body: str,
     opportunity_type: str,
@@ -17475,18 +17686,73 @@ def _coaching_assertion_signature(
         for token in re.findall(r"[\w@:+./-]+", body, flags=re.UNICODE)
         if marker.search(token)
     )
+    location_clauses = re.compile(
+        r"\b(?:in|at|near|around|from|within)\s+[^.!?;,:\n]+|"
+        r"\b(?:в|на|из|около|рядом\s+с)\s+[^.!?;,:\n]+|"
+        r"\b(?:en|cerca\s+de|desde)\s+[^.!?;,:\n]+|"
+        r"\b(?:à|dans|près\s+de|depuis)\s+[^.!?;,:\n]+|"
+        r"\b(?:location|city|country|venue|place|"
+        r"место|город|страна|площадк\w*|"
+        r"lugar|ciudad|pa[ií]s|ville|lieu)\s*[:=—–-]\s*"
+        r"[^.!?;,\n]+",
+        re.IGNORECASE,
+    )
+    location_tokens = tuple(
+        token.casefold()
+        for match in location_clauses.finditer(body)
+        for token in re.findall(r"[\w@]+", match.group(0), flags=re.UNICODE)
+    )
     metadata_tokens: list[str] = []
     if bounded_metadata is not None:
-        for key in (
+        route_keys = {
             "source_author_dm_url",
             "reply_route_url",
             "source_message_url",
             "source_message_reply_capable",
-        ):
-            value = bounded_metadata.get(key)
-            if isinstance(value, (str, bool)):
+        }
+        fixed_location_keys = {
+            "canonical_location",
+            "canonical_city",
+            "city_id",
+            "country_id",
+            "place_id",
+        }
+        for key, value in bounded_metadata.items():
+            if not isinstance(key, str):
+                continue
+            normalized_key = key.casefold()
+            is_canonical_location_key = (
+                normalized_key in fixed_location_keys
+                or (
+                    normalized_key.startswith(("canonical_", "resolved_"))
+                    and (
+                        "location" in normalized_key
+                        or "city" in normalized_key
+                        or "place" in normalized_key
+                    )
+                )
+                or normalized_key
+                in {"location_id", "city_id", "country_id", "place_id"}
+            )
+            if normalized_key not in route_keys and not is_canonical_location_key:
+                continue
+            if isinstance(value, (str, bool, int, float)):
                 metadata_tokens.extend((key, str(value).casefold()))
-    return (opportunity_type, *tokens, *metadata_tokens)
+            elif is_canonical_location_key and isinstance(
+                value, (Mapping, list, tuple)
+            ):
+                metadata_tokens.extend(
+                    (
+                        key,
+                        json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).casefold(),
+                    )
+                )
+    return (opportunity_type, *tokens, *location_tokens, *metadata_tokens)
 
 
 def _source_coaching_edit_qualifies_freshness(
@@ -18197,27 +18463,20 @@ def _classifier_artifact_versions(
     primary_schema_version: JsonValue, *, player_release: bool = False
 ) -> tuple[str, str, tuple[str, str]] | None:
     """Return immutable artifact identities for an adapter-selected release."""
+    primary_schema = str(primary_schema_version)
+    if player_release and primary_schema == "source-message-classification-v4":
+        primary_prompt = "player-match-primary-v2"
+    elif player_release and primary_schema == "source-message-classification-v3":
+        primary_prompt = "player-match-primary-v1"
+    elif primary_schema == "source-message-classification-v3":
+        primary_prompt = "open-match-primary-v3"
+    elif primary_schema == "source-message-classification-v4":
+        primary_prompt = "open-match-primary-v4"
+    else:
+        primary_prompt = None
     descriptor = classifier_artifact_descriptor_for_primary(
-        str(primary_schema_version),
-        primary_prompt_version=(
-            "player-match-primary-v2"
-            if player_release
-            and primary_schema_version == "source-message-classification-v4"
-            else (
-                "player-match-primary-v1"
-                if player_release
-                and primary_schema_version == "source-message-classification-v3"
-                else (
-                    "open-match-primary-v3"
-                    if primary_schema_version == "source-message-classification-v3"
-                    else (
-                        "open-match-primary-v4"
-                        if primary_schema_version == "source-message-classification-v4"
-                        else None
-                    )
-                )
-            )
-        ),
+        primary_schema,
+        primary_prompt_version=primary_prompt,
     )
     if descriptor is None:
         return None
@@ -18999,6 +19258,10 @@ _OPTIONAL_TRANSFER_FACTS = frozenset(
         "payment",
     }
 )
+_MANDATORY_REFEREE_FACTS = frozenset({"opportunity", "location"})
+_OPTIONAL_REFEREE_FACTS = frozenset(
+    {"event_time", "event_types", "team_formats", "referee_roles", "payment"}
+)
 _MANDATORY_COACHING_FACTS = frozenset({"opportunity", "location"})
 _OPTIONAL_COACHING_FACTS = frozenset(
     {
@@ -19294,6 +19557,8 @@ def _proposition_opportunity_id(
         "player_match_availability",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
         "coach_availability",
         "coach_request",
     }:
@@ -19358,6 +19623,8 @@ def _canonicalize_legacy_proposition_records(
         "tournament",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
         "coach_availability",
         "coach_request",
     }
@@ -19771,6 +20038,14 @@ def _proposition_graph_has_closed_target_set(
         allowed_facts = (
             _MANDATORY_OPPONENT_REQUEST_FACTS | _OPTIONAL_OPPONENT_REQUEST_FACTS
         )
+    elif effective_meaning in {"referee_availability", "referee_request"}:
+        participation_ids = set()
+        expected_mandatory = _MANDATORY_REFEREE_FACTS | {effective_meaning}
+        if effective_meaning == "referee_request":
+            expected_mandatory |= {"event_time"}
+        allowed_facts = (
+            _MANDATORY_REFEREE_FACTS | _OPTIONAL_REFEREE_FACTS | {effective_meaning}
+        )
     elif effective_meaning in {"coach_availability", "coach_request"}:
         participation_ids = set()
         expected_mandatory = _MANDATORY_COACHING_FACTS | {
@@ -19904,6 +20179,8 @@ def _validated_opportunity_proposal(
         "tournament",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
         "coach_availability",
         "coach_request",
     }:
@@ -22539,8 +22816,13 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
         r"(?:wanted|required|requested|needed)|"
         r"(?:wanted|required|requested|needed)\s+(?:an?\s+)?"
         r"(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)|"
+        r"(?:want(?:s|ed)?|request(?:s|ed)?|need(?:s|ed)?)\s+"
+        r"(?:an?\s+)?(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)|"
+        r"(?:want(?:s|ed)?|request(?:s|ed)?|need(?:s|ed)?)\s*[,.:;—–-]\s*"
+        r"(?:an?\s+)?(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)|"
         r"looking\s+for\s+(?:a\s+)?coach|look\s+for\s+(?:a\s+)?coach|"
-        r"seeking\s+(?:a\s+)?coach|want\s+(?:a\s+)?coach|hire\s+(?:a\s+)?coach|"
+        r"seeking\s+(?:a\s+)?coach|want(?:s)?\s+(?:a\s+)?coach|"
+        r"hire\s+(?:a\s+)?coach|"
         r"нужен\w*\s+тренер\w*|требуется\s+тренер\w*|"
         r"ищ\w*\s+тренер\w*|тренер\w*\s+нужен\w*|"
         r"busc\w*\s+(?:un\s+)?entrenador\w*|necesit\w*\s+(?:un\s+)?entrenador\w*|"
@@ -22549,6 +22831,15 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
         r"besoin\s+d['’]?un\s+entra[iî]neur\w*)\b"
     )
     has_request = request_pattern.search(normalized) is not None
+    negated_request_pattern = re.compile(
+        r"\b(?:not|never|no|не|нет|без|sin|pas|sans)"
+        r"(?:\s|[,.:;—–-]){1,8}"
+        r"(?:is\s+|are\s+|was\s+|were\s+)?"
+        r"(?:(?:an?\s+)?(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)\s+)?"
+        r"(?:wanted|required|requested|needed)\b"
+    )
+    if negated_request_pattern.search(normalized) is not None:
+        return False
     if opportunity_type == "coach_request":
         return has_request
     if has_request:

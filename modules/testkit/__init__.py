@@ -982,8 +982,16 @@ class ControlledModelAdapter:
         self.primary_schema_version = "source-message-classification-v4"
         self.primary_prompt_version = "open-match-primary-v4"
 
+    def enable_open_match_primary_v4(self) -> None:
+        """Opt the controlled model boundary into the Open Match v4 release."""
+        self.enable_primary_v4()
+
+    def enable_coaching_primary_v1(self) -> None:
+        """Opt the controlled model boundary into the versioned coaching release."""
+        self.enable_open_match_primary_v4()
+
     def enable_player_match_primary_v2(self) -> None:
-        """Opt the controlled model boundary into the additive Player release."""
+        """Opt the controlled model boundary into the versioned Player release."""
         self.primary_schema_version = "source-message-classification-v4"
         self.primary_prompt_version = "player-match-primary-v2"
 
@@ -1128,6 +1136,8 @@ def _add_test_proposition_evidence(
         "tournament",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
         "coach_availability",
         "coach_request",
     }:
@@ -1255,6 +1265,8 @@ def _build_test_semantic_proof(
             "player_transfer_availability",
             "coach_availability",
             "coach_request",
+            "referee_availability",
+            "referee_request",
         }
     ):
         return {}
@@ -1268,6 +1280,8 @@ def _build_test_semantic_proof(
         "player_transfer_availability",
         "coach_availability",
         "coach_request",
+        "referee_availability",
+        "referee_request",
     }:
         return {}
 
@@ -2764,6 +2778,8 @@ class AcceptanceSpine:
         opponent_search_details: dict[str, list[str]] | None = None,
         tournament_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
+        referee_search_details: dict[str, list[str]] | None = None,
+        refereeing_service_offer_details: dict[str, list[str]] | None = None,
         coaching_search_details: dict[str, JsonValue] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
@@ -2780,6 +2796,8 @@ class AcceptanceSpine:
             opponent_search_details=opponent_search_details,
             tournament_search_details=tournament_search_details,
             transfer_search_details=transfer_search_details,
+            referee_search_details=referee_search_details,
+            refereeing_service_offer_details=refereeing_service_offer_details,
             coaching_search_details=coaching_search_details,
         )
 

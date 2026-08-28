@@ -82,6 +82,7 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     classifier = ControlledModelAdapter()
+    classifier.enable_open_match_primary_v4()
     resolver = ControlledLocationResolverAdapter()
     date_interpretation = ControlledDateInterpretationAdapter()
     timezone_data = ControlledTimezoneDataAdapter()
@@ -163,6 +164,7 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
     evidence = candidate["evidence"]
     assert isinstance(evidence, dict)
     candidate["opportunity_type"] = opportunity_type
+    candidate["source_context"] = body
     candidate.pop("event_time", None)
     candidate.pop("open_places", None)
     candidate[opportunity_type] = True
@@ -206,6 +208,11 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
         "place_id": "station:ru:spb:petrogradskaya",
         "country_id": "country:ru",
         "city_id": "city:ru:saint-petersburg",
+    }
+    result.output["schema_version"] = "source-message-classification-v4"
+    result.output["routing"] = {
+        "reason_code": "accepted",
+        "required_context": "none",
     }
     classifier.return_for(body=body, result=result)
     resolver.return_for(

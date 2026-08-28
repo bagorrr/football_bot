@@ -11,7 +11,9 @@ ALTER TABLE football_runtime.application_opportunities
             'roster_vacancy',
             'player_transfer_availability',
             'coach_availability',
-            'coach_request'
+            'coach_request',
+            'referee_availability',
+            'referee_request'
         )
     );
 
@@ -28,7 +30,9 @@ ALTER TABLE football_runtime.recommendation_opportunities
             'roster_vacancy',
             'player_transfer_availability',
             'coach_availability',
-            'coach_request'
+            'coach_request',
+            'referee_availability',
+            'referee_request'
         )
     );
 

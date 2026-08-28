@@ -10,11 +10,15 @@ from modules.application import (
     _coaching_search_detail_submenu_message,
     _coaching_search_result_message,
     _coaching_search_schedule_prompt_message,
+    _source_coaching_edit_qualifies_freshness,
+    _source_coaching_qualifying_assertion_at,
 )
 from modules.contracts import JsonValue
-from modules.domain import SearchResult
+from modules.domain import SearchResult, SourceEventKind, SourceMessageRevision
 from modules.postgres_adapter import (
     _exact_repost_candidate_is_fresh,
+    _exact_repost_cluster_identity,
+    _exact_repost_key,
     _exact_repost_resolved_event_date,
     _legacy_candidate_alias_for_canonical,
     _proposition_identity_parts,
@@ -118,6 +122,113 @@ def test_coaching_exact_reposts_use_the_nested_schedule_start_date() -> None:
             "source_qualifying_assertion_at": "2026-08-01T09:00:00+00:00",
         },
         as_of=datetime(2026, 8, 30, 9, tzinfo=UTC),
+    )
+
+
+def test_undated_coaching_reposts_have_stable_identity_without_dates() -> None:
+    accepted_facts: dict[str, JsonValue] = {
+        "coach_availability": True,
+        "in_person": True,
+        "source_qualifying_assertion_at": "2026-08-18T09:00:00+00:00",
+        "schedule": {"weekdays": ["wednesday"], "day_parts": ["evening"]},
+    }
+
+    assert _exact_repost_resolved_event_date(accepted_facts) is None
+    assert (
+        _exact_repost_cluster_identity(
+            accepted_facts, opportunity_type="coach_availability"
+        )
+        == "undated:coach_availability"
+    )
+    assert (
+        _exact_repost_cluster_identity(accepted_facts, opportunity_type="coach_request")
+        == "undated:coach_request"
+    )
+    assert "start_local_date" not in accepted_facts
+    assert "end_local_date" not in accepted_facts
+
+
+def test_undated_exact_reposts_share_identity_but_distinct_listings_do_not() -> None:
+    cluster_identity = "undated:coach_availability"
+    first = _exact_repost_key(
+        source_chat_reference="source-chat:channel:123",
+        source_publisher_id="publisher:42",
+        normalized_body="in person coach available in moscow",
+        resolved_event_date=cluster_identity,
+    )
+    repost = _exact_repost_key(
+        source_chat_reference="source-chat:channel:123",
+        source_publisher_id="publisher:42",
+        normalized_body="in person coach available in moscow",
+        resolved_event_date=cluster_identity,
+    )
+    distinct_listing = _exact_repost_key(
+        source_chat_reference="source-chat:channel:123",
+        source_publisher_id="publisher:42",
+        normalized_body="in person coach available in london",
+        resolved_event_date=cluster_identity,
+    )
+
+    assert repost == first
+    assert distinct_listing != first
+
+
+def _coaching_revision(
+    *,
+    revision: int,
+    body: str,
+    bounded_metadata: dict[str, object] | None = None,
+) -> SourceMessageRevision:
+    event_time = datetime(2026, 8, 1 + revision, 9, tzinfo=UTC)
+    return SourceMessageRevision(
+        source_message_revision_id=f"source:coach:revision:{revision}",
+        source_message_id="source:coach",
+        source_event_id=f"event:coach:{revision}",
+        revision=revision,
+        event_kind=SourceEventKind.CREATE if revision == 1 else SourceEventKind.EDIT,
+        body=body,
+        event_time=event_time,
+        recorded_at=event_time,
+        bounded_metadata=bounded_metadata or {},
+    )
+
+
+def test_actionable_coaching_location_edit_renews_the_freshness_clock() -> None:
+    created = _coaching_revision(
+        revision=1,
+        body="In-person coach available in Moscow. Message @coach",
+    )
+    edited = _coaching_revision(
+        revision=2,
+        body="In-person coach available in London. Message @coach",
+    )
+
+    assert _source_coaching_edit_qualifies_freshness(
+        edited, created, "coach_availability"
+    )
+    assert (
+        _source_coaching_qualifying_assertion_at(
+            edited, (created, edited), "coach_availability"
+        )
+        == edited.event_time
+    )
+
+
+def test_arbitrary_canonical_city_edit_renews_coaching_freshness() -> None:
+    body = "In-person coach available. Message @coach"
+    created = _coaching_revision(
+        revision=1,
+        body=body,
+        bounded_metadata={"canonical_city": "Moscow", "city_id": "city:moscow"},
+    )
+    edited = _coaching_revision(
+        revision=2,
+        body=body,
+        bounded_metadata={"canonical_city": "London", "city_id": "city:london"},
+    )
+
+    assert _source_coaching_edit_qualifies_freshness(
+        edited, created, "coach_availability"
     )
 
 
@@ -275,6 +386,37 @@ def test_generic_online_coaching_wording_does_not_establish_in_person_intent() -
             "In-person coaching wanted in Moscow. Message @team.",
             "coach_request",
             True,
+        ),
+        ("Wanted, an in-person coach in Moscow. Message @team.", "coach_request", True),
+        (
+            "Requested: in-person coaching in Moscow. Message @team.",
+            "coach_request",
+            True,
+        ),
+        (
+            "The team wants an in-person coach in Moscow. Message @team.",
+            "coach_request",
+            True,
+        ),
+        (
+            "In-person coaching not wanted in Moscow. Message @team.",
+            "coach_request",
+            False,
+        ),
+        (
+            "No coach requested: in-person coaching in Moscow. Message @team.",
+            "coach_request",
+            False,
+        ),
+        (
+            "No coach requested: in-person coaching in Moscow. Message @team.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "Not wanted, an in-person coach in Moscow. Message @team.",
+            "coach_availability",
+            False,
         ),
         (
             "In-person coaching requested in Moscow. Message @team.",

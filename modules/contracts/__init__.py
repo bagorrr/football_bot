@@ -258,6 +258,20 @@ SUPPORTED_CONTRACTS = (
         "source_message_revision_id",
     ),
     ContractDefinition(
+        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        4,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.RECOMMENDATION,
+        "opportunity_id",
+    ),
+    ContractDefinition(
+        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        5,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.RECOMMENDATION,
+        "source_message_revision_id",
+    ),
+    ContractDefinition(
         ContractName.RUN_SEARCH,
         1,
         RuntimeRole.BOT_ASSISTANT,
@@ -517,6 +531,16 @@ class ContractEnvelope(RawContractEnvelope):
             and self.contract_version == 3
         ):
             _validate_opportunity_publication_batch_changed(self, self.payload)
+        elif (
+            self.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            and self.contract_version == 4
+        ):
+            _validate_coaching_opportunity_publication_changed(self, self.payload)
+        elif (
+            self.contract_name is ContractName.OPPORTUNITY_PUBLICATION_CHANGED
+            and self.contract_version == 5
+        ):
+            _validate_coaching_opportunity_publication_batch_changed(self, self.payload)
         elif self.contract_name is ContractName.SEARCH_COMPLETED:
             _validate_search_completed(self, self.payload)
         elif self.contract_name is ContractName.GET_COMPLETED_SEARCH:
@@ -689,6 +713,15 @@ _TRANSFER_SEARCH_DETAIL_VALUES = {
     "venue_settings": _GAME_SEARCH_DETAIL_VALUES["venue_settings"],
     "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
     "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
+}
+_REFEREE_SEARCH_DETAIL_VALUES = {
+    "event_types": frozenset({"match", "tournament"}),
+    "team_formats": _GAME_SEARCH_DETAIL_VALUES["team_formats"],
+    "referee_roles": frozenset({"head_referee", "assistant_referee", "var"}),
+    "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
+}
+_REFEREEING_SERVICE_OFFER_DETAIL_VALUES = {
+    key: frozenset(values) for key, values in _REFEREE_SEARCH_DETAIL_VALUES.items()
 }
 _COACHING_SEARCH_DETAIL_VALUES = {
     "coaching_types": frozenset(
@@ -936,6 +969,8 @@ def _validate_run_search(
         ):
             raise ValueError("RunSearch has invalid Opponent Search details")
     transfer_details = payload.get("transfer_search_details")
+    referee_search_details = payload.get("referee_search_details")
+    refereeing_service_offer_details = payload.get("refereeing_service_offer_details")
     coaching_details = payload.get("coaching_search_details")
     if (
         sum(
@@ -945,6 +980,8 @@ def _validate_run_search(
                 opponent_details,
                 tournament_details,
                 transfer_details,
+                referee_search_details,
+                refereeing_service_offer_details,
                 coaching_details,
             )
         )
@@ -1005,6 +1042,47 @@ def _validate_run_search(
             for key, values in transfer_details.items()
         ):
             raise ValueError("RunSearch has invalid transfer Search details")
+    for details, expected_intent, detail_values, label in (
+        (
+            referee_search_details,
+            "referee_search",
+            _REFEREE_SEARCH_DETAIL_VALUES,
+            "Referee Search",
+        ),
+        (
+            refereeing_service_offer_details,
+            "refereeing_service_offer",
+            _REFEREEING_SERVICE_OFFER_DETAIL_VALUES,
+            "Refereeing Service Offer",
+        ),
+    ):
+        if details is None:
+            continue
+        if user_intent != expected_intent or not isinstance(details, dict):
+            raise ValueError(f"RunSearch details require {label}")
+        if set(details) - {"times"} - set(detail_values) or not all(
+            isinstance(values, list)
+            and ((key == "times" and len(values) <= 1) or key != "times")
+            and len(values)
+            == len(set(value for value in values if isinstance(value, str)))
+            and all(
+                isinstance(value, str)
+                and (
+                    value in detail_values.get(key, ())
+                    or (
+                        key == "times"
+                        and (
+                            value in {"morning", "daytime", "evening", "night"}
+                            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
+                            is not None
+                        )
+                    )
+                )
+                for value in values
+            )
+            for key, values in details.items()
+        ):
+            raise ValueError(f"RunSearch has invalid {label} details")
     if coaching_details is not None:
         if contract_version < 3:
             raise ValueError(
@@ -2061,16 +2139,8 @@ def _validate_ambiguity_pass_execution(
             raise ValueError("ambiguity-pass artifact is not configured")
     elif player_release:
         expected_routing = "classifier-routing-player-v1"
-        expected_prompt = (
-            "player-match-ambiguity-v2"
-            if value["schema_version"] == "source-message-classification-v4"
-            else "player-match-ambiguity-v1"
-        )
-        expected_schema = (
-            "source-message-classification-v4"
-            if expected_prompt == "player-match-ambiguity-v2"
-            else "source-message-classification-v3"
-        )
+        expected_prompt = "player-match-ambiguity-v1"
+        expected_schema = "source-message-classification-v3"
     else:
         expected_prompt = prompt_version or (
             "open-match-ambiguity-v3"
@@ -2099,7 +2169,6 @@ def _validate_ambiguity_pass_execution(
         "open-match-ambiguity-v1",
         "open-match-ambiguity-v2",
         "open-match-ambiguity-v3",
-        "player-match-ambiguity-v2",
     }:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
     if value["schema_version"] not in {
@@ -2220,11 +2289,7 @@ def _validate_semantic_proof_execution(
         if not isinstance(raw_schema_version, str):
             raise ValueError("semantic-proof schema provenance is invalid")
         expected_prompt = prompt_version or (
-            (
-                "player-match-semantic-proof-v2"
-                if value["schema_version"] == "source-semantic-proof-v3"
-                else "player-match-semantic-proof-v1"
-            )
+            "player-match-semantic-proof-v1"
             if player_release
             else (
                 "open-match-semantic-proof-v3"
@@ -2302,8 +2367,8 @@ def _validate_opportunity_publication_changed(
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
-        "coach_availability",
-        "coach_request",
+        "referee_availability",
+        "referee_request",
     }:
         raise ValueError("Opportunity type is invalid")
     identity_type = str(opportunity_type)
@@ -2458,13 +2523,13 @@ def _validate_opportunity_publication_batch_changed(
             "opponent_request",
             "roster_vacancy",
             "player_transfer_availability",
-            "coach_availability",
-            "coach_request",
+            "referee_availability",
+            "referee_request",
         }:
             raise ValueError("OpportunityPublicationChanged v3 item type is invalid")
         if (
             re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request|roster_vacancy|player_transfer_availability|coach_availability|coach_request):(?:candidate|proposition):[0-9a-f]{{16}}",
+                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request|roster_vacancy|player_transfer_availability|referee_availability|referee_request):(?:candidate|proposition):[0-9a-f]{{16}}",
                 opportunity_id,
             )
             is None
@@ -2499,6 +2564,270 @@ def _validate_opportunity_publication_batch_changed(
         raise ValueError(
             "OpportunityPublicationChanged v3 idempotency key is not canonical"
         )
+
+
+_LEGACY_PUBLICATION_OPPORTUNITY_TYPES = frozenset(
+    {
+        "open_match",
+        "tournament",
+        "player_match_availability",
+        "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
+    }
+)
+_COACHING_PUBLICATION_OPPORTUNITY_TYPES = frozenset(
+    {"coach_availability", "coach_request"}
+)
+
+
+def _validate_opportunity_publication_changed_with_types(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+    *,
+    allowed_opportunity_types: frozenset[str],
+) -> None:
+    allowed = {
+        "opportunity_id",
+        "opportunity_revision_id",
+        "source_message_revision_id",
+        "publication_state",
+        "publication_reason",
+        "opportunity_type",
+        "accepted_facts",
+        "response_route",
+    }
+    legacy_allowed = allowed - {"publication_reason"}
+    if frozenset(payload) not in {frozenset(legacy_allowed), frozenset(allowed)}:
+        raise ValueError("OpportunityPublicationChanged has incomplete semantics")
+    opportunity_id = _required_text(payload, "opportunity_id")
+    if opportunity_id != envelope.subject_id:
+        raise ValueError("OpportunityPublicationChanged subject is inconsistent")
+    source_revision_id = _required_text(payload, "source_message_revision_id")
+    source_scope = source_revision_id.rsplit(":revision:", 1)[0]
+    opportunity_type = payload["opportunity_type"]
+    if opportunity_type not in allowed_opportunity_types:
+        raise ValueError("Opportunity type is invalid")
+    identity_type = str(opportunity_type)
+    legacy_identity = f"opportunity:{source_scope}:{identity_type}"
+    candidate_identity = re.fullmatch(
+        rf"opportunity:{re.escape(source_scope)}:{re.escape(identity_type)}:candidate:[0-9a-f]{{16}}",
+        opportunity_id,
+    )
+    lineage_identity = re.fullmatch(
+        rf"opportunity:{re.escape(source_scope)}:{re.escape(identity_type)}:proposition:[0-9a-f]{{16}}",
+        opportunity_id,
+    )
+    if (
+        opportunity_id != legacy_identity
+        and lineage_identity is None
+        and candidate_identity is None
+    ):
+        raise ValueError(
+            "Opportunity identity is inconsistent with its source revision"
+        )
+    opportunity_revision_id = _required_text(payload, "opportunity_revision_id")
+    if (
+        opportunity_revision_id
+        != f"{opportunity_id}:revision:{envelope.subject_revision}"
+    ):
+        raise ValueError("Opportunity revision identity is inconsistent")
+    if payload["publication_state"] not in {
+        "active",
+        "held_for_review",
+        "suppressed",
+        "expired",
+    }:
+        raise ValueError("Opportunity publication state is invalid")
+    publication_reason = payload.get("publication_reason")
+    if publication_reason is not None:
+        if publication_reason not in {
+            "source_revision_superseded",
+            "source_deleted",
+            "exact_repost_superseded",
+            "moderation_held",
+            "moderation_suppressed",
+        }:
+            raise ValueError("Opportunity publication reason is invalid")
+        if (
+            publication_reason == "moderation_held"
+            and payload["publication_state"] != "held_for_review"
+        ):
+            raise ValueError("moderation_held requires held_for_review state")
+        if (
+            publication_reason != "moderation_held"
+            and payload["publication_state"] == "active"
+        ):
+            raise ValueError("active publication cannot carry a suppression reason")
+    accepted_facts = payload["accepted_facts"]
+    if not isinstance(accepted_facts, dict):
+        raise TypeError("accepted_facts must be an object")
+    _validate_accepted_opportunity_facts(accepted_facts, opportunity_type)
+    route = payload["response_route"]
+    if not isinstance(route, dict) or set(route) != {"kind", "value"}:
+        raise TypeError("response_route must contain kind and value")
+    route_kind = route["kind"]
+    route_value = route["value"]
+    valid_route = (
+        isinstance(route_value, str)
+        and bool(route_value)
+        and (
+            (
+                route_kind == "explicit_telegram_username"
+                and re.fullmatch(r"@[A-Za-z0-9_]{5,32}", route_value) is not None
+            )
+            or (
+                route_kind == "explicit_phone"
+                and re.fullmatch(r"\+?[0-9][0-9 ()-]{5,}[0-9]", route_value) is not None
+                and 7 <= sum(character.isdigit() for character in route_value) <= 15
+            )
+            or (route_kind == "explicit_url" and _is_safe_http_route(route_value))
+            or (
+                route_kind in {"direct_message", "reply_thread", "source_message"}
+                and _is_safe_telegram_route(route_value)
+            )
+        )
+    )
+    if not valid_route:
+        raise ValueError("response_route is invalid")
+    _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
+    allowed_idempotency_keys = {f"opportunity-publication:{opportunity_revision_id}"}
+    if payload["publication_state"] == "suppressed":
+        allowed_idempotency_keys.add(
+            f"opportunity-publication-source-suppression:{opportunity_revision_id}"
+        )
+    if re.fullmatch(
+        rf"opportunity-publication-exact-repost:{re.escape(opportunity_revision_id)}"
+        r":(?:active|held_for_review|suppressed|expired):[1-9][0-9]*",
+        envelope.idempotency_key,
+    ):
+        allowed_idempotency_keys.add(envelope.idempotency_key)
+    if envelope.idempotency_key not in allowed_idempotency_keys:
+        raise ValueError(
+            "OpportunityPublicationChanged idempotency key is not canonical"
+        )
+
+
+def _validate_coaching_opportunity_publication_changed(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    """Validate the additive v4 coaching publication contract."""
+    _validate_opportunity_publication_changed_with_types(
+        envelope,
+        payload,
+        allowed_opportunity_types=_COACHING_PUBLICATION_OPPORTUNITY_TYPES,
+    )
+
+
+def _validate_opportunity_publication_batch_changed_with_types(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+    *,
+    allowed_opportunity_types: frozenset[str],
+) -> None:
+    """Validate one publication batch against its immutable type boundary."""
+    allowed = {
+        "source_message_revision_id",
+        "publication_state",
+        "opportunities",
+    }
+    if set(payload) != allowed:
+        raise ValueError("OpportunityPublicationChanged v3 has incomplete semantics")
+    source_revision_id = _required_text(payload, "source_message_revision_id")
+    source_scope, separator, revision_suffix = source_revision_id.rpartition(
+        ":revision:"
+    )
+    if not separator or not source_scope or not revision_suffix.isdigit():
+        raise ValueError("OpportunityPublicationChanged v3 source lineage is invalid")
+    if envelope.subject_id != f"opportunity-batch:{source_revision_id}":
+        raise ValueError("OpportunityPublicationChanged v3 subject is inconsistent")
+    publication_state = payload["publication_state"]
+    if publication_state not in {
+        "active",
+        "held_for_review",
+        "suppressed",
+        "expired",
+    }:
+        raise ValueError(
+            "OpportunityPublicationChanged v3 publication state is invalid"
+        )
+    opportunities = payload["opportunities"]
+    if not isinstance(opportunities, list) or not 2 <= len(opportunities) <= 8:
+        raise ValueError("OpportunityPublicationChanged v3 batch size is invalid")
+    opportunity_type_pattern = "|".join(
+        sorted(re.escape(item) for item in allowed_opportunity_types)
+    )
+    opportunity_ids: set[str] = set()
+    for opportunity in opportunities:
+        if not isinstance(opportunity, dict) or set(opportunity) != {
+            "opportunity_id",
+            "opportunity_revision_id",
+            "opportunity_type",
+            "accepted_facts",
+            "response_route",
+        }:
+            raise ValueError("OpportunityPublicationChanged v3 item is incomplete")
+        opportunity_id = _required_text(opportunity, "opportunity_id")
+        opportunity_type = opportunity["opportunity_type"]
+        if opportunity_type not in allowed_opportunity_types:
+            raise ValueError("OpportunityPublicationChanged v3 item type is invalid")
+        if (
+            re.fullmatch(
+                rf"opportunity:{re.escape(source_scope)}:"
+                rf"(?:{opportunity_type_pattern}):"
+                r"(?:candidate|proposition):[0-9a-f]{16}",
+                opportunity_id,
+            )
+            is None
+            or opportunity_id in opportunity_ids
+        ):
+            raise ValueError(
+                "OpportunityPublicationChanged v3 item identity is invalid"
+            )
+        opportunity_ids.add(opportunity_id)
+        opportunity_revision_id = _required_text(opportunity, "opportunity_revision_id")
+        if (
+            opportunity_revision_id
+            != f"{opportunity_id}:revision:{envelope.subject_revision}"
+        ):
+            raise ValueError("OpportunityPublicationChanged v3 revision is invalid")
+        accepted_facts = opportunity["accepted_facts"]
+        if not isinstance(accepted_facts, dict):
+            raise TypeError("OpportunityPublicationChanged v3 facts must be an object")
+        _validate_accepted_opportunity_facts(
+            accepted_facts,
+            str(opportunity["opportunity_type"]),
+        )
+        route = opportunity["response_route"]
+        if not isinstance(route, dict) or set(route) != {"kind", "value"}:
+            raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
+        _validate_publication_response_route(route)
+    _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
+    if envelope.idempotency_key != (
+        f"opportunity-publication-batch:{source_revision_id}:"
+        f"revision:{envelope.subject_revision}"
+    ):
+        raise ValueError(
+            "OpportunityPublicationChanged v3 idempotency key is not canonical"
+        )
+
+
+def _validate_coaching_opportunity_publication_batch_changed(
+    envelope: RawContractEnvelope,
+    payload: dict[str, JsonValue],
+) -> None:
+    """Validate the additive v5 coaching publication contract."""
+    _validate_opportunity_publication_batch_changed_with_types(
+        envelope,
+        payload,
+        allowed_opportunity_types=(
+            _LEGACY_PUBLICATION_OPPORTUNITY_TYPES
+            | _COACHING_PUBLICATION_OPPORTUNITY_TYPES
+        ),
+    )
 
 
 def _validate_publication_response_route(route: dict[str, JsonValue]) -> None:
@@ -2539,6 +2868,8 @@ def _validate_accepted_opportunity_facts(
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
         "coach_availability",
         "coach_request",
     }:
