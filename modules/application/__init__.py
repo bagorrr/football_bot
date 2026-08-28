@@ -16056,6 +16056,90 @@ def _source_transfer_qualifying_assertion_at(
     return qualifying
 
 
+_REFEREE_ACTIONABLE_TERM_PATTERN = re.compile(
+    r"(?:referee\w*|official\w*|arbitr(?:ator|e|al)\w*|"
+    r"судь\w*|арбитр\w*|[áa]rbitro\w*|arbitre\w*|"
+    r"available|offering|offers?|ready|officiat\w*|availability|"
+    r"доступ\w*|готов\w*|предлага\w*|свобод\w*|"
+    r"disponible|ofrezc\w*|listo\w*|propon\w*|pr[êe]t\w*|propos\w*|"
+    r"need\w*|require\w*|want\w*|looking|seeking|needed|required|wanted|"
+    r"нуж\w*|требу\w*|ищ\w*|"
+    r"necesit\w*|busc\w*|requier\w*|cherch\w*|recherch\w*|besoin|"
+    r"football\w*|soccer\w*|футбол\w*|f[úu]tbol\w*|"
+    r"match\w*|game\w*|fixture\w*|матч\w*|игр\w*|partid\w*|"
+    r"encuentro\w*|rencontre\w*|tournament\w*|cup\w*|competition\w*|"
+    r"турнир\w*|кубок\w*|соревнован\w*|torneo\w*|copa\w*|"
+    r"competici[oó]n\w*|tournoi\w*|coupe\w*|comp[ée]tition\w*|"
+    r"adult\w*|youth\w*|junior\w*|children\w*|kids?\b|"
+    r"взросл\w*|детск\w*|юнош\w*|молодёж\w*|молодеж\w*|"
+    r"head\b|main\b|chief\b|assistant\w*|line\b|video\b|var\b|"
+    r"главн\w*|ассистент\w*|помощник\w*|боков\w*|видео\w*|"
+    r"principal\w*|asistente\w*|videoarbit\w*|principal\w*|assistant\w*|"
+    r"free\b|paid\b|pay\w*|gratis\w*|gratuit\w*|"
+    r"бесплат\w*|платн\w*|гонорар\w*|оплат\w*|payant\w*|"
+    r"\d{1,2}\s*[xх×]\s*\d{1,2}|"
+    r"20\d{2}(?:[-/.]\d{1,2}){1,2}|\d{1,2}[./-]\d{1,2}[./-]20\d{2}|"
+    r"\b\d{1,2}:\d{2}\b|"
+    r"@[a-z0-9_]{3,}|https?://[^\s]+|"
+    r"[\w.+-]+@[\w.-]+\.[a-z]{2,}|\+?[0-9][0-9 ()-]{5,}[0-9])",
+    re.IGNORECASE,
+)
+_REFEREE_LOCATION_CLAUSE_PATTERN = re.compile(
+    r"\b(?:in|at|near|around|from|within)\s+[^.!?;,\n]+|"
+    r"\b(?:в|на|из|около|рядом\s+с)\s+[^.!?;,\n]+|"
+    r"\b(?:en|cerca\s+de|desde)\s+[^.!?;,\n]+|"
+    r"\b(?:à|dans|près\s+de|depuis)\s+[^.!?;,\n]+",
+    re.IGNORECASE,
+)
+_REFEREE_EXPLICIT_RENEWAL_PATTERN = re.compile(
+    r"\b(?:renew\w*|re[- ]?post\w*|"
+    r"still\s+(?:available|offering)|"
+    r"availability\s+(?:renewed|extended)|"
+    r"обновл\w*|снова\s+(?:доступ\w*|готов\w*)|"
+    r"(?:disponible|disponibilidad)\s+(?:de\s+nuevo|renov\w*)|"
+    r"(?:disponible|offre)\s+(?:encore|à\s+nouveau))\b",
+    re.IGNORECASE,
+)
+
+
+def _referee_assertion_signature(body: str) -> tuple[str, ...]:
+    """Retain only terms that can change a referee source assertion."""
+    normalized = re.sub(r"['’]", " ", body.casefold())
+    terms = [
+        token
+        for match in _REFEREE_ACTIONABLE_TERM_PATTERN.finditer(normalized)
+        for token in re.findall(r"[\w@]+", match.group(0), flags=re.UNICODE)
+    ]
+    for match in _REFEREE_LOCATION_CLAUSE_PATTERN.finditer(body):
+        terms.extend(re.findall(r"[\w@]+", match.group(0).casefold(), flags=re.UNICODE))
+    return tuple(sorted(terms))
+
+
+def _referee_bounded_response_route(
+    bounded_metadata: Mapping[str, object] | None,
+) -> tuple[str, str] | None:
+    """Return the currently selected fallback route from bounded metadata."""
+    if bounded_metadata is None:
+        return None
+    fallback_routes = (
+        ("direct_message", "source_author_dm_url"),
+        ("reply_thread", "reply_route_url"),
+        ("source_message", "source_message_url"),
+    )
+    for kind, key in fallback_routes:
+        value = bounded_metadata.get(key)
+        if (
+            (
+                key != "source_message_url"
+                or bounded_metadata.get("source_message_reply_capable") is True
+            )
+            and isinstance(value, str)
+            and _is_safe_telegram_response_url(value)
+        ):
+            return kind, value
+    return None
+
+
 def _source_refereeing_edit_qualifies_freshness(
     current_revision: SourceMessageRevision,
     previous_revision: SourceMessageRevision | None,
@@ -16069,10 +16153,15 @@ def _source_refereeing_edit_qualifies_freshness(
         return False
     if previous_revision is None or previous_revision.body is None:
         return True
-    return _source_edit_qualifies_freshness(
-        current_revision,
-        (previous_revision,),
-    )
+    if _REFEREE_EXPLICIT_RENEWAL_PATTERN.search(current_revision.body):
+        return True
+    if _referee_assertion_signature(current_revision.body) != (
+        _referee_assertion_signature(previous_revision.body)
+    ):
+        return True
+    return _referee_bounded_response_route(
+        current_revision.bounded_metadata
+    ) != _referee_bounded_response_route(previous_revision.bounded_metadata)
 
 
 def _source_refereeing_qualifying_assertion_at(
@@ -20939,13 +21028,24 @@ def _refereeing_optional_values_are_supported(
         if not isinstance(team_formats, list) or not isinstance(field_evidence, str):
             return False
         normalized = field_evidence.casefold()
+        canonical_team_formats = (
+            "5x5",
+            "6x6",
+            "7x7",
+            "8x8",
+            "9x9",
+            "10x10",
+            "11x11",
+        )
+
+        def team_format_pattern(value: str) -> str:
+            left, right = value.split("x", 1)
+            return rf"(?<!\w){left}\s*[xх×]\s*{right}(?!\w)"
+
         mentioned_values = {
             value
-            for value in {"5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"}
-            if re.search(
-                rf"(?<!\w){value[0:-2]}\s*[xх×]\s*{value[-1]}(?!\w)",
-                normalized,
-            )
+            for value in canonical_team_formats
+            if re.search(team_format_pattern(value), normalized)
         }
         selected_values = {value for value in team_formats if isinstance(value, str)}
         if mentioned_values - selected_values or not selected_values.issubset(
@@ -20953,20 +21053,9 @@ def _refereeing_optional_values_are_supported(
         ):
             return False
         for value in team_formats:
-            if not isinstance(value, str) or value not in {
-                "5x5",
-                "6x6",
-                "7x7",
-                "8x8",
-                "9x9",
-                "10x10",
-                "11x11",
-            }:
+            if not isinstance(value, str) or value not in canonical_team_formats:
                 return False
-            if not re.search(
-                rf"(?<!\w){value[0:-2]}\s*[xх×]\s*{value[-1]}(?!\w)",
-                normalized,
-            ):
+            if not re.search(team_format_pattern(value), normalized):
                 return False
     payment = candidate.get("payment")
     if payment is not None:

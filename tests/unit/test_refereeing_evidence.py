@@ -2,6 +2,8 @@
 
 from typing import cast
 
+import pytest
+
 from modules.application import (
     _refereeing_opportunity_is_supported,
     _refereeing_optional_values_are_supported,
@@ -82,4 +84,24 @@ def test_referee_optional_values_are_bound_to_the_current_source_proposition() -
         {**candidate, "team_formats": cast(JsonValue, ["11x11"])},
         evidence,
         authoritative_body=body,
+    )
+
+
+@pytest.mark.parametrize("team_format", ("10x10", "11x11"))
+def test_referee_optional_values_accept_canonical_large_team_formats(
+    team_format: str,
+) -> None:
+    body = (
+        "Referee available for an adult football match, "
+        f"{team_format}, head referee, paid in Petrogradskaya. "
+        "Contact @referee_contact"
+    )
+    candidate: dict[str, JsonValue] = {
+        "opportunity_type": "referee_availability",
+        "team_formats": [team_format],
+    }
+    evidence: dict[str, JsonValue] = {"team_formats": team_format}
+
+    assert _refereeing_optional_values_are_supported(
+        candidate, evidence, authoritative_body=body
     )

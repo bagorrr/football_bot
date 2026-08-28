@@ -6,6 +6,8 @@ import os
 from datetime import UTC, date, datetime
 from typing import cast
 
+import psycopg
+
 from modules.contracts import JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
@@ -145,6 +147,24 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
             ("match",),
         ),
         (
+            "standing-availability-repost",
+            "⚽ Referee available for adult football matches in Saint Petersburg, "
+            "7x7, head referee, paid. Contact @referee_standing ⚽",
+            "referee_availability",
+            {
+                "opportunity": "Referee available for adult football matches",
+                "location": "in Saint Petersburg",
+                "referee_availability": "Referee available",
+                "event_types": "adult football matches",
+                "team_formats": "7x7",
+                "referee_roles": "head referee",
+                "payment": "paid",
+            },
+            None,
+            {"referee_availability": True},
+            ("match",),
+        ),
+        (
             "dated-request",
             "A team needs a referee for an adult football match on 20 August "
             "2026 at 19:00 in Saint Petersburg, 7x7, head referee, paid. "
@@ -191,6 +211,10 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
             ),
         )
         telegram_message_id = 1570 + offset
+        if label.startswith("standing-availability"):
+            source_publisher_id = "publisher:standing-availability"
+        else:
+            source_publisher_id = f"publisher:{label}"
         ingestion.add_channel_difference_event(
             identity=source_identity,
             from_checkpoint=TelegramChannelCheckpoint(pts=49570 + offset),
@@ -201,6 +225,7 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
             kind=SourceEventKind.CREATE,
             body=body,
             event_time=datetime(2026, 8, 10, 9, 6 + offset, tzinfo=UTC),
+            source_publisher_id=source_publisher_id,
         )
         assert system.process_next_channel_telegram_difference(
             identity=source_identity,
@@ -213,7 +238,7 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
         "referee_availability",
         "referee_request",
     }
-    assert len(published) == 3
+    assert len(published) == 4
     assert any(
         opportunity.opportunity_type == "referee_request" for opportunity in published
     )
@@ -230,6 +255,86 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
     assert isinstance(standing_facts, dict)
     assert standing_facts["start_local_date"] is None
     assert standing_facts["end_local_date"] is None
+    standing_clusters = tuple(
+        cluster
+        for cluster in system.exact_repost_clusters()
+        if cluster.opportunity_type == "referee_availability"
+        and cluster.resolved_event_date == "standing"
+    )
+    assert len(standing_clusters) == 1
+    standing_cluster = standing_clusters[0]
+    assert standing_cluster.opportunity_type == "referee_availability"
+    assert standing_cluster.resolved_event_date == "standing"
+    assert isinstance(standing_cluster.representative_source_message_id, str)
+    assert standing_cluster.representative_source_message_id.endswith(":1572")
+    standing_members = system.exact_repost_cluster_members(
+        standing_cluster.exact_repost_cluster_id
+    )
+    assert len(standing_members) == 2
+    assert sum(member.is_representative for member in standing_members) == 1
+    standing_representative = next(
+        opportunity
+        for opportunity in published
+        if opportunity.source_message_revision_id.endswith(":1572:revision:1")
+    )
+
+    for offset, team_format in enumerate(("10x10", "11x11")):
+        body = (
+            "Referee available for adult football matches in Saint Petersburg, "
+            f"{team_format}, head referee, paid. Contact @referee_standing"
+        )
+        classifier.return_for(
+            body=body,
+            result=_classifier_result(
+                body=body,
+                opportunity_type="referee_availability",
+                evidence={
+                    "opportunity": "Referee available for adult football matches",
+                    "location": "in Saint Petersburg",
+                    "referee_availability": "Referee available",
+                    "event_types": "adult football matches",
+                    "team_formats": team_format,
+                    "referee_roles": "head referee",
+                    "payment": "paid",
+                },
+                event_time=None,
+                direction={"referee_availability": True},
+                event_types=("match",),
+                team_format=team_format,
+            ),
+        )
+        telegram_message_id = 1580 + offset
+        ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=49574 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=49575 + offset),
+            source_event_id=f"source-event:refereeing:{team_format}",
+            telegram_message_id=telegram_message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=body,
+            event_time=datetime(2026, 8, 10, 10 + offset, tzinfo=UTC),
+            source_publisher_id=f"publisher:{team_format}",
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+        large_format_opportunity = next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.source_message_revision_id.endswith(
+                f":{telegram_message_id}:revision:1"
+            )
+        )
+        publication = system.opportunity_publication_contracts(
+            large_format_opportunity.source_message_revision_id
+        )[-1]
+        assert isinstance(publication.payload, dict)
+        accepted_facts = publication.payload["accepted_facts"]
+        assert isinstance(accepted_facts, dict)
+        assert accepted_facts["team_formats"] == [team_format]
 
     _advance_to_complete_search(system, user_id=user_id)
     assert system.conversation_state(user_id).stage is ConversationStage.POST_CORE, (
@@ -250,7 +355,9 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
     assert result_classes == ["confirmed_match", "possible_match"]
     result_types = [dict(result.card_facts)["opportunity_type"] for result in results]
     assert result_types == ["referee_availability", "referee_availability"]
-    assert dict(results[-1].card_facts)["opportunity_id"] == standing.opportunity_id
+    assert dict(results[-1].card_facts)["opportunity_id"] == (
+        standing_representative.opportunity_id
+    )
     availability_card = delivery.messages[-1].text
     assert "⚖️ Referee Availability" in availability_card
     assert "Event type: Match" in availability_card
@@ -295,6 +402,42 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
     assert "Surface" not in request_card
     assert "Contact: " in request_card
     assert request_card.count("Contact: ") == 1
+
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = FALSE, updated_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            """,
+            (clock.now(), source_identity.kind.value, source_identity.telegram_id, 1),
+        )
+
+    unavailable_results = system.results(completed[0].completed_search_id)
+    assert unavailable_results
+    assert all(
+        dict(result.card_facts)["publication_state"] == "suppressed"
+        for result in unavailable_results
+    )
+    assert all(
+        "response_route_value" not in dict(result.card_facts)
+        for result in unavailable_results
+    )
+
+    disabled_user_id = user_id + 2
+    _advance_to_complete_search(system, user_id=disabled_user_id)
+    _configure_referee_details(system, user_id=disabled_user_id)
+    system.submit_search(
+        update_id="submit-disabled-source-chat",
+        telegram_user_id=disabled_user_id,
+    )
+    system.process_searches_until_idle()
+    disabled_completed = system.completed_searches(disabled_user_id)
+    assert len(disabled_completed) == 1
+    assert system.results(disabled_completed[0].completed_search_id) == ()
+
     system.reset()
 
 
@@ -386,6 +529,7 @@ def _classifier_result(
     event_time: dict[str, str] | None,
     direction: dict[str, bool],
     event_types: tuple[str, ...],
+    team_format: str = "7x7",
 ) -> ClassifierAdapterResult:
     candidate: dict[str, JsonValue] = {
         "candidate_key": opportunity_type,
@@ -400,7 +544,7 @@ def _classifier_result(
         },
         **direction,
         "event_types": list(event_types),
-        "team_formats": ["7x7"],
+        "team_formats": [team_format],
         "referee_roles": ["head_referee"],
         "payment": "paid",
         "response_routes": [

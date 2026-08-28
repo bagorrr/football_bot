@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
 from modules.application import _refereeing_result_message
 from modules.domain import SearchResult
+from modules.postgres_adapter import _result_card_facts_with_current_publication_state
 
 
 def _result(
@@ -165,3 +167,27 @@ def test_referee_result_card_covers_all_conversation_languages() -> None:
         )
         assert title in message.text
         assert "@referee_contact" in message.text
+
+
+def test_historical_referee_card_uses_current_source_timestamps() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_result().card_facts),
+        {
+            "opportunity_revision_id": "opportunity:referee-card:revision:2",
+            "publication_state": "suppressed",
+            "current_facts": {
+                "source_posted_at": "2026-08-20T08:00:00+00:00",
+                "source_edited_at": "2026-08-21T08:00:00+00:00",
+                "source_qualifying_assertion_at": "2026-08-21T08:00:00+00:00",
+            },
+            "response_route_kind": None,
+            "response_route_value": None,
+        },
+        as_of=datetime(2026, 8, 22, tzinfo=UTC),
+    )
+
+    assert overlaid["source_posted_at"] == "2026-08-20T08:00:00+00:00"
+    assert overlaid["source_edited_at"] == "2026-08-21T08:00:00+00:00"
+    assert overlaid["source_qualifying_assertion_at"] == ("2026-08-21T08:00:00+00:00")
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_value" not in overlaid
