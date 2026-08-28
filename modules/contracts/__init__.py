@@ -267,6 +267,14 @@ SUPPORTED_CONTRACTS = (
         ("telegram_user_id",),
     ),
     ContractDefinition(
+        ContractName.RUN_SEARCH,
+        3,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.RECOMMENDATION,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
         ContractName.SEARCH_COMPLETED,
         1,
         RuntimeRole.RECOMMENDATION,
@@ -714,7 +722,7 @@ def _validate_run_search(
 ) -> None:
     """Validate the complete confirmed discovery snapshot on the wire."""
     contract_version = envelope.contract_version
-    if contract_version == 2:
+    if contract_version in {2, 3}:
         required_fields = {
             "search_update_id",
             "telegram_user_id",
@@ -735,10 +743,13 @@ def _validate_run_search(
             "opponent_search_details",
             "tournament_search_details",
             "transfer_search_details",
-            "coaching_search_details",
         }
+        if contract_version == 3:
+            allowed_fields.add("coaching_search_details")
         if not required_fields <= set(payload) or set(payload) - allowed_fields:
-            raise ValueError("RunSearch v2 contains unsupported or missing facts")
+            raise ValueError(
+                f"RunSearch v{contract_version} contains unsupported or missing facts"
+            )
         search_update_id = _required_text(payload, "search_update_id")
         telegram_user_id = payload["telegram_user_id"]
         draft_revision = payload["discovery_draft_revision"]
@@ -750,25 +761,37 @@ def _validate_run_search(
             or isinstance(draft_revision, bool)
             or draft_revision < 1
         ):
-            raise ValueError("RunSearch v2 identities must be positive integers")
+            raise ValueError(
+                f"RunSearch v{contract_version} identities must be positive integers"
+            )
         expected_message_id = derive_run_search_message_id(
             telegram_user_id, search_update_id
         )
         if envelope.message_id != expected_message_id:
-            raise ValueError("RunSearch v2 message identity is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} message identity is not canonical"
+            )
         if envelope.subject_id != f"bot-user:{telegram_user_id}":
-            raise ValueError("RunSearch v2 subject identity is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} subject identity is not canonical"
+            )
         if envelope.subject_revision != draft_revision:
-            raise ValueError("RunSearch v2 subject revision is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} subject revision is not canonical"
+            )
         if envelope.idempotency_key != (
             f"run-search:{telegram_user_id}:{search_update_id}"
         ):
-            raise ValueError("RunSearch v2 idempotency key is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} idempotency key is not canonical"
+            )
         if (
             envelope.causation_id != expected_message_id
             or envelope.correlation_id != expected_message_id
         ):
-            raise ValueError("RunSearch v2 causation/correlation is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} causation/correlation is not canonical"
+            )
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
@@ -974,6 +997,10 @@ def _validate_run_search(
         ):
             raise ValueError("RunSearch has invalid transfer Search details")
     if coaching_details is not None:
+        if contract_version < 3:
+            raise ValueError(
+                "RunSearch coaching_search_details requires contract version 3"
+            )
         if user_intent not in {
             "coach_search",
             "coaching_service_offer",
@@ -2025,18 +2052,34 @@ def _validate_ambiguity_pass_execution(
             raise ValueError("ambiguity-pass artifact is not configured")
     elif player_release:
         expected_routing = "classifier-routing-player-v1"
-        expected_prompt = "player-match-ambiguity-v1"
-        expected_schema = "source-message-classification-v3"
+        expected_prompt = (
+            "player-match-ambiguity-v2"
+            if value["schema_version"] == "source-message-classification-v4"
+            else "player-match-ambiguity-v1"
+        )
+        expected_schema = (
+            "source-message-classification-v4"
+            if expected_prompt == "player-match-ambiguity-v2"
+            else "source-message-classification-v3"
+        )
     else:
         expected_prompt = prompt_version or (
-            "open-match-ambiguity-v2"
-            if value["prompt_version"] == "open-match-ambiguity-v2"
-            else "open-match-ambiguity-v1"
+            "open-match-ambiguity-v3"
+            if value["prompt_version"] == "open-match-ambiguity-v3"
+            else (
+                "open-match-ambiguity-v2"
+                if value["prompt_version"] == "open-match-ambiguity-v2"
+                else "open-match-ambiguity-v1"
+            )
         )
         expected_schema = schema_version or (
-            "source-message-classification-v3"
-            if expected_prompt == "open-match-ambiguity-v2"
-            else "source-message-classification-v2"
+            "source-message-classification-v4"
+            if expected_prompt == "open-match-ambiguity-v3"
+            else (
+                "source-message-classification-v3"
+                if expected_prompt == "open-match-ambiguity-v2"
+                else "source-message-classification-v2"
+            )
         )
     if value["prompt_version"] != expected_prompt:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
@@ -2046,11 +2089,14 @@ def _validate_ambiguity_pass_execution(
         "player-match-ambiguity-v1",
         "open-match-ambiguity-v1",
         "open-match-ambiguity-v2",
+        "open-match-ambiguity-v3",
+        "player-match-ambiguity-v2",
     }:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
     if value["schema_version"] not in {
         "source-message-classification-v2",
         "source-message-classification-v3",
+        "source-message-classification-v4",
     }:
         raise ValueError("ambiguity-pass prompt and schema versions disagree")
     if value["context_bundle_version"] != "primary-classifier-context-v1":
@@ -2165,12 +2211,20 @@ def _validate_semantic_proof_execution(
         if not isinstance(raw_schema_version, str):
             raise ValueError("semantic-proof schema provenance is invalid")
         expected_prompt = prompt_version or (
-            "player-match-semantic-proof-v1"
+            (
+                "player-match-semantic-proof-v2"
+                if value["schema_version"] == "source-semantic-proof-v3"
+                else "player-match-semantic-proof-v1"
+            )
             if player_release
             else (
-                "open-match-semantic-proof-v2"
-                if value["schema_version"] == "source-semantic-proof-v2"
-                else "open-match-semantic-proof-v1"
+                "open-match-semantic-proof-v3"
+                if value["schema_version"] == "source-semantic-proof-v3"
+                else (
+                    "open-match-semantic-proof-v2"
+                    if value["schema_version"] == "source-semantic-proof-v2"
+                    else "open-match-semantic-proof-v1"
+                )
             )
         )
         expected_schema = schema_version or raw_schema_version
@@ -2194,6 +2248,7 @@ def _validate_semantic_proof_execution(
     if value["schema_version"] not in {
         "source-semantic-proof-v1",
         "source-semantic-proof-v2",
+        "source-semantic-proof-v3",
     }:
         raise ValueError("semantic-proof schema provenance is unsupported")
     if any(value[field_name] != expected for field_name, expected in pinned.items()):

@@ -1,0 +1,9 @@
+{
+  "requested_model": "gpt-5.6-sol",
+  "requested_reasoning_effort": "high",
+  "prompt_version": "open-match-semantic-proof-v3",
+  "schema_version": "source-semantic-proof-v3",
+  "glossary_version": "football-opportunity-glossary-v1",
+  "context_policy_version": "semantic-proof-context-v1",
+  "routing_policy_version": "classifier-routing-v1"
+}

@@ -60,10 +60,12 @@ def _coaching_result(*, publication_state: str = "active") -> SearchResult:
 
 def _current_coaching_projection(
     *,
+    opportunity_id: str = "opportunity:coach:card",
     publication_state: str = "active",
     qualifying_at: str = "2026-08-01T09:00:00+00:00",
 ) -> dict[str, object]:
     return {
+        "opportunity_id": opportunity_id,
         "opportunity_revision_id": "opportunity:coach:card:revision:2",
         "publication_state": publication_state,
         "current_facts": {
@@ -140,6 +142,34 @@ def test_current_coaching_projection_preserves_fresh_current_route() -> None:
     assert overlaid["response_route_value"] == "@current_coach_contact"
 
 
+def test_current_coaching_projection_remaps_card_identity_and_current_facts() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_coaching_result().card_facts),
+        _current_coaching_projection(
+            opportunity_id="opportunity:coach:current",
+            qualifying_at="2026-08-19T09:00:00+00:00",
+        ),
+        as_of=datetime(2026, 8, 20, 9, tzinfo=UTC),
+    )
+    assert overlaid["opportunity_id"] == "opportunity:coach:current"
+    assert overlaid["opportunity_revision_id"] == "opportunity:coach:card:revision:2"
+    assert overlaid["source_qualifying_assertion_at"] == "2026-08-19T09:00:00+00:00"
+
+
+def test_suppressed_current_coaching_representative_remains_uncontactable() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_coaching_result().card_facts),
+        _current_coaching_projection(
+            opportunity_id="opportunity:coach:suppressed",
+            publication_state="suppressed",
+        ),
+        as_of=datetime(2026, 8, 20, 9, tzinfo=UTC),
+    )
+    assert overlaid["opportunity_id"] == "opportunity:coach:suppressed"
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_value" not in overlaid
+
+
 def test_inactive_coaching_card_is_unavailable_without_contact_route() -> None:
     facts = dict(_coaching_result(publication_state="expired").card_facts)
     facts.pop("response_route_kind")
@@ -211,3 +241,54 @@ def test_generic_online_coaching_wording_does_not_establish_in_person_intent() -
         "Message @coach",
         "coach_availability",
     )
+
+
+@pytest.mark.parametrize(
+    ("body", "opportunity_type", "expected"),
+    (
+        (
+            "In-person coaching is available; online-only sessions are also available.",
+            "coach_availability",
+            True,
+        ),
+        (
+            "Online-only coaching available in Moscow. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is not available. Online-only sessions are offered.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching — unavailable. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching. Not available. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching wanted in Moscow. Message @team.",
+            "coach_request",
+            True,
+        ),
+        (
+            "In-person coaching requested in Moscow. Message @team.",
+            "coach_request",
+            True,
+        ),
+        (
+            "In-person coaching wanted in Moscow. Message @team.",
+            "coach_availability",
+            False,
+        ),
+    ),
+)
+def test_coaching_polarity_and_direction_are_explicit(
+    body: str, opportunity_type: str, expected: bool
+) -> None:
+    assert _body_establishes_coaching_opportunity(body, opportunity_type) is expected

@@ -3059,7 +3059,15 @@ class ConversationOnboarding:
             )
             command = ContractEnvelope(
                 contract_name=ContractName.RUN_SEARCH,
-                contract_version=2,
+                contract_version=(
+                    3
+                    if draft.user_intent
+                    in {
+                        UserIntent.COACH_SEARCH,
+                        UserIntent.COACHING_SERVICE_OFFER,
+                    }
+                    else 2
+                ),
                 message_id=message_id,
                 producer=RuntimeRole.BOT_ASSISTANT,
                 consumer=RuntimeRole.RECOMMENDATION,
@@ -11583,7 +11591,7 @@ class RuntimeApplication:
                 )
                 or (
                     definition.name is ContractName.RUN_SEARCH
-                    and definition.version == 2
+                    and definition.version in {2, 3}
                 )
                 or (
                     definition.name
@@ -12597,6 +12605,7 @@ class RuntimeApplication:
         if self.model.primary_schema_version in {
             "source-message-classification-v2",
             "source-message-classification-v3",
+            "source-message-classification-v4",
         }:
             self._classify_source_message_v2(
                 incoming,
@@ -13233,6 +13242,7 @@ class RuntimeApplication:
         if descriptor.primary_schema_version not in {
             "source-message-classification-v2",
             "source-message-classification-v3",
+            "source-message-classification-v4",
         }:
             raise RuntimeError("classifier adapter exposes unsupported artifacts")
         if descriptor.ambiguity_prompt_version is None:
@@ -16884,6 +16894,7 @@ def _classifier_proposal_has_pinned_provenance(
     if payload.get("schema_version") in {
         "source-message-classification-v2",
         "source-message-classification-v3",
+        "source-message-classification-v4",
     }:
         descriptor = _classifier_artifact_descriptor_for_payload(payload)
         if descriptor is None:
@@ -16893,9 +16904,14 @@ def _classifier_proposal_has_pinned_provenance(
             revision_id=revision_id,
             body=body,
             artifact_version=(
-                "v3"
-                if payload.get("schema_version") == "source-message-classification-v3"
-                else "v2"
+                "v4"
+                if payload.get("schema_version") == "source-message-classification-v4"
+                else (
+                    "v3"
+                    if payload.get("schema_version")
+                    == "source-message-classification-v3"
+                    else "v2"
+                )
             ),
             artifact_descriptor=descriptor,
         )
@@ -17010,13 +17026,22 @@ def _classifier_artifact_versions(
     descriptor = classifier_artifact_descriptor_for_primary(
         str(primary_schema_version),
         primary_prompt_version=(
-            "player-match-primary-v1"
+            "player-match-primary-v2"
             if player_release
-            and primary_schema_version == "source-message-classification-v3"
+            and primary_schema_version == "source-message-classification-v4"
             else (
-                "open-match-primary-v3"
-                if primary_schema_version == "source-message-classification-v3"
-                else None
+                "player-match-primary-v1"
+                if player_release
+                and primary_schema_version == "source-message-classification-v3"
+                else (
+                    "open-match-primary-v3"
+                    if primary_schema_version == "source-message-classification-v3"
+                    else (
+                        "open-match-primary-v4"
+                        if primary_schema_version == "source-message-classification-v4"
+                        else None
+                    )
+                )
             )
         ),
     )
@@ -20897,8 +20922,10 @@ def _coaching_body_is_in_person(body: str) -> bool:
         r"\b(?:not|no|without|never|не|нет|без|sin|pas|sans)\s*$"
     )
     physical_negation_after = re.compile(
-        r"^\s*(?:\w+\s+){0,5}(?:not\s+(?:available|offered|possible)|"
-        r"unavailable|не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
+        r"^\s*(?:(?:[\w'-]+\s*)|[—–,.:;!?()\[\]/-]+\s*){0,12}?"
+        r"(?:not\s+(?:available|offered|possible|provided)|"
+        r"unavailable|no\s+(?:availability|sessions?|coaching)|"
+        r"не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
         r"no\s+disponible|indisponible|pas\s+disponible)\b"
     )
     coaching = re.search(
@@ -20910,18 +20937,24 @@ def _coaching_body_is_in_person(body: str) -> bool:
     )
     if coaching is None:
         return False
-    if online_only is not None:
-        return False
     physical_matches = tuple(physical_pattern.finditer(normalized))
-    if any(
-        physical_negation_before.search(
-            normalized[max(0, match.start() - 24) : match.start()]
-        )
-        or physical_negation_after.search(normalized[match.end() : match.end() + 48])
-        for match in physical_matches
-    ):
+    if not physical_matches:
         return False
-    return bool(physical_matches)
+
+    def is_negated(match: re.Match[str]) -> bool:
+        before = normalized[max(0, match.start() - 64) : match.start()]
+        after = normalized[match.end() : match.end() + 72]
+        return bool(
+            physical_negation_before.search(before)
+            or physical_negation_after.search(after)
+        )
+
+    has_positive_physical = any(not is_negated(match) for match in physical_matches)
+    # An online-only proposition does not cancel a separate affirmative
+    # in-person proposition, but it cannot establish one on its own.
+    if online_only is not None and not has_positive_physical:
+        return False
+    return has_positive_physical
 
 
 def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> bool:
@@ -20932,7 +20965,10 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
         return False
     normalized = re.sub(r"['’]", " ", body.casefold())
     request_pattern = re.compile(
-        r"\b(?:need\s+(?:a\s+)?coach|coach\s+(?:needed|required)|"
+        r"\b(?:need\s+(?:a\s+)?coach|coach(?:ing)?\s+(?:is\s+)?"
+        r"(?:wanted|required|requested|needed)|"
+        r"(?:wanted|required|requested|needed)\s+(?:an?\s+)?"
+        r"(?:in[- ]person\s+)?(?:coach(?:ing)?|trainer)|"
         r"looking\s+for\s+(?:a\s+)?coach|look\s+for\s+(?:a\s+)?coach|"
         r"seeking\s+(?:a\s+)?coach|want\s+(?:a\s+)?coach|hire\s+(?:a\s+)?coach|"
         r"нужен\w*\s+тренер\w*|требуется\s+тренер\w*|"

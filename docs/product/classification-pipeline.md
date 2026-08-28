@@ -186,6 +186,13 @@ versioned context policy or a refined versioned prompt. It may not use a
 different model, reasoning effort, tool set, unrestricted history, or
 unversioned operator instruction.
 
+Classifier wire contracts are immutable release boundaries. Adding a candidate
+type or proof/graph fact creates a new primary schema, proposition-evidence
+version, semantic-proof version, prompt, and trusted adapter descriptor. The
+application can read older releases through explicit compatibility branches,
+but neither a validator nor a provider schema expands an older version in
+place.
+
 Every classification result records:
 
 - requested and effective model;

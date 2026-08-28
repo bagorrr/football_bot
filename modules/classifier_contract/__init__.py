@@ -195,8 +195,10 @@ def _candidate_field_sets(
 
 PROPOSITION_EVIDENCE_VERSION = "source-proposition-evidence-v1"
 PROPOSITION_EVIDENCE_V2_VERSION = "source-proposition-evidence-v2"
+PROPOSITION_EVIDENCE_V3_VERSION = "source-proposition-evidence-v3"
 SEMANTIC_PROOF_VERSION = "source-semantic-proof-v1"
 SEMANTIC_PROOF_V2_VERSION = "source-semantic-proof-v2"
+SEMANTIC_PROOF_V3_VERSION = "source-semantic-proof-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +223,8 @@ class ClassifierArtifactDescriptor:
 
     def proposition_version_for(self, opportunity_type: str) -> str:
         """Return the trusted graph version for one application candidate type."""
+        if self.primary_schema_version == "source-message-classification-v4":
+            return PROPOSITION_EVIDENCE_V3_VERSION
         if self.artifact_family == "player_match_availability":
             return PROPOSITION_EVIDENCE_VERSION
         if opportunity_type in {"open_match", "tournament"}:
@@ -231,6 +235,8 @@ class ClassifierArtifactDescriptor:
 
     def semantic_proof_version_for(self, opportunity_type: str) -> str:
         """Return the trusted proof schema for one candidate meaning."""
+        if self.primary_schema_version == "source-message-classification-v4":
+            return SEMANTIC_PROOF_V3_VERSION
         if opportunity_type in {
             "roster_vacancy",
             "player_transfer_availability",
@@ -286,6 +292,18 @@ OPEN_MATCH_V3_DESCRIPTOR = ClassifierArtifactDescriptor(
     routing_policy_version="classifier-routing-v1",
     contract_envelope_versions=(5,),
 )
+OPEN_MATCH_V4_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="open-match-primary-v4",
+    artifact_family="open_match",
+    primary_prompt_version="open-match-primary-v4",
+    primary_schema_version="source-message-classification-v4",
+    ambiguity_prompt_version="open-match-ambiguity-v3",
+    semantic_proof_prompt_version="open-match-semantic-proof-v3",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_V3_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_V3_VERSION,
+    routing_policy_version="classifier-routing-v1",
+    contract_envelope_versions=(5,),
+)
 PLAYER_MATCH_AVAILABILITY_DESCRIPTOR = ClassifierArtifactDescriptor(
     release_name="player-match-primary-v1",
     artifact_family="player_match_availability",
@@ -298,11 +316,25 @@ PLAYER_MATCH_AVAILABILITY_DESCRIPTOR = ClassifierArtifactDescriptor(
     routing_policy_version="classifier-routing-player-v1",
     contract_envelope_versions=(4,),
 )
+PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR = ClassifierArtifactDescriptor(
+    release_name="player-match-primary-v2",
+    artifact_family="player_match_availability",
+    primary_prompt_version="player-match-primary-v2",
+    primary_schema_version="source-message-classification-v4",
+    ambiguity_prompt_version="player-match-ambiguity-v2",
+    semantic_proof_prompt_version="player-match-semantic-proof-v2",
+    proposition_evidence_version=PROPOSITION_EVIDENCE_V3_VERSION,
+    semantic_proof_version=SEMANTIC_PROOF_V3_VERSION,
+    routing_policy_version="classifier-routing-player-v1",
+    contract_envelope_versions=(4,),
+)
 _TRUSTED_ARTIFACT_DESCRIPTORS = (
     OPEN_MATCH_V1_DESCRIPTOR,
     OPEN_MATCH_V2_DESCRIPTOR,
     OPEN_MATCH_V3_DESCRIPTOR,
+    OPEN_MATCH_V4_DESCRIPTOR,
     PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR,
 )
 
 
@@ -338,6 +370,15 @@ def classifier_artifact_descriptor_for_primary(
             else None
         )
     if primary_schema_version != "source-message-classification-v3":
+        if primary_schema_version != "source-message-classification-v4":
+            return None
+        if primary_prompt_version == OPEN_MATCH_V4_DESCRIPTOR.primary_prompt_version:
+            return OPEN_MATCH_V4_DESCRIPTOR
+        if (
+            primary_prompt_version
+            == PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR.primary_prompt_version
+        ):
+            return PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR
         return None
     if (
         primary_prompt_version
@@ -377,7 +418,11 @@ def classifier_artifact_descriptor_for_provenance(
     return matches[0] if len(matches) == 1 else None
 
 
-_SEMANTIC_PROOF_VERSIONS = {SEMANTIC_PROOF_VERSION, SEMANTIC_PROOF_V2_VERSION}
+_SEMANTIC_PROOF_VERSIONS = {
+    SEMANTIC_PROOF_VERSION,
+    SEMANTIC_PROOF_V2_VERSION,
+    SEMANTIC_PROOF_V3_VERSION,
+}
 _PROPOSITION_DOMAINS = {"football_match"}
 _PROPOSITION_POLARITIES = {"positive", "negative", "ambiguous"}
 _PROPOSITION_CURRENTNESS = {"current", "superseded", "withdrawn", "unknown"}
@@ -421,7 +466,10 @@ def classifier_output_is_schema_valid(
         return False
     if descriptor.primary_schema_version == "source-message-classification-v2":
         return _classifier_output_v2_is_schema_valid(
-            output, body=body, artifact_descriptor=descriptor
+            output,
+            body=body,
+            artifact_descriptor=descriptor,
+            allow_coaching=False,
         )
     if descriptor.primary_schema_version == "source-message-classification-v3":
         return _classifier_output_v2_is_schema_valid(
@@ -433,6 +481,21 @@ def classifier_output_is_schema_valid(
                 descriptor.artifact_family == "player_match_availability"
             ),
             allow_fact_observations=True,
+            allow_coaching=False,
+        )
+    if descriptor.primary_schema_version == "source-message-classification-v4":
+        return _classifier_output_v2_is_schema_valid(
+            output,
+            body=body,
+            artifact_descriptor=descriptor,
+            allow_tournament=True,
+            allow_player_match_availability=(
+                descriptor.artifact_family == "player_match_availability"
+            ),
+            allow_fact_observations=(
+                descriptor.artifact_family == "player_match_availability"
+            ),
+            allow_coaching=True,
         )
     if (
         set(output) != {"schema_version", "disposition", "candidates"}
@@ -465,6 +528,9 @@ def classifier_output_is_schema_valid(
             proposition_version=descriptor.proposition_version_for(opportunity_type),
         )
     if opportunity_type in _COACHING_OPPORTUNITY_TYPES:
+        # Coaching was added to the versioned v4 classifier release. The
+        # legacy v1 schema remains a controlled compatibility seam, but the
+        # additive v2/v3 contracts must not claim an artifact they cannot emit.
         return _accepted_coaching_candidate_is_schema_valid(
             candidate,
             body=body,
@@ -607,6 +673,7 @@ def _classifier_output_v2_is_schema_valid(
     allow_tournament: bool = False,
     allow_player_match_availability: bool = False,
     allow_fact_observations: bool = False,
+    allow_coaching: bool = True,
     artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate the additive multi-candidate and alternatives contract."""
@@ -664,6 +731,7 @@ def _classifier_output_v2_is_schema_valid(
                     candidate,
                     body=body,
                     allow_player_match_availability=allow_player_match_availability,
+                    allow_coaching=allow_coaching,
                     artifact_descriptor=descriptor,
                 )
                 if allow_tournament
@@ -672,6 +740,7 @@ def _classifier_output_v2_is_schema_valid(
                     body=body,
                     artifact_descriptor=descriptor,
                     allow_player_match_availability=allow_player_match_availability,
+                    allow_coaching=allow_coaching,
                 )
             )
             for candidate in candidates
@@ -690,7 +759,11 @@ def _classifier_output_v2_is_schema_valid(
         if (
             candidate.get("opportunity_type")
             not in (
-                _UNRESOLVED_OPPORTUNITY_TYPES
+                (
+                    _UNRESOLVED_OPPORTUNITY_TYPES
+                    if allow_coaching
+                    else _UNRESOLVED_OPPORTUNITY_TYPES - _COACHING_OPPORTUNITY_TYPES
+                )
                 if allow_tournament or allow_player_match_availability
                 else {
                     "open_match",
@@ -808,6 +881,7 @@ def _accepted_candidate_is_schema_valid(
     *,
     body: str,
     allow_player_match_availability: bool = False,
+    allow_coaching: bool = True,
     artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate one v2 accepted candidate using the v1 fact contract."""
@@ -817,7 +891,7 @@ def _accepted_candidate_is_schema_valid(
         "open_match",
         "opponent_request",
         *_TRANSFER_OPPORTUNITY_TYPES,
-        *_COACHING_OPPORTUNITY_TYPES,
+        *(_COACHING_OPPORTUNITY_TYPES if allow_coaching else set()),
     }
     if allow_player_match_availability:
         allowed_types.add("player_match_availability")
@@ -841,7 +915,10 @@ def _accepted_candidate_is_schema_valid(
                 opportunity_type
             ),
         )
-    if candidate.get("opportunity_type") in _COACHING_OPPORTUNITY_TYPES:
+    if (
+        allow_coaching
+        and candidate.get("opportunity_type") in _COACHING_OPPORTUNITY_TYPES
+    ):
         return _accepted_coaching_candidate_is_schema_valid(
             candidate,
             body=body,
@@ -967,6 +1044,7 @@ def _accepted_candidate_v3_is_schema_valid(
     *,
     body: str,
     allow_player_match_availability: bool = False,
+    allow_coaching: bool = True,
     artifact_descriptor: ClassifierArtifactDescriptor,
 ) -> bool:
     """Validate one v3 candidate while retaining the v2 open-match contract."""
@@ -975,7 +1053,10 @@ def _accepted_candidate_v3_is_schema_valid(
     descriptor = artifact_descriptor
     opportunity_type = candidate.get("opportunity_type")
     if descriptor.artifact_family == "player_match_availability":
-        if opportunity_type not in {"open_match", "player_match_availability"}:
+        allowed_types = {"open_match", "player_match_availability"}
+        if allow_coaching:
+            allowed_types |= _COACHING_OPPORTUNITY_TYPES
+        if opportunity_type not in allowed_types:
             return False
     elif opportunity_type == "player_match_availability":
         return False
@@ -995,7 +1076,10 @@ def _accepted_candidate_v3_is_schema_valid(
                 str(opportunity_type)
             ),
         )
-    if candidate.get("opportunity_type") in _COACHING_OPPORTUNITY_TYPES:
+    if (
+        allow_coaching
+        and candidate.get("opportunity_type") in _COACHING_OPPORTUNITY_TYPES
+    ):
         return _accepted_coaching_candidate_is_schema_valid(
             candidate,
             body=body,
@@ -1009,6 +1093,7 @@ def _accepted_candidate_v3_is_schema_valid(
         body=body,
         artifact_descriptor=descriptor,
         allow_player_match_availability=allow_player_match_availability,
+        allow_coaching=allow_coaching,
     )
 
 
@@ -1732,7 +1817,10 @@ def semantic_proof_is_schema_valid(
         "player_match_availability",
         *_TRANSFER_OPPORTUNITY_TYPES,
         *_COACHING_OPPORTUNITY_TYPES,
-    } and (contract_version != SEMANTIC_PROOF_V2_VERSION):
+    } and contract_version not in {
+        SEMANTIC_PROOF_V2_VERSION,
+        SEMANTIC_PROOF_V3_VERSION,
+    }:
         return False
     allowed_meanings = (
         {"open_match", "opponent_request"}

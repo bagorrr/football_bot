@@ -78,6 +78,13 @@ schema version. The second pass is available once and may differ only through
 additional permitted context or a refined versioned prompt. Remaining
 ambiguity becomes review or an unpublished unresolved outcome.
 
+The primary and bounded second pass are one strict-schema boundary: they use
+the same immutable output schema version for a release. Any additive candidate,
+fact, proposition-graph, semantic-proof, or cross-process contract shape gets a
+new schema/artifact version and an explicit trusted descriptor. Older releases
+remain readable only through deliberate versioned compatibility branches; their
+schemas and validators are not expanded in place.
+
 The application owns schema and evidence validation, normalization, durable
 persistence, publication, deterministic matching, Completed Searches, Result
 IDs, accepted facts, and Bot Assistant delivery. The model cannot establish any

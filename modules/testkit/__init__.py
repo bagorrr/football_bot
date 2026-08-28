@@ -977,6 +977,16 @@ class ControlledModelAdapter:
         self.primary_schema_version = "source-message-classification-v3"
         self.primary_prompt_version = "open-match-primary-v3"
 
+    def enable_primary_v4(self) -> None:
+        """Opt the controlled model boundary into the additive open release."""
+        self.primary_schema_version = "source-message-classification-v4"
+        self.primary_prompt_version = "open-match-primary-v4"
+
+    def enable_player_match_primary_v2(self) -> None:
+        """Opt the controlled model boundary into the additive Player release."""
+        self.primary_schema_version = "source-message-classification-v4"
+        self.primary_prompt_version = "player-match-primary-v2"
+
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
         self._classify_failures.setdefault(pass_kind, []).append(error)
@@ -1038,8 +1048,12 @@ class ControlledModelAdapter:
                 body=request.body,
                 source_message_revision_reference=request.source_message_revision_id,
                 proof_version=(
-                    "source-semantic-proof-v2"
-                    if request.schema_version == "source-semantic-proof-v2"
+                    request.schema_version
+                    if request.schema_version
+                    in {
+                        "source-semantic-proof-v2",
+                        "source-semantic-proof-v3",
+                    }
                     else "source-semantic-proof-v1"
                 ),
             )
@@ -1079,7 +1093,12 @@ def _ensure_test_proposition_evidence(
             else (
                 "source-proposition-evidence-v2"
                 if enriched.get("schema_version") == "source-message-classification-v3"
-                else "source-proposition-evidence-v1"
+                else (
+                    "source-proposition-evidence-v3"
+                    if enriched.get("schema_version")
+                    == "source-message-classification-v4"
+                    else "source-proposition-evidence-v1"
+                )
             )
         )
         _add_test_proposition_evidence(
@@ -1334,11 +1353,13 @@ def _build_test_semantic_proof(
             }
         )
     semantic_proof_version = proof_version
-    if semantic_proof_version == "source-semantic-proof-v1" and (
-        output.get("schema_version") == "source-message-classification-v3"
-        or opportunity_type in {"roster_vacancy", "player_transfer_availability"}
-    ):
-        semantic_proof_version = "source-semantic-proof-v2"
+    if semantic_proof_version == "source-semantic-proof-v1":
+        if output.get("schema_version") == "source-message-classification-v4":
+            semantic_proof_version = "source-semantic-proof-v3"
+        elif output.get("schema_version") == "source-message-classification-v3" or (
+            opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+        ):
+            semantic_proof_version = "source-semantic-proof-v2"
     return {
         "contract_version": semantic_proof_version,
         "source_message_revision_reference": source_message_revision_reference,

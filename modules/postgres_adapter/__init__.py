@@ -152,6 +152,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0028_classifier_promotion_execution_records.sql",
     "0029_coaching_opportunities.sql",
     "0030_coaching_exact_repost_clusters.sql",
+    "0031_exact_repost_result_projection.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -186,6 +187,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
     "4a9356358f2e925659f0488b7185729b3a5d9498eaf55eb284e3d85e0de1c4d0",
     "6de928289cef3754a109c4c3a92997b0d5a73e33309dc071f5ad59e86431ebbc",
+    "b563284e78139a97b8da8692ff75b0a91a017535b53b79b78628d62f4c5b063d",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1780,6 +1782,8 @@ class PostgresAcceptanceObserver:
                 SELECT result.result_id, result.completed_search_id,
                        result.absolute_position, result.result_class,
                        result.card_facts,
+                       current_projection.opportunity_id
+                           AS current_opportunity_id,
                        current_projection.opportunity_revision_id
                            AS current_opportunity_revision_id,
                        current_projection.publication_state
@@ -1789,7 +1793,8 @@ class PostgresAcceptanceObserver:
                        current_projection.response_route_value
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
-                    SELECT opportunity_revision_id, publication_state,
+                    SELECT opportunity_id, opportunity_revision_id,
+                           publication_state,
                            CASE
                                WHEN opportunity_type = 'tournament'
                                THEN jsonb_build_object(
@@ -1816,7 +1821,21 @@ class PostgresAcceptanceObserver:
                            response_route ->> 'kind' AS response_route_kind,
                            response_route ->> 'value' AS response_route_value
                     FROM football_runtime.recommendation_opportunities
-                    WHERE opportunity_id = result.card_facts->>'opportunity_id'
+                    WHERE opportunity_id = COALESCE(
+                        (
+                            SELECT cluster.representative_opportunity_id
+                            FROM football_runtime
+                                .application_exact_repost_cluster_members AS member
+                            JOIN football_runtime.application_exact_repost_clusters
+                                AS cluster
+                              ON cluster.exact_repost_cluster_id =
+                                 member.exact_repost_cluster_id
+                            WHERE member.opportunity_id =
+                                  result.card_facts->>'opportunity_id'
+                              AND cluster.representative_opportunity_id IS NOT NULL
+                        ),
+                        result.card_facts->>'opportunity_id'
+                    )
                       AND opportunity_type = result.card_facts->>'opportunity_type'
                       AND opportunity_type IN (
                           'tournament', 'coach_availability', 'coach_request'
@@ -7857,6 +7876,8 @@ class PostgresRoleStore:
                 SELECT result.result_id, result.completed_search_id,
                        result.absolute_position, result.result_class,
                        result.card_facts,
+                       current_projection.opportunity_id
+                           AS current_opportunity_id,
                        current_projection.opportunity_revision_id
                            AS current_opportunity_revision_id,
                        current_projection.publication_state
@@ -7866,7 +7887,8 @@ class PostgresRoleStore:
                        current_projection.response_route_value
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
-                    SELECT opportunity_revision_id, publication_state,
+                    SELECT opportunity_id, opportunity_revision_id,
+                           publication_state,
                            current_facts, response_route_kind, response_route_value
                     FROM football_runtime.read_current_opportunity_result_projection(
                         result.card_facts->>'opportunity_id'
@@ -8522,6 +8544,7 @@ def _result_card_facts_with_current_publication_state(
             **card_facts,
             "publication_state": publication_state,
         }
+        _overlay_current_result_projection(result, current_projection)
         if publication_state == "active":
             assert current_projection is not None
             route_kind = current_projection.get("response_route_kind")
@@ -8563,6 +8586,7 @@ def _result_card_facts_with_current_publication_state(
             **card_facts,
             "publication_state": publication_state,
         }
+        _overlay_current_result_projection(result, current_projection)
         if publication_state == "active":
             assert current_projection is not None
             route_kind = current_projection.get("response_route_kind")
@@ -8579,7 +8603,40 @@ def _result_card_facts_with_current_publication_state(
         return result
     if current_projection is None:
         return dict(card_facts)
-    return {**card_facts, "publication_state": current_projection["publication_state"]}
+    result = {
+        **card_facts,
+        "publication_state": current_projection["publication_state"],
+    }
+    _overlay_current_result_projection(result, current_projection)
+    return result
+
+
+def _overlay_current_result_projection(
+    result: dict[str, Any],
+    current_projection: Mapping[str, Any] | None,
+) -> None:
+    """Project the current representative identity and public facts onto a card."""
+    if current_projection is None:
+        return
+    current_opportunity_id = current_projection.get("opportunity_id")
+    if isinstance(current_opportunity_id, str) and current_opportunity_id:
+        result["opportunity_id"] = current_opportunity_id
+    current_revision_id = current_projection.get("opportunity_revision_id")
+    if isinstance(current_revision_id, str) and current_revision_id:
+        result["opportunity_revision_id"] = current_revision_id
+    current_facts = current_projection.get("current_facts")
+    if not isinstance(current_facts, Mapping):
+        return
+    for key in tuple(result):
+        if key not in current_facts:
+            continue
+        value = current_facts[key]
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, str):
+            result[key] = value
+        else:
+            result[key] = json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 def _current_tournament_projection(
@@ -8590,6 +8647,7 @@ def _current_tournament_projection(
     if not isinstance(revision_id, str) or not revision_id:
         return None
     return {
+        "opportunity_id": row.get("current_opportunity_id"),
         "opportunity_revision_id": revision_id,
         "publication_state": row.get("current_publication_state"),
         "current_facts": row.get("current_facts"),

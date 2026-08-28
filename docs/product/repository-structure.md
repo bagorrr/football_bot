@@ -102,6 +102,10 @@ container per folder.
 - `classifier/*` contains immutable versioned model artifacts. An active
   classifier deployment binds exact prompt, schema, glossary, context-policy,
   and routing-policy versions.
+- A change to a classifier output, proposition graph, semantic-proof, or
+  cross-process contract shape is additive: it creates a new immutable schema
+  and artifact version. Validators may retain explicit compatibility branches
+  for older versions, but no released schema is expanded in place.
 - `assistant/*` contains the separate versioned Bot Assistant prompt,
   response-contract, and context-policy artifacts.
 

@@ -4,8 +4,14 @@ import json
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from modules.classifier_contract import (
     OPEN_MATCH_V1_DESCRIPTOR,
+    OPEN_MATCH_V3_DESCRIPTOR,
+    OPEN_MATCH_V4_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR,
+    ClassifierArtifactDescriptor,
     classifier_output_is_schema_valid,
 )
 from modules.contracts import JsonValue
@@ -107,4 +113,129 @@ def test_old_recorded_schema_id_does_not_replay_as_player_behavior() -> None:
         output,
         body=body,
         artifact_descriptor=OPEN_MATCH_V1_DESCRIPTOR,
+    )
+
+
+@pytest.mark.parametrize(
+    ("descriptor", "body", "opportunity_type"),
+    (
+        (
+            OPEN_MATCH_V4_DESCRIPTOR,
+            "In-person coaching available in Moscow.",
+            "coach_availability",
+        ),
+        (
+            PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR,
+            "In-person coaching wanted in Moscow.",
+            "coach_request",
+        ),
+    ),
+)
+def test_versioned_classifier_artifacts_accept_coaching_candidates(
+    descriptor: ClassifierArtifactDescriptor, body: str, opportunity_type: str
+) -> None:
+    candidate = {
+        "candidate_key": "coach-1",
+        "opportunity_type": opportunity_type,
+        "evidence": {
+            "opportunity": body.split(" in ")[0] + " in Moscow.",
+            "location": "Moscow",
+            opportunity_type: body.split(" in ")[0],
+            "in_person": "In-person",
+        },
+        "source_context": body,
+        "location": {
+            "mention": "Moscow",
+            "place_id": "place:moscow",
+            "country_id": "country:ru",
+            "city_id": "city:moscow",
+        },
+        opportunity_type: True,
+        "in_person": True,
+        "response_routes": [],
+    }
+    output = cast(
+        dict[str, JsonValue],
+        {
+            "schema_version": descriptor.primary_schema_version,
+            "disposition": "accepted",
+            "candidates": [candidate],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        },
+    )
+    assert classifier_output_is_schema_valid(
+        output,
+        body=body,
+        artifact_descriptor=descriptor,
+    )
+
+
+def test_coaching_artifact_expansion_is_not_applied_to_the_old_v3_release() -> None:
+    body = "In-person coaching available in Moscow."
+    candidate = {
+        "candidate_key": "coach-1",
+        "opportunity_type": "coach_availability",
+        "evidence": {
+            "opportunity": body,
+            "location": "Moscow",
+            "coach_availability": "In-person coaching available",
+            "in_person": "In-person",
+        },
+        "source_context": body,
+        "location": {
+            "mention": "Moscow",
+            "place_id": "place:moscow",
+            "country_id": "country:ru",
+            "city_id": "city:moscow",
+        },
+        "coach_availability": True,
+        "in_person": True,
+        "response_routes": [],
+    }
+    output = cast(
+        dict[str, JsonValue],
+        {
+            "schema_version": "source-message-classification-v3",
+            "disposition": "accepted",
+            "candidates": [candidate],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        },
+    )
+    assert not classifier_output_is_schema_valid(
+        output,
+        body=body,
+        artifact_descriptor=OPEN_MATCH_V3_DESCRIPTOR,
+    )
+
+
+def test_coaching_artifacts_have_distinct_schema_and_prompt_versions() -> None:
+    root = Path(__file__).parents[2] / "classifier"
+    for release_name, _prompt_name in (
+        ("open-match-primary-v4", "open-match-primary-v4"),
+        ("player-match-primary-v2", "player-match-primary-v2"),
+    ):
+        release = root / release_name
+        schema = json.loads(
+            (release / "source-message-classification-v4.schema.json").read_text()
+        )
+        prompt = (release / "prompt.md").read_text().casefold()
+        assert schema["$id"] == "source-message-classification-v4"
+        accepted_types = schema["$defs"]["acceptedCandidate"]["properties"][
+            "opportunity_type"
+        ]["enum"]
+        assert {"coach_availability", "coach_request"} <= set(accepted_types)
+        assert "coach_availability" in prompt
+        assert "coach_request" in prompt
+
+    semantic_schema = json.loads(
+        (
+            root
+            / "open-match-semantic-proof-v3"
+            / "source-semantic-proof-v3.schema.json"
+        ).read_text()
+    )
+    assert semantic_schema["$id"] == "source-semantic-proof-v3"
+    assert (
+        "coach_availability"
+        in semantic_schema["$defs"]["root"]["properties"]["meaning"]["enum"]
     )
