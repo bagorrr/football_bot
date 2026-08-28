@@ -1141,6 +1141,12 @@ _COACHING_WEEKDAYS = (
     "sunday",
 )
 _COACHING_DAY_PARTS = ("morning", "daytime", "evening", "night")
+_COACHING_START_DATE_ANY = {
+    "en": frozenset({"any"}),
+    "ru": frozenset({"неважно", "не важно"}),
+    "es": frozenset({"cualquiera"}),
+    "fr": frozenset({"peu importe"}),
+}
 _COACHING_SEARCH_DETAIL_NAMES = {
     "en": (
         "Coaching type",
@@ -6798,7 +6804,7 @@ class ConversationOnboarding:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
-            operation="set_start_date",
+            operation="clear_start_date" if normalized is None else "set_start_date",
             value=normalized,
         )
 
@@ -6830,10 +6836,15 @@ class ConversationOnboarding:
         text: str,
         locale: str,
         draft: DiscoveryDraft,
-    ) -> str:
+    ) -> str | None:
         """Resolve one current-or-future city-local date through the date port."""
         if draft.city is None or not draft.city.iana_timezone:
             raise ValueError("Coaching Search start date is invalid")
+        normalized_text = " ".join(text.casefold().split())
+        if normalized_text == "any" or normalized_text in _COACHING_START_DATE_ANY.get(
+            locale, frozenset()
+        ):
+            return None
         now = self._clock.now()
         if now.tzinfo is None:
             raise RuntimeError("authoritative UTC clock returned a naive instant")
@@ -6952,14 +6963,26 @@ class ConversationOnboarding:
             elif operation == "select_day_part":
                 if editing != "schedule":
                     raise RuntimeError("Coaching Search Schedule is not open")
-                temporary = [
-                    token
-                    for token in temporary
-                    if not token.startswith("day_part:")
-                    and not token.startswith("interval:")
-                ]
-                if value is not None:
-                    temporary.append(f"day_part:{value}")
+                if value is None:
+                    temporary = [
+                        token
+                        for token in temporary
+                        if not token.startswith("day_part:")
+                        and not token.startswith("interval:")
+                    ]
+                else:
+                    temporary = [
+                        token
+                        for token in temporary
+                        if not token.startswith("interval:")
+                    ]
+                    day_part_token = f"day_part:{value}"
+                    if day_part_token in temporary:
+                        temporary = [
+                            token for token in temporary if token != day_part_token
+                        ]
+                    else:
+                        temporary.append(day_part_token)
                 target = "submenu"
             elif operation == "set_interval":
                 if editing != "schedule" or value is None:
@@ -7001,6 +7024,7 @@ class ConversationOnboarding:
                     for token in temporary
                     if not token.startswith("start_local_date:")
                 ]
+                schedule_prompt = None
                 target = "submenu"
             elif operation == "schedule_prompt":
                 if editing != "schedule":
@@ -10380,7 +10404,7 @@ def _coaching_schedule_from_tokens(tokens: list[str]) -> dict[str, JsonValue]:
         for item in tokens
         if item.startswith("start_local_date:")
     ]
-    if len(day_parts) > 1 or len(intervals) > 1 or len(dates) > 1:
+    if len(day_parts) != len(set(day_parts)) or len(intervals) > 1 or len(dates) > 1:
         raise ValueError("Coaching Search Schedule contains duplicate criteria")
     if day_parts and intervals:
         raise ValueError("Coaching Search Schedule cannot mix day-parts and intervals")
@@ -10422,6 +10446,10 @@ def _coaching_schedule_from_tokens(tokens: list[str]) -> dict[str, JsonValue]:
     ]
     if unknown:
         raise ValueError("Coaching Search Schedule contains unsupported criteria")
+    if tokens and not weekdays:
+        raise ValueError("Coaching Search Schedule requires a recurring weekday")
+    if tokens and not (day_parts or intervals):
+        raise ValueError("Coaching Search Schedule requires a recurring time slot")
     return schedule
 
 
@@ -10581,7 +10609,7 @@ def _coaching_search_detail_submenu_message(
                     f"coaching-details:start-date:{screen_revision}",
                 ),
             ),
-            ((any_label, f"coaching-details:clear-time:{screen_revision}"),),
+            ((any_label, f"coaching-details:clear-start-date:{screen_revision}"),),
         )
     else:
         options = _COACHING_SEARCH_DETAIL_OPTIONS[detail_key]
@@ -10616,10 +10644,22 @@ def _coaching_search_schedule_prompt_message(
     """Render a controlled prompt for the optional coaching Schedule date."""
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     text, back = {
-        "en": ("Send the Schedule start date, for example: 25 August.", "Back"),
-        "ru": ("Введите дату начала расписания, например: 25 августа.", "Назад"),
-        "es": ("Escribe la fecha de inicio, por ejemplo: 25 de agosto.", "Atrás"),
-        "fr": ("Indiquez la date de début, par exemple : 25 août.", "Retour"),
+        "en": (
+            'Send the Schedule start date or "any", for example: 25 August.',
+            "Back",
+        ),
+        "ru": (
+            "Введите дату начала расписания или «неважно», например: 25 августа.",
+            "Назад",
+        ),
+        "es": (
+            "Escribe la fecha de inicio o «cualquiera», por ejemplo: 25 de agosto.",
+            "Atrás",
+        ),
+        "fr": (
+            "Indiquez la date de début ou «peu importe», par exemple : 25 août.",
+            "Retour",
+        ),
     }[copy_locale]
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
@@ -10660,6 +10700,7 @@ def _coaching_search_result_message(
             "posted": "Posted",
             "edited": "Edited",
             "contact": "Contact",
+            "unavailable": "Unavailable",
             "at": "at",
             "start": "from",
             "questions": (
@@ -10685,6 +10726,7 @@ def _coaching_search_result_message(
             "posted": "Пост",
             "edited": "Изменён",
             "contact": "Контакт",
+            "unavailable": "Недоступно",
             "at": "в",
             "start": "с",
             "questions": (
@@ -10710,6 +10752,7 @@ def _coaching_search_result_message(
             "posted": "Publicado",
             "edited": "Modificado",
             "contact": "Contacto",
+            "unavailable": "No disponible",
             "at": "a las",
             "start": "desde",
             "questions": (
@@ -10735,6 +10778,7 @@ def _coaching_search_result_message(
             "posted": "Publié",
             "edited": "Modifié",
             "contact": "Contact",
+            "unavailable": "Indisponible",
             "at": "à",
             "start": "à partir du",
             "questions": (
@@ -10955,8 +10999,15 @@ def _coaching_search_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}"
         )
-    route = render_response_route(
-        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    route_kind = facts.get("response_route_kind")
+    route_value = facts.get("response_route_value")
+    contact_copy = (
+        f"{labels['contact']}: "
+        + render_response_route(route_kind, route_value, copy_locale)
+        if facts.get("publication_state") == "active"
+        and isinstance(route_kind, str)
+        and isinstance(route_value, str)
+        else labels["unavailable"]
     )
     parts = [f"⚽ {title}", f"{labels['location']}: {where}", *detail_lines, match_text]
     if result.result_class == "possible_match":
@@ -10966,7 +11017,7 @@ def _coaching_search_result_message(
     parts.extend(
         [
             posted + edited,
-            f"{labels['contact']}: {route}",
+            contact_copy,
             labels["questions"],
         ]
     )
@@ -20850,29 +20901,6 @@ def _coaching_body_is_in_person(body: str) -> bool:
         r"unavailable|не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
         r"no\s+disponible|indisponible|pas\s+disponible)\b"
     )
-    physical = next(
-        (
-            match
-            for match in physical_pattern.finditer(normalized)
-            if not (
-                physical_negation_before.search(
-                    normalized[max(0, match.start() - 24) : match.start()]
-                )
-                or physical_negation_after.search(
-                    normalized[match.end() : match.end() + 48]
-                )
-            )
-        ),
-        None,
-    )
-    concrete_place = re.search(
-        r"\[[A-Z][A-Z0-9_ -]{1,80}\]|"
-        r"\b(?:field|pitch|venue|gym|stadium|court|"
-        r"поле|площадк\w*|стадион\w*|зал\w*|аренда|"
-        r"campo|cancha|estadio|gimnasio|terrain|stade|salle)\b",
-        body,
-        re.IGNORECASE,
-    )
     coaching = re.search(
         r"\b(?:coach\w*|trainer\w*|train\w*|coaching|"
         r"тренер\w*|трениров\w*|заняти\w*|"
@@ -20882,36 +20910,18 @@ def _coaching_body_is_in_person(body: str) -> bool:
     )
     if coaching is None:
         return False
-    if physical is not None:
-        return True
     if online_only is not None:
         return False
-    # The corpus and the product wording use ordinary football invitations
-    # and venue rental language as explicit in-person signals even when the
-    # message does not spell out "in person".
-    invitation_or_group = re.search(
-        r"\b(?:come|join|attend|session|group|trial|"
-        r"приходите|присоедин\w*|занят\w*\s+в\s+групп\w*|"
-        r"можно\s+в\s+групп\w*|пробн\w*\s+трениров\w*|"
-        r"ofrezc\w*|ven\s+a|grupo|clase|ses[ií]on|"
-        r"venez|groupe|s[eé]ance|essai)\b",
-        normalized,
-    )
-    if concrete_place is not None and invitation_or_group is not None:
-        return True
-    if re.search(
-        r"\b(?:team|squad|roster|команд\w*|состав\w*|equipo|équipe)\b",
-        normalized,
-    ) and re.search(
-        r"\b(?:need\w*|require\w*|look\w*\s+for|seek\w*|"
-        r"нуж\w*|требу\w*|ищ\w*|busc\w*|necesit\w*|"
-        r"cherch\w*|besoin)\b",
-        normalized,
+    physical_matches = tuple(physical_pattern.finditer(normalized))
+    if any(
+        physical_negation_before.search(
+            normalized[max(0, match.start() - 24) : match.start()]
+        )
+        or physical_negation_after.search(normalized[match.end() : match.end() + 48])
+        for match in physical_matches
     ):
-        return True
-    # A football coaching session with an explicit visit/invitation or a
-    # concrete rental is physical; a bare online-neutral service is not.
-    return invitation_or_group is not None or concrete_place is not None
+        return False
+    return bool(physical_matches)
 
 
 def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> bool:
@@ -24124,7 +24134,7 @@ def _runtime_coaching_schedule(value: JsonValue) -> bool:
     if set(value) - allowed:
         return False
     weekdays = value.get("weekdays")
-    if weekdays is not None and (
+    if (
         not isinstance(weekdays, list)
         or not weekdays
         or len(weekdays) != len(set(item for item in weekdays if isinstance(item, str)))
@@ -24141,6 +24151,8 @@ def _runtime_coaching_schedule(value: JsonValue) -> bool:
         != len(set(item for item in day_parts if isinstance(item, str)))
         or not all(item in _COACHING_DAY_PARTS for item in day_parts)
     ):
+        return False
+    if day_parts is None and not has_exact:
         return False
     if has_exact:
         start = value.get("local_start_time")

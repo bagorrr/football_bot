@@ -1035,7 +1035,7 @@ def _valid_coaching_schedule(value: JsonValue) -> bool:
     if set(value) - allowed:
         return False
     weekdays = value.get("weekdays")
-    if weekdays is not None and (
+    if (
         not isinstance(weekdays, list)
         or not weekdays
         or len(weekdays) != len(set(item for item in weekdays if isinstance(item, str)))
@@ -1056,6 +1056,8 @@ def _valid_coaching_schedule(value: JsonValue) -> bool:
             isinstance(item, str) and item in _COACHING_DAY_PARTS for item in day_parts
         )
     ):
+        return False
+    if day_parts is None and not has_exact:
         return False
     if has_exact:
         start = value.get("local_start_time")

@@ -4,6 +4,9 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
+from modules.application import _coaching_schedule_from_tokens
+from modules.classifier_contract import _coaching_schedule_is_schema_valid
+from modules.contracts import JsonValue, _valid_coaching_schedule
 from modules.domain import (
     CompletedSearch,
     MatchState,
@@ -139,10 +142,42 @@ def test_day_parts_and_weekdays_are_alternatives_with_unknown_missing_facts() ->
     )
 
 
+def test_multiple_day_parts_are_preserved_as_or_choices() -> None:
+    assert _coaching_schedule_from_tokens(
+        ["monday", "day_part:morning", "day_part:evening"]
+    ) == {
+        "weekdays": ["monday"],
+        "day_parts": ["morning", "evening"],
+    }
+    assert (
+        match_coaching_schedule(
+            {
+                "weekdays": ["monday"],
+                "day_parts": ["morning", "evening"],
+            },
+            {"weekdays": ["monday"], "day_parts": ["evening"]},
+            user_intent=UserIntent.COACH_SEARCH,
+        )["schedule"]
+        is MatchState.CONFIRMED
+    )
+
+
 def test_start_date_is_directional_and_missing_date_is_unknown() -> None:
-    requested = {"start_local_date": "2026-09-01"}
-    availability_before = {"start_local_date": "2026-08-20"}
-    request_after = {"start_local_date": "2026-09-15"}
+    requested = {
+        "weekdays": ["monday"],
+        "day_parts": ["evening"],
+        "start_local_date": "2026-09-01",
+    }
+    availability_before = {
+        "weekdays": ["monday"],
+        "day_parts": ["evening"],
+        "start_local_date": "2026-08-20",
+    }
+    request_after = {
+        "weekdays": ["monday"],
+        "day_parts": ["evening"],
+        "start_local_date": "2026-09-15",
+    }
     assert (
         match_coaching_schedule(
             requested,
@@ -154,7 +189,11 @@ def test_start_date_is_directional_and_missing_date_is_unknown() -> None:
     assert (
         match_coaching_schedule(
             requested,
-            {"start_local_date": "2026-09-15"},
+            {
+                "weekdays": ["monday"],
+                "day_parts": ["evening"],
+                "start_local_date": "2026-09-15",
+            },
             user_intent=UserIntent.COACH_SEARCH,
         )["schedule_start_date"]
         is MatchState.CONFLICT
@@ -175,6 +214,18 @@ def test_start_date_is_directional_and_missing_date_is_unknown() -> None:
         )["schedule_start_date"]
         is MatchState.UNKNOWN
     )
+
+
+def test_date_only_schedule_is_rejected_at_matching_and_contract_boundaries() -> None:
+    date_only: dict[str, JsonValue] = {"start_local_date": "2026-09-01"}
+    states = match_coaching_schedule(
+        date_only,
+        {"weekdays": ["monday"], "day_parts": ["evening"]},
+        user_intent=UserIntent.COACH_SEARCH,
+    )
+    assert states["schedule"] is MatchState.CONFLICT
+    assert not _valid_coaching_schedule(date_only)
+    assert not _coaching_schedule_is_schema_valid(date_only)
 
 
 def test_malformed_requested_schedule_is_conflicting_not_unconstrained() -> None:

@@ -1259,6 +1259,12 @@ def _coaching_schedule_mapping(value: Any) -> dict[str, Any] | None:
     schedule = dict(value)
     if not schedule or set(schedule) - _COACHING_SCHEDULE_KEYS:
         return None
+    weekdays = _coaching_schedule_list(schedule, "weekdays", _COACHING_WEEKDAYS)
+    intervals = _coaching_schedule_intervals(schedule)
+    if weekdays is None or not weekdays or intervals is None or not intervals:
+        return None
+    if "start_local_date" in schedule and _coaching_schedule_date(schedule) is None:
+        return None
     return schedule
 
 
@@ -1418,38 +1424,6 @@ def match_coaching_schedule(
             )
     else:
         time_state = MatchState.CONFIRMED
-
-    # A recurring slot needs both a weekday and a time even when only one of
-    # those dimensions was selected. A date-only criterion does not require a
-    # recurring slot, because it is still independently comparable.
-    requested_has_recurring_dimension = bool(requested_weekdays or requested_intervals)
-    if (
-        requested_has_recurring_dimension
-        and not requested_weekdays
-        and (
-            accepted_schedule.get("weekdays") is None
-            or _coaching_schedule_list(
-                accepted_schedule, "weekdays", _COACHING_WEEKDAYS
-            )
-            in (None, ())
-        )
-    ):
-        weekday_state = MatchState.UNKNOWN
-    if (
-        requested_has_recurring_dimension
-        and not requested_intervals
-        and (
-            (
-                accepted_schedule.get("day_parts") is None
-                and not (
-                    "local_start_time" in accepted_schedule
-                    or "local_end_time" in accepted_schedule
-                )
-            )
-            or accepted_intervals in (None, ())
-        )
-    ):
-        time_state = MatchState.UNKNOWN
 
     requested_start = _coaching_schedule_date(requested_schedule)
     accepted_start = _coaching_schedule_date(accepted_schedule)

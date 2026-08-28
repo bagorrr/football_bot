@@ -334,11 +334,34 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
         telegram_user_id=bot_user_id,
         value="evening",
     )
+    system.select_coaching_search_schedule_day_part(
+        update_id=f"day-part-second:{direction}",
+        telegram_user_id=bot_user_id,
+        value="morning",
+    )
     draft = system.discovery_draft(bot_user_id)
     assert draft is not None
     assert draft.coaching_search_detail_draft == (
         "wednesday",
         "day_part:evening",
+        "day_part:morning",
+    )
+    system.open_coaching_search_schedule_start_date(
+        update_id=f"start-date-any-prompt:{direction}",
+        telegram_user_id=bot_user_id,
+    )
+    assert "any" in telegram_delivery.messages[-1].text.casefold()
+    system.submit_coaching_search_schedule_start_date_text(
+        update_id=f"start-date-any:{direction}",
+        telegram_user_id=bot_user_id,
+        text="any",
+    )
+    draft = system.discovery_draft(bot_user_id)
+    assert draft is not None
+    assert draft.coaching_search_detail_draft == (
+        "wednesday",
+        "day_part:evening",
+        "day_part:morning",
     )
     system.back_from_coaching_search_detail(
         update_id=f"discard:{direction}",

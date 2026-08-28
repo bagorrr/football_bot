@@ -151,6 +151,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0027_classifier_promotion_attestations.sql",
     "0028_classifier_promotion_execution_records.sql",
     "0029_coaching_opportunities.sql",
+    "0030_coaching_exact_repost_clusters.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -184,6 +185,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "460bb27388e10e836c8f1d8d3db37a01c2c2779a85bf7e5d114d68bcb1d018a9",
     "a646caad86524645427e0f83a2960f32c7f7aa5f48e22afdba3d43cd81328d02",
     "4a9356358f2e925659f0488b7185729b3a5d9498eaf55eb284e3d85e0de1c4d0",
+    "6de928289cef3754a109c4c3a92997b0d5a73e33309dc071f5ad59e86431ebbc",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1788,21 +1790,28 @@ class PostgresAcceptanceObserver:
                 FROM football_runtime.recommendation_results AS result
                 LEFT JOIN LATERAL (
                     SELECT opportunity_revision_id, publication_state,
-                           jsonb_build_object(
-                               'start_local_date', accepted_facts -> 'start_local_date',
-                               'end_local_date', accepted_facts -> 'end_local_date',
-                               'exact_local_time', accepted_facts -> 'exact_local_time',
-                               'day_part', accepted_facts -> 'day_part',
-                               'iana_timezone', accepted_facts -> 'iana_timezone',
-                               'open_participation',
-                               accepted_facts -> 'open_participation'
-                           ) || CASE
-                               WHEN accepted_facts ? 'registration_deadline'
+                           CASE
+                               WHEN opportunity_type = 'tournament'
                                THEN jsonb_build_object(
-                                   'registration_deadline',
-                                   accepted_facts -> 'registration_deadline'
-                               )
-                               ELSE '{}'::jsonb
+                                   'start_local_date',
+                                   accepted_facts -> 'start_local_date',
+                                   'end_local_date',
+                                   accepted_facts -> 'end_local_date',
+                                   'exact_local_time',
+                                   accepted_facts -> 'exact_local_time',
+                                   'day_part', accepted_facts -> 'day_part',
+                                   'iana_timezone', accepted_facts -> 'iana_timezone',
+                                   'open_participation',
+                                   accepted_facts -> 'open_participation'
+                               ) || CASE
+                                   WHEN accepted_facts ? 'registration_deadline'
+                                   THEN jsonb_build_object(
+                                       'registration_deadline',
+                                       accepted_facts -> 'registration_deadline'
+                                   )
+                                   ELSE '{}'::jsonb
+                               END
+                               ELSE accepted_facts
                            END AS current_facts,
                            response_route ->> 'kind' AS response_route_kind,
                            response_route ->> 'value' AS response_route_value
@@ -8531,11 +8540,25 @@ def _result_card_facts_with_current_publication_state(
         "coach_availability",
         "coach_request",
     }:
-        if current_projection is None:
+        current_facts = (
+            current_projection.get("current_facts")
+            if current_projection is not None
+            else None
+        )
+        if not isinstance(current_facts, Mapping) or current_projection is None:
             publication_state = "suppressed"
         else:
             state = current_projection.get("publication_state")
-            publication_state = state if isinstance(state, str) else "suppressed"
+            if state not in {"active", "held_for_review", "suppressed", "expired"}:
+                publication_state = "suppressed"
+            elif state != "active":
+                publication_state = state
+            elif _exact_repost_candidate_is_fresh(
+                str(card_facts["opportunity_type"]), current_facts, as_of=as_of
+            ):
+                publication_state = "active"
+            else:
+                publication_state = "expired"
         result = {
             **card_facts,
             "publication_state": publication_state,
@@ -8714,6 +8737,8 @@ def _proposition_identity_parts(
             "roster_vacancy",
             "player_match_availability",
             "player_transfer_availability",
+            "coach_availability",
+            "coach_request",
         }:
             return None
         if len(identity_hash) != 16 or any(
@@ -8911,6 +8936,8 @@ def _legacy_candidate_alias_for_canonical(
         "roster_vacancy",
         "player_match_availability",
         "player_transfer_availability",
+        "coach_availability",
+        "coach_request",
     }:
         return None
     if len(candidate_hash) != 16 or any(
@@ -9284,6 +9311,24 @@ def _exact_repost_resolved_event_date(
         if parsed_start > parsed_end:
             return None
         return f"{parsed_start.isoformat()}/{parsed_end.isoformat()}"
+    schedule = accepted_facts.get("schedule")
+    if isinstance(schedule, Mapping):
+        nested_start = schedule.get("start_local_date")
+        nested_end = schedule.get("end_local_date")
+        if isinstance(nested_start, str) and isinstance(nested_end, str):
+            try:
+                parsed_start = date.fromisoformat(nested_start)
+                parsed_end = date.fromisoformat(nested_end)
+            except ValueError:
+                return None
+            if parsed_start > parsed_end:
+                return None
+            return f"{parsed_start.isoformat()}/{parsed_end.isoformat()}"
+        if isinstance(nested_start, str):
+            try:
+                return date.fromisoformat(nested_start).isoformat()
+            except ValueError:
+                return None
     for field_name in ("event_date", "local_date", "date"):
         value = accepted_facts.get(field_name)
         if isinstance(value, str):
@@ -9332,6 +9377,8 @@ def _exact_repost_candidate_is_fresh(
     if opportunity_type in {
         "roster_vacancy",
         "player_transfer_availability",
+        "coach_availability",
+        "coach_request",
     }:
         qualifying_text = accepted_facts.get("source_qualifying_assertion_at")
         if not isinstance(qualifying_text, str):
