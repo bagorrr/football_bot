@@ -161,6 +161,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0033_exact_repost_result_projection.sql",
     "0034_coaching_source_chat_projection_gate.sql",
     "0035_coaching_source_chat_ingestion_failure_projection_gate.sql",
+    "0036_coaching_ingestion_role_projection_gate.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -200,6 +201,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a962802784545373f32833cbd8222e6e93a257cb690b397c2c3d485cc7ab5c1d",
     "d835cf5c9201c1b9b0628b3f13193814470b481746b82a98cc162f141a4a4f51",
     "dc4f0f227a03128ee1f96b7c3a3e83f26fdea51626fa17c42b2cbd2efd22fab5",
+    "eb84eafe22948f916e3f2ddca2105aed342316305f862511dbc2dbc190992eb3",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1897,6 +1899,26 @@ class PostgresAcceptanceObserver:
                                           AND registry.enabled
                                           AND registry.initial_consent_attestation =
                                               'confirmed'
+                                          AND NOT EXISTS (
+                                              SELECT 1
+                                              FROM football_runtime.ingestion_failures
+                                                  AS failure
+                                              WHERE failure.active
+                                                AND (
+                                                    failure.scope =
+                                                        'ingestion_role'
+                                                    OR (
+                                                        failure.scope =
+                                                            'source_stream'
+                                                        AND failure.peer_kind =
+                                                            source.peer_kind
+                                                        AND failure.telegram_chat_id =
+                                                            source.telegram_chat_id
+                                                        AND failure.registry_generation
+                                                            = source.registry_generation
+                                                    )
+                                                )
+                                          )
                                     ) AS source_chat_enabled
                             ) AS source_chat
                             WHERE opportunity.opportunity_id = COALESCE(

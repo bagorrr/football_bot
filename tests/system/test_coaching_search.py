@@ -14,6 +14,7 @@ from modules.domain import (
     DateInterpretation,
     DateInterpretationResolution,
     SourceEventKind,
+    TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -474,6 +475,93 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
     assert json.loads(facts["match_states"])["schedule_start_date"] == "confirmed"
     assert title in telegram_delivery.messages[-1].text
     assert "In-person" not in telegram_delivery.messages[-1].text
+    account_checkpoint = TelegramAccountCheckpoint(
+        pts=5_600,
+        qts=560,
+        seq=56,
+        date=clock.now(),
+    )
+    system.initialize_account_ingestion_checkpoint(account_checkpoint)
+    telegram_ingestion.add_ingestion_role_account_difference_failure(
+        checkpoint=account_checkpoint,
+        reason="authentication_lost",
+    )
+    assert system.process_next_account_telegram_difference()
+    assert system.process_next_source_event()
+    role_failed_results = system.results(completed[0].completed_search_id)
+    assert len(role_failed_results) == 1
+    role_failed_facts = dict(role_failed_results[0].card_facts)
+    assert role_failed_facts["publication_state"] == "suppressed"
+    assert "response_route_value" not in role_failed_facts
+    system.open_main_menu(
+        update_id=f"role-failed-menu:{direction}",
+        telegram_user_id=bot_user_id,
+    )
+    system.select_main_menu_action(
+        update_id=f"role-failed-new-search:{direction}",
+        telegram_user_id=bot_user_id,
+        action="new-search",
+    )
+    system.select_direction(
+        update_id=f"role-failed-branch:{direction}",
+        telegram_user_id=bot_user_id,
+        direction="coaching_services",
+    )
+    system.select_direction(
+        update_id=f"role-failed-intent:{direction}",
+        telegram_user_id=bot_user_id,
+        direction=direction,
+    )
+    system.submit_location_text(
+        update_id=f"role-failed-country:{direction}",
+        telegram_user_id=bot_user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id=f"role-failed-city:{direction}",
+        telegram_user_id=bot_user_id,
+        text="Saint Petersburg",
+    )
+    system.submit_location_text(
+        update_id=f"role-failed-area:{direction}",
+        telegram_user_id=bot_user_id,
+        text="whole city",
+    )
+    system.submit_search(
+        update_id=f"role-failed-submit:{direction}",
+        telegram_user_id=bot_user_id,
+        coaching_search_details={
+            "coaching_types": [coaching_type],
+            "schedule": {
+                "weekdays": ["wednesday"],
+                "local_start_time": "19:00",
+                "local_end_time": "21:00",
+                "start_local_date": requested_start_date.isoformat(),
+            },
+        },
+    )
+    system.process_searches_until_idle()
+    completed_after_role_stop = system.completed_searches(bot_user_id)
+    assert len(completed_after_role_stop) == 2
+    role_failed_search = next(
+        search
+        for search in completed_after_role_stop
+        if search.search_update_id == f"role-failed-submit:{direction}"
+    )
+    assert system.results(role_failed_search.completed_search_id) == ()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.ingestion_failures
+            SET active = false
+            WHERE scope = 'ingestion_role'
+            """
+        )
+    restored_results = system.results(completed[0].completed_search_id)
+    assert len(restored_results) == 1
+    restored_facts = dict(restored_results[0].card_facts)
+    assert restored_facts["publication_state"] == "active"
+    assert restored_facts["response_route_value"] == contact
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
         connection.execute(
             """

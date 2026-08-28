@@ -1090,6 +1090,97 @@ def test_bot_assistant_result_projection_follows_current_exact_repost_representa
         route["kind"],
         route["value"],
     )
+    role_failure_id = uuid4()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'ingestion', 'application', 'SourceStreamStopped', 1,
+                'ingestion-role-failure', 1, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                role_failure_id,
+                f"ingestion-role-stop:{role_failure_id}",
+                uuid4(),
+                uuid4(),
+                recorded_at,
+                json.dumps(
+                    {
+                        "source_stream_failure_id": str(role_failure_id),
+                        "scope": "ingestion_role",
+                        "failure_reason": "authentication_lost",
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.ingestion_failures (
+                failure_id, scope, failure_reason, recorded_at
+            ) VALUES (%s, 'ingestion_role', 'authentication_lost', %s)
+            """,
+            (role_failure_id, recorded_at),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        role_failed_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        role_failed_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert role_failed_gate == (False,)
+    assert role_failed_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.ingestion_failures
+            SET active = false
+            WHERE failure_id = %s
+            """,
+            (role_failure_id,),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        role_restored_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        role_restored_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert role_restored_gate == (True,)
+    assert role_restored_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "active",
+        route["kind"],
+        route["value"],
+    )
     with psycopg.connect(fresh_database_url) as connection:
         connection.execute(
             """
