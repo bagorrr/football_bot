@@ -3697,6 +3697,7 @@ class PostgresRoleStore:
                     source_message_id=incoming.subject_id,
                     incoming=incoming,
                     recorded_at=received_at,
+                    source_deleted=event_kind == SourceEventKind.DELETE.value,
                 )
                 for cluster_outgoing in cluster_outgoings:
                     _insert_outbox(connection, cluster_outgoing)
@@ -10599,6 +10600,7 @@ def _reconcile_exact_repost_clusters_for_source_message(
     source_message_id: str,
     incoming: ContractEnvelope,
     recorded_at: datetime,
+    source_deleted: bool,
 ) -> tuple[ContractEnvelope, ...]:
     """Re-elect a cluster after a Source Message edit or deletion."""
     cluster_ids = tuple(
@@ -10637,6 +10639,30 @@ def _reconcile_exact_repost_clusters_for_source_message(
                 recorded_at=recorded_at,
             )
         )
+        if source_deleted:
+            has_surviving_member = connection.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM football_runtime.application_exact_repost_cluster_members
+                    JOIN football_runtime.source_messages
+                      ON source_messages.source_message_id =
+                         application_exact_repost_cluster_members.source_message_id
+                    WHERE application_exact_repost_cluster_members
+                              .exact_repost_cluster_id = %s
+                      AND NOT source_messages.tombstoned
+                )
+                """,
+                (cluster_id,),
+            ).fetchone()
+            if has_surviving_member is not None and not has_surviving_member[0]:
+                connection.execute(
+                    """
+                    DELETE FROM football_runtime.application_exact_repost_clusters
+                    WHERE exact_repost_cluster_id = %s
+                    """,
+                    (cluster_id,),
+                )
     return tuple(outgoings)
 
 

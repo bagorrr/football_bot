@@ -392,6 +392,97 @@ def test_deleting_newest_representative_reactivates_old_survivor() -> None:
     )
 
 
+def test_deleting_last_exact_repost_member_scrubs_cluster_and_is_idempotent() -> None:
+    probe = _probe()
+    _, _, first_source, second_source = _create_pair(probe)
+    cluster_before = _cluster(probe)
+    cluster_id = cluster_before.exact_repost_cluster_id
+
+    deleted_revision, _ = probe.source_event(
+        body=None,
+        operation_number=3,
+        kind=SourceEventKind.DELETE,
+        revision=2,
+        telegram_message_id=702,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert deleted_revision == f"{second_source}:revision:2"
+    survivor_cluster = _cluster(probe)
+    assert survivor_cluster.exact_repost_cluster_id == cluster_id
+    assert survivor_cluster.source_publisher_id == "publisher:one"
+    assert survivor_cluster.normalized_body == CONTROLLED_LIFECYCLE_BODY.casefold()
+    assert survivor_cluster.representative_source_message_id == first_source
+
+    deleted_revision, _ = probe.source_event(
+        body=None,
+        operation_number=4,
+        kind=SourceEventKind.DELETE,
+        revision=2,
+        telegram_message_id=701,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 9, tzinfo=UTC),
+    )
+    assert deleted_revision == f"{first_source}:revision:2"
+    assert probe.system.exact_repost_clusters() == ()
+    assert probe.system.exact_repost_cluster_members(cluster_id) == ()
+
+    assert all(item.body is None for item in probe.system.source_events())
+    assert all(
+        item.source_publisher_id is None for item in probe.system.source_events()
+    )
+    assert all(item.body is None for item in probe.system.source_messages())
+    assert all(
+        item.source_publisher_id is None for item in probe.system.source_messages()
+    )
+    assert all(
+        revision.body is None
+        and revision.source_publisher_id is None
+        and revision.reply_to_telegram_message_id is None
+        for revision in probe.system.source_message_revisions()
+    )
+    assert all(
+        opportunity.response_route.value == ""
+        for opportunity in probe.system.opportunities()
+    )
+    assert all(
+        opportunity.response_route.value == ""
+        for opportunity in probe.system.recommendation_opportunities()
+        if opportunity.publication_reason == "source_deleted"
+    )
+    assert {
+        tombstone.source_message_id
+        for tombstone in probe.system.source_message_deletion_tombstones()
+    } == {first_source, second_source}
+
+    before_replay = (
+        probe.system.source_messages(),
+        probe.system.source_message_revisions(),
+        probe.system.source_message_deletion_tombstones(),
+        probe.system.opportunities(),
+        probe.system.recommendation_opportunities(),
+        probe.system.exact_repost_clusters(),
+    )
+    deletion_events = tuple(
+        event
+        for event in probe.system.source_events()
+        if event.event_kind is SourceEventKind.DELETE
+    )
+    assert len(deletion_events) == 2
+    assert all(
+        not probe.system.redeliver_source_event(event.source_event_id)
+        for event in deletion_events
+    )
+    assert (
+        probe.system.source_messages(),
+        probe.system.source_message_revisions(),
+        probe.system.source_message_deletion_tombstones(),
+        probe.system.opportunities(),
+        probe.system.recommendation_opportunities(),
+        probe.system.exact_repost_clusters(),
+    ) == before_replay
+
+
 def test_moderation_applies_to_the_whole_cluster_and_approval_releases_it() -> None:
     probe = _probe()
     _create_pair(probe)
