@@ -8373,6 +8373,10 @@ def _post_core_message(
     details_callback = (
         "opponent-details:hub"
         if user_intent is UserIntent.OPPONENT_SEARCH
+        else "referee-search-details:hub"
+        if user_intent is UserIntent.REFEREE_SEARCH
+        else "refereeing-service-offer-details:hub"
+        if user_intent is UserIntent.REFEREEING_SERVICE_OFFER
         else "coaching-details:hub"
         if user_intent in {UserIntent.COACH_SEARCH, UserIntent.COACHING_SERVICE_OFFER}
         else "transfer-details:hub"

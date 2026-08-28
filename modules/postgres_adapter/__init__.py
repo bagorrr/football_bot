@@ -9175,6 +9175,8 @@ def _proposition_identity_parts(
             "roster_vacancy",
             "player_match_availability",
             "player_transfer_availability",
+            "referee_availability",
+            "referee_request",
             "coach_availability",
             "coach_request",
         }:
@@ -9374,6 +9376,8 @@ def _legacy_candidate_alias_for_canonical(
         "roster_vacancy",
         "player_match_availability",
         "player_transfer_availability",
+        "referee_availability",
+        "referee_request",
         "coach_availability",
         "coach_request",
     }:
