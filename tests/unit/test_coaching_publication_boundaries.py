@@ -460,6 +460,16 @@ def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -
             True,
         ),
         (
+            "In-person coaching is available to anyone in Moscow. Message @coach.",
+            "coach_availability",
+            True,
+        ),
+        (
+            "In-person coaching is offered to anyone at the field. Message @coach.",
+            "coach_availability",
+            True,
+        ),
+        (
             "No coach was found at the field, but in-person coaching is available.",
             "coach_availability",
             True,
@@ -485,6 +495,36 @@ def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -
             False,
         ),
         (
+            "In-person coaching is offered by no one in Moscow. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is provided by nobody at the field. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is available to no one in Moscow. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is not for anyone at the field. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is for no one in Moscow. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is offered to nobody at the field. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
             "In-person coaching does not exist. Message @coach.",
             "coach_availability",
             False,
@@ -506,6 +546,11 @@ def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -
         ),
         (
             "Nobody wants an in-person coach. Message @team.",
+            "coach_request",
+            False,
+        ),
+        (
+            "Nobody wants an in-person coach in Moscow. Message @team.",
             "coach_request",
             False,
         ),
@@ -591,3 +636,27 @@ def test_coaching_polarity_and_direction_are_explicit(
     body: str, opportunity_type: str, expected: bool
 ) -> None:
     assert _body_establishes_coaching_opportunity(body, opportunity_type) is expected
+
+
+def test_coaching_negative_recipient_polarity_is_bound_to_its_clause() -> None:
+    body = (
+        "In-person coaching is offered by no one in Moscow. "
+        "In-person coaching is available in Saint Petersburg."
+    )
+
+    assert not _coaching_proposition_evidence_is_bound(
+        body,
+        "coach_availability",
+        {
+            "coach_availability": "In-person coaching is offered by no one in Moscow",
+            "in_person": "In-person",
+        },
+    )
+    assert _coaching_proposition_evidence_is_bound(
+        body,
+        "coach_availability",
+        {
+            "coach_availability": "In-person coaching is available in Saint Petersburg",
+            "in_person": "In-person",
+        },
+    )

@@ -637,6 +637,60 @@ def test_online_only_coaching_proposition_is_not_published() -> None:
             False,
         ),
         (
+            "In-person coaching is offered by no one in Moscow. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is provided by nobody at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is available to no one in Moscow. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is not for anyone at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is for no one in Moscow. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is offered to nobody at the field. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
             "Nobody offers in-person coaching. "
             "Message @coach_contact on Petrogradskaya.",
             "coach_availability",
@@ -664,7 +718,8 @@ def test_online_only_coaching_proposition_is_not_published() -> None:
             False,
         ),
         (
-            "Nobody wants an in-person coach. Message @team_contact on Petrogradskaya.",
+            "Nobody wants an in-person coach in Moscow. "
+            "Message @team_contact on Petrogradskaya.",
             "coach_request",
             "Nobody wants an in-person coach",
             "in-person",

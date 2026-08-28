@@ -22840,6 +22840,30 @@ def _coaching_body_is_in_person(body: str) -> bool:
         r"не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
         r"no\s+disponible|indisponible|pas\s+disponible)\b"
     )
+    physical_recipient_negation_after = re.compile(
+        r"^\s*(?:(?:[\w'-]+\s*)|[—–,.:;!?()\[\]/-]+\s*){0,12}?"
+        r"(?:"
+        r"(?:(?:is|are|was|were|be|being)\s+)?"
+        r"(?:available|offered|provided|offer\w*|provide\w*|"
+        r"conduct\w*|teach\w*|wanted|required|requested|needed)\s+"
+        r"(?:by|to|for)\s+"
+        r"(?:nobody|no\s+one|no-one|no\s+person|none|neither|nadie|personne)|"
+        r"(?:(?:is|are|was|were)\s+)?not\s+(?:for|to)\s+"
+        r"(?:anyone|anybody|any\s+person)|"
+        r"(?:(?:is|are|was|were)\s+)?(?:for|to)\s+"
+        r"(?:nobody|no\s+one|no-one|no\s+person|none|neither|nadie|personne)"
+        r")\b"
+    )
+    physical_negation_continuation_after = re.compile(
+        r"^\s*(?:[\w'-]+\s*){1,4}[.!?;]\s*"
+        r"(?:(?:unfortunately|sadly|currently|still)\s*,?\s*)?"
+        r"(?:not\s+(?:(?:be|being)\s+)?(?:available|offered|possible|"
+        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*|exist\w*|"
+        r"happen\w*|necessary|needed|required|taking\s+place)|"
+        r"unavailable|no\s+(?:availability|sessions?|coaching)|"
+        r"не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
+        r"no\s+disponible|indisponible|pas\s+disponible)\b"
+    )
     coaching_pattern = re.compile(
         r"\b(?:coach\w*|trainer\w*|train\w*|coaching|"
         r"тренер\w*|трениров\w*|заняти\w*|"
@@ -22860,10 +22884,14 @@ def _coaching_body_is_in_person(body: str) -> bool:
     contrast_marker = re.compile(r"\b(?:but|however|although|yet|and)\b")
 
     def is_negated(match: re.Match[str], clause: re.Match[str]) -> bool:
-        before = normalized[max(0, match.start() - 64) : match.start()]
+        before = normalized[clause.start() : match.start()]
+        clause_after = normalized[match.end() : clause.end()]
         after = normalized[match.end() : match.end() + 72]
-        if physical_negation_before.search(before) or physical_negation_after.search(
-            after
+        if (
+            physical_negation_before.search(before)
+            or physical_negation_after.search(clause_after)
+            or physical_recipient_negation_after.search(clause_after)
+            or physical_negation_continuation_after.search(after)
         ):
             return True
 
