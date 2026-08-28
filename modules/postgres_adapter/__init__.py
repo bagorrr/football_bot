@@ -9822,14 +9822,20 @@ def _exact_repost_key(
     source_publisher_id: str,
     normalized_body: str,
     resolved_event_date: str,
+    opportunity_type: str | None = None,
 ) -> str:
+    material_fields: dict[str, str] = {
+        "resolved_event_date": resolved_event_date,
+        "source_chat_reference": source_chat_reference,
+        "source_publisher_id": source_publisher_id,
+        "normalized_body": normalized_body,
+    }
+    if not resolved_event_date.startswith("undated:"):
+        if not isinstance(opportunity_type, str) or not opportunity_type:
+            raise ValueError("dated exact repost identity requires opportunity type")
+        material_fields["opportunity_type"] = opportunity_type
     material = json.dumps(
-        {
-            "resolved_event_date": resolved_event_date,
-            "source_chat_reference": source_chat_reference,
-            "source_publisher_id": source_publisher_id,
-            "normalized_body": normalized_body,
-        },
+        material_fields,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -10314,6 +10320,7 @@ def _reconcile_exact_repost_for_opportunity(
         source_publisher_id=publisher_id,
         normalized_body=normalized_body,
         resolved_event_date=cluster_identity,
+        opportunity_type=opportunity_type,
     )
     cluster_id = f"exact-repost-cluster:{cluster_key}"
     old_cluster_ids = tuple(

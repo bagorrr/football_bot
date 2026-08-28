@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from datetime import UTC, date, datetime
 
 import psycopg
 import pytest
 
+from modules.contracts import JsonValue
 from modules.domain import (
     ConversationStage,
     DateInterpretation,
@@ -28,6 +30,7 @@ from modules.testkit import (
     ControlledTimezoneDataAdapter,
     FrozenClock,
     boot_acceptance_spine,
+    semantic_proof_result_for,
 )
 from tests.system.test_open_match_game_search import (
     _minimal_classifier_result,
@@ -625,6 +628,50 @@ def test_online_only_coaching_proposition_is_not_published() -> None:
             False,
         ),
         (
+            "In-person coaching does not exist. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "Nobody offers in-person coaching. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "Nobody offers in-person coaching",
+            "in-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is not happening. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "In-person coaching is not necessary. "
+            "Message @coach_contact on Petrogradskaya.",
+            "coach_availability",
+            "In-person coaching",
+            "In-person",
+            "@coach_contact",
+            False,
+        ),
+        (
+            "Nobody wants an in-person coach. Message @team_contact on Petrogradskaya.",
+            "coach_request",
+            "Nobody wants an in-person coach",
+            "in-person",
+            "@team_contact",
+            False,
+        ),
+        (
             "Not looking for a coach in person at the field. "
             "Message @team_contact on Petrogradskaya.",
             "coach_request",
@@ -821,4 +868,211 @@ def test_coaching_polarity_is_enforced_by_authoritative_acceptance(
     else:
         assert system.opportunities() == ()
         assert active_publications == []
+    system.reset()
+
+
+def test_compound_coaching_source_keeps_typed_exact_reposts_separate() -> None:
+    """Independent coaching directions retain separate typed repost clusters."""
+    body = (
+        "Coach offers in-person coaching on Petrogradskaya on Wednesday "
+        "19:00-20:00 starting 20 August 2026 (2026-08-20). The team wants an "
+        "in-person coach on Petrogradskaya on Wednesday 19:00-20:00 starting "
+        "20 August 2026 (2026-08-20). "
+        "Individual training for average players on outdoor artificial turf. "
+        "Message @coach_contact or @team_contact."
+    )
+    telegram_ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_coaching_primary_v1()
+    resolver = ControlledLocationResolverAdapter()
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    base_result = _minimal_classifier_result(
+        candidate_key="compound-coaching-template",
+        body=body,
+        response_routes=[
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@coach_contact",
+                "evidence": "@coach_contact",
+            }
+        ],
+        opportunity_evidence="Coach offers in-person coaching",
+    )
+    candidates = base_result.output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    template = candidates[0]
+    assert isinstance(template, dict)
+    compound_candidates: list[JsonValue] = []
+    candidate_specs = (
+        (
+            "compound-coach-availability",
+            "coach_availability",
+            "Coach offers in-person coaching",
+            "in-person",
+            "@coach_contact",
+        ),
+        (
+            "compound-coach-request",
+            "coach_request",
+            "The team wants an in-person coach",
+            "in-person",
+            "@team_contact",
+        ),
+    )
+    for (
+        candidate_key,
+        opportunity_type,
+        directional_evidence,
+        in_person_evidence,
+        route,
+    ) in candidate_specs:
+        candidate = deepcopy(template)
+        candidate["candidate_key"] = candidate_key
+        candidate["opportunity_type"] = opportunity_type
+        candidate["source_context"] = body
+        candidate.pop("event_time", None)
+        candidate.pop("open_places", None)
+        candidate[opportunity_type] = True
+        candidate["in_person"] = True
+        candidate["coaching_types"] = ["individual_training"]
+        candidate["playing_levels"] = ["average"]
+        candidate["schedule"] = {
+            "weekdays": ["wednesday"],
+            "local_start_time": "19:00",
+            "local_end_time": "20:00",
+            "start_local_date": "2026-08-20",
+        }
+        candidate["venue_settings"] = ["outdoor"]
+        candidate["playing_surfaces"] = ["artificial_turf"]
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        evidence.clear()
+        evidence.update(
+            {
+                "opportunity": directional_evidence,
+                "location": "on Petrogradskaya",
+                opportunity_type: directional_evidence,
+                "in_person": in_person_evidence,
+                "coaching_types": "Individual training",
+                "playing_levels": "average players",
+                "schedule": (
+                    "Wednesday 19:00-20:00 starting 20 August 2026 (2026-08-20)"
+                ),
+                "venue_settings": "outdoor",
+                "playing_surfaces": "artificial turf",
+            }
+        )
+        candidate["location"] = {
+            "mention": "on Petrogradskaya",
+            "place_id": "station:ru:spb:petrogradskaya",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        }
+        candidate["response_routes"] = [
+            {
+                "kind": "explicit_telegram_username",
+                "value": route,
+                "evidence": route,
+            }
+        ]
+        compound_candidates.append(candidate)
+    base_result.output["candidates"] = compound_candidates
+    base_result.output["schema_version"] = "source-message-classification-v5"
+    base_result.output["routing"] = {
+        "reason_code": "accepted",
+        "required_context": "none",
+    }
+    classifier.return_for(body=body, result=base_result)
+    for proof_candidate in compound_candidates:
+        assert isinstance(proof_candidate, dict)
+        proof_candidate_key = proof_candidate.get("candidate_key")
+        assert isinstance(proof_candidate_key, str)
+        proof_output = deepcopy(base_result.output)
+        proof_output["candidates"] = [deepcopy(proof_candidate)]
+        classifier.return_proof_for(
+            body=body,
+            candidate_key=proof_candidate_key,
+            result=semantic_proof_result_for(output=proof_output, body=body),
+        )
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="on Petrogradskaya",
+        resolution=_transfer_location_resolution(),
+    )
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 56_005
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=5_600_500,
+    )
+    telegram_ingestion.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:5620",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram_ingestion,
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezone_data,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    for checkpoint, message_id in ((5620, 5621), (5621, 5622)):
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=checkpoint),
+            to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint + 1),
+            source_event_id=f"source-event:compound-coaching:{message_id}",
+            telegram_message_id=message_id,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=body,
+            event_time=datetime(2026, 8, 18, 9, message_id - 5615, tzinfo=UTC),
+            source_publisher_id="publisher:compound",
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+
+    opportunities = system.opportunities()
+    assert len(opportunities) == 4
+    assert {opportunity.opportunity_type for opportunity in opportunities} == {
+        "coach_availability",
+        "coach_request",
+    }
+    clusters = system.exact_repost_clusters()
+    assert len(clusters) == 2
+    assert {cluster.opportunity_type for cluster in clusters} == {
+        "coach_availability",
+        "coach_request",
+    }
+    second_source_id = "source-chat:channel:5600500:generation:1:message:5622"
+    for cluster in clusters:
+        members = system.exact_repost_cluster_members(cluster.exact_repost_cluster_id)
+        assert len(members) == 2
+        assert {member.source_message_id for member in members} == {
+            "source-chat:channel:5600500:generation:1:message:5621",
+            second_source_id,
+        }
+        assert cluster.representative_source_message_id == second_source_id
+        assert sum(member.is_representative for member in members) == 1
+        assert sum(member.publication_state == "active" for member in members) == 1
     system.reset()

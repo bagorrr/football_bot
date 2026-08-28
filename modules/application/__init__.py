@@ -22817,17 +22817,24 @@ def _coaching_body_is_in_person(body: str) -> bool:
         r"sur\s+place|en\s+présentiel|en\s+salle|sur\s+le\s+terrain)\b"
     )
     physical_negation_before = re.compile(
-        r"\b(?:not|no|without|never|не|нет|без|sin|pas|sans)\s*$"
+        r"(?:"
+        r"\b(?:not|no|without|never|не|нет|без|sin|pas|sans)\s*$|"
+        r"\b(?:nobody|no\s+one|neither|nadie|personne)"
+        r"(?:\s+[\w'-]+){0,4}\s*$"
+        r")"
     )
     physical_negation_after = re.compile(
         r"^\s*(?:(?:[\w'-]+\s*)|[—–,.:;!?()\[\]/-]+\s*){0,12}?"
         r"(?:not\s+(?:(?:be|being)\s+)?(?:available|offered|possible|"
-        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*)|"
+        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*|exist\w*|"
+        r"happen\w*|necessary|needed|required|taking\s+place)|"
         r"(?:does|do|did|will|can|could)\s+not\s+(?:(?:be|being)\s+)?"
         r"(?:available|offered|possible|provided|offer\w*|provide\w*|"
-        r"conduct\w*|teach\w*)|"
+        r"conduct\w*|teach\w*|exist\w*|happen\w*|necessary|needed|"
+        r"required|taking\s+place)|"
         r"cannot\s+(?:(?:be|being)\s+)?(?:available|offered|possible|"
-        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*)|"
+        r"provided|offer\w*|provide\w*|conduct\w*|teach\w*|exist\w*|"
+        r"happen\w*|necessary|needed|required|taking\s+place)|"
         r"(?:no\s+longer|never)\s+(?:available|offered|possible|provided)|"
         r"unavailable|no\s+(?:availability|sessions?|coaching)|"
         r"не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
@@ -22927,6 +22934,12 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
     if _body_has_terminal_retraction(body) or not _coaching_body_is_in_person(body):
         return False
     normalized = re.sub(r"['’]", " ", body.casefold())
+    coaching_pattern = re.compile(
+        r"\b(?:coach\w*|trainer\w*|train\w*|coaching|"
+        r"тренер\w*|трениров\w*|заняти\w*|"
+        r"entrenador\w*|entrenamiento\w*|"
+        r"entra[iî]neur\w*|entraîn\w*|formation\w*)\b"
+    )
     request_pattern = re.compile(
         r"\b(?:need\s+(?:a\s+)?coach|coach(?:ing)?\s+(?:is\s+)?"
         r"(?:wanted|required|requested|needed)|"
@@ -22946,7 +22959,6 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
         r"cherche\w*\s+(?:un\s+)?entra[iî]neur\w*|"
         r"besoin\s+d['’]?un\s+entra[iî]neur\w*)\b"
     )
-    has_request = request_pattern.search(normalized) is not None
     negated_request_pattern = re.compile(
         r"(?:"
         r"\b(?:not|never|no|without|cannot|do\s+not|does\s+not|did\s+not|"
@@ -22968,29 +22980,37 @@ def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> 
         r"(?:wanted|required|requested|needed)\b"
         r")"
     )
-    if negated_request_pattern.search(normalized) is not None:
-        return False
-    if opportunity_type == "coach_request":
-        return has_request
-    if has_request:
-        return False
-    return (
-        re.search(
-            r"\b(?:offer\w*|provid\w*|available|conduct\w*|teach\w*|coach\w*|"
-            r"предлага\w*|провод\w*|доступ\w*|тренир\w*|я\s+тренер\w*|"
-            r"ofrec\w*|impart\w*|disponib\w*|soy\s+entrenador\w*|"
-            r"propos\w*|disponible|j['’]?enseigne\w*|entra[iî]ne\w*)\b",
-            normalized,
-        )
-        is not None
-        or re.search(
-            r"\b(?:training|трениров\w*|заняти\w*|entrenamiento\w*|formation\w*)\b"
-            r"[^.!?;\n]{0,100}\b(?:come|join|trial|приходите|присоедин\w*|"
-            r"пробн\w*|цена|стоимость|пишите|личку|precio|grupo|groupe)\b",
-            normalized,
-        )
-        is not None
+    offer_pattern = re.compile(
+        r"\b(?:offer\w*|provid\w*|available|conduct\w*|teach\w*|coach\w*|"
+        r"предлага\w*|провод\w*|доступ\w*|тренир\w*|я\s+тренер\w*|"
+        r"ofrec\w*|impart\w*|disponib\w*|soy\s+entrenador\w*|"
+        r"propos\w*|disponible|j['’]?enseigne\w*|entra[iî]ne\w*)\b"
     )
+    training_offer_pattern = re.compile(
+        r"\b(?:training|трениров\w*|заняти\w*|entrenamiento\w*|formation\w*)\b"
+        r"[^.!?;\n]{0,100}\b(?:come|join|trial|приходите|присоедин\w*|"
+        r"пробн\w*|цена|стоимость|пишите|личку|precio|grupo|groupe)\b"
+    )
+    proposition_clauses = tuple(re.finditer(r"[^.!?;\n]+", normalized))
+    for clause in proposition_clauses:
+        clause_text = clause.group(0)
+        if coaching_pattern.search(clause_text) is None:
+            continue
+        if not _coaching_body_is_in_person(clause_text):
+            continue
+        if negated_request_pattern.search(clause_text) is not None:
+            continue
+        has_request = request_pattern.search(clause_text) is not None
+        if opportunity_type == "coach_request":
+            if has_request:
+                return True
+            continue
+        if not has_request and (
+            offer_pattern.search(clause_text) is not None
+            or training_offer_pattern.search(clause_text) is not None
+        ):
+            return True
+    return False
 
 
 def _transfer_offer_is_single_player(body: str, opportunity_type: str) -> bool:

@@ -174,6 +174,30 @@ def test_undated_exact_reposts_share_identity_but_distinct_listings_do_not() -> 
     assert distinct_listing != first
 
 
+def test_dated_exact_repost_identity_partitions_coaching_directions() -> None:
+    common = {
+        "source_chat_reference": "source-chat:channel:123",
+        "source_publisher_id": "publisher:42",
+        "normalized_body": "in person coach available in moscow",
+        "resolved_event_date": "2026-08-20",
+    }
+    availability = _exact_repost_key(
+        **common,
+        opportunity_type="coach_availability",
+    )
+    request = _exact_repost_key(
+        **common,
+        opportunity_type="coach_request",
+    )
+    availability_repost = _exact_repost_key(
+        **common,
+        opportunity_type="coach_availability",
+    )
+
+    assert availability != request
+    assert availability_repost == availability
+
+
 def _coaching_revision(
     *,
     revision: int,
@@ -440,6 +464,31 @@ def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -
         (
             "In-person coaching is not available at the field. Message @coach.",
             "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching does not exist. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "Nobody offers in-person coaching. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is not happening. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "In-person coaching is not necessary. Message @coach.",
+            "coach_availability",
+            False,
+        ),
+        (
+            "Nobody wants an in-person coach. Message @team.",
+            "coach_request",
             False,
         ),
         (
