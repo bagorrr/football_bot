@@ -796,6 +796,7 @@ class SourceMessageDeletionTombstone:
     telegram_message_id: int
     deleted_revision: int
     source_event_id: str
+    source_publisher_id: str
     deleted_at: datetime
     expires_at: datetime
 

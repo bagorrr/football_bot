@@ -2159,6 +2159,13 @@ class AcceptanceSpine:
         """Observe bounded body-free deletion tombstones through the testkit."""
         return self._observer.source_message_deletion_tombstones()
 
+    def cleanup_expired_source_message_tombstones(self) -> int:
+        """Run the Application-owned physical tombstone retention cleanup."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.cleanup_expired_source_message_tombstones(
+            as_of=self._clock.now()
+        )
+
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
         """Observe body-free Protected Content Skips through the testkit."""
         return self._observer.protected_content_skips()

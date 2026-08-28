@@ -12004,6 +12004,8 @@ class RuntimeApplication:
 
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
+        if self.role is RuntimeRole.APPLICATION:
+            self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
         claimed = self.store.claim_next(
             supported_versions=self.supported_versions,
             claimed_at=self.clock.now(),

@@ -3170,6 +3170,7 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
         kind=SourceEventKind.CREATE,
         body="Open training tomorrow. Contact @training_contact.",
         source_author_dm_url="https://t.me/training_contact",
+        source_publisher_id="publisher:delete-replay",
         event_time=clock.now(),
     )
     telethon.add_channel_difference_event(
@@ -3181,6 +3182,7 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
         revision=2,
         kind=SourceEventKind.DELETE,
         body=None,
+        source_publisher_id="publisher:delete-replay",
         event_time=clock.now() + timedelta(minutes=1),
     )
 
@@ -3244,9 +3246,19 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
             telegram_message_id=405,
             deleted_revision=2,
             source_event_id="source-event:delete-replay:delete",
+            source_publisher_id="publisher:delete-replay",
             deleted_at=clock.now(),
             expires_at=clock.now() + timedelta(days=90),
         ),
+    )
+    clock.advance_to(clock.now() + timedelta(days=90))
+    assert system.cleanup_expired_source_message_tombstones() == 1
+    assert system.source_message_deletion_tombstones() == ()
+    assert system.cleanup_expired_source_message_tombstones() == 0
+    # Physical expiry must not weaken the permanent tombstoned-source replay
+    # barrier after the bounded tombstone row has been removed.
+    assert not system.redeliver_classifier_command(
+        f"{source_message.source_message_id}:revision:1"
     )
 
 

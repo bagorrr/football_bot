@@ -157,6 +157,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0029_refereeing_opportunities.sql",
     "0030_referee_source_chat_projection_gate.sql",
     "0031_source_message_lifecycle.sql",
+    "0032_source_message_lifecycle_hardening.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -192,6 +193,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "f3dfa0e4dc25c72cf25076ae7b3fcde842e162b548d988a3a6a53b6fe7a6f65d",
     "85436cdbd933795eb6b27b20b1cfcc84338dbba14c59918b3c0a77d1243ad972",
     "7fddc4d44988b3f0cfec72a370c13e92ff284ad2dafe747c4e4655a8f5bbc54a",
+    "beb5dce7b1fa0769b37066e90a134f82cb122505e879b430978409013121bded",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -918,7 +920,8 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT source_message_id, peer_kind, telegram_chat_id,
                        registry_generation, telegram_message_id,
-                       deleted_revision, source_event_id, deleted_at, expires_at
+                       deleted_revision, source_event_id, source_publisher_id,
+                       deleted_at, expires_at
                 FROM football_runtime.application_source_message_tombstones
                 ORDER BY source_message_id
                 """
@@ -934,6 +937,7 @@ class PostgresAcceptanceObserver:
                 telegram_message_id=row["telegram_message_id"],
                 deleted_revision=row["deleted_revision"],
                 source_event_id=row["source_event_id"],
+                source_publisher_id=row["source_publisher_id"],
                 deleted_at=row["deleted_at"],
                 expires_at=row["expires_at"],
             )
@@ -1943,6 +1947,68 @@ class PostgresAcceptanceObserver:
                             WHERE recommendation.opportunity_id =
                                       result.card_facts->>'opportunity_id'
                               AND result.card_facts->>'opportunity_type' IN (
+                                  'referee_availability', 'referee_request'
+                              )
+                            ORDER BY CASE
+                                         WHEN recommendation.opportunity_revision_id ~ (
+                                             ':revision:' || '[0-9]+$'
+                                         )
+                                         THEN substring(
+                                             recommendation.opportunity_revision_id
+                                             FROM ':revision:([0-9]+)$'
+                                         )::bigint
+                                         ELSE 0
+                                     END DESC,
+                                     recommendation.published_at DESC,
+                                     recommendation.opportunity_revision_id DESC
+                            LIMIT 1
+                        )
+                        UNION ALL
+                        (
+                            SELECT recommendation.opportunity_revision_id,
+                                   CASE
+                                       WHEN source_lifecycle.source_deleted
+                                       THEN 'suppressed'
+                                       ELSE recommendation.publication_state
+                                   END AS publication_state,
+                                   recommendation.accepted_facts AS current_facts,
+                                   CASE
+                                       WHEN recommendation.publication_state = 'active'
+                                        AND NOT source_lifecycle.source_deleted
+                                       THEN recommendation.response_route ->> 'kind'
+                                       ELSE NULL
+                                   END AS response_route_kind,
+                                   CASE
+                                       WHEN recommendation.publication_state = 'active'
+                                        AND NOT source_lifecycle.source_deleted
+                                       THEN recommendation.response_route ->> 'value'
+                                       ELSE NULL
+                                   END AS response_route_value
+                            FROM football_runtime.recommendation_opportunities
+                                AS recommendation
+                            CROSS JOIN LATERAL (
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM football_runtime.application_opportunities
+                                        AS application
+                                    JOIN football_runtime.source_message_revisions
+                                        AS revision
+                                      ON revision.source_message_revision_id =
+                                         application.source_message_revision_id
+                                    JOIN football_runtime.source_messages AS source
+                                      ON source.source_message_id =
+                                         revision.source_message_id
+                                    WHERE application.opportunity_id =
+                                        recommendation.opportunity_id
+                                      AND source.tombstoned
+                                ) AS source_deleted
+                            ) AS source_lifecycle
+                            WHERE recommendation.opportunity_id =
+                                      result.card_facts->>'opportunity_id'
+                              AND COALESCE(
+                                  result.card_facts->>'opportunity_type', ''
+                              ) NOT IN (
+                                  'tournament',
                                   'referee_availability', 'referee_request'
                               )
                             ORDER BY CASE
@@ -3437,20 +3503,30 @@ class PostgresRoleStore:
                 SourceEventKind.DELETE.value,
             }:
                 raise RuntimeError("this Source Event kind is not implemented")
-            if event_kind == SourceEventKind.DELETE.value:
-                _lock_source_message_lifecycle(
-                    connection,
-                    source_message_id=incoming.subject_id,
-                )
+            _lock_source_message_lifecycle(
+                connection,
+                source_message_id=incoming.subject_id,
+            )
             existing_source_message = connection.execute(
                 """
-                SELECT tombstoned
+                SELECT tombstoned, bounded_metadata
                 FROM football_runtime.source_messages
                 WHERE source_message_id = %s
                 FOR UPDATE
                 """,
                 (incoming.subject_id,),
             ).fetchone()
+            existing_tombstone = None
+            if event_kind == SourceEventKind.DELETE.value:
+                existing_tombstone = connection.execute(
+                    """
+                    SELECT source_publisher_id
+                    FROM football_runtime.application_source_message_tombstones
+                    WHERE source_message_id = %s
+                    FOR UPDATE
+                    """,
+                    (incoming.subject_id,),
+                ).fetchone()
             deletion_barrier = connection.execute(
                 """
                 SELECT football_runtime.source_message_deletion_barrier(%s)
@@ -3466,10 +3542,23 @@ class PostgresRoleStore:
             ):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
-            event_time = datetime.fromisoformat(str(payload["event_time"]))
-            bounded_metadata = payload.get(
+            incoming_bounded_metadata = payload.get(
                 "bounded_metadata", empty_bounded_source_metadata()
             )
+            source_publisher_id = _source_message_tombstone_publisher_id(
+                source_message_id=incoming.subject_id,
+                existing_metadata=(
+                    existing_source_message[1]
+                    if existing_source_message is not None
+                    else None
+                ),
+                incoming_metadata=incoming_bounded_metadata,
+                previous_tombstone=(
+                    existing_tombstone[0] if existing_tombstone is not None else None
+                ),
+            )
+            event_time = datetime.fromisoformat(str(payload["event_time"]))
+            bounded_metadata = incoming_bounded_metadata
             reply_to_message_id = payload.get("reply_to_telegram_message_id")
             if event_kind == SourceEventKind.DELETE.value:
                 bounded_metadata = empty_bounded_source_metadata()
@@ -3659,8 +3748,9 @@ class PostgresRoleStore:
                     INSERT INTO football_runtime.application_source_message_tombstones (
                         source_message_id, peer_kind, telegram_chat_id,
                         registry_generation, telegram_message_id,
-                        deleted_revision, source_event_id, deleted_at, expires_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                        deleted_revision, source_event_id, source_publisher_id,
+                        deleted_at, expires_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                               %s + INTERVAL '90 days')
                     ON CONFLICT (source_message_id) DO UPDATE
                     SET peer_kind = EXCLUDED.peer_kind,
@@ -3669,6 +3759,7 @@ class PostgresRoleStore:
                         telegram_message_id = EXCLUDED.telegram_message_id,
                         deleted_revision = EXCLUDED.deleted_revision,
                         source_event_id = EXCLUDED.source_event_id,
+                        source_publisher_id = EXCLUDED.source_publisher_id,
                         deleted_at = EXCLUDED.deleted_at,
                         expires_at = EXCLUDED.expires_at
                     """,
@@ -3680,6 +3771,7 @@ class PostgresRoleStore:
                         payload["telegram_message_id"],
                         incoming.subject_revision,
                         payload["source_event_id"],
+                        source_publisher_id,
                         received_at,
                         received_at,
                     ),
@@ -3728,6 +3820,19 @@ class PostgresRoleStore:
                 (source_message_id,),
             ).fetchone()
         return bool(row[0]) if row is not None else False
+
+    def cleanup_expired_source_message_tombstones(self, *, as_of: datetime) -> int:
+        """Physically delete body-free tombstones after their retention bound."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.cleanup_expired_source_message_tombstones(%s)
+                """,
+                (as_of,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def scrub_source_message_contracts(
         self, source_message_id: str, *, recorded_at: datetime
@@ -4398,6 +4503,36 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
+            if finalize:
+                source_message_ids = tuple(
+                    sorted(
+                        {
+                            _source_message_id_for_lifecycle(
+                                stored_attempt.source_message_revision_id
+                            )
+                            for stored_attempt in (
+                                attempt,
+                                *(
+                                    stored_attempt
+                                    for stored_attempt, _ in additional_attempts
+                                ),
+                            )
+                        }
+                    )
+                )
+                source_deleted = any(
+                    _source_message_lifecycle_deleted(
+                        connection,
+                        source_message_id=source_message_id,
+                    )
+                    for source_message_id in source_message_ids
+                )
+                if source_deleted:
+                    # Preserve the body-free execution record, but never commit
+                    # protected proof state or a stale ClassificationProposal.
+                    outgoing = None
+                    proof_work = None
+                    clear_proof_work = True
             for stored_attempt, stored_result in (
                 (attempt, result),
                 *additional_attempts,
@@ -5523,6 +5658,16 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
+            if ":revision:" in outcome.source_message_revision_id and (
+                _source_message_lifecycle_deleted(
+                    connection,
+                    source_message_id=_source_message_id_for_lifecycle(
+                        outcome.source_message_revision_id
+                    ),
+                )
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             connection.execute(
                 """
                 INSERT INTO football_runtime.classification_routing_outcomes (
@@ -5579,6 +5724,20 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
+            source_message_revision_id = opportunity.get("source_message_revision_id")
+            if not isinstance(source_message_revision_id, str):
+                raise ValueError(
+                    "publication requires a Source Message revision lineage"
+                )
+            source_message_id = _source_message_id_for_lifecycle(
+                source_message_revision_id
+            )
+            if _source_message_lifecycle_deleted(
+                connection,
+                source_message_id=source_message_id,
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             if routing_outcome is not None:
                 connection.execute(
                     """
@@ -5601,7 +5760,6 @@ class PostgresRoleStore:
                 )
             proposition_slot = opportunity.get("proposition_slot")
             proposition_discriminator = opportunity.get("proposition_discriminator")
-            source_message_revision_id = opportunity.get("source_message_revision_id")
             opportunity_id = opportunity.get("opportunity_id")
             if (
                 not isinstance(proposition_slot, int)
@@ -5615,7 +5773,6 @@ class PostgresRoleStore:
                 raise ValueError(
                     "publication requires an Application proposition lineage"
                 )
-            source_message_id = source_message_revision_id.rsplit(":revision:", 1)[0]
             _ensure_application_proposition_identity_mapping(
                 connection,
                 source_message_id=source_message_id,
@@ -5729,6 +5886,34 @@ class PostgresRoleStore:
                 received_at=received_at,
             ):
                 return ConsumeResult.REPLAYED
+            source_message_revision_ids = tuple(
+                opportunity.get("source_message_revision_id")
+                for opportunity in opportunities
+            )
+            if any(
+                not isinstance(source_message_revision_id, str)
+                for source_message_revision_id in source_message_revision_ids
+            ):
+                raise ValueError(
+                    "compound publication requires one Source Message lineage"
+                )
+            source_message_ids = {
+                _source_message_id_for_lifecycle(source_message_revision_id)
+                for source_message_revision_id in cast(
+                    tuple[str, ...], source_message_revision_ids
+                )
+            }
+            if len(source_message_ids) != 1:
+                raise ValueError(
+                    "compound publication requires one Source Message lineage"
+                )
+            source_deleted = _source_message_lifecycle_deleted(
+                connection,
+                source_message_id=next(iter(source_message_ids)),
+            )
+            if source_deleted:
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             if routing_outcome is not None:
                 connection.execute(
                     """
@@ -8405,6 +8590,22 @@ class PostgresRoleStore:
                                 'referee_availability', 'referee_request'
                             )
                         )
+                        UNION ALL
+                        (
+                            SELECT opportunity_revision_id, publication_state,
+                                   current_facts, response_route_kind,
+                                   response_route_value
+                            FROM football_runtime
+                                .read_current_generic_result_projection(
+                                result.card_facts->>'opportunity_id'
+                            )
+                            WHERE COALESCE(
+                                result.card_facts->>'opportunity_type', ''
+                            ) NOT IN (
+                                'tournament',
+                                'referee_availability', 'referee_request'
+                            )
+                        )
                     ) AS projection
                     LIMIT 1
                 ) AS current_projection ON TRUE
@@ -9135,8 +9336,35 @@ def _result_card_facts_with_current_publication_state(
             result.pop("response_route_value", None)
         return result
     if current_projection is None:
-        return dict(card_facts)
-    return {**card_facts, "publication_state": current_projection["publication_state"]}
+        result = {**card_facts, "publication_state": "suppressed"}
+        result.pop("response_route_kind", None)
+        result.pop("response_route_value", None)
+        return result
+    current_publication_state = current_projection.get("publication_state")
+    publication_state = (
+        current_publication_state
+        if isinstance(current_publication_state, str)
+        else "suppressed"
+    )
+    route_kind = current_projection.get("response_route_kind")
+    route_value = current_projection.get("response_route_value")
+    if publication_state == "active" and (
+        not isinstance(route_kind, str)
+        or not route_kind
+        or not isinstance(route_value, str)
+        or not route_value
+    ):
+        publication_state = "suppressed"
+    result = {**card_facts, "publication_state": publication_state}
+    if publication_state == "active":
+        assert isinstance(route_kind, str)
+        assert isinstance(route_value, str)
+        result["response_route_kind"] = route_kind
+        result["response_route_value"] = route_value
+    else:
+        result.pop("response_route_kind", None)
+        result.pop("response_route_value", None)
+    return result
 
 
 def _current_result_projection(
@@ -10845,6 +11073,12 @@ def _scrub_application_source_message_data(
     )
     connection.execute(
         """
+        SELECT football_runtime.scrub_source_message_result_card_facts(%s)
+        """,
+        (source_message_id,),
+    )
+    connection.execute(
+        """
         SELECT football_runtime.scrub_source_message_outbox_contracts(%s)
         """,
         (source_message_id,),
@@ -10872,11 +11106,62 @@ def _lock_source_message_lifecycle(
     *,
     source_message_id: str,
 ) -> None:
-    """Serialize Recommendation publication with source-message deletion."""
+    """Serialize every source-derived terminal transition with deletion."""
     connection.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
         (f"source-message-lifecycle:{source_message_id}",),
     )
+
+
+def _source_message_id_for_lifecycle(source_message_revision_id: str) -> str:
+    """Return the stable Source Message identity from a revision identity."""
+    source_message_id, separator, _revision = source_message_revision_id.rpartition(
+        ":revision:"
+    )
+    if not separator or not source_message_id:
+        raise ValueError("Source Message revision identity is invalid")
+    return source_message_id
+
+
+def _source_message_tombstone_publisher_id(
+    *,
+    source_message_id: str,
+    existing_metadata: Any,
+    incoming_metadata: Any,
+    previous_tombstone: Any,
+) -> str:
+    """Capture one bounded opaque publisher reference before deletion scrubbing."""
+    for metadata in (existing_metadata,):
+        if isinstance(metadata, Mapping):
+            publisher_id = source_publisher_id_from_metadata(metadata)
+            if publisher_id is not None:
+                return publisher_id
+    if isinstance(previous_tombstone, str) and previous_tombstone.strip():
+        return previous_tombstone.strip()
+    if isinstance(incoming_metadata, Mapping):
+        publisher_id = source_publisher_id_from_metadata(incoming_metadata)
+        if publisher_id is not None:
+            return publisher_id
+    return f"unknown-publisher:{sha256(source_message_id.encode()).hexdigest()}"
+
+
+def _source_message_lifecycle_deleted(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+) -> bool:
+    """Lock and re-check deletion immediately before a terminal source write."""
+    _lock_source_message_lifecycle(
+        connection,
+        source_message_id=source_message_id,
+    )
+    deleted_row = connection.execute(
+        """
+        SELECT football_runtime.source_message_deletion_barrier(%s)
+        """,
+        (source_message_id,),
+    ).fetchone()
+    return bool(deleted_row[0]) if deleted_row is not None else False
 
 
 def _scrub_ingestion_source_message_data(

@@ -872,6 +872,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the body-free cross-role deletion barrier."""
         ...
 
+    def cleanup_expired_source_message_tombstones(self, *, as_of: datetime) -> int:
+        """Delete body-free Source Message tombstones past their retention bound."""
+        ...
+
     def scrub_source_message_contracts(
         self, source_message_id: str, *, recorded_at: datetime
     ) -> None:
