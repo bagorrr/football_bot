@@ -2753,7 +2753,8 @@ class AcceptanceSpine:
         opponent_search_details: dict[str, list[str]] | None = None,
         tournament_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
-        refereeing_search_details: dict[str, list[str]] | None = None,
+        referee_search_details: dict[str, list[str]] | None = None,
+        refereeing_service_offer_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2769,7 +2770,8 @@ class AcceptanceSpine:
             opponent_search_details=opponent_search_details,
             tournament_search_details=tournament_search_details,
             transfer_search_details=transfer_search_details,
-            refereeing_search_details=refereeing_search_details,
+            referee_search_details=referee_search_details,
+            refereeing_service_offer_details=refereeing_service_offer_details,
         )
 
     def open_game_search_details(
@@ -3060,85 +3062,169 @@ class AcceptanceSpine:
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def open_refereeing_search_details(
+    def open_referee_search_details(
         self, *, update_id: str, telegram_user_id: int
     ) -> None:
-        """Drive the shared referee Details hub through Bot Assistant."""
-        self._conversation_onboarding().open_refereeing_search_details(
+        """Drive the Referee Search Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_referee_search_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def open_refereeing_search_detail(
+    def open_referee_search_detail(
         self, *, update_id: str, telegram_user_id: int, detail_key: str
     ) -> None:
-        """Drive one shared referee detail submenu."""
-        self._conversation_onboarding().open_refereeing_search_detail(
+        """Drive one Referee Search detail submenu."""
+        self._conversation_onboarding().open_referee_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             detail_key=detail_key,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def toggle_refereeing_search_detail_value(
+    def toggle_referee_search_detail_value(
         self, *, update_id: str, telegram_user_id: int, value: str
     ) -> None:
-        """Toggle one shared referee detail value."""
-        self._conversation_onboarding().toggle_refereeing_search_detail_value(
+        """Toggle one Referee Search detail value."""
+        self._conversation_onboarding().toggle_referee_search_detail_value(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             value=value,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def commit_refereeing_search_detail(
+    def commit_referee_search_detail(
         self, *, update_id: str, telegram_user_id: int
     ) -> None:
-        """Commit the current shared referee detail submenu."""
-        self._conversation_onboarding().commit_refereeing_search_detail(
+        """Commit the current Referee Search detail submenu."""
+        self._conversation_onboarding().commit_referee_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def select_refereeing_search_time(
+    def select_referee_search_time(
         self, *, update_id: str, telegram_user_id: int, value: str | None
     ) -> None:
-        """Select or clear one referee time criterion."""
-        self._conversation_onboarding().select_refereeing_search_time(
+        """Select or clear one Referee Search time criterion."""
+        self._conversation_onboarding().select_referee_search_time(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             value=value,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def open_refereeing_search_exact_time(
+    def open_referee_search_exact_time(
         self, *, update_id: str, telegram_user_id: int
     ) -> None:
-        """Open the referee exact-time prompt."""
-        self._conversation_onboarding().open_refereeing_search_exact_time(
+        """Open the Referee Search exact-time prompt."""
+        self._conversation_onboarding().open_referee_search_exact_time(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def submit_refereeing_search_exact_time_text(
+    def submit_referee_search_exact_time_text(
         self, *, update_id: str, telegram_user_id: int, text: str
     ) -> None:
-        """Submit one referee exact-time answer."""
-        self._conversation_onboarding().submit_refereeing_search_exact_time_text(
+        """Submit one Referee Search exact-time answer."""
+        self._conversation_onboarding().submit_referee_search_exact_time_text(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             text=text,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
-    def back_from_refereeing_search_detail(
+    def back_from_referee_search_detail(
         self, *, update_id: str, telegram_user_id: int
     ) -> None:
-        """Leave a referee detail submenu or hub."""
-        self._conversation_onboarding().back_from_refereeing_search_detail(
+        """Leave a Referee Search detail submenu or hub."""
+        self._conversation_onboarding().back_from_referee_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_refereeing_service_offer_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Refereeing Service Offer Details hub."""
+        self._conversation_onboarding().open_refereeing_service_offer_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_refereeing_service_offer_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Refereeing Service Offer detail submenu."""
+        self._conversation_onboarding().open_refereeing_service_offer_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_refereeing_service_offer_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one Refereeing Service Offer detail value."""
+        self._conversation_onboarding().toggle_refereeing_service_offer_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_refereeing_service_offer_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Commit the current Refereeing Service Offer detail submenu."""
+        self._conversation_onboarding().commit_refereeing_service_offer_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_refereeing_service_offer_time(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Select or clear one Refereeing Service Offer time criterion."""
+        self._conversation_onboarding().select_refereeing_service_offer_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_refereeing_service_offer_exact_time(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the Refereeing Service Offer exact-time prompt."""
+        self._conversation_onboarding().open_refereeing_service_offer_exact_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_refereeing_service_offer_exact_time_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit one Refereeing Service Offer exact-time answer."""
+        self._conversation_onboarding().submit_refereeing_service_offer_exact_time_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_refereeing_service_offer_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Leave a Refereeing Service Offer detail submenu or hub."""
+        self._conversation_onboarding().back_from_refereeing_service_offer_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

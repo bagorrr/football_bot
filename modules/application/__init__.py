@@ -849,12 +849,15 @@ _TOURNAMENT_SEARCH_DETAIL_OPTIONS = {
     ),
     "payment": ("free", "paid"),
 }
-_REFEREEING_SEARCH_DETAIL_OPTIONS = {
+_REFEREE_SEARCH_DETAIL_OPTIONS = {
     "times": ("morning", "daytime", "evening", "night"),
     "event_types": ("match", "tournament"),
     "team_formats": ("5x5", "6x6", "7x7", "8x8", "9x9", "10x10", "11x11"),
     "referee_roles": ("head_referee", "assistant_referee", "var"),
     "payment": ("free", "paid"),
+}
+_REFEREEING_SERVICE_OFFER_DETAIL_OPTIONS = {
+    key: values for key, values in _REFEREE_SEARCH_DETAIL_OPTIONS.items()
 }
 _OPPONENT_SEARCH_DETAIL_NAMES = {
     "en": (
@@ -924,7 +927,7 @@ _TOURNAMENT_SEARCH_DETAIL_NAMES = {
         "Paiement",
     ),
 }
-_REFEREEING_SEARCH_DETAIL_NAMES = {
+_REFEREE_SEARCH_DETAIL_NAMES = {
     "en": ("Time", "Event type", "Team format", "Referee role", "Payment"),
     "ru": ("Время", "Тип события", "Формат команд", "Роль судьи", "Оплата"),
     "es": (
@@ -941,6 +944,9 @@ _REFEREEING_SEARCH_DETAIL_NAMES = {
         "Rôle de l’arbitre",
         "Paiement",
     ),
+}
+_REFEREEING_SERVICE_OFFER_DETAIL_NAMES = {
+    locale: names for locale, names in _REFEREE_SEARCH_DETAIL_NAMES.items()
 }
 _OPPONENT_SEARCH_VALUE_COPY = {
     "en": {
@@ -1018,35 +1024,38 @@ _TOURNAMENT_SEARCH_DETAIL_HEADINGS = {
         "💳 Sélectionnez le type de paiement.",
     ),
 }
-_REFEREEING_SEARCH_DETAIL_HEADINGS = {
+_REFEREE_SEARCH_DETAIL_HEADINGS = {
     "en": (
         "🕒 What time?",
-        "⚽ Select event types.",
+        "🏆 Select the event type.",
         "👥 Select team formats.",
-        "⚖️ Select referee roles.",
+        "⚖️ Select the referee role.",
         "💳 Select the payment type.",
     ),
     "ru": (
         "🕒 В какое время?",
-        "⚽ Выберите типы событий.",
+        "🏆 Выберите тип события.",
         "👥 Выберите форматы команд.",
-        "⚖️ Выберите роли судьи.",
+        "⚖️ Выберите роль судьи.",
         "💳 Выберите тип оплаты.",
     ),
     "es": (
         "🕒 ¿A qué hora?",
-        "⚽ Selecciona los tipos de evento.",
+        "🏆 Selecciona el tipo de evento.",
         "👥 Selecciona los formatos de equipos.",
-        "⚖️ Selecciona los roles del árbitro.",
+        "⚖️ Selecciona el rol del árbitro.",
         "💳 Selecciona el tipo de pago.",
     ),
     "fr": (
         "🕒 À quelle heure ?",
-        "⚽ Sélectionnez les types d’événement.",
+        "🏆 Sélectionnez le type d’événement.",
         "👥 Sélectionnez les formats d’équipes.",
-        "⚖️ Sélectionnez les rôles de l’arbitre.",
+        "⚖️ Sélectionnez le rôle de l’arbitre.",
         "💳 Sélectionnez le type de paiement.",
     ),
+}
+_REFEREEING_SERVICE_OFFER_DETAIL_HEADINGS = {
+    locale: headings for locale, headings in _REFEREE_SEARCH_DETAIL_HEADINGS.items()
 }
 _TRANSFER_SEARCH_DETAIL_OPTIONS = {
     "positions": ("goalkeeper", "defender", "midfielder", "forward"),
@@ -1411,7 +1420,7 @@ _GAME_SEARCH_VALUE_COPY = {
         "paid": "Payant",
     },
 }
-_REFEREEING_SEARCH_VALUE_COPY = {
+_REFEREE_SEARCH_VALUE_COPY = {
     "en": {
         "morning": "Morning",
         "daytime": "Daytime",
@@ -1464,6 +1473,9 @@ _REFEREEING_SEARCH_VALUE_COPY = {
         "free": "Gratuit",
         "paid": "Payant",
     },
+}
+_REFEREEING_SERVICE_OFFER_VALUE_COPY = {
+    locale: values for locale, values in _REFEREE_SEARCH_VALUE_COPY.items()
 }
 
 _ZERO_RESULT_COPY = {
@@ -2816,7 +2828,8 @@ class ConversationOnboarding:
         number_of_players: int | None = None,
         opponent_search_details: dict[str, list[str]] | None = None,
         transfer_search_details: dict[str, list[str]] | None = None,
-        refereeing_search_details: dict[str, list[str]] | None = None,
+        referee_search_details: dict[str, list[str]] | None = None,
+        refereeing_service_offer_details: dict[str, list[str]] | None = None,
     ) -> None:
         """Submit one complete Discovery Draft through the RunSearch contract."""
         with self._store.serialize_conversation_update(
@@ -2874,7 +2887,8 @@ class ConversationOnboarding:
                         opponent_search_details,
                         tournament_search_details,
                         transfer_search_details,
-                        refereeing_search_details,
+                        referee_search_details,
+                        refereeing_service_offer_details,
                     )
                 )
                 > 1
@@ -2914,19 +2928,26 @@ class ConversationOnboarding:
                     }
                 )
                 details_payload_key = "transfer_search_details"
-            elif draft.user_intent in {
-                UserIntent.REFEREE_SEARCH,
-                UserIntent.REFEREEING_SERVICE_OFFER,
-            }:
+            elif draft.user_intent is UserIntent.REFEREE_SEARCH:
                 selected_details = (
-                    refereeing_search_details
-                    if refereeing_search_details is not None
+                    referee_search_details
+                    if referee_search_details is not None
                     else {
                         key: list(values)
-                        for key, values in draft.refereeing_search_details
+                        for key, values in draft.referee_search_details
                     }
                 )
-                details_payload_key = "refereeing_search_details"
+                details_payload_key = "referee_search_details"
+            elif draft.user_intent is UserIntent.REFEREEING_SERVICE_OFFER:
+                selected_details = (
+                    refereeing_service_offer_details
+                    if refereeing_service_offer_details is not None
+                    else {
+                        key: list(values)
+                        for key, values in draft.refereeing_service_offer_details
+                    }
+                )
+                details_payload_key = "refereeing_service_offer_details"
             else:
                 selected_details = (
                     game_search_details
@@ -3416,18 +3437,18 @@ class ConversationOnboarding:
             operation="back",
         )
 
-    def open_refereeing_search_details(
+    def open_referee_search_details(
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
-        """Open the shared Referee Search and service-offer Details hub."""
-        self._change_refereeing_search_details(
+        """Open the Referee Search Details hub."""
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="open_hub",
         )
 
-    def open_refereeing_search_detail(
+    def open_referee_search_detail(
         self,
         *,
         update_id: str,
@@ -3435,10 +3456,10 @@ class ConversationOnboarding:
         screen_revision: int,
         detail_key: str,
     ) -> None:
-        """Open one shared refereeing detail submenu."""
-        if detail_key not in _REFEREEING_SEARCH_DETAIL_OPTIONS:
-            raise ValueError("Refereeing Search detail key must be canonical")
-        self._change_refereeing_search_details(
+        """Open one Referee Search detail submenu."""
+        if detail_key not in _REFEREE_SEARCH_DETAIL_OPTIONS:
+            raise ValueError("Referee Search detail key must be canonical")
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
@@ -3446,7 +3467,7 @@ class ConversationOnboarding:
             detail_key=detail_key,
         )
 
-    def toggle_refereeing_search_detail_value(
+    def toggle_referee_search_detail_value(
         self,
         *,
         update_id: str,
@@ -3455,7 +3476,7 @@ class ConversationOnboarding:
         value: str,
     ) -> None:
         """Toggle one Referee Search detail value."""
-        self._change_refereeing_search_details(
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
@@ -3463,18 +3484,18 @@ class ConversationOnboarding:
             value=value,
         )
 
-    def commit_refereeing_search_detail(
+    def commit_referee_search_detail(
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
         """Commit one Referee Search detail submenu."""
-        self._change_refereeing_search_details(
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="commit",
         )
 
-    def select_refereeing_search_time(
+    def select_referee_search_time(
         self,
         *,
         update_id: str,
@@ -3484,8 +3505,8 @@ class ConversationOnboarding:
     ) -> None:
         """Commit one Referee Search time choice or clear it."""
         if value is not None and not _canonical_game_search_time(value):
-            raise ValueError("Refereeing Search Time must be canonical")
-        self._change_refereeing_search_details(
+            raise ValueError("Referee Search Time must be canonical")
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
@@ -3493,18 +3514,18 @@ class ConversationOnboarding:
             value=value,
         )
 
-    def open_refereeing_search_exact_time(
+    def open_referee_search_exact_time(
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
         """Open the Referee Search exact-time prompt."""
-        self._change_refereeing_search_details(
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="exact_time_prompt",
         )
 
-    def submit_refereeing_search_exact_time_text(
+    def submit_referee_search_exact_time_text(
         self,
         *,
         update_id: str,
@@ -3514,8 +3535,8 @@ class ConversationOnboarding:
     ) -> None:
         """Validate and commit one exact Referee Search local time."""
         if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text) is None:
-            raise ValueError("Refereeing Search exact time must be HH:MM")
-        self._change_refereeing_search_details(
+            raise ValueError("Referee Search exact time must be HH:MM")
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
@@ -3523,18 +3544,144 @@ class ConversationOnboarding:
             value=text,
         )
 
-    def back_from_refereeing_search_detail(
+    def back_from_referee_search_detail(
         self, *, update_id: str, telegram_user_id: int, screen_revision: int
     ) -> None:
-        """Discard submenu edits or leave the shared refereeing Details hub."""
-        self._change_refereeing_search_details(
+        """Discard submenu edits or leave the Referee Search Details hub."""
+        self._change_referee_details(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="back",
         )
 
-    def _change_refereeing_search_details(
+    def open_refereeing_service_offer_details(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the Refereeing Service Offer Details hub."""
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_hub",
+            detail_family="refereeing_service_offer",
+        )
+
+    def open_refereeing_service_offer_detail(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        detail_key: str,
+    ) -> None:
+        """Open one Refereeing Service Offer detail submenu."""
+        if detail_key not in _REFEREEING_SERVICE_OFFER_DETAIL_OPTIONS:
+            raise ValueError("Refereeing Service Offer detail key must be canonical")
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="open_detail",
+            detail_key=detail_key,
+            detail_family="refereeing_service_offer",
+        )
+
+    def toggle_refereeing_service_offer_detail_value(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str,
+    ) -> None:
+        """Toggle one Refereeing Service Offer detail value."""
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="toggle",
+            value=value,
+            detail_family="refereeing_service_offer",
+        )
+
+    def commit_refereeing_service_offer_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Commit one Refereeing Service Offer detail submenu."""
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="commit",
+            detail_family="refereeing_service_offer",
+        )
+
+    def select_refereeing_service_offer_time(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        value: str | None,
+    ) -> None:
+        """Commit one Refereeing Service Offer time choice or clear it."""
+        if value is not None and not _canonical_game_search_time(value):
+            raise ValueError("Refereeing Service Offer Time must be canonical")
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="select_time",
+            value=value,
+            detail_family="refereeing_service_offer",
+        )
+
+    def open_refereeing_service_offer_exact_time(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the Refereeing Service Offer exact-time prompt."""
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="exact_time_prompt",
+            detail_family="refereeing_service_offer",
+        )
+
+    def submit_refereeing_service_offer_exact_time_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and commit one Refereeing Service Offer local time."""
+        if re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", text) is None:
+            raise ValueError("Refereeing Service Offer exact time must be HH:MM")
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_exact_time",
+            value=text,
+            detail_family="refereeing_service_offer",
+        )
+
+    def back_from_refereeing_service_offer_detail(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Discard submenu edits or leave the Refereeing Service Offer hub."""
+        self._change_referee_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="back",
+            detail_family="refereeing_service_offer",
+        )
+
+    def _change_referee_details(
         self,
         *,
         update_id: str,
@@ -3543,6 +3690,7 @@ class ConversationOnboarding:
         operation: str,
         detail_key: str | None = None,
         value: str | None = None,
+        detail_family: str = "referee_search",
     ) -> None:
         with self._store.serialize_conversation_update(
             update_id=update_id,
@@ -3558,18 +3706,40 @@ class ConversationOnboarding:
                 current.stage is not ConversationStage.POST_CORE
                 or draft.stage is not ConversationStage.POST_CORE
                 or draft.user_intent
-                not in {
-                    UserIntent.REFEREE_SEARCH,
-                    UserIntent.REFEREEING_SERVICE_OFFER,
-                }
+                is not {
+                    "referee_search": UserIntent.REFEREE_SEARCH,
+                    "refereeing_service_offer": UserIntent.REFEREEING_SERVICE_OFFER,
+                }.get(detail_family)
                 or draft.screen_revision != screen_revision
             ):
                 self._queue_current_view(update_id=update_id, state=current)
                 return
-            details = dict(draft.refereeing_search_details)
-            editing = draft.editing_refereeing_search_detail
-            temporary = list(draft.refereeing_search_detail_draft)
-            exact_time_prompt = draft.refereeing_search_exact_time_prompt
+            if detail_family == "referee_search":
+                options = _REFEREE_SEARCH_DETAIL_OPTIONS
+                names = _REFEREE_SEARCH_DETAIL_NAMES
+                headings = _REFEREE_SEARCH_DETAIL_HEADINGS
+                values_copy = _REFEREE_SEARCH_VALUE_COPY
+                callback_prefix = "referee-search-details"
+                details_attr = "referee_search_details"
+                editing_attr = "editing_referee_search_detail"
+                temporary_attr = "referee_search_detail_draft"
+                prompt_attr = "referee_search_exact_time_prompt"
+            elif detail_family == "refereeing_service_offer":
+                options = _REFEREEING_SERVICE_OFFER_DETAIL_OPTIONS
+                names = _REFEREEING_SERVICE_OFFER_DETAIL_NAMES
+                headings = _REFEREEING_SERVICE_OFFER_DETAIL_HEADINGS
+                values_copy = _REFEREEING_SERVICE_OFFER_VALUE_COPY
+                callback_prefix = "refereeing-service-offer-details"
+                details_attr = "refereeing_service_offer_details"
+                editing_attr = "editing_refereeing_service_offer_detail"
+                temporary_attr = "refereeing_service_offer_detail_draft"
+                prompt_attr = "refereeing_service_offer_exact_time_prompt"
+            else:
+                raise ValueError("Referee detail family is not canonical")
+            details = dict(getattr(draft, details_attr))
+            editing = getattr(draft, editing_attr)
+            temporary = list(getattr(draft, temporary_attr))
+            exact_time_prompt = getattr(draft, prompt_attr)
             target = "hub"
             if operation == "open_hub":
                 editing = None
@@ -3577,18 +3747,16 @@ class ConversationOnboarding:
                 exact_time_prompt = False
             elif operation == "open_detail":
                 if detail_key is None:
-                    raise RuntimeError("Refereeing Search detail key is missing")
+                    raise RuntimeError("Referee detail key is missing")
                 editing = detail_key
                 temporary = list(details.get(detail_key, ()))
                 exact_time_prompt = False
                 target = "submenu"
             elif operation == "toggle":
                 if editing is None or editing == "times":
-                    raise RuntimeError(
-                        "No multi-select Refereeing Search detail is open"
-                    )
-                if value not in _REFEREEING_SEARCH_DETAIL_OPTIONS[editing]:
-                    raise ValueError("Refereeing Search detail value must be canonical")
+                    raise RuntimeError("No multi-select Referee detail is open")
+                if value not in options[editing]:
+                    raise ValueError("Referee detail value must be canonical")
                 if value in temporary:
                     temporary.remove(value)
                 else:
@@ -3596,7 +3764,7 @@ class ConversationOnboarding:
                 target = "submenu"
             elif operation == "select_time":
                 if editing != "times":
-                    raise RuntimeError("Refereeing Search Time detail is not open")
+                    raise RuntimeError("Referee Time detail is not open")
                 if value is None:
                     details.pop("times", None)
                 else:
@@ -3606,25 +3774,21 @@ class ConversationOnboarding:
                 exact_time_prompt = False
             elif operation == "submit_exact_time":
                 if editing != "times" or not exact_time_prompt:
-                    raise RuntimeError(
-                        "Refereeing Search exact-time prompt is not open"
-                    )
+                    raise RuntimeError("Referee exact-time prompt is not open")
                 if value is None or not _canonical_game_search_time(value):
-                    raise ValueError("Refereeing Search exact time must be canonical")
+                    raise ValueError("Referee exact time must be canonical")
                 details["times"] = (value,)
                 editing = None
                 temporary = []
                 exact_time_prompt = False
             elif operation == "exact_time_prompt":
                 if editing != "times":
-                    raise RuntimeError("Refereeing Search Time detail is not open")
+                    raise RuntimeError("Referee Time detail is not open")
                 exact_time_prompt = True
                 target = "exact_time_prompt"
             elif operation == "commit":
                 if editing is None or editing == "times":
-                    raise RuntimeError(
-                        "No multi-select Refereeing Search detail is open"
-                    )
+                    raise RuntimeError("No multi-select Referee detail is open")
                 if temporary:
                     details[editing] = tuple(temporary)
                 else:
@@ -3643,7 +3807,7 @@ class ConversationOnboarding:
                     temporary = []
                     exact_time_prompt = False
             else:
-                raise RuntimeError("Unknown Refereeing Search detail operation")
+                raise RuntimeError("Unknown Referee detail operation")
             now = self._clock.now()
             state = replace(
                 current,
@@ -3655,15 +3819,17 @@ class ConversationOnboarding:
                 screen_revision=state.screen_revision,
                 revision=draft.revision + 1,
                 last_activity_at=now,
-                refereeing_search_details=tuple(sorted(details.items())),
-                editing_refereeing_search_detail=editing,
-                refereeing_search_detail_draft=tuple(temporary),
-                refereeing_search_exact_time_prompt=exact_time_prompt,
+                **{
+                    details_attr: tuple(sorted(details.items())),
+                    editing_attr: editing,
+                    temporary_attr: tuple(temporary),
+                    prompt_attr: exact_time_prompt,
+                },
             )
             locale = current.locale or "en"
             if target == "post_core":
                 if draft.country is None or draft.city is None:
-                    raise RuntimeError("Refereeing Search Details lost its Search Area")
+                    raise RuntimeError("Referee Details lost its Search Area")
                 message = _post_core_message(
                     update_id=update_id,
                     telegram_user_id=telegram_user_id,
@@ -3677,13 +3843,17 @@ class ConversationOnboarding:
                 )
             elif target == "submenu":
                 assert editing is not None
-                message = _refereeing_search_detail_submenu_message(
+                message = _referee_detail_submenu_message(
                     update_id=update_id,
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=state.screen_revision,
                     detail_key=editing,
                     temporary=tuple(temporary),
+                    options=options,
+                    headings=headings,
+                    values_copy=values_copy,
+                    callback_prefix=callback_prefix,
                 )
             elif target == "exact_time_prompt":
                 message = _game_search_exact_time_message(
@@ -3693,12 +3863,16 @@ class ConversationOnboarding:
                     screen_revision=state.screen_revision,
                 )
             else:
-                message = _refereeing_search_details_hub_message(
+                message = _referee_details_hub_message(
                     update_id=update_id,
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=state.screen_revision,
                     details=details,
+                    options=options,
+                    names=names,
+                    values_copy=values_copy,
+                    callback_prefix=callback_prefix,
                 )
             self._store.commit_conversation_update(
                 update_id=update_id,
@@ -7473,9 +7647,10 @@ def _post_core_message(
     details_callback = (
         "opponent-details:hub"
         if user_intent is UserIntent.OPPONENT_SEARCH
-        else "refereeing-details:hub"
-        if user_intent
-        in {UserIntent.REFEREE_SEARCH, UserIntent.REFEREEING_SERVICE_OFFER}
+        else "referee-search-details:hub"
+        if user_intent is UserIntent.REFEREE_SEARCH
+        else "refereeing-service-offer-details:hub"
+        if user_intent is UserIntent.REFEREEING_SERVICE_OFFER
         else "transfer-details:hub"
         if user_intent
         in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
@@ -7811,15 +7986,67 @@ def _opponent_search_detail_submenu_message(
     )
 
 
-def _refereeing_search_details_hub_message(
+def _referee_search_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    """Render one Referee Search detail submenu with canonical copy."""
+    return _referee_detail_submenu_message(
+        update_id=update_id,
+        telegram_user_id=telegram_user_id,
+        locale=locale,
+        screen_revision=screen_revision,
+        detail_key=detail_key,
+        temporary=temporary,
+        options=_REFEREE_SEARCH_DETAIL_OPTIONS,
+        headings=_REFEREE_SEARCH_DETAIL_HEADINGS,
+        values_copy=_REFEREE_SEARCH_VALUE_COPY,
+        callback_prefix="referee-search-details",
+    )
+
+
+def _refereeing_service_offer_detail_submenu_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    detail_key: str,
+    temporary: tuple[str, ...],
+) -> TelegramMessage:
+    """Render one Refereeing Service Offer detail submenu with canonical copy."""
+    return _referee_detail_submenu_message(
+        update_id=update_id,
+        telegram_user_id=telegram_user_id,
+        locale=locale,
+        screen_revision=screen_revision,
+        detail_key=detail_key,
+        temporary=temporary,
+        options=_REFEREEING_SERVICE_OFFER_DETAIL_OPTIONS,
+        headings=_REFEREEING_SERVICE_OFFER_DETAIL_HEADINGS,
+        values_copy=_REFEREEING_SERVICE_OFFER_VALUE_COPY,
+        callback_prefix="refereeing-service-offer-details",
+    )
+
+
+def _referee_details_hub_message(
     *,
     update_id: str,
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
     details: dict[str, tuple[str, ...]],
+    options: Mapping[str, tuple[str, ...]],
+    names: Mapping[str, tuple[str, ...]],
+    values_copy: Mapping[str, Mapping[str, str]],
+    callback_prefix: str,
 ) -> TelegramMessage:
-    """Render the shared Referee Search and service-offer Details hub."""
+    """Render one canonical referee-direction Details hub."""
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     introduction, not_set, back_label, search_label = {
         "en": ("You can choose the following settings:", "not set", "Back", "Search"),
@@ -7837,12 +8064,11 @@ def _refereeing_search_details_hub_message(
             "Rechercher",
         ),
     }[copy_locale]
-    keys = tuple(_REFEREEING_SEARCH_DETAIL_OPTIONS)
-    names = _REFEREEING_SEARCH_DETAIL_NAMES[copy_locale]
+    keys = tuple(options)
+    localized_names = names[copy_locale]
     summaries = tuple(
         ", ".join(
-            _REFEREEING_SEARCH_VALUE_COPY[copy_locale].get(value, value)
-            for value in details.get(key, ())
+            values_copy[copy_locale].get(value, value) for value in details.get(key, ())
         )
         or not_set
         for key in keys
@@ -7856,17 +8082,19 @@ def _refereeing_search_details_hub_message(
         + "\n\n"
         + "\n".join(
             f"- {name}: {summary}"
-            for name, summary in zip(names, summaries, strict=True)
+            for name, summary in zip(localized_names, summaries, strict=True)
         ),
         button_rows=(
             *tuple(
                 (
                     (
                         f"{name}: {summary} ▸",
-                        f"refereeing-details:open:{key}:{screen_revision}",
+                        f"{callback_prefix}:open:{key}:{screen_revision}",
                     ),
                 )
-                for key, name, summary in zip(keys, names, summaries, strict=True)
+                for key, name, summary in zip(
+                    keys, localized_names, summaries, strict=True
+                )
             ),
             ((back_label, f"details:back:{screen_revision}"),),
             ((search_label, f"search:submit:{screen_revision}"),),
@@ -7874,7 +8102,7 @@ def _refereeing_search_details_hub_message(
     )
 
 
-def _refereeing_search_detail_submenu_message(
+def _referee_detail_submenu_message(
     *,
     update_id: str,
     telegram_user_id: int,
@@ -7882,11 +8110,15 @@ def _refereeing_search_detail_submenu_message(
     screen_revision: int,
     detail_key: str,
     temporary: tuple[str, ...],
+    options: Mapping[str, tuple[str, ...]],
+    headings: Mapping[str, tuple[str, ...]],
+    values_copy: Mapping[str, Mapping[str, str]],
+    callback_prefix: str,
 ) -> TelegramMessage:
-    """Render one Referee Search multi-select detail submenu."""
+    """Render one canonical referee-direction detail submenu."""
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
-    keys = tuple(_REFEREEING_SEARCH_DETAIL_OPTIONS)
-    heading = _REFEREEING_SEARCH_DETAIL_HEADINGS[copy_locale][keys.index(detail_key)]
+    keys = tuple(options)
+    heading = headings[copy_locale][keys.index(detail_key)]
     done_label, any_label, back_label, exact_label = {
         "en": ("Done", "Any", "Back", "Enter exact time"),
         "ru": ("Готово", "Неважно", "Назад", "Указать точное время"),
@@ -7897,33 +8129,37 @@ def _refereeing_search_detail_submenu_message(
     def button(value: str) -> tuple[str, str]:
         return (
             f"{'✓ ' if value in temporary else ''}"
-            f"{_REFEREEING_SEARCH_VALUE_COPY[copy_locale].get(value, value)}",
+            f"{values_copy[copy_locale].get(value, value)}",
             (
-                f"refereeing-details:time:{value}:{screen_revision}"
+                f"{callback_prefix}:time:{value}:{screen_revision}"
                 if detail_key == "times"
-                else f"refereeing-details:toggle:{value}:{screen_revision}"
+                else f"{callback_prefix}:toggle:{value}:{screen_revision}"
             ),
         )
 
     rows: tuple[tuple[tuple[str, str], ...], ...]
     if detail_key == "times":
         rows = (
-            ((exact_label, f"refereeing-details:time:exact:{screen_revision}"),),
+            ((exact_label, f"{callback_prefix}:time:exact:{screen_revision}"),),
             (button("morning"), button("daytime")),
             (button("evening"), button("night")),
-            ((any_label, f"refereeing-details:time:any:{screen_revision}"),),
+            ((any_label, f"{callback_prefix}:time:any:{screen_revision}"),),
         )
     else:
-        options = _REFEREEING_SEARCH_DETAIL_OPTIONS[detail_key]
+        detail_options = options[detail_key]
         grouped_options: tuple[tuple[str, ...], ...] = {
-            "event_types": (options,),
-            "team_formats": (options[:3], options[3:6], options[6:]),
-            "referee_roles": (options,),
-            "payment": (options,),
+            "event_types": (detail_options,),
+            "team_formats": (
+                detail_options[:3],
+                detail_options[3:6],
+                detail_options[6:],
+            ),
+            "referee_roles": (detail_options,),
+            "payment": (detail_options,),
         }[detail_key]
         rows = (
             *tuple(tuple(button(value) for value in row) for row in grouped_options),
-            ((done_label, f"refereeing-details:done:{screen_revision}"),),
+            ((done_label, f"{callback_prefix}:done:{screen_revision}"),),
         )
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
@@ -7933,7 +8169,7 @@ def _refereeing_search_detail_submenu_message(
         text=heading,
         button_rows=(
             *rows,
-            ((back_label, f"refereeing-details:back:{screen_revision}"),),
+            ((back_label, f"{callback_prefix}:back:{screen_revision}"),),
         ),
     )
 
@@ -7961,6 +8197,7 @@ def _refereeing_result_message(
             "posted": "Posted",
             "edited": "Edited",
             "contact": "Contact",
+            "unavailable": "Unavailable",
             "at": "at",
             "date": "date",
             "date_and_search_area": "date and search area",
@@ -7981,6 +8218,7 @@ def _refereeing_result_message(
             "posted": "Пост",
             "edited": "Изменён",
             "contact": "Контакт",
+            "unavailable": "Недоступно",
             "at": "в",
             "date": "дата",
             "date_and_search_area": "дата и район поиска",
@@ -8001,6 +8239,7 @@ def _refereeing_result_message(
             "posted": "Publicado",
             "edited": "Modificado",
             "contact": "Contacto",
+            "unavailable": "No disponible",
             "at": "a las",
             "date": "fecha",
             "date_and_search_area": "fecha y zona de búsqueda",
@@ -8021,6 +8260,7 @@ def _refereeing_result_message(
             "posted": "Publié",
             "edited": "Modifié",
             "contact": "Contact",
+            "unavailable": "Indisponible",
             "at": "à",
             "date": "date",
             "date_and_search_area": "date et zone de recherche",
@@ -8165,11 +8405,11 @@ def _refereeing_result_message(
                 return tuple(value for value in values if isinstance(value, str))
         return ()
 
-    value_copy = _REFEREEING_SEARCH_VALUE_COPY[copy_locale]
+    value_copy = _REFEREE_SEARCH_VALUE_COPY[copy_locale]
     detail_names = dict(
         zip(
-            _REFEREEING_SEARCH_DETAIL_OPTIONS,
-            _REFEREEING_SEARCH_DETAIL_NAMES[copy_locale],
+            _REFEREE_SEARCH_DETAIL_OPTIONS,
+            _REFEREE_SEARCH_DETAIL_NAMES[copy_locale],
             strict=True,
         )
     )
@@ -8297,11 +8537,17 @@ def _refereeing_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}"
         )
-    route_copy = render_response_route(
-        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    is_active = facts.get("publication_state") == "active"
+    route_copy = (
+        render_response_route(
+            facts["response_route_kind"], facts["response_route_value"], copy_locale
+        )
+        if is_active
+        else None
     )
     sections = [
         labels["request_title"] if is_request else labels["availability_title"],
+        *(() if is_active else (labels["unavailable"],)),
         when,
         where,
         *detail_lines,
@@ -8312,7 +8558,10 @@ def _refereeing_result_message(
     if additional:
         sections.append(f"{labels['additional']}: {additional}")
     sections.extend([posted, edited] if edited else [posted])
-    sections.extend([f"{labels['contact']}: {route_copy}", labels["invitation"]])
+    if is_active:
+        assert route_copy is not None
+        sections.append(f"{labels['contact']}: {route_copy}")
+    sections.append(labels["invitation"])
     return TelegramMessage(
         delivery_id=delivery_id,
         telegram_user_id=telegram_user_id,
@@ -15370,8 +15619,11 @@ class RuntimeApplication:
         tournament_search_details = _runtime_tournament_search_details(
             payload.get("tournament_search_details")
         )
-        refereeing_search_details = _runtime_refereeing_search_details(
-            payload.get("refereeing_search_details")
+        referee_search_details = _runtime_referee_search_details(
+            payload.get("referee_search_details")
+        )
+        refereeing_service_offer_details = _runtime_refereeing_service_offer_details(
+            payload.get("refereeing_service_offer_details")
         )
         transfer_search_details = _runtime_transfer_search_details(
             payload.get("transfer_search_details")
@@ -15390,7 +15642,10 @@ class RuntimeApplication:
             game_search_details=tuple(sorted(game_search_details.items())),
             opponent_search_details=tuple(sorted(opponent_search_details.items())),
             tournament_search_details=tuple(sorted(tournament_search_details.items())),
-            refereeing_search_details=tuple(sorted(refereeing_search_details.items())),
+            referee_search_details=tuple(sorted(referee_search_details.items())),
+            refereeing_service_offer_details=tuple(
+                sorted(refereeing_service_offer_details.items())
+            ),
             transfer_search_details=tuple(sorted(transfer_search_details.items())),
             sub_city_area_geographic_types=tuple(
                 value for value in area_types if isinstance(value, str)
@@ -23600,28 +23855,53 @@ def _runtime_tournament_search_details(
     return details
 
 
-def _runtime_refereeing_search_details(
+def _runtime_referee_search_details(
     value: JsonValue,
 ) -> dict[str, tuple[str, ...]]:
-    """Validate canonical Referee Search and service-offer detail criteria."""
+    """Validate canonical Referee Search detail criteria."""
+    return _runtime_referee_details(
+        value,
+        detail_family="Referee Search",
+        options=_REFEREE_SEARCH_DETAIL_OPTIONS,
+    )
+
+
+def _runtime_refereeing_service_offer_details(
+    value: JsonValue,
+) -> dict[str, tuple[str, ...]]:
+    """Validate canonical Refereeing Service Offer detail criteria."""
+    return _runtime_referee_details(
+        value,
+        detail_family="Refereeing Service Offer",
+        options=_REFEREEING_SERVICE_OFFER_DETAIL_OPTIONS,
+    )
+
+
+def _runtime_referee_details(
+    value: JsonValue,
+    *,
+    detail_family: str,
+    options: Mapping[str, tuple[str, ...]],
+) -> dict[str, tuple[str, ...]]:
+    """Validate one direction's canonical referee detail criteria."""
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise TypeError("RunSearch refereeing_search_details must be an object")
-    allowed = set(_REFEREEING_SEARCH_DETAIL_OPTIONS)
+        raise TypeError(f"RunSearch {detail_family} details must be an object")
+    allowed = set(options)
     if set(value) - allowed:
-        raise ValueError("RunSearch refereeing search details have unsupported keys")
+        raise ValueError(f"RunSearch {detail_family} details have unsupported keys")
     details: dict[str, tuple[str, ...]] = {}
     for key, raw in value.items():
         if not isinstance(raw, list) or not all(
             isinstance(item, str) and item for item in raw
         ):
-            raise TypeError("RunSearch Refereeing Search details must be string lists")
+            raise TypeError(f"RunSearch {detail_family} details must be string lists")
         typed_raw = cast(list[str], raw)
         valid = all(
             _canonical_game_search_time(item)
             if key == "times"
-            else item in _REFEREEING_SEARCH_DETAIL_OPTIONS[key]
+            else item in options[key]
             for item in typed_raw
         )
         if (
@@ -23629,7 +23909,7 @@ def _runtime_refereeing_search_details(
             or len(typed_raw) != len(set(typed_raw))
             or (key == "times" and len(typed_raw) > 1)
         ):
-            raise ValueError("RunSearch Refereeing Search details have invalid values")
+            raise ValueError(f"RunSearch {detail_family} details have invalid values")
         details[key] = tuple(typed_raw)
     return details
 

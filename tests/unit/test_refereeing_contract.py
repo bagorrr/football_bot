@@ -15,9 +15,12 @@ from modules.contracts import (
 
 
 def _run_search_payload(
-    *, user_intent: str = "referee_search", details: JsonValue
+    *,
+    user_intent: str = "referee_search",
+    details: JsonValue,
+    details_key: str = "referee_search_details",
 ) -> dict[str, JsonValue]:
-    return {
+    payload: dict[str, JsonValue] = {
         "search_update_id": "referee-contract",
         "telegram_user_id": 55_300,
         "discovery_draft_revision": 4,
@@ -35,8 +38,9 @@ def _run_search_payload(
             "iana_timezone": "Europe/Moscow",
             "timezone_data_version": "controlled-tzdb-v1",
         },
-        "refereeing_search_details": details,
     }
+    payload[details_key] = details
+    return payload
 
 
 def _envelope(payload: dict[str, JsonValue]) -> ContractEnvelope:
@@ -93,7 +97,7 @@ def _facts(*, opportunity_type: str, dated: bool) -> dict[str, JsonValue]:
     return facts
 
 
-def test_refereeing_search_accepts_both_directions_and_allowlisted_details() -> None:
+def test_referee_directions_accept_allowlisted_details() -> None:
     for user_intent in ("referee_search", "refereeing_service_offer"):
         envelope = _envelope(
             _run_search_payload(
@@ -105,10 +109,32 @@ def test_refereeing_search_accepts_both_directions_and_allowlisted_details() -> 
                     "referee_roles": ["head_referee"],
                     "payment": ["paid"],
                 },
+                details_key=(
+                    "referee_search_details"
+                    if user_intent == "referee_search"
+                    else "refereeing_service_offer_details"
+                ),
             )
         )
         assert isinstance(envelope.payload, dict)
         assert envelope.payload["user_intent"] == user_intent
+
+
+def test_referee_directions_use_distinct_canonical_detail_families() -> None:
+    details: JsonValue = {"event_types": ["match"]}
+    for user_intent, details_key in (
+        ("referee_search", "referee_search_details"),
+        ("refereeing_service_offer", "refereeing_service_offer_details"),
+    ):
+        envelope = _envelope(
+            _run_search_payload(
+                user_intent=user_intent,
+                details=details,
+                details_key=details_key,
+            )
+        )
+        assert isinstance(envelope.payload, dict)
+        assert envelope.payload.get(details_key) == details
 
 
 @pytest.mark.parametrize(
@@ -119,10 +145,10 @@ def test_refereeing_search_accepts_both_directions_and_allowlisted_details() -> 
         {"times": ["19:00", "evening"]},
     ),
 )
-def test_refereeing_search_contract_rejects_unselectable_or_ambiguous_details(
+def test_referee_contract_rejects_unselectable_or_ambiguous_details(
     details: dict[str, JsonValue],
 ) -> None:
-    with pytest.raises(ValueError, match="Refereeing Search details"):
+    with pytest.raises(ValueError, match="Referee Search details"):
         _envelope(_run_search_payload(details=details))
 
 

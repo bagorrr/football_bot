@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
@@ -331,11 +331,26 @@ def transfer_search_result_sort_key(
     )
 
 
-def refereeing_search_result_sort_key(
+def referee_search_result_sort_key(
     result: SearchResult,
-) -> tuple[int, int, str, int, str, int, str]:
-    """Order Referee Search results with standing availability last."""
+) -> tuple[int, int, int, float, str, int, str, int, str]:
+    """Order Referee Search results deterministically."""
+    return _referee_result_sort_key(result)
+
+
+def refereeing_service_offer_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, int, float, str, int, str, int, str]:
+    """Order Refereeing Service Offer results deterministically."""
+    return _referee_result_sort_key(result)
+
+
+def _referee_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, int, float, str, int, str, int, str]:
+    """Apply the shared deterministic order for either referee direction."""
     facts = dict(result.card_facts)
+    standing = not facts.get("start_local_date")
     canonical_local_time = facts.get("exact_local_time")
     time_is_unknown = canonical_local_time is None and not facts.get("day_part")
     if canonical_local_time is None:
@@ -345,10 +360,23 @@ def refereeing_search_result_sort_key(
             "evening": "18:00",
             "night": "22:00",
         }.get(facts.get("day_part") or "", "23:59")
+    assertion_at = (
+        facts.get("source_qualifying_assertion_at")
+        or facts.get("source_edited_at")
+        or facts.get("source_posted_at")
+    )
+    try:
+        freshness = (
+            datetime.fromisoformat(str(assertion_at)).astimezone(UTC).timestamp()
+        )
+    except (TypeError, ValueError, OverflowError):
+        freshness = float("-inf")
     return (
         0 if result.result_class == "confirmed_match" else 1,
         int(facts.get("unknown_criterion_count", "0")),
-        facts.get("sort_local_date", "9999-12-31"),
+        1 if standing else 0,
+        -freshness if standing else 0.0,
+        "" if standing else facts.get("sort_local_date", "9999-12-31"),
         1 if time_is_unknown else 0,
         canonical_local_time,
         -int(facts.get("location_specificity", "0")),
@@ -863,10 +891,14 @@ class DiscoveryDraft:
     tournament_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     editing_tournament_search_detail: str | None = None
     tournament_search_detail_draft: tuple[str, ...] = ()
-    refereeing_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
-    editing_refereeing_search_detail: str | None = None
-    refereeing_search_detail_draft: tuple[str, ...] = ()
-    refereeing_search_exact_time_prompt: bool = False
+    referee_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_referee_search_detail: str | None = None
+    referee_search_detail_draft: tuple[str, ...] = ()
+    referee_search_exact_time_prompt: bool = False
+    refereeing_service_offer_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    editing_refereeing_service_offer_detail: str | None = None
+    refereeing_service_offer_detail_draft: tuple[str, ...] = ()
+    refereeing_service_offer_exact_time_prompt: bool = False
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     editing_transfer_search_detail: str | None = None
     transfer_search_detail_draft: tuple[str, ...] = ()
@@ -1081,7 +1113,8 @@ class CompletedSearch:
     number_of_players: int | None = None
     opponent_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     tournament_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
-    refereeing_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    referee_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    refereeing_service_offer_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
@@ -1128,7 +1161,7 @@ _TRANSFER_SEARCH_DETAIL_KEYS = (
     "playing_surfaces",
     "payment",
 )
-_REFEREEING_SEARCH_DETAIL_KEYS = (
+_REFEREE_DETAIL_KEYS = (
     "event_types",
     "team_formats",
     "referee_roles",
@@ -1388,25 +1421,128 @@ def evaluate_opponent_search(
     )
 
 
-def evaluate_refereeing_search(
+def evaluate_referee_search(
     completed_search: CompletedSearch,
-    refereeing_search_details: Mapping[str, tuple[str, ...]],
+    referee_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
 ) -> tuple[SearchResult, ...]:
-    """Classify Referee Search or service-offer results deterministically."""
+    """Classify Referee Search results deterministically."""
+    return _evaluate_referee_opportunity(
+        completed_search,
+        referee_search_details,
+        opportunities,
+        expected_intent=UserIntent.REFEREE_SEARCH,
+        result_sort_key=referee_search_result_sort_key,
+    )
+
+
+def referee_publication_state_as_of(
+    facts: Mapping[str, Any],
+    *,
+    current_publication_state: str | None,
+    as_of: datetime,
+) -> str:
+    """Return the fail-closed Referee publication state at a read time."""
+    canonical_states = {"active", "held_for_review", "suppressed", "expired"}
+    if current_publication_state not in canonical_states:
+        return "suppressed"
+    if current_publication_state != "active":
+        return current_publication_state
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return "suppressed"
+    if (
+        facts.get("referee_availability") is not True
+        and facts.get("referee_request") is not True
+    ):
+        return "suppressed"
+    try:
+        timezone = ZoneInfo(str(facts["iana_timezone"]))
+    except (KeyError, TypeError, ZoneInfoNotFoundError):
+        return "suppressed"
+    start_value = facts.get("start_local_date")
+    end_value = facts.get("end_local_date")
+    if start_value is None and end_value is None:
+        try:
+            qualifying_at = datetime.fromisoformat(
+                str(facts["source_qualifying_assertion_at"])
+            )
+        except (KeyError, TypeError, ValueError):
+            return "suppressed"
+        if qualifying_at.tzinfo is None or qualifying_at.utcoffset() is None:
+            return "suppressed"
+        expiry = qualifying_at + timedelta(days=30)
+    elif start_value is None or end_value is None:
+        return "suppressed"
+    else:
+        try:
+            start = date.fromisoformat(str(start_value))
+            end = date.fromisoformat(str(end_value))
+        except (TypeError, ValueError):
+            return "suppressed"
+        if end < start:
+            return "suppressed"
+        exact_time = facts.get("exact_local_time")
+        if isinstance(exact_time, str) and start == end:
+            try:
+                expiry = datetime.combine(
+                    start,
+                    datetime.strptime(exact_time, "%H:%M").time(),
+                    tzinfo=timezone,
+                )
+            except ValueError:
+                return "suppressed"
+        else:
+            expiry = datetime.combine(
+                end + timedelta(days=1), time.min, tzinfo=timezone
+            )
+    return "expired" if as_of >= expiry else "active"
+
+
+def evaluate_refereeing_service_offer(
+    completed_search: CompletedSearch,
+    refereeing_service_offer_details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Classify Refereeing Service Offer results deterministically."""
+    return _evaluate_referee_opportunity(
+        completed_search,
+        refereeing_service_offer_details,
+        opportunities,
+        expected_intent=UserIntent.REFEREEING_SERVICE_OFFER,
+        result_sort_key=refereeing_service_offer_result_sort_key,
+    )
+
+
+def _evaluate_referee_opportunity(
+    completed_search: CompletedSearch,
+    details: Mapping[str, tuple[str, ...]],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    expected_intent: UserIntent,
+    result_sort_key: Callable[
+        [SearchResult], tuple[int, int, int, float, str, int, str, int, str]
+    ],
+) -> tuple[SearchResult, ...]:
+    """Classify one referee direction without conflating application seams."""
     opportunity_type = _REFEREEING_OPPORTUNITY_TYPES.get(completed_search.user_intent)
+    if completed_search.user_intent is not expected_intent:
+        return ()
     required = completed_search.required_date
     if opportunity_type is None or required is None:
         return ()
 
     matched: list[SearchResult] = []
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != opportunity_type
-        ):
+        if opportunity.opportunity_type != opportunity_type:
             continue
         facts = opportunity.accepted_facts
+        publication_state = referee_publication_state_as_of(
+            facts,
+            current_publication_state=opportunity.publication_state,
+            as_of=completed_search.completed_at,
+        )
+        if publication_state != "active":
+            continue
         if facts.get(opportunity_type) is not True:
             continue
         if (
@@ -1450,8 +1586,8 @@ def evaluate_refereeing_search(
             date_state = MatchState.CONFIRMED
 
         detail_state_by_key: dict[str, MatchState] = {"date": date_state}
-        for key in _REFEREEING_SEARCH_DETAIL_KEYS:
-            requested = refereeing_search_details.get(key, ())
+        for key in _REFEREE_DETAIL_KEYS:
+            requested = details.get(key, ())
             accepted = facts.get(key)
             accepted_values: tuple[str, ...] | None
             if key == "payment":
@@ -1468,7 +1604,7 @@ def evaluate_refereeing_search(
                 )
             detail_state_by_key[key] = match_detail(requested, accepted_values)
         detail_state_by_key["times"] = match_time_detail(
-            refereeing_search_details.get("times", ()),
+            details.get("times", ()),
             str(facts["exact_local_time"]) if facts.get("exact_local_time") else None,
             str(facts["day_part"]) if facts.get("day_part") else None,
         )
@@ -1486,11 +1622,24 @@ def evaluate_refereeing_search(
             continue
 
         route = opportunity.response_route
+        if not isinstance(route, Mapping):
+            continue
+        route_kind = route.get("kind")
+        route_value = route.get("value")
+        if not isinstance(route_kind, str) or not route_kind:
+            continue
+        if not isinstance(route_value, str) or not route_value:
+            continue
+        try:
+            render_response_route(route_kind, route_value, "en")
+        except ValueError:
+            continue
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
             "opportunity_type": opportunity_type,
             opportunity_type: "true",
+            "publication_state": publication_state,
             "sort_local_date": (
                 max(start, required.start_local_date).isoformat()
                 if start is not None
@@ -1498,8 +1647,8 @@ def evaluate_refereeing_search(
             ),
             "iana_timezone": str(facts.get("iana_timezone", required.iana_timezone)),
             "source_posted_at": str(facts["source_posted_at"]),
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
                 sum(state is MatchState.UNKNOWN for state in states)
             ),
@@ -1510,7 +1659,7 @@ def evaluate_refereeing_search(
                 {
                     key: state.value
                     for key, state in detail_state_by_key.items()
-                    if refereeing_search_details.get(key)
+                    if details.get(key)
                     or (key == "date" and state is MatchState.UNKNOWN)
                     or (key == "search_area" and not completed_search.whole_city)
                 },
@@ -1532,6 +1681,10 @@ def evaluate_refereeing_search(
         for key in ("event_types", "team_formats", "referee_roles"):
             if facts.get(key):
                 card[key] = json.dumps(facts[key])
+        if facts.get("source_qualifying_assertion_at"):
+            card["source_qualifying_assertion_at"] = str(
+                facts["source_qualifying_assertion_at"]
+            )
         if facts.get("source_edited_at"):
             card["source_edited_at"] = str(facts["source_edited_at"])
         if facts.get("payment") in {"free", "paid"}:
@@ -1555,7 +1708,7 @@ def evaluate_refereeing_search(
                 card_facts=tuple(sorted(card.items())),
             )
         )
-    matched.sort(key=refereeing_search_result_sort_key)
+    matched.sort(key=result_sort_key)
     return tuple(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)

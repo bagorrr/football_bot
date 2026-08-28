@@ -236,9 +236,9 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
         system.conversation_state(user_id),
         system.discovery_draft(user_id),
     )
-    _configure_refereeing_search_details(system, user_id=user_id)
+    _configure_referee_details(system, user_id=user_id)
     system.submit_search(
-        update_id="submit-refereeing-search",
+        update_id="submit-referee-search",
         telegram_user_id=user_id,
     )
     system.process_searches_until_idle()
@@ -268,9 +268,13 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
         user_id=request_user_id,
         direction="refereeing_service_offer",
     )
-    _configure_refereeing_search_details(system, user_id=request_user_id)
+    _configure_referee_details(
+        system,
+        user_id=request_user_id,
+        direction="refereeing_service_offer",
+    )
     system.submit_search(
-        update_id="submit-refereeing-service-offer-search",
+        update_id="submit-refereeing-service-offer",
         telegram_user_id=request_user_id,
     )
     system.process_searches_until_idle()
@@ -487,14 +491,21 @@ def _advance_to_complete_search(
     )
 
 
-def _configure_refereeing_search_details(
+def _configure_referee_details(
     system: AcceptanceSpine,
     *,
     user_id: int,
+    direction: str = "referee_search",
 ) -> None:
-    """Set the shared referee detail draft through its public seams."""
-    assert system.discovery_draft(user_id).refereeing_search_details == ()
-    system.open_refereeing_search_details(
+    """Set one canonical referee-direction detail draft through public seams."""
+    method_prefix = (
+        "refereeing_service_offer"
+        if direction == "refereeing_service_offer"
+        else "referee_search"
+    )
+    details_attr = f"{method_prefix}_details"
+    assert getattr(system.discovery_draft(user_id), details_attr) == ()
+    getattr(system, f"open_{method_prefix}_details")(
         update_id=f"details-hub:refereeing-user:{user_id}",
         telegram_user_id=user_id,
     )
@@ -505,47 +516,47 @@ def _configure_refereeing_search_details(
         ("referee_roles", "head_referee"),
         ("payment", "paid"),
     ):
-        system.open_refereeing_search_detail(
+        getattr(system, f"open_{method_prefix}_detail")(
             update_id=f"details-open:{detail_key}:{user_id}",
             telegram_user_id=user_id,
             detail_key=detail_key,
         )
-        system.toggle_refereeing_search_detail_value(
+        getattr(system, f"toggle_{method_prefix}_detail_value")(
             update_id=f"details-toggle:{detail_key}:{user_id}",
             telegram_user_id=user_id,
             value=value,
         )
         draft = system.discovery_draft(user_id)
-        assert dict(draft.refereeing_search_details).get(detail_key) is None
-        assert draft.refereeing_search_detail_draft == (value,)
-        system.commit_refereeing_search_detail(
+        assert dict(getattr(draft, details_attr)).get(detail_key) is None
+        assert getattr(draft, f"{method_prefix}_detail_draft") == (value,)
+        getattr(system, f"commit_{method_prefix}_detail")(
             update_id=f"details-commit:{detail_key}:{user_id}",
             telegram_user_id=user_id,
         )
         committed_details[detail_key] = (value,)
-        assert dict(system.discovery_draft(user_id).refereeing_search_details) == (
+        assert dict(getattr(system.discovery_draft(user_id), details_attr)) == (
             committed_details
         )
 
-    system.open_refereeing_search_detail(
+    getattr(system, f"open_{method_prefix}_detail")(
         update_id=f"details-open:times:{user_id}",
         telegram_user_id=user_id,
         detail_key="times",
     )
-    system.open_refereeing_search_exact_time(
+    getattr(system, f"open_{method_prefix}_exact_time")(
         update_id=f"details-exact-time-open:{user_id}",
         telegram_user_id=user_id,
     )
-    system.submit_refereeing_search_exact_time_text(
+    getattr(system, f"submit_{method_prefix}_exact_time_text")(
         update_id=f"details-exact-time-submit:{user_id}",
         telegram_user_id=user_id,
         text="19:00",
     )
     committed_details["times"] = ("19:00",)
-    assert dict(system.discovery_draft(user_id).refereeing_search_details) == (
+    assert dict(getattr(system.discovery_draft(user_id), details_attr)) == (
         committed_details
     )
     system.restart(RuntimeRole.BOT_ASSISTANT)
-    assert dict(system.discovery_draft(user_id).refereeing_search_details) == (
+    assert dict(getattr(system.discovery_draft(user_id), details_attr)) == (
         committed_details
     )

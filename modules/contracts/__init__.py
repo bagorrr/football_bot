@@ -682,11 +682,14 @@ _TRANSFER_SEARCH_DETAIL_VALUES = {
     "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
     "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
 }
-_REFEREEING_SEARCH_DETAIL_VALUES = {
+_REFEREE_SEARCH_DETAIL_VALUES = {
     "event_types": frozenset({"match", "tournament"}),
     "team_formats": _GAME_SEARCH_DETAIL_VALUES["team_formats"],
     "referee_roles": frozenset({"head_referee", "assistant_referee", "var"}),
     "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
+}
+_REFEREEING_SERVICE_OFFER_DETAIL_VALUES = {
+    key: frozenset(values) for key, values in _REFEREE_SEARCH_DETAIL_VALUES.items()
 }
 
 SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
@@ -729,7 +732,8 @@ def _validate_run_search(
             "opponent_search_details",
             "tournament_search_details",
             "transfer_search_details",
-            "refereeing_search_details",
+            "referee_search_details",
+            "refereeing_service_offer_details",
         }
         if not required_fields <= set(payload) or set(payload) - allowed_fields:
             raise ValueError("RunSearch v2 contains unsupported or missing facts")
@@ -894,7 +898,8 @@ def _validate_run_search(
         ):
             raise ValueError("RunSearch has invalid Opponent Search details")
     transfer_details = payload.get("transfer_search_details")
-    refereeing_details = payload.get("refereeing_search_details")
+    referee_search_details = payload.get("referee_search_details")
+    refereeing_service_offer_details = payload.get("refereeing_service_offer_details")
     if (
         sum(
             details is not None
@@ -903,7 +908,8 @@ def _validate_run_search(
                 opponent_details,
                 tournament_details,
                 transfer_details,
-                refereeing_details,
+                referee_search_details,
+                refereeing_service_offer_details,
             )
         )
         > 1
@@ -963,15 +969,25 @@ def _validate_run_search(
             for key, values in transfer_details.items()
         ):
             raise ValueError("RunSearch has invalid transfer Search details")
-    if refereeing_details is not None:
-        if user_intent not in {
+    for details, expected_intent, detail_values, label in (
+        (
+            referee_search_details,
             "referee_search",
+            _REFEREE_SEARCH_DETAIL_VALUES,
+            "Referee Search",
+        ),
+        (
+            refereeing_service_offer_details,
             "refereeing_service_offer",
-        } or not isinstance(refereeing_details, dict):
-            raise ValueError("RunSearch details require Referee Search")
-        if set(refereeing_details) - {"times"} - set(
-            _REFEREEING_SEARCH_DETAIL_VALUES
-        ) or not all(
+            _REFEREEING_SERVICE_OFFER_DETAIL_VALUES,
+            "Refereeing Service Offer",
+        ),
+    ):
+        if details is None:
+            continue
+        if user_intent != expected_intent or not isinstance(details, dict):
+            raise ValueError(f"RunSearch details require {label}")
+        if set(details) - {"times"} - set(detail_values) or not all(
             isinstance(values, list)
             and ((key == "times" and len(values) <= 1) or key != "times")
             and len(values)
@@ -979,7 +995,7 @@ def _validate_run_search(
             and all(
                 isinstance(value, str)
                 and (
-                    value in _REFEREEING_SEARCH_DETAIL_VALUES.get(key, ())
+                    value in detail_values.get(key, ())
                     or (
                         key == "times"
                         and (
@@ -991,9 +1007,9 @@ def _validate_run_search(
                 )
                 for value in values
             )
-            for key, values in refereeing_details.items()
+            for key, values in details.items()
         ):
-            raise ValueError("RunSearch has invalid Refereeing Search details")
+            raise ValueError(f"RunSearch has invalid {label} details")
 
 
 def _valid_transfer_seasonal_timing(value: str) -> bool:

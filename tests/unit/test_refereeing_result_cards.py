@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from modules.application import _refereeing_result_message
 from modules.domain import SearchResult
 
@@ -15,6 +17,7 @@ def _result(
         "opportunity_id": "opportunity:referee-card",
         "opportunity_revision_id": "opportunity:referee-card:revision:1",
         "opportunity_type": opportunity_type,
+        "publication_state": "active",
         "iana_timezone": "Europe/Moscow",
         "source_posted_at": "2026-08-18T08:00:00+00:00",
         "source_edited_at": "2026-08-19T08:00:00+00:00",
@@ -104,6 +107,45 @@ def test_standing_referee_availability_card_explains_unknown_date() -> None:
     assert "Постоянная доступность" in message.text
     assert "Нужно уточнить: дата." in message.text
     assert "@referee_contact" in message.text
+
+
+@pytest.mark.parametrize(
+    ("locale", "unavailable"),
+    (
+        ("en", "Unavailable"),
+        ("ru", "Недоступно"),
+        ("es", "No disponible"),
+        ("fr", "Indisponible"),
+    ),
+)
+def test_non_active_referee_result_is_unavailable_without_contact(
+    locale: str, unavailable: str
+) -> None:
+    result = _result()
+    facts = dict(result.card_facts)
+    facts["publication_state"] = "suppressed"
+    result = SearchResult(
+        result_id=result.result_id,
+        completed_search_id=result.completed_search_id,
+        absolute_position=result.absolute_position,
+        result_class=result.result_class,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _refereeing_result_message(
+        delivery_id="delivery:referee-unavailable",
+        telegram_user_id=49_100,
+        locale=locale,
+        screen_revision=2,
+        result=result,
+    )
+
+    assert unavailable in message.text
+    assert all(
+        contact_label not in message.text
+        for contact_label in ("Contact", "Контакт", "Contacto", "Contact")
+    )
+    assert "@referee_contact" not in message.text
 
 
 def test_referee_result_card_covers_all_conversation_languages() -> None:
