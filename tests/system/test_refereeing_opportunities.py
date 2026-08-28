@@ -403,6 +403,48 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
     assert "Contact: " in request_card
     assert request_card.count("Contact: ") == 1
 
+    dated_availability = next(
+        opportunity
+        for opportunity in published
+        if opportunity.source_message_revision_id.endswith(":1570:revision:1")
+    )
+    deletion_time = clock.now()
+    ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=49576),
+        to_checkpoint=TelegramChannelCheckpoint(pts=49577),
+        source_event_id="source-event:refereeing:dated-availability-delete",
+        telegram_message_id=1570,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=deletion_time,
+        source_publisher_id="publisher:dated-availability",
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    # The Bot Assistant's typed projection must honor the deletion barrier
+    # before Recommendation consumes its suppression outbox.
+    delete_first_results = system.results(completed[0].completed_search_id)
+    deleted_result = next(
+        result
+        for result in delete_first_results
+        if dict(result.card_facts)["opportunity_id"]
+        == dated_availability.opportunity_id
+    )
+    assert dict(deleted_result.card_facts)["publication_state"] == "suppressed"
+    assert "response_route_value" not in dict(deleted_result.card_facts)
+    assert any(
+        dict(result.card_facts)["publication_state"] == "active"
+        for result in delete_first_results
+        if dict(result.card_facts)["opportunity_id"]
+        != dated_availability.opportunity_id
+    )
+
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
         connection.execute(
             """

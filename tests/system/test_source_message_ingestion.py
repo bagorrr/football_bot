@@ -3255,11 +3255,84 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
     assert system.cleanup_expired_source_message_tombstones() == 1
     assert system.source_message_deletion_tombstones() == ()
     assert system.cleanup_expired_source_message_tombstones() == 0
-    # Physical expiry must not weaken the permanent tombstoned-source replay
-    # barrier after the bounded tombstone row has been removed.
+    # Retention removes the source lineage, but the configured Source Chat's
+    # minimal replay barrier remains body-free and effective.
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    assert system.source_events() == ()
     assert not system.redeliver_classifier_command(
         f"{source_message.source_message_id}:revision:1"
     )
+
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4753),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4754),
+        source_event_id="source-event:delete-replay:late-create",
+        telegram_message_id=405,
+        revision=3,
+        kind=SourceEventKind.CREATE,
+        body="Late replay must remain outside the retained corpus.",
+        source_author_dm_url="https://t.me/late_replay_contact",
+        source_publisher_id="publisher:delete-replay",
+        event_time=clock.now(),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_source_event()
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    assert system.source_events() == ()
+
+    removal_time = clock.now() + timedelta(days=1)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = FALSE, updated_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            """,
+            (removal_time, identity.kind.value, identity.telegram_id, 1),
+        )
+        barrier = connection.execute(
+            """
+            SELECT expires_at
+            FROM football_runtime.application_source_message_replay_barriers
+            WHERE source_message_id = %s
+            """,
+            (source_message.source_message_id,),
+        ).fetchone()
+    assert barrier == (removal_time + timedelta(days=90),)
+    clock.advance_to(removal_time + timedelta(days=90) - timedelta(seconds=1))
+    assert system.cleanup_expired_source_message_tombstones() == 0
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM football_runtime.application_source_message_replay_barriers
+                WHERE source_message_id = %s
+            )
+            """,
+            (source_message.source_message_id,),
+        ).fetchone() == (True,)
+    clock.advance_to(removal_time + timedelta(days=90))
+    assert system.cleanup_expired_source_message_tombstones() == 0
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM football_runtime.application_source_message_replay_barriers
+                WHERE source_message_id = %s
+            )
+            """,
+            (source_message.source_message_id,),
+        ).fetchone() == (False,)
 
 
 def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> None:

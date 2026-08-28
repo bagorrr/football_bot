@@ -158,6 +158,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0030_referee_source_chat_projection_gate.sql",
     "0031_source_message_lifecycle.sql",
     "0032_source_message_lifecycle_hardening.sql",
+    "0033_source_message_retention_and_projection_barrier.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -194,6 +195,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "85436cdbd933795eb6b27b20b1cfcc84338dbba14c59918b3c0a77d1243ad972",
     "7fddc4d44988b3f0cfec72a370c13e92ff284ad2dafe747c4e4655a8f5bbc54a",
     "beb5dce7b1fa0769b37066e90a134f82cb122505e879b430978409013121bded",
+    "5e5be9ffee69af6610c174db1e51a4b86cefda07af80ffd55661243a44e23e65",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -707,6 +709,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.application_opportunities,
                      football_runtime.recommendation_opportunities,
                      football_runtime.application_source_message_tombstones,
+                     football_runtime.application_source_message_replay_barriers,
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
@@ -1243,8 +1246,24 @@ class PostgresAcceptanceObserver:
                        recommendation.opportunity_revision_id,
                        application.source_message_revision_id,
                        recommendation.opportunity_type,
-                       recommendation.publication_state,
-                       recommendation.response_route,
+                       CASE
+                           WHEN football_runtime.
+                               source_message_deleted_for_opportunity(
+                                   recommendation.opportunity_id
+                               )
+                           THEN 'suppressed'
+                           ELSE recommendation.publication_state
+                       END AS publication_state,
+                       CASE
+                           WHEN football_runtime.
+                               source_message_deleted_for_opportunity(
+                                   recommendation.opportunity_id
+                               )
+                           THEN jsonb_build_object(
+                               'kind', 'unavailable', 'value', ''
+                           )
+                           ELSE recommendation.response_route
+                       END AS response_route,
                        recommendation.publication_reason
                 FROM football_runtime.recommendation_opportunities AS recommendation
                 LEFT JOIN football_runtime.application_opportunities AS application
@@ -1853,29 +1872,61 @@ class PostgresAcceptanceObserver:
                            projection.response_route_value
                     FROM (
                         (
-                            SELECT opportunity_revision_id, publication_state,
+                            SELECT recommendation.opportunity_revision_id,
+                                   CASE
+                                       WHEN football_runtime.
+                                           source_message_deleted_for_opportunity(
+                                               recommendation.opportunity_id
+                                           )
+                                       THEN 'suppressed'
+                                       ELSE recommendation.publication_state
+                                   END AS publication_state,
                                jsonb_build_object(
                                    'start_local_date',
-                                   accepted_facts -> 'start_local_date',
+                                   recommendation.accepted_facts
+                                       -> 'start_local_date',
                                    'end_local_date',
-                                   accepted_facts -> 'end_local_date',
+                                   recommendation.accepted_facts -> 'end_local_date',
                                    'exact_local_time',
-                                   accepted_facts -> 'exact_local_time',
-                                   'day_part', accepted_facts -> 'day_part',
-                                   'iana_timezone', accepted_facts -> 'iana_timezone',
+                                   recommendation.accepted_facts
+                                       -> 'exact_local_time',
+                                   'day_part', recommendation.accepted_facts
+                                       -> 'day_part',
+                                   'iana_timezone', recommendation.accepted_facts
+                                       -> 'iana_timezone',
                                    'open_participation',
-                                   accepted_facts -> 'open_participation'
+                                   recommendation.accepted_facts
+                                       -> 'open_participation'
                                ) || CASE
-                                   WHEN accepted_facts ? 'registration_deadline'
+                                   WHEN recommendation.accepted_facts ?
+                                       'registration_deadline'
                                    THEN jsonb_build_object(
                                        'registration_deadline',
-                                       accepted_facts -> 'registration_deadline'
+                                       recommendation.accepted_facts
+                                           -> 'registration_deadline'
                                    )
                                    ELSE '{}'::jsonb
                                END AS current_facts,
-                               response_route ->> 'kind' AS response_route_kind,
-                               response_route ->> 'value' AS response_route_value
+                               CASE
+                                   WHEN recommendation.publication_state = 'active'
+                                    AND NOT football_runtime.
+                                        source_message_deleted_for_opportunity(
+                                            recommendation.opportunity_id
+                                        )
+                                   THEN recommendation.response_route ->> 'kind'
+                                   ELSE NULL
+                               END AS response_route_kind,
+                               CASE
+                                   WHEN recommendation.publication_state = 'active'
+                                    AND NOT football_runtime.
+                                        source_message_deleted_for_opportunity(
+                                            recommendation.opportunity_id
+                                        )
+                                   THEN recommendation.response_route ->> 'value'
+                                   ELSE NULL
+                               END AS response_route_value
                             FROM football_runtime.recommendation_opportunities
+                                AS recommendation
                             WHERE opportunity_id = result.card_facts->>'opportunity_id'
                               AND result.card_facts->>'opportunity_type' = 'tournament'
                             ORDER BY CASE
@@ -1897,6 +1948,10 @@ class PostgresAcceptanceObserver:
                             SELECT recommendation.opportunity_revision_id,
                                    CASE
                                        WHEN source_chat.source_chat_enabled
+                                        AND NOT football_runtime.
+                                            source_message_deleted_for_opportunity(
+                                                recommendation.opportunity_id
+                                            )
                                        THEN recommendation.publication_state
                                        ELSE 'suppressed'
                                    END AS publication_state,
@@ -1904,12 +1959,20 @@ class PostgresAcceptanceObserver:
                                    CASE
                                        WHEN recommendation.publication_state = 'active'
                                         AND source_chat.source_chat_enabled
+                                        AND NOT football_runtime.
+                                            source_message_deleted_for_opportunity(
+                                                recommendation.opportunity_id
+                                            )
                                        THEN recommendation.response_route ->> 'kind'
                                        ELSE NULL
                                    END AS response_route_kind,
                                    CASE
                                        WHEN recommendation.publication_state = 'active'
                                         AND source_chat.source_chat_enabled
+                                        AND NOT football_runtime.
+                                            source_message_deleted_for_opportunity(
+                                                recommendation.opportunity_id
+                                            )
                                        THEN recommendation.response_route ->> 'value'
                                        ELSE NULL
                                    END AS response_route_value
@@ -1987,21 +2050,10 @@ class PostgresAcceptanceObserver:
                             FROM football_runtime.recommendation_opportunities
                                 AS recommendation
                             CROSS JOIN LATERAL (
-                                SELECT EXISTS (
-                                    SELECT 1
-                                    FROM football_runtime.application_opportunities
-                                        AS application
-                                    JOIN football_runtime.source_message_revisions
-                                        AS revision
-                                      ON revision.source_message_revision_id =
-                                         application.source_message_revision_id
-                                    JOIN football_runtime.source_messages AS source
-                                      ON source.source_message_id =
-                                         revision.source_message_id
-                                    WHERE application.opportunity_id =
+                                SELECT football_runtime.
+                                    source_message_deleted_for_opportunity(
                                         recommendation.opportunity_id
-                                      AND source.tombstoned
-                                ) AS source_deleted
+                                    ) AS source_deleted
                             ) AS source_lifecycle
                             WHERE recommendation.opportunity_id =
                                       result.card_facts->>'opportunity_id'
@@ -6435,8 +6487,25 @@ class PostgresRoleStore:
                 """
                 SELECT DISTINCT ON (opportunity_id)
                        opportunity_id, opportunity_revision_id, opportunity_type,
-                       publication_state, accepted_facts, response_route
+                       CASE
+                           WHEN source_lifecycle.source_deleted
+                           THEN 'suppressed'
+                           ELSE publication_state
+                       END AS publication_state,
+                       accepted_facts,
+                       CASE
+                           WHEN source_lifecycle.source_deleted
+                           THEN jsonb_build_object(
+                               'kind', 'unavailable', 'value', ''
+                           )
+                           ELSE response_route
+                       END AS response_route
                 FROM football_runtime.recommendation_opportunities AS opportunity
+                CROSS JOIN LATERAL (
+                    SELECT football_runtime.source_message_deleted_for_opportunity(
+                        opportunity.opportunity_id
+                    ) AS source_deleted
+                ) AS source_lifecycle
                 WHERE opportunity.opportunity_type NOT IN (
                     'referee_availability', 'referee_request'
                 )
@@ -6580,8 +6649,26 @@ class PostgresRoleStore:
                 """
                 SELECT DISTINCT ON (opportunity_id)
                        opportunity_id, opportunity_revision_id, opportunity_type,
-                       publication_state, accepted_facts, response_route, published_at
+                       CASE
+                           WHEN source_lifecycle.source_deleted
+                           THEN 'suppressed'
+                           ELSE publication_state
+                       END AS publication_state,
+                       accepted_facts,
+                       CASE
+                           WHEN source_lifecycle.source_deleted
+                           THEN jsonb_build_object(
+                               'kind', 'unavailable', 'value', ''
+                           )
+                           ELSE response_route
+                       END AS response_route,
+                       published_at
                 FROM football_runtime.recommendation_opportunities AS opportunity
+                CROSS JOIN LATERAL (
+                    SELECT football_runtime.source_message_deleted_for_opportunity(
+                        opportunity.opportunity_id
+                    ) AS source_deleted
+                ) AS source_lifecycle
                 WHERE opportunity.opportunity_type NOT IN (
                     'referee_availability', 'referee_request'
                 )
@@ -11070,6 +11157,12 @@ def _scrub_application_source_message_data(
         WHERE source_message_revision_id LIKE %s
         """,
         (revision_pattern,),
+    )
+    connection.execute(
+        """
+        SELECT football_runtime.scrub_source_message_recommendation_history(%s)
+        """,
+        (source_message_id,),
     )
     connection.execute(
         """

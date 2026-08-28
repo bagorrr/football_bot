@@ -4206,6 +4206,15 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         registry_generation=1,
     )
     assert system.process_next_source_event()
+    deleted_snapshot_inputs = system.completed_search_opportunity_revision_inputs(
+        possible_search.completed_search_id
+    )
+    deleted_snapshot = next(
+        item
+        for item in deleted_snapshot_inputs
+        if item["opportunity_id"] == minimal_opportunity.opportunity_id
+    )
+    assert "response_route" not in deleted_snapshot
     system.process_opportunities_until_idle()
 
     deleted_history = system.results(possible_search.completed_search_id)
