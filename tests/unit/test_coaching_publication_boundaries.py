@@ -7,6 +7,7 @@ import pytest
 
 from modules.application import (
     _body_establishes_coaching_opportunity,
+    _coaching_proposition_evidence_is_bound,
     _coaching_search_detail_submenu_message,
     _coaching_search_result_message,
     _coaching_search_schedule_prompt_message,
@@ -230,6 +231,42 @@ def test_arbitrary_canonical_city_edit_renews_coaching_freshness() -> None:
     assert _source_coaching_edit_qualifies_freshness(
         edited, created, "coach_availability"
     )
+    assert (
+        _source_coaching_qualifying_assertion_at(
+            edited, (created, edited), "coach_availability"
+        )
+        == edited.event_time
+    )
+
+
+def test_body_only_city_edit_renews_coaching_freshness() -> None:
+    created = _coaching_revision(
+        revision=1,
+        body="Moscow — in-person coach available Mondays. Message @coach",
+    )
+    edited = _coaching_revision(
+        revision=2,
+        body="London — in-person coach available Mondays. Message @coach",
+    )
+
+    assert _source_coaching_edit_qualifies_freshness(
+        edited, created, "coach_availability"
+    )
+
+
+def test_non_material_body_only_city_edit_does_not_renew_coaching_freshness() -> None:
+    created = _coaching_revision(
+        revision=1,
+        body="Moscow — in-person coach available Mondays. Message @coach",
+    )
+    repost = _coaching_revision(
+        revision=2,
+        body=" Moscow - in-person coach available Mondays.  Message @coach ",
+    )
+
+    assert not _source_coaching_edit_qualifies_freshness(
+        repost, created, "coach_availability"
+    )
 
 
 def test_current_coaching_projection_expires_stale_card_and_removes_route() -> None:
@@ -354,6 +391,23 @@ def test_generic_online_coaching_wording_does_not_establish_in_person_intent() -
     )
 
 
+def test_coaching_in_person_evidence_is_bound_to_the_directional_proposition() -> None:
+    body = "In-person field rental; online coaching available. Message @coach"
+    assert not _coaching_proposition_evidence_is_bound(
+        body,
+        "coach_availability",
+        {
+            "coach_availability": "online coaching available",
+            "in_person": "In-person field rental",
+        },
+    )
+    assert _coaching_proposition_evidence_is_bound(
+        "In-person coach offers sessions. Message @coach",
+        "coach_availability",
+        {"coach_availability": "coach offers", "in_person": "In-person"},
+    )
+
+
 @pytest.mark.parametrize(
     ("body", "opportunity_type", "expected"),
     (
@@ -361,6 +415,11 @@ def test_generic_online_coaching_wording_does_not_establish_in_person_intent() -
             "In-person coaching is available; online-only sessions are also available.",
             "coach_availability",
             True,
+        ),
+        (
+            "In-person field rental; online coaching available.",
+            "coach_availability",
+            False,
         ),
         (
             "Online-only coaching available in Moscow. Message @coach.",

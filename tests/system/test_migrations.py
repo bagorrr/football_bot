@@ -779,6 +779,20 @@ def test_bot_assistant_result_projection_follows_current_exact_repost_representa
     }
     route = {"kind": "explicit_telegram_username", "value": "@current_coach"}
     with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_chat_registry (
+                peer_kind, telegram_chat_id, registry_generation,
+                address_kind, current_address, processing_started_at,
+                transport_boundary, enabled, initial_consent_attestation,
+                attested_at, created_at, updated_at
+            ) VALUES (
+                'channel', 5501, 1, 'public_username', '@projection_source',
+                %s, 'channel-pts:1', true, 'confirmed', %s, %s, %s
+            )
+            """,
+            (recorded_at, recorded_at, recorded_at, recorded_at),
+        )
         for source_message_id, telegram_message_id, body in (
             (old_source_message_id, 501, "old repost"),
             (current_source_message_id, 502, "current repost"),
@@ -942,6 +956,41 @@ def test_bot_assistant_result_projection_follows_current_exact_repost_representa
         assert projection[3]["projection_marker"] == "current-representative"
         assert projection[4:] == (route["kind"], route["value"])
     with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = false
+            WHERE peer_kind = 'channel'
+              AND telegram_chat_id = 5501
+              AND registry_generation = 1
+            """
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        disabled_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert disabled_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = true
+            WHERE peer_kind = 'channel'
+              AND telegram_chat_id = 5501
+              AND registry_generation = 1
+            """
+        )
         connection.execute(
             """
             UPDATE football_runtime.recommendation_opportunities

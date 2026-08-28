@@ -6,6 +6,7 @@ import json
 import os
 from datetime import UTC, date, datetime
 
+import psycopg
 import pytest
 
 from modules.domain import (
@@ -473,6 +474,22 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
     assert json.loads(facts["match_states"])["schedule_start_date"] == "confirmed"
     assert title in telegram_delivery.messages[-1].text
     assert "In-person" not in telegram_delivery.messages[-1].text
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = false, updated_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = 1
+            """,
+            (clock.now(), source_identity.kind.value, source_identity.telegram_id),
+        )
+    disabled_results = system.results(completed[0].completed_search_id)
+    assert len(disabled_results) == 1
+    disabled_facts = dict(disabled_results[0].card_facts)
+    assert disabled_facts["publication_state"] == "suppressed"
+    assert "response_route_value" not in disabled_facts
     system.reset()
 
 

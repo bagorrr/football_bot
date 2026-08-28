@@ -17697,11 +17697,26 @@ def _coaching_assertion_signature(
         r"[^.!?;,\n]+",
         re.IGNORECASE,
     )
-    location_tokens = tuple(
+    leading_location_clause = re.compile(
+        r"(?m)^\s*(?P<location>[^.!?;,\n:—–-]+?)\s*[,—–:-]\s*"
+        r"(?=(?:the\s+)?(?:in[- ]person|face[- ]to[- ]face|on[- ]site|"
+        r"offline|coach\w*|trainer\w*|coaching|training|"
+        r"wanted|required|requested|needed|looking|seeking|want\w*|need\w*|"
+        r"нуж\w*|треб\w*|ищ\w*|busc\w*|necesit\w*|cherche\w*|"
+        r"besoin)\b)",
+        re.IGNORECASE,
+    )
+    location_tokens_list = [
         token.casefold()
         for match in location_clauses.finditer(body)
         for token in re.findall(r"[\w@]+", match.group(0), flags=re.UNICODE)
+    ]
+    location_tokens_list.extend(
+        token.casefold()
+        for match in leading_location_clause.finditer(body)
+        for token in re.findall(r"[\w@]+", match.group("location"), flags=re.UNICODE)
     )
+    location_tokens = tuple(location_tokens_list)
     metadata_tokens: list[str] = []
     if bounded_metadata is not None:
         route_keys = {
@@ -21084,6 +21099,9 @@ def _validated_coaching_proposal(
         or candidate.get("in_person") is not True
         or not _body_establishes_coaching_opportunity(body, opportunity_type)
         or not _body_establishes_coaching_opportunity(validation_body, opportunity_type)
+        or not _coaching_proposition_evidence_is_bound(
+            validation_body, opportunity_type, evidence
+        )
     ):
         return None
     route = _select_response_route(
@@ -22775,17 +22793,17 @@ def _coaching_body_is_in_person(body: str) -> bool:
         r"не\s+(?:доступ\w*|возмож\w*)|недоступ\w*|"
         r"no\s+disponible|indisponible|pas\s+disponible)\b"
     )
-    coaching = re.search(
+    coaching_pattern = re.compile(
         r"\b(?:coach\w*|trainer\w*|train\w*|coaching|"
         r"тренер\w*|трениров\w*|заняти\w*|"
         r"entrenador\w*|entrenamiento\w*|"
         r"entra[iî]neur\w*|entraîn\w*|formation\w*)\b",
-        normalized,
     )
-    if coaching is None:
-        return False
-    physical_matches = tuple(physical_pattern.finditer(normalized))
-    if not physical_matches:
+    proposition_clauses = tuple(re.finditer(r"[^.!?;\n]+", normalized))
+    if not any(
+        coaching_pattern.search(clause.group(0)) is not None
+        for clause in proposition_clauses
+    ):
         return False
 
     def is_negated(match: re.Match[str]) -> bool:
@@ -22796,12 +22814,40 @@ def _coaching_body_is_in_person(body: str) -> bool:
             or physical_negation_after.search(after)
         )
 
-    has_positive_physical = any(not is_negated(match) for match in physical_matches)
+    has_positive_physical = any(
+        not is_negated(match)
+        for clause in proposition_clauses
+        if coaching_pattern.search(clause.group(0)) is not None
+        for match in physical_pattern.finditer(normalized, clause.start(), clause.end())
+    )
     # An online-only proposition does not cancel a separate affirmative
     # in-person proposition, but it cannot establish one on its own.
     if online_only is not None and not has_positive_physical:
         return False
     return has_positive_physical
+
+
+def _coaching_proposition_evidence_is_bound(
+    body: str,
+    opportunity_type: str,
+    evidence: Mapping[str, JsonValue],
+) -> bool:
+    """Require direction and in-person evidence in one coaching proposition."""
+    directional_evidence = evidence.get(opportunity_type)
+    in_person_evidence = evidence.get("in_person")
+    if not isinstance(directional_evidence, str) or not isinstance(
+        in_person_evidence, str
+    ):
+        return False
+    for clause in re.finditer(r"[^.!?;\n]+", body):
+        clause_text = clause.group(0)
+        if (
+            directional_evidence not in clause_text
+            or in_person_evidence not in clause_text
+        ):
+            continue
+        return _body_establishes_coaching_opportunity(clause_text, opportunity_type)
+    return False
 
 
 def _body_establishes_coaching_opportunity(body: str, opportunity_type: str) -> bool:

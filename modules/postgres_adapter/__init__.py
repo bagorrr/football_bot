@@ -159,6 +159,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0031_coaching_opportunities.sql",
     "0032_coaching_exact_repost_clusters.sql",
     "0033_exact_repost_result_projection.sql",
+    "0034_coaching_source_chat_projection_gate.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -196,6 +197,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "9be9f446dcd41fb57b213a4e65668de2fd020ba2c2102131511021330dca2f6f",
     "198ac94c3f46c53ded9df4f94e5767514ad42fa389ef084af2834f16a9be2d7e",
     "a962802784545373f32833cbd8222e6e93a257cb690b397c2c3d485cc7ab5c1d",
+    "d835cf5c9201c1b9b0628b3f13193814470b481746b82a98cc162f141a4a4f51",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1811,37 +1813,91 @@ class PostgresAcceptanceObserver:
                            projection.published_at
                     FROM (
                         (
-                            SELECT opportunity_id, opportunity_revision_id,
-                                   publication_state,
+                            SELECT opportunity.opportunity_id,
+                                   opportunity.opportunity_revision_id,
                                    CASE
-                                       WHEN opportunity_type = 'tournament'
+                                       WHEN source_chat.source_chat_enabled
+                                       THEN opportunity.publication_state
+                                       ELSE 'suppressed'
+                                   END AS publication_state,
+                                   CASE
+                                       WHEN opportunity.opportunity_type = 'tournament'
                                        THEN jsonb_build_object(
                                            'start_local_date',
-                                           accepted_facts -> 'start_local_date',
+                                           opportunity.accepted_facts ->
+                                               'start_local_date',
                                            'end_local_date',
-                                           accepted_facts -> 'end_local_date',
+                                           opportunity.accepted_facts ->
+                                               'end_local_date',
                                            'exact_local_time',
-                                           accepted_facts -> 'exact_local_time',
-                                           'day_part', accepted_facts -> 'day_part',
+                                           opportunity.accepted_facts ->
+                                               'exact_local_time',
+                                           'day_part', opportunity.accepted_facts ->
+                                               'day_part',
                                            'iana_timezone',
-                                           accepted_facts -> 'iana_timezone',
+                                           opportunity.accepted_facts ->
+                                               'iana_timezone',
                                            'open_participation',
-                                           accepted_facts -> 'open_participation'
+                                           opportunity.accepted_facts ->
+                                               'open_participation'
                                        ) || CASE
-                                           WHEN accepted_facts ? 'registration_deadline'
+                                           WHEN opportunity.accepted_facts ?
+                                               'registration_deadline'
                                            THEN jsonb_build_object(
                                                'registration_deadline',
-                                               accepted_facts -> 'registration_deadline'
+                                               opportunity.accepted_facts ->
+                                                   'registration_deadline'
                                            )
                                            ELSE '{}'::jsonb
                                        END
-                                       ELSE accepted_facts
+                                       ELSE opportunity.accepted_facts
                                    END AS current_facts,
-                                   response_route ->> 'kind' AS response_route_kind,
-                                   response_route ->> 'value' AS response_route_value,
-                                   published_at
+                                   CASE
+                                       WHEN opportunity.publication_state = 'active'
+                                        AND source_chat.source_chat_enabled
+                                       THEN opportunity.response_route ->> 'kind'
+                                       ELSE NULL
+                                   END AS response_route_kind,
+                                   CASE
+                                       WHEN opportunity.publication_state = 'active'
+                                        AND source_chat.source_chat_enabled
+                                       THEN opportunity.response_route ->> 'value'
+                                       ELSE NULL
+                                   END AS response_route_value,
+                                   opportunity.published_at
                             FROM football_runtime.recommendation_opportunities
-                            WHERE opportunity_id = COALESCE(
+                                AS opportunity
+                            CROSS JOIN LATERAL (
+                                SELECT opportunity.opportunity_type = 'tournament'
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM football_runtime.application_opportunities
+                                            AS application
+                                        JOIN football_runtime.source_message_revisions
+                                            AS revision
+                                          ON revision.source_message_revision_id =
+                                             application.source_message_revision_id
+                                        JOIN football_runtime.source_messages AS source
+                                          ON source.source_message_id =
+                                             revision.source_message_id
+                                        JOIN football_runtime.source_chat_registry
+                                            AS registry
+                                          ON registry.peer_kind = source.peer_kind
+                                         AND registry.telegram_chat_id =
+                                             source.telegram_chat_id
+                                         AND registry.registry_generation =
+                                             source.registry_generation
+                                        WHERE application.opportunity_id =
+                                            opportunity.opportunity_id
+                                          AND application.opportunity_type IN (
+                                              'coach_availability', 'coach_request'
+                                          )
+                                          AND registry.enabled
+                                          AND registry.initial_consent_attestation =
+                                              'confirmed'
+                                    ) AS source_chat_enabled
+                            ) AS source_chat
+                            WHERE opportunity.opportunity_id = COALESCE(
                                 (
                                     SELECT cluster.representative_opportunity_id
                                     FROM football_runtime
@@ -1858,9 +1914,9 @@ class PostgresAcceptanceObserver:
                                 ),
                                 result.card_facts->>'opportunity_id'
                             )
-                              AND opportunity_type =
+                              AND opportunity.opportunity_type =
                                   result.card_facts->>'opportunity_type'
-                              AND opportunity_type IN (
+                              AND opportunity.opportunity_type IN (
                                   'tournament', 'coach_availability', 'coach_request'
                               )
                         )
@@ -5906,10 +5962,24 @@ class PostgresRoleStore:
                        publication_state, accepted_facts, response_route
                 FROM football_runtime.recommendation_opportunities AS opportunity
                 WHERE opportunity.opportunity_type NOT IN (
-                    'referee_availability', 'referee_request'
+                    'referee_availability', 'referee_request',
+                    'coach_availability', 'coach_request'
                 )
-                   OR football_runtime.referee_opportunity_source_chat_enabled(
-                       opportunity.opportunity_id
+                   OR (
+                       opportunity.opportunity_type IN (
+                           'referee_availability', 'referee_request'
+                       )
+                       AND football_runtime.referee_opportunity_source_chat_enabled(
+                           opportunity.opportunity_id
+                       )
+                   )
+                   OR (
+                       opportunity.opportunity_type IN (
+                           'coach_availability', 'coach_request'
+                       )
+                       AND football_runtime.coaching_opportunity_source_chat_enabled(
+                           opportunity.opportunity_id
+                       )
                    )
                 ORDER BY opportunity_id,
                          (substring(opportunity_revision_id
@@ -6062,10 +6132,24 @@ class PostgresRoleStore:
                        publication_state, accepted_facts, response_route, published_at
                 FROM football_runtime.recommendation_opportunities AS opportunity
                 WHERE opportunity.opportunity_type NOT IN (
-                    'referee_availability', 'referee_request'
+                    'referee_availability', 'referee_request',
+                    'coach_availability', 'coach_request'
                 )
-                   OR football_runtime.referee_opportunity_source_chat_enabled(
-                       opportunity.opportunity_id
+                   OR (
+                       opportunity.opportunity_type IN (
+                           'referee_availability', 'referee_request'
+                       )
+                       AND football_runtime.referee_opportunity_source_chat_enabled(
+                           opportunity.opportunity_id
+                       )
+                   )
+                   OR (
+                       opportunity.opportunity_type IN (
+                           'coach_availability', 'coach_request'
+                       )
+                       AND football_runtime.coaching_opportunity_source_chat_enabled(
+                           opportunity.opportunity_id
+                       )
                    )
                 ORDER BY opportunity_id,
                          (substring(opportunity_revision_id
