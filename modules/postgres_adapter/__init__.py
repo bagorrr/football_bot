@@ -3437,6 +3437,11 @@ class PostgresRoleStore:
                 SourceEventKind.DELETE.value,
             }:
                 raise RuntimeError("this Source Event kind is not implemented")
+            if event_kind == SourceEventKind.DELETE.value:
+                _lock_source_message_lifecycle(
+                    connection,
+                    source_message_id=incoming.subject_id,
+                )
             existing_source_message = connection.execute(
                 """
                 SELECT tombstoned
@@ -5952,6 +5957,10 @@ class PostgresRoleStore:
                 return ConsumeResult.REPLAYED
             source_deleted = False
             if source_message_id is not None:
+                _lock_source_message_lifecycle(
+                    connection,
+                    source_message_id=source_message_id,
+                )
                 deleted_row = connection.execute(
                     """
                     SELECT football_runtime.source_message_deletion_barrier(%s)
@@ -5967,6 +5976,12 @@ class PostgresRoleStore:
                     if not isinstance(opportunity, dict):
                         raise TypeError(
                             "OpportunityPublicationChanged v3 item is invalid"
+                        )
+                    opportunity_id = cast(str, opportunity["opportunity_id"])
+                    if source_deleted:
+                        _scrub_recommendation_source_deleted_projection(
+                            connection,
+                            opportunity_id=opportunity_id,
                         )
                     connection.execute(
                         """
@@ -5987,7 +6002,7 @@ class PostgresRoleStore:
                               EXCLUDED.opportunity_id
                         """,
                         (
-                            opportunity["opportunity_id"],
+                            opportunity_id,
                             opportunity["opportunity_revision_id"],
                             opportunity["opportunity_type"],
                             "suppressed"
@@ -6019,6 +6034,12 @@ class PostgresRoleStore:
                     if source_deleted
                     else payload["response_route"]
                 )
+                opportunity_id = cast(str, payload["opportunity_id"])
+                if source_deleted:
+                    _scrub_recommendation_source_deleted_projection(
+                        connection,
+                        opportunity_id=opportunity_id,
+                    )
                 connection.execute(
                     f"""
                     INSERT INTO football_runtime.recommendation_opportunities (
@@ -6039,7 +6060,7 @@ class PostgresRoleStore:
                     {source_suppression_guard}
                     """,
                     (
-                        payload["opportunity_id"],
+                        opportunity_id,
                         payload["opportunity_revision_id"],
                         payload["opportunity_type"],
                         publication_state,
@@ -10827,6 +10848,34 @@ def _scrub_application_source_message_data(
         SELECT football_runtime.scrub_source_message_outbox_contracts(%s)
         """,
         (source_message_id,),
+    )
+
+
+def _scrub_recommendation_source_deleted_projection(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_id: str,
+) -> None:
+    """Remove contact-bearing routes from all deleted opportunity history."""
+    connection.execute(
+        """
+        UPDATE football_runtime.recommendation_opportunities
+        SET response_route = %s::jsonb
+        WHERE opportunity_id = %s
+        """,
+        (json.dumps(_UNAVAILABLE_RESPONSE_ROUTE), opportunity_id),
+    )
+
+
+def _lock_source_message_lifecycle(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+) -> None:
+    """Serialize Recommendation publication with source-message deletion."""
+    connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (f"source-message-lifecycle:{source_message_id}",),
     )
 
 
