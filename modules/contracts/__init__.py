@@ -274,6 +274,14 @@ SUPPORTED_CONTRACTS = (
         ("telegram_user_id",),
     ),
     ContractDefinition(
+        ContractName.RUN_SEARCH,
+        3,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.RECOMMENDATION,
+        "search_update_id",
+        ("telegram_user_id",),
+    ),
+    ContractDefinition(
         ContractName.SEARCH_COMPLETED,
         1,
         RuntimeRole.RECOMMENDATION,
@@ -682,15 +690,25 @@ _TRANSFER_SEARCH_DETAIL_VALUES = {
     "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
     "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
 }
-_REFEREE_SEARCH_DETAIL_VALUES = {
-    "event_types": frozenset({"match", "tournament"}),
+_COACHING_SEARCH_DETAIL_VALUES = {
+    "coaching_types": frozenset(
+        {
+            "individual_training",
+            "team_training",
+            "goalkeeper_training",
+            "fitness_training",
+        }
+    ),
+    "playing_levels": _GAME_SEARCH_DETAIL_VALUES["playing_levels"],
     "team_formats": _GAME_SEARCH_DETAIL_VALUES["team_formats"],
-    "referee_roles": frozenset({"head_referee", "assistant_referee", "var"}),
+    "venue_settings": _GAME_SEARCH_DETAIL_VALUES["venue_settings"],
+    "playing_surfaces": _GAME_SEARCH_DETAIL_VALUES["playing_surfaces"],
     "payment": _GAME_SEARCH_DETAIL_VALUES["payment"],
 }
-_REFEREEING_SERVICE_OFFER_DETAIL_VALUES = {
-    key: frozenset(values) for key, values in _REFEREE_SEARCH_DETAIL_VALUES.items()
-}
+_COACHING_WEEKDAYS = frozenset(
+    {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+)
+_COACHING_DAY_PARTS = frozenset({"morning", "daytime", "evening", "night"})
 
 SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
     {
@@ -711,7 +729,7 @@ def _validate_run_search(
 ) -> None:
     """Validate the complete confirmed discovery snapshot on the wire."""
     contract_version = envelope.contract_version
-    if contract_version == 2:
+    if contract_version in {2, 3}:
         required_fields = {
             "search_update_id",
             "telegram_user_id",
@@ -735,8 +753,12 @@ def _validate_run_search(
             "referee_search_details",
             "refereeing_service_offer_details",
         }
+        if contract_version == 3:
+            allowed_fields.add("coaching_search_details")
         if not required_fields <= set(payload) or set(payload) - allowed_fields:
-            raise ValueError("RunSearch v2 contains unsupported or missing facts")
+            raise ValueError(
+                f"RunSearch v{contract_version} contains unsupported or missing facts"
+            )
         search_update_id = _required_text(payload, "search_update_id")
         telegram_user_id = payload["telegram_user_id"]
         draft_revision = payload["discovery_draft_revision"]
@@ -748,25 +770,37 @@ def _validate_run_search(
             or isinstance(draft_revision, bool)
             or draft_revision < 1
         ):
-            raise ValueError("RunSearch v2 identities must be positive integers")
+            raise ValueError(
+                f"RunSearch v{contract_version} identities must be positive integers"
+            )
         expected_message_id = derive_run_search_message_id(
             telegram_user_id, search_update_id
         )
         if envelope.message_id != expected_message_id:
-            raise ValueError("RunSearch v2 message identity is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} message identity is not canonical"
+            )
         if envelope.subject_id != f"bot-user:{telegram_user_id}":
-            raise ValueError("RunSearch v2 subject identity is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} subject identity is not canonical"
+            )
         if envelope.subject_revision != draft_revision:
-            raise ValueError("RunSearch v2 subject revision is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} subject revision is not canonical"
+            )
         if envelope.idempotency_key != (
             f"run-search:{telegram_user_id}:{search_update_id}"
         ):
-            raise ValueError("RunSearch v2 idempotency key is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} idempotency key is not canonical"
+            )
         if (
             envelope.causation_id != expected_message_id
             or envelope.correlation_id != expected_message_id
         ):
-            raise ValueError("RunSearch v2 causation/correlation is not canonical")
+            raise ValueError(
+                f"RunSearch v{contract_version} causation/correlation is not canonical"
+            )
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
@@ -831,6 +865,10 @@ def _validate_run_search(
         required_date is not None
     ):
         raise ValueError("RunSearch transfer Search cannot include required_date")
+    if user_intent in {"coach_search", "coaching_service_offer"} and (
+        required_date is not None
+    ):
+        raise ValueError("RunSearch coaching Search cannot include required_date")
     if user_intent in _DATE_REQUIRED_USER_INTENTS or required_date is not None:
         _validate_required_date(
             required_date,
@@ -898,8 +936,7 @@ def _validate_run_search(
         ):
             raise ValueError("RunSearch has invalid Opponent Search details")
     transfer_details = payload.get("transfer_search_details")
-    referee_search_details = payload.get("referee_search_details")
-    refereeing_service_offer_details = payload.get("refereeing_service_offer_details")
+    coaching_details = payload.get("coaching_search_details")
     if (
         sum(
             details is not None
@@ -908,8 +945,7 @@ def _validate_run_search(
                 opponent_details,
                 tournament_details,
                 transfer_details,
-                referee_search_details,
-                refereeing_service_offer_details,
+                coaching_details,
             )
         )
         > 1
@@ -969,47 +1005,35 @@ def _validate_run_search(
             for key, values in transfer_details.items()
         ):
             raise ValueError("RunSearch has invalid transfer Search details")
-    for details, expected_intent, detail_values, label in (
-        (
-            referee_search_details,
-            "referee_search",
-            _REFEREE_SEARCH_DETAIL_VALUES,
-            "Referee Search",
-        ),
-        (
-            refereeing_service_offer_details,
-            "refereeing_service_offer",
-            _REFEREEING_SERVICE_OFFER_DETAIL_VALUES,
-            "Refereeing Service Offer",
-        ),
-    ):
-        if details is None:
-            continue
-        if user_intent != expected_intent or not isinstance(details, dict):
-            raise ValueError(f"RunSearch details require {label}")
-        if set(details) - {"times"} - set(detail_values) or not all(
-            isinstance(values, list)
-            and ((key == "times" and len(values) <= 1) or key != "times")
-            and len(values)
-            == len(set(value for value in values if isinstance(value, str)))
-            and all(
-                isinstance(value, str)
-                and (
-                    value in detail_values.get(key, ())
-                    or (
-                        key == "times"
-                        and (
-                            value in {"morning", "daytime", "evening", "night"}
-                            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value)
-                            is not None
-                        )
-                    )
-                )
-                for value in values
+    if coaching_details is not None:
+        if contract_version < 3:
+            raise ValueError(
+                "RunSearch coaching_search_details requires contract version 3"
             )
-            for key, values in details.items()
-        ):
-            raise ValueError(f"RunSearch has invalid {label} details")
+        if user_intent not in {
+            "coach_search",
+            "coaching_service_offer",
+        } or not isinstance(coaching_details, dict):
+            raise ValueError("RunSearch details require Coaching Services")
+        if set(coaching_details) - set(_COACHING_SEARCH_DETAIL_VALUES) - {"schedule"}:
+            raise ValueError("RunSearch coaching details have unsupported keys")
+        for key, values in coaching_details.items():
+            if key == "schedule":
+                if not _valid_coaching_schedule(values):
+                    raise ValueError("RunSearch has invalid Coaching Schedule")
+                continue
+            if (
+                not isinstance(values, list)
+                or not values
+                or len(values)
+                != len(set(value for value in values if isinstance(value, str)))
+                or not all(
+                    isinstance(value, str)
+                    and value in _COACHING_SEARCH_DETAIL_VALUES[key]
+                    for value in values
+                )
+            ):
+                raise ValueError("RunSearch has invalid Coaching Search details")
 
 
 def _valid_transfer_seasonal_timing(value: str) -> bool:
@@ -1031,6 +1055,68 @@ def _valid_transfer_seasonal_timing(value: str) -> bool:
         and raw_value == raw_value.casefold()
         and raw_value == raw_value.strip()
     )
+
+
+def _valid_coaching_schedule(value: JsonValue) -> bool:
+    """Validate the nested recurring Schedule used by Coaching Services."""
+    if not isinstance(value, dict) or not value:
+        return False
+    allowed = {
+        "weekdays",
+        "day_parts",
+        "local_start_time",
+        "local_end_time",
+        "start_local_date",
+    }
+    if set(value) - allowed:
+        return False
+    weekdays = value.get("weekdays")
+    if (
+        not isinstance(weekdays, list)
+        or not weekdays
+        or len(weekdays) != len(set(item for item in weekdays if isinstance(item, str)))
+        or not all(
+            isinstance(item, str) and item in _COACHING_WEEKDAYS for item in weekdays
+        )
+    ):
+        return False
+    day_parts = value.get("day_parts")
+    has_exact = "local_start_time" in value or "local_end_time" in value
+    if day_parts is not None and (
+        has_exact
+        or not isinstance(day_parts, list)
+        or not day_parts
+        or len(day_parts)
+        != len(set(item for item in day_parts if isinstance(item, str)))
+        or not all(
+            isinstance(item, str) and item in _COACHING_DAY_PARTS for item in day_parts
+        )
+    ):
+        return False
+    if day_parts is None and not has_exact:
+        return False
+    if has_exact:
+        start = value.get("local_start_time")
+        end = value.get("local_end_time")
+        if (
+            not isinstance(start, str)
+            or not isinstance(end, str)
+            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", start) is None
+            or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", end) is None
+            or int(start[:2]) * 60 + int(start[3:]) >= int(end[:2]) * 60 + int(end[3:])
+        ):
+            return False
+    start_date = value.get("start_local_date")
+    if start_date is not None:
+        try:
+            if (
+                not isinstance(start_date, str)
+                or date.fromisoformat(start_date).isoformat() != start_date
+            ):
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def _validate_required_date(value: JsonValue, *, exact_fields: bool) -> None:
@@ -1975,22 +2061,34 @@ def _validate_ambiguity_pass_execution(
             raise ValueError("ambiguity-pass artifact is not configured")
     elif player_release:
         expected_routing = "classifier-routing-player-v1"
-        expected_prompt = "player-match-ambiguity-v1"
-        expected_schema = "source-message-classification-v3"
+        expected_prompt = (
+            "player-match-ambiguity-v2"
+            if value["schema_version"] == "source-message-classification-v4"
+            else "player-match-ambiguity-v1"
+        )
+        expected_schema = (
+            "source-message-classification-v4"
+            if expected_prompt == "player-match-ambiguity-v2"
+            else "source-message-classification-v3"
+        )
     else:
         expected_prompt = prompt_version or (
             "open-match-ambiguity-v3"
             if value["prompt_version"] == "open-match-ambiguity-v3"
-            else "open-match-ambiguity-v2"
-            if value["prompt_version"] == "open-match-ambiguity-v2"
-            else "open-match-ambiguity-v1"
+            else (
+                "open-match-ambiguity-v2"
+                if value["prompt_version"] == "open-match-ambiguity-v2"
+                else "open-match-ambiguity-v1"
+            )
         )
         expected_schema = schema_version or (
             "source-message-classification-v4"
             if expected_prompt == "open-match-ambiguity-v3"
-            else "source-message-classification-v3"
-            if expected_prompt == "open-match-ambiguity-v2"
-            else "source-message-classification-v2"
+            else (
+                "source-message-classification-v3"
+                if expected_prompt == "open-match-ambiguity-v2"
+                else "source-message-classification-v2"
+            )
         )
     if value["prompt_version"] != expected_prompt:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
@@ -2001,6 +2099,7 @@ def _validate_ambiguity_pass_execution(
         "open-match-ambiguity-v1",
         "open-match-ambiguity-v2",
         "open-match-ambiguity-v3",
+        "player-match-ambiguity-v2",
     }:
         raise ValueError("ambiguity-pass prompt provenance is invalid")
     if value["schema_version"] not in {
@@ -2121,14 +2220,20 @@ def _validate_semantic_proof_execution(
         if not isinstance(raw_schema_version, str):
             raise ValueError("semantic-proof schema provenance is invalid")
         expected_prompt = prompt_version or (
-            "player-match-semantic-proof-v1"
+            (
+                "player-match-semantic-proof-v2"
+                if value["schema_version"] == "source-semantic-proof-v3"
+                else "player-match-semantic-proof-v1"
+            )
             if player_release
             else (
-                "open-match-semantic-proof-v2"
-                if value["schema_version"] == "source-semantic-proof-v2"
-                else "open-match-semantic-proof-v3"
+                "open-match-semantic-proof-v3"
                 if value["schema_version"] == "source-semantic-proof-v3"
-                else "open-match-semantic-proof-v1"
+                else (
+                    "open-match-semantic-proof-v2"
+                    if value["schema_version"] == "source-semantic-proof-v2"
+                    else "open-match-semantic-proof-v1"
+                )
             )
         )
         expected_schema = schema_version or raw_schema_version
@@ -2197,8 +2302,8 @@ def _validate_opportunity_publication_changed(
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
-        "referee_availability",
-        "referee_request",
+        "coach_availability",
+        "coach_request",
     }:
         raise ValueError("Opportunity type is invalid")
     identity_type = str(opportunity_type)
@@ -2353,13 +2458,13 @@ def _validate_opportunity_publication_batch_changed(
             "opponent_request",
             "roster_vacancy",
             "player_transfer_availability",
-            "referee_availability",
-            "referee_request",
+            "coach_availability",
+            "coach_request",
         }:
             raise ValueError("OpportunityPublicationChanged v3 item type is invalid")
         if (
             re.fullmatch(
-                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request|roster_vacancy|player_transfer_availability|referee_availability|referee_request):(?:candidate|proposition):[0-9a-f]{{16}}",
+                rf"opportunity:{re.escape(source_scope)}:(?:open_match|player_match_availability|opponent_request|roster_vacancy|player_transfer_availability|coach_availability|coach_request):(?:candidate|proposition):[0-9a-f]{{16}}",
                 opportunity_id,
             )
             is None
@@ -2434,8 +2539,8 @@ def _validate_accepted_opportunity_facts(
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
-        "referee_availability",
-        "referee_request",
+        "coach_availability",
+        "coach_request",
     }:
         raise ValueError("opportunity type is invalid")
     if opportunity_type == "opponent_request":
@@ -2449,6 +2554,9 @@ def _validate_accepted_opportunity_facts(
         return
     if opportunity_type == "tournament":
         _validate_tournament_accepted_facts(facts)
+        return
+    if opportunity_type in {"coach_availability", "coach_request"}:
+        _validate_coaching_accepted_facts(facts, opportunity_type)
         return
     _validate_open_match_accepted_facts(facts, opportunity_type)
 
@@ -3016,6 +3124,136 @@ def _valid_tournament_json_fact(value: JsonValue) -> bool:
             for key, item in value.items()
         )
     return False
+
+
+def _validate_coaching_accepted_facts(
+    facts: dict[str, JsonValue], opportunity_type: str
+) -> None:
+    """Validate one standing in-person coaching fact snapshot."""
+    if opportunity_type not in {"coach_availability", "coach_request"}:
+        raise ValueError("coaching opportunity type is invalid")
+    required = {
+        "country_id",
+        "city_id",
+        "place_id",
+        "location_geographic_type",
+        "location_parent_ids",
+        "location_verified_disjoint_place_ids",
+        "iana_timezone",
+        "timezone_data_version",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "in_person",
+        "coaching_types",
+        "playing_levels",
+        "team_formats",
+        "schedule",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "payment_amount",
+        "payment_currency",
+        "source_posted_at",
+        "source_edited_at",
+        "source_qualifying_assertion_at",
+        opportunity_type,
+    }
+    if set(facts) != required:
+        raise ValueError("coaching accepted facts are incomplete")
+    for field_name in (
+        "country_id",
+        "city_id",
+        "place_id",
+        "city_display_en",
+        "city_display_ru",
+        "city_display_es",
+        "city_display_fr",
+        "place_display_en",
+        "place_display_ru",
+        "place_display_es",
+        "place_display_fr",
+        "iana_timezone",
+        "timezone_data_version",
+    ):
+        _required_text(facts, field_name)
+    if _required_text(facts, "location_geographic_type") not in {
+        "country",
+        "city",
+        *SUB_CITY_GEOGRAPHIC_TYPES,
+    }:
+        raise ValueError("coaching geographic type is invalid")
+    parent_ids = facts["location_parent_ids"]
+    if (
+        not isinstance(parent_ids, list)
+        or not parent_ids
+        or not all(isinstance(value, str) and value for value in parent_ids)
+        or len(parent_ids) != len(set(parent_ids))
+    ):
+        raise TypeError("coaching location parents are invalid")
+    disjoint_ids = facts["location_verified_disjoint_place_ids"]
+    if (
+        not isinstance(disjoint_ids, list)
+        or len(disjoint_ids) > 128
+        or not all(isinstance(value, str) and value for value in disjoint_ids)
+        or len(disjoint_ids) != len(set(disjoint_ids))
+        or facts["place_id"] in disjoint_ids
+        or bool(set(parent_ids).intersection(disjoint_ids))
+    ):
+        raise TypeError("coaching location disjoint proof is invalid")
+    if facts["in_person"] is not True or facts[opportunity_type] is not True:
+        raise ValueError("coaching opportunity must be explicit and in person")
+    list_allowlists = {
+        "coaching_types": {
+            "individual_training",
+            "team_training",
+            "goalkeeper_training",
+            "fitness_training",
+        },
+        "playing_levels": set(_GAME_SEARCH_DETAIL_VALUES["playing_levels"]),
+        "team_formats": set(_GAME_SEARCH_DETAIL_VALUES["team_formats"]),
+        "venue_settings": set(_GAME_SEARCH_DETAIL_VALUES["venue_settings"]),
+        "playing_surfaces": set(_GAME_SEARCH_DETAIL_VALUES["playing_surfaces"]),
+    }
+    for field_name, allowed in list_allowlists.items():
+        values = facts[field_name]
+        if values is not None and (
+            not isinstance(values, list)
+            or not values
+            or len(values) != len(set(cast(list[str], values)))
+            or not all(isinstance(value, str) and value in allowed for value in values)
+        ):
+            raise ValueError(f"coaching {field_name} is invalid")
+    schedule = facts["schedule"]
+    if schedule is not None and not _valid_coaching_schedule(schedule):
+        raise ValueError("coaching Schedule is invalid")
+    if facts["payment"] not in {None, "free", "paid"}:
+        raise ValueError("coaching payment is invalid")
+    payment_amount = facts["payment_amount"]
+    payment_currency = facts["payment_currency"]
+    if (payment_amount is None) != (payment_currency is None) or (
+        payment_amount is not None
+        and (
+            facts["payment"] != "paid"
+            or not isinstance(payment_amount, str)
+            or not payment_amount
+            or not isinstance(payment_currency, str)
+            or not payment_currency
+        )
+    ):
+        raise ValueError("coaching payment details are invalid")
+    source_posted_at = _required_iso_datetime(facts, "source_posted_at")
+    qualifying_at = _required_iso_datetime(facts, "source_qualifying_assertion_at")
+    if datetime.fromisoformat(qualifying_at) < datetime.fromisoformat(source_posted_at):
+        raise ValueError("coaching qualifying assertion predates publication")
+    source_edited_at = facts["source_edited_at"]
+    if source_edited_at is not None:
+        _required_iso_datetime(facts, "source_edited_at")
 
 
 def _validate_transfer_accepted_facts(
