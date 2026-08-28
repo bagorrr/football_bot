@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -14,6 +15,7 @@ from typing import cast
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.codex_classification_adapter import CodexCliClassifierAdapter
@@ -1298,6 +1300,184 @@ def test_queue_health_excludes_expired_lease_from_active_lease_age() -> None:
     assert expired.queue_depth == 1
     assert expired.oldest_ready_job_age_seconds == 181
     assert expired.oldest_lease_age_seconds == 0
+
+
+def test_delete_first_rejects_classifier_before_any_model_admission() -> None:
+    """A committed delete wins while a stale classifier waits for admission."""
+    body = "Delete-first classification must never reach the model."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        ),
+    )
+    system, _, source_identity, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_161,
+        checkpoint=4961,
+        administrator_id=49_161,
+    )
+    telegram = cast(
+        ControlledTelegramIngestionAdapter,
+        system._roles[RuntimeRole.INGESTION].telegram_ingestion,
+    )
+    database_url = os.environ["TEST_DATABASE_URL"]
+    pause_key = 59_161
+    trigger_name = "test_fix59_pause_source_delete_before_commit"
+    function_name = "test_fix59_pause_source_delete_before_commit"
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE OR REPLACE FUNCTION {}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $function$
+                BEGIN
+                    IF NEW.tombstoned THEN
+                        PERFORM pg_advisory_lock({});
+                    END IF;
+                    RETURN NEW;
+                END
+                $function$
+                """
+            ).format(
+                sql.Identifier("football_runtime", function_name),
+                sql.Literal(pause_key),
+            )
+        )
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE TRIGGER {}
+                BEFORE UPDATE OF current_revision
+                ON football_runtime.source_messages
+                FOR EACH ROW
+                EXECUTE FUNCTION {}()
+                """
+            ).format(
+                sql.Identifier(trigger_name),
+                sql.Identifier("football_runtime", function_name),
+            )
+        )
+
+    delete_event_id = "source-event:classification-delete-first"
+    checkpoint = system.channel_ingestion_checkpoint(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=checkpoint,
+        to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint.pts + 1),
+        source_event_id=delete_event_id,
+        telegram_message_id=4_900_161,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        source_publisher_id="publisher:delete-first",
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+
+    lock_connection = psycopg.connect(database_url)
+    delete_future = None
+    classifier_future = None
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        lock_connection.execute("SELECT pg_advisory_lock(%s)", (pause_key,))
+        delete_future = executor.submit(system.process_next_source_event)
+
+        delete_trigger_waiting = False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                waiting = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND pid <> pg_backend_pid()
+                          AND wait_event_type = 'Lock'
+                          AND wait_event ILIKE '%advisory%'
+                    )
+                    """
+                ).fetchone()
+            if waiting is not None and waiting[0]:
+                delete_trigger_waiting = True
+                break
+            time.sleep(0.01)
+        assert delete_trigger_waiting
+
+        classifier_future = executor.submit(
+            system.process_next_contract_handoff,
+            RuntimeRole.CLASSIFICATION,
+        )
+        two_advisory_waiters = False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                waiting = connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND wait_event_type = 'Lock'
+                      AND wait_event ILIKE '%advisory%'
+                    """
+                ).fetchone()
+            if waiting is not None and waiting[0] >= 2:
+                two_advisory_waiters = True
+                break
+            time.sleep(0.01)
+        assert two_advisory_waiters
+
+        lock_connection.execute("SELECT pg_advisory_unlock(%s)", (pause_key,))
+        lock_connection.commit()
+        assert delete_future.result(timeout=5)
+        assert classifier_future.result(timeout=5)
+    finally:
+        try:
+            lock_connection.execute("SELECT pg_advisory_unlock(%s)", (pause_key,))
+            lock_connection.commit()
+        except Exception:
+            pass
+        lock_connection.close()
+        executor.shutdown(wait=True)
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL(
+                    "DROP TRIGGER IF EXISTS {} ON football_runtime.source_messages"
+                ).format(sql.Identifier(trigger_name))
+            )
+            connection.execute(
+                sql.SQL("DROP FUNCTION IF EXISTS {}()").format(
+                    sql.Identifier("football_runtime", function_name)
+                )
+            )
+
+    assert classifier.requests == []
+    assert system.source_messages()[0].tombstoned
+    assert system.source_message_revisions()[0].body is None
+    assert system.classification_attempts() == ()
+    assert not system.redeliver_classifier_command(revision_id)
 
 
 def test_quota_circuit_honors_retry_after_before_one_probe() -> None:

@@ -417,8 +417,9 @@ CREATE TRIGGER recommendation_completed_search_deleted_source_privacy
         football_runtime.sanitize_deleted_source_completed_search_snapshot();
 
 CREATE OR REPLACE FUNCTION
-    football_runtime.scrub_source_message_recommendation_history(
-        requested_source_message_id text
+    football_runtime.recommendation_scrub_source_message_history(
+        requested_opportunity_ids text[],
+        requested_opportunity_revision_ids text[]
     )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -426,16 +427,18 @@ SECURITY DEFINER
 SET search_path = pg_catalog, football_runtime
 AS $$
 DECLARE
-    revision_pattern text := requested_source_message_id || ':revision:%';
+    opportunity_ids text[] := COALESCE(
+        requested_opportunity_ids, '{}'::text[]
+    );
+    opportunity_revision_ids text[] := COALESCE(
+        requested_opportunity_revision_ids, '{}'::text[]
+    );
     scrubbed_count bigint := 0;
     row_count bigint;
 BEGIN
-    IF SESSION_USER <> 'football_application' THEN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_recommendation' THEN
         RAISE EXCEPTION 'runtime role cannot scrub Recommendation history';
-    END IF;
-    IF requested_source_message_id IS NULL
-       OR requested_source_message_id = '' THEN
-        RAISE EXCEPTION 'Recommendation history scrub requires an identity';
     END IF;
 
     UPDATE football_runtime.recommendation_opportunities AS recommendation
@@ -445,12 +448,7 @@ BEGIN
             'kind', 'unavailable',
             'value', ''
         )
-    WHERE EXISTS (
-        SELECT 1
-        FROM football_runtime.application_opportunities AS application
-        WHERE application.opportunity_id = recommendation.opportunity_id
-          AND application.source_message_revision_id LIKE revision_pattern
-    );
+    WHERE recommendation.opportunity_id = ANY(opportunity_ids);
     GET DIAGNOSTICS row_count = ROW_COUNT;
     scrubbed_count := scrubbed_count + row_count;
 
@@ -460,20 +458,12 @@ BEGIN
         SELECT search_row.completed_search_id,
                jsonb_agg(
                    CASE
-                       WHEN EXISTS (
-                           SELECT 1
-                           FROM football_runtime.application_opportunities
-                               AS application
-                           WHERE application.source_message_revision_id LIKE
-                                     revision_pattern
-                             AND (
-                                 application.opportunity_id =
-                                     item_with_ordinality.item ->>
-                                     'opportunity_id'
-                                 OR application.opportunity_revision_id =
-                                     item_with_ordinality.item ->>
-                                     'opportunity_revision_id'
-                             )
+                       WHEN (
+                           item_with_ordinality.item ->> 'opportunity_id'
+                               = ANY(opportunity_ids)
+                           OR item_with_ordinality.item ->>
+                               'opportunity_revision_id'
+                               = ANY(opportunity_revision_ids)
                        )
                        THEN item_with_ordinality.item - 'response_route'
                        ELSE item_with_ordinality.item
@@ -481,21 +471,10 @@ BEGIN
                    ORDER BY item_with_ordinality.ordinality
                ) AS inputs,
                bool_or(
-                   EXISTS (
-                       SELECT 1
-                       FROM football_runtime.application_opportunities
-                           AS application
-                       WHERE application.source_message_revision_id LIKE
-                                 revision_pattern
-                         AND (
-                             application.opportunity_id =
-                                 item_with_ordinality.item ->>
-                                 'opportunity_id'
-                             OR application.opportunity_revision_id =
-                                 item_with_ordinality.item ->>
-                                 'opportunity_revision_id'
-                         )
-                   )
+                   item_with_ordinality.item ->> 'opportunity_id'
+                       = ANY(opportunity_ids)
+                   OR item_with_ordinality.item ->> 'opportunity_revision_id'
+                       = ANY(opportunity_revision_ids)
                ) AS changed
         FROM football_runtime.recommendation_completed_searches AS search_row
         CROSS JOIN LATERAL jsonb_array_elements(
@@ -515,12 +494,295 @@ BEGIN
 END
 $$;
 
+ALTER FUNCTION
+    football_runtime.recommendation_scrub_source_message_history(text[], text[])
+    OWNER TO football_recommendation;
+REVOKE ALL ON FUNCTION
+    football_runtime.recommendation_scrub_source_message_history(text[], text[])
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    football_runtime.recommendation_scrub_source_message_history(text[], text[])
+    TO football_application;
+
+CREATE OR REPLACE FUNCTION
+    football_runtime.scrub_source_message_recommendation_history(
+        requested_source_message_id text
+    )
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    revision_pattern text := requested_source_message_id || ':revision:%';
+    opportunity_ids text[];
+    opportunity_revision_ids text[];
+    scrubbed_count bigint;
+BEGIN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_application' THEN
+        RAISE EXCEPTION 'runtime role cannot scrub Recommendation history';
+    END IF;
+    IF requested_source_message_id IS NULL
+       OR requested_source_message_id = '' THEN
+        RAISE EXCEPTION 'Recommendation history scrub requires an identity';
+    END IF;
+
+    SELECT COALESCE(array_agg(opportunity.opportunity_id), '{}'::text[]),
+           COALESCE(
+               array_agg(opportunity.opportunity_revision_id), '{}'::text[]
+           )
+    INTO opportunity_ids, opportunity_revision_ids
+    FROM football_runtime.application_opportunities AS opportunity
+    WHERE opportunity.source_message_revision_id LIKE revision_pattern;
+
+    SELECT football_runtime.recommendation_scrub_source_message_history(
+        opportunity_ids, opportunity_revision_ids
+    ) INTO scrubbed_count;
+    RETURN scrubbed_count;
+END
+$$;
+
+ALTER FUNCTION
+    football_runtime.scrub_source_message_recommendation_history(text)
+    OWNER TO football_application;
 REVOKE ALL ON FUNCTION
     football_runtime.scrub_source_message_recommendation_history(text)
     FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION
     football_runtime.scrub_source_message_recommendation_history(text)
     TO football_application;
+
+CREATE OR REPLACE FUNCTION
+    football_runtime.recommendation_scrub_source_message_result_card_facts(
+        requested_opportunity_ids text[]
+    )
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    scrubbed_count bigint;
+BEGIN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_recommendation' THEN
+        RAISE EXCEPTION 'runtime role cannot scrub Recommendation result facts';
+    END IF;
+
+    UPDATE football_runtime.recommendation_results AS result
+    SET card_facts = result.card_facts - ARRAY[
+        'response_route_kind', 'response_route_value'
+    ]::text[]
+    WHERE result.card_facts ->> 'opportunity_id' = ANY(
+        COALESCE(requested_opportunity_ids, '{}'::text[])
+    );
+    GET DIAGNOSTICS scrubbed_count = ROW_COUNT;
+    RETURN scrubbed_count;
+END
+$$;
+
+ALTER FUNCTION
+    football_runtime.recommendation_scrub_source_message_result_card_facts(text[])
+    OWNER TO football_recommendation;
+REVOKE ALL ON FUNCTION
+    football_runtime.recommendation_scrub_source_message_result_card_facts(text[])
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    football_runtime.recommendation_scrub_source_message_result_card_facts(text[])
+    TO football_application;
+
+CREATE OR REPLACE FUNCTION football_runtime.scrub_source_message_result_card_facts(
+    requested_source_message_id text
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    opportunity_ids text[];
+    scrubbed_count bigint;
+BEGIN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_application' THEN
+        RAISE EXCEPTION 'runtime role cannot scrub completed-search result facts';
+    END IF;
+    IF requested_source_message_id IS NULL
+       OR requested_source_message_id = '' THEN
+        RAISE EXCEPTION 'Source Message result scrub requires an identity';
+    END IF;
+
+    SELECT COALESCE(array_agg(opportunity.opportunity_id), '{}'::text[])
+    INTO opportunity_ids
+    FROM football_runtime.application_opportunities AS opportunity
+    WHERE opportunity.source_message_revision_id LIKE
+              requested_source_message_id || ':revision:%';
+
+    SELECT football_runtime.recommendation_scrub_source_message_result_card_facts(
+        opportunity_ids
+    ) INTO scrubbed_count;
+    RETURN scrubbed_count;
+END
+$$;
+
+ALTER FUNCTION
+    football_runtime.scrub_source_message_result_card_facts(text)
+    OWNER TO football_application;
+REVOKE ALL ON FUNCTION
+    football_runtime.scrub_source_message_result_card_facts(text)
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    football_runtime.scrub_source_message_result_card_facts(text)
+    TO football_application;
+
+CREATE OR REPLACE FUNCTION
+    football_runtime.classification_cleanup_source_message_data(
+        requested_source_message_id text
+    )
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    revision_pattern text := requested_source_message_id || ':revision:%';
+    removed_count bigint := 0;
+    row_count bigint;
+BEGIN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_classification' THEN
+        RAISE EXCEPTION 'runtime role cannot clean Classification data';
+    END IF;
+    IF requested_source_message_id IS NULL
+       OR requested_source_message_id = '' THEN
+        RAISE EXCEPTION 'Classification cleanup requires an identity';
+    END IF;
+
+    DELETE FROM football_runtime.classification_proof_work
+    WHERE source_message_revision_id LIKE revision_pattern;
+    GET DIAGNOSTICS row_count = ROW_COUNT;
+    removed_count := removed_count + row_count;
+
+    DELETE FROM football_runtime.classification_attempts
+    WHERE source_message_revision_id LIKE revision_pattern;
+    GET DIAGNOSTICS row_count = ROW_COUNT;
+    removed_count := removed_count + row_count;
+    RETURN removed_count;
+END
+$$;
+
+ALTER FUNCTION
+    football_runtime.classification_cleanup_source_message_data(text)
+    OWNER TO football_classification;
+REVOKE ALL ON FUNCTION
+    football_runtime.classification_cleanup_source_message_data(text)
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    football_runtime.classification_cleanup_source_message_data(text)
+    TO football_application;
+
+CREATE OR REPLACE FUNCTION
+    football_runtime.application_cleanup_source_message_routing_outcomes(
+        requested_source_message_id text
+    )
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    removed_count bigint;
+BEGIN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_application' THEN
+        RAISE EXCEPTION 'runtime role cannot clean Application routing outcomes';
+    END IF;
+    IF requested_source_message_id IS NULL
+       OR requested_source_message_id = '' THEN
+        RAISE EXCEPTION 'Application routing cleanup requires an identity';
+    END IF;
+
+    DELETE FROM football_runtime.classification_routing_outcomes
+    WHERE source_message_revision_id LIKE
+              requested_source_message_id || ':revision:%';
+    GET DIAGNOSTICS removed_count = ROW_COUNT;
+    RETURN removed_count;
+END
+$$;
+
+ALTER FUNCTION
+    football_runtime.application_cleanup_source_message_routing_outcomes(text)
+    OWNER TO football_application;
+REVOKE ALL ON FUNCTION
+    football_runtime.application_cleanup_source_message_routing_outcomes(text)
+    FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    football_runtime.application_cleanup_source_message_routing_outcomes(text)
+    TO football_application;
+
+CREATE OR REPLACE FUNCTION
+    football_runtime.ingestion_cleanup_source_event_records(
+        requested_peer_kind text,
+        requested_telegram_chat_id bigint,
+        requested_registry_generation bigint,
+        requested_telegram_message_id bigint
+    )
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    removed_count bigint;
+BEGIN
+    IF SESSION_USER <> 'football_application'
+       OR CURRENT_USER <> 'football_ingestion' THEN
+        RAISE EXCEPTION 'runtime role cannot clean Ingestion event records';
+    END IF;
+
+    DELETE FROM football_runtime.source_event_records
+    WHERE peer_kind = requested_peer_kind
+      AND telegram_chat_id = requested_telegram_chat_id
+      AND registry_generation = requested_registry_generation
+      AND telegram_message_id = requested_telegram_message_id;
+    GET DIAGNOSTICS removed_count = ROW_COUNT;
+    RETURN removed_count;
+END
+$$;
+
+ALTER FUNCTION
+    football_runtime.ingestion_cleanup_source_event_records(
+        text, bigint, bigint, bigint
+    ) OWNER TO football_ingestion;
+REVOKE ALL ON FUNCTION
+    football_runtime.ingestion_cleanup_source_event_records(
+        text, bigint, bigint, bigint
+    ) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION
+    football_runtime.ingestion_cleanup_source_event_records(
+        text, bigint, bigint, bigint
+    ) TO football_application;
+
+GRANT DELETE ON football_runtime.classification_attempts
+    TO football_classification;
+GRANT DELETE ON football_runtime.classification_routing_outcomes
+    TO football_application;
+GRANT DELETE ON football_runtime.source_event_records
+    TO football_ingestion;
+GRANT DELETE ON
+    football_runtime.application_source_message_replay_barriers,
+    football_runtime.application_proposition_identities,
+    football_runtime.application_legacy_proposition_identity_compatibility,
+    football_runtime.source_message_revisions,
+    football_runtime.source_messages
+    TO football_application;
+GRANT UPDATE (opportunity_revision_inputs)
+    ON football_runtime.recommendation_completed_searches
+    TO football_recommendation;
+GRANT UPDATE (card_facts)
+    ON football_runtime.recommendation_results
+    TO football_recommendation;
 
 CREATE OR REPLACE FUNCTION
     football_runtime.cleanup_expired_source_message_tombstones(
@@ -592,23 +854,24 @@ BEGIN
             football_runtime.application_legacy_proposition_identity_compatibility
         WHERE source_message_id = tombstone_row.source_message_id;
 
-        DELETE FROM football_runtime.classification_proof_work
-        WHERE source_message_revision_id LIKE
-              tombstone_row.source_message_id || ':revision:%';
-
-        DELETE FROM football_runtime.classification_attempts
-        WHERE source_message_revision_id LIKE
-              tombstone_row.source_message_id || ':revision:%';
-
-        DELETE FROM football_runtime.classification_routing_outcomes
-        WHERE source_message_revision_id LIKE
-              tombstone_row.source_message_id || ':revision:%';
-
-        DELETE FROM football_runtime.source_event_records
-        WHERE peer_kind = tombstone_row.peer_kind
-          AND telegram_chat_id = tombstone_row.telegram_chat_id
-          AND registry_generation = tombstone_row.registry_generation
-          AND telegram_message_id = tombstone_row.telegram_message_id;
+        PERFORM football_runtime.scrub_source_message_recommendation_history(
+            tombstone_row.source_message_id
+        );
+        PERFORM football_runtime.scrub_source_message_result_card_facts(
+            tombstone_row.source_message_id
+        );
+        PERFORM football_runtime.classification_cleanup_source_message_data(
+            tombstone_row.source_message_id
+        );
+        PERFORM football_runtime.application_cleanup_source_message_routing_outcomes(
+            tombstone_row.source_message_id
+        );
+        PERFORM football_runtime.ingestion_cleanup_source_event_records(
+            tombstone_row.peer_kind,
+            tombstone_row.telegram_chat_id,
+            tombstone_row.registry_generation,
+            tombstone_row.telegram_message_id
+        );
 
         DELETE FROM football_runtime.source_message_revisions
         WHERE source_message_id = tombstone_row.source_message_id;
@@ -651,6 +914,10 @@ BEGIN
     RETURN removed_count;
 END
 $$;
+
+ALTER FUNCTION
+    football_runtime.cleanup_expired_source_message_tombstones(timestamptz)
+    OWNER TO football_application;
 
 REVOKE ALL ON FUNCTION
     football_runtime.cleanup_expired_source_message_tombstones(timestamptz)

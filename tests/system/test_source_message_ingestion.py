@@ -3042,6 +3042,127 @@ def test_leased_older_revision_is_preserved_without_regressing_current_state() -
     system.reset()
 
 
+def test_out_of_order_delete_does_not_tombstone_a_newer_revision() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 12, 45, tzinfo=UTC)
+    clock = FrozenClock(datetime(2026, 8, 12, 12, 45, tzinfo=UTC))
+    administrator_id = 47_014
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_701_400,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_out_of_order_delete",
+        identity=identity,
+        transport_boundary="channel-pts:4830",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address="@synthetic_out_of_order_delete",
+    )
+
+    def deliver(
+        *,
+        source_event_id: str,
+        revision: int,
+        kind: SourceEventKind,
+        body: str | None,
+        event_time: datetime,
+    ) -> None:
+        checkpoint = system.channel_ingestion_checkpoint(
+            identity=identity,
+            registry_generation=1,
+        )
+        telethon.add_channel_difference_event(
+            identity=identity,
+            from_checkpoint=checkpoint,
+            to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint.pts + 1),
+            source_event_id=source_event_id,
+            telegram_message_id=1_401,
+            revision=revision,
+            kind=kind,
+            body=body,
+            source_publisher_id="publisher:out-of-order",
+            event_time=event_time,
+        )
+        clock.advance_to(event_time)
+        assert system.process_next_channel_telegram_difference(
+            identity=identity,
+            registry_generation=1,
+        )
+        assert system.process_next_source_event()
+
+    deliver(
+        source_event_id="source-event:out-of-order:create",
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Newer current body.",
+        event_time=datetime(2026, 9, 12, 12, 46, tzinfo=UTC),
+    )
+    deliver(
+        source_event_id="source-event:out-of-order:edit-three",
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body="Revision three remains authoritative.",
+        event_time=datetime(2026, 9, 12, 12, 48, tzinfo=UTC),
+    )
+    deliver(
+        source_event_id="source-event:out-of-order:delete-two",
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=datetime(2026, 9, 12, 12, 49, tzinfo=UTC),
+    )
+    deliver(
+        source_event_id="source-event:out-of-order:delete-two-replay",
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=datetime(2026, 9, 12, 12, 50, tzinfo=UTC),
+    )
+
+    current = system.source_messages()[0]
+    assert current.current_revision == 3
+    assert current.body == "Revision three remains authoritative."
+    assert not current.tombstoned
+    assert system.source_message_deletion_tombstones() == ()
+    assert [revision.revision for revision in system.source_message_revisions()] == [
+        1,
+        3,
+    ]
+
+    deliver(
+        source_event_id="source-event:out-of-order:edit-four",
+        revision=4,
+        kind=SourceEventKind.EDIT,
+        body="A later revision still applies after stale deletes.",
+        event_time=datetime(2026, 9, 12, 12, 51, tzinfo=UTC),
+    )
+    current = system.source_messages()[0]
+    assert current.current_revision == 4
+    assert current.body == "A later revision still applies after stale deletes."
+    assert not current.tombstoned
+    assert [revision.revision for revision in system.source_message_revisions()] == [
+        1,
+        3,
+        4,
+    ]
+    system.reset()
+
+
 def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     registered_at = datetime(2026, 9, 12, 13, 0, tzinfo=UTC)
@@ -3801,6 +3922,77 @@ def test_source_ingestion_and_message_state_enforce_role_and_rls_boundaries() ->
     ):
         with pytest.raises(OwnershipViolationError):
             system.source_messages_as(actor)
+
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        owner_rows = connection.execute(
+            """
+            SELECT procedure.proname,
+                   pg_get_function_identity_arguments(procedure.oid),
+                   pg_get_userbyid(procedure.proowner)
+            FROM pg_proc AS procedure
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = procedure.pronamespace
+            WHERE namespace.nspname = 'football_runtime'
+              AND procedure.proname IN (
+                  'recommendation_scrub_source_message_history',
+                  'scrub_source_message_recommendation_history',
+                  'recommendation_scrub_source_message_result_card_facts',
+                  'scrub_source_message_result_card_facts',
+                  'classification_cleanup_source_message_data',
+                  'application_cleanup_source_message_routing_outcomes',
+                  'ingestion_cleanup_source_event_records',
+                  'cleanup_expired_source_message_tombstones'
+              )
+            """
+        ).fetchall()
+        owners = {
+            f"{name}({arguments})": owner for name, arguments, owner in owner_rows
+        }
+        assert owners == {
+            "recommendation_scrub_source_message_history("
+            "requested_opportunity_ids text[], "
+            "requested_opportunity_revision_ids text[])": "football_recommendation",
+            "scrub_source_message_recommendation_history("
+            "requested_source_message_id text)": "football_application",
+            "recommendation_scrub_source_message_result_card_facts("
+            "requested_opportunity_ids text[])": "football_recommendation",
+            "scrub_source_message_result_card_facts("
+            "requested_source_message_id text)": "football_application",
+            "classification_cleanup_source_message_data("
+            "requested_source_message_id text)": "football_classification",
+            "application_cleanup_source_message_routing_outcomes("
+            "requested_source_message_id text)": "football_application",
+            "ingestion_cleanup_source_event_records("
+            "requested_peer_kind text, requested_telegram_chat_id bigint, "
+            "requested_registry_generation bigint, "
+            "requested_telegram_message_id bigint)": "football_ingestion",
+            "cleanup_expired_source_message_tombstones("
+            "requested_as_of timestamp with time zone)": "football_application",
+        }
+        force_rl_rows = connection.execute(
+            """
+            SELECT relation.relname, relation.relforcerowsecurity
+            FROM pg_class AS relation
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'football_runtime'
+              AND relation.relname IN (
+                  'source_event_records', 'classification_attempts',
+                  'classification_proof_work',
+                  'classification_routing_outcomes',
+                  'recommendation_opportunities',
+                  'recommendation_completed_searches'
+              )
+            """
+        ).fetchall()
+    assert dict(force_rl_rows) == {
+        "source_event_records": True,
+        "classification_attempts": True,
+        "classification_proof_work": True,
+        "classification_routing_outcomes": True,
+        "recommendation_opportunities": True,
+        "recommendation_completed_searches": True,
+    }
     system.reset()
 
 

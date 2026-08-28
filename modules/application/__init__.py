@@ -12493,6 +12493,35 @@ class RuntimeApplication:
             raise RuntimeProcessingError from error
         return True
 
+    def _admit_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: ClassifierAdapterResult,
+        started_at: datetime,
+    ) -> bool:
+        """Consume stale classifier work without crossing the model boundary."""
+        admitted = self.store.begin_classification_attempt(
+            incoming=incoming,
+            attempt=attempt,
+            result=result,
+            started_at=started_at,
+        )
+        if admitted:
+            return True
+        self.store.consume(
+            incoming=incoming,
+            supported_versions=self.versions_for(incoming.contract_name),
+            received_at=self.clock.now(),
+            outgoing=None,
+        )
+        return False
+
+    def _abort_classification_attempt_admission(self) -> None:
+        """Release the model-boundary lock when a worker is interrupted."""
+        self.store.abort_classification_attempt_admission()
+
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
@@ -12631,12 +12660,13 @@ class RuntimeApplication:
             attempt_number=primary_attempt_number,
             input_manifest_hash=input_manifest_hash,
         )
-        self.store.begin_classification_attempt(
+        if not self._admit_classification_attempt(
             incoming=incoming,
             attempt=primary_started_attempt,
             result=primary_started_result,
             started_at=self.clock.now(),
-        )
+        ):
+            return
         try:
             result = self.model.classify(request)
         except Exception as error:
@@ -12680,6 +12710,9 @@ class RuntimeApplication:
                 circuit_retry_at=circuit_retry_at,
             )
             return
+        except BaseException:
+            self._abort_classification_attempt_admission()
+            raise
         result_disposition = result.output.get("disposition")
         disposition = (
             result_disposition
@@ -12854,12 +12887,13 @@ class RuntimeApplication:
                 input_manifest_hash=proof_input_manifest_hash,
                 candidate_key=proof_candidate_key,
             )
-            self.store.begin_classification_attempt(
+            if not self._admit_classification_attempt(
                 incoming=incoming,
                 attempt=proof_started_attempt,
                 result=proof_started_result,
                 started_at=self.clock.now(),
-            )
+            ):
+                return
             try:
                 semantic_proof_result = self.model.semantic_proof(
                     semantic_proof_request
@@ -12908,6 +12942,9 @@ class RuntimeApplication:
                     circuit_retry_at=circuit_retry_at,
                 )
                 return
+            except BaseException:
+                self._abort_classification_attempt_admission()
+                raise
             semantic_proof_recorded_result = replace(
                 semantic_proof_result,
                 duration_ms=_nonnegative_metric_or_zero(
@@ -13333,12 +13370,13 @@ class RuntimeApplication:
                 attempt_number=primary_attempt_number,
                 input_manifest_hash=attempt_manifest_hash,
             )
-            self.store.begin_classification_attempt(
+            if not self._admit_classification_attempt(
                 incoming=incoming,
                 attempt=started_attempt,
                 result=started_result,
                 started_at=self.clock.now(),
-            )
+            ):
+                return
             try:
                 primary_result = self.model.classify(request)
             except Exception as error:
@@ -13382,6 +13420,9 @@ class RuntimeApplication:
                     circuit_retry_at=circuit_retry_at,
                 )
                 return
+            except BaseException:
+                self._abort_classification_attempt_admission()
+                raise
             primary_valid = primary_result_is_valid(primary_result)
             primary_attempts = (
                 ClassificationAttempt(
@@ -13548,12 +13589,13 @@ class RuntimeApplication:
                     attempt_number=second_attempt_number,
                 ),
             )
-            self.store.begin_classification_attempt(
+            if not self._admit_classification_attempt(
                 incoming=incoming,
                 attempt=second_started_attempt,
                 result=second_started_result,
                 started_at=self.clock.now(),
-            )
+            ):
+                return
             try:
                 second_result = self.model.classify(second_request)
             except Exception as error:
@@ -13633,6 +13675,9 @@ class RuntimeApplication:
                         circuit_retry_at=circuit_retry_at,
                     )
                 return
+            except BaseException:
+                self._abort_classification_attempt_admission()
+                raise
             second_valid = (
                 _classifier_adapter_result_has_complete_provenance(second_result)
                 and second_result.effective_model == "gpt-5.6-sol"
@@ -13940,12 +13985,13 @@ class RuntimeApplication:
                         input_manifest_hash=proof_manifest_hash,
                         candidate_key=candidate_key,
                     )
-                    self.store.begin_classification_attempt(
+                    if not self._admit_classification_attempt(
                         incoming=incoming,
                         attempt=proof_started_attempt,
                         result=proof_started_result,
                         started_at=self.clock.now(),
-                    )
+                    ):
+                        return
                     try:
                         proof_result = self.model.semantic_proof(proof_request)
                     except Exception as error:
@@ -13969,6 +14015,9 @@ class RuntimeApplication:
                                 existing_circuit.probe_count if existing_circuit else 0
                             ),
                         )
+                    except BaseException:
+                        self._abort_classification_attempt_admission()
+                        raise
                     else:
                         proof_recorded_result = replace(
                             proof_result,

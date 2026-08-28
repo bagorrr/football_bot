@@ -910,8 +910,16 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         attempt: ClassificationAttempt,
         result: ClassifierAdapterResult,
         started_at: datetime,
-    ) -> None:
-        """Persist an execution identity before crossing the model boundary."""
+    ) -> bool:
+        """Admit and persist work before crossing the model boundary.
+
+        ``False`` means that the Source Message deletion barrier won the
+        lifecycle race.  In that case the caller must not invoke the model.
+        """
+        ...
+
+    def abort_classification_attempt_admission(self) -> None:
+        """Release an admitted model boundary after worker interruption."""
         ...
 
     def classification_attempts_for_revision(

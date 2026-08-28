@@ -195,7 +195,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "85436cdbd933795eb6b27b20b1cfcc84338dbba14c59918b3c0a77d1243ad972",
     "7fddc4d44988b3f0cfec72a370c13e92ff284ad2dafe747c4e4655a8f5bbc54a",
     "beb5dce7b1fa0769b37066e90a134f82cb122505e879b430978409013121bded",
-    "5e5be9ffee69af6610c174db1e51a4b86cefda07af80ffd55661243a44e23e65",
+    "2c28d8b9d44edbc3d570de8002ecab4bf3b7c818cdddf5b718d484dc6d23b16d",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -2289,6 +2289,9 @@ class PostgresRoleStore:
         self._database_url = database_url
         self._promotion_gate_database_url = promotion_gate_database_url
         self._search_snapshot_hook: Callable[[], None] | None = None
+        self._classification_admission_context: Any | None = None
+        self._classification_admission_connection: psycopg.Connection[Any] | None = None
+        self._classification_admission_source_message_id: str | None = None
 
     @property
     def role(self) -> RuntimeRole:
@@ -3561,7 +3564,7 @@ class PostgresRoleStore:
             )
             existing_source_message = connection.execute(
                 """
-                SELECT tombstoned, bounded_metadata
+                SELECT tombstoned, bounded_metadata, current_revision
                 FROM football_runtime.source_messages
                 WHERE source_message_id = %s
                 FOR UPDATE
@@ -3592,6 +3595,16 @@ class PostgresRoleStore:
                 (existing_source_message is not None and existing_source_message[0])
                 or deletion_barrier_active
             ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            if (
+                event_kind == SourceEventKind.DELETE.value
+                and existing_source_message is not None
+                and existing_source_message[2] >= incoming.subject_revision
+            ):
+                # A lower or equal delete is stale once a newer current row is
+                # durable.  It must not create a history row or activate a
+                # tombstone that could scrub the newer revision.
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             incoming_bounded_metadata = payload.get(
@@ -4522,6 +4535,67 @@ class PostgresRoleStore:
                 (presented_at, self._role.value, message_id),
             )
 
+    @contextmanager
+    def _classification_attempt_transaction(
+        self,
+    ) -> Iterator[psycopg.Connection[Any]]:
+        """Keep the Source Message admission lock through model terminalization."""
+        admission_context = self._classification_admission_context
+        admission_connection = self._classification_admission_connection
+        if admission_context is None or admission_connection is None:
+            with psycopg.connect(self._database_url) as connection:
+                yield connection
+            return
+        try:
+            yield admission_connection
+        except BaseException:
+            self._finish_classification_admission(
+                connection=admission_connection,
+                context=admission_context,
+                commit=False,
+            )
+            raise
+        else:
+            self._finish_classification_admission(
+                connection=admission_connection,
+                context=admission_context,
+                commit=True,
+            )
+
+    def _finish_classification_admission(
+        self,
+        *,
+        connection: psycopg.Connection[Any],
+        context: Any,
+        commit: bool,
+    ) -> None:
+        """Commit terminal work, then release the session-level lifecycle lock."""
+        source_message_id = self._classification_admission_source_message_id
+        try:
+            if commit:
+                connection.commit()
+            else:
+                connection.rollback()
+            if not connection.closed and source_message_id is not None:
+                unlocked = connection.execute(
+                    """
+                    SELECT pg_advisory_unlock(
+                        hashtextextended(%s, 0)
+                    )
+                    """,
+                    (f"source-message-lifecycle:{source_message_id}",),
+                ).fetchone()
+                if unlocked is None or not unlocked[0]:
+                    raise RuntimeError("Source Message admission lock was not held")
+                connection.commit()
+        finally:
+            try:
+                context.__exit__(None, None, None)
+            finally:
+                self._classification_admission_context = None
+                self._classification_admission_connection = None
+                self._classification_admission_source_message_id = None
+
     def record_classification_attempt(
         self,
         *,
@@ -4547,7 +4621,7 @@ class PostgresRoleStore:
             raise ValueError("a terminal classifier attempt cannot be rescheduled")
         if circuit_state not in {None, "authentication_open", "quota_open"}:
             raise ValueError("classifier circuit state is invalid")
-        with psycopg.connect(self._database_url) as connection:
+        with self._classification_attempt_transaction() as connection:
             if finalize and not _begin_owned_contract(
                 connection,
                 consumer=self._role,
@@ -4747,11 +4821,37 @@ class PostgresRoleStore:
         attempt: ClassificationAttempt,
         result: Any,
         started_at: datetime,
-    ) -> None:
-        """Commit one body-free attempt before the external model call."""
+    ) -> bool:
+        """Admit one attempt while serializing deletion with the model call."""
         if self._role is not RuntimeRole.CLASSIFICATION:
             raise ConversationAccessDeniedError
-        with psycopg.connect(self._database_url) as connection:
+        source_message_id = _source_message_id_for_lifecycle(
+            attempt.source_message_revision_id
+        )
+        if self._classification_admission_connection is not None:
+            if self._classification_admission_source_message_id != source_message_id:
+                self._finish_classification_admission(
+                    connection=self._classification_admission_connection,
+                    context=self._classification_admission_context,
+                    commit=False,
+                )
+                raise RuntimeError(
+                    "one classification store cannot admit two Source Messages"
+                )
+            connection = self._classification_admission_connection
+            barrier = connection.execute(
+                """
+                SELECT football_runtime.source_message_deletion_barrier(%s)
+                """,
+                (source_message_id,),
+            ).fetchone()
+            if barrier is not None and barrier[0]:
+                self._finish_classification_admission(
+                    connection=connection,
+                    context=self._classification_admission_context,
+                    commit=False,
+                )
+                return False
             connection.execute(
                 """
                 INSERT INTO football_runtime.classification_attempts (
@@ -4792,6 +4892,91 @@ class PostgresRoleStore:
                     started_at,
                 ),
             )
+            connection.commit()
+            return True
+
+        context = psycopg.connect(self._database_url)
+        connection = context.__enter__()
+        try:
+            connection.execute(
+                """
+                SELECT pg_advisory_lock(
+                    hashtextextended(%s, 0)
+                )
+                """,
+                (f"source-message-lifecycle:{source_message_id}",),
+            )
+            barrier = connection.execute(
+                """
+                SELECT football_runtime.source_message_deletion_barrier(%s)
+                """,
+                (source_message_id,),
+            ).fetchone()
+            if barrier is not None and barrier[0]:
+                connection.rollback()
+                context.__exit__(None, None, None)
+                return False
+            connection.execute(
+                """
+                INSERT INTO football_runtime.classification_attempts (
+                    attempt_id, source_message_revision_id, requested_model,
+                    effective_model, requested_reasoning_effort,
+                    effective_reasoning_effort, prompt_version, schema_version,
+                    glossary_version, context_policy_version,
+                    routing_policy_version, codex_version, adapter_kind,
+                    adapter_version, pass_number, pass_kind, attempt_number,
+                    input_manifest_hash, evidence_references, duration_ms,
+                    input_tokens, output_tokens, disposition, status, recorded_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, '[]'::jsonb, 0, 0, 0,
+                    %s, 'failed', %s
+                ) ON CONFLICT (attempt_id) DO NOTHING
+                """,
+                (
+                    attempt.attempt_id,
+                    attempt.source_message_revision_id,
+                    attempt.requested_model,
+                    attempt.effective_model,
+                    attempt.requested_reasoning_effort,
+                    attempt.effective_reasoning_effort,
+                    attempt.prompt_version,
+                    attempt.schema_version,
+                    attempt.glossary_version,
+                    attempt.context_policy_version,
+                    attempt.routing_policy_version,
+                    result.codex_version,
+                    result.adapter_kind,
+                    result.adapter_version,
+                    attempt.pass_number,
+                    attempt.pass_kind,
+                    attempt.attempt_number,
+                    attempt.input_manifest_hash,
+                    attempt.disposition,
+                    started_at,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            context.__exit__(None, None, None)
+            raise
+        self._classification_admission_context = context
+        self._classification_admission_connection = connection
+        self._classification_admission_source_message_id = source_message_id
+        return True
+
+    def abort_classification_attempt_admission(self) -> None:
+        """Release a durable admission after an unhandled worker interruption."""
+        admission_connection = self._classification_admission_connection
+        admission_context = self._classification_admission_context
+        if admission_connection is None or admission_context is None:
+            return
+        self._finish_classification_admission(
+            connection=admission_connection,
+            context=admission_context,
+            commit=False,
+        )
 
     def close_classifier_authentication_circuit(
         self, *, adapter_kind: str, closed_at: datetime
