@@ -1828,8 +1828,8 @@ def _exact_repost_snapshot(probe: DurableAcceptanceProbe) -> dict[str, JsonValue
             for event in probe.system.source_events()
             if event.source_message_id in source_message_ids
         )
-        latest_recorded_at = max(
-            (event.recorded_at for event in source_events),
+        latest_source_event_at = max(
+            (event.event_time for event in source_events),
             default=cluster.freshness_renewed_at,
         )
         cluster_values.append(
@@ -1851,7 +1851,8 @@ def _exact_repost_snapshot(probe: DurableAcceptanceProbe) -> dict[str, JsonValue
                 "publication_state": cluster.publication_state,
                 "moderation_state": cluster.moderation_state,
                 "freshness_renewed_at": cluster.freshness_renewed_at.isoformat(),
-                "freshness_renewed": cluster.freshness_renewed_at == latest_recorded_at,
+                "freshness_renewed": cluster.freshness_renewed_at
+                == latest_source_event_at,
                 "members": member_values,
             }
         )
@@ -2069,6 +2070,33 @@ def _operation_source(operation: dict[str, JsonValue], body: str) -> str:
     return source if isinstance(source, str) else body
 
 
+def _edit_freshness_was_advanced(
+    *,
+    before_cluster: dict[str, JsonValue],
+    current_cluster: dict[str, JsonValue] | None,
+) -> bool:
+    """Report an edit-time freshness transition from durable cluster clocks."""
+    if current_cluster is None:
+        return False
+    before_value = before_cluster.get("freshness_renewed_at")
+    current_value = current_cluster.get("freshness_renewed_at")
+    if not isinstance(before_value, str) or not isinstance(current_value, str):
+        return False
+    try:
+        before_at = datetime.fromisoformat(before_value)
+        current_at = datetime.fromisoformat(current_value)
+    except ValueError:
+        return False
+    if (
+        before_at.tzinfo is None
+        or before_at.utcoffset() is None
+        or current_at.tzinfo is None
+        or current_at.utcoffset() is None
+    ):
+        return False
+    return current_at > before_at
+
+
 def _edit_durable_metrics(
     probe: DurableAcceptanceProbe,
     *,
@@ -2192,10 +2220,9 @@ def _edit_durable_metrics(
         "new_cluster_member_count": new_cluster_member_count,
         "old_cluster_empty": not old_members,
         "key_unchanged": current_cluster_id == old_cluster_id,
-        "freshness_renewed": bool(
-            current_member is not None
-            and current_cluster is not None
-            and current_cluster.get("freshness_renewed") is True
+        "freshness_renewed": _edit_freshness_was_advanced(
+            before_cluster=before_cluster,
+            current_cluster=current_cluster,
         ),
         "current_publication_reason": (
             current_opportunity.publication_reason

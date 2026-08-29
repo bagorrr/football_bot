@@ -1,5 +1,5 @@
 {
-  "suite_version": "player-match-lifecycle-failure-v7",
+  "suite_version": "player-match-lifecycle-failure-v8",
   "status": "reviewed",
   "scope": "Specification #38 executable controlled lifecycle and failure testing",
   "families": [
@@ -152,7 +152,7 @@
             "new_cluster_member_count": 0,
             "old_cluster_empty": false,
             "key_unchanged": true,
-            "freshness_renewed": true,
+            "freshness_renewed": false,
             "current_publication_reason": null,
             "current_representative_is_current": true
           }

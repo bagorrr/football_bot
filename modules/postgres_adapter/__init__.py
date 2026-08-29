@@ -215,7 +215,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a27d6cea76ab1811eda37d53bea5c76550282e5b2539a4bf245f5d942623a630",
     "0a280649e65244326c7d6f0a10f08db29c00fc609e73f67ef4f22bd5aadfc38f",
     "b222c3c6a41130b4062f671de0c4a4706fdf7b13c1a09ba50a6cf8929934a161",
-    "0000000000000000000000000000000000000000000000000000000000000000",
+    "7626882c2b8c0e13f539157963ee4406d3cb704901efd7a830e11365f6fa459d",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -9934,14 +9934,21 @@ def _result_card_facts_with_current_publication_state(
         result.pop("response_route_value", None)
         return result
     current_facts = current_projection.get("current_facts")
+    # Legacy Open Match cards predate the public opportunity_type field.  The
+    # renderer already treats an otherwise-untyped generic card as Open Match;
+    # use the same bounded default for freshness evaluation so expiry does not
+    # accidentally turn an active card into a route-less payload.
+    effective_opportunity_type = (
+        opportunity_type if isinstance(opportunity_type, str) else "open_match"
+    )
     publication_state = (
         opportunity_publication_state_as_of(
             current_facts,
-            opportunity_type=opportunity_type,
+            opportunity_type=effective_opportunity_type,
             current_publication_state=current_projection.get("publication_state"),
             as_of=as_of,
         )
-        if isinstance(opportunity_type, str) and isinstance(current_facts, Mapping)
+        if isinstance(current_facts, Mapping)
         else "suppressed"
     )
     result = {**card_facts, "publication_state": publication_state}
