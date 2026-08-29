@@ -23,6 +23,7 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg import conninfo, sql
 
+from modules.classifier_contract import classifier_artifact_descriptor_for_provenance
 from modules.contracts import JsonValue
 
 PLAYER_CLASSIFIER_RELEASE_NAME = "player-match-evaluation-v1"
@@ -212,6 +213,26 @@ _FAILURE_EXECUTION_PATHS = {
         "duplicate_delivery_ignored",
     ),
 }
+
+_PUBLISHABLE_OPPORTUNITY_TYPES = frozenset(
+    {
+        "open_match",
+        "player_match_availability",
+        "tournament",
+        "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
+        "coach_availability",
+        "coach_request",
+        "referee_availability",
+        "referee_request",
+    }
+)
+
+
+def _is_publishable_opportunity_type(value: JsonValue) -> bool:
+    """Check an untrusted value without hashing a potentially unhashable JSON value."""
+    return isinstance(value, str) and value in _PUBLISHABLE_OPPORTUNITY_TYPES
 
 
 @dataclass(frozen=True, slots=True)
@@ -895,6 +916,8 @@ __all__ = [
     "ControlledPlayerClassifierAdapter",
     "DurableAcceptanceProbe",
     "canonical_replay_digest",
+    "classifier_promotion_is_approved",
+    "classifier_proposal_contains_publication",
     "compare_failure_observation",
     "compare_lifecycle_observation",
     "compare_recorded_observation",
@@ -1683,6 +1706,23 @@ def player_classifier_proposal_contains_player(
     return False
 
 
+def classifier_proposal_contains_publication(
+    payload: dict[str, JsonValue],
+) -> bool:
+    """Return whether an untrusted proposal contains a publishable candidate."""
+    if _is_publishable_opportunity_type(payload.get("opportunity_type")):
+        return True
+    output = payload.get("output")
+    if not isinstance(output, dict) or output.get("disposition") != "accepted":
+        return False
+    candidates = output.get("candidates")
+    return isinstance(candidates, list) and any(
+        isinstance(candidate, dict)
+        and _is_publishable_opportunity_type(candidate.get("opportunity_type"))
+        for candidate in candidates
+    )
+
+
 def player_classifier_promotion_is_approved(
     approval: JsonValue,
     *,
@@ -1738,3 +1778,56 @@ def player_classifier_promotion_is_approved(
         "classification_status": "succeeded",
     }
     return all(proposal.get(key) == value for key, value in expected_provenance.items())
+
+
+def classifier_promotion_is_approved(
+    approval: JsonValue,
+    *,
+    proposal: dict[str, JsonValue] | None = None,
+    contract_envelope_version: int | None = None,
+) -> bool:
+    """Validate shared promotion evidence and the proposal's trusted artifact.
+
+    The reviewed contract is shared by every canonical Opportunity Type.  The
+    proposal still has to bind itself to one of the immutable classifier
+    descriptors shipped by the application, so approval cannot be replayed for
+    an unknown prompt, schema, routing policy, model, or reasoning setting.
+    """
+    if not player_classifier_promotion_is_approved(approval):
+        return False
+    if proposal is None:
+        return True
+    try:
+        release = describe_player_classifier_release()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
+        return False
+    if not all(
+        proposal.get(key) == expected
+        for key, expected in {
+            "requested_model": release.requested_model,
+            "effective_model": release.requested_model,
+            "requested_reasoning_effort": release.requested_reasoning_effort,
+            "effective_reasoning_effort": release.requested_reasoning_effort,
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": "classifier-context-v1",
+            "classification_status": "succeeded",
+        }.items()
+    ):
+        return False
+    prompt_version = proposal.get("prompt_version")
+    schema_version = proposal.get("schema_version")
+    routing_policy_version = proposal.get("routing_policy_version")
+    if not all(
+        isinstance(value, str)
+        for value in (prompt_version, schema_version, routing_policy_version)
+    ):
+        return False
+    return (
+        classifier_artifact_descriptor_for_provenance(
+            prompt_version=cast(str, prompt_version),
+            schema_version=cast(str, schema_version),
+            routing_policy_version=cast(str, routing_policy_version),
+            contract_envelope_version=contract_envelope_version,
+        )
+        is not None
+    )

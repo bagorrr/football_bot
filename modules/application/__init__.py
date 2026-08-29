@@ -29,7 +29,8 @@ from modules.classifier_contract import (
 )
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
-    player_classifier_promotion_is_approved,
+    classifier_promotion_is_approved,
+    classifier_proposal_contains_publication,
     player_classifier_proposal_contains_player,
 )
 from modules.contracts import (
@@ -16291,12 +16292,17 @@ class RuntimeApplication:
         }
         if (
             incoming.contract_version not in {4, 5, 6, 7}
-            and player_classifier_proposal_contains_player(authoritative_payload)
-            and not player_classifier_promotion_is_approved(
+            and classifier_proposal_contains_publication(authoritative_payload)
+            and (
+                _classifier_promotion_required(self.store)
+                or player_classifier_proposal_contains_player(authoritative_payload)
+            )
+            and not classifier_promotion_is_approved(
                 self.store.classifier_release_promotion(
                     release_name=PLAYER_CLASSIFIER_RELEASE_NAME
                 ),
                 proposal=authoritative_payload,
+                contract_envelope_version=incoming.contract_version,
             )
         ):
             self._record_classification_routing_outcome(
@@ -16417,14 +16423,18 @@ class RuntimeApplication:
                     received_at=self.clock.now(),
                 )
                 return
-            if player_classifier_proposal_contains_player(
-                authoritative_payload
-            ) and not (
-                player_classifier_promotion_is_approved(
+            if (
+                classifier_proposal_contains_publication(authoritative_payload)
+                and (
+                    _classifier_promotion_required(self.store)
+                    or player_classifier_proposal_contains_player(authoritative_payload)
+                )
+                and not classifier_promotion_is_approved(
                     self.store.classifier_release_promotion(
                         release_name=PLAYER_CLASSIFIER_RELEASE_NAME
                     ),
                     proposal=authoritative_payload,
+                    contract_envelope_version=incoming.contract_version,
                 )
             ):
                 self._record_classification_routing_outcome(
@@ -18976,6 +18986,11 @@ def _classifier_proposal_has_pinned_provenance(
 def _classifier_model_uses_player_release(model: ModelAdapter) -> bool:
     """Identify the Player artifact set from the adapter's trusted descriptor."""
     return model.artifact_descriptor.artifact_family == "player_match_availability"
+
+
+def _classifier_promotion_required(store: object) -> bool:
+    """Read the controlled test-harness compatibility switch, fail-closed."""
+    return bool(getattr(store, "require_classifier_promotion", True))
 
 
 def _classifier_artifact_descriptor_for_payload(

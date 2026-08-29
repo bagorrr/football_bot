@@ -8,6 +8,16 @@ from typing import cast
 
 import pytest
 
+from modules import classifier_promotion
+from modules.classifier_contract import (
+    OPEN_MATCH_V1_DESCRIPTOR,
+    OPEN_MATCH_V2_DESCRIPTOR,
+    OPEN_MATCH_V3_DESCRIPTOR,
+    OPEN_MATCH_V4_DESCRIPTOR,
+    OPEN_MATCH_V5_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR,
+)
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
     describe_player_classifier_release,
@@ -133,3 +143,96 @@ def test_player_publication_methods_fail_closed_on_exact_approval_mismatch(
                 outgoing=outgoing,
                 received_at=datetime.now(UTC),
             )
+
+
+@pytest.mark.parametrize(
+    "opportunity_type",
+    [
+        "open_match",
+        "player_match_availability",
+        "tournament",
+        "opponent_request",
+        "roster_vacancy",
+        "player_transfer_availability",
+        "coach_availability",
+        "coach_request",
+        "referee_availability",
+        "referee_request",
+    ],
+)
+def test_classifier_publication_methods_fail_closed_without_promotion(
+    opportunity_type: str,
+) -> None:
+    """Every accepted Source Chat type requires the same promotion evidence."""
+    store = _PublicationStoreDouble(None)
+    incoming = cast(
+        ContractEnvelope,
+        SimpleNamespace(payload={"classification_status": "succeeded"}),
+    )
+    with pytest.raises(ValueError, match="cannot publish"):
+        PostgresRoleStore.publish_opportunity(
+            cast(PostgresRoleStore, store),
+            incoming=incoming,
+            opportunity={"opportunity_type": opportunity_type},
+            outgoing=cast(ContractEnvelope, SimpleNamespace()),
+            received_at=datetime.now(UTC),
+        )
+
+
+def test_shared_promotion_approval_binds_all_trusted_artifact_versions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Promotion evidence cannot be replayed for an unknown artifact tuple."""
+    monkeypatch.setattr(
+        classifier_promotion,
+        "player_classifier_promotion_is_approved",
+        lambda approval: True,
+    )
+    descriptors = (
+        OPEN_MATCH_V1_DESCRIPTOR,
+        OPEN_MATCH_V2_DESCRIPTOR,
+        OPEN_MATCH_V3_DESCRIPTOR,
+        OPEN_MATCH_V4_DESCRIPTOR,
+        OPEN_MATCH_V5_DESCRIPTOR,
+        PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+        PLAYER_MATCH_AVAILABILITY_V2_DESCRIPTOR,
+    )
+    for descriptor in descriptors:
+        proposal: dict[str, JsonValue] = {
+            "requested_model": "gpt-5.6-sol",
+            "effective_model": "gpt-5.6-sol",
+            "requested_reasoning_effort": "high",
+            "effective_reasoning_effort": "high",
+            "prompt_version": descriptor.primary_prompt_version,
+            "schema_version": descriptor.primary_schema_version,
+            "glossary_version": "football-opportunity-glossary-v1",
+            "context_policy_version": "classifier-context-v1",
+            "routing_policy_version": descriptor.routing_policy_version,
+            "classification_status": "succeeded",
+        }
+        assert classifier_promotion.classifier_promotion_is_approved(
+            {},
+            proposal=proposal,
+            contract_envelope_version=descriptor.contract_envelope_version,
+        )
+
+        proposal["routing_policy_version"] = "classifier-routing-tampered-v1"
+        assert not classifier_promotion.classifier_promotion_is_approved(
+            {},
+            proposal=proposal,
+            contract_envelope_version=descriptor.contract_envelope_version,
+        )
+
+
+@pytest.mark.parametrize("malformed_type", [[], {}])
+def test_classifier_publication_detector_fails_closed_on_unhashable_type(
+    malformed_type: JsonValue,
+) -> None:
+    """Adversarial JSON cannot turn publication detection into an exception."""
+    payload: dict[str, JsonValue] = {
+        "output": {
+            "disposition": "accepted",
+            "candidates": [{"opportunity_type": malformed_type}],
+        }
+    }
+    assert not classifier_promotion.classifier_proposal_contains_publication(payload)

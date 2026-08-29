@@ -2327,6 +2327,22 @@ class AcceptanceSpine:
             release_name=PLAYER_CLASSIFIER_RELEASE_NAME
         )
 
+    def record_classifier_promotion(
+        self,
+        *,
+        release_fingerprint: str | None = None,
+        state: str = "approved",
+    ) -> None:
+        """Run and record the reviewed classifier promotion gate."""
+        self.record_player_classifier_promotion(
+            release_fingerprint=release_fingerprint,
+            state=state,
+        )
+
+    def classifier_promotion(self) -> dict[str, JsonValue] | None:
+        """Observe shared classifier promotion evidence through Application."""
+        return self.player_classifier_promotion()
+
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()
@@ -4120,6 +4136,7 @@ def boot_acceptance_spine(
     *,
     admin_database_url: str,
     clock: Clock,
+    require_classifier_promotion: bool = False,
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
@@ -4129,7 +4146,12 @@ def boot_acceptance_spine(
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
 ) -> AcceptanceSpine:
-    """Provision the administrative test seam and boot each role separately."""
+    """Provision the administrative test seam and boot each role separately.
+
+    Legacy controlled fixtures keep their pre-promotion behavior by default;
+    the real acceptance composition and the PostgreSQL store default to the
+    fail-closed classifier promotion requirement.
+    """
     from apps.system_acceptance import boot_acceptance_role
     from modules.postgres_adapter import (
         PostgresAcceptanceMigrator,
@@ -4172,6 +4194,7 @@ def boot_acceptance_spine(
             role=role,
             database_url=role_urls[role],
             promotion_gate_database_url=admin_database_url,
+            require_classifier_promotion=require_classifier_promotion,
             clock=clock,
             telegram_ingestion=(
                 controlled_ingestion if role is RuntimeRole.INGESTION else None

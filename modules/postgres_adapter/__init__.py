@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
     canonical_replay_digest,
+    classifier_promotion_is_approved,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
@@ -2410,10 +2411,12 @@ class PostgresRoleStore:
         database_url: str,
         *,
         promotion_gate_database_url: str | None = None,
+        require_classifier_promotion: bool = True,
     ) -> None:
         self._role = role
         self._database_url = database_url
         self._promotion_gate_database_url = promotion_gate_database_url
+        self._require_classifier_promotion = require_classifier_promotion
         self._search_snapshot_hook: Callable[[], None] | None = None
         self._classification_admission_context: Any | None = None
         self._classification_admission_connection: psycopg.Connection[Any] | None = None
@@ -2423,6 +2426,11 @@ class PostgresRoleStore:
     def role(self) -> RuntimeRole:
         """Return the sole owner represented by this store."""
         return self._role
+
+    @property
+    def require_classifier_promotion(self) -> bool:
+        """Return whether every classifier publication needs promotion evidence."""
+        return self._require_classifier_promotion
 
     def commit_initial(
         self,
@@ -5826,28 +5834,33 @@ class PostgresRoleStore:
                 ),
             )
 
-    def _ensure_player_publication_approval(
+    def _ensure_classifier_publication_approval(
         self,
         *,
         incoming: ContractEnvelope,
         opportunities: Iterable[dict[str, JsonValue]],
     ) -> None:
-        """Keep the persistence boundary fail-closed for Player publications."""
-        if not any(
+        """Keep the Application publication boundary fail-closed for all types."""
+        opportunity_values = tuple(opportunities)
+        if not opportunity_values:
+            return
+        if not getattr(self, "_require_classifier_promotion", True) and not any(
             opportunity.get("opportunity_type") == "player_match_availability"
-            for opportunity in opportunities
+            for opportunity in opportunity_values
         ):
             return
         proposal = incoming.payload
-        if not isinstance(
-            proposal, dict
-        ) or not player_classifier_promotion_is_approved(
+        if not isinstance(proposal, dict) or not classifier_promotion_is_approved(
             self.classifier_release_promotion(
                 release_name=PLAYER_CLASSIFIER_RELEASE_NAME,
             ),
             proposal=proposal,
+            contract_envelope_version=getattr(incoming, "contract_version", None),
         ):
-            raise ValueError("unapproved Player classifier release cannot publish")
+            raise ValueError("unapproved classifier release cannot publish")
+
+    # Preserve the established private seam used by Player promotion tests.
+    _ensure_player_publication_approval = _ensure_classifier_publication_approval
 
     def proposition_opportunity_ids(
         self, source_message_id: str
