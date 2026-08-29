@@ -173,6 +173,7 @@ def test_historical_referee_card_uses_current_source_timestamps() -> None:
     overlaid = _result_card_facts_with_current_publication_state(
         dict(_result().card_facts),
         {
+            "opportunity_id": "opportunity:referee-current",
             "opportunity_revision_id": "opportunity:referee-card:revision:2",
             "publication_state": "suppressed",
             "current_facts": {
@@ -186,6 +187,8 @@ def test_historical_referee_card_uses_current_source_timestamps() -> None:
         as_of=datetime(2026, 8, 22, tzinfo=UTC),
     )
 
+    assert overlaid["opportunity_id"] == "opportunity:referee-current"
+    assert overlaid["opportunity_revision_id"] == "opportunity:referee-card:revision:2"
     assert overlaid["source_posted_at"] == "2026-08-20T08:00:00+00:00"
     assert overlaid["source_edited_at"] == "2026-08-21T08:00:00+00:00"
     assert overlaid["source_qualifying_assertion_at"] == ("2026-08-21T08:00:00+00:00")

@@ -110,6 +110,8 @@ from modules.domain import (
     evaluate_transfer_search,
     is_valid_opaque_source_publisher_id,
     normalize_exact_repost_text,
+    opportunity_freshness_is_current,
+    opportunity_publication_state_as_of,
     referee_publication_state_as_of,
     render_response_route,
     source_publisher_id_from_metadata,
@@ -168,6 +170,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0038_coaching_source_chat_projection_gate.sql",
     "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
     "0040_coaching_ingestion_role_projection_gate.sql",
+    "0041_exact_repost_referee_generic_projection.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -212,6 +215,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a27d6cea76ab1811eda37d53bea5c76550282e5b2539a4bf245f5d942623a630",
     "0a280649e65244326c7d6f0a10f08db29c00fc609e73f67ef4f22bd5aadfc38f",
     "b222c3c6a41130b4062f671de0c4a4706fdf7b13c1a09ba50a6cf8929934a161",
+    "0000000000000000000000000000000000000000000000000000000000000000",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -2096,8 +2100,23 @@ class PostgresAcceptanceObserver:
                                           'confirmed'
                                 ) AS source_chat_enabled
                             ) AS source_chat
-                            WHERE recommendation.opportunity_id =
-                                      result.card_facts->>'opportunity_id'
+                            WHERE recommendation.opportunity_id = COALESCE(
+                                (
+                                    SELECT cluster.representative_opportunity_id
+                                    FROM football_runtime
+                                        .application_exact_repost_cluster_members
+                                        AS member
+                                    JOIN football_runtime
+                                        .application_exact_repost_clusters AS cluster
+                                      ON cluster.exact_repost_cluster_id =
+                                         member.exact_repost_cluster_id
+                                    WHERE member.opportunity_id =
+                                          result.card_facts->>'opportunity_id'
+                                      AND cluster.representative_opportunity_id
+                                          IS NOT NULL
+                                ),
+                                result.card_facts->>'opportunity_id'
+                            )
                               AND recommendation.opportunity_type =
                                       result.card_facts->>'opportunity_type'
                               AND recommendation.opportunity_type IN (
@@ -2135,8 +2154,23 @@ class PostgresAcceptanceObserver:
                                         recommendation.opportunity_id
                                     ) AS source_deleted
                             ) AS source_lifecycle
-                            WHERE recommendation.opportunity_id =
-                                      result.card_facts->>'opportunity_id'
+                            WHERE recommendation.opportunity_id = COALESCE(
+                                (
+                                    SELECT cluster.representative_opportunity_id
+                                    FROM football_runtime
+                                        .application_exact_repost_cluster_members
+                                        AS member
+                                    JOIN football_runtime
+                                        .application_exact_repost_clusters AS cluster
+                                      ON cluster.exact_repost_cluster_id =
+                                         member.exact_repost_cluster_id
+                                    WHERE member.opportunity_id =
+                                          result.card_facts->>'opportunity_id'
+                                      AND cluster.representative_opportunity_id
+                                          IS NOT NULL
+                                ),
+                                result.card_facts->>'opportunity_id'
+                            )
                               AND COALESCE(
                                   result.card_facts->>'opportunity_type', ''
                               ) NOT IN (
@@ -9803,17 +9837,12 @@ def _result_card_facts_with_current_publication_state(
         if not isinstance(current_facts, Mapping) or current_projection is None:
             publication_state = "suppressed"
         else:
-            state = current_projection.get("publication_state")
-            if state not in {"active", "held_for_review", "suppressed", "expired"}:
-                publication_state = "suppressed"
-            elif state != "active":
-                publication_state = state
-            elif _exact_repost_candidate_is_fresh(
-                str(card_facts["opportunity_type"]), current_facts, as_of=as_of
-            ):
-                publication_state = "active"
-            else:
-                publication_state = "expired"
+            publication_state = opportunity_publication_state_as_of(
+                current_facts,
+                opportunity_type=str(card_facts["opportunity_type"]),
+                current_publication_state=current_projection.get("publication_state"),
+                as_of=as_of,
+            )
         result = {
             **card_facts,
             "publication_state": publication_state,
@@ -9851,6 +9880,7 @@ def _result_card_facts_with_current_publication_state(
             **card_facts,
             "publication_state": publication_state,
         }
+        _overlay_current_result_projection(result, current_projection)
         for timestamp_key in (
             "source_posted_at",
             "source_edited_at",
@@ -9903,12 +9933,19 @@ def _result_card_facts_with_current_publication_state(
         result.pop("response_route_kind", None)
         result.pop("response_route_value", None)
         return result
-    current_publication_state = current_projection.get("publication_state")
+    current_facts = current_projection.get("current_facts")
     publication_state = (
-        current_publication_state
-        if isinstance(current_publication_state, str)
+        opportunity_publication_state_as_of(
+            current_facts,
+            opportunity_type=opportunity_type,
+            current_publication_state=current_projection.get("publication_state"),
+            as_of=as_of,
+        )
+        if isinstance(opportunity_type, str) and isinstance(current_facts, Mapping)
         else "suppressed"
     )
+    result = {**card_facts, "publication_state": publication_state}
+    _overlay_current_result_projection(result, current_projection)
     route_kind = current_projection.get("response_route_kind")
     route_value = current_projection.get("response_route_value")
     if publication_state == "active" and (
@@ -9918,7 +9955,7 @@ def _result_card_facts_with_current_publication_state(
         or not route_value
     ):
         publication_state = "suppressed"
-    result = {**card_facts, "publication_state": publication_state}
+    result["publication_state"] = publication_state
     if publication_state == "active":
         assert isinstance(route_kind, str)
         assert isinstance(route_value, str)
@@ -10807,26 +10844,17 @@ def _exact_repost_candidate_is_fresh(
     as_of: datetime,
 ) -> bool:
     """Apply the publication freshness cutoff to a cluster candidate."""
-    if as_of.tzinfo is None or as_of.utcoffset() is None:
-        return False
-    is_standing_referee_availability = (
+    if (
         opportunity_type == "referee_availability"
         and accepted_facts.get("start_local_date") is None
         and accepted_facts.get("end_local_date") is None
-    )
-    if (
-        opportunity_type
-        in {
-            "roster_vacancy",
-            "player_transfer_availability",
-            "coach_availability",
-            "coach_request",
-        }
-        or is_standing_referee_availability
+        and "referee_availability" not in accepted_facts
     ):
+        # Keep the narrow legacy helper contract used by cluster diagnostics;
+        # fully projected Result Cards still require the typed referee facts.
+        if as_of.tzinfo is None or as_of.utcoffset() is None:
+            return False
         qualifying_text = accepted_facts.get("source_qualifying_assertion_at")
-        if not isinstance(qualifying_text, str):
-            qualifying_text = accepted_facts.get("source_posted_at")
         if not isinstance(qualifying_text, str):
             return False
         try:
@@ -10838,29 +10866,37 @@ def _exact_repost_candidate_is_fresh(
             and qualifying_at.utcoffset() is not None
             and as_of < qualifying_at + timedelta(days=30)
         )
-    try:
-        start = date.fromisoformat(str(accepted_facts["start_local_date"]))
-        end = date.fromisoformat(str(accepted_facts["end_local_date"]))
-        timezone = ZoneInfo(str(accepted_facts["iana_timezone"]))
-    except (KeyError, TypeError, ValueError):
-        return False
-    if end < start:
-        return False
-    exact_time = accepted_facts.get("exact_local_time")
-    if isinstance(exact_time, str) and start == end:
+    return opportunity_freshness_is_current(
+        accepted_facts,
+        opportunity_type=opportunity_type,
+        as_of=as_of,
+    )
+
+
+def _exact_repost_freshness_anchor(
+    opportunity_type: str,
+    accepted_facts: Mapping[str, Any],
+    *,
+    fallback: datetime,
+) -> datetime:
+    """Read the source assertion timestamp used by the cluster clock."""
+    timestamp_keys = (
+        ("source_qualifying_assertion_at", "source_posted_at")
+        if opportunity_type in _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES
+        or opportunity_type in {"coach_availability", "coach_request"}
+        else ("source_posted_at",)
+    )
+    for key in timestamp_keys:
+        value = accepted_facts.get(key)
+        if not isinstance(value, str):
+            continue
         try:
-            expiry = datetime.combine(
-                start,
-                datetime.strptime(exact_time, "%H:%M").time(),
-                tzinfo=timezone,
-            )
+            parsed = datetime.fromisoformat(value)
         except ValueError:
-            return False
-    else:
-        expiry = datetime.combine(
-            end + timedelta(days=1), datetime.min.time(), tzinfo=timezone
-        )
-    return as_of.astimezone(timezone) < expiry
+            continue
+        if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+            return parsed
+    return fallback
 
 
 def _publication_envelope_for_state(
@@ -11280,6 +11316,28 @@ def _reconcile_exact_repost_for_opportunity(
         opportunity_type=opportunity_type,
     )
     cluster_id = f"exact-repost-cluster:{cluster_key}"
+    existing_cluster = connection.execute(
+        """
+        SELECT freshness_renewed_at
+        FROM football_runtime.application_exact_repost_clusters
+        WHERE exact_repost_cluster_id = %s
+        FOR UPDATE
+        """,
+        (cluster_id,),
+    ).fetchone()
+    existing_members = tuple(
+        (row[0], row[1])
+        for row in connection.execute(
+            """
+            SELECT source_message_id, source_message_revision_id
+            FROM football_runtime.application_exact_repost_cluster_members
+            WHERE exact_repost_cluster_id = %s
+            FOR UPDATE
+            """,
+            (cluster_id,),
+        ).fetchall()
+    )
+    existing_source_message_ids = frozenset(row[0] for row in existing_members)
     old_cluster_ids = tuple(
         row[0]
         for row in connection.execute(
@@ -11321,6 +11379,34 @@ def _reconcile_exact_repost_for_opportunity(
                 recorded_at=recorded_at,
             )
         )
+    freshness_anchor = _exact_repost_freshness_anchor(
+        opportunity_type,
+        accepted_facts,
+        fallback=recorded_at,
+    )
+    source_message_id = source[0]
+    existing_source_revision_id = next(
+        (
+            member_source_revision_id
+            for member_source_id, member_source_revision_id in existing_members
+            if member_source_id == source_message_id
+        ),
+        None,
+    )
+    is_exact_repost = source_message_id not in existing_source_message_ids
+    is_new_source_revision = existing_source_revision_id != source_revision_id
+    renewal_requested = (
+        existing_cluster is None
+        or is_exact_repost
+        or (
+            is_new_source_revision
+            and (
+                opportunity_type in _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES
+                or opportunity_type in {"coach_availability", "coach_request"}
+            )
+            and (existing_cluster is None or freshness_anchor > existing_cluster[0])
+        )
+    )
     connection.execute(
         """
         INSERT INTO football_runtime.application_exact_repost_clusters (
@@ -11330,10 +11416,13 @@ def _reconcile_exact_repost_for_opportunity(
             freshness_renewed_at, created_at, updated_at
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', 'none', %s, %s, %s)
         ON CONFLICT (cluster_key) DO UPDATE
-        SET freshness_renewed_at = GREATEST(
-                application_exact_repost_clusters.freshness_renewed_at,
-                EXCLUDED.freshness_renewed_at
-            ),
+        SET freshness_renewed_at = CASE
+                WHEN %s THEN GREATEST(
+                    application_exact_repost_clusters.freshness_renewed_at,
+                    EXCLUDED.freshness_renewed_at
+                )
+                ELSE application_exact_repost_clusters.freshness_renewed_at
+            END,
             updated_at = EXCLUDED.updated_at
         """,
         (
@@ -11344,9 +11433,10 @@ def _reconcile_exact_repost_for_opportunity(
             normalized_body,
             cluster_identity,
             opportunity_type,
+            freshness_anchor,
             recorded_at,
             recorded_at,
-            recorded_at,
+            renewal_requested,
         ),
     )
     connection.execute(
@@ -11366,9 +11456,7 @@ def _reconcile_exact_repost_for_opportunity(
         (
             cluster_id,
             opportunity_id,
-            source[0].rsplit(":revision:", 1)[0]
-            if ":revision:" in source[0]
-            else source[0],
+            source_message_id,
             source_revision_id,
             opportunity.get("publication_state", "active"),
             opportunity.get("publication_reason"),

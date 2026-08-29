@@ -57,6 +57,7 @@ def test_live_main_migrations_precede_the_contiguous_coaching_range() -> None:
         "0038_coaching_source_chat_projection_gate.sql",
         "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
         "0040_coaching_ingestion_role_projection_gate.sql",
+        "0041_exact_repost_referee_generic_projection.sql",
     ]
 
 
