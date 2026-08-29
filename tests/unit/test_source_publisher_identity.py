@@ -30,6 +30,7 @@ def _classify_command_with_publisher(publisher_id: str) -> RawContractEnvelope:
     "publisher_id",
     (
         "publisher:one",
+        "publisher:10x10",
         "unknown-publisher:" + "a" * 64,
     ),
 )

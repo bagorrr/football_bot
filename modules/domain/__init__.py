@@ -489,7 +489,7 @@ def is_valid_opaque_source_publisher_id(value: object) -> bool:
     return (
         isinstance(value, str)
         and re.fullmatch(
-            r"(?:publisher|unknown-publisher):[A-Za-z][A-Za-z0-9._-]{0,127}",
+            r"(?:publisher|unknown-publisher):[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
             value,
         )
         is not None
