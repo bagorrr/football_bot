@@ -36,6 +36,316 @@ from modules.testkit import (
 )
 
 
+def test_standing_referee_route_only_edit_renews_freshness() -> None:
+    """A bounded Response Route edit renews a standing referee assertion."""
+    ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_open_match_primary_v4()
+    resolver = ControlledLocationResolverAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_580
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_905_800,
+    )
+    ingestion.allow_public_username(
+        address="@synthetic_refereeing_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:49580",
+    )
+    timezones.add_source(version="controlled-tzdb-v1", timezones=("Europe/Moscow",))
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="Saint Petersburg",
+        resolution=_city_resolution(),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=ingestion,
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+
+    body = (
+        "Referee available for adult football matches in Saint Petersburg, "
+        "7x7, head referee, paid."
+    )
+    result = _classifier_result(
+        body=body,
+        opportunity_type="referee_availability",
+        evidence={
+            "opportunity": "Referee available for adult football matches",
+            "location": "in Saint Petersburg",
+            "referee_availability": "Referee available",
+            "event_types": "adult football matches",
+            "team_formats": "7x7",
+            "referee_roles": "head referee",
+            "payment": "paid",
+        },
+        event_time=None,
+        direction={"referee_availability": True},
+        event_types=("match",),
+    )
+    candidates = result.output["candidates"]
+    assert isinstance(candidates, list) and len(candidates) == 1
+    candidate = candidates[0]
+    assert isinstance(candidate, dict)
+    # Force both accepted revisions to use only the bounded source route.
+    candidate["response_routes"] = []
+    classifier.return_for(body=body, result=result)
+
+    old_route = "https://t.me/referee_route_old"
+    new_route = "https://t.me/referee_route_new"
+    create_time = datetime(2026, 8, 18, 9, 6, tzinfo=UTC)
+    clock.advance_to(create_time)
+    ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=49580),
+        to_checkpoint=TelegramChannelCheckpoint(pts=49581),
+        source_event_id="source-event:route-only-renewal:create",
+        telegram_message_id=1590,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=create_time,
+        source_publisher_id="publisher:route-only-renewal",
+        source_author_dm_url=old_route,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+
+    created = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id.endswith(":1590:revision:1")
+    )
+    created_cluster = next(
+        cluster
+        for cluster in system.exact_repost_clusters()
+        if cluster.opportunity_type == "referee_availability"
+    )
+    assert created.response_route.kind == "direct_message"
+    assert created.response_route.value == old_route
+    assert created_cluster.freshness_renewed_at == create_time
+
+    edit_time = datetime(2026, 8, 19, 9, 8, tzinfo=UTC)
+    clock.advance_to(edit_time)
+    ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=49581),
+        to_checkpoint=TelegramChannelCheckpoint(pts=49582),
+        source_event_id="source-event:route-only-renewal:edit",
+        telegram_message_id=1590,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=body,
+        event_time=edit_time,
+        source_publisher_id="publisher:route-only-renewal",
+        source_author_dm_url=new_route,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+
+    updated = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == created.opportunity_id
+    )
+    updated_cluster = next(
+        cluster
+        for cluster in system.exact_repost_clusters()
+        if cluster.opportunity_type == "referee_availability"
+    )
+    assert updated.source_message_revision_id.endswith(":1590:revision:2")
+    assert updated.response_route.kind == "direct_message"
+    assert updated.response_route.value == new_route
+    assert updated_cluster.exact_repost_cluster_id == (
+        created_cluster.exact_repost_cluster_id
+    )
+    assert updated_cluster.freshness_renewed_at == edit_time
+    members = system.exact_repost_cluster_members(
+        updated_cluster.exact_repost_cluster_id
+    )
+    assert len(members) == 1
+    assert members[0].source_message_revision_id.endswith(":1590:revision:2")
+    assert members[0].is_representative
+
+    system.reset()
+
+
+def test_dated_referee_route_only_edit_does_not_renew_freshness() -> None:
+    """A dated referee edit remains governed by its event-bound cutoff."""
+    ingestion = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_open_match_primary_v4()
+    resolver = ControlledLocationResolverAdapter()
+    dates = ControlledDateInterpretationAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_581
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_905_810,
+    )
+    ingestion.allow_public_username(
+        address="@synthetic_refereeing_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:49581",
+    )
+    timezones.add_source(version="controlled-tzdb-v1", timezones=("Europe/Moscow",))
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="Saint Petersburg",
+        resolution=_city_resolution(),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=ingestion,
+        model=classifier,
+        location_resolver=resolver,
+        date_interpretation=dates,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+
+    body = (
+        "Referee available for an adult football match on 20 August 2026 "
+        "at 19:00 in Saint Petersburg, 7x7, head referee, paid. "
+        "Contact @referee_dated"
+    )
+    result = _classifier_result(
+        body=body,
+        opportunity_type="referee_availability",
+        evidence={
+            "opportunity": "Referee available for an adult football match",
+            "event_time": "20 August 2026 at 19:00",
+            "location": "in Saint Petersburg",
+            "referee_availability": "Referee available",
+            "event_types": "adult football match",
+            "team_formats": "7x7",
+            "referee_roles": "head referee",
+            "payment": "paid",
+        },
+        event_time={
+            "start_local_date": "2026-08-20",
+            "end_local_date": "2026-08-20",
+            "exact_local_time": "19:00",
+            "iana_timezone": "Europe/Moscow",
+        },
+        direction={"referee_availability": True},
+        event_types=("match",),
+    )
+    classifier.return_for(body=body, result=result)
+
+    old_route = "https://t.me/referee_dated_route_old"
+    new_route = "https://t.me/referee_dated_route_new"
+    create_time = datetime(2026, 8, 18, 9, 6, tzinfo=UTC)
+    clock.advance_to(create_time)
+    ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=49581),
+        to_checkpoint=TelegramChannelCheckpoint(pts=49582),
+        source_event_id="source-event:dated-route-renewal:create",
+        telegram_message_id=1591,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=create_time,
+        source_publisher_id="publisher:dated-route-renewal",
+        source_author_dm_url=old_route,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+
+    created = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id.endswith(":1591:revision:1")
+    )
+    created_cluster = next(
+        cluster
+        for cluster in system.exact_repost_clusters()
+        if cluster.opportunity_type == "referee_availability"
+    )
+    assert created.response_route.kind == "explicit_telegram_username"
+    assert created.response_route.value == "@referee_dated"
+    assert created_cluster.resolved_event_date == "2026-08-20/2026-08-20"
+    assert created_cluster.freshness_renewed_at == create_time
+
+    edit_time = datetime(2026, 8, 19, 9, 8, tzinfo=UTC)
+    clock.advance_to(edit_time)
+    ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=49582),
+        to_checkpoint=TelegramChannelCheckpoint(pts=49583),
+        source_event_id="source-event:dated-route-renewal:edit",
+        telegram_message_id=1591,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=body,
+        event_time=edit_time,
+        source_publisher_id="publisher:dated-route-renewal",
+        source_author_dm_url=new_route,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+
+    updated = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == created.opportunity_id
+    )
+    updated_cluster = next(
+        cluster
+        for cluster in system.exact_repost_clusters()
+        if cluster.opportunity_type == "referee_availability"
+    )
+    assert updated.source_message_revision_id.endswith(":1591:revision:2")
+    assert updated.response_route.kind == "explicit_telegram_username"
+    assert updated.response_route.value == "@referee_dated"
+    assert updated_cluster.exact_repost_cluster_id == (
+        created_cluster.exact_repost_cluster_id
+    )
+    assert updated_cluster.freshness_renewed_at == create_time
+    members = system.exact_repost_cluster_members(
+        updated_cluster.exact_repost_cluster_id
+    )
+    assert len(members) == 1
+    assert members[0].source_message_revision_id.endswith(":1591:revision:2")
+    assert members[0].is_representative
+
+    system.reset()
+
+
 def test_referee_availability_and_request_are_published_and_matched() -> None:
     """Match dated availability, standing availability, and a dated request."""
     ingestion = ControlledTelegramIngestionAdapter()

@@ -471,7 +471,11 @@ def normalize_exact_repost_text(value: str) -> str:
         and character not in {"\ufe0e", "\ufe0f", "\u200d"}
     )
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    return re.sub(r"([^\w\s])\1+", r"\1", normalized, flags=re.UNICODE)
+    parts = re.split(r"(https?://[^\s]+)", normalized)
+    return "".join(
+        part if index % 2 else re.sub(r"([^\w\s])\1+", r"\1", part, flags=re.UNICODE)
+        for index, part in enumerate(parts)
+    )
 
 
 def source_publisher_id_from_metadata(
@@ -1245,6 +1249,25 @@ _TRANSFER_OPPORTUNITY_TYPES = {
     UserIntent.NEW_TEAM_SEARCH: "roster_vacancy",
     UserIntent.TRANSFER_PLAYER_SEARCH: "player_transfer_availability",
 }
+_EVENT_BOUND_OPPORTUNITY_TYPES = frozenset(
+    {
+        "open_match",
+        "tournament",
+        "opponent_request",
+        "referee_request",
+        "player_match_availability",
+        "referee_availability",
+    }
+)
+_STANDING_OPPORTUNITY_TYPES = frozenset(
+    {
+        "roster_vacancy",
+        "player_transfer_availability",
+        "coach_availability",
+        "coach_request",
+        "referee_availability",
+    }
+)
 
 
 def _seasonal_timing_parts(value: Any) -> tuple[str, str | None] | None:
@@ -1586,12 +1609,19 @@ def evaluate_opponent_search(
         iter(opponent_search_details.get("venue_provision", ())), None
     )
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != "opponent_request"
-        ):
+        if opportunity.opportunity_type != "opponent_request":
             continue
         facts = opportunity.accepted_facts
+        if (
+            opportunity_publication_state_as_of(
+                facts,
+                opportunity_type=opportunity.opportunity_type,
+                current_publication_state=opportunity.publication_state,
+                as_of=completed_search.completed_at,
+            )
+            != "active"
+        ):
+            continue
         if facts.get("opponent_request") is not True:
             continue
         if (
@@ -2020,12 +2050,19 @@ def evaluate_transfer_search(
         return ()
     matched: list[SearchResult] = []
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != opportunity_type
-        ):
+        if opportunity.opportunity_type != opportunity_type:
             continue
         facts = opportunity.accepted_facts
+        if (
+            opportunity_publication_state_as_of(
+                facts,
+                opportunity_type=opportunity.opportunity_type,
+                current_publication_state=opportunity.publication_state,
+                as_of=completed_search.completed_at,
+            )
+            != "active"
+        ):
+            continue
         if facts.get(opportunity_type) is not True:
             continue
         if (
@@ -2200,12 +2237,19 @@ def evaluate_coaching_search(
     requested_schedule = _coaching_schedule_from_details(coaching_search_details)
     matched: list[SearchResult] = []
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != opportunity_type
-        ):
+        if opportunity.opportunity_type != opportunity_type:
             continue
         facts = opportunity.accepted_facts
+        if (
+            opportunity_publication_state_as_of(
+                facts,
+                opportunity_type=opportunity.opportunity_type,
+                current_publication_state=opportunity.publication_state,
+                as_of=completed_search.completed_at,
+            )
+            != "active"
+        ):
+            continue
         if facts.get(opportunity_type) is not True:
             continue
         if (
@@ -2376,12 +2420,19 @@ def evaluate_game_search(
         return ()
     matched: list[SearchResult] = []
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != "open_match"
-        ):
+        if opportunity.opportunity_type != "open_match":
             continue
         facts = opportunity.accepted_facts
+        if (
+            opportunity_publication_state_as_of(
+                facts,
+                opportunity_type=opportunity.opportunity_type,
+                current_publication_state=opportunity.publication_state,
+                as_of=completed_search.completed_at,
+            )
+            != "active"
+        ):
+            continue
         if (
             facts.get("country_id") != completed_search.country_id
             or facts.get("city_id") != completed_search.city_id
@@ -2751,6 +2802,103 @@ def _tournament_registration_expiry(
     return None
 
 
+def _opportunity_freshness_state_as_of(
+    facts: Mapping[str, Any],
+    *,
+    opportunity_type: str,
+    as_of: datetime,
+) -> str:
+    """Return the fail-closed freshness state for one accepted Opportunity."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        return "suppressed"
+    if opportunity_type == "tournament":
+        return tournament_publication_state_as_of(
+            facts,
+            current_publication_state="active",
+            as_of=as_of,
+        )
+    if opportunity_type in {"referee_availability", "referee_request"}:
+        return referee_publication_state_as_of(
+            facts,
+            current_publication_state="active",
+            as_of=as_of,
+        )
+    if opportunity_type in _STANDING_OPPORTUNITY_TYPES:
+        qualifying_text = facts.get("source_qualifying_assertion_at")
+        if not isinstance(qualifying_text, str):
+            qualifying_text = facts.get("source_posted_at")
+        if not isinstance(qualifying_text, str):
+            return "suppressed"
+        try:
+            qualifying_at = datetime.fromisoformat(qualifying_text)
+        except ValueError:
+            return "suppressed"
+        if qualifying_at.tzinfo is None or qualifying_at.utcoffset() is None:
+            return "suppressed"
+        return "active" if as_of < qualifying_at + timedelta(days=30) else "expired"
+    if opportunity_type not in _EVENT_BOUND_OPPORTUNITY_TYPES:
+        return "suppressed"
+    try:
+        start = date.fromisoformat(str(facts["start_local_date"]))
+        end = date.fromisoformat(str(facts["end_local_date"]))
+        timezone = ZoneInfo(str(facts["iana_timezone"]))
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+        return "suppressed"
+    if end < start:
+        return "suppressed"
+    exact_time = facts.get("exact_local_time")
+    if isinstance(exact_time, str) and start == end:
+        try:
+            expiry = datetime.combine(
+                start,
+                datetime.strptime(exact_time, "%H:%M").time(),
+                tzinfo=timezone,
+            )
+        except ValueError:
+            return "suppressed"
+    else:
+        expiry = datetime.combine(end + timedelta(days=1), time.min, tzinfo=timezone)
+    return "active" if as_of.astimezone(timezone) < expiry else "expired"
+
+
+def opportunity_freshness_is_current(
+    facts: Mapping[str, Any],
+    *,
+    opportunity_type: str,
+    as_of: datetime,
+) -> bool:
+    """Return whether one accepted Opportunity is fresh at a read time."""
+    return (
+        _opportunity_freshness_state_as_of(
+            facts,
+            opportunity_type=opportunity_type,
+            as_of=as_of,
+        )
+        == "active"
+    )
+
+
+def opportunity_publication_state_as_of(
+    facts: Mapping[str, Any],
+    *,
+    opportunity_type: str,
+    current_publication_state: str | None,
+    as_of: datetime,
+) -> str:
+    """Return the current publication state after applying freshness gates."""
+    canonical_states = {"active", "held_for_review", "suppressed", "expired"}
+    if current_publication_state not in canonical_states:
+        return "suppressed"
+    if current_publication_state != "active":
+        return current_publication_state
+    freshness_state = _opportunity_freshness_state_as_of(
+        facts,
+        opportunity_type=opportunity_type,
+        as_of=as_of,
+    )
+    return freshness_state
+
+
 def player_search_result_sort_key(
     result: SearchResult,
 ) -> tuple[int, int, str, int, str, int, int, str]:
@@ -2818,12 +2966,19 @@ def evaluate_player_search(
         return ()
     matched: list[SearchResult] = []
     for opportunity in opportunities:
-        if (
-            opportunity.publication_state != "active"
-            or opportunity.opportunity_type != "player_match_availability"
-        ):
+        if opportunity.opportunity_type != "player_match_availability":
             continue
         facts = opportunity.accepted_facts
+        if (
+            opportunity_publication_state_as_of(
+                facts,
+                opportunity_type=opportunity.opportunity_type,
+                current_publication_state=opportunity.publication_state,
+                as_of=completed_search.completed_at,
+            )
+            != "active"
+        ):
+            continue
         if (
             facts.get("country_id") != completed_search.country_id
             or facts.get("city_id") != completed_search.city_id

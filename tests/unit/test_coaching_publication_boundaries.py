@@ -333,6 +333,22 @@ def test_current_coaching_projection_preserves_fresh_current_route() -> None:
     assert overlaid["response_route_value"] == "@current_coach_contact"
 
 
+def test_current_coaching_projection_fails_closed_on_malformed_facts() -> None:
+    projection = _current_coaching_projection()
+    projection["current_facts"] = {
+        "source_posted_at": "not-a-timestamp",
+        "source_qualifying_assertion_at": "not-a-timestamp",
+    }
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_coaching_result().card_facts),
+        projection,
+        as_of=datetime(2026, 8, 20, 9, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_value" not in overlaid
+
+
 def test_current_coaching_projection_remaps_card_identity_and_current_facts() -> None:
     overlaid = _result_card_facts_with_current_publication_state(
         dict(_coaching_result().card_facts),

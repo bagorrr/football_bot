@@ -33,7 +33,7 @@
   },
   "controlled_lifecycle_failure_suite": {
     "path": "classifier/player-match-evaluation-v1/lifecycle-failure-suite.json",
-    "version": "player-match-lifecycle-failure-v7"
+    "version": "player-match-lifecycle-failure-v8"
   },
   "promotion_gate": {
     "deterministic": true,
@@ -51,9 +51,9 @@
     "process_isolated_replays": true
   },
   "canonical_replay_digests": [
-    "ddadb15dd70550a580d124f805f2e57fe7e8ea8bf441afce83dcf5c9195b6a07",
-    "18593af05ae79848e7635e1f88e5901c204fe785b6c6ef4dd16431391edb8ee5",
-    "25350a171d441512c5965390dc378b0cf1de59764d60827f9e2fa3ff61efb1e5"
+    "a87a00d93b2acabfb762542e6b17d405121842b0d08c71e477dbb7715d673ad6",
+    "103c32fdb603478b16ba49139706c851a33f7a34dd3cb85e09eb602275ba60bb",
+    "41a2d327047a7c9aee9ce0007945bbe863274545310879d1ebb09150c7aac979"
   ],
   "required_case_families": [
     "routing",

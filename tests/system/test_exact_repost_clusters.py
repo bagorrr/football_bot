@@ -222,7 +222,7 @@ def test_material_body_edit_without_reclassification_removes_old_membership() ->
     assert current_projection.publication_reason == "source_revision_superseded"
 
 
-def test_cosmetic_edit_retains_cluster_identity_and_renews_freshness() -> None:
+def test_cosmetic_edit_retains_cluster_identity_without_renewing_freshness() -> None:
     probe = _probe({"kind": "edit", "source": CONTROLLED_COSMETIC_EDIT_BODY})
     first_revision, _ = probe.source_event(
         body=CONTROLLED_LIFECYCLE_BODY,
@@ -234,6 +234,7 @@ def test_cosmetic_edit_retains_cluster_identity_and_renews_freshness() -> None:
     assert first_revision is not None
     before = _cluster(probe)
     before_key = before.cluster_key
+    before_freshness = before.freshness_renewed_at
     probe.clock.advance_to(datetime(2026, 8, 18, 9, 8, tzinfo=UTC))
     edited_revision, snapshot = probe.source_event(
         body=CONTROLLED_COSMETIC_EDIT_BODY,
@@ -249,7 +250,7 @@ def test_cosmetic_edit_retains_cluster_identity_and_renews_freshness() -> None:
     assert cluster.cluster_key == before_key
     assert cluster.representative_source_message_revision_id == edited_revision
     assert cluster.representative_source_message_id == _source_id(edited_revision)
-    assert cluster.freshness_renewed_at == probe.clock.now()
+    assert cluster.freshness_renewed_at == before_freshness
     members = probe.system.exact_repost_cluster_members(cluster.exact_repost_cluster_id)
     assert len(members) == 1
     assert members[0].source_message_revision_id == edited_revision
