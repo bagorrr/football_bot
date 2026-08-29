@@ -978,10 +978,24 @@ class ControlledModelAdapter:
         self.primary_schema_version = "source-message-classification-v3"
         self.primary_prompt_version = "open-match-primary-v3"
 
-    def enable_open_match_primary_v4(self) -> None:
-        """Opt the controlled model boundary into the Refereeing release."""
+    def enable_primary_v4(self) -> None:
+        """Opt the controlled model boundary into the additive open release."""
         self.primary_schema_version = "source-message-classification-v4"
         self.primary_prompt_version = "open-match-primary-v4"
+
+    def enable_open_match_primary_v4(self) -> None:
+        """Opt the controlled model boundary into the Open Match v4 release."""
+        self.enable_primary_v4()
+
+    def enable_coaching_primary_v1(self) -> None:
+        """Opt the controlled model boundary into the versioned coaching release."""
+        self.primary_schema_version = "source-message-classification-v5"
+        self.primary_prompt_version = "open-match-primary-v5"
+
+    def enable_player_match_primary_v2(self) -> None:
+        """Opt the controlled model boundary into the versioned Player release."""
+        self.primary_schema_version = "source-message-classification-v4"
+        self.primary_prompt_version = "player-match-primary-v2"
 
     def raise_for(self, *, pass_kind: str = "primary", error: BaseException) -> None:
         """Inject one provider/process failure at the controlled classifier seam."""
@@ -1044,10 +1058,13 @@ class ControlledModelAdapter:
                 body=request.body,
                 source_message_revision_reference=request.source_message_revision_id,
                 proof_version=(
-                    "source-semantic-proof-v3"
-                    if request.schema_version == "source-semantic-proof-v3"
-                    else "source-semantic-proof-v2"
-                    if request.schema_version == "source-semantic-proof-v2"
+                    request.schema_version
+                    if request.schema_version
+                    in {
+                        "source-semantic-proof-v2",
+                        "source-semantic-proof-v3",
+                        "source-semantic-proof-v4",
+                    }
                     else "source-semantic-proof-v1"
                 ),
             )
@@ -1087,7 +1104,12 @@ def _ensure_test_proposition_evidence(
             else (
                 "source-proposition-evidence-v2"
                 if enriched.get("schema_version") == "source-message-classification-v3"
-                else "source-proposition-evidence-v1"
+                else (
+                    "source-proposition-evidence-v3"
+                    if enriched.get("schema_version")
+                    == "source-message-classification-v4"
+                    else "source-proposition-evidence-v1"
+                )
             )
         )
         _add_test_proposition_evidence(
@@ -1119,6 +1141,8 @@ def _add_test_proposition_evidence(
         "player_transfer_availability",
         "referee_availability",
         "referee_request",
+        "coach_availability",
+        "coach_request",
     }:
         return
     if not all(isinstance(value, str) and value in body for value in evidence.values()):
@@ -1242,6 +1266,8 @@ def _build_test_semantic_proof(
             "opponent_request",
             "roster_vacancy",
             "player_transfer_availability",
+            "coach_availability",
+            "coach_request",
             "referee_availability",
             "referee_request",
         }
@@ -1255,6 +1281,8 @@ def _build_test_semantic_proof(
         "opponent_request",
         "roster_vacancy",
         "player_transfer_availability",
+        "coach_availability",
+        "coach_request",
         "referee_availability",
         "referee_request",
     }:
@@ -1343,12 +1371,13 @@ def _build_test_semantic_proof(
         )
     semantic_proof_version = proof_version
     if semantic_proof_version == "source-semantic-proof-v1":
-        if opportunity_type in {"referee_availability", "referee_request"}:
+        if output.get("schema_version") == "source-message-classification-v5":
+            semantic_proof_version = "source-semantic-proof-v4"
+        elif output.get("schema_version") == "source-message-classification-v4":
             semantic_proof_version = "source-semantic-proof-v3"
-        elif output.get("schema_version") in {
-            "source-message-classification-v3",
-            "source-message-classification-v4",
-        } or opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
+        elif output.get("schema_version") == "source-message-classification-v3" or (
+            opportunity_type in {"roster_vacancy", "player_transfer_availability"}
+        ):
             semantic_proof_version = "source-semantic-proof-v2"
     return {
         "contract_version": semantic_proof_version,
@@ -2769,6 +2798,7 @@ class AcceptanceSpine:
         transfer_search_details: dict[str, list[str]] | None = None,
         referee_search_details: dict[str, list[str]] | None = None,
         refereeing_service_offer_details: dict[str, list[str]] | None = None,
+        coaching_search_details: dict[str, JsonValue] | None = None,
     ) -> None:
         """Drive one Search callback through the external Bot Assistant port."""
         self._conversation_onboarding().submit_search(
@@ -2786,6 +2816,7 @@ class AcceptanceSpine:
             transfer_search_details=transfer_search_details,
             referee_search_details=referee_search_details,
             refereeing_service_offer_details=refereeing_service_offer_details,
+            coaching_search_details=coaching_search_details,
         )
 
     def open_game_search_details(
@@ -3249,6 +3280,159 @@ class AcceptanceSpine:
     ) -> None:
         """Drive Back from Tournament Search details."""
         self._conversation_onboarding().back_from_tournament_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_coaching_search_details(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive the Coaching Services Details hub through Bot Assistant."""
+        self._conversation_onboarding().open_coaching_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_coaching_search_detail(
+        self, *, update_id: str, telegram_user_id: int, detail_key: str
+    ) -> None:
+        """Drive one Coaching Services detail submenu."""
+        self._conversation_onboarding().open_coaching_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            detail_key=detail_key,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def toggle_coaching_search_detail_value(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Drive one temporary Coaching Services categorical toggle."""
+        self._conversation_onboarding().toggle_coaching_search_detail_value(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def commit_coaching_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Done for the current Coaching Services detail submenu."""
+        self._conversation_onboarding().commit_coaching_search_detail(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_coaching_search_schedule_weekday(
+        self, *, update_id: str, telegram_user_id: int, value: str
+    ) -> None:
+        """Toggle one temporary recurring Schedule weekday."""
+        self._conversation_onboarding().select_coaching_search_schedule_weekday(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def select_coaching_search_schedule_day_part(
+        self, *, update_id: str, telegram_user_id: int, value: str | None
+    ) -> None:
+        """Set or clear one temporary recurring Schedule day-part."""
+        self._conversation_onboarding().select_coaching_search_schedule_day_part(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            value=value,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_coaching_search_schedule_interval(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the exact recurring interval prompt through the Bot Assistant."""
+        self._conversation_onboarding().open_coaching_search_schedule_interval(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_coaching_search_schedule_interval(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        start_time: str,
+        end_time: str,
+    ) -> None:
+        """Set one temporary exact local coaching interval."""
+        self._conversation_onboarding().submit_coaching_search_schedule_interval(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            start_time=start_time,
+            end_time=end_time,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_coaching_search_schedule_interval_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit exact recurring interval text through the Bot Assistant."""
+        self._conversation_onboarding().submit_coaching_search_schedule_interval_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def clear_coaching_search_schedule_time(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Clear temporary coaching day-part and exact-time criteria."""
+        self._conversation_onboarding().clear_coaching_search_schedule_time(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def open_coaching_search_schedule_start_date(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the optional Coaching Services local start-date prompt."""
+        self._conversation_onboarding().open_coaching_search_schedule_start_date(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_coaching_search_schedule_start_date_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Drive one Coaching Services local start-date answer."""
+        self._conversation_onboarding().submit_coaching_search_schedule_start_date_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def clear_coaching_search_schedule_start_date(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Clear the optional coaching Schedule start date."""
+        self._conversation_onboarding().clear_coaching_search_schedule_start_date(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def back_from_coaching_search_detail(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Drive Back from a Coaching Services submenu or hub."""
+        self._conversation_onboarding().back_from_coaching_search_detail(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,

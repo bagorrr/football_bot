@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
@@ -42,6 +42,22 @@ from modules.testkit import (
 def _migration_paths() -> list[Path]:
     migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
     return sorted(migration_root.glob("*.sql"))
+
+
+def test_live_main_migrations_precede_the_contiguous_coaching_range() -> None:
+    """Keep post-main coaching migrations in the first free numeric range."""
+    assert [path.name for path in _migration_paths()][-10:] == [
+        "0031_source_message_lifecycle.sql",
+        "0032_source_message_lifecycle_hardening.sql",
+        "0033_source_message_retention_and_projection_barrier.sql",
+        "0034_source_chat_pause_removal_barrier.sql",
+        "0035_coaching_opportunities.sql",
+        "0036_coaching_exact_repost_clusters.sql",
+        "0037_exact_repost_result_projection.sql",
+        "0038_coaching_source_chat_projection_gate.sql",
+        "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
+        "0040_coaching_ingestion_role_projection_gate.sql",
+    ]
 
 
 def _apply_untracked_repository_migrations(
@@ -782,6 +798,463 @@ def test_bot_assistant_tournament_projection_fails_closed_for_unknown_state(
         ).fetchone()
 
     assert projection == ("future_state", None, None)
+
+
+def test_bot_assistant_result_projection_follows_current_exact_repost_representative(
+    fresh_database_url: str,
+) -> None:
+    """A historical member resolves to the live representative and route."""
+    migrator = PostgresAcceptanceMigrator(fresh_database_url)
+    migrator.migrate()
+    passwords = {role: "migration-repost-projection-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    recorded_at = datetime(2026, 8, 20, 9, tzinfo=UTC)
+    old_opportunity_id = "opportunity:coach:repost:old"
+    current_opportunity_id = "opportunity:coach:repost:current"
+    old_revision_id = f"{old_opportunity_id}:revision:1"
+    current_revision_id = f"{current_opportunity_id}:revision:3"
+    old_source_message_id = "source-chat:repost:message:old"
+    current_source_message_id = "source-chat:repost:message:current"
+    old_source_revision_id = f"{old_source_message_id}:revision:1"
+    current_source_revision_id = f"{current_source_message_id}:revision:1"
+    cluster_id = "exact-repost-cluster:coaching-projection"
+    current_facts = {
+        "coach_availability": True,
+        "city_id": "city:moscow",
+        "source_posted_at": "2026-08-19T09:00:00+00:00",
+        "source_qualifying_assertion_at": "2026-08-19T09:00:00+00:00",
+        "schedule": {"start_local_date": "2026-08-25"},
+        "projection_marker": "current-representative",
+    }
+    route = {"kind": "explicit_telegram_username", "value": "@current_coach"}
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_chat_registry (
+                peer_kind, telegram_chat_id, registry_generation,
+                address_kind, current_address, processing_started_at,
+                transport_boundary, enabled, initial_consent_attestation,
+                attested_at, created_at, updated_at
+            ) VALUES (
+                'channel', 5501, 1, 'public_username', '@projection_source',
+                %s, 'channel-pts:1', true, 'confirmed', %s, %s, %s
+            )
+            """,
+            (recorded_at, recorded_at, recorded_at, recorded_at),
+        )
+        for source_message_id, telegram_message_id, body in (
+            (old_source_message_id, 501, "old repost"),
+            (current_source_message_id, 502, "current repost"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_messages (
+                    source_message_id, peer_kind, telegram_chat_id,
+                    registry_generation, telegram_message_id, current_revision,
+                    event_kind, body, event_time, recorded_at, tombstoned
+                ) VALUES (%s, 'channel', 5501, 1, %s, 1, 'create', %s, %s, %s, false)
+                """,
+                (
+                    source_message_id,
+                    telegram_message_id,
+                    body,
+                    recorded_at,
+                    recorded_at,
+                ),
+            )
+        for source_message_id, source_revision_id in (
+            (old_source_message_id, old_source_revision_id),
+            (current_source_message_id, current_source_revision_id),
+        ):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_message_revisions (
+                    source_message_revision_id, source_message_id, source_event_id,
+                    revision, event_kind, body, event_time, recorded_at
+                ) VALUES (%s, %s, %s, 1, 'create', 'coaching repost', %s, %s)
+                """,
+                (
+                    source_revision_id,
+                    source_message_id,
+                    f"source-event:{source_message_id}",
+                    recorded_at,
+                    recorded_at,
+                ),
+            )
+        for opportunity_id, opportunity_revision_id, source_revision_id, state in (
+            (old_opportunity_id, old_revision_id, old_source_revision_id, "suppressed"),
+            (
+                current_opportunity_id,
+                current_revision_id,
+                current_source_revision_id,
+                "active",
+            ),
+        ):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.application_opportunities (
+                    opportunity_id, opportunity_revision_id,
+                    source_message_revision_id, opportunity_type,
+                    publication_state, accepted_facts, evidence,
+                    response_route, accepted_at, publication_reason
+                ) VALUES (%s, %s, %s, 'coach_availability', %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    opportunity_id,
+                    opportunity_revision_id,
+                    source_revision_id,
+                    state,
+                    json.dumps(current_facts),
+                    json.dumps({"projection_marker": opportunity_id}),
+                    json.dumps(route),
+                    recorded_at,
+                    "exact_repost_superseded" if state == "suppressed" else None,
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES
+                (%s, %s, 'coach_availability', 'suppressed', %s, %s, %s),
+                (%s, %s, 'coach_availability', 'active', %s, %s, %s)
+            """,
+            (
+                old_opportunity_id,
+                old_revision_id,
+                json.dumps({"projection_marker": "old-member"}),
+                json.dumps({"kind": "source_message", "value": "old"}),
+                recorded_at,
+                current_opportunity_id,
+                current_revision_id,
+                json.dumps(current_facts),
+                json.dumps(route),
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_exact_repost_clusters (
+                exact_repost_cluster_id, cluster_key, source_chat_reference,
+                source_publisher_id, normalized_body, resolved_event_date,
+                opportunity_type, representative_opportunity_id,
+                representative_source_message_id,
+                representative_source_message_revision_id, publication_state,
+                publication_transition_revision, moderation_state,
+                freshness_renewed_at, created_at, updated_at
+            ) VALUES (
+                %s, 'cluster-key:coaching-projection', 'channel:5501', 'publisher:1',
+                'coaching repost', '2026-08-25', 'coach_availability', %s, %s, %s,
+                'active', 2, 'none', %s, %s, %s
+            )
+            """,
+            (
+                cluster_id,
+                current_opportunity_id,
+                current_source_message_id,
+                current_source_revision_id,
+                recorded_at,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_exact_repost_cluster_members (
+                exact_repost_cluster_id, opportunity_id, source_message_id,
+                source_message_revision_id, publication_state, publication_reason,
+                is_representative, linked_at
+            ) VALUES
+                (%s, %s, %s, %s, 'suppressed', 'exact_repost_superseded', false, %s),
+                (%s, %s, %s, %s, 'active', NULL, true, %s)
+            """,
+            (
+                cluster_id,
+                old_opportunity_id,
+                old_source_message_id,
+                old_source_revision_id,
+                recorded_at,
+                cluster_id,
+                current_opportunity_id,
+                current_source_message_id,
+                current_source_revision_id,
+                recorded_at,
+            ),
+        )
+    bot_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.BOT_ASSISTANT,
+        passwords[RuntimeRole.BOT_ASSISTANT],
+    )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   current_facts, response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+        assert projection is not None
+        assert projection[0:3] == (
+            current_opportunity_id,
+            current_revision_id,
+            "active",
+        )
+        assert projection[3]["projection_marker"] == "current-representative"
+        assert projection[4:] == (route["kind"], route["value"])
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = false
+            WHERE peer_kind = 'channel'
+              AND telegram_chat_id = 5501
+              AND registry_generation = 1
+            """
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        disabled_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert disabled_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = true
+            WHERE peer_kind = 'channel'
+              AND telegram_chat_id = 5501
+              AND registry_generation = 1
+            """
+        )
+    failure_id = uuid4()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'ingestion', 'application', 'SourceStreamStopped', 1,
+                'source-chat:channel:5501:generation:1', 1, %s,
+                %s, %s, %s, %s
+            )
+            """,
+            (
+                failure_id,
+                f"source-stream-stop:{failure_id}",
+                uuid4(),
+                uuid4(),
+                recorded_at,
+                json.dumps(
+                    {
+                        "source_stream_failure_id": str(failure_id),
+                        "scope": "source_stream",
+                        "failure_reason": "protection_unavailable",
+                        "telegram_peer_kind": "channel",
+                        "telegram_chat_id": 5501,
+                        "registry_generation": 1,
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.ingestion_failures (
+                failure_id, scope, failure_reason, peer_kind,
+                telegram_chat_id, registry_generation, recorded_at
+            ) VALUES (
+                %s, 'source_stream', 'protection_unavailable', 'channel',
+                5501, 1, %s
+            )
+            """,
+            (failure_id, recorded_at),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        failed_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        failed_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert failed_gate == (False,)
+    assert failed_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.ingestion_failures
+            SET active = false
+            WHERE failure_id = %s
+            """,
+            (failure_id,),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        resolved_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        resolved_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert resolved_gate == (True,)
+    assert resolved_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "active",
+        route["kind"],
+        route["value"],
+    )
+    role_failure_id = uuid4()
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision, idempotency_key,
+                causation_id, correlation_id, recorded_at, payload
+            ) VALUES (
+                %s, 'ingestion', 'application', 'SourceStreamStopped', 1,
+                'ingestion-role-failure', 1, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                role_failure_id,
+                f"ingestion-role-stop:{role_failure_id}",
+                uuid4(),
+                uuid4(),
+                recorded_at,
+                json.dumps(
+                    {
+                        "source_stream_failure_id": str(role_failure_id),
+                        "scope": "ingestion_role",
+                        "failure_reason": "authentication_lost",
+                    }
+                ),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.ingestion_failures (
+                failure_id, scope, failure_reason, recorded_at
+            ) VALUES (%s, 'ingestion_role', 'authentication_lost', %s)
+            """,
+            (role_failure_id, recorded_at),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        role_failed_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        role_failed_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert role_failed_gate == (False,)
+    assert role_failed_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.ingestion_failures
+            SET active = false
+            WHERE failure_id = %s
+            """,
+            (role_failure_id,),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        role_restored_gate = connection.execute(
+            """
+            SELECT football_runtime.coaching_opportunity_source_chat_enabled(%s)
+            """,
+            (current_opportunity_id,),
+        ).fetchone()
+        role_restored_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert role_restored_gate == (True,)
+    assert role_restored_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "active",
+        route["kind"],
+        route["value"],
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.recommendation_opportunities
+            SET publication_state = 'suppressed'
+            WHERE opportunity_revision_id = %s
+            """,
+            (current_revision_id,),
+        )
+    with psycopg.connect(bot_url, autocommit=True) as connection:
+        inactive_projection = connection.execute(
+            """
+            SELECT opportunity_id, opportunity_revision_id, publication_state,
+                   response_route_kind, response_route_value
+            FROM football_runtime.read_current_opportunity_result_projection(%s)
+            """,
+            (old_opportunity_id,),
+        ).fetchone()
+    assert inactive_projection == (
+        current_opportunity_id,
+        current_revision_id,
+        "suppressed",
+        None,
+        None,
+    )
 
 
 def test_repeated_migrate_preserves_completed_and_submitting_search_state(

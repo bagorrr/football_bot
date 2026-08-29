@@ -930,6 +930,10 @@ class DiscoveryDraft:
     editing_transfer_search_detail: str | None = None
     transfer_search_detail_draft: tuple[str, ...] = ()
     transfer_search_seasonal_timing_prompt: str | None = None
+    coaching_search_details: tuple[tuple[str, Any], ...] = ()
+    editing_coaching_search_detail: str | None = None
+    coaching_search_detail_draft: tuple[str, ...] = ()
+    coaching_search_schedule_prompt: str | None = None
     search_submission_update_id: str | None = None
 
 
@@ -1143,6 +1147,7 @@ class CompletedSearch:
     referee_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     refereeing_service_offer_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
     transfer_search_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    coaching_search_details: tuple[tuple[str, Any], ...] = ()
     sub_city_area_geographic_types: tuple[str, ...] = ()
     sub_city_area_verified_parent_ids: tuple[tuple[str, ...], ...] = ()
 
@@ -1198,6 +1203,44 @@ _REFEREEING_OPPORTUNITY_TYPES = {
     UserIntent.REFEREE_SEARCH: "referee_availability",
     UserIntent.REFEREEING_SERVICE_OFFER: "referee_request",
 }
+_COACHING_SEARCH_DETAIL_KEYS = (
+    "coaching_types",
+    "playing_levels",
+    "team_formats",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
+_COACHING_OPPORTUNITY_TYPES = {
+    UserIntent.COACH_SEARCH: "coach_availability",
+    UserIntent.COACHING_SERVICE_OFFER: "coach_request",
+}
+_COACHING_WEEKDAYS = frozenset(
+    {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+)
+_COACHING_DAY_PART_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
+    "morning": ((6 * 60, 12 * 60),),
+    "daytime": ((12 * 60, 18 * 60),),
+    "evening": ((18 * 60, 22 * 60),),
+    "night": ((22 * 60, 24 * 60), (0, 6 * 60)),
+}
+_COACHING_SCHEDULE_KEYS = frozenset(
+    {
+        "weekdays",
+        "day_parts",
+        "local_start_time",
+        "local_end_time",
+        "start_local_date",
+    }
+)
+_COACHING_CATEGORICAL_KEYS = (
+    "coaching_types",
+    "playing_levels",
+    "team_formats",
+    "venue_settings",
+    "playing_surfaces",
+    "payment",
+)
 _TRANSFER_OPPORTUNITY_TYPES = {
     UserIntent.NEW_TEAM_SEARCH: "roster_vacancy",
     UserIntent.TRANSFER_PLAYER_SEARCH: "player_transfer_availability",
@@ -1300,6 +1343,230 @@ def match_venue_provision(
         if accepted in compatible[requested]
         else MatchState.CONFLICT
     )
+
+
+def _coaching_schedule_mapping(value: Any) -> dict[str, Any] | None:
+    """Decode one schedule object without inferring omitted facts."""
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, Mapping):
+        return None
+    schedule = dict(value)
+    if not schedule or set(schedule) - _COACHING_SCHEDULE_KEYS:
+        return None
+    weekdays = _coaching_schedule_list(schedule, "weekdays", _COACHING_WEEKDAYS)
+    intervals = _coaching_schedule_intervals(schedule)
+    if weekdays is None or not weekdays or intervals is None or not intervals:
+        return None
+    if "start_local_date" in schedule and _coaching_schedule_date(schedule) is None:
+        return None
+    return schedule
+
+
+def _coaching_schedule_from_details(details: Mapping[str, Any]) -> Any:
+    """Accept the nested wire shape and the flat internal editing shape."""
+    schedule = details.get("schedule")
+    if schedule is not None:
+        return schedule
+    flat_keys = {
+        "weekdays",
+        "day_parts",
+        "local_start_time",
+        "local_end_time",
+        "start_local_date",
+    }
+    flat = {key: details[key] for key in flat_keys if key in details}
+    return flat or None
+
+
+def _coaching_schedule_list(
+    schedule: Mapping[str, Any], key: str, allowed: frozenset[str]
+) -> tuple[str, ...] | None:
+    """Return one canonical list, preserving unknown/malformed as ``None``."""
+    value = schedule.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    values = tuple(item for item in value if isinstance(item, str))
+    if len(values) != len(value) or len(values) != len(set(values)):
+        return None
+    if not all(item in allowed for item in values):
+        return None
+    return values
+
+
+def _coaching_time_minutes(value: Any) -> int | None:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value) is None
+    ):
+        return None
+    hour, minute = (int(part) for part in value.split(":", 1))
+    return hour * 60 + minute
+
+
+def _coaching_schedule_intervals(
+    schedule: Mapping[str, Any],
+) -> tuple[tuple[int, int], ...] | None:
+    """Normalize day parts or one exact local interval into half-open ranges."""
+    day_parts = schedule.get("day_parts")
+    has_exact = "local_start_time" in schedule or "local_end_time" in schedule
+    if day_parts is not None and has_exact:
+        return None
+    if day_parts is not None:
+        values = _coaching_schedule_list(
+            schedule, "day_parts", frozenset(_COACHING_DAY_PART_RANGES)
+        )
+        if values is None:
+            return None
+        return tuple(
+            interval
+            for day_part in values
+            for interval in _COACHING_DAY_PART_RANGES[day_part]
+        )
+    if not has_exact:
+        return ()
+    start = _coaching_time_minutes(schedule.get("local_start_time"))
+    end = _coaching_time_minutes(schedule.get("local_end_time"))
+    if start is None or end is None or end <= start:
+        return None
+    return ((start, end),)
+
+
+def _coaching_intervals_overlap(
+    requested: tuple[tuple[int, int], ...], accepted: tuple[tuple[int, int], ...]
+) -> bool:
+    return any(
+        max(requested_start, accepted_start) < min(requested_end, accepted_end)
+        for requested_start, requested_end in requested
+        for accepted_start, accepted_end in accepted
+    )
+
+
+def _coaching_schedule_date(schedule: Mapping[str, Any]) -> date | None:
+    value = schedule.get("start_local_date")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def match_coaching_schedule(
+    requested: Mapping[str, Any] | str | None,
+    accepted: Mapping[str, Any] | str | None,
+    *,
+    user_intent: UserIntent,
+) -> dict[str, MatchState]:
+    """Compare recurring coaching Schedule facts deterministically.
+
+    Weekdays and time selections are alternatives within their respective
+    criterion. Exact intervals use positive half-open overlap, and a selected
+    start date is directional: a Coach Search accepts availability beginning
+    no later than the requested date, while a Coaching Service Offer accepts a
+    request beginning on or after the coach's available date.
+    """
+    requested_schedule = _coaching_schedule_mapping(requested)
+    accepted_schedule = _coaching_schedule_mapping(accepted)
+    if requested is None:
+        return {"schedule": MatchState.CONFIRMED}
+    if requested_schedule is None:
+        return {
+            "schedule_weekdays": MatchState.CONFLICT,
+            "schedule_time": MatchState.CONFLICT,
+            "schedule_start_date": MatchState.CONFLICT,
+            "schedule": MatchState.CONFLICT,
+        }
+    if accepted_schedule is None:
+        accepted_schedule = {}
+
+    requested_weekdays = _coaching_schedule_list(
+        requested_schedule, "weekdays", _COACHING_WEEKDAYS
+    )
+    if requested_weekdays is None:
+        weekday_state = MatchState.CONFLICT
+    elif requested_weekdays:
+        accepted_weekdays = _coaching_schedule_list(
+            accepted_schedule, "weekdays", _COACHING_WEEKDAYS
+        )
+        if accepted_weekdays is None or not accepted_weekdays:
+            weekday_state = MatchState.UNKNOWN
+        else:
+            weekday_state = (
+                MatchState.CONFIRMED
+                if set(requested_weekdays).intersection(accepted_weekdays)
+                else MatchState.CONFLICT
+            )
+    else:
+        weekday_state = MatchState.CONFIRMED
+
+    requested_intervals = _coaching_schedule_intervals(requested_schedule)
+    accepted_intervals = _coaching_schedule_intervals(accepted_schedule)
+    if requested_intervals is None:
+        time_state = MatchState.CONFLICT
+    elif requested_intervals:
+        if accepted_intervals is None or not accepted_intervals:
+            time_state = MatchState.UNKNOWN
+        else:
+            time_state = (
+                MatchState.CONFIRMED
+                if _coaching_intervals_overlap(requested_intervals, accepted_intervals)
+                else MatchState.CONFLICT
+            )
+    else:
+        time_state = MatchState.CONFIRMED
+
+    requested_start = _coaching_schedule_date(requested_schedule)
+    accepted_start = _coaching_schedule_date(accepted_schedule)
+    if "start_local_date" in requested_schedule and requested_start is None:
+        start_state = MatchState.CONFLICT
+    elif requested_start is None:
+        start_state = MatchState.CONFIRMED
+    elif accepted_start is None:
+        start_state = MatchState.UNKNOWN
+    elif user_intent is UserIntent.COACH_SEARCH:
+        start_state = (
+            MatchState.CONFIRMED
+            if accepted_start <= requested_start
+            else MatchState.CONFLICT
+        )
+    elif user_intent is UserIntent.COACHING_SERVICE_OFFER:
+        start_state = (
+            MatchState.CONFIRMED
+            if accepted_start >= requested_start
+            else MatchState.CONFLICT
+        )
+    else:
+        start_state = MatchState.CONFLICT
+
+    component_states = (weekday_state, time_state, start_state)
+    schedule_state = (
+        MatchState.CONFLICT
+        if MatchState.CONFLICT in component_states
+        else MatchState.UNKNOWN
+        if MatchState.UNKNOWN in component_states
+        else MatchState.CONFIRMED
+    )
+    return {
+        "schedule_weekdays": weekday_state,
+        "schedule_time": time_state,
+        "schedule_start_date": start_state,
+        "schedule": schedule_state,
+    }
+
+
+# Keep the public name explicit for callers that use the domain term from the
+# product documents.
+match_recurring_schedule = match_coaching_schedule
 
 
 def evaluate_opponent_search(
@@ -1896,6 +2163,203 @@ def evaluate_transfer_search(
             )
         )
     matched.sort(key=transfer_search_result_sort_key)
+    return tuple(
+        replace_result_position(result, position)
+        for position, result in enumerate(matched, start=1)
+    )
+
+
+def coaching_search_result_sort_key(
+    result: SearchResult,
+) -> tuple[int, int, float, int, str]:
+    """Order standing coaching results by certainty and fresh assertion."""
+    return transfer_search_result_sort_key(result)
+
+
+def _coaching_values(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    if not isinstance(value, (list, tuple)):
+        return None
+    if not all(isinstance(item, str) for item in value):
+        return None
+    return tuple(value)
+
+
+def evaluate_coaching_search(
+    completed_search: CompletedSearch,
+    coaching_search_details: Mapping[str, Any],
+    opportunities: tuple[OpportunityRevisionProjection, ...],
+) -> tuple[SearchResult, ...]:
+    """Classify one direction of the in-person coaching discovery flow."""
+    opportunity_type = _COACHING_OPPORTUNITY_TYPES.get(completed_search.user_intent)
+    if opportunity_type is None:
+        return ()
+    requested_schedule = _coaching_schedule_from_details(coaching_search_details)
+    matched: list[SearchResult] = []
+    for opportunity in opportunities:
+        if (
+            opportunity.publication_state != "active"
+            or opportunity.opportunity_type != opportunity_type
+        ):
+            continue
+        facts = opportunity.accepted_facts
+        if facts.get(opportunity_type) is not True:
+            continue
+        if (
+            facts.get("country_id") != completed_search.country_id
+            or facts.get("city_id") != completed_search.city_id
+        ):
+            continue
+        try:
+            source_posted_at = datetime.fromisoformat(str(facts["source_posted_at"]))
+            source_assertion_at = datetime.fromisoformat(
+                str(
+                    facts.get("source_qualifying_assertion_at")
+                    or facts["source_posted_at"]
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            source_posted_at.tzinfo is None
+            or source_assertion_at.tzinfo is None
+            or source_assertion_at < source_posted_at
+            or completed_search.completed_at.tzinfo is None
+            or completed_search.completed_at >= source_assertion_at + timedelta(days=30)
+        ):
+            continue
+        accepted_schedule = facts.get("schedule")
+        if accepted_schedule is None:
+            accepted_schedule = {
+                key: facts[key]
+                for key in (
+                    "weekdays",
+                    "day_parts",
+                    "local_start_time",
+                    "local_end_time",
+                    "start_local_date",
+                )
+                if key in facts
+            }
+        schedule_states = match_coaching_schedule(
+            requested_schedule,
+            accepted_schedule,
+            user_intent=completed_search.user_intent,
+        )
+        detail_state_by_key: dict[str, MatchState] = {}
+        for key in _COACHING_CATEGORICAL_KEYS:
+            requested_values = _coaching_values(coaching_search_details.get(key))
+            accepted_values = _coaching_values(facts.get(key))
+            if key == "payment":
+                detail_state_by_key[key] = match_detail(
+                    requested_values or (),
+                    accepted_values,
+                )
+            else:
+                detail_state_by_key[key] = match_detail(
+                    requested_values or (),
+                    accepted_values,
+                )
+        if requested_schedule is not None:
+            detail_state_by_key.update(schedule_states)
+        detail_state_by_key["search_area"] = match_search_area(
+            whole_city=completed_search.whole_city,
+            selected_area_ids=completed_search.sub_city_area_ids,
+            selected_area_types=completed_search.sub_city_area_geographic_types,
+            selected_area_parent_ids=completed_search.sub_city_area_verified_parent_ids,
+            country_id=completed_search.country_id,
+            city_id=completed_search.city_id,
+            facts=facts,
+        )
+        states = tuple(detail_state_by_key.values())
+        if MatchState.CONFLICT in states:
+            continue
+        route = opportunity.response_route
+        source_posted_at_text = str(facts["source_posted_at"])
+        source_assertion_at_text = str(
+            facts.get("source_qualifying_assertion_at") or source_posted_at_text
+        )
+        normalized_schedule = _coaching_schedule_mapping(accepted_schedule) or {}
+        accepted_start = _coaching_schedule_date(normalized_schedule)
+        card: dict[str, str] = {
+            "opportunity_id": opportunity.opportunity_id,
+            "opportunity_revision_id": opportunity.opportunity_revision_id,
+            "opportunity_type": opportunity_type,
+            opportunity_type: "true",
+            "iana_timezone": str(facts.get("iana_timezone", "UTC")),
+            "timezone_data_version": str(facts.get("timezone_data_version", "")),
+            "source_posted_at": source_posted_at_text,
+            "source_qualifying_assertion_at": source_assertion_at_text,
+            "response_route_kind": str(route["kind"]),
+            "response_route_value": str(route["value"]),
+            "unknown_criterion_count": str(
+                sum(state is MatchState.UNKNOWN for state in states)
+            ),
+            "location_specificity": str(
+                _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
+            ),
+            "match_states": json.dumps(
+                {
+                    key: state.value
+                    for key, state in detail_state_by_key.items()
+                    if coaching_search_details.get(key)
+                    or (key == "schedule" and requested_schedule is not None)
+                    or (key.startswith("schedule_") and requested_schedule is not None)
+                    or (key == "search_area" and not completed_search.whole_city)
+                },
+                sort_keys=True,
+            ),
+        }
+        if accepted_start is not None:
+            card["sort_local_date"] = accepted_start.isoformat()
+            card["start_local_date"] = accepted_start.isoformat()
+        for locale in ("en", "ru", "es", "fr"):
+            card[f"city_display_{locale}"] = str(
+                facts.get(f"city_display_{locale}", "")
+            )
+            card[f"place_display_{locale}"] = str(
+                facts.get(f"place_display_{locale}", "")
+            )
+        if normalized_schedule:
+            card["schedule"] = json.dumps(
+                normalized_schedule, ensure_ascii=False, sort_keys=True
+            )
+        for key in (
+            "coaching_types",
+            "playing_levels",
+            "team_formats",
+            "venue_settings",
+            "playing_surfaces",
+        ):
+            if facts.get(key):
+                card[key] = json.dumps(facts[key], ensure_ascii=False)
+        if facts.get("payment"):
+            card["payment"] = str(facts["payment"])
+        if facts.get("payment_amount") and facts.get("payment_currency"):
+            card["payment_amount"] = str(facts["payment_amount"])
+            card["payment_currency"] = str(facts["payment_currency"])
+        if facts.get("source_edited_at"):
+            card["source_edited_at"] = str(facts["source_edited_at"])
+        matched.append(
+            SearchResult(
+                result_id=(
+                    f"result:{completed_search.completed_search_id}:"
+                    f"{opportunity.opportunity_id}"
+                ),
+                completed_search_id=completed_search.completed_search_id,
+                absolute_position=1,
+                result_class=(
+                    "possible_match"
+                    if MatchState.UNKNOWN in states
+                    else "confirmed_match"
+                ),
+                card_facts=tuple(sorted(card.items())),
+            )
+        )
+    matched.sort(key=coaching_search_result_sort_key)
     return tuple(
         replace_result_position(result, position)
         for position, result in enumerate(matched, start=1)

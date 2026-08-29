@@ -129,12 +129,29 @@ class CodexCliClassifierAdapter:
             and "source-semantic-proof-v2" in self._schema_paths
             and "open-match-semantic-proof-v2" in self._prompt_paths
         )
+        player_v4_artifacts_complete = (
+            "source-message-classification-v4" in self._schema_paths
+            and "player-match-primary-v2" in self._prompt_paths
+            and "player-match-ambiguity-v2" in self._prompt_paths
+            and "source-semantic-proof-v3" in self._schema_paths
+            and "player-match-semantic-proof-v2" in self._prompt_paths
+        )
         open_v4_artifacts_complete = (
             "source-message-classification-v4" in self._schema_paths
             and "open-match-primary-v4" in self._prompt_paths
             and "open-match-ambiguity-v3" in self._prompt_paths
             and "source-semantic-proof-v3" in self._schema_paths
             and "open-match-semantic-proof-v3" in self._prompt_paths
+        )
+        open_v5_artifacts_complete = (
+            "source-message-classification-v5" in self._schema_paths
+            and "open-match-primary-v5" in self._prompt_paths
+            and "open-match-ambiguity-v4" in self._prompt_paths
+            and "source-semantic-proof-v4" in self._schema_paths
+            and "open-match-semantic-proof-v4" in self._prompt_paths
+        )
+        v4_artifacts_complete = (
+            player_v4_artifacts_complete or open_v4_artifacts_complete
         )
         v3_artifacts_complete = (
             player_v3_artifacts_complete or open_v3_artifacts_complete
@@ -145,7 +162,8 @@ class CodexCliClassifierAdapter:
                 for version, available in (
                     ("source-message-classification-v2", v2_primary_available),
                     ("source-message-classification-v3", v3_artifacts_complete),
-                    ("source-message-classification-v4", open_v4_artifacts_complete),
+                    ("source-message-classification-v4", v4_artifacts_complete),
+                    ("source-message-classification-v5", open_v5_artifacts_complete),
                 )
                 if available
             ]
@@ -165,37 +183,47 @@ class CodexCliClassifierAdapter:
             v3_artifacts_complete
         ):
             raise ValueError("incomplete v3 classifier artifact set")
+        if (
+            primary_schema_version == "source-message-classification-v4"
+            and not v4_artifacts_complete
+        ):
+            raise ValueError("incomplete v4 classifier artifact set")
+        if (
+            primary_schema_version == "source-message-classification-v5"
+            and not open_v5_artifacts_complete
+        ):
+            raise ValueError("incomplete v5 classifier artifact set")
         if primary_schema_version == "source-message-classification-v2" and not (
             v2_primary_available
         ):
             raise ValueError("incomplete v2 classifier artifact set")
-        if primary_schema_version == "source-message-classification-v4" and not (
-            open_v4_artifacts_complete
-        ):
-            raise ValueError("incomplete v4 classifier artifact set")
         self._primary_schema_version = primary_schema_version
         if self._primary_schema_version not in {
             "source-message-classification-v1",
             "source-message-classification-v2",
             "source-message-classification-v3",
             "source-message-classification-v4",
+            "source-message-classification-v5",
         }:
             raise ValueError("unsupported primary classifier schema version")
-        self._primary_prompt_version = (
-            "player-match-primary-v1"
-            if self._primary_schema_version == "source-message-classification-v3"
-            and player_v3_artifacts_complete
-            and not open_v3_artifacts_complete
-            else (
-                "open-match-primary-v3"
-                if self._primary_schema_version == "source-message-classification-v3"
+        if self._primary_schema_version == "source-message-classification-v5":
+            self._primary_prompt_version = "open-match-primary-v5"
+        elif self._primary_schema_version == "source-message-classification-v4":
+            self._primary_prompt_version = (
+                "player-match-primary-v2"
+                if player_v4_artifacts_complete and not open_v4_artifacts_complete
                 else "open-match-primary-v4"
-                if self._primary_schema_version == "source-message-classification-v4"
-                else "open-match-primary-v2"
-                if self._primary_schema_version == "source-message-classification-v2"
-                else "open-match-primary-v1"
             )
-        )
+        elif self._primary_schema_version == "source-message-classification-v3":
+            self._primary_prompt_version = (
+                "player-match-primary-v1"
+                if player_v3_artifacts_complete and not open_v3_artifacts_complete
+                else "open-match-primary-v3"
+            )
+        elif self._primary_schema_version == "source-message-classification-v2":
+            self._primary_prompt_version = "open-match-primary-v2"
+        else:
+            self._primary_prompt_version = "open-match-primary-v1"
         self._smoke_test = smoke_test
 
     @property
@@ -204,8 +232,8 @@ class CodexCliClassifierAdapter:
 
     @property
     def primary_schema_version(self) -> str:
-        # v3 remains evaluation-only until its promotion gate is accepted;
-        # v2 is the compatible runtime contract for opponent_request.
+        # The selected schema remains explicit so released artifacts never
+        # silently switch families or versions.
         return self._primary_schema_version
 
     @property
