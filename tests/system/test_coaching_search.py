@@ -394,11 +394,64 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
         telegram_user_id=bot_user_id,
         value="wednesday",
     )
-    system.submit_coaching_search_schedule_interval(
+    schedule_menu = telegram_delivery.messages[-1]
+    interval_buttons = [
+        (label, callback)
+        for row in schedule_menu.button_rows
+        for label, callback in row
+        if callback.startswith("coaching-details:interval:")
+    ]
+    assert interval_buttons == [
+        ("Exact interval", f"coaching-details:interval:{schedule_menu.screen_revision}")
+    ]
+    system.open_coaching_search_schedule_interval(
+        update_id=f"interval-prompt:{direction}",
+        telegram_user_id=bot_user_id,
+    )
+    assert "19:00-21:00" in telegram_delivery.messages[-1].text
+    assert telegram_delivery.messages[-1].button_rows == (
+        (
+            (
+                "Back",
+                f"coaching-details:back:{telegram_delivery.messages[-1].screen_revision}",
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="HH:MM-HH:MM"):
+        system.submit_coaching_search_schedule_interval_text(
+            update_id=f"interval-malformed:{direction}",
+            telegram_user_id=bot_user_id,
+            text="19:00 until 21:00",
+        )
+    assert "HH:MM-HH:MM" in telegram_delivery.messages[-1].text
+    with pytest.raises(ValueError, match="positive duration"):
+        system.submit_coaching_search_schedule_interval_text(
+            update_id=f"interval-invalid:{direction}",
+            telegram_user_id=bot_user_id,
+            text="21:00-19:00",
+        )
+    assert "HH:MM-HH:MM" in telegram_delivery.messages[-1].text
+    system.back_from_coaching_search_detail(
+        update_id=f"interval-back:{direction}",
+        telegram_user_id=bot_user_id,
+    )
+    assert "recurring interval" not in telegram_delivery.messages[-1].text
+    draft = system.discovery_draft(bot_user_id)
+    assert draft is not None
+    assert draft.coaching_search_detail_draft == ("wednesday",)
+    system.open_coaching_search_schedule_interval(
+        update_id=f"interval-prompt-again:{direction}",
+        telegram_user_id=bot_user_id,
+    )
+    system.submit_coaching_search_schedule_interval_text(
         update_id=f"interval:{direction}",
         telegram_user_id=bot_user_id,
-        start_time="19:00",
-        end_time="21:00",
+        text="19:00-21:00",
+    )
+    assert any(
+        label == "✓ Exact interval"
+        for row in telegram_delivery.messages[-1].button_rows
+        for label, _callback in row
     )
     system.open_coaching_search_schedule_start_date(
         update_id=f"start-date-prompt:{direction}",
@@ -478,6 +531,25 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
     assert json.loads(facts["match_states"])["schedule_start_date"] == "confirmed"
     assert title in telegram_delivery.messages[-1].text
     assert "In-person" not in telegram_delivery.messages[-1].text
+    card_text = telegram_delivery.messages[-1].text
+    additional_index = card_text.index("Additional:")
+    primary_text = card_text[:additional_index]
+    additional_text = card_text[additional_index:]
+    assert "Coaching type:" in primary_text
+    assert "Schedule:" in primary_text
+    for label in (
+        "Playing levels:",
+        "Venue type:",
+        "Playing surface:",
+        "Payment:",
+    ):
+        assert label not in primary_text
+        assert additional_text.count(label) == 1
+        assert card_text.count(label) == 1
+    if direction == "coaching_service_offer":
+        assert "Team format:" not in primary_text
+        assert additional_text.count("Team format:") == 1
+        assert card_text.count("Team format:") == 1
     account_checkpoint = TelegramAccountCheckpoint(
         pts=5_600,
         qts=560,

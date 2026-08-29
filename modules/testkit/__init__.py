@@ -3349,6 +3349,16 @@ class AcceptanceSpine:
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 
+    def open_coaching_search_schedule_interval(
+        self, *, update_id: str, telegram_user_id: int
+    ) -> None:
+        """Open the exact recurring interval prompt through the Bot Assistant."""
+        self._conversation_onboarding().open_coaching_search_schedule_interval(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
     def submit_coaching_search_schedule_interval(
         self,
         *,
@@ -3363,6 +3373,17 @@ class AcceptanceSpine:
             telegram_user_id=telegram_user_id,
             start_time=start_time,
             end_time=end_time,
+            screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
+        )
+
+    def submit_coaching_search_schedule_interval_text(
+        self, *, update_id: str, telegram_user_id: int, text: str
+    ) -> None:
+        """Submit exact recurring interval text through the Bot Assistant."""
+        self._conversation_onboarding().submit_coaching_search_schedule_interval_text(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
             screen_revision=self.discovery_draft(telegram_user_id).screen_revision,
         )
 

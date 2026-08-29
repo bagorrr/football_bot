@@ -1211,6 +1211,7 @@ _COACHING_START_DATE_ANY = {
     "es": frozenset({"cualquiera"}),
     "fr": frozenset({"peu importe"}),
 }
+_COACHING_INTERVAL_PROMPT_TOKEN = "__coaching_interval_prompt__"
 _COACHING_SEARCH_DETAIL_NAMES = {
     "en": (
         "Coaching type",
@@ -7339,6 +7340,17 @@ class ConversationOnboarding:
             value=value,
         )
 
+    def open_coaching_search_schedule_interval(
+        self, *, update_id: str, telegram_user_id: int, screen_revision: int
+    ) -> None:
+        """Open the exact recurring interval text prompt."""
+        self._change_coaching_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="interval_prompt",
+        )
+
     def submit_coaching_search_schedule_interval(
         self,
         *,
@@ -7358,6 +7370,24 @@ class ConversationOnboarding:
             telegram_user_id=telegram_user_id,
             screen_revision=screen_revision,
             operation="set_interval",
+            value=f"{start_time}-{end_time}",
+        )
+
+    def submit_coaching_search_schedule_interval_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+        text: str,
+    ) -> None:
+        """Validate and submit one exact recurring interval from text."""
+        start_time, end_time = _parse_coaching_interval_text(text)
+        self._change_coaching_search_details(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            screen_revision=screen_revision,
+            operation="submit_interval",
             value=f"{start_time}-{end_time}",
         )
 
@@ -7557,6 +7587,11 @@ class ConversationOnboarding:
             elif operation == "toggle_weekday":
                 if editing != "schedule" or value not in _COACHING_WEEKDAYS:
                     raise RuntimeError("Coaching Search Schedule is not open")
+                temporary = [
+                    token
+                    for token in temporary
+                    if token != _COACHING_INTERVAL_PROMPT_TOKEN
+                ]
                 if value in temporary:
                     temporary.remove(value)
                 else:
@@ -7571,12 +7606,14 @@ class ConversationOnboarding:
                         for token in temporary
                         if not token.startswith("day_part:")
                         and not token.startswith("interval:")
+                        and token != _COACHING_INTERVAL_PROMPT_TOKEN
                     ]
                 else:
                     temporary = [
                         token
                         for token in temporary
                         if not token.startswith("interval:")
+                        and token != _COACHING_INTERVAL_PROMPT_TOKEN
                     ]
                     day_part_token = f"day_part:{value}"
                     if day_part_token in temporary:
@@ -7594,8 +7631,37 @@ class ConversationOnboarding:
                     for token in temporary
                     if not token.startswith("day_part:")
                     and not token.startswith("interval:")
+                    and token != _COACHING_INTERVAL_PROMPT_TOKEN
                 ]
                 temporary.append(f"interval:{value}")
+                target = "submenu"
+            elif operation == "interval_prompt":
+                if editing != "schedule":
+                    raise RuntimeError("Coaching Search Schedule is not open")
+                temporary = [
+                    token
+                    for token in temporary
+                    if token != _COACHING_INTERVAL_PROMPT_TOKEN
+                ]
+                temporary.append(_COACHING_INTERVAL_PROMPT_TOKEN)
+                schedule_prompt = None
+                target = "interval_prompt"
+            elif operation == "submit_interval":
+                if (
+                    editing != "schedule"
+                    or _COACHING_INTERVAL_PROMPT_TOKEN not in temporary
+                    or value is None
+                ):
+                    raise RuntimeError("Coaching Search interval prompt is not open")
+                temporary = [
+                    token
+                    for token in temporary
+                    if not token.startswith("day_part:")
+                    and not token.startswith("interval:")
+                    and token != _COACHING_INTERVAL_PROMPT_TOKEN
+                ]
+                temporary.append(f"interval:{value}")
+                schedule_prompt = None
                 target = "submenu"
             elif operation == "clear_time":
                 if editing != "schedule":
@@ -7605,6 +7671,7 @@ class ConversationOnboarding:
                     for token in temporary
                     if not token.startswith("day_part:")
                     and not token.startswith("interval:")
+                    and token != _COACHING_INTERVAL_PROMPT_TOKEN
                 ]
                 target = "submenu"
             elif operation == "set_start_date":
@@ -7614,6 +7681,7 @@ class ConversationOnboarding:
                     token
                     for token in temporary
                     if not token.startswith("start_local_date:")
+                    and token != _COACHING_INTERVAL_PROMPT_TOKEN
                 ]
                 temporary.append(value)
                 schedule_prompt = None
@@ -7625,19 +7693,31 @@ class ConversationOnboarding:
                     token
                     for token in temporary
                     if not token.startswith("start_local_date:")
+                    and token != _COACHING_INTERVAL_PROMPT_TOKEN
                 ]
                 schedule_prompt = None
                 target = "submenu"
             elif operation == "schedule_prompt":
                 if editing != "schedule":
                     raise RuntimeError("Coaching Search Schedule is not open")
+                temporary = [
+                    token
+                    for token in temporary
+                    if token != _COACHING_INTERVAL_PROMPT_TOKEN
+                ]
                 schedule_prompt = value or "start_local_date"
                 target = "schedule_prompt"
             elif operation == "commit":
                 if editing is None:
                     raise RuntimeError("No Coaching Search detail is open")
                 if editing == "schedule":
-                    schedule = _coaching_schedule_from_tokens(temporary)
+                    schedule = _coaching_schedule_from_tokens(
+                        [
+                            token
+                            for token in temporary
+                            if token != _COACHING_INTERVAL_PROMPT_TOKEN
+                        ]
+                    )
                     if schedule:
                         details[editing] = schedule
                     else:
@@ -7651,7 +7731,17 @@ class ConversationOnboarding:
                 schedule_prompt = None
                 target = "hub"
             elif operation == "back":
-                if schedule_prompt is not None and editing == "schedule":
+                if (
+                    editing == "schedule"
+                    and _COACHING_INTERVAL_PROMPT_TOKEN in temporary
+                ):
+                    temporary = [
+                        token
+                        for token in temporary
+                        if token != _COACHING_INTERVAL_PROMPT_TOKEN
+                    ]
+                    target = "submenu"
+                elif schedule_prompt is not None and editing == "schedule":
                     schedule_prompt = None
                     target = "submenu"
                 elif editing is None:
@@ -7711,6 +7801,14 @@ class ConversationOnboarding:
                     locale=locale,
                     screen_revision=state.screen_revision,
                     prompt_kind=schedule_prompt or "start_local_date",
+                )
+            elif target == "interval_prompt":
+                message = _coaching_search_schedule_prompt_message(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    prompt_kind="interval",
                 )
             else:
                 message = _coaching_search_details_hub_message(
@@ -11788,6 +11886,8 @@ def _coaching_search_detail_submenu_message(
             "exact_interval"
         ]
         start_date_label = _COACHING_SEARCH_VALUE_COPY[copy_locale]["start_local_date"]
+        if any(token.startswith("interval:") for token in temporary):
+            exact_interval_label = f"✓ {exact_interval_label}"
         rows: tuple[tuple[tuple[str, str], ...], ...] = (
             *((button(value),) for value in _COACHING_WEEKDAYS),
             *((button(value),) for value in _COACHING_DAY_PARTS),
@@ -11835,34 +11935,72 @@ def _coaching_search_schedule_prompt_message(
     screen_revision: int,
     prompt_kind: str,
 ) -> TelegramMessage:
-    """Render a controlled prompt for the optional coaching Schedule date."""
+    """Render a controlled prompt for one optional coaching Schedule input."""
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
-    text, back = {
-        "en": (
-            'Send the Schedule start date or "any", for example: 25 August.',
-            "Back",
-        ),
-        "ru": (
-            "Введите дату начала расписания или «неважно», например: 25 августа.",
-            "Назад",
-        ),
-        "es": (
-            "Escribe la fecha de inicio o «cualquiera», por ejemplo: 25 de agosto.",
-            "Atrás",
-        ),
-        "fr": (
-            "Indiquez la date de début ou «peu importe», par exemple : 25 août.",
-            "Retour",
-        ),
+    prompts = {
+        "en": {
+            "start_local_date": (
+                'Send the Schedule start date or "any", for example: 25 August.'
+            ),
+            "interval": (
+                "Send the recurring interval as HH:MM-HH:MM, for example: 19:00-21:00."
+            ),
+            "back": "Back",
+        },
+        "ru": {
+            "start_local_date": (
+                "Введите дату начала расписания или «неважно», например: 25 августа."
+            ),
+            "interval": (
+                "Введите повторяющийся интервал в формате HH:MM-HH:MM, например: "
+                "19:00-21:00."
+            ),
+            "back": "Назад",
+        },
+        "es": {
+            "start_local_date": (
+                "Escribe la fecha de inicio o «cualquiera», por ejemplo: 25 de agosto."
+            ),
+            "interval": (
+                "Escribe el intervalo recurrente como HH:MM-HH:MM, por ejemplo: "
+                "19:00-21:00."
+            ),
+            "back": "Atrás",
+        },
+        "fr": {
+            "start_local_date": (
+                "Indiquez la date de début ou «peu importe», par exemple : 25 août."
+            ),
+            "interval": (
+                "Indiquez l’intervalle récurrent au format HH:MM-HH:MM, par exemple : "
+                "19:00-21:00."
+            ),
+            "back": "Retour",
+        },
     }[copy_locale]
     return TelegramMessage(
         delivery_id=f"onboarding:{update_id}",
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
-        text=text,
-        button_rows=(((back, f"coaching-details:back:{screen_revision}"),),),
+        text=prompts[prompt_kind],
+        button_rows=(((prompts["back"], f"coaching-details:back:{screen_revision}"),),),
     )
+
+
+def _parse_coaching_interval_text(text: str) -> tuple[str, str]:
+    """Parse one exact recurring interval using the canonical local format."""
+    match = re.fullmatch(
+        r"\s*((?:[01][0-9]|2[0-3]):[0-5][0-9])\s*[-–—]\s*"
+        r"((?:[01][0-9]|2[0-3]):[0-5][0-9])\s*",
+        text,
+    )
+    if match is None:
+        raise ValueError("Coaching Search interval must be HH:MM-HH:MM")
+    start_time, end_time = match.groups()
+    if start_time >= end_time:
+        raise ValueError("Coaching Search interval must have positive duration")
+    return start_time, end_time
 
 
 def _coaching_search_result_message(
@@ -12166,15 +12304,29 @@ def _coaching_search_result_message(
         "playing_surfaces",
         "payment",
     )
+    schedule_state_keys = frozenset(
+        {"schedule", "schedule_weekdays", "schedule_time", "schedule_start_date"}
+    )
+    selected_detail_keys = {
+        "schedule" if key in schedule_state_keys else key
+        for key in match_states
+        if key in names
+    }
+    selected_detail_states = {
+        key: (
+            match_states.get("schedule") if key == "schedule" else match_states.get(key)
+        )
+        for key in detail_order
+    }
     detail_lines = [
         f"{labels[key]}: {known_values[key]}"
         for key in detail_order
-        if key in known_values
+        if key in known_values and selected_detail_states[key] == "confirmed"
     ]
     additional = " · ".join(
         f"{labels[key]}: {known_values[key]}"
         for key in detail_order
-        if key in known_values and match_states.get(key) != "confirmed"
+        if key in known_values and key not in selected_detail_keys
     )
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts.get("iana_timezone", "UTC"))

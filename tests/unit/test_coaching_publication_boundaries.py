@@ -382,6 +382,34 @@ def test_inactive_coaching_card_is_unavailable_without_contact_route() -> None:
     assert "@coach_contact" not in message.text
 
 
+def test_selected_unknown_coaching_fact_is_needs_clarification_only() -> None:
+    facts = dict(_coaching_result().card_facts)
+    facts["playing_levels"] = json.dumps(["average"])
+    facts["match_states"] = json.dumps(
+        {
+            "coaching_types": "confirmed",
+            "playing_levels": "unknown",
+            "schedule": "confirmed",
+        },
+        sort_keys=True,
+    )
+    message = _coaching_search_result_message(
+        delivery_id="delivery:coach:unknown-detail",
+        telegram_user_id=49_118,
+        locale="en",
+        screen_revision=4,
+        result=SearchResult(
+            result_id="result:coach:unknown-detail",
+            completed_search_id="completed-search:coach:unknown-detail",
+            absolute_position=1,
+            card_facts=tuple(sorted(facts.items())),
+        ),
+    )
+    assert "Needs clarification: Playing levels." in message.text
+    assert "Playing levels: Average" not in message.text
+    assert "Additional:" not in message.text
+
+
 @pytest.mark.parametrize(
     ("locale", "any_label", "any_text"),
     (
@@ -417,6 +445,46 @@ def test_schedule_submenu_any_button_clears_start_date_not_time(
         prompt_kind="start_local_date",
     )
     assert any_text in prompt.text.casefold()
+
+
+@pytest.mark.parametrize(
+    ("locale", "expected_prompt", "back_label"),
+    (
+        (
+            "en",
+            "Send the recurring interval as HH:MM-HH:MM",
+            "Back",
+        ),
+        (
+            "ru",
+            "Введите повторяющийся интервал в формате HH:MM-HH:MM",
+            "Назад",
+        ),
+        (
+            "es",
+            "Escribe el intervalo recurrente como HH:MM-HH:MM",
+            "Atrás",
+        ),
+        (
+            "fr",
+            "intervalle récurrent au format HH:MM-HH:MM",
+            "Retour",
+        ),
+    ),
+)
+def test_exact_interval_prompt_is_localized_and_has_back(
+    locale: str, expected_prompt: str, back_label: str
+) -> None:
+    message = _coaching_search_schedule_prompt_message(
+        update_id="schedule-interval-prompt",
+        telegram_user_id=49_118,
+        locale=locale,
+        screen_revision=4,
+        prompt_kind="interval",
+    )
+
+    assert expected_prompt in message.text
+    assert message.button_rows == (((back_label, "coaching-details:back:4"),),)
 
 
 def test_generic_online_coaching_wording_does_not_establish_in_person_intent() -> None:
