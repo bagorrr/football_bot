@@ -1,8 +1,19 @@
 """Exact Repost Cluster behavior through the durable Player system seam."""
 
+import os
+import time
 from datetime import UTC, datetime
+from threading import Event, Thread
 
-from modules.contracts import JsonValue
+import psycopg
+from psycopg import sql
+
+from modules.contracts import (
+    ContractName,
+    JsonValue,
+    RuntimeRole,
+    derive_contract_message_id,
+)
 from modules.domain import ExactRepostCluster, SourceEventKind
 from modules.player_promotion_runtime import (
     CONTROLLED_COSMETIC_EDIT_BODY,
@@ -16,8 +27,6 @@ from modules.player_promotion_runtime import (
 def _probe(
     *operations: dict[str, JsonValue],
 ) -> DurableAcceptanceProbe:
-    import os
-
     return DurableAcceptanceProbe(
         database_url=os.environ["TEST_DATABASE_URL"],
         execution_id="exact-repost-regression",
@@ -382,14 +391,567 @@ def test_deleting_newest_representative_reactivates_old_survivor() -> None:
     assert deleted_member.publication_reason == "source_deleted"
     assert survivor.publication_state == "active"
     assert survivor.is_representative
-    projected = {
-        item.opportunity_id: item
-        for item in probe.system.recommendation_opportunities()
-    }
-    assert projected[survivor.opportunity_id].publication_state == "active"
-    assert (
-        projected[deleted_member.opportunity_id].publication_reason == "source_deleted"
+    projected = probe.system.recommendation_opportunities()
+    deleted_projection_rows = tuple(
+        item
+        for item in projected
+        if item.opportunity_id == deleted_member.opportunity_id
     )
+    survivor_projection_rows = tuple(
+        item for item in projected if item.opportunity_id == survivor.opportunity_id
+    )
+    assert deleted_projection_rows
+    assert all(item.response_route.value == "" for item in deleted_projection_rows)
+    assert survivor_projection_rows
+    assert all(
+        item.response_route.value == "@controlled_open_match"
+        for item in survivor_projection_rows
+    )
+    projected_by_opportunity = {item.opportunity_id: item for item in projected}
+    assert (
+        projected_by_opportunity[survivor.opportunity_id].publication_state == "active"
+    )
+    assert (
+        projected_by_opportunity[deleted_member.opportunity_id].publication_reason
+        == "source_deleted"
+    )
+
+
+def test_claimed_recommendation_publication_cannot_reintroduce_deleted_route() -> None:
+    probe = _probe()
+    source_revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=703,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+        process=False,
+    )
+    assert source_revision is not None
+    assert probe.system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    publications = probe.system.opportunity_publication_contracts(source_revision)
+    assert len(publications) == 1
+    publication_payload = publications[0].payload
+    assert isinstance(publication_payload, dict)
+    opportunity_id = publication_payload["opportunity_id"]
+    opportunity_revision_id = publication_payload["opportunity_revision_id"]
+    assert isinstance(opportunity_id, str)
+    assert isinstance(opportunity_revision_id, str)
+    assert probe.system.process_next_contract_handoff(RuntimeRole.RECOMMENDATION)
+    assert any(
+        item.opportunity_id == opportunity_id
+        and item.response_route.value == "@controlled_open_match"
+        for item in probe.system.recommendation_opportunities()
+    )
+    probe.system.process_opportunities_until_idle()
+
+    database_url = os.environ["TEST_DATABASE_URL"]
+    trigger_name = "test_fix59_pause_recommendation_inbox"
+    function_name = "test_fix59_pause_recommendation_inbox"
+    advisory_key = 59059
+    stale_message_id = derive_contract_message_id(
+        publications[0].message_id,
+        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+    )
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE OR REPLACE FUNCTION {}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $function$
+                BEGIN
+                    IF NEW.consumer_role = 'recommendation'
+                       AND NEW.message_id = {} THEN
+                        PERFORM pg_advisory_lock({});
+                    END IF;
+                    RETURN NEW;
+                END
+                $function$
+                """
+            ).format(
+                sql.Identifier("football_runtime", function_name),
+                sql.Literal(stale_message_id),
+                sql.Literal(advisory_key),
+            )
+        )
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE TRIGGER {}
+                BEFORE INSERT ON football_runtime.contract_inbox
+                FOR EACH ROW
+                EXECUTE FUNCTION {}()
+                """
+            ).format(
+                sql.Identifier(trigger_name),
+                sql.Identifier("football_runtime", function_name),
+            )
+        )
+
+    probe.system.record_search_event(
+        probe_id="exact-repost-stale-publication",
+        contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        contract_version=2,
+        telegram_user_id=49_520,
+        producer=RuntimeRole.APPLICATION,
+        include_telegram_user_id=False,
+        subject_id=opportunity_id,
+        subject_revision=1,
+        idempotency_key=(
+            f"opportunity-publication-exact-repost:{opportunity_revision_id}:active:2"
+        ),
+        message_id=stale_message_id,
+        causation_id=publications[0].message_id,
+        payload={
+            "opportunity_id": opportunity_id,
+            "opportunity_revision_id": opportunity_revision_id,
+            "source_message_revision_id": source_revision,
+            "publication_state": "active",
+            "opportunity_type": publication_payload["opportunity_type"],
+            "accepted_facts": publication_payload["accepted_facts"],
+            "response_route": publication_payload["response_route"],
+        },
+    )
+    stale_envelope = probe.system.recoverable_contract_message(stale_message_id)
+
+    lock_connection = psycopg.connect(database_url)
+    worker_errors: list[BaseException] = []
+    delete_errors: list[BaseException] = []
+    delete_started = Event()
+    delete_finished = Event()
+    worker_finished = Event()
+
+    def process_claimed_publication() -> None:
+        try:
+            assert probe.system.process_next_contract_handoff(
+                RuntimeRole.RECOMMENDATION
+            )
+        except BaseException as error:
+            worker_errors.append(error)
+        finally:
+            worker_finished.set()
+
+    def delete_source_message() -> None:
+        delete_started.set()
+        try:
+            deleted_revision, _ = probe.source_event(
+                body=None,
+                operation_number=2,
+                kind=SourceEventKind.DELETE,
+                revision=2,
+                telegram_message_id=703,
+                source_publisher_id="publisher:one",
+                event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+                process=False,
+            )
+            assert deleted_revision == f"{_source_id(source_revision)}:revision:2"
+        except BaseException as error:
+            delete_errors.append(error)
+        finally:
+            delete_finished.set()
+
+    worker = Thread(target=process_claimed_publication)
+    deleter: Thread | None = None
+    try:
+        lock_connection.execute("SELECT pg_advisory_lock(%s)", (advisory_key,))
+        worker.start()
+
+        trigger_waiting = False
+        activity_snapshot: tuple[object, ...] = ()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                activity_snapshot = tuple(
+                    connection.execute(
+                        """
+                        SELECT usename, state, wait_event_type, wait_event,
+                               left(query, 120)
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND pid <> pg_backend_pid()
+                        ORDER BY pid
+                        """
+                    ).fetchall()
+                )
+                waiting = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND pid <> pg_backend_pid()
+                          AND wait_event_type = 'Lock'
+                          AND wait_event ILIKE '%advisory%'
+                    )
+                    """
+                ).fetchone()
+            if waiting is not None and waiting[0]:
+                trigger_waiting = True
+                break
+            time.sleep(0.01)
+        with psycopg.connect(database_url) as connection:
+            inbox_snapshot = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = 'recommendation'
+                  AND message_id = %s
+                """,
+                (stale_envelope.message_id,),
+            ).fetchone()
+        assert trigger_waiting, (
+            worker_errors,
+            worker_finished.is_set(),
+            activity_snapshot,
+            inbox_snapshot,
+        )
+
+        deleter = Thread(target=delete_source_message)
+        deleter.start()
+        assert delete_started.wait(timeout=2)
+
+        deletion_committed = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                tombstone = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM football_runtime.application_source_message_tombstones
+                        WHERE source_message_id = %s
+                    )
+                    """,
+                    (_source_id(source_revision),),
+                ).fetchone()
+            if tombstone is not None and tombstone[0]:
+                deletion_committed = True
+                break
+            time.sleep(0.01)
+        assert deletion_committed
+        assert not worker_finished.is_set()
+        probe.system.process_opportunities_until_idle()
+        pre_release_rows = tuple(
+            item
+            for item in probe.system.recommendation_opportunities()
+            if item.opportunity_id == opportunity_id
+        )
+        assert pre_release_rows
+        assert all(item.response_route.value == "" for item in pre_release_rows)
+    finally:
+        lock_connection.execute("SELECT pg_advisory_unlock(%s)", (advisory_key,))
+        lock_connection.commit()
+        worker.join(timeout=5)
+        if deleter is not None:
+            deleter.join(timeout=5)
+        lock_connection.close()
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL(
+                    "DROP TRIGGER IF EXISTS {} ON football_runtime.contract_inbox"
+                ).format(sql.Identifier(trigger_name))
+            )
+            connection.execute(
+                sql.SQL("DROP FUNCTION IF EXISTS {}()").format(
+                    sql.Identifier("football_runtime", function_name)
+                )
+            )
+
+    assert worker_finished.is_set()
+    assert delete_finished.is_set()
+    assert not worker_errors, worker_errors
+    assert not delete_errors, delete_errors
+
+    probe.system.process_opportunities_until_idle()
+    deleted_projection_rows = tuple(
+        item
+        for item in probe.system.recommendation_opportunities()
+        if item.opportunity_id == opportunity_id
+    )
+    assert deleted_projection_rows
+    assert all(
+        item.response_route.kind == "unavailable" and item.response_route.value == ""
+        for item in deleted_projection_rows
+    )
+
+
+def test_delete_first_rejects_claimed_application_publication() -> None:
+    probe = _probe()
+    source_revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=704,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+        process=False,
+    )
+    assert source_revision is not None
+    proposals = probe.system.classification_proposals_for_revision(source_revision)
+    assert len(proposals) == 1
+    stale_message_id = proposals[0].message_id
+
+    database_url = os.environ["TEST_DATABASE_URL"]
+    trigger_name = "test_fix59_pause_application_inbox"
+    function_name = "test_fix59_pause_application_inbox"
+    advisory_key = 59060
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE OR REPLACE FUNCTION {}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $function$
+                BEGIN
+                    IF NEW.consumer_role = 'application'
+                       AND NEW.message_id = {} THEN
+                        PERFORM pg_advisory_lock({});
+                    END IF;
+                    RETURN NEW;
+                END
+                $function$
+                """
+            ).format(
+                sql.Identifier("football_runtime", function_name),
+                sql.Literal(stale_message_id),
+                sql.Literal(advisory_key),
+            )
+        )
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE TRIGGER {}
+                BEFORE INSERT ON football_runtime.contract_inbox
+                FOR EACH ROW
+                EXECUTE FUNCTION {}()
+                """
+            ).format(
+                sql.Identifier(trigger_name),
+                sql.Identifier("football_runtime", function_name),
+            )
+        )
+
+    lock_connection = psycopg.connect(database_url)
+    worker_errors: list[BaseException] = []
+    delete_errors: list[BaseException] = []
+    delete_started = Event()
+    delete_finished = Event()
+    worker_finished = Event()
+
+    def process_claimed_proposal() -> None:
+        try:
+            assert probe.system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+        except BaseException as error:
+            worker_errors.append(error)
+        finally:
+            worker_finished.set()
+
+    def delete_source_message() -> None:
+        delete_started.set()
+        try:
+            deleted_revision, _ = probe.source_event(
+                body=None,
+                operation_number=2,
+                kind=SourceEventKind.DELETE,
+                revision=2,
+                telegram_message_id=704,
+                source_publisher_id="publisher:one",
+                event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+                process=False,
+            )
+            assert deleted_revision == f"{_source_id(source_revision)}:revision:2"
+        except BaseException as error:
+            delete_errors.append(error)
+        finally:
+            delete_finished.set()
+
+    worker = Thread(target=process_claimed_proposal)
+    deleter: Thread | None = None
+    try:
+        lock_connection.execute("SELECT pg_advisory_lock(%s)", (advisory_key,))
+        worker.start()
+
+        trigger_waiting = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                waiting = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND pid <> pg_backend_pid()
+                          AND wait_event_type = 'Lock'
+                          AND wait_event ILIKE '%advisory%'
+                    )
+                    """
+                ).fetchone()
+            if waiting is not None and waiting[0]:
+                trigger_waiting = True
+                break
+            time.sleep(0.01)
+        assert trigger_waiting
+
+        deleter = Thread(target=delete_source_message)
+        deleter.start()
+        assert delete_started.wait(timeout=2)
+
+        deletion_committed = False
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                tombstone = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM football_runtime.application_source_message_tombstones
+                        WHERE source_message_id = %s
+                    )
+                    """,
+                    (_source_id(source_revision),),
+                ).fetchone()
+            if tombstone is not None and tombstone[0]:
+                deletion_committed = True
+                break
+            time.sleep(0.01)
+        assert deletion_committed
+        assert not worker_finished.is_set()
+    finally:
+        lock_connection.execute("SELECT pg_advisory_unlock(%s)", (advisory_key,))
+        lock_connection.commit()
+        worker.join(timeout=5)
+        if deleter is not None:
+            deleter.join(timeout=5)
+        lock_connection.close()
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL(
+                    "DROP TRIGGER IF EXISTS {} ON football_runtime.contract_inbox"
+                ).format(sql.Identifier(trigger_name))
+            )
+            connection.execute(
+                sql.SQL("DROP FUNCTION IF EXISTS {}()").format(
+                    sql.Identifier("football_runtime", function_name)
+                )
+            )
+
+    assert worker_finished.is_set()
+    assert delete_finished.is_set()
+    assert not worker_errors, worker_errors
+    assert not delete_errors, delete_errors
+    probe.system.process_opportunities_until_idle()
+    assert all(
+        opportunity.publication_state != "active"
+        for opportunity in probe.system.opportunities()
+    )
+
+
+def test_deleting_last_exact_repost_member_scrubs_cluster_and_is_idempotent() -> None:
+    probe = _probe()
+    _, _, first_source, second_source = _create_pair(probe)
+    cluster_before = _cluster(probe)
+    cluster_id = cluster_before.exact_repost_cluster_id
+
+    deleted_revision, _ = probe.source_event(
+        body=None,
+        operation_number=3,
+        kind=SourceEventKind.DELETE,
+        revision=2,
+        telegram_message_id=702,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert deleted_revision == f"{second_source}:revision:2"
+    survivor_cluster = _cluster(probe)
+    assert survivor_cluster.exact_repost_cluster_id == cluster_id
+    assert survivor_cluster.source_publisher_id == "publisher:one"
+    assert survivor_cluster.normalized_body == CONTROLLED_LIFECYCLE_BODY.casefold()
+    assert survivor_cluster.representative_source_message_id == first_source
+
+    deleted_revision, _ = probe.source_event(
+        body=None,
+        operation_number=4,
+        kind=SourceEventKind.DELETE,
+        revision=2,
+        telegram_message_id=701,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 9, tzinfo=UTC),
+    )
+    assert deleted_revision == f"{first_source}:revision:2"
+    assert probe.system.exact_repost_clusters() == ()
+    assert probe.system.exact_repost_cluster_members(cluster_id) == ()
+
+    assert all(item.body is None for item in probe.system.source_events())
+    assert all(
+        item.source_publisher_id is None for item in probe.system.source_events()
+    )
+    assert all(item.body is None for item in probe.system.source_messages())
+    assert all(
+        item.source_publisher_id is None for item in probe.system.source_messages()
+    )
+    assert all(
+        revision.body is None
+        and revision.source_publisher_id is None
+        and revision.reply_to_telegram_message_id is None
+        for revision in probe.system.source_message_revisions()
+    )
+    assert all(
+        opportunity.response_route.value == ""
+        for opportunity in probe.system.opportunities()
+    )
+    recommendation_rows = probe.system.recommendation_opportunities()
+    assert recommendation_rows
+    assert all(
+        opportunity.response_route.kind == "unavailable"
+        and opportunity.response_route.value == ""
+        for opportunity in recommendation_rows
+    )
+    assert {
+        tombstone.source_message_id
+        for tombstone in probe.system.source_message_deletion_tombstones()
+    } == {first_source, second_source}
+
+    deletion_events = tuple(
+        event
+        for event in probe.system.source_events()
+        if event.event_kind is SourceEventKind.DELETE
+    )
+    assert len(deletion_events) == 2
+    before_replay = (
+        probe.system.source_messages(),
+        probe.system.source_message_revisions(),
+        probe.system.source_message_deletion_tombstones(),
+        probe.system.opportunities(),
+        probe.system.recommendation_opportunities(),
+        probe.system.exact_repost_clusters(),
+        tuple(
+            probe.system.opportunity_publication_contracts(
+                f"{event.source_message_id}:revision:{event.revision}"
+            )
+            for event in deletion_events
+        ),
+    )
+    assert all(
+        not probe.system.redeliver_source_event(event.source_event_id)
+        for event in deletion_events
+    )
+    assert (
+        probe.system.source_messages(),
+        probe.system.source_message_revisions(),
+        probe.system.source_message_deletion_tombstones(),
+        probe.system.opportunities(),
+        probe.system.recommendation_opportunities(),
+        probe.system.exact_repost_clusters(),
+        tuple(
+            probe.system.opportunity_publication_contracts(
+                f"{event.source_message_id}:revision:{event.revision}"
+            )
+            for event in deletion_events
+        ),
+    ) == before_replay
 
 
 def test_moderation_applies_to_the_whole_cluster_and_approval_releases_it() -> None:

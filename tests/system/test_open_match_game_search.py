@@ -9,6 +9,7 @@ import os
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 
+import psycopg
 import pytest
 
 from modules.contracts import (
@@ -4186,6 +4187,73 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         )
         for revision_input in invalid_revision_inputs
     )
+
+    deletion_time = datetime(2026, 8, 28, 9, 7, tzinfo=UTC)
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=5008),
+        to_checkpoint=TelegramChannelCheckpoint(pts=5009),
+        source_event_id="source-event:open-match:2-delete",
+        telegram_message_id=1000,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=deletion_time,
+    )
+    clock.advance_to(deletion_time)
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    deleted_snapshot_inputs = system.completed_search_opportunity_revision_inputs(
+        possible_search.completed_search_id
+    )
+    deleted_snapshot = next(
+        item
+        for item in deleted_snapshot_inputs
+        if item["opportunity_id"] == minimal_opportunity.opportunity_id
+    )
+    assert "response_route" not in deleted_snapshot
+    system.process_opportunities_until_idle()
+
+    deleted_history = system.results(possible_search.completed_search_id)
+    deleted_result = next(
+        result
+        for result in deleted_history
+        if dict(result.card_facts)["opportunity_id"]
+        == minimal_opportunity.opportunity_id
+    )
+    deleted_facts = dict(deleted_result.card_facts)
+    assert deleted_facts["publication_state"] == "suppressed"
+    assert "response_route_kind" not in deleted_facts
+    assert "response_route_value" not in deleted_facts
+    assert "@minimal_match_contact" not in json.dumps(deleted_facts)
+    result_id = (
+        f"result:{possible_search.completed_search_id}:"
+        f"{minimal_opportunity.opportunity_id}"
+    )
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        stored_facts = connection.execute(
+            """
+            SELECT card_facts
+            FROM football_runtime.recommendation_results
+            WHERE result_id = %s
+            """,
+            (result_id,),
+        ).fetchone()
+    assert stored_facts is not None
+    stored_deleted_facts = dict(stored_facts[0])
+    assert "response_route_kind" not in stored_deleted_facts
+    assert "response_route_value" not in stored_deleted_facts
+    assert "@minimal_match_contact" not in json.dumps(stored_deleted_facts)
+    stored_deleted_rows = tuple(
+        item
+        for item in system.recommendation_opportunities()
+        if item.opportunity_id == minimal_opportunity.opportunity_id
+    )
+    assert stored_deleted_rows
+    assert all(item.response_route.value == "" for item in stored_deleted_rows)
     system.reset()
 
 

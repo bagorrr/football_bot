@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
-from typing import cast
+from typing import Any, cast
+from unittest.mock import patch
 
 import psycopg
 import pytest
+from psycopg import sql
 
 from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.codex_classification_adapter import CodexCliClassifierAdapter
@@ -37,6 +40,7 @@ from modules.ports import (
     ClassifierTransientError,
     ModelAdapter,
 )
+from modules.postgres_adapter import PostgresRoleStore
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
 from modules.testkit import (
     AcceptanceSpine,
@@ -309,6 +313,124 @@ def test_irrelevant_classifier_outcome_is_durable_and_unpublished() -> None:
 
     system.process_opportunities_until_idle()
     assert system.classification_routing_outcomes() == outcomes
+
+
+@pytest.mark.parametrize("primary_v2", (False, True), ids=("v1", "v2"))
+def test_stale_classification_proposal_cannot_publish_after_newer_edit(
+    primary_v2: bool,
+) -> None:
+    """A proposal leased before an edit cannot publish stale source truth."""
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    if primary_v2:
+        classifier.enable_primary_v2()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_180 if primary_v2 else 49_179
+    telegram_id = 4_900_180 if primary_v2 else 4_900_179
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=telegram_id,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary=f"channel-pts:{telegram_id}",
+    )
+    body = (
+        "20 August 2026 in whole city. Need one player. "
+        f"Contact {'@v2_proof' if primary_v2 else '@v1_crash'}."
+    )
+    accepted = (
+        _v2_accepted_result(body=body, candidate_key="stale-v2")
+        if primary_v2
+        else _legacy_v1_accepted_result(body=body)
+    )
+    classifier.return_for(body=body, result=accepted)
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=telegram_id),
+        to_checkpoint=TelegramChannelCheckpoint(pts=telegram_id + 1),
+        source_event_id=f"source-event:stale-proposal:create:{telegram_id}",
+        telegram_message_id=telegram_id + 1,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+        source_publisher_id="publisher:stale-proposal",
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    revision_id = (
+        f"source-chat:channel:{telegram_id}:generation:1:"
+        f"message:{telegram_id + 1}:revision:1"
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(system.classification_proposals_for_revision(revision_id)) == 1
+
+    leased = system.lease_next_source_event()
+    assert leased is not None
+    assert leased.contract_name == ContractName.CLASSIFICATION_PROPOSAL
+
+    edited_body = body
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=telegram_id + 1),
+        to_checkpoint=TelegramChannelCheckpoint(pts=telegram_id + 2),
+        source_event_id=f"source-event:stale-proposal:edit:{telegram_id}",
+        telegram_message_id=telegram_id + 1,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=edited_body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+        source_publisher_id="publisher:stale-proposal",
+    )
+    application_store = system._roles[RuntimeRole.APPLICATION].store
+    original_publish_opportunity = application_store.publish_opportunity
+
+    def publish_after_newer_edit(_store: PostgresRoleStore, **kwargs: Any) -> object:
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        assert system.process_next_source_event()
+        assert system.source_messages()[0].current_revision == 2
+        return original_publish_opportunity(**kwargs)
+
+    clock.advance_to(clock.now() + timedelta(seconds=31))
+    with patch.object(
+        PostgresRoleStore,
+        "publish_opportunity",
+        publish_after_newer_edit,
+    ):
+        assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert len(classifier.requests) == 1
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.reset()
 
 
 def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal() -> (
@@ -1298,6 +1420,184 @@ def test_queue_health_excludes_expired_lease_from_active_lease_age() -> None:
     assert expired.queue_depth == 1
     assert expired.oldest_ready_job_age_seconds == 181
     assert expired.oldest_lease_age_seconds == 0
+
+
+def test_delete_first_rejects_classifier_before_any_model_admission() -> None:
+    """A committed delete wins while a stale classifier waits for admission."""
+    body = "Delete-first classification must never reach the model."
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    classifier.return_for(
+        body=body,
+        result=replace_classifier_output(
+            _irrelevant_classifier_result(),
+            {
+                "schema_version": "source-message-classification-v2",
+                "disposition": "irrelevant",
+                "candidates": [],
+                "routing": {
+                    "reason_code": "irrelevant",
+                    "required_context": "none",
+                },
+            },
+        ),
+    )
+    system, _, source_identity, revision_id = _stage_v2_source_delivery(
+        classifier=classifier,
+        body=body,
+        telegram_id=4_900_161,
+        checkpoint=4961,
+        administrator_id=49_161,
+    )
+    telegram = cast(
+        ControlledTelegramIngestionAdapter,
+        system._roles[RuntimeRole.INGESTION].telegram_ingestion,
+    )
+    database_url = os.environ["TEST_DATABASE_URL"]
+    pause_key = 59_161
+    trigger_name = "test_fix59_pause_source_delete_before_commit"
+    function_name = "test_fix59_pause_source_delete_before_commit"
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE OR REPLACE FUNCTION {}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                AS $function$
+                BEGIN
+                    IF NEW.tombstoned THEN
+                        PERFORM pg_advisory_lock({});
+                    END IF;
+                    RETURN NEW;
+                END
+                $function$
+                """
+            ).format(
+                sql.Identifier("football_runtime", function_name),
+                sql.Literal(pause_key),
+            )
+        )
+        connection.execute(
+            sql.SQL(
+                """
+                CREATE TRIGGER {}
+                BEFORE UPDATE OF current_revision
+                ON football_runtime.source_messages
+                FOR EACH ROW
+                EXECUTE FUNCTION {}()
+                """
+            ).format(
+                sql.Identifier(trigger_name),
+                sql.Identifier("football_runtime", function_name),
+            )
+        )
+
+    delete_event_id = "source-event:classification-delete-first"
+    checkpoint = system.channel_ingestion_checkpoint(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=checkpoint,
+        to_checkpoint=TelegramChannelCheckpoint(pts=checkpoint.pts + 1),
+        source_event_id=delete_event_id,
+        telegram_message_id=4_900_161,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        source_publisher_id="publisher:delete-first",
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+
+    lock_connection = psycopg.connect(database_url)
+    delete_future = None
+    classifier_future = None
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        lock_connection.execute("SELECT pg_advisory_lock(%s)", (pause_key,))
+        delete_future = executor.submit(system.process_next_source_event)
+
+        delete_trigger_waiting = False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                waiting = connection.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND pid <> pg_backend_pid()
+                          AND wait_event_type = 'Lock'
+                          AND wait_event ILIKE '%advisory%'
+                    )
+                    """
+                ).fetchone()
+            if waiting is not None and waiting[0]:
+                delete_trigger_waiting = True
+                break
+            time.sleep(0.01)
+        assert delete_trigger_waiting
+
+        classifier_future = executor.submit(
+            system.process_next_contract_handoff,
+            RuntimeRole.CLASSIFICATION,
+        )
+        two_advisory_waiters = False
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with psycopg.connect(database_url) as connection:
+                waiting = connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND wait_event_type = 'Lock'
+                      AND wait_event ILIKE '%advisory%'
+                    """
+                ).fetchone()
+            if waiting is not None and waiting[0] >= 2:
+                two_advisory_waiters = True
+                break
+            time.sleep(0.01)
+        assert two_advisory_waiters
+
+        lock_connection.execute("SELECT pg_advisory_unlock(%s)", (pause_key,))
+        lock_connection.commit()
+        assert delete_future.result(timeout=5)
+        assert classifier_future.result(timeout=5)
+    finally:
+        try:
+            lock_connection.execute("SELECT pg_advisory_unlock(%s)", (pause_key,))
+            lock_connection.commit()
+        except Exception:
+            pass
+        lock_connection.close()
+        executor.shutdown(wait=True)
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL(
+                    "DROP TRIGGER IF EXISTS {} ON football_runtime.source_messages"
+                ).format(sql.Identifier(trigger_name))
+            )
+            connection.execute(
+                sql.SQL("DROP FUNCTION IF EXISTS {}()").format(
+                    sql.Identifier("football_runtime", function_name)
+                )
+            )
+
+    assert classifier.requests == []
+    assert system.source_messages()[0].tombstoned
+    assert system.source_message_revisions()[0].body is None
+    assert system.classification_attempts() == ()
+    assert not system.redeliver_classifier_command(revision_id)
 
 
 def test_quota_circuit_honors_retry_after_before_one_probe() -> None:
@@ -3877,6 +4177,208 @@ def test_source_edit_and_delete_immediately_suppress_all_prior_projections() -> 
         publication_count
     )
     assert system.opportunity_publication_contracts(revision_one)
+
+
+def test_response_route_loss_suppresses_contact_and_recovers_on_later_edit() -> None:
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    classifier.enable_primary_v2()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_115
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_105,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:4905",
+    )
+
+    def accepted_result(
+        *, body: str, route_value: str | None
+    ) -> ClassifierAdapterResult:
+        result = _v2_accepted_result(body=body, candidate_key="route-recovery")
+        output = deepcopy(result.output)
+        candidates = output["candidates"]
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        candidate["response_routes"] = (
+            []
+            if route_value is None
+            else [
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": route_value,
+                    "evidence": route_value,
+                }
+            ]
+        )
+        return replace_classifier_output(result, output)
+
+    initial_body = (
+        "20 August 2026 in whole city. Need one player. Contact @route_initial."
+    )
+    classifier.return_for(
+        body=initial_body,
+        result=accepted_result(body=initial_body, route_value="@route_initial"),
+    )
+    classifier.return_proof_for(
+        body=initial_body,
+        result=semantic_proof_result_for(
+            output=accepted_result(
+                body=initial_body, route_value="@route_initial"
+            ).output,
+            body=initial_body,
+        ),
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4905),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        source_event_id="source-event:classification-routing:route-initial",
+        telegram_message_id=49005,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=initial_body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    source_message_id = "source-chat:channel:4900105:generation:1:message:49005"
+    initial_revision = f"{source_message_id}:revision:1"
+    initial_opportunity = system.opportunities()[0]
+    opportunity_id = initial_opportunity.opportunity_id
+    assert initial_opportunity.publication_state == "active"
+    assert initial_opportunity.response_route.value == "@route_initial"
+
+    route_lost_body = "20 August 2026 in whole city. Need one player."
+    route_lost_result = accepted_result(body=route_lost_body, route_value=None)
+    classifier.return_for(body=route_lost_body, result=route_lost_result)
+    classifier.return_proof_for(
+        body=route_lost_body,
+        result=semantic_proof_result_for(
+            output=route_lost_result.output,
+            body=route_lost_body,
+        ),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4906),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        source_event_id="source-event:classification-routing:route-lost",
+        telegram_message_id=49005,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=route_lost_body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    route_lost_revision = f"{source_message_id}:revision:2"
+    suppressed = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == opportunity_id
+    )
+    assert suppressed.publication_state == "suppressed"
+    assert suppressed.publication_reason == "response_route_unavailable"
+    assert suppressed.response_route.kind == "unavailable"
+    assert suppressed.response_route.value == ""
+    assert any(
+        outcome.source_message_revision_id == route_lost_revision
+        and outcome.reason_code == "response_route_unavailable"
+        for outcome in system.classification_routing_outcomes()
+    )
+    recommendation = next(
+        opportunity
+        for opportunity in system.recommendation_opportunities()
+        if opportunity.opportunity_id == opportunity_id
+        and opportunity.opportunity_revision_id.endswith(":revision:2")
+    )
+    assert recommendation.publication_state == "suppressed"
+    assert recommendation.publication_reason == "response_route_unavailable"
+    assert recommendation.response_route.kind == "unavailable"
+    assert recommendation.response_route.value == ""
+    assert system.opportunity_publication_contracts(initial_revision)
+
+    recovered_body = (
+        "20 August 2026 in whole city. Need one player. Contact @route_recovered."
+    )
+    recovered_result = accepted_result(
+        body=recovered_body, route_value="@route_recovered"
+    )
+    classifier.return_for(body=recovered_body, result=recovered_result)
+    classifier.return_proof_for(
+        body=recovered_body,
+        result=semantic_proof_result_for(
+            output=recovered_result.output,
+            body=recovered_body,
+        ),
+    )
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4907),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4908),
+        source_event_id="source-event:classification-routing:route-recovered",
+        telegram_message_id=49005,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body=recovered_body,
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    recovered = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.opportunity_id == opportunity_id
+    )
+    assert recovered.publication_state == "active"
+    assert recovered.response_route.value == "@route_recovered"
+    recovered_projection = next(
+        opportunity
+        for opportunity in system.recommendation_opportunities()
+        if opportunity.opportunity_id == opportunity_id
+        and opportunity.opportunity_revision_id.endswith(":revision:3")
+    )
+    assert recovered_projection.publication_state == "active"
+    assert recovered_projection.response_route.value == "@route_recovered"
 
 
 def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:

@@ -386,14 +386,17 @@ def _assert_final_migration_state(database_url: str) -> None:
         unauthorized_owners = connection.execute(
             """
             WITH owned_objects AS (
-                SELECT owner.rolname AS owner_name
+                SELECT 'schema' AS object_kind,
+                       namespace.nspname::text AS object_identity,
+                       owner.rolname AS owner_name
                 FROM pg_namespace AS namespace
                 JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
                 WHERE namespace.nspname IN (
                     'football_runtime', 'football_migrations'
                 )
                 UNION ALL
-                SELECT owner.rolname
+                SELECT 'relation', namespace.nspname || '.' || relation.relname,
+                       owner.rolname
                 FROM pg_class AS relation
                 JOIN pg_namespace AS namespace
                   ON namespace.oid = relation.relnamespace
@@ -403,7 +406,9 @@ def _assert_final_migration_state(database_url: str) -> None:
                 )
                   AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
                 UNION ALL
-                SELECT owner.rolname
+                SELECT 'function', namespace.nspname || '.' || procedure.proname ||
+                       '(' || pg_get_function_identity_arguments(procedure.oid) || ')',
+                       owner.rolname
                 FROM pg_proc AS procedure
                 JOIN pg_namespace AS namespace
                   ON namespace.oid = procedure.pronamespace
@@ -412,7 +417,35 @@ def _assert_final_migration_state(database_url: str) -> None:
                     'football_runtime', 'football_migrations'
                 )
             )
-            SELECT count(*) FILTER (WHERE owner_name <> current_user), count(*)
+            SELECT count(*) FILTER (
+                       WHERE owner_name <> current_user
+                         AND NOT (
+                             object_kind = 'function'
+                             AND object_identity = ANY(ARRAY[
+                                 'football_runtime.recommendation_scrub_source_message_history('
+                                 'requested_opportunity_ids text[], '
+                                 'requested_opportunity_revision_ids text[])',
+                                 'football_runtime.scrub_source_message_recommendation_history('
+                                 'requested_source_message_id text)',
+                                 'football_runtime.recommendation_scrub_source_message_result_card_facts('
+                                 'requested_opportunity_ids text[])',
+                                 'football_runtime.scrub_source_message_result_card_facts('
+                                 'requested_source_message_id text)',
+                                 'football_runtime.classification_cleanup_source_message_data('
+                                 'requested_source_message_id text)',
+                                 'football_runtime.application_cleanup_source_message_routing_outcomes('
+                                 'requested_source_message_id text)',
+                                 'football_runtime.ingestion_cleanup_source_event_records('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_registry_generation bigint, '
+                                 'requested_telegram_message_id bigint)',
+                                 'football_runtime.cleanup_expired_source_message_tombstones('
+                                 'requested_as_of timestamp with time zone)'
+                             ])
+                         )
+                   ),
+                   count(*)
             FROM owned_objects
             """,
         ).fetchone()
