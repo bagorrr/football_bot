@@ -11392,22 +11392,15 @@ def _reconcile_exact_repost_for_opportunity(
         fallback=recorded_at,
     )
     source_message_id = source[0]
-    existing_source_revision_id = next(
-        (
-            member_source_revision_id
-            for member_source_id, member_source_revision_id in existing_members
-            if member_source_id == source_message_id
-        ),
-        None,
-    )
     is_exact_repost = source_message_id not in existing_source_message_ids
-    is_new_source_revision = existing_source_revision_id != source_revision_id
+    # Cluster re-election may record a pending source revision before
+    # Application validates the edit. The qualifying assertion timestamp is
+    # the authority for standing freshness renewal.
     renewal_requested = (
         existing_cluster is None
         or is_exact_repost
         or (
-            is_new_source_revision
-            and (
+            (
                 opportunity_type in _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES
                 or opportunity_type in {"coach_availability", "coach_request"}
             )
