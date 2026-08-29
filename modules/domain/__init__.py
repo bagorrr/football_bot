@@ -479,9 +479,21 @@ def source_publisher_id_from_metadata(
 ) -> str | None:
     """Read the stable visible-publisher identity, if the source supplied one."""
     value = metadata.get("source_publisher_id")
-    if not isinstance(value, str) or not value.strip():
+    if not is_valid_opaque_source_publisher_id(value):
         return None
-    return value.strip()
+    return value
+
+
+def is_valid_opaque_source_publisher_id(value: object) -> bool:
+    """Accept only the internal, non-transport Source Publisher reference."""
+    return (
+        isinstance(value, str)
+        and re.fullmatch(
+            r"(?:publisher|unknown-publisher):[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            value,
+        )
+        is not None
+    )
 
 
 def is_valid_source_chat_address(
@@ -784,6 +796,21 @@ class SourceMessageRevision:
     def source_publisher_id(self) -> str | None:
         """Return the source-visible publisher identity carried by metadata."""
         return source_publisher_id_from_metadata(self.bounded_metadata)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceMessageDeletionTombstone:
+    """Bounded, body-free deletion state retained for replay protection."""
+
+    source_message_id: str
+    source_chat_identity: TelegramPeerIdentity
+    registry_generation: int
+    telegram_message_id: int
+    deleted_revision: int
+    source_event_id: str
+    source_publisher_id: str
+    deleted_at: datetime
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

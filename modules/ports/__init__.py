@@ -55,6 +55,7 @@ from modules.domain import (
     SourceChatRegistryEntry,
     SourceEventRecord,
     SourceMessage,
+    SourceMessageDeletionTombstone,
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramCallbackDeliveryClaim,
@@ -867,6 +868,20 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Apply one Source Event to Application-owned Source Message state."""
         ...
 
+    def source_message_deletion_barrier(self, source_message_id: str) -> bool:
+        """Read the body-free cross-role deletion barrier."""
+        ...
+
+    def cleanup_expired_source_message_tombstones(self, *, as_of: datetime) -> int:
+        """Delete body-free Source Message tombstones past their retention bound."""
+        ...
+
+    def scrub_source_message_contracts(
+        self, source_message_id: str, *, recorded_at: datetime
+    ) -> None:
+        """Scrub protected payloads produced by this runtime for one Source Message."""
+        ...
+
     def record_classification_attempt(
         self,
         *,
@@ -895,8 +910,16 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         attempt: ClassificationAttempt,
         result: ClassifierAdapterResult,
         started_at: datetime,
-    ) -> None:
-        """Persist an execution identity before crossing the model boundary."""
+    ) -> bool:
+        """Admit and persist work before crossing the model boundary.
+
+        ``False`` means that the Source Message deletion barrier won the
+        lifecycle race.  In that case the caller must not invoke the model.
+        """
+        ...
+
+    def abort_classification_attempt_admission(self) -> None:
+        """Release an admitted model boundary after worker interruption."""
         ...
 
     def classification_attempts_for_revision(
@@ -956,6 +979,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read all currently active Application opportunities for one source."""
         ...
 
+    def current_suppressed_opportunity_records(
+        self, source_message_id: str, source_message_revision_id: str
+    ) -> tuple[dict[str, JsonValue], ...]:
+        """Read current-revision rows awaiting a terminal routing outcome."""
+        ...
+
     def record_classification_routing_outcome(
         self,
         *,
@@ -964,6 +993,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         received_at: datetime,
         suppressed_opportunities: tuple[dict[str, JsonValue], ...] = (),
         additional_outgoings: tuple[ContractEnvelope, ...] = (),
+        current_source_message_revision_id: str | None = None,
     ) -> ConsumeResult:
         """Atomically retain one body-free Application routing outcome."""
         ...
@@ -1199,6 +1229,12 @@ class AcceptanceObserver(Protocol):
 
     def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
         """Observe immutable Source Message revisions through the testkit."""
+        ...
+
+    def source_message_deletion_tombstones(
+        self,
+    ) -> tuple[SourceMessageDeletionTombstone, ...]:
+        """Observe bounded body-free Source Message deletion tombstones."""
         ...
 
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:

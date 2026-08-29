@@ -383,3 +383,30 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         completed[0].completed_search_id
     )
     assert len(revision_inputs) == 1
+
+    deletion_time = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    telegram_ingestion.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=5501),
+        to_checkpoint=TelegramChannelCheckpoint(pts=5502),
+        source_event_id=f"source-event:{opportunity_type}:delete",
+        telegram_message_id=5501,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=deletion_time,
+    )
+    clock.advance_to(deletion_time)
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+
+    deleted_result = system.results(completed[0].completed_search_id)[0]
+    deleted_facts = dict(deleted_result.card_facts)
+    assert deleted_facts["publication_state"] == "suppressed"
+    assert "response_route_kind" not in deleted_facts
+    assert "response_route_value" not in deleted_facts
+    assert contact not in json.dumps(deleted_facts)

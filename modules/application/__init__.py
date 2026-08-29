@@ -13369,6 +13369,34 @@ class RuntimeApplication:
             raise RuntimeError("runtime role cannot consume another owner's contract")
         if incoming.contract_version not in self.versions_for(incoming.contract_name):
             raise ValueError("contract version is unsupported by this runtime")
+        if (
+            self.role is RuntimeRole.CLASSIFICATION
+            and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and self.store.source_message_deletion_barrier(incoming.subject_id)
+        ):
+            result = self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return result is ConsumeResult.APPLIED
+        if (
+            self.role is RuntimeRole.APPLICATION
+            and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
+            and isinstance(incoming.payload, dict)
+        ):
+            revision_id = incoming.payload.get("source_message_revision_id")
+            if isinstance(revision_id, str) and ":revision:" in revision_id:
+                source_message_id = revision_id.rsplit(":revision:", 1)[0]
+                if self.store.source_message_deletion_barrier(source_message_id):
+                    result = self.store.consume(
+                        incoming=incoming,
+                        supported_versions=self.versions_for(incoming.contract_name),
+                        received_at=self.clock.now(),
+                        outgoing=None,
+                    )
+                    return result is ConsumeResult.APPLIED
         envelope = ContractEnvelope.from_raw(incoming)
         result = self.store.consume(
             incoming=envelope,
@@ -13380,6 +13408,8 @@ class RuntimeApplication:
 
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
+        if self.role is RuntimeRole.APPLICATION:
+            self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
         claimed = self.store.claim_next(
             supported_versions=self.supported_versions,
             claimed_at=self.clock.now(),
@@ -13398,6 +13428,34 @@ class RuntimeApplication:
                     claimed.source_chat_admission_provenance_id
                 )
             )
+        if (
+            self.role is RuntimeRole.CLASSIFICATION
+            and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and self.store.source_message_deletion_barrier(incoming.subject_id)
+        ):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return True
+        if (
+            self.role is RuntimeRole.APPLICATION
+            and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
+            and isinstance(incoming.payload, dict)
+        ):
+            revision_id = incoming.payload.get("source_message_revision_id")
+            if isinstance(revision_id, str) and ":revision:" in revision_id:
+                source_message_id = revision_id.rsplit(":revision:", 1)[0]
+                if self.store.source_message_deletion_barrier(source_message_id):
+                    self.store.consume(
+                        incoming=incoming,
+                        supported_versions=self.versions_for(incoming.contract_name),
+                        received_at=self.clock.now(),
+                        outgoing=None,
+                    )
+                    return True
         supported_incoming = None
         if incoming.contract_version in self.versions_for(incoming.contract_name):
             try:
@@ -13499,6 +13557,7 @@ class RuntimeApplication:
         ):
             payload = supported_incoming.payload
             classify = None
+            recorded_at = self.clock.now()
             if (
                 isinstance(payload, dict)
                 and payload.get("event_kind") != "delete"
@@ -13617,10 +13676,70 @@ class RuntimeApplication:
                         "adjacent_context": adjacent_context,
                     },
                 )
+            if isinstance(payload, dict) and payload.get("event_kind") == "delete":
+                source_event_id = payload.get("source_event_id")
+                source_message_revision_id = payload.get("source_message_revision_id")
+                if not isinstance(source_event_id, str) or not isinstance(
+                    source_message_revision_id, str
+                ):
+                    self.store.reject_invalid_contract(
+                        incoming=supported_incoming,
+                        received_at=recorded_at,
+                    )
+                    return True
+                classify = ContractEnvelope(
+                    contract_name=ContractName.SOURCE_MESSAGE_DELETED,
+                    contract_version=1,
+                    message_id=derive_contract_message_id(
+                        supported_incoming.message_id,
+                        ContractName.SOURCE_MESSAGE_DELETED,
+                    ),
+                    producer=RuntimeRole.APPLICATION,
+                    consumer=RuntimeRole.CLASSIFICATION,
+                    subject_id=supported_incoming.subject_id,
+                    subject_revision=supported_incoming.subject_revision,
+                    idempotency_key=(
+                        "source-message-deleted:"
+                        f"{supported_incoming.subject_id}:{supported_incoming.subject_revision}"
+                    ),
+                    causation_id=supported_incoming.message_id,
+                    correlation_id=supported_incoming.correlation_id,
+                    recorded_at=recorded_at,
+                    payload={
+                        "source_message_id": supported_incoming.subject_id,
+                        "source_event_id": source_event_id,
+                        "source_message_revision_id": source_message_revision_id,
+                        "deleted_revision": supported_incoming.subject_revision,
+                        "deleted_at": recorded_at.isoformat(),
+                    },
+                )
             self.store.accept_source_event(
                 incoming=supported_incoming,
-                received_at=self.clock.now(),
+                received_at=recorded_at,
                 outgoing=classify,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_MESSAGE_DELETED
+            and supported_incoming is not None
+        ):
+            if self.role is not RuntimeRole.CLASSIFICATION:
+                self.store.consume(
+                    incoming=supported_incoming,
+                    supported_versions=self.versions_for(incoming.contract_name),
+                    received_at=self.clock.now(),
+                    outgoing=None,
+                )
+                return True
+            self.store.scrub_source_message_contracts(
+                supported_incoming.subject_id,
+                recorded_at=self.clock.now(),
+            )
+            self.store.consume(
+                incoming=supported_incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
             )
             return True
         if (
@@ -13778,9 +13897,54 @@ class RuntimeApplication:
             raise RuntimeProcessingError from error
         return True
 
+    def _admit_classification_attempt(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        attempt: ClassificationAttempt,
+        result: ClassifierAdapterResult,
+        started_at: datetime,
+    ) -> bool:
+        """Consume stale classifier work without crossing the model boundary."""
+        admitted = self.store.begin_classification_attempt(
+            incoming=incoming,
+            attempt=attempt,
+            result=result,
+            started_at=started_at,
+        )
+        if admitted:
+            return True
+        self.store.consume(
+            incoming=incoming,
+            supported_versions=self.versions_for(incoming.contract_name),
+            received_at=self.clock.now(),
+            outgoing=None,
+        )
+        return False
+
+    def _abort_classification_attempt_admission(self) -> None:
+        """Release the model-boundary lock when a worker is interrupted."""
+        self.store.abort_classification_attempt_admission()
+
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
+        """Run one admitted classification and release it on any interruption."""
+        try:
+            self._classify_source_message_impl(incoming)
+        except BaseException:
+            self._abort_classification_attempt_admission()
+            raise
+
+    def _classify_source_message_impl(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
+        if self.store.source_message_deletion_barrier(incoming.subject_id):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
         artifact_descriptor = self.model.artifact_descriptor
         if (
             not classifier_artifact_descriptor_is_trusted(artifact_descriptor)
@@ -13909,12 +14073,13 @@ class RuntimeApplication:
             attempt_number=primary_attempt_number,
             input_manifest_hash=input_manifest_hash,
         )
-        self.store.begin_classification_attempt(
+        if not self._admit_classification_attempt(
             incoming=incoming,
             attempt=primary_started_attempt,
             result=primary_started_result,
             started_at=self.clock.now(),
-        )
+        ):
+            return
         try:
             result = self.model.classify(request)
         except Exception as error:
@@ -13958,6 +14123,9 @@ class RuntimeApplication:
                 circuit_retry_at=circuit_retry_at,
             )
             return
+        except BaseException:
+            self._abort_classification_attempt_admission()
+            raise
         result_disposition = result.output.get("disposition")
         disposition = (
             result_disposition
@@ -14132,12 +14300,13 @@ class RuntimeApplication:
                 input_manifest_hash=proof_input_manifest_hash,
                 candidate_key=proof_candidate_key,
             )
-            self.store.begin_classification_attempt(
+            if not self._admit_classification_attempt(
                 incoming=incoming,
                 attempt=proof_started_attempt,
                 result=proof_started_result,
                 started_at=self.clock.now(),
-            )
+            ):
+                return
             try:
                 semantic_proof_result = self.model.semantic_proof(
                     semantic_proof_request
@@ -14186,6 +14355,9 @@ class RuntimeApplication:
                     circuit_retry_at=circuit_retry_at,
                 )
                 return
+            except BaseException:
+                self._abort_classification_attempt_admission()
+                raise
             semantic_proof_recorded_result = replace(
                 semantic_proof_result,
                 duration_ms=_nonnegative_metric_or_zero(
@@ -14415,6 +14587,22 @@ class RuntimeApplication:
         *,
         artifact_descriptor: ClassifierArtifactDescriptor | None = None,
     ) -> None:
+        """Run one additive classification and release it on any interruption."""
+        try:
+            self._classify_source_message_v2_impl(
+                incoming,
+                artifact_descriptor=artifact_descriptor,
+            )
+        except BaseException:
+            self._abort_classification_attempt_admission()
+            raise
+
+    def _classify_source_message_v2_impl(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        artifact_descriptor: ClassifierArtifactDescriptor | None = None,
+    ) -> None:
         """Run the additive multi-candidate classifier and one-way ambiguity pass."""
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError(
@@ -14612,12 +14800,13 @@ class RuntimeApplication:
                 attempt_number=primary_attempt_number,
                 input_manifest_hash=attempt_manifest_hash,
             )
-            self.store.begin_classification_attempt(
+            if not self._admit_classification_attempt(
                 incoming=incoming,
                 attempt=started_attempt,
                 result=started_result,
                 started_at=self.clock.now(),
-            )
+            ):
+                return
             try:
                 primary_result = self.model.classify(request)
             except Exception as error:
@@ -14661,6 +14850,9 @@ class RuntimeApplication:
                     circuit_retry_at=circuit_retry_at,
                 )
                 return
+            except BaseException:
+                self._abort_classification_attempt_admission()
+                raise
             primary_valid = primary_result_is_valid(primary_result)
             primary_attempts = (
                 ClassificationAttempt(
@@ -14827,12 +15019,13 @@ class RuntimeApplication:
                     attempt_number=second_attempt_number,
                 ),
             )
-            self.store.begin_classification_attempt(
+            if not self._admit_classification_attempt(
                 incoming=incoming,
                 attempt=second_started_attempt,
                 result=second_started_result,
                 started_at=self.clock.now(),
-            )
+            ):
+                return
             try:
                 second_result = self.model.classify(second_request)
             except Exception as error:
@@ -14912,6 +15105,9 @@ class RuntimeApplication:
                         circuit_retry_at=circuit_retry_at,
                     )
                 return
+            except BaseException:
+                self._abort_classification_attempt_admission()
+                raise
             second_valid = (
                 _classifier_adapter_result_has_complete_provenance(second_result)
                 and second_result.effective_model == "gpt-5.6-sol"
@@ -15219,12 +15415,13 @@ class RuntimeApplication:
                         input_manifest_hash=proof_manifest_hash,
                         candidate_key=candidate_key,
                     )
-                    self.store.begin_classification_attempt(
+                    if not self._admit_classification_attempt(
                         incoming=incoming,
                         attempt=proof_started_attempt,
                         result=proof_started_result,
                         started_at=self.clock.now(),
-                    )
+                    ):
+                        return
                     try:
                         proof_result = self.model.semantic_proof(proof_request)
                     except Exception as error:
@@ -15248,6 +15445,9 @@ class RuntimeApplication:
                                 existing_circuit.probe_count if existing_circuit else 0
                             ),
                         )
+                    except BaseException:
+                        self._abort_classification_attempt_admission()
+                        raise
                     else:
                         proof_recorded_result = replace(
                             proof_result,
@@ -15562,6 +15762,8 @@ class RuntimeApplication:
         incoming: ContractEnvelope,
         outcome: ClassificationRoutingOutcome,
         received_at: datetime,
+        suppression_reason: str = "source_revision_superseded",
+        suppression_opportunity_ids: tuple[str, ...] | None = None,
     ) -> None:
         """Record a routing outcome and suppress every stale current identity."""
         suppressed_opportunities, suppression_outgoings = (
@@ -15569,6 +15771,8 @@ class RuntimeApplication:
                 incoming=incoming,
                 source_message_revision_id=outcome.source_message_revision_id,
                 retained_opportunity_ids=(),
+                publication_reason=suppression_reason,
+                target_opportunity_ids=suppression_opportunity_ids,
             )
         )
         self.store.record_classification_routing_outcome(
@@ -15577,6 +15781,7 @@ class RuntimeApplication:
             received_at=received_at,
             suppressed_opportunities=suppressed_opportunities,
             additional_outgoings=suppression_outgoings,
+            current_source_message_revision_id=outcome.source_message_revision_id,
         )
 
     def _stale_opportunity_suppression(
@@ -15585,6 +15790,8 @@ class RuntimeApplication:
         incoming: ContractEnvelope,
         source_message_revision_id: str,
         retained_opportunity_ids: tuple[str, ...],
+        publication_reason: str = "source_revision_superseded",
+        target_opportunity_ids: tuple[str, ...] | None = None,
     ) -> tuple[tuple[dict[str, JsonValue], ...], tuple[ContractEnvelope, ...]]:
         """Build current-revision suppression facts and Recommendation handoffs."""
         source_revision = self.store.source_message_revision(source_message_revision_id)
@@ -15594,15 +15801,23 @@ class RuntimeApplication:
         records = self.store.active_opportunity_records(
             source_revision.source_message_id
         )
+        if publication_reason == "response_route_unavailable":
+            records += self.store.current_suppressed_opportunity_records(
+                source_revision.source_message_id,
+                source_message_revision_id,
+            )
         stale_by_storage_id: dict[str, dict[str, JsonValue]] = {}
         for record in records:
             raw_opportunity_id = record.get("raw_opportunity_id")
             opportunity_id = record.get("opportunity_id")
-            if (
-                not isinstance(raw_opportunity_id, str)
-                or not isinstance(opportunity_id, str)
-                or opportunity_id in retained
+            if not isinstance(raw_opportunity_id, str) or not isinstance(
+                opportunity_id, str
             ):
+                continue
+            if target_opportunity_ids is not None:
+                if opportunity_id not in target_opportunity_ids:
+                    continue
+            elif opportunity_id in retained:
                 continue
             if raw_opportunity_id in stale_by_storage_id:
                 continue
@@ -15618,9 +15833,14 @@ class RuntimeApplication:
                 "source_message_revision_id": source_message_revision_id,
                 "opportunity_type": record["opportunity_type"],
                 "publication_state": "suppressed",
+                "publication_reason": publication_reason,
                 "accepted_facts": record["accepted_facts"],
                 "evidence": record["evidence"],
-                "response_route": record["response_route"],
+                "response_route": (
+                    {"kind": "unavailable", "value": ""}
+                    if publication_reason == "response_route_unavailable"
+                    else record["response_route"]
+                ),
             }
         suppressed = tuple(stale_by_storage_id.values())
         suppression_outgoings: list[ContractEnvelope] = []
@@ -15684,6 +15904,7 @@ class RuntimeApplication:
                             "opportunity_revision_id": opportunity_revision_id,
                             "source_message_revision_id": source_message_revision_id,
                             "publication_state": "suppressed",
+                            "publication_reason": publication_reason,
                             "opportunity_type": opportunity_type,
                             "accepted_facts": suppressed_item["accepted_facts"],
                             "response_route": suppressed_item["response_route"],
@@ -16071,6 +16292,7 @@ class RuntimeApplication:
             if len(v4_candidates) != 1:
                 accepted_opportunities: list[dict[str, JsonValue]] = []
                 publication_items: list[dict[str, JsonValue]] = []
+                route_unavailable_opportunity_ids: list[str] = []
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
                 for candidate in v4_candidates:
                     if not isinstance(candidate, dict):
@@ -16129,6 +16351,7 @@ class RuntimeApplication:
                         candidate_payload,
                         resolver=self.location_resolver,
                         timezone_data=self.timezone_data,
+                        allow_missing_route=True,
                     )
                     if accepted_candidate is None:
                         self._record_classification_routing_outcome(
@@ -16178,15 +16401,140 @@ class RuntimeApplication:
                             "proposition_discriminator": proposition_discriminator,
                         }
                     )
-                    publication_items.append(
-                        {
-                            "opportunity_id": opportunity_id,
-                            "opportunity_revision_id": opportunity_revision_id,
-                            "opportunity_type": accepted_candidate["opportunity_type"],
-                            "accepted_facts": accepted_candidate["accepted_facts"],
-                            "response_route": accepted_candidate["response_route"],
-                        }
+                    if _response_route_is_unavailable(
+                        accepted_candidate.get("response_route")
+                    ):
+                        accepted_candidate["publication_state"] = "suppressed"
+                        accepted_candidate["publication_reason"] = (
+                            "response_route_unavailable"
+                        )
+                        route_unavailable_opportunity_ids.append(opportunity_id)
+                    else:
+                        publication_items.append(
+                            {
+                                "opportunity_id": opportunity_id,
+                                "opportunity_revision_id": opportunity_revision_id,
+                                "opportunity_type": accepted_candidate[
+                                    "opportunity_type"
+                                ],
+                                "accepted_facts": accepted_candidate["accepted_facts"],
+                                "response_route": accepted_candidate["response_route"],
+                            }
+                        )
+                if len(
+                    {item["opportunity_id"] for item in accepted_opportunities}
+                ) != len(accepted_opportunities):
+                    self._record_classification_routing_outcome(
+                        incoming=incoming,
+                        outcome=_classification_routing_outcome(
+                            authoritative_payload,
+                            source_message_revision_id=revision_id,
+                            reason_code="provenance_invalid",
+                            recorded_at=self.clock.now(),
+                        ),
+                        received_at=self.clock.now(),
                     )
+                    return
+                if not publication_items:
+                    self._record_classification_routing_outcome(
+                        incoming=incoming,
+                        outcome=_classification_routing_outcome(
+                            authoritative_payload,
+                            source_message_revision_id=revision_id,
+                            reason_code="response_route_unavailable",
+                            recorded_at=self.clock.now(),
+                        ),
+                        received_at=self.clock.now(),
+                        suppression_reason="response_route_unavailable",
+                        suppression_opportunity_ids=tuple(
+                            route_unavailable_opportunity_ids
+                        ),
+                    )
+                    return
+                retained_opportunity_ids = tuple(
+                    cast(str, opportunity["opportunity_id"])
+                    for opportunity in accepted_opportunities
+                )
+                suppressed_opportunities, suppression_outgoings = (
+                    self._stale_opportunity_suppression(
+                        incoming=incoming,
+                        source_message_revision_id=revision_id,
+                        retained_opportunity_ids=retained_opportunity_ids,
+                    )
+                )
+                if route_unavailable_opportunity_ids:
+                    route_suppressed_opportunities, route_suppression_outgoings = (
+                        self._stale_opportunity_suppression(
+                            incoming=incoming,
+                            source_message_revision_id=revision_id,
+                            retained_opportunity_ids=(),
+                            publication_reason="response_route_unavailable",
+                            target_opportunity_ids=tuple(
+                                route_unavailable_opportunity_ids
+                            ),
+                        )
+                    )
+                    suppressed_opportunities += route_suppressed_opportunities
+                    suppression_outgoings += route_suppression_outgoings
+                if len(publication_items) == 1:
+                    active_opportunity = next(
+                        opportunity
+                        for opportunity in accepted_opportunities
+                        if not _response_route_is_unavailable(
+                            opportunity.get("response_route")
+                        )
+                    )
+                    active_opportunity_id = cast(
+                        str, active_opportunity["opportunity_id"]
+                    )
+                    active_opportunity_revision_id = (
+                        f"{active_opportunity_id}:revision:{incoming.subject_revision}"
+                    )
+                    single_outgoing = ContractEnvelope(
+                        contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                        contract_version=2,
+                        message_id=derive_contract_message_id(
+                            incoming.message_id,
+                            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                        ),
+                        producer=RuntimeRole.APPLICATION,
+                        consumer=RuntimeRole.RECOMMENDATION,
+                        subject_id=active_opportunity_id,
+                        subject_revision=incoming.subject_revision,
+                        idempotency_key=(
+                            f"opportunity-publication:{active_opportunity_revision_id}"
+                        ),
+                        causation_id=incoming.message_id,
+                        correlation_id=incoming.correlation_id,
+                        recorded_at=self.clock.now(),
+                        payload={
+                            "opportunity_id": active_opportunity_id,
+                            "opportunity_revision_id": active_opportunity_revision_id,
+                            "source_message_revision_id": revision_id,
+                            "publication_state": "active",
+                            "opportunity_type": active_opportunity["opportunity_type"],
+                            "accepted_facts": active_opportunity["accepted_facts"],
+                            "response_route": active_opportunity["response_route"],
+                        },
+                    )
+                    self.store.publish_opportunity(
+                        incoming=incoming,
+                        opportunity=active_opportunity,
+                        outgoing=single_outgoing,
+                        received_at=self.clock.now(),
+                        routing_outcome=_classification_routing_outcome(
+                            authoritative_payload,
+                            source_message_revision_id=revision_id,
+                            reason_code="classifier_disposition",
+                            recorded_at=self.clock.now(),
+                            pass_number=_classification_pass_number(
+                                authoritative_payload
+                            ),
+                        ),
+                        suppressed_opportunities=suppressed_opportunities,
+                        additional_outgoings=suppression_outgoings,
+                    )
+                    return
                 if len({item["opportunity_id"] for item in publication_items}) != len(
                     publication_items
                 ):
@@ -16306,6 +16654,7 @@ class RuntimeApplication:
             authoritative_payload,
             resolver=self.location_resolver,
             timezone_data=self.timezone_data,
+            allow_missing_route=True,
         )
         if accepted is None:
             self._record_classification_routing_outcome(
@@ -16350,6 +16699,20 @@ class RuntimeApplication:
             "proposition_discriminator": proposition_discriminator,
             "opportunity_revision_id": opportunity_revision_id,
         }
+        if _response_route_is_unavailable(accepted.get("response_route")):
+            self._record_classification_routing_outcome(
+                incoming=incoming,
+                outcome=_classification_routing_outcome(
+                    authoritative_payload,
+                    source_message_revision_id=revision_id,
+                    reason_code="response_route_unavailable",
+                    recorded_at=self.clock.now(),
+                ),
+                received_at=self.clock.now(),
+                suppression_reason="response_route_unavailable",
+                suppression_opportunity_ids=(opportunity_id,),
+            )
+            return
         suppressed_opportunities, suppression_outgoings = (
             self._stale_opportunity_suppression(
                 incoming=incoming,
@@ -19349,6 +19712,11 @@ def _classification_validation_reason(payload: dict[str, JsonValue]) -> str:
     )
 
 
+def _response_route_is_unavailable(value: JsonValue | None) -> bool:
+    """Recognize the body-free route state used when direct contact is lost."""
+    return value == {"kind": "unavailable", "value": ""}
+
+
 def _classification_routing_outcome(
     payload: dict[str, JsonValue],
     *,
@@ -19552,8 +19920,12 @@ def _proposition_lineage_features(
             features[f"evidence:{key}"] = (
                 evidence_value if isinstance(evidence_value, str) else None
             )
-    features["route:kind"] = response_route.get("kind")
-    features["route:value"] = response_route.get("value")
+    if _response_route_is_unavailable(response_route):
+        features["route:kind"] = None
+        features["route:value"] = None
+    else:
+        features["route:kind"] = response_route.get("kind")
+        features["route:value"] = response_route.get("value")
     return features
 
 
@@ -20170,6 +20542,7 @@ def _validated_opportunity_proposal(
     resolver: LocationResolverAdapter,
     expected_opportunity_type: str | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
+    allow_missing_route: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Accept only schema-, evidence-, domain-, route-, and location-valid facts."""
     if not isinstance(payload_value, dict):
@@ -20222,13 +20595,18 @@ def _validated_opportunity_proposal(
     ):
         return None
     if opportunity_type == "tournament":
-        return _validated_tournament_proposal(payload_value, resolver=resolver)
+        return _validated_tournament_proposal(
+            payload_value,
+            resolver=resolver,
+            allow_missing_route=allow_missing_route,
+        )
     if opportunity_type in {"referee_availability", "referee_request"}:
         return _validated_refereeing_proposal(
             payload_value,
             candidate=candidate,
             resolver=resolver,
             timezone_data=timezone_data,
+            allow_missing_route=allow_missing_route,
         )
     is_player_match = opportunity_type == "player_match_availability"
     if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
@@ -20237,6 +20615,7 @@ def _validated_opportunity_proposal(
             candidate=candidate,
             resolver=resolver,
             timezone_data=timezone_data,
+            allow_missing_route=allow_missing_route,
         )
     if opportunity_type in {"coach_availability", "coach_request"}:
         return _validated_coaching_proposal(
@@ -20337,7 +20716,9 @@ def _validated_opportunity_proposal(
     ):
         return None
     if route is None:
-        return None
+        if not allow_missing_route:
+            return None
+        route = {"kind": "unavailable", "value": ""}
     route_value = route["value"]
     mention = location.get("mention")
     country_id = location.get("country_id")
@@ -20658,6 +21039,7 @@ def _validated_tournament_proposal(
     payload_value: JsonValue,
     *,
     resolver: LocationResolverAdapter,
+    allow_missing_route: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Validate a Tournament proposal without borrowing Open Match gates."""
     if not isinstance(payload_value, dict):
@@ -20749,23 +21131,24 @@ def _validated_tournament_proposal(
         proposed_routes=routes,
         bounded_metadata=payload_value.get("bounded_metadata"),
     )
-    if (
-        not _proposition_evidence_is_authoritative(
-            candidate.get("proposition_evidence"),
-            body=body,
-            candidate_key=candidate_key,
-            evidence=evidence,
-            routes=routes,
-            semantic_proof=semantic_proof,
-            source_message_revision_reference=_opaque_classifier_reference(
-                revision_id, kind="revision"
-            ),
-            opportunity_type="tournament",
-            artifact_descriptor=artifact_descriptor,
-        )
-        or route is None
+    if not _proposition_evidence_is_authoritative(
+        candidate.get("proposition_evidence"),
+        body=body,
+        candidate_key=candidate_key,
+        evidence=evidence,
+        routes=routes,
+        semantic_proof=semantic_proof,
+        source_message_revision_reference=_opaque_classifier_reference(
+            revision_id, kind="revision"
+        ),
+        opportunity_type="tournament",
+        artifact_descriptor=artifact_descriptor,
     ):
         return None
+    if route is None:
+        if not allow_missing_route:
+            return None
+        route = {"kind": "unavailable", "value": ""}
     mention = location.get("mention")
     country_id = location.get("country_id")
     city_id = location.get("city_id")
@@ -21031,6 +21414,7 @@ def _validated_open_match_proposal(
     *,
     resolver: LocationResolverAdapter,
     timezone_data: TimezoneDataAdapter | None = None,
+    allow_missing_route: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Keep the established Open Match validation seam explicit."""
     return _validated_opportunity_proposal(
@@ -21038,6 +21422,7 @@ def _validated_open_match_proposal(
         resolver=resolver,
         expected_opportunity_type="open_match",
         timezone_data=timezone_data,
+        allow_missing_route=allow_missing_route,
     )
 
 
@@ -21342,6 +21727,7 @@ def _validated_transfer_proposal(
     candidate: dict[str, JsonValue],
     resolver: LocationResolverAdapter,
     timezone_data: TimezoneDataAdapter | None,
+    allow_missing_route: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Normalize one evidence-backed long-term transfer proposal."""
     body = payload_value.get("body")
@@ -21428,7 +21814,9 @@ def _validated_transfer_proposal(
     ):
         return None
     if route is None:
-        return None
+        if not allow_missing_route:
+            return None
+        route = {"kind": "unavailable", "value": ""}
     mention = location.get("mention")
     country_id = location.get("country_id")
     city_id = location.get("city_id")
@@ -21634,6 +22022,7 @@ def _validated_refereeing_proposal(
     candidate: dict[str, JsonValue],
     resolver: LocationResolverAdapter,
     timezone_data: TimezoneDataAdapter | None,
+    allow_missing_route: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Normalize one evidence-backed Referee Availability or Referee Request."""
     body = payload_value.get("body")
@@ -21708,7 +22097,7 @@ def _validated_refereeing_proposal(
         proposed_routes=routes,
         bounded_metadata=payload_value.get("bounded_metadata"),
     )
-    if route is None or not _proposition_evidence_is_authoritative(
+    if not _proposition_evidence_is_authoritative(
         candidate.get("proposition_evidence"),
         body=body,
         candidate_key=candidate_key,
@@ -21722,6 +22111,10 @@ def _validated_refereeing_proposal(
         artifact_descriptor=artifact_descriptor,
     ):
         return None
+    if route is None:
+        if not allow_missing_route:
+            return None
+        route = {"kind": "unavailable", "value": ""}
     mention = location.get("mention")
     country_id = location.get("country_id")
     city_id = location.get("city_id")
@@ -22008,6 +22401,7 @@ def _validated_classification_proposal(
     *,
     resolver: LocationResolverAdapter,
     timezone_data: TimezoneDataAdapter | None = None,
+    allow_missing_route: bool = False,
 ) -> dict[str, JsonValue] | None:
     """Route each accepted v3 candidate to its matching application validator."""
     if not isinstance(payload_value, dict):
@@ -22019,7 +22413,11 @@ def _validated_classification_proposal(
         isinstance(candidate, dict)
         and candidate.get("opportunity_type") == "tournament"
     ):
-        return _validated_tournament_proposal(payload_value, resolver=resolver)
+        return _validated_tournament_proposal(
+            payload_value,
+            resolver=resolver,
+            allow_missing_route=allow_missing_route,
+        )
     if isinstance(candidate, dict) and candidate.get("opportunity_type") in {
         "coach_availability",
         "coach_request",
@@ -22029,11 +22427,13 @@ def _validated_classification_proposal(
             resolver=resolver,
             timezone_data=timezone_data,
             expected_opportunity_type=str(candidate["opportunity_type"]),
+            allow_missing_route=allow_missing_route,
         )
     return _validated_open_match_proposal(
         payload_value,
         resolver=resolver,
         timezone_data=timezone_data,
+        allow_missing_route=allow_missing_route,
     )
 
 

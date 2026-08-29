@@ -51,9 +51,9 @@
     "process_isolated_replays": true
   },
   "canonical_replay_digests": [
-    "8b11d10a7dc2d109151787401772b0181c994efc6dfb87d2b2cddb2ef36396d5",
-    "b984cb0590cbfe09471c801dd66b271a579c91c34039e14535d805fcdcc91e8b",
-    "f3fb5413790145053aba4bba724bad92d736c340ff5e7f3b3ecf27acd50afc6c"
+    "ddadb15dd70550a580d124f805f2e57fe7e8ea8bf441afce83dcf5c9195b6a07",
+    "18593af05ae79848e7635e1f88e5901c204fe785b6c6ef4dd16431391edb8ee5",
+    "25350a171d441512c5965390dc378b0cf1de59764d60827f9e2fa3ff61efb1e5"
   ],
   "required_case_families": [
     "routing",
