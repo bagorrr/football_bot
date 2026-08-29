@@ -12523,6 +12523,14 @@ class RuntimeApplication:
         self.store.abort_classification_attempt_admission()
 
     def _classify_source_message(self, incoming: ContractEnvelope) -> None:
+        """Run one admitted classification and release it on any interruption."""
+        try:
+            self._classify_source_message_impl(incoming)
+        except BaseException:
+            self._abort_classification_attempt_admission()
+            raise
+
+    def _classify_source_message_impl(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
         if self.store.source_message_deletion_barrier(incoming.subject_id):
@@ -13169,6 +13177,22 @@ class RuntimeApplication:
         )
 
     def _classify_source_message_v2(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        artifact_descriptor: ClassifierArtifactDescriptor | None = None,
+    ) -> None:
+        """Run one additive classification and release it on any interruption."""
+        try:
+            self._classify_source_message_v2_impl(
+                incoming,
+                artifact_descriptor=artifact_descriptor,
+            )
+        except BaseException:
+            self._abort_classification_attempt_admission()
+            raise
+
+    def _classify_source_message_v2_impl(
         self,
         incoming: ContractEnvelope,
         *,

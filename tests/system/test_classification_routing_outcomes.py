@@ -11,7 +11,8 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
-from typing import cast
+from typing import Any, cast
+from unittest.mock import patch
 
 import psycopg
 import pytest
@@ -39,6 +40,7 @@ from modules.ports import (
     ClassifierTransientError,
     ModelAdapter,
 )
+from modules.postgres_adapter import PostgresRoleStore
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
 from modules.testkit import (
     AcceptanceSpine,
@@ -311,6 +313,124 @@ def test_irrelevant_classifier_outcome_is_durable_and_unpublished() -> None:
 
     system.process_opportunities_until_idle()
     assert system.classification_routing_outcomes() == outcomes
+
+
+@pytest.mark.parametrize("primary_v2", (False, True), ids=("v1", "v2"))
+def test_stale_classification_proposal_cannot_publish_after_newer_edit(
+    primary_v2: bool,
+) -> None:
+    """A proposal leased before an edit cannot publish stale source truth."""
+    telegram = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    if primary_v2:
+        classifier.enable_primary_v2()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_180 if primary_v2 else 49_179
+    telegram_id = 4_900_180 if primary_v2 else 4_900_179
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=telegram_id,
+    )
+    telegram.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary=f"channel-pts:{telegram_id}",
+    )
+    body = (
+        "20 August 2026 in whole city. Need one player. "
+        f"Contact {'@v2_proof' if primary_v2 else '@v1_crash'}."
+    )
+    accepted = (
+        _v2_accepted_result(body=body, candidate_key="stale-v2")
+        if primary_v2
+        else _legacy_v1_accepted_result(body=body)
+    )
+    classifier.return_for(body=body, result=accepted)
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=classifier,
+        location_resolver=_whole_city_resolver(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(system, clock=clock, administrator_id=administrator_id)
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=telegram_id),
+        to_checkpoint=TelegramChannelCheckpoint(pts=telegram_id + 1),
+        source_event_id=f"source-event:stale-proposal:create:{telegram_id}",
+        telegram_message_id=telegram_id + 1,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+        source_publisher_id="publisher:stale-proposal",
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=source_identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    revision_id = (
+        f"source-chat:channel:{telegram_id}:generation:1:"
+        f"message:{telegram_id + 1}:revision:1"
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    assert len(system.classification_proposals_for_revision(revision_id)) == 1
+
+    leased = system.lease_next_source_event()
+    assert leased is not None
+    assert leased.contract_name == ContractName.CLASSIFICATION_PROPOSAL
+
+    edited_body = body
+    telegram.add_channel_difference_event(
+        identity=source_identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=telegram_id + 1),
+        to_checkpoint=TelegramChannelCheckpoint(pts=telegram_id + 2),
+        source_event_id=f"source-event:stale-proposal:edit:{telegram_id}",
+        telegram_message_id=telegram_id + 1,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=edited_body,
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+        source_publisher_id="publisher:stale-proposal",
+    )
+    application_store = system._roles[RuntimeRole.APPLICATION].store
+    original_publish_opportunity = application_store.publish_opportunity
+
+    def publish_after_newer_edit(_store: PostgresRoleStore, **kwargs: Any) -> object:
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        assert system.process_next_source_event()
+        assert system.source_messages()[0].current_revision == 2
+        return original_publish_opportunity(**kwargs)
+
+    clock.advance_to(clock.now() + timedelta(seconds=31))
+    with patch.object(
+        PostgresRoleStore,
+        "publish_opportunity",
+        publish_after_newer_edit,
+    ):
+        assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert len(classifier.requests) == 1
+    assert system.classification_routing_outcomes() == ()
+    assert system.opportunities() == ()
+    assert system.opportunity_publication_contracts(revision_id) == ()
+
+    system.reset()
 
 
 def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal() -> (

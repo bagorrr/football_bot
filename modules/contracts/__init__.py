@@ -16,7 +16,11 @@ from modules.classifier_contract import (
     classifier_output_is_schema_valid,
     semantic_proof_is_schema_valid,
 )
-from modules.domain import SourceChatAddressKind, is_valid_source_chat_address
+from modules.domain import (
+    SourceChatAddressKind,
+    is_valid_opaque_source_publisher_id,
+    is_valid_source_chat_address,
+)
 
 JsonValue: TypeAlias = (
     bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"] | None
@@ -1333,13 +1337,12 @@ def _validate_bounded_source_metadata(value: JsonValue) -> None:
         )
     if "source_publisher_id" in value:
         publisher_id = value["source_publisher_id"]
-        if publisher_id is not None and (
-            not isinstance(publisher_id, str)
-            or not publisher_id.strip()
-            or len(publisher_id) > 256
-            or any(character.isspace() for character in publisher_id)
+        if publisher_id is not None and not is_valid_opaque_source_publisher_id(
+            publisher_id
         ):
-            raise TypeError("source_publisher_id must be bounded text or null")
+            raise TypeError(
+                "source_publisher_id must be an opaque publisher reference or null"
+            )
 
 
 def _validate_source_revision_lineage(

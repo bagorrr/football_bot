@@ -107,6 +107,7 @@ from modules.domain import (
     evaluate_refereeing_service_offer,
     evaluate_tournament_search,
     evaluate_transfer_search,
+    is_valid_opaque_source_publisher_id,
     normalize_exact_repost_text,
     referee_publication_state_as_of,
     render_response_route,
@@ -159,6 +160,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0031_source_message_lifecycle.sql",
     "0032_source_message_lifecycle_hardening.sql",
     "0033_source_message_retention_and_projection_barrier.sql",
+    "0034_source_chat_pause_removal_barrier.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -196,6 +198,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7fddc4d44988b3f0cfec72a370c13e92ff284ad2dafe747c4e4655a8f5bbc54a",
     "beb5dce7b1fa0769b37066e90a134f82cb122505e879b430978409013121bded",
     "2c28d8b9d44edbc3d570de8002ecab4bf3b7c818cdddf5b718d484dc6d23b16d",
+    "74ec1563e3c9c60dce72d3dd510098ca124b6ea9f05fb978d5c700eeaab8d00f",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -2644,13 +2647,17 @@ class PostgresRoleStore:
                 connection.execute(
                     """
                     UPDATE football_runtime.source_chat_registry
-                    SET enabled = FALSE, updated_at = %s
+                    SET permanently_removed_at = COALESCE(
+                            permanently_removed_at, %s
+                        ),
+                        enabled = FALSE,
+                        updated_at = %s
                     WHERE peer_kind = %s
                       AND telegram_chat_id = %s
                       AND registry_generation <> %s
-                      AND enabled
                     """,
                     (
+                        received_at,
                         received_at,
                         entry.identity.kind.value,
                         entry.identity.telegram_id,
@@ -3211,6 +3218,8 @@ class PostgresRoleStore:
                     ),
                 )
                 return True
+            account_create_is_after_boundary = False
+            channel_event_is_after_boundary = False
             if account_route:
                 account_checkpoint = connection.execute(
                     """
@@ -3230,7 +3239,6 @@ class PostgresRoleStore:
                 )
                 if current_account_checkpoint != event.from_checkpoint:
                     return False
-                account_create_is_after_boundary = False
                 if identity.kind is TelegramPeerKind.CHAT:
                     prefix = "chat-sequence:"
                     boundary = context["transport_boundary"]
@@ -3248,6 +3256,20 @@ class PostgresRoleStore:
                     raise LookupError("Telegram channel checkpoint is unavailable")
                 if TelegramChannelCheckpoint(pts=channel_pts) != event.from_checkpoint:
                     return False
+                prefix = "channel-pts:"
+                boundary = context["transport_boundary"]
+                if (
+                    not boundary.startswith(prefix)
+                    or not boundary[len(prefix) :].isdigit()
+                ):
+                    raise ValueError("Source Chat channel boundary is invalid")
+                # A channel boundary is the last observed pts.  The event
+                # beginning at that pts is the pre-boundary replay, while a
+                # strictly later starting pts is the first post-boundary
+                # transport identity we can safely admit.
+                channel_event_is_after_boundary = event.from_checkpoint.pts > int(
+                    boundary[len(prefix) :]
+                )
             else:
                 raise TypeError("Telegram difference checkpoint scope is unsupported")
             source_message_id = canonical_source_message_id(
@@ -3301,9 +3323,15 @@ class PostgresRoleStore:
                     stored_envelope = envelope
             else:
                 stored_envelope = envelope
-            known_transport_identity = event.kind is SourceEventKind.CREATE and (
-                channel_route or account_create_is_after_boundary
+            event_is_after_boundary = (
+                channel_event_is_after_boundary
+                if channel_route
+                else account_create_is_after_boundary
             )
+            known_transport_identity = (
+                event.kind is SourceEventKind.CREATE
+                and (channel_route or account_create_is_after_boundary)
+            ) or event_is_after_boundary
             if not known_transport_identity:
                 known_transport_identity = (
                     connection.execute(
@@ -3607,9 +3635,30 @@ class PostgresRoleStore:
                 # tombstone that could scrub the newer revision.
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
+            if (
+                event_kind == SourceEventKind.EDIT.value
+                and existing_source_message is not None
+                and existing_source_message[2] >= incoming.subject_revision
+            ):
+                # A lower or equal edit is stale once a newer current row is
+                # durable.  Reject it before recording history or emitting any
+                # classification, suppression, or publication work.
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             incoming_bounded_metadata = payload.get(
                 "bounded_metadata", empty_bounded_source_metadata()
             )
+            if isinstance(incoming_bounded_metadata, Mapping):
+                incoming_publisher_id = incoming_bounded_metadata.get(
+                    "source_publisher_id"
+                )
+                if (
+                    incoming_publisher_id is not None
+                    and not is_valid_opaque_source_publisher_id(incoming_publisher_id)
+                ):
+                    raise ValueError(
+                        "Source Publisher identity must be an opaque reference"
+                    )
             source_publisher_id = _source_message_tombstone_publisher_id(
                 source_message_id=incoming.subject_id,
                 existing_metadata=(
@@ -5975,6 +6024,12 @@ class PostgresRoleStore:
             ):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
+            if not _source_message_revision_is_current(
+                connection,
+                source_message_revision_id=source_message_revision_id,
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             if routing_outcome is not None:
                 connection.execute(
                     """
@@ -6149,6 +6204,17 @@ class PostgresRoleStore:
                 source_message_id=next(iter(source_message_ids)),
             )
             if source_deleted:
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            if any(
+                not _source_message_revision_is_current(
+                    connection,
+                    source_message_revision_id=source_message_revision_id,
+                )
+                for source_message_revision_id in cast(
+                    tuple[str, ...], source_message_revision_ids
+                )
+            ):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             if routing_outcome is not None:
@@ -11414,8 +11480,8 @@ def _source_message_tombstone_publisher_id(
             publisher_id = source_publisher_id_from_metadata(metadata)
             if publisher_id is not None:
                 return publisher_id
-    if isinstance(previous_tombstone, str) and previous_tombstone.strip():
-        return previous_tombstone.strip()
+    if is_valid_opaque_source_publisher_id(previous_tombstone):
+        return cast(str, previous_tombstone)
     if isinstance(incoming_metadata, Mapping):
         publisher_id = source_publisher_id_from_metadata(incoming_metadata)
         if publisher_id is not None:
@@ -11440,6 +11506,29 @@ def _source_message_lifecycle_deleted(
         (source_message_id,),
     ).fetchone()
     return bool(deleted_row[0]) if deleted_row is not None else False
+
+
+def _source_message_revision_is_current(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_revision_id: str,
+) -> bool:
+    """Confirm a proposal still names the non-tombstoned current revision."""
+    return (
+        connection.execute(
+            """
+            SELECT 1
+            FROM football_runtime.source_messages AS source
+            JOIN football_runtime.source_message_revisions AS revision
+              ON revision.source_message_id = source.source_message_id
+             AND revision.revision = source.current_revision
+            WHERE revision.source_message_revision_id = %s
+              AND NOT source.tombstoned
+            """,
+            (source_message_revision_id,),
+        ).fetchone()
+        is not None
+    )
 
 
 def _scrub_ingestion_source_message_data(

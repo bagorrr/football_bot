@@ -28,7 +28,7 @@ from modules.domain import (
     TelegramProtectedContentEvent,
     TelegramProtectionUnavailableEvent,
 )
-from modules.ports import ClassifierAdapterResult
+from modules.ports import ClassifierAdapterResult, ClassifierRequest
 from modules.testkit import (
     AcceptanceSpine,
     ControlledLocationResolverAdapter,
@@ -51,6 +51,30 @@ class _SteppingClock(FrozenClock):
         if self.step is not None:
             self.instant += self.step
         return instant
+
+
+@dataclass(slots=True)
+class _InterruptingClock(FrozenClock):
+    interrupt_next: bool = False
+
+    def now(self) -> datetime:
+        if self.interrupt_next:
+            self.interrupt_next = False
+            raise KeyboardInterrupt
+        return FrozenClock.now(self)
+
+
+class _InterruptAfterModelAdapter(ControlledModelAdapter):
+    """Raise at the first post-model clock read to exercise admission cleanup."""
+
+    def __init__(self, clock: _InterruptingClock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    def classify(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        result = super().classify(request)
+        self._clock.interrupt_next = True
+        return result
 
 
 def test_copy_permitted_difference_event_has_no_protected_content_capability() -> None:
@@ -3030,15 +3054,20 @@ def test_leased_older_revision_is_preserved_without_regressing_current_state() -
 
     assert [revision.revision for revision in system.source_message_revisions()] == [
         1,
-        2,
         3,
     ]
     current = system.source_messages()[0]
     assert current.current_revision == 3
     assert current.body == "Revision three."
+    assert (
+        system.classifier_commands_for_revision(
+            "source-chat:channel:4701300:generation:1:message:1301:revision:2"
+        )
+        == ()
+    )
     assert not system.redeliver_source_event("source-event:leased-edit:2")
     assert not system.redeliver_source_event("source-event:leased-edit:3")
-    assert len(system.source_message_revisions()) == 3
+    assert len(system.source_message_revisions()) == 2
     system.reset()
 
 
@@ -3407,7 +3436,7 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
     assert system.source_message_revisions() == ()
     assert system.source_events() == ()
 
-    removal_time = clock.now() + timedelta(days=1)
+    paused_at = clock.now() + timedelta(days=1)
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
         connection.execute(
             """
@@ -3417,7 +3446,80 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
               AND telegram_chat_id = %s
               AND registry_generation = %s
             """,
-            (removal_time, identity.kind.value, identity.telegram_id, 1),
+            (paused_at, identity.kind.value, identity.telegram_id, 1),
+        )
+        barrier = connection.execute(
+            """
+            SELECT expires_at
+            FROM football_runtime.application_source_message_replay_barriers
+            WHERE source_message_id = %s
+            """,
+            (source_message.source_message_id,),
+        ).fetchone()
+    assert barrier == (clock.now(),)
+    clock.advance_to(paused_at + timedelta(days=90))
+    assert system.cleanup_expired_source_message_tombstones() == 0
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM football_runtime.application_source_message_replay_barriers
+                WHERE source_message_id = %s
+            )
+            """,
+            (source_message.source_message_id,),
+        ).fetchone() == (True,)
+
+    reenabled_at = clock.now() + timedelta(minutes=1)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = TRUE, updated_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            """,
+            (reenabled_at, identity.kind.value, identity.telegram_id, 1),
+        )
+    clock.advance_to(reenabled_at)
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4754),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4755),
+        source_event_id="source-event:delete-replay:re-enabled-replay",
+        telegram_message_id=405,
+        revision=4,
+        kind=SourceEventKind.CREATE,
+        body="A paused chat must retain its replay barrier.",
+        source_publisher_id="publisher:delete-replay",
+        event_time=reenabled_at,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_source_event()
+    assert system.source_events() == ()
+
+    removal_time = clock.now() + timedelta(days=1)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET permanently_removed_at = %s, enabled = FALSE, updated_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            """,
+            (
+                removal_time,
+                removal_time,
+                identity.kind.value,
+                identity.telegram_id,
+                1,
+            ),
         )
         barrier = connection.execute(
             """
@@ -3454,6 +3556,233 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
             """,
             (source_message.source_message_id,),
         ).fetchone() == (False,)
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("event_kind", "revision", "body"),
+    (
+        (SourceEventKind.EDIT, 7, "A first-seen edit must cross the boundary."),
+        (SourceEventKind.DELETE, 7, None),
+    ),
+)
+def test_first_seen_post_boundary_edit_or_delete_is_recorded_before_checkpoint(
+    event_kind: SourceEventKind,
+    revision: int,
+    body: str | None,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 15, 30, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=(4_701_501 if event_kind is SourceEventKind.EDIT else 4_701_502),
+    )
+    address = (
+        "@synthetic_first_seen_edit"
+        if event_kind is SourceEventKind.EDIT
+        else "@synthetic_first_seen_delete"
+    )
+    boundary = 4860 if event_kind is SourceEventKind.EDIT else 4870
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary=f"channel-pts:{boundary}",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=47_015,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 15, 30, tzinfo=UTC),
+        administrator_id=47_015,
+        address=address,
+        update_suffix=f"first-seen-{event_kind.value}",
+    )
+    source_event_id = f"source-event:first-seen:{event_kind.value}"
+    event_time = clock.now()
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=boundary),
+        to_checkpoint=TelegramChannelCheckpoint(pts=boundary + 1),
+        source_event_id=f"{source_event_id}:boundary",
+        telegram_message_id=1_501,
+        revision=1,
+        kind=event_kind,
+        body=(
+            "A pre-boundary edit must advance the cursor without becoming a record."
+            if event_kind is SourceEventKind.EDIT
+            else None
+        ),
+        source_publisher_id="publisher:first-seen",
+        event_time=event_time,
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_source_event()
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=boundary + 1),
+        to_checkpoint=TelegramChannelCheckpoint(pts=boundary + 2),
+        source_event_id=source_event_id,
+        telegram_message_id=1_502,
+        revision=revision,
+        kind=event_kind,
+        body=body,
+        source_publisher_id="publisher:first-seen",
+        event_time=event_time,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=boundary + 2)
+    assert len(system.source_events()) == 1
+    assert len(system.source_event_contracts()) == 1
+    assert system.source_events()[0].event_kind is event_kind
+    assert system.process_next_source_event()
+    if event_kind is SourceEventKind.DELETE:
+        assert system.source_messages()[0].tombstoned
+        assert system.source_message_deletion_tombstones()
+    else:
+        assert system.source_messages()[0].body == body
+        assert system.classifier_commands_for_revision(
+            "source-chat:channel:4701501:generation:1:message:1502:revision:7"
+        )
+    system.reset()
+
+
+@pytest.mark.parametrize("primary_v2", (False, True), ids=("v1", "v2"))
+def test_post_model_classification_interruption_releases_source_lifecycle_lock(
+    primary_v2: bool,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = _InterruptingClock(datetime(2026, 8, 12, 16, 0, tzinfo=UTC))
+    model = _InterruptAfterModelAdapter(clock)
+    if primary_v2:
+        model.enable_primary_v2()
+    body = f"A post-model interruption must release the {model.primary_schema_version}."
+    output: dict[str, JsonValue] = {
+        "schema_version": model.primary_schema_version,
+        "disposition": "irrelevant",
+        "candidates": [],
+    }
+    if primary_v2:
+        output["routing"] = {
+            "reason_code": "irrelevant",
+            "required_context": "none",
+        }
+    model.return_for(
+        body=body,
+        result=ClassifierAdapterResult(
+            output=output,
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="controlled_recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=(4_701_610 if primary_v2 else 4_701_609),
+    )
+    address = "@synthetic_interrupt_v2" if primary_v2 else "@synthetic_interrupt_v1"
+    boundary = 4891 if primary_v2 else 4890
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary=f"channel-pts:{boundary}",
+    )
+    system = boot_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=model,
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=47_016,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 16, 0, tzinfo=UTC),
+        administrator_id=47_016,
+        address=address,
+        update_suffix=f"classification-interrupt-{model.primary_schema_version}",
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=boundary),
+        to_checkpoint=TelegramChannelCheckpoint(pts=boundary + 1),
+        source_event_id=f"source-event:classification-interrupt:{model.primary_schema_version}",
+        telegram_message_id=1_610,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=clock.now(),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    source_message_id = (
+        f"source-chat:channel:{identity.telegram_id}:generation:1:message:1610"
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+    with psycopg.connect(
+        os.environ["TEST_DATABASE_URL"], autocommit=True
+    ) as connection:
+        lock_available = connection.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+            (f"source-message-lifecycle:{source_message_id}",),
+        ).fetchone()
+        assert lock_available == (True,)
+        connection.execute(
+            "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+            (f"source-message-lifecycle:{source_message_id}",),
+        )
+
+    delete_time = clock.now() + timedelta(minutes=1)
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=boundary + 1),
+        to_checkpoint=TelegramChannelCheckpoint(pts=boundary + 2),
+        source_event_id=f"source-event:classification-interrupt:delete:{model.primary_schema_version}",
+        telegram_message_id=1_610,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        event_time=delete_time,
+    )
+    clock.advance_to(delete_time)
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.source_messages()[0].tombstoned
+    system.reset()
 
 
 def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> None:
