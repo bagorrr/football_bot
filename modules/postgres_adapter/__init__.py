@@ -10747,6 +10747,28 @@ _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES = frozenset(
 _EXACT_REPOST_STANDING_EVENT_DATE = "standing"
 
 
+def _exact_repost_is_standing_referee_availability(
+    accepted_facts: Mapping[str, Any],
+) -> bool:
+    """Return whether referee availability has no bounded date."""
+    return (
+        accepted_facts.get("start_local_date") is None
+        and accepted_facts.get("end_local_date") is None
+    )
+
+
+def _exact_repost_uses_qualifying_assertion(
+    opportunity_type: str,
+    accepted_facts: Mapping[str, Any],
+) -> bool:
+    """Return whether the cluster clock uses the qualifying assertion time."""
+    if opportunity_type == "referee_availability":
+        return _exact_repost_is_standing_referee_availability(accepted_facts)
+    return opportunity_type in _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES or (
+        opportunity_type in {"coach_availability", "coach_request"}
+    )
+
+
 def _exact_repost_resolved_event_date(
     accepted_facts: Mapping[str, JsonValue],
     *,
@@ -10889,8 +10911,10 @@ def _exact_repost_freshness_anchor(
     """Read the source assertion timestamp used by the cluster clock."""
     timestamp_keys = (
         ("source_qualifying_assertion_at", "source_posted_at")
-        if opportunity_type in _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES
-        or opportunity_type in {"coach_availability", "coach_request"}
+        if _exact_repost_uses_qualifying_assertion(
+            opportunity_type,
+            accepted_facts,
+        )
         else ("source_posted_at",)
     )
     for key in timestamp_keys:
@@ -11400,9 +11424,9 @@ def _reconcile_exact_repost_for_opportunity(
         existing_cluster is None
         or is_exact_repost
         or (
-            (
-                opportunity_type in _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES
-                or opportunity_type in {"coach_availability", "coach_request"}
+            _exact_repost_uses_qualifying_assertion(
+                opportunity_type,
+                accepted_facts,
             )
             and (existing_cluster is None or freshness_anchor > existing_cluster[0])
         )
