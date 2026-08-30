@@ -21,7 +21,7 @@ import os
 import re
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -3249,32 +3249,42 @@ def _assert_publication_gate_for_all_types(
             classifier.enable_primary_v2()
         else:
             classifier.enable_coaching_primary_v1()
-        operations: tuple[dict[str, JsonValue], ...] = tuple(
+        source = _canonical_promotion_gate_source(f"{schema_version}-compound")
+        operations: tuple[dict[str, JsonValue], ...] = (
             {
                 "kind": "promotion_gate",
-                "opportunity_type": opportunity_type,
-                "source": _canonical_promotion_gate_source(opportunity_type),
-            }
-            for opportunity_type in group_types
+                "opportunity_type": group_types[0],
+                "source": source,
+            },
         )
-        for operation in operations:
-            source = operation["source"]
-            opportunity_type = operation["opportunity_type"]
-            if not isinstance(source, str) or not isinstance(opportunity_type, str):
-                raise RuntimeError("canonical promotion gate fixture is malformed")
-            primary_result = _canonical_promotion_gate_result(
+        primary_result = _canonical_promotion_gate_result_for_types(
+            body=source,
+            opportunity_types=group_types,
+            schema_version=schema_version,
+        )
+        classifier.return_for(
+            body=source,
+            result=primary_result,
+        )
+        for opportunity_type in group_types:
+            single_result = _canonical_promotion_gate_result(
                 body=source,
                 opportunity_type=opportunity_type,
                 schema_version=schema_version,
             )
-            classifier.return_for(
-                body=source,
-                result=primary_result,
-            )
+            single_candidates = single_result.output.get("candidates")
+            if not isinstance(single_candidates, list) or len(single_candidates) != 1:
+                raise RuntimeError("canonical promotion gate fixture is malformed")
+            candidate = single_candidates[0]
+            if not isinstance(candidate, dict):
+                raise RuntimeError("canonical promotion gate fixture is malformed")
+            candidate_key = candidate.get("candidate_key")
+            if not isinstance(candidate_key, str):
+                raise RuntimeError("canonical promotion gate fixture is malformed")
             classifier.return_proof_for(
                 body=source,
                 result=semantic_proof_result_for(
-                    output=primary_result.output,
+                    output=single_result.output,
                     body=source,
                     proof_version=(
                         "source-semantic-proof-v2"
@@ -3282,6 +3292,7 @@ def _assert_publication_gate_for_all_types(
                         else "source-semantic-proof-v4"
                     ),
                 ),
+                candidate_key=candidate_key,
             )
         probe = DurableAcceptanceProbe(
             database_url=database_url,
@@ -3292,12 +3303,14 @@ def _assert_publication_gate_for_all_types(
             model=classifier,
         )
         for operation_number, operation in enumerate(operations, start=1):
-            source = operation["source"]
-            opportunity_type = operation["opportunity_type"]
-            if not isinstance(source, str) or not isinstance(opportunity_type, str):
+            operation_source = operation["source"]
+            operation_type_value = operation["opportunity_type"]
+            if not isinstance(operation_source, str) or not isinstance(
+                operation_type_value, str
+            ):
                 raise RuntimeError("canonical promotion gate fixture is malformed")
             revision_id, snapshot = probe.source_event(
-                body=source,
+                body=operation_source,
                 operation_number=operation_number,
                 event_time=PROMOTION_GATE_EVENT_TIME,
                 process=True,
@@ -3313,9 +3326,9 @@ def _assert_publication_gate_for_all_types(
             ):
                 raise RuntimeError(
                     "shared classifier promotion gate did not fail closed for "
-                    f"{opportunity_type} in gate run {gate_run_id}"
+                    f"{operation_type_value} in gate run {gate_run_id}"
                 )
-            observed_types.add(opportunity_type)
+            observed_types.update(group_types)
     if observed_types != expected_types:
         raise RuntimeError(
             "shared classifier promotion gate did not cover every canonical type "
@@ -3329,6 +3342,36 @@ def _canonical_promotion_gate_source(opportunity_type: str) -> str:
         f"Controlled {opportunity_type} publication evidence in Saint Petersburg "
         "on 2026-12-01. Contact @controlled_publication_gate."
     )
+
+
+def _canonical_promotion_gate_result_for_types(
+    *, body: str, opportunity_types: tuple[str, ...], schema_version: str
+) -> ClassifierAdapterResult:
+    """Build one bounded compound controlled proposal for compatible types."""
+    results = tuple(
+        _canonical_promotion_gate_result(
+            body=body,
+            opportunity_type=opportunity_type,
+            schema_version=schema_version,
+        )
+        for opportunity_type in opportunity_types
+    )
+    if not results:
+        raise RuntimeError("canonical promotion gate fixture has no opportunity types")
+    first = results[0]
+    output = dict(first.output)
+    output["routing"] = {
+        "reason_code": "compound_propositions",
+        "required_context": "none",
+    }
+    candidates: list[JsonValue] = []
+    for result in results:
+        result_candidates = result.output.get("candidates")
+        if not isinstance(result_candidates, list):
+            raise RuntimeError("canonical promotion gate fixture is malformed")
+        candidates.extend(result_candidates)
+    output["candidates"] = candidates
+    return replace(first, output=output)
 
 
 def _canonical_promotion_gate_result(
