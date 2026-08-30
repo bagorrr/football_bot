@@ -23,7 +23,7 @@ from modules.testkit import (
     FrozenClock,
     InjectedTelegramDeliveryError,
     InjectedTelegramDeliveryInterruptionError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -928,7 +928,7 @@ def _boot_menu_system(
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram,

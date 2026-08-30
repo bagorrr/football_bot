@@ -23,7 +23,7 @@ from modules.testkit import (
     ControlledTelegramDeliveryAdapter,
     FrozenClock,
     InjectedTelegramDeliveryError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -45,7 +45,7 @@ def _all_locale_labels(label: str) -> tuple[tuple[str, str], ...]:
 def test_unique_validated_country_from_natural_language_advances_to_city() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     resolver = ControlledLocationResolverAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -89,7 +89,7 @@ def test_unique_validated_country_from_natural_language_advances_to_city() -> No
 
 def test_unique_city_preserves_verified_country_parent_and_iana_timezone() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -139,7 +139,7 @@ def test_unique_city_preserves_verified_country_parent_and_iana_timezone() -> No
 
 def test_ambiguous_country_is_distinguished_and_left_unconfirmed() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -180,7 +180,7 @@ def test_ambiguous_country_is_distinguished_and_left_unconfirmed() -> None:
 
 def test_natural_language_whole_city_scope_completes_the_search_area() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -235,7 +235,7 @@ def test_natural_language_whole_city_scope_completes_the_search_area() -> None:
 
 def test_one_answer_accepts_several_typed_areas_with_verified_hierarchy() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -316,7 +316,7 @@ def test_one_answer_accepts_several_typed_areas_with_verified_hierarchy() -> Non
 def test_unfinished_search_area_never_becomes_repeated_search_history() -> None:
     clock = _AdjustableClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC))
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram_delivery,
@@ -479,7 +479,7 @@ def test_city_resolution_outcomes_are_distinct_and_preserve_confirmed_country() 
         resolution=ambiguous_city,
     )
     resolver.fail_for(stage=ConversationStage.CITY, text="resolver unavailable")
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -538,7 +538,7 @@ def test_city_resolution_outcomes_are_distinct_and_preserve_confirmed_country() 
 
 def test_back_preserves_search_area_and_stale_callbacks_are_inert() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -653,7 +653,7 @@ def test_country_rejection_and_resolver_failure_preserve_prior_confirmed_values(
         ),
     )
     resolver.fail_for(stage=ConversationStage.COUNTRY, text="resolver unavailable")
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -791,7 +791,7 @@ def test_search_area_outcomes_are_distinct_and_preserve_confirmed_scope() -> Non
         ),
     )
     resolver.fail_for(stage=ConversationStage.SEARCH_AREA, text="resolver unavailable")
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -861,7 +861,7 @@ def test_search_area_outcomes_are_distinct_and_preserve_confirmed_scope() -> Non
 
 def test_search_area_flow_preserves_explicit_conversation_language() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -944,7 +944,7 @@ def test_whole_city_uses_validated_identity_not_localized_candidate_equality() -
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1080,7 +1080,7 @@ def test_only_application_valid_candidate_advances_among_resolver_proposals() ->
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=ControlledTelegramDeliveryAdapter(),
@@ -1118,7 +1118,7 @@ def test_only_application_valid_candidate_advances_among_resolver_proposals() ->
 
 
 def test_geography_confirmations_are_append_only_explicit_events() -> None:
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=ControlledTelegramDeliveryAdapter(),
@@ -1174,7 +1174,7 @@ def test_geography_confirmations_are_append_only_explicit_events() -> None:
 
 def test_location_transition_survives_delivery_failure_and_restart() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1221,7 +1221,7 @@ def test_location_transition_survives_delivery_failure_and_restart() -> None:
 
 def test_post_core_back_returns_to_required_date_for_date_required_intent() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1312,7 +1312,7 @@ def test_confirmed_search_area_rerenders_in_each_supported_language_offline() ->
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1435,7 +1435,7 @@ def test_required_date_prompt_uses_approved_ai_native_examples(
     expected_prompt: str,
 ) -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1515,7 +1515,7 @@ def test_sub_city_area_rejects_a_parent_after_the_confirmed_country() -> None:
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1687,7 +1687,7 @@ def test_canonical_resolver_duplicates_advance_once_and_conflicts_fail_closed() 
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
         telegram_delivery=ControlledTelegramDeliveryAdapter(),

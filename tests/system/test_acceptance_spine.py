@@ -26,7 +26,7 @@ from modules.testkit import (
     InjectedInterruptionError,
     OperatorAlert,
     OwnershipViolationError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -41,7 +41,7 @@ def spine(
 ) -> AcceptanceSpine:
     database_url = os.environ["TEST_DATABASE_URL"]
     clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=database_url,
         clock=clock,
         telegram_delivery=telegram_delivery,

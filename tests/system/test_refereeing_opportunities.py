@@ -32,7 +32,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     ControlledTimezoneDataAdapter,
     FrozenClock,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -60,7 +60,7 @@ def test_standing_referee_route_only_edit_renews_freshness() -> None:
         text="Saint Petersburg",
         resolution=_city_resolution(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ingestion,
@@ -214,7 +214,7 @@ def test_dated_referee_route_only_edit_does_not_renew_freshness() -> None:
         text="Saint Petersburg",
         resolution=_city_resolution(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ingestion,
@@ -385,7 +385,7 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
         text="Saint Petersburg",
         resolution=_city_resolution(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ingestion,

@@ -4136,7 +4136,7 @@ def boot_acceptance_spine(
     *,
     admin_database_url: str,
     clock: Clock,
-    require_classifier_promotion: bool = False,
+    require_classifier_promotion: bool = True,
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
@@ -4148,9 +4148,10 @@ def boot_acceptance_spine(
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately.
 
-    Legacy controlled fixtures keep their pre-promotion behavior by default;
-    the real acceptance composition and the PostgreSQL store default to the
-    fail-closed classifier promotion requirement.
+    The primary acceptance composition defaults to the fail-closed classifier
+    promotion requirement.  Historical controlled fixtures that intentionally
+    exercise pre-promotion behavior must use the explicitly named legacy
+    compatibility helper below.
     """
     from apps.system_acceptance import boot_acceptance_role
     from modules.postgres_adapter import (
@@ -4236,6 +4237,35 @@ def boot_acceptance_spine(
         restart_role=restart_role,
         clock=clock,
         admin_database_url=admin_database_url,
+    )
+
+
+def boot_legacy_acceptance_spine(
+    *,
+    admin_database_url: str,
+    clock: Clock,
+    telegram_ingestion: TelegramIngestionAdapter | None = None,
+    telegram_delivery: TelegramDeliveryAdapter | None = None,
+    model: ModelAdapter | None = None,
+    location_resolver: LocationResolverAdapter | None = None,
+    conversation_language: ConversationLanguageAdapter | None = None,
+    date_interpretation: DateInterpretationAdapter | None = None,
+    timezone_data: TimezoneDataAdapter | None = None,
+    telegram_admin_user_id: int | None = None,
+) -> AcceptanceSpine:
+    """Boot a named legacy fixture with its compatibility opt-out enabled."""
+    return boot_acceptance_spine(
+        admin_database_url=admin_database_url,
+        clock=clock,
+        require_classifier_promotion=False,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=telegram_delivery,
+        model=model,
+        location_resolver=location_resolver,
+        conversation_language=conversation_language,
+        date_interpretation=date_interpretation,
+        timezone_data=timezone_data,
+        telegram_admin_user_id=telegram_admin_user_id,
     )
 
 

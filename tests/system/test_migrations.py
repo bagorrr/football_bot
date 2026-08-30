@@ -35,7 +35,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     FrozenClock,
     OwnershipViolationError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -2704,7 +2704,7 @@ def test_0014_rekeys_populated_generation_two_source_history(
         event_time=edit_time,
     )
     clock = FrozenClock(datetime(2026, 8, 20, 19, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=fresh_database_url,
         clock=clock,
         telegram_ingestion=telegram,

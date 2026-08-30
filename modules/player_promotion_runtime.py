@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
@@ -34,6 +35,7 @@ from modules.classifier_contract import (
     classifier_output_is_schema_valid,
 )
 from modules.contracts import (
+    ContractEnvelope,
     JsonValue,
     RuntimeRole,
 )
@@ -716,6 +718,11 @@ CONTROLLED_MATERIAL_EDIT_BODY = (
 CONTROLLED_REJECTED_MATERIAL_EDIT_BODY = (
     "This edited source message is unrelated to a football match."
 )
+PROMOTION_GATE_PLAYER_BODY = (
+    "4 players available for a match in Saint Petersburg on 2026-12-01. "
+    "Contact @controlled_player_match."
+)
+PROMOTION_GATE_EVENT_TIME = datetime(2026, 8, 18, 9, 5, tzinfo=UTC)
 CONTROLLED_COMPOUND_BODY = (
     "Two open matches in Saint Petersburg on 2026-12-01. "
     "Need one place for each. "
@@ -760,6 +767,52 @@ def _provider_open_match_candidate(
     }
     _add_provider_proposition_evidence(candidate, body=body)
     return candidate
+
+
+def _provider_player_match_response(body: str) -> dict[str, JsonValue]:
+    """Return one accepted Player candidate for the shared gate probe."""
+    event_date_match = re.search(r"\b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b", body)
+    event_date = event_date_match.group(0) if event_date_match else "2026-12-01"
+    candidate_key = (
+        f"provider-lifecycle-player-{sha256(body.encode()).hexdigest()[:12]}"
+    )
+    candidate: dict[str, JsonValue] = {
+        "candidate_key": candidate_key,
+        "opportunity_type": "player_match_availability",
+        "evidence": {
+            "opportunity": "4 players available for a match",
+            "event_time": event_date,
+            "location": "Saint Petersburg",
+            "available_player_count": "4 players available",
+        },
+        "source_context": body,
+        "location": {
+            "mention": "Saint Petersburg",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        },
+        "event_time": {
+            "start_local_date": event_date,
+            "end_local_date": event_date,
+            "iana_timezone": "Europe/Moscow",
+        },
+        "available_player_count": 4,
+        "response_routes": [
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@controlled_player_match",
+                "evidence": "@controlled_player_match",
+            }
+        ],
+    }
+    _add_provider_proposition_evidence(candidate, body=body)
+    return {
+        "schema_version": _PRIMARY_SCHEMA,
+        "disposition": "accepted",
+        "candidates": [candidate],
+        "routing": {"reason_code": "accepted", "required_context": "none"},
+    }
 
 
 def controlled_lifecycle_provider_outputs() -> dict[str, dict[str, JsonValue]]:
@@ -1265,6 +1318,12 @@ def _output_for_operation(
         return _provider_compound_response(body)
     if kind == "failure":
         return _provider_review_response()
+    if kind == "promotion_gate":
+        if operation.get("opportunity_type") == "player_match_availability":
+            return _provider_player_match_response(body)
+        if operation.get("opportunity_type") == "open_match":
+            return _provider_open_match_response(body)
+        return _provider_review_response()
     if kind in {"route", "create", "edit", "repost", "reply", "publication"}:
         if kind == "edit" and body == CONTROLLED_REJECTED_MATERIAL_EDIT_BODY:
             return _provider_review_response(reason_code="irrelevant")
@@ -1343,6 +1402,7 @@ class DurableAcceptanceProbe:
         case_id: str,
         operations: tuple[dict[str, JsonValue], ...],
         failure_mode: str | None = None,
+        require_classifier_promotion: bool = True,
     ) -> None:
         from modules.testkit import (
             ControlledTelegramIngestionAdapter,
@@ -1380,6 +1440,7 @@ class DurableAcceptanceProbe:
                     "repost_replay",
                     "repost_delete",
                     "repost_moderation",
+                    "promotion_gate",
                 }
                 and isinstance(source_override, str)
                 else _operation_body(case_id, operation_number, kind)
@@ -1409,6 +1470,7 @@ class DurableAcceptanceProbe:
         self.system = boot_acceptance_spine(
             admin_database_url=database_url,
             clock=self.clock,
+            require_classifier_promotion=require_classifier_promotion,
             telegram_ingestion=self.ingestion,
             model=self.model,
             telegram_admin_user_id=self.administrator_id,
@@ -2274,6 +2336,11 @@ def execute_lifecycle_case(
         execution_id=execution_id,
         case_id=case_id,
         operations=operations,
+        # The versioned lifecycle fixture predates the shared promotion gate;
+        # its explicit compatibility opt-out keeps those baseline observations
+        # stable while the worker's dedicated gate probe below exercises the
+        # real fail-closed publication boundary.
+        require_classifier_promotion=False,
     )
     observed_operations: list[dict[str, JsonValue]] = []
     route_state: dict[str, str] = {}
@@ -2844,6 +2911,7 @@ def execute_failure_case(
         case_id=case_id,
         operations=(operation,),
         failure_mode=effective_failure_mode,
+        require_classifier_promotion=False,
     )
     before_publications = 0
     revision_id: str | None = None
@@ -3071,6 +3139,106 @@ def _uuid_text(value: JsonValue) -> bool:
     return True
 
 
+def _assert_shared_promotion_gate(
+    *,
+    database_url: str,
+    execution_id: str,
+    gate_run_id: str,
+) -> None:
+    """Exercise the real publication gate without adding digest-only output."""
+    operations: tuple[dict[str, JsonValue], ...] = (
+        {
+            "kind": "promotion_gate",
+            "opportunity_type": "open_match",
+            "source": CONTROLLED_LIFECYCLE_BODY,
+        },
+        {
+            "kind": "promotion_gate",
+            "opportunity_type": "player_match_availability",
+            "source": PROMOTION_GATE_PLAYER_BODY,
+        },
+    )
+    probe = DurableAcceptanceProbe(
+        database_url=database_url,
+        execution_id=f"{execution_id}:promotion-gate",
+        case_id="promotion-gate",
+        operations=operations,
+        require_classifier_promotion=True,
+    )
+    first_revision_id: str | None = None
+    for operation_number, operation in enumerate(operations, start=1):
+        source = operation["source"]
+        if not isinstance(source, str):
+            raise RuntimeError("promotion gate fixture source is not text")
+        revision_id, snapshot = probe.source_event(
+            body=source,
+            operation_number=operation_number,
+            event_time=PROMOTION_GATE_EVENT_TIME,
+            process=True,
+        )
+        routing_reasons = snapshot.get("routing_reasons")
+        if (
+            not isinstance(revision_id, str)
+            or not isinstance(routing_reasons, list)
+            or "application_validation_failed" not in routing_reasons
+            or snapshot.get("publication_state") != "suppressed"
+            or snapshot.get("publication_effects") != 0
+            or snapshot.get("opportunity_ids") != []
+        ):
+            raise RuntimeError(
+                "shared classifier promotion gate did not fail closed for "
+                f"{operation['opportunity_type']} in gate run {gate_run_id}"
+            )
+        if operation_number == 1:
+            first_revision_id = revision_id
+    if first_revision_id is None:
+        raise RuntimeError("shared classifier promotion gate has no source revision")
+    proposals = probe.system.classification_proposals_for_revision(first_revision_id)
+    if not proposals or not isinstance(proposals[-1].payload, dict):
+        raise RuntimeError("shared classifier promotion gate has no durable proposal")
+    _assert_publication_gate_for_all_types(
+        probe=probe,
+        proposal_payload=proposals[-1].payload,
+        gate_run_id=gate_run_id,
+    )
+
+
+def _assert_publication_gate_for_all_types(
+    *,
+    probe: DurableAcceptanceProbe,
+    proposal_payload: dict[str, JsonValue],
+    gate_run_id: str,
+) -> None:
+    """Exercise the real Application publication gate for every canonical type."""
+    from modules.classifier_promotion import CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES
+
+    application_store = probe.system._roles[RuntimeRole.APPLICATION].store
+    incoming = cast(
+        ContractEnvelope,
+        SimpleNamespace(payload=proposal_payload, contract_version=4),
+    )
+    outgoing = cast(ContractEnvelope, SimpleNamespace())
+    for opportunity_type in CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES:
+        try:
+            application_store.publish_opportunity(
+                incoming=incoming,
+                opportunity={"opportunity_type": opportunity_type},
+                outgoing=outgoing,
+                received_at=probe.clock.now(),
+            )
+        except ValueError as error:
+            if str(error) != "unapproved classifier release cannot publish":
+                raise RuntimeError(
+                    "shared classifier promotion gate raised an unexpected error "
+                    f"for {opportunity_type} in gate run {gate_run_id}"
+                ) from error
+        else:
+            raise RuntimeError(
+                "shared classifier promotion gate accepted publication for "
+                f"{opportunity_type} in gate run {gate_run_id}"
+            )
+
+
 def run_replay_worker(
     *,
     database_url: str,
@@ -3082,6 +3250,11 @@ def run_replay_worker(
     """Execute one complete promotion run in a worker process."""
     from modules.classifier_promotion import promotion_database_binding_for_url
 
+    _assert_shared_promotion_gate(
+        database_url=database_url,
+        execution_id=execution_id,
+        gate_run_id=gate_run_id,
+    )
     corpus_adapter = ControlledPlayerClassifierAdapter()
     corpus: list[JsonValue] = []
     failures: list[str] = []

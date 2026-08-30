@@ -29,7 +29,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     ControlledTimezoneDataAdapter,
     FrozenClock,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
     semantic_proof_result_for,
 )
 from tests.system.test_open_match_game_search import (
@@ -225,7 +225,7 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
         text="on Petrogradskaya",
         resolution=_transfer_location_resolution(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
@@ -942,7 +942,7 @@ def test_coaching_polarity_is_enforced_by_authoritative_acceptance(
         text="on Petrogradskaya",
         resolution=_transfer_location_resolution(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
@@ -1141,7 +1141,7 @@ def test_compound_coaching_source_keeps_typed_exact_reposts_separate() -> None:
         identity=source_identity,
         transport_boundary="channel-pts:5620",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,

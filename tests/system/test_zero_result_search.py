@@ -31,7 +31,7 @@ from modules.testkit import (
     ControlledTimezoneDataAdapter,
     FrozenClock,
     InjectedTelegramDeliveryError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -55,7 +55,7 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram,
@@ -179,7 +179,7 @@ def test_technical_search_failure_preserves_confirmed_values_and_exposes_retry()
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram,
@@ -998,7 +998,7 @@ def _boot_search_system_with_clock() -> tuple[
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram,

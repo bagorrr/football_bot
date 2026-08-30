@@ -214,20 +214,19 @@ _FAILURE_EXECUTION_PATHS = {
     ),
 }
 
-_PUBLISHABLE_OPPORTUNITY_TYPES = frozenset(
-    {
-        "open_match",
-        "player_match_availability",
-        "tournament",
-        "opponent_request",
-        "roster_vacancy",
-        "player_transfer_availability",
-        "coach_availability",
-        "coach_request",
-        "referee_availability",
-        "referee_request",
-    }
+CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES = (
+    "open_match",
+    "player_match_availability",
+    "tournament",
+    "opponent_request",
+    "roster_vacancy",
+    "player_transfer_availability",
+    "coach_availability",
+    "coach_request",
+    "referee_availability",
+    "referee_request",
 )
+_PUBLISHABLE_OPPORTUNITY_TYPES = frozenset(CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES)
 
 
 def _is_publishable_opportunity_type(value: JsonValue) -> bool:
@@ -913,6 +912,7 @@ def promotion_release_binding(release: PlayerClassifierRelease) -> str:
 
 
 __all__ = [
+    "CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES",
     "ControlledPlayerClassifierAdapter",
     "DurableAcceptanceProbe",
     "canonical_replay_digest",
@@ -1028,7 +1028,14 @@ def _fresh_replay_database_url(base_database_url: str, replay_number: int) -> st
         connection.execute(
             sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
         )
-    return conninfo.make_conninfo(base_database_url, dbname=database_name)
+    # CREATE DATABASE inherits the local cluster's template timezone.  Pin
+    # worker sessions to UTC so the durable provenance manifest is stable on
+    # both developer PostgreSQL and CI clusters.
+    return conninfo.make_conninfo(
+        base_database_url,
+        dbname=database_name,
+        options="-c timezone=UTC",
+    )
 
 
 def _promotion_release_cache_token(release: PlayerClassifierRelease) -> str:

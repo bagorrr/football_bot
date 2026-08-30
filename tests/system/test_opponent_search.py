@@ -32,7 +32,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     ControlledTimezoneDataAdapter,
     FrozenClock,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 from tests.system.test_open_match_game_search import (
     _minimal_classifier_result,
@@ -139,7 +139,7 @@ def test_opponent_request_search_matches_published_request_end_to_end() -> None:
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
@@ -392,7 +392,7 @@ def test_edited_current_representative_reaches_persisted_facts_and_result_card()
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
@@ -547,7 +547,7 @@ def test_venue_provision_menu_is_one_answer_and_has_any_in_every_locale(
         timezones=("Europe/Moscow",),
     )
     delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC)),
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -603,7 +603,7 @@ def test_venue_provision_replaces_prior_choice_and_any_is_no_constraint() -> Non
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC)),
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -804,7 +804,7 @@ def test_multilingual_venue_provision_evidence_reaches_publication() -> None:
             event_time=datetime(2026, 8, 18, 9, index, tzinfo=UTC),
         )
 
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
