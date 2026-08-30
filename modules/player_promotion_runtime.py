@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
@@ -35,7 +34,6 @@ from modules.classifier_contract import (
     classifier_output_is_schema_valid,
 )
 from modules.contracts import (
-    ContractEnvelope,
     JsonValue,
     RuntimeRole,
 )
@@ -57,6 +55,7 @@ from modules.ports import (
     ClassifierQuotaError,
     ClassifierRequest,
     ClassifierTransientError,
+    ModelAdapter,
 )
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
 
@@ -1403,6 +1402,7 @@ class DurableAcceptanceProbe:
         operations: tuple[dict[str, JsonValue], ...],
         failure_mode: str | None = None,
         require_classifier_promotion: bool = True,
+        model: ModelAdapter | None = None,
     ) -> None:
         from modules.testkit import (
             ControlledTelegramIngestionAdapter,
@@ -1466,7 +1466,9 @@ class DurableAcceptanceProbe:
                 key: tuple(values) for key, values in output_sequences.items()
             },
         )
-        self.model = ControlledPlayerClassifierAdapter(transport=self.transport)
+        self.model = model or ControlledPlayerClassifierAdapter(
+            transport=self.transport
+        )
         self.system = boot_acceptance_spine(
             admin_database_url=database_url,
             clock=self.clock,
@@ -3165,7 +3167,6 @@ def _assert_shared_promotion_gate(
         operations=operations,
         require_classifier_promotion=True,
     )
-    first_revision_id: str | None = None
     for operation_number, operation in enumerate(operations, start=1):
         source = operation["source"]
         if not isinstance(source, str):
@@ -3189,54 +3190,228 @@ def _assert_shared_promotion_gate(
                 "shared classifier promotion gate did not fail closed for "
                 f"{operation['opportunity_type']} in gate run {gate_run_id}"
             )
-        if operation_number == 1:
-            first_revision_id = revision_id
-    if first_revision_id is None:
-        raise RuntimeError("shared classifier promotion gate has no source revision")
-    proposals = probe.system.classification_proposals_for_revision(first_revision_id)
-    if not proposals or not isinstance(proposals[-1].payload, dict):
-        raise RuntimeError("shared classifier promotion gate has no durable proposal")
     _assert_publication_gate_for_all_types(
-        probe=probe,
-        proposal_payload=proposals[-1].payload,
+        database_url=database_url,
+        execution_id=f"{execution_id}:promotion-gate:canonical-types",
+        covered_types=tuple(
+            str(operation["opportunity_type"]) for operation in operations
+        ),
         gate_run_id=gate_run_id,
     )
 
 
 def _assert_publication_gate_for_all_types(
     *,
-    probe: DurableAcceptanceProbe,
-    proposal_payload: dict[str, JsonValue],
+    database_url: str,
+    execution_id: str,
+    covered_types: tuple[str, ...],
     gate_run_id: str,
 ) -> None:
-    """Exercise the real Application publication gate for every canonical type."""
+    """Exercise the real Application gate for every canonical opportunity type."""
     from modules.classifier_promotion import CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES
+    from modules.testkit import ControlledModelAdapter, semantic_proof_result_for
 
-    application_store = probe.system._roles[RuntimeRole.APPLICATION].store
-    incoming = cast(
-        ContractEnvelope,
-        SimpleNamespace(payload=proposal_payload, contract_version=4),
+    all_types = tuple(CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES)
+    expected_types = set(all_types)
+    observed_types = set(covered_types)
+    if not observed_types.issubset(expected_types):
+        raise RuntimeError(
+            "shared classifier promotion gate has an unknown covered opportunity type"
+        )
+    remaining_types = tuple(
+        opportunity_type
+        for opportunity_type in all_types
+        if opportunity_type not in observed_types
     )
-    outgoing = cast(ContractEnvelope, SimpleNamespace())
-    for opportunity_type in CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES:
-        try:
-            application_store.publish_opportunity(
-                incoming=incoming,
-                opportunity={"opportunity_type": opportunity_type},
-                outgoing=outgoing,
-                received_at=probe.clock.now(),
-            )
-        except ValueError as error:
-            if str(error) != "unapproved classifier release cannot publish":
-                raise RuntimeError(
-                    "shared classifier promotion gate raised an unexpected error "
-                    f"for {opportunity_type} in gate run {gate_run_id}"
-                ) from error
+    transfer_types = {"roster_vacancy", "player_transfer_availability"}
+    for schema_version, group_types in (
+        (
+            "source-message-classification-v5",
+            tuple(
+                opportunity_type
+                for opportunity_type in remaining_types
+                if opportunity_type not in transfer_types
+            ),
+        ),
+        (
+            "source-message-classification-v2",
+            tuple(
+                opportunity_type
+                for opportunity_type in remaining_types
+                if opportunity_type in transfer_types
+            ),
+        ),
+    ):
+        if not group_types:
+            continue
+        classifier = ControlledModelAdapter()
+        if schema_version == "source-message-classification-v2":
+            classifier.enable_primary_v2()
         else:
-            raise RuntimeError(
-                "shared classifier promotion gate accepted publication for "
-                f"{opportunity_type} in gate run {gate_run_id}"
+            classifier.enable_coaching_primary_v1()
+        operations: tuple[dict[str, JsonValue], ...] = tuple(
+            {
+                "kind": "promotion_gate",
+                "opportunity_type": opportunity_type,
+                "source": _canonical_promotion_gate_source(opportunity_type),
+            }
+            for opportunity_type in group_types
+        )
+        for operation in operations:
+            source = operation["source"]
+            opportunity_type = operation["opportunity_type"]
+            if not isinstance(source, str) or not isinstance(opportunity_type, str):
+                raise RuntimeError("canonical promotion gate fixture is malformed")
+            primary_result = _canonical_promotion_gate_result(
+                body=source,
+                opportunity_type=opportunity_type,
+                schema_version=schema_version,
             )
+            classifier.return_for(
+                body=source,
+                result=primary_result,
+            )
+            classifier.return_proof_for(
+                body=source,
+                result=semantic_proof_result_for(
+                    output=primary_result.output,
+                    body=source,
+                    proof_version=(
+                        "source-semantic-proof-v2"
+                        if schema_version == "source-message-classification-v2"
+                        else "source-semantic-proof-v4"
+                    ),
+                ),
+            )
+        probe = DurableAcceptanceProbe(
+            database_url=database_url,
+            execution_id=f"{execution_id}:{schema_version}",
+            case_id="promotion-gate-canonical-types",
+            operations=operations,
+            require_classifier_promotion=True,
+            model=classifier,
+        )
+        for operation_number, operation in enumerate(operations, start=1):
+            source = operation["source"]
+            opportunity_type = operation["opportunity_type"]
+            if not isinstance(source, str) or not isinstance(opportunity_type, str):
+                raise RuntimeError("canonical promotion gate fixture is malformed")
+            revision_id, snapshot = probe.source_event(
+                body=source,
+                operation_number=operation_number,
+                event_time=PROMOTION_GATE_EVENT_TIME,
+                process=True,
+            )
+            routing_reasons = snapshot.get("routing_reasons")
+            if (
+                not isinstance(revision_id, str)
+                or not isinstance(routing_reasons, list)
+                or "application_validation_failed" not in routing_reasons
+                or snapshot.get("publication_state") != "suppressed"
+                or snapshot.get("publication_effects") != 0
+                or snapshot.get("opportunity_ids") != []
+            ):
+                raise RuntimeError(
+                    "shared classifier promotion gate did not fail closed for "
+                    f"{opportunity_type} in gate run {gate_run_id}"
+                )
+            observed_types.add(opportunity_type)
+    if observed_types != expected_types:
+        raise RuntimeError(
+            "shared classifier promotion gate did not cover every canonical type "
+            f"in gate run {gate_run_id}: {sorted(observed_types)}"
+        )
+
+
+def _canonical_promotion_gate_source(opportunity_type: str) -> str:
+    """Build one source-bound body for the canonical controlled gate cases."""
+    return (
+        f"Controlled {opportunity_type} publication evidence in Saint Petersburg "
+        "on 2026-12-01. Contact @controlled_publication_gate."
+    )
+
+
+def _canonical_promotion_gate_result(
+    *, body: str, opportunity_type: str, schema_version: str
+) -> ClassifierAdapterResult:
+    """Build a valid controlled proposal for one canonical publication type."""
+    evidence: dict[str, JsonValue] = {
+        "opportunity": body,
+        "location": body,
+    }
+    candidate: dict[str, JsonValue] = {
+        "candidate_key": f"controlled-promotion-gate-{opportunity_type}",
+        "opportunity_type": opportunity_type,
+        "source_context": body,
+        "evidence": evidence,
+        "location": {
+            "mention": "Saint Petersburg",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        },
+        "response_routes": [
+            {
+                "kind": "explicit_telegram_username",
+                "value": "@controlled_publication_gate",
+                "evidence": "@controlled_publication_gate",
+            }
+        ],
+    }
+    if opportunity_type == "tournament":
+        candidate["event_time"] = {
+            "start_local_date": "2026-12-01",
+            "end_local_date": "2026-12-01",
+            "iana_timezone": "Europe/Moscow",
+        }
+        candidate["open_participation"] = True
+        evidence["event_time"] = body
+        evidence["open_participation"] = body
+    elif opportunity_type == "opponent_request":
+        candidate["event_time"] = {
+            "start_local_date": "2026-12-01",
+            "end_local_date": "2026-12-01",
+            "iana_timezone": "Europe/Moscow",
+        }
+        candidate["opponent_request"] = True
+        evidence["event_time"] = body
+        evidence["opponent_request"] = body
+    elif opportunity_type in {
+        "coach_availability",
+        "coach_request",
+    }:
+        candidate[opportunity_type] = True
+        candidate["in_person"] = True
+        evidence[opportunity_type] = body
+        evidence["in_person"] = body
+    elif opportunity_type == "referee_request":
+        candidate[opportunity_type] = True
+        candidate["event_time"] = {
+            "start_local_date": "2026-12-01",
+            "end_local_date": "2026-12-01",
+            "iana_timezone": "Europe/Moscow",
+        }
+        evidence[opportunity_type] = body
+        evidence["event_time"] = body
+    else:
+        candidate[opportunity_type] = True
+        evidence[opportunity_type] = body
+    return ClassifierAdapterResult(
+        output={
+            "schema_version": schema_version,
+            "disposition": "accepted",
+            "candidates": [candidate],
+            "routing": {"reason_code": "accepted", "required_context": "none"},
+        },
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="controlled_recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=30,
+        output_tokens=20,
+    )
 
 
 def run_replay_worker(

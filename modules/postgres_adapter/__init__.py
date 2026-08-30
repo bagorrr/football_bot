@@ -818,6 +818,38 @@ class PostgresAcceptanceObserver:
             validate_registered=(row["inbox_status"] != "rejected_invalid_contract"),
         )
 
+    def classifier_promotion_contract(
+        self,
+        release_name: str,
+    ) -> RawContractEnvelope:
+        """Observe one serialized classifier-promotion approval envelope."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT contract_outbox.*
+                FROM football_runtime.contract_outbox
+                WHERE contract_outbox.contract_name = %s
+                  AND contract_outbox.contract_version = 1
+                  AND contract_outbox.producer_role = %s
+                  AND contract_outbox.consumer_role IS NULL
+                  AND contract_outbox.subject_id = %s
+                ORDER BY contract_outbox.recorded_at DESC,
+                         contract_outbox.message_id DESC
+                LIMIT 1
+                """,
+                (
+                    ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
+                    RuntimeRole.APPLICATION.value,
+                    release_name,
+                ),
+            ).fetchone()
+        if row is None:
+            raise LookupError(release_name)
+        return _row_to_envelope(row, validate_registered=False)
+
     def source_messages(self) -> tuple[SourceMessage, ...]:
         """Observe authoritative Source Messages without exposing table layout."""
         with psycopg.connect(

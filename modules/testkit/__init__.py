@@ -2343,6 +2343,12 @@ class AcceptanceSpine:
         """Observe shared classifier promotion evidence through Application."""
         return self.player_classifier_promotion()
 
+    def classifier_promotion_contract(self) -> RawContractEnvelope:
+        """Observe the shared approval envelope through the admin testkit seam."""
+        return self._observer.classifier_promotion_contract(
+            PLAYER_CLASSIFIER_RELEASE_NAME
+        )
+
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()

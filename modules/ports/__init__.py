@@ -1219,6 +1219,13 @@ class AcceptanceObserver(Protocol):
         """Recover one durable envelope."""
         ...
 
+    def classifier_promotion_contract(
+        self,
+        release_name: str,
+    ) -> RawContractEnvelope:
+        """Observe one durable classifier-promotion approval envelope."""
+        ...
+
     def source_messages(self) -> tuple[SourceMessage, ...]:
         """Observe Application-owned Source Messages through the testkit."""
         ...

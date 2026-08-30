@@ -11,7 +11,6 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
-from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -21,7 +20,7 @@ from psycopg import sql
 
 from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.codex_classification_adapter import CodexCliClassifierAdapter
-from modules.contracts import ContractEnvelope, ContractName, JsonValue, RuntimeRole
+from modules.contracts import ContractName, JsonValue, RuntimeRole
 from modules.domain import (
     ConversationStage,
     GeographicType,
@@ -107,49 +106,16 @@ def test_primary_gate_blocks_missing_and_failed_non_player_publication() -> None
     assert missing_proposals
     assert isinstance(missing_proposals[-1].payload, dict)
 
-    application_store = probe.system._roles[RuntimeRole.APPLICATION].store
-    incoming = cast(
-        ContractEnvelope,
-        SimpleNamespace(
-            payload=missing_proposals[-1].payload,
-            contract_version=4,
-        ),
-    )
-    for opportunity_type in ("open_match", "opponent_request", "tournament"):
-        with pytest.raises(
-            ValueError,
-            match="unapproved classifier release cannot publish",
-        ):
-            application_store.publish_opportunity(
-                incoming=incoming,
-                opportunity={"opportunity_type": opportunity_type},
-                outgoing=cast(ContractEnvelope, SimpleNamespace()),
-                received_at=probe.clock.now(),
-            )
-
     probe.system.record_player_classifier_promotion()
     approval = probe.system.player_classifier_promotion()
     assert approval is not None
-    release_name = approval["release_name"]
-    assert isinstance(release_name, str)
-    with psycopg.connect(database_url) as connection:
-        changed = connection.execute(
-            """
-            UPDATE football_runtime.contract_outbox AS outbox
-            SET payload = jsonb_set(outbox.payload, '{state}', '"failed"'::jsonb)
-            FROM football_runtime.application_classifier_promotion_attestations
-                AS attestation
-            WHERE outbox.message_id = attestation.approval_message_id
-              AND outbox.contract_name = %s
-              AND attestation.release_name = %s
-            RETURNING outbox.message_id
-            """,
-            (
-                ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
-                release_name,
-            ),
-        ).fetchone()
-    assert changed is not None
+    approval_contract = probe.system.classifier_promotion_contract()
+    assert isinstance(approval_contract.payload, dict)
+    assert approval_contract.payload.get("state") == "approved"
+    probe.system.invalidate_contract_payload(
+        message_id=approval_contract.message_id,
+        payload_updates={"state": "failed"},
+    )
     assert probe.system.player_classifier_promotion() is None
 
     failed_revision_id, failed_snapshot = probe.source_event(
