@@ -5894,6 +5894,20 @@ class PostgresRoleStore:
     # Preserve the established private seam used by Player promotion tests.
     _ensure_player_publication_approval = _ensure_classifier_publication_approval
 
+    def check_classifier_publication_gate(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity_type: str,
+    ) -> None:
+        """Check one Application publication type without committing effects."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        self._ensure_classifier_publication_approval(
+            incoming=incoming,
+            opportunities=({"opportunity_type": opportunity_type},),
+        )
+
     def proposition_opportunity_ids(
         self, source_message_id: str
     ) -> tuple[tuple[int, str], ...]:

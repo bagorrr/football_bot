@@ -961,6 +961,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Run and record an Application-owned classifier promotion attestation."""
         ...
 
+    def check_classifier_publication_gate(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity_type: str,
+    ) -> None:
+        """Check one Application publication type without committing effects."""
+        ...
+
     def proposition_opportunity_ids(
         self, source_message_id: str
     ) -> tuple[tuple[int, str], ...]:
