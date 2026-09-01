@@ -1440,6 +1440,22 @@ _BOUNDED_METADATA_FIELDS = {
     "source_message_url",
     "source_message_reply_capable",
 }
+_TELEGRAM_SIGNAL_FIELDS = {
+    "telegram_publisher_flags",
+    "telegram_author_flags",
+}
+_TELEGRAM_SIGNAL_VALUES = frozenset({"restricted", "scam", "fake"})
+
+
+def _is_full_bounded_metadata_shape(keys: frozenset[str]) -> bool:
+    """Recognize the complete source metadata plus optional Telegram signals."""
+    return (
+        _BOUNDED_METADATA_FIELDS
+        <= keys
+        <= (
+            _BOUNDED_METADATA_FIELDS | {"source_publisher_id"} | _TELEGRAM_SIGNAL_FIELDS
+        )
+    )
 
 
 def _is_safe_telegram_route(value: str) -> bool:
@@ -1468,10 +1484,9 @@ def _is_safe_http_route(value: str) -> bool:
 
 
 def _validate_bounded_source_metadata(value: JsonValue) -> None:
-    if not isinstance(value, dict) or frozenset(value) not in {
-        frozenset(_BOUNDED_METADATA_FIELDS),
-        frozenset(_BOUNDED_METADATA_FIELDS | {"source_publisher_id"}),
-    }:
+    if not isinstance(value, dict) or not _is_full_bounded_metadata_shape(
+        frozenset(value)
+    ):
         raise TypeError("bounded source metadata contains unsupported facts")
     language = value["message_language"]
     if language is not None and (
@@ -1514,6 +1529,18 @@ def _validate_bounded_source_metadata(value: JsonValue) -> None:
             raise TypeError(
                 "source_publisher_id must be an opaque publisher reference or null"
             )
+    for field_name in _TELEGRAM_SIGNAL_FIELDS:
+        flags = value.get(field_name, [])
+        if (
+            not isinstance(flags, list)
+            or len(flags) > len(_TELEGRAM_SIGNAL_VALUES)
+            or not all(
+                isinstance(flag, str) and flag in _TELEGRAM_SIGNAL_VALUES
+                for flag in flags
+            )
+            or len(flags) != len(set(flags))
+        ):
+            raise TypeError(f"{field_name} must be a bounded Telegram signal list")
 
 
 def _validate_source_revision_lineage(
@@ -1688,11 +1715,13 @@ def _validate_classify_source_message_revision(
     ):
         raise TypeError("source_chat_geography values must be text or null")
     metadata = payload["bounded_metadata"]
-    if not isinstance(metadata, dict) or frozenset(metadata) not in {
-        frozenset({"message_language", "attachment_types"}),
-        frozenset(_BOUNDED_METADATA_FIELDS),
-        frozenset(_BOUNDED_METADATA_FIELDS | {"source_publisher_id"}),
-    }:
+    if not isinstance(metadata, dict):
+        raise TypeError("bounded_metadata contains unsupported facts")
+    metadata_keys = frozenset(metadata)
+    if not (
+        metadata_keys == frozenset({"message_language", "attachment_types"})
+        or _is_full_bounded_metadata_shape(metadata_keys)
+    ):
         raise TypeError("bounded_metadata contains unsupported facts")
     if (
         "message_language" in metadata
@@ -1707,10 +1736,7 @@ def _validate_classify_source_message_revision(
         or not all(isinstance(value, str) and value for value in attachment_types)
     ):
         raise TypeError("attachment_types must be a bounded text list")
-    if frozenset(metadata) in {
-        frozenset(_BOUNDED_METADATA_FIELDS),
-        frozenset(_BOUNDED_METADATA_FIELDS | {"source_publisher_id"}),
-    }:
+    if _is_full_bounded_metadata_shape(metadata_keys):
         _validate_bounded_source_metadata(metadata)
     reply = payload["eligible_reply_context"]
     if reply is not None:
@@ -2494,6 +2520,7 @@ def _validate_opportunity_publication_changed(
             "exact_repost_superseded",
             "moderation_held",
             "moderation_suppressed",
+            "review_timeout",
         }:
             raise ValueError("Opportunity publication reason is invalid")
         if (
@@ -2506,6 +2533,11 @@ def _validate_opportunity_publication_changed(
             and payload["publication_state"] == "active"
         ):
             raise ValueError("active publication cannot carry a suppression reason")
+        if (
+            publication_reason == "review_timeout"
+            and payload["publication_state"] != "suppressed"
+        ):
+            raise ValueError("review_timeout requires suppressed state")
     accepted_facts = payload["accepted_facts"]
     if not isinstance(accepted_facts, dict):
         raise TypeError("accepted_facts must be an object")
@@ -2562,6 +2594,12 @@ def _validate_opportunity_publication_changed(
         envelope.idempotency_key,
     ):
         allowed_idempotency_keys.add(envelope.idempotency_key)
+    if re.fullmatch(
+        rf"opportunity-publication-moderation:{re.escape(opportunity_revision_id)}"
+        r":[0-9a-f-]{36}",
+        envelope.idempotency_key,
+    ):
+        allowed_idempotency_keys.add(envelope.idempotency_key)
     if envelope.idempotency_key not in allowed_idempotency_keys:
         raise ValueError(
             "OpportunityPublicationChanged idempotency key is not canonical"
@@ -2576,9 +2614,11 @@ def _validate_opportunity_publication_batch_changed(
     allowed = {
         "source_message_revision_id",
         "publication_state",
+        "publication_reason",
         "opportunities",
     }
-    if set(payload) != allowed:
+    legacy_allowed = allowed - {"publication_reason"}
+    if frozenset(payload) not in {frozenset(legacy_allowed), frozenset(allowed)}:
         raise ValueError("OpportunityPublicationChanged v3 has incomplete semantics")
     source_revision_id = _required_text(payload, "source_message_revision_id")
     source_scope, separator, revision_suffix = source_revision_id.rpartition(
@@ -2598,6 +2638,28 @@ def _validate_opportunity_publication_batch_changed(
         raise ValueError(
             "OpportunityPublicationChanged v3 publication state is invalid"
         )
+    publication_reason = payload.get("publication_reason")
+    if publication_reason is not None and publication_reason not in {
+        "source_revision_superseded",
+        "source_deleted",
+        "response_route_unavailable",
+        "exact_repost_superseded",
+        "moderation_held",
+        "moderation_suppressed",
+        "review_timeout",
+    }:
+        raise ValueError(
+            "OpportunityPublicationChanged v3 publication reason is invalid"
+        )
+    if (
+        publication_reason == "moderation_held"
+        and publication_state != "held_for_review"
+    ):
+        raise ValueError("moderation_held requires held_for_review state")
+    if publication_reason == "review_timeout" and publication_state != "suppressed":
+        raise ValueError("review_timeout requires suppressed state")
+    if publication_state == "active" and publication_reason is not None:
+        raise ValueError("active batch publication cannot carry a suppression reason")
     opportunities = payload["opportunities"]
     if not isinstance(opportunities, list) or not 2 <= len(opportunities) <= 8:
         raise ValueError("OpportunityPublicationChanged v3 batch size is invalid")
@@ -2749,6 +2811,8 @@ def _validate_opportunity_publication_changed_with_types(
             "exact_repost_superseded",
             "moderation_held",
             "moderation_suppressed",
+            "response_route_unavailable",
+            "review_timeout",
         }:
             raise ValueError("Opportunity publication reason is invalid")
         if (
@@ -2761,6 +2825,11 @@ def _validate_opportunity_publication_changed_with_types(
             and payload["publication_state"] == "active"
         ):
             raise ValueError("active publication cannot carry a suppression reason")
+        if (
+            publication_reason == "review_timeout"
+            and payload["publication_state"] != "suppressed"
+        ):
+            raise ValueError("review_timeout requires suppressed state")
     accepted_facts = payload["accepted_facts"]
     if not isinstance(accepted_facts, dict):
         raise TypeError("accepted_facts must be an object")
@@ -2804,6 +2873,12 @@ def _validate_opportunity_publication_changed_with_types(
         envelope.idempotency_key,
     ):
         allowed_idempotency_keys.add(envelope.idempotency_key)
+    if re.fullmatch(
+        rf"opportunity-publication-moderation:{re.escape(opportunity_revision_id)}"
+        r":[0-9a-f-]{36}",
+        envelope.idempotency_key,
+    ):
+        allowed_idempotency_keys.add(envelope.idempotency_key)
     if envelope.idempotency_key not in allowed_idempotency_keys:
         raise ValueError(
             "OpportunityPublicationChanged idempotency key is not canonical"
@@ -2832,9 +2907,11 @@ def _validate_opportunity_publication_batch_changed_with_types(
     allowed = {
         "source_message_revision_id",
         "publication_state",
+        "publication_reason",
         "opportunities",
     }
-    if set(payload) != allowed:
+    legacy_allowed = allowed - {"publication_reason"}
+    if frozenset(payload) not in {frozenset(legacy_allowed), frozenset(allowed)}:
         raise ValueError("OpportunityPublicationChanged v3 has incomplete semantics")
     source_revision_id = _required_text(payload, "source_message_revision_id")
     source_scope, separator, revision_suffix = source_revision_id.rpartition(
@@ -2854,6 +2931,27 @@ def _validate_opportunity_publication_batch_changed_with_types(
         raise ValueError(
             "OpportunityPublicationChanged v3 publication state is invalid"
         )
+    publication_reason = payload.get("publication_reason")
+    if publication_reason is not None and publication_reason not in {
+        "source_revision_superseded",
+        "source_deleted",
+        "exact_repost_superseded",
+        "moderation_held",
+        "moderation_suppressed",
+        "review_timeout",
+    }:
+        raise ValueError(
+            "OpportunityPublicationChanged v3 publication reason is invalid"
+        )
+    if (
+        publication_reason == "moderation_held"
+        and publication_state != "held_for_review"
+    ):
+        raise ValueError("moderation_held requires held_for_review state")
+    if publication_reason == "review_timeout" and publication_state != "suppressed":
+        raise ValueError("review_timeout requires suppressed state")
+    if publication_state == "active" and publication_reason is not None:
+        raise ValueError("active batch publication cannot carry a suppression reason")
     opportunities = payload["opportunities"]
     if not isinstance(opportunities, list) or not 2 <= len(opportunities) <= 8:
         raise ValueError("OpportunityPublicationChanged v3 batch size is invalid")

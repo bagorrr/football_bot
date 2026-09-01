@@ -16,6 +16,7 @@ from modules.contracts import (
 )
 from modules.domain import ExactRepostCluster, SourceEventKind
 from modules.player_promotion_runtime import (
+    CONTROLLED_COMPOUND_BODY,
     CONTROLLED_COSMETIC_EDIT_BODY,
     CONTROLLED_LIFECYCLE_BODY,
     CONTROLLED_MATERIAL_EDIT_BODY,
@@ -1011,6 +1012,320 @@ def test_moderation_applies_to_the_whole_cluster_and_approval_releases_it() -> N
         and member.publication_reason == "moderation_suppressed"
         for member in probe.system.exact_repost_cluster_members(cluster_id)
     )
+
+
+def test_current_telegram_scam_signal_holds_cluster_until_admin_approval() -> None:
+    probe = _probe()
+    first_revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=705,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert first_revision is not None
+    opportunity = probe.system.opportunities()[0]
+    assert opportunity.publication_state == "held_for_review"
+    assert opportunity.publication_reason == "moderation_held"
+    cluster = _cluster(probe)
+    assert cluster.moderation_state == "held_for_review"
+    assert cluster.publication_state == "held_for_review"
+    assert probe.system.recommendation_opportunities()[0].publication_state == (
+        "held_for_review"
+    )
+    assert not probe.system.moderate_opportunity(
+        opportunity_id=opportunity.opportunity_id,
+        opportunity_revision_id=opportunity.opportunity_revision_id,
+        decision="approve",
+        telegram_user_id=probe.administrator_id + 1,
+    )
+    assert probe.system.moderate_opportunity(
+        opportunity_id=opportunity.opportunity_id,
+        opportunity_revision_id=opportunity.opportunity_revision_id,
+        decision="approve",
+        telegram_user_id=probe.administrator_id,
+    )
+    probe.system.process_opportunities_until_idle()
+    assert probe.system.opportunities()[0].publication_state == "active"
+    assert _cluster(probe).publication_state == "active"
+
+
+def test_current_telegram_author_fake_signal_holds_for_review() -> None:
+    probe = _probe()
+    revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=706,
+        source_publisher_id="publisher:one",
+        telegram_author_fake=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunity = probe.system.opportunities()[0]
+    assert opportunity.publication_state == "held_for_review"
+    assert opportunity.publication_reason == "moderation_held"
+    events = probe.system.moderation_events()
+    assert {event.trigger for event in events} == {"telegram_fake"}
+    assert all(event.event_kind == "triggered" for event in events)
+
+
+def test_restricted_telegram_signal_does_not_hold_an_opportunity() -> None:
+    probe = _probe()
+    revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=707,
+        source_publisher_id="publisher:one",
+        telegram_restricted=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunity = probe.system.opportunities()[0]
+    assert opportunity.publication_state == "active"
+    assert opportunity.publication_reason is None
+    assert _cluster(probe).publication_state == "active"
+    assert probe.system.moderation_events() == ()
+
+
+def test_admin_moderation_is_revision_scoped_and_audited() -> None:
+    probe = _probe()
+    revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=708,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunity = probe.system.opportunities()[0]
+    wrong_revision = opportunity.opportunity_revision_id.replace(
+        ":revision:1", ":revision:2"
+    )
+    assert not probe.system.moderate_opportunity(
+        opportunity_id=opportunity.opportunity_id,
+        opportunity_revision_id=wrong_revision,
+        decision="suppress",
+        telegram_user_id=probe.administrator_id,
+    )
+    assert probe.system.opportunities()[0].publication_state == "held_for_review"
+    assert probe.system.moderate_opportunity(
+        opportunity_id=opportunity.opportunity_id,
+        opportunity_revision_id=opportunity.opportunity_revision_id,
+        decision="suppress",
+        telegram_user_id=probe.administrator_id,
+    )
+    probe.system.process_opportunities_until_idle()
+    assert probe.system.opportunities()[0].publication_state == "suppressed"
+    assert probe.system.opportunities()[0].publication_reason == (
+        "moderation_suppressed"
+    )
+    assert probe.system.recommendation_opportunities()[0].publication_reason == (
+        "moderation_suppressed"
+    )
+    decisions = [
+        event
+        for event in probe.system.moderation_events()
+        if event.event_kind == "suppressed"
+    ]
+    assert len(decisions) == 1
+    assert decisions[0].trigger == "telegram_scam"
+    assert decisions[0].telegram_user_id == probe.administrator_id
+
+
+def test_admin_can_approve_a_non_cluster_opportunity() -> None:
+    probe = _probe()
+    revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=710,
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    assert probe.system.exact_repost_clusters() == ()
+    opportunity = probe.system.opportunities()[0]
+    assert opportunity.publication_state == "held_for_review"
+    assert probe.system.moderate_opportunity(
+        opportunity_id=opportunity.opportunity_id,
+        opportunity_revision_id=opportunity.opportunity_revision_id,
+        decision="approve",
+        telegram_user_id=probe.administrator_id,
+    )
+    probe.system.process_opportunities_until_idle()
+    assert probe.system.opportunities()[0].publication_state == "active"
+    assert probe.system.recommendation_opportunities()[0].publication_state == "active"
+
+
+def test_removing_a_telegram_signal_does_not_reactivate_the_revision() -> None:
+    probe = _probe({"kind": "edit", "source": CONTROLLED_COSMETIC_EDIT_BODY})
+    first_revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=711,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert first_revision is not None
+    probe.clock.advance_to(datetime(2026, 8, 18, 9, 8, tzinfo=UTC))
+    edited_revision, _ = probe.source_event(
+        body=CONTROLLED_COSMETIC_EDIT_BODY,
+        operation_number=2,
+        kind=SourceEventKind.EDIT,
+        revision=2,
+        telegram_message_id=711,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert edited_revision is not None
+    current = probe.system.opportunities()[0]
+    assert current.source_message_revision_id == edited_revision
+    assert current.publication_state == "held_for_review"
+    assert current.publication_reason == "moderation_held"
+    assert probe.system.recommendation_opportunities()[0].publication_state == (
+        "held_for_review"
+    )
+    assert {
+        event.opportunity_revision_id for event in probe.system.moderation_events()
+    } == {
+        opportunity_revision
+        for opportunity_revision in (f"{current.opportunity_id}:revision:1",)
+    }
+
+
+def test_telegram_signal_holds_every_compound_opportunity() -> None:
+    probe = _probe({"kind": "compound", "source": CONTROLLED_COMPOUND_BODY})
+    revision, _ = probe.source_event(
+        body=CONTROLLED_COMPOUND_BODY,
+        operation_number=1,
+        telegram_message_id=712,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunities = probe.system.opportunities()
+    assert len(opportunities) == 2
+    assert all(
+        opportunity.publication_state == "held_for_review"
+        and opportunity.publication_reason == "moderation_held"
+        for opportunity in opportunities
+    )
+    assert all(
+        opportunity.publication_state == "held_for_review"
+        for opportunity in probe.system.recommendation_opportunities()
+    )
+    cluster = _cluster(probe)
+    assert cluster.publication_state == "held_for_review"
+    assert probe.system.moderate_opportunity(
+        opportunity_id=opportunities[0].opportunity_id,
+        opportunity_revision_id=opportunities[0].opportunity_revision_id,
+        decision="approve",
+        telegram_user_id=probe.administrator_id,
+    )
+    probe.system.process_opportunities_until_idle()
+    assert _cluster(probe).publication_state == "active"
+    members = probe.system.exact_repost_cluster_members(cluster.exact_repost_cluster_id)
+    assert any(member.publication_state == "active" for member in members)
+
+
+def test_compound_publication_cannot_bypass_an_existing_cluster_hold() -> None:
+    compound_body = (
+        f"{CONTROLLED_COMPOUND_BODY}\n"
+        "controlled-case:exact-repost-regression:operation:2"
+    )
+    probe = _probe(
+        {"kind": "repost", "source": compound_body},
+        {"kind": "compound"},
+    )
+    first_revision, _ = probe.source_event(
+        body=compound_body,
+        operation_number=1,
+        telegram_message_id=713,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert first_revision is not None
+    probe.clock.advance_to(datetime(2026, 8, 18, 9, 7, tzinfo=UTC))
+    second_revision, _ = probe.source_event(
+        body=compound_body,
+        operation_number=2,
+        telegram_message_id=714,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert second_revision is not None
+    second_publications = probe.system.opportunity_publication_contracts(
+        second_revision
+    )
+    batch = next(
+        publication
+        for publication in second_publications
+        if publication.contract_version == 3
+    )
+    assert isinstance(batch.payload, dict)
+    assert batch.payload["publication_state"] == "held_for_review"
+    assert batch.payload["publication_reason"] == "moderation_held"
+    assert all(
+        opportunity.publication_state == "held_for_review"
+        for opportunity in probe.system.recommendation_opportunities()
+        if opportunity.source_message_revision_id == second_revision
+    )
+
+
+def test_unresolved_moderation_review_times_out_as_unresolved() -> None:
+    timeout_body = CONTROLLED_LIFECYCLE_BODY.replace("2026-12-01", "2026-08-18")
+    probe = _probe({"kind": "repost", "source": timeout_body})
+    revision, _ = probe.source_event(
+        body=timeout_body,
+        operation_number=1,
+        telegram_message_id=709,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunity = probe.system.opportunities()[0]
+    probe.clock.advance_to(datetime(2026, 9, 18, 9, 0, tzinfo=UTC))
+    assert probe.system.expire_moderation_reviews() == 1
+    assert probe.system.expire_moderation_reviews() == 0
+    probe.system.process_opportunities_until_idle()
+    timed_out = probe.system.opportunities()[0]
+    assert timed_out.publication_state == "suppressed"
+    assert timed_out.publication_reason == "review_timeout"
+    assert probe.system.recommendation_opportunities()[0].publication_reason == (
+        "review_timeout"
+    )
+    cluster = _cluster(probe)
+    assert cluster.publication_state == "suppressed"
+    assert cluster.moderation_state == "suppressed"
+    member = probe.system.exact_repost_cluster_members(cluster.exact_repost_cluster_id)[
+        0
+    ]
+    assert member.publication_reason == "review_timeout"
+    outcomes = [
+        outcome
+        for outcome in probe.system.classification_routing_outcomes()
+        if outcome.source_message_revision_id == revision
+    ]
+    assert len(outcomes) == 2
+    assert any(
+        outcome.disposition == "unresolved"
+        and outcome.route == "unresolved"
+        and outcome.reason_code == "review_timeout"
+        for outcome in outcomes
+    )
+    assert (
+        sum(
+            event.event_kind == "review_timeout"
+            for event in probe.system.moderation_events()
+        )
+        == 1
+    )
+    assert opportunity.opportunity_id == timed_out.opportunity_id
 
 
 def test_new_exact_repost_cannot_bypass_suppressed_cluster() -> None:

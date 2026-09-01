@@ -42,6 +42,7 @@ from modules.domain import (
     LanguageSelection,
     LocationResolution,
     LocationResolutionQuery,
+    ModerationEvent,
     OldChatViewCleanup,
     Opportunity,
     ProtectedContentSkip,
@@ -1045,6 +1046,22 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Apply one application-owned moderation decision to a cluster."""
         ...
 
+    def moderate_opportunity(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        decision: str,
+        telegram_user_id: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Apply a protected, revision-scoped moderation decision."""
+        ...
+
+    def expire_moderation_reviews(self, *, as_of: datetime) -> int:
+        """Finalize moderation reviews that exceeded their bounded lifetime."""
+        ...
+
     def project_opportunity(
         self,
         *,
@@ -1320,6 +1337,10 @@ class AcceptanceObserver(Protocol):
 
     def exact_repost_clusters(self) -> tuple[ExactRepostCluster, ...]:
         """Observe application-owned Exact Repost Cluster state."""
+        ...
+
+    def moderation_events(self) -> tuple[ModerationEvent, ...]:
+        """Observe body-free moderation audit events."""
         ...
 
     def exact_repost_cluster_members(

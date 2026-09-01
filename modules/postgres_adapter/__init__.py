@@ -68,6 +68,7 @@ from modules.domain import (
     InitialConsentAttestation,
     IntentBranch,
     LocaleSource,
+    ModerationEvent,
     OldChatViewCleanup,
     Opportunity,
     OpportunityResponseRoute,
@@ -116,6 +117,7 @@ from modules.domain import (
     referee_publication_state_as_of,
     render_response_route,
     source_publisher_id_from_metadata,
+    telegram_moderation_triggers,
     tournament_publication_state_as_of,
 )
 from modules.ports import (
@@ -172,6 +174,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
     "0040_coaching_ingestion_role_projection_gate.sql",
     "0041_exact_repost_referee_generic_projection.sql",
+    "0042_moderation_review_events.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -217,6 +220,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "0a280649e65244326c7d6f0a10f08db29c00fc609e73f67ef4f22bd5aadfc38f",
     "b222c3c6a41130b4062f671de0c4a4706fdf7b13c1a09ba50a6cf8929934a161",
     "7626882c2b8c0e13f539157963ee4406d3cb704901efd7a830e11365f6fa459d",
+    "cc2935d5b8c9462086677646d50c793f550c9b85e694c5bc68e28f86f84889ca",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -725,6 +729,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.application_classifier_promotion_gate_runs,
                      football_runtime.application_classifier_promotion_attestations,
                      football_runtime.application_proposition_identities,
+                     football_runtime.application_moderation_events,
                      football_runtime.application_exact_repost_cluster_members,
                      football_runtime.application_exact_repost_clusters,
                      football_runtime.application_opportunities,
@@ -1259,6 +1264,24 @@ class PostgresAcceptanceObserver:
                 """
             ).fetchall()
         return tuple(ClassificationRoutingOutcome(**row) for row in rows)
+
+    def moderation_events(self) -> tuple[ModerationEvent, ...]:
+        """Observe the body-free Application moderation audit trail."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT moderation_event_id, source_message_revision_id,
+                       opportunity_id, opportunity_revision_id,
+                       exact_repost_cluster_id, trigger, event_kind,
+                       telegram_user_id, reason, recorded_at, expires_at
+                FROM football_runtime.application_moderation_events
+                ORDER BY recorded_at, moderation_event_id
+                """
+            ).fetchall()
+        return tuple(ModerationEvent(**row) for row in rows)
 
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
@@ -6312,6 +6335,15 @@ class PostgresRoleStore:
                     exclude_opportunity_id=opportunity_id,
                 )
             )
+            _insert_moderation_trigger_events(
+                connection,
+                opportunity_id=opportunity_id,
+                opportunity_revision_id=cast(
+                    str, opportunity["opportunity_revision_id"]
+                ),
+                source_message_revision_id=source_message_revision_id,
+                recorded_at=received_at,
+            )
             if cluster_transition is not None:
                 outgoing = _publication_envelope_for_state(
                     outgoing,
@@ -6500,18 +6532,46 @@ class PostgresRoleStore:
                 suppressed_opportunities=suppressed_opportunities,
                 recorded_at=received_at,
             )
+            cluster_outgoings: list[ContractEnvelope] = []
+            cluster_held = False
+            for opportunity in opportunities:
+                candidate_outgoings, candidate_state, _, _ = (
+                    _reconcile_exact_repost_for_opportunity(
+                        connection,
+                        opportunity=opportunity,
+                        incoming=incoming,
+                        recorded_at=received_at,
+                    )
+                )
+                cluster_outgoings.extend(candidate_outgoings)
+                cluster_held = cluster_held or candidate_state == "held_for_review"
+                _insert_moderation_trigger_events(
+                    connection,
+                    opportunity_id=cast(str, opportunity["opportunity_id"]),
+                    opportunity_revision_id=cast(
+                        str, opportunity["opportunity_revision_id"]
+                    ),
+                    source_message_revision_id=cast(
+                        str, opportunity["source_message_revision_id"]
+                    ),
+                    recorded_at=received_at,
+                )
+            if cluster_held:
+                batch_payload = outgoing.payload
+                if not isinstance(batch_payload, dict):
+                    raise TypeError("compound publication payload must be an object")
+                batch_payload = dict(batch_payload)
+                batch_payload["publication_state"] = "held_for_review"
+                batch_payload["publication_reason"] = "moderation_held"
+                outgoing = replace(
+                    outgoing,
+                    payload=cast(JsonValue, batch_payload),
+                )
             _insert_outbox(connection, outgoing)
             for additional_outgoing in additional_outgoings:
                 _insert_outbox(connection, additional_outgoing)
-            for opportunity in opportunities:
-                cluster_outgoings, _, _, _ = _reconcile_exact_repost_for_opportunity(
-                    connection,
-                    opportunity=opportunity,
-                    incoming=incoming,
-                    recorded_at=received_at,
-                )
-                for cluster_outgoing in cluster_outgoings:
-                    _insert_outbox(connection, cluster_outgoing)
+            for cluster_outgoing in cluster_outgoings:
+                _insert_outbox(connection, cluster_outgoing)
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
@@ -6525,59 +6585,397 @@ class PostgresRoleStore:
         """Apply one durable moderation decision to every cluster member."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
-        moderation_state_by_decision = {
-            "approve": "approved",
-            "hold": "held_for_review",
-            "suppress": "suppressed",
-        }
-        moderation_state = moderation_state_by_decision.get(decision)
-        if moderation_state is None:
-            raise ValueError("exact repost moderation decision is invalid")
         with psycopg.connect(self._database_url) as connection:
-            current = connection.execute(
-                """
-                SELECT moderation_state, publication_transition_revision
-                FROM football_runtime.application_exact_repost_clusters
-                WHERE exact_repost_cluster_id = %s
-                FOR UPDATE
-            """,
-                (exact_repost_cluster_id,),
-            ).fetchone()
-            if current is None:
-                raise LookupError(exact_repost_cluster_id)
-            if current[0] == moderation_state:
-                return False
-            causation_seed = uuid5(
-                NAMESPACE_URL,
-                "football-bot:exact-repost-moderation:"
-                f"{exact_repost_cluster_id}:{decision}:{current[1] + 1}",
-            )
-            correlation_id = causation_seed
-            connection.execute(
-                """
-                UPDATE football_runtime.application_exact_repost_clusters
-                SET moderation_state = %s, updated_at = %s
-                WHERE exact_repost_cluster_id = %s
-                """,
-                (moderation_state, recorded_at, exact_repost_cluster_id),
-            )
-            changes, transition_revision = _reconcile_exact_repost_cluster(
+            return _moderate_exact_repost_cluster_in_connection(
                 connection,
                 exact_repost_cluster_id=exact_repost_cluster_id,
-                causation_seed=causation_seed,
-                correlation_id=correlation_id,
+                decision=decision,
                 recorded_at=recorded_at,
             )
-            for cluster_outgoing in _exact_repost_changes_to_outgoings(
-                changes=changes,
-                cluster_id=exact_repost_cluster_id,
-                transition_revision=transition_revision,
-                causation_seed=causation_seed,
-                correlation_id=correlation_id,
-                recorded_at=recorded_at,
+
+    def moderate_opportunity(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        decision: str,
+        telegram_user_id: int,
+        recorded_at: datetime,
+    ) -> bool:
+        """Apply one protected, current-revision moderation decision."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        _moderation_publication_transition(decision)
+        if not isinstance(telegram_user_id, int) or telegram_user_id <= 0:
+            raise ValueError("moderation administrator identity is invalid")
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT opportunity.opportunity_id,
+                       opportunity.opportunity_revision_id,
+                       opportunity.source_message_revision_id,
+                       opportunity.opportunity_type,
+                       opportunity.publication_state,
+                       opportunity.publication_reason,
+                       opportunity.accepted_facts,
+                       opportunity.response_route,
+                       revision.revision,
+                       source.current_revision,
+                       source.tombstoned,
+                       registry.enabled,
+                       registry.initial_consent_attestation,
+                       revision.bounded_metadata
+                FROM football_runtime.application_opportunities AS opportunity
+                JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_revision_id =
+                     opportunity.source_message_revision_id
+                JOIN football_runtime.source_messages AS source
+                  ON source.source_message_id = revision.source_message_id
+                LEFT JOIN football_runtime.source_chat_registry AS registry
+                  ON registry.peer_kind = source.peer_kind
+                 AND registry.telegram_chat_id = source.telegram_chat_id
+                 AND registry.registry_generation = source.registry_generation
+                WHERE opportunity.opportunity_id = %s
+                  AND opportunity.opportunity_revision_id = %s
+                FOR UPDATE OF opportunity, source
+                """,
+                (opportunity_id, opportunity_revision_id),
+            ).fetchone()
+            if row is None:
+                return False
+            if (
+                row[8] != row[9]
+                or row[10]
+                or row[11] is not True
+                or row[12] != "confirmed"
             ):
-                _insert_outbox(connection, cluster_outgoing)
+                return False
+            if decision == "approve" and (
+                row[7] == _UNAVAILABLE_RESPONSE_ROUTE
+                or not isinstance(row[6], Mapping)
+                or not opportunity_freshness_is_current(
+                    row[6],
+                    opportunity_type=row[3],
+                    as_of=recorded_at,
+                )
+            ):
+                return False
+            member = connection.execute(
+                """
+                SELECT exact_repost_cluster_id, source_message_revision_id
+                FROM football_runtime.application_exact_repost_cluster_members
+                WHERE opportunity_id = %s
+                FOR UPDATE
+                """,
+                (opportunity_id,),
+            ).fetchone()
+            if member is not None:
+                if member[1] != row[2]:
+                    return False
+                changed = _moderate_exact_repost_cluster_in_connection(
+                    connection,
+                    exact_repost_cluster_id=member[0],
+                    decision=decision,
+                    recorded_at=recorded_at,
+                    telegram_user_id=telegram_user_id,
+                )
+                return changed
+            _moderation_state, publication_state, publication_reason = (
+                _moderation_publication_transition(decision)
+            )
+            if row[4] == publication_state and row[5] == publication_reason:
+                return False
+            transition_number = connection.execute(
+                """
+                SELECT count(*)::integer
+                FROM football_runtime.application_moderation_events
+                WHERE opportunity_id = %s
+                  AND opportunity_revision_id = %s
+            """,
+                (opportunity_id, opportunity_revision_id),
+            ).fetchone()
+            event_number = (transition_number[0] if transition_number else 0) + 1
+            causation_id = uuid5(
+                NAMESPACE_URL,
+                "football-bot:moderation-opportunity:"
+                f"{opportunity_id}:{opportunity_revision_id}:{event_number}",
+            )
+            connection.execute(
+                """
+                UPDATE football_runtime.application_opportunities
+                SET publication_state = %s, publication_reason = %s
+                WHERE opportunity_id = %s
+                  AND opportunity_revision_id = %s
+                """,
+                (
+                    publication_state,
+                    publication_reason,
+                    opportunity_id,
+                    opportunity_revision_id,
+                ),
+            )
+            _insert_outbox(
+                connection,
+                _moderation_publication_outgoing(
+                    opportunity_id=opportunity_id,
+                    opportunity_revision_id=opportunity_revision_id,
+                    source_message_revision_id=row[2],
+                    opportunity_type=row[3],
+                    accepted_facts=row[6],
+                    response_route=row[7],
+                    publication_state=publication_state,
+                    publication_reason=publication_reason,
+                    causation_id=causation_id,
+                    recorded_at=recorded_at,
+                ),
+            )
+            _insert_moderation_transition_events(
+                connection,
+                opportunity_rows=(
+                    (opportunity_id, opportunity_revision_id, row[2], row[13]),
+                ),
+                exact_repost_cluster_id=None,
+                event_kind=(
+                    "approved"
+                    if decision == "approve"
+                    else "suppressed"
+                    if decision == "suppress"
+                    else "triggered"
+                ),
+                decision=decision,
+                telegram_user_id=telegram_user_id,
+                reason=publication_reason,
+                recorded_at=recorded_at,
+            )
         return True
+
+    def expire_moderation_reviews(self, *, as_of: datetime) -> int:
+        """Suppress unresolved Telegram moderation reviews after 30 days."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            candidates = connection.execute(
+                """
+                SELECT DISTINCT opportunity.opportunity_id,
+                                opportunity.opportunity_revision_id
+                FROM football_runtime.application_opportunities AS opportunity
+                JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_revision_id =
+                     opportunity.source_message_revision_id
+                JOIN football_runtime.source_messages AS source
+                  ON source.source_message_id = revision.source_message_id
+                 AND source.current_revision = revision.revision
+                 AND NOT source.tombstoned
+                JOIN football_runtime.application_moderation_events AS event
+                  ON event.opportunity_id = opportunity.opportunity_id
+                 AND event.opportunity_revision_id =
+                     opportunity.opportunity_revision_id
+                WHERE opportunity.publication_state = 'held_for_review'
+                  AND opportunity.publication_reason = 'moderation_held'
+                  AND event.event_kind = 'triggered'
+                  AND event.trigger IN ('telegram_scam', 'telegram_fake')
+                  AND event.recorded_at + INTERVAL '30 days' <= %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM football_runtime.application_moderation_events AS done
+                      WHERE done.opportunity_id = opportunity.opportunity_id
+                        AND done.opportunity_revision_id =
+                            opportunity.opportunity_revision_id
+                        AND done.event_kind IN (
+                            'approved', 'suppressed', 'review_timeout'
+                        )
+                  )
+                ORDER BY opportunity.opportunity_id
+                """,
+                (as_of,),
+            ).fetchall()
+            expired = 0
+            handled_clusters: set[str] = set()
+            for opportunity_id, opportunity_revision_id in candidates:
+                row = connection.execute(
+                    """
+                    SELECT opportunity.source_message_revision_id,
+                           opportunity.opportunity_type,
+                           opportunity.accepted_facts,
+                           opportunity.response_route,
+                           opportunity.publication_state,
+                           opportunity.publication_reason,
+                           revision.bounded_metadata
+                    FROM football_runtime.application_opportunities AS opportunity
+                    JOIN football_runtime.source_message_revisions AS revision
+                      ON revision.source_message_revision_id =
+                         opportunity.source_message_revision_id
+                    JOIN football_runtime.source_messages AS source
+                      ON source.source_message_id = revision.source_message_id
+                     AND source.current_revision = revision.revision
+                     AND NOT source.tombstoned
+                    WHERE opportunity.opportunity_id = %s
+                      AND opportunity.opportunity_revision_id = %s
+                    FOR UPDATE OF opportunity, source
+                    """,
+                    (opportunity_id, opportunity_revision_id),
+                ).fetchone()
+                if row is None or (
+                    row[4] != "held_for_review" or row[5] != "moderation_held"
+                ):
+                    continue
+                member = connection.execute(
+                    """
+                    SELECT exact_repost_cluster_id
+                    FROM football_runtime.application_exact_repost_cluster_members
+                    WHERE opportunity_id = %s
+                      AND source_message_revision_id = %s
+                    FOR UPDATE
+                    """,
+                    (opportunity_id, row[0]),
+                ).fetchone()
+                if member is not None:
+                    cluster_id = member[0]
+                    if cluster_id in handled_clusters:
+                        continue
+                    cluster = connection.execute(
+                        """
+                        SELECT moderation_state, publication_transition_revision
+                        FROM football_runtime.application_exact_repost_clusters
+                        WHERE exact_repost_cluster_id = %s
+                        FOR UPDATE
+                        """,
+                        (cluster_id,),
+                    ).fetchone()
+                    if cluster is None or cluster[0] != "held_for_review":
+                        continue
+                    connection.execute(
+                        """
+                        UPDATE football_runtime.application_exact_repost_clusters
+                        SET moderation_state = 'suppressed', updated_at = %s
+                        WHERE exact_repost_cluster_id = %s
+                        """,
+                        (as_of, cluster_id),
+                    )
+                    causation_seed = uuid5(
+                        NAMESPACE_URL,
+                        "football-bot:moderation-timeout:"
+                        f"{cluster_id}:{cluster[1] + 1}",
+                    )
+                    changes, transition_revision = _reconcile_exact_repost_cluster(
+                        connection,
+                        exact_repost_cluster_id=cluster_id,
+                        causation_seed=causation_seed,
+                        correlation_id=causation_seed,
+                        recorded_at=as_of,
+                        forced_publication_reason="review_timeout",
+                    )
+                    for outgoing in _exact_repost_changes_to_outgoings(
+                        changes=changes,
+                        cluster_id=cluster_id,
+                        transition_revision=transition_revision,
+                        causation_seed=causation_seed,
+                        correlation_id=causation_seed,
+                        recorded_at=as_of,
+                    ):
+                        _insert_outbox(connection, outgoing)
+                    affected_rows = tuple(
+                        (
+                            value[0],
+                            value[1],
+                            value[2],
+                            value[3],
+                        )
+                        for value in connection.execute(
+                            """
+                            SELECT opportunity.opportunity_id,
+                                   opportunity.opportunity_revision_id,
+                                   opportunity.source_message_revision_id,
+                                   revision.bounded_metadata
+                            FROM football_runtime.
+                                application_exact_repost_cluster_members AS member
+                            JOIN football_runtime.application_opportunities
+                                AS opportunity
+                              ON opportunity.opportunity_id = member.opportunity_id
+                            JOIN football_runtime.source_message_revisions AS revision
+                              ON revision.source_message_revision_id =
+                                 opportunity.source_message_revision_id
+                            WHERE member.exact_repost_cluster_id = %s
+                            ORDER BY opportunity.opportunity_id
+                            """,
+                            (cluster_id,),
+                        ).fetchall()
+                    )
+                    _insert_moderation_transition_events(
+                        connection,
+                        opportunity_rows=affected_rows,
+                        exact_repost_cluster_id=cluster_id,
+                        event_kind="review_timeout",
+                        decision="review_timeout",
+                        telegram_user_id=None,
+                        reason="review_timeout",
+                        recorded_at=as_of,
+                    )
+                    for affected in affected_rows:
+                        _insert_review_timeout_routing_outcome(
+                            connection,
+                            source_message_revision_id=affected[2],
+                            recorded_at=as_of,
+                        )
+                    handled_clusters.add(cluster_id)
+                    expired += 1
+                    continue
+                if not isinstance(row[2], Mapping):
+                    continue
+                causation_id = uuid5(
+                    NAMESPACE_URL,
+                    "football-bot:moderation-timeout:"
+                    f"{opportunity_id}:{opportunity_revision_id}",
+                )
+                connection.execute(
+                    """
+                    UPDATE football_runtime.application_opportunities
+                    SET publication_state = 'suppressed',
+                        publication_reason = 'review_timeout'
+                    WHERE opportunity_id = %s
+                      AND opportunity_revision_id = %s
+                    """,
+                    (opportunity_id, opportunity_revision_id),
+                )
+                _insert_outbox(
+                    connection,
+                    _moderation_publication_outgoing(
+                        opportunity_id=opportunity_id,
+                        opportunity_revision_id=opportunity_revision_id,
+                        source_message_revision_id=row[0],
+                        opportunity_type=row[1],
+                        accepted_facts=row[2],
+                        response_route=row[3],
+                        publication_state="suppressed",
+                        publication_reason="review_timeout",
+                        causation_id=causation_id,
+                        recorded_at=as_of,
+                    ),
+                )
+                _insert_moderation_transition_events(
+                    connection,
+                    opportunity_rows=(
+                        (
+                            opportunity_id,
+                            opportunity_revision_id,
+                            row[0],
+                            row[6],
+                        ),
+                    ),
+                    exact_repost_cluster_id=None,
+                    event_kind="review_timeout",
+                    decision="review_timeout",
+                    telegram_user_id=None,
+                    reason="review_timeout",
+                    recorded_at=as_of,
+                )
+                _insert_review_timeout_routing_outcome(
+                    connection,
+                    source_message_revision_id=row[0],
+                    recorded_at=as_of,
+                )
+                expired += 1
+        return expired
 
     def project_opportunity(
         self,
@@ -10794,6 +11192,7 @@ _EXACT_REPOST_PUBLICATION_REASONS = frozenset(
         "exact_repost_superseded",
         "moderation_held",
         "moderation_suppressed",
+        "review_timeout",
     }
 )
 _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES = frozenset(
@@ -11088,6 +11487,370 @@ def _exact_repost_publication_outgoing(
     )
 
 
+def _moderation_publication_transition(
+    decision: str,
+) -> tuple[str, str, str | None]:
+    """Map one protected operator outcome to durable publication state."""
+    transitions = {
+        "approve": ("approved", "active", None),
+        "hold": ("held_for_review", "held_for_review", "moderation_held"),
+        "suppress": ("suppressed", "suppressed", "moderation_suppressed"),
+    }
+    transition = transitions.get(decision)
+    if transition is None:
+        raise ValueError("moderation decision is invalid")
+    return transition
+
+
+def _opportunity_revision_number(opportunity_revision_id: str) -> int:
+    """Extract the positive revision number used by publication contracts."""
+    revision_text = opportunity_revision_id.rsplit(":revision:", 1)[-1]
+    if not revision_text.isdigit() or int(revision_text) < 1:
+        raise ValueError("opportunity revision is invalid")
+    return int(revision_text)
+
+
+def _moderation_event_id(
+    *,
+    source_message_revision_id: str,
+    opportunity_id: str | None,
+    opportunity_revision_id: str | None,
+    exact_repost_cluster_id: str | None,
+    trigger: str,
+    event_kind: str,
+    event_key: str,
+) -> str:
+    """Derive one stable body-free moderation audit identity."""
+    return str(
+        uuid5(
+            NAMESPACE_URL,
+            "football-bot:moderation-event:"
+            f"{source_message_revision_id}:{opportunity_id or ''}:"
+            f"{opportunity_revision_id or ''}:{exact_repost_cluster_id or ''}:"
+            f"{trigger}:{event_kind}:{event_key}",
+        )
+    )
+
+
+def _insert_moderation_event(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_revision_id: str,
+    opportunity_id: str | None,
+    opportunity_revision_id: str | None,
+    exact_repost_cluster_id: str | None,
+    trigger: str,
+    event_kind: str,
+    telegram_user_id: int | None,
+    reason: str | None,
+    recorded_at: datetime,
+    event_key: str,
+) -> None:
+    """Persist one idempotent moderation event without message content."""
+    event_id = _moderation_event_id(
+        source_message_revision_id=source_message_revision_id,
+        opportunity_id=opportunity_id,
+        opportunity_revision_id=opportunity_revision_id,
+        exact_repost_cluster_id=exact_repost_cluster_id,
+        trigger=trigger,
+        event_kind=event_kind,
+        event_key=event_key,
+    )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.application_moderation_events (
+            moderation_event_id, source_message_revision_id,
+            opportunity_id, opportunity_revision_id, exact_repost_cluster_id,
+            trigger, event_kind, telegram_user_id, reason,
+            recorded_at, expires_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                  %s + INTERVAL '90 days')
+        ON CONFLICT (moderation_event_id) DO NOTHING
+        """,
+        (
+            event_id,
+            source_message_revision_id,
+            opportunity_id,
+            opportunity_revision_id,
+            exact_repost_cluster_id,
+            trigger,
+            event_kind,
+            telegram_user_id,
+            reason,
+            recorded_at,
+            recorded_at,
+        ),
+    )
+
+
+def _source_revision_moderation_triggers(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_revision_id: str,
+) -> tuple[str, ...]:
+    """Read only current bounded Telegram signals for one source revision."""
+    row = connection.execute(
+        """
+        SELECT bounded_metadata
+        FROM football_runtime.source_message_revisions
+        WHERE source_message_revision_id = %s
+        """,
+        (source_message_revision_id,),
+    ).fetchone()
+    metadata = row[0] if row is not None else {}
+    return telegram_moderation_triggers(
+        metadata if isinstance(metadata, Mapping) else {}
+    )
+
+
+def _insert_moderation_trigger_events(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_id: str,
+    opportunity_revision_id: str,
+    source_message_revision_id: str,
+    recorded_at: datetime,
+) -> None:
+    """Record each current Telegram scam/fake trigger for a new Opportunity."""
+    cluster_row = connection.execute(
+        """
+        SELECT exact_repost_cluster_id
+        FROM football_runtime.application_exact_repost_cluster_members
+        WHERE opportunity_id = %s
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    cluster_id = cluster_row[0] if cluster_row is not None else None
+    for trigger in _source_revision_moderation_triggers(
+        connection,
+        source_message_revision_id=source_message_revision_id,
+    ):
+        _insert_moderation_event(
+            connection,
+            source_message_revision_id=source_message_revision_id,
+            opportunity_id=opportunity_id,
+            opportunity_revision_id=opportunity_revision_id,
+            exact_repost_cluster_id=cluster_id,
+            trigger=trigger,
+            event_kind="triggered",
+            telegram_user_id=None,
+            reason=None,
+            recorded_at=recorded_at,
+            event_key="initial-trigger",
+        )
+
+
+def _insert_moderation_transition_events(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_rows: Iterable[tuple[str, str, str, Any]],
+    exact_repost_cluster_id: str | None,
+    event_kind: str,
+    decision: str,
+    telegram_user_id: int | None,
+    reason: str | None,
+    recorded_at: datetime,
+) -> None:
+    """Record one operator or timeout event for each affected Opportunity."""
+    for (
+        opportunity_id,
+        opportunity_revision_id,
+        source_message_revision_id,
+        metadata,
+    ) in opportunity_rows:
+        triggers = telegram_moderation_triggers(
+            metadata if isinstance(metadata, Mapping) else {}
+        )
+        if not triggers:
+            triggers = ("operator",)
+        for trigger in triggers:
+            _insert_moderation_event(
+                connection,
+                source_message_revision_id=source_message_revision_id,
+                opportunity_id=opportunity_id,
+                opportunity_revision_id=opportunity_revision_id,
+                exact_repost_cluster_id=exact_repost_cluster_id,
+                trigger=trigger,
+                event_kind=event_kind,
+                telegram_user_id=telegram_user_id,
+                reason=reason or decision,
+                recorded_at=recorded_at,
+                event_key=f"{decision}:{recorded_at.isoformat()}",
+            )
+
+
+def _insert_review_timeout_routing_outcome(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_revision_id: str,
+    recorded_at: datetime,
+) -> None:
+    """Finalize one timed-out source revision as an unresolved route."""
+    outcome_id = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"football-bot:review-timeout-routing:{source_message_revision_id}",
+        )
+    )
+    connection.execute(
+        """
+        INSERT INTO football_runtime.classification_routing_outcomes (
+            outcome_id, source_message_revision_id, disposition, route,
+            reason_code, pass_number, candidate_count, recorded_at
+        ) VALUES (%s, %s, 'unresolved', 'unresolved', 'review_timeout', 1, 1, %s)
+        ON CONFLICT (source_message_revision_id, pass_number, route) DO NOTHING
+        """,
+        (outcome_id, source_message_revision_id, recorded_at),
+    )
+
+
+def _moderation_publication_outgoing(
+    *,
+    opportunity_id: str,
+    opportunity_revision_id: str,
+    source_message_revision_id: str,
+    opportunity_type: str,
+    accepted_facts: Mapping[str, JsonValue],
+    response_route: Mapping[str, JsonValue],
+    publication_state: str,
+    publication_reason: str | None,
+    causation_id: UUID,
+    recorded_at: datetime,
+) -> ContractEnvelope:
+    """Build one revision-scoped publication handoff from moderation state."""
+    payload: dict[str, JsonValue] = {
+        "opportunity_id": opportunity_id,
+        "opportunity_revision_id": opportunity_revision_id,
+        "source_message_revision_id": source_message_revision_id,
+        "publication_state": publication_state,
+        "opportunity_type": opportunity_type,
+        "accepted_facts": cast(JsonValue, dict(accepted_facts)),
+        "response_route": cast(JsonValue, dict(response_route)),
+    }
+    if publication_reason is not None:
+        payload["publication_reason"] = publication_reason
+    return ContractEnvelope(
+        contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        contract_version=(
+            4 if opportunity_type in {"coach_availability", "coach_request"} else 2
+        ),
+        message_id=derive_contract_message_id(
+            causation_id,
+            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+        ),
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.RECOMMENDATION,
+        subject_id=opportunity_id,
+        subject_revision=_opportunity_revision_number(opportunity_revision_id),
+        idempotency_key=(
+            "opportunity-publication-moderation:"
+            f"{opportunity_revision_id}:{causation_id}"
+        ),
+        causation_id=causation_id,
+        correlation_id=causation_id,
+        recorded_at=recorded_at,
+        payload=payload,
+    )
+
+
+def _moderate_exact_repost_cluster_in_connection(
+    connection: psycopg.Connection[Any],
+    *,
+    exact_repost_cluster_id: str,
+    decision: str,
+    recorded_at: datetime,
+    telegram_user_id: int | None = None,
+) -> bool:
+    """Apply and audit one cluster decision in its caller's transaction."""
+    moderation_state, _publication_state, _publication_reason = (
+        _moderation_publication_transition(decision)
+    )
+    current = connection.execute(
+        """
+        SELECT moderation_state, publication_transition_revision
+        FROM football_runtime.application_exact_repost_clusters
+        WHERE exact_repost_cluster_id = %s
+        FOR UPDATE
+        """,
+        (exact_repost_cluster_id,),
+    ).fetchone()
+    if current is None:
+        raise LookupError(exact_repost_cluster_id)
+    if current[0] == moderation_state:
+        return False
+    causation_seed = uuid5(
+        NAMESPACE_URL,
+        "football-bot:exact-repost-moderation:"
+        f"{exact_repost_cluster_id}:{decision}:{current[1] + 1}",
+    )
+    connection.execute(
+        """
+        UPDATE football_runtime.application_exact_repost_clusters
+        SET moderation_state = %s, updated_at = %s
+        WHERE exact_repost_cluster_id = %s
+        """,
+        (moderation_state, recorded_at, exact_repost_cluster_id),
+    )
+    changes, transition_revision = _reconcile_exact_repost_cluster(
+        connection,
+        exact_repost_cluster_id=exact_repost_cluster_id,
+        causation_seed=causation_seed,
+        correlation_id=causation_seed,
+        recorded_at=recorded_at,
+    )
+    for cluster_outgoing in _exact_repost_changes_to_outgoings(
+        changes=changes,
+        cluster_id=exact_repost_cluster_id,
+        transition_revision=transition_revision,
+        causation_seed=causation_seed,
+        correlation_id=causation_seed,
+        recorded_at=recorded_at,
+    ):
+        _insert_outbox(connection, cluster_outgoing)
+    affected_rows = tuple(
+        (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+        )
+        for row in connection.execute(
+            """
+            SELECT opportunity.opportunity_id,
+                   opportunity.opportunity_revision_id,
+                   opportunity.source_message_revision_id,
+                   revision.bounded_metadata
+            FROM football_runtime.application_exact_repost_cluster_members AS member
+            JOIN football_runtime.application_opportunities AS opportunity
+              ON opportunity.opportunity_id = member.opportunity_id
+            JOIN football_runtime.source_message_revisions AS revision
+              ON revision.source_message_revision_id =
+                 opportunity.source_message_revision_id
+            WHERE member.exact_repost_cluster_id = %s
+            ORDER BY opportunity.opportunity_id
+            """,
+            (exact_repost_cluster_id,),
+        ).fetchall()
+    )
+    _insert_moderation_transition_events(
+        connection,
+        opportunity_rows=affected_rows,
+        exact_repost_cluster_id=exact_repost_cluster_id,
+        event_kind=(
+            "approved"
+            if decision == "approve"
+            else "suppressed"
+            if decision == "suppress"
+            else "triggered"
+        ),
+        decision=decision,
+        telegram_user_id=telegram_user_id,
+        reason=_publication_reason,
+        recorded_at=recorded_at,
+    )
+    return True
+
+
 def _reconcile_exact_repost_cluster(
     connection: psycopg.Connection[Any],
     *,
@@ -11095,6 +11858,7 @@ def _reconcile_exact_repost_cluster(
     causation_seed: UUID,
     correlation_id: UUID,
     recorded_at: datetime,
+    forced_publication_reason: str | None = None,
 ) -> tuple[tuple[dict[str, Any], ...], int]:
     """Select one current representative and persist every member transition."""
     cluster = connection.execute(
@@ -11112,6 +11876,8 @@ def _reconcile_exact_repost_cluster(
     ).fetchone()
     if cluster is None:
         return (), 0
+    if forced_publication_reason not in {None, "review_timeout"}:
+        raise ValueError("exact repost forced publication reason is invalid")
     rows = connection.execute(
         """
         SELECT member.opportunity_id, member.source_message_id,
@@ -11155,6 +11921,7 @@ def _reconcile_exact_repost_cluster(
                 "exact_repost_superseded",
                 "moderation_held",
                 "moderation_suppressed",
+                "review_timeout",
             }
             and _exact_repost_candidate_is_fresh(
                 row[8],
@@ -11201,7 +11968,7 @@ def _reconcile_exact_repost_cluster(
             desired_reason = "moderation_held"
         elif moderation_state == "suppressed":
             desired_state = "suppressed"
-            desired_reason = "moderation_suppressed"
+            desired_reason = forced_publication_reason or "moderation_suppressed"
         elif selected is not None and selected["opportunity_id"] == opportunity_id:
             desired_state = "active"
             desired_reason = None
@@ -11223,6 +11990,7 @@ def _reconcile_exact_repost_cluster(
                 "exact_repost_superseded",
                 "moderation_held",
                 "moderation_suppressed",
+                "review_timeout",
             }
         ):
             desired_state = "suppressed"
@@ -11279,8 +12047,12 @@ def _reconcile_exact_repost_cluster(
                     "publication_reason": desired_reason,
                 }
             )
-    if moderation_state == "held_for_review" and any(not row[14] for row in rows):
-        publication_state = "held_for_review"
+    if moderation_state == "held_for_review":
+        publication_state = (
+            "held_for_review" if any(not row[14] for row in rows) else "suppressed"
+        )
+    elif moderation_state == "suppressed":
+        publication_state = "suppressed"
     elif selected is not None:
         publication_state = "active"
     elif rows and all(
@@ -11490,6 +12262,11 @@ def _reconcile_exact_repost_for_opportunity(
             and (existing_cluster is None or freshness_anchor > existing_cluster[0])
         )
     )
+    moderation_triggered = bool(
+        telegram_moderation_triggers(
+            source[2] if isinstance(source[2], Mapping) else {}
+        )
+    )
     connection.execute(
         """
         INSERT INTO football_runtime.application_exact_repost_clusters (
@@ -11497,7 +12274,7 @@ def _reconcile_exact_repost_for_opportunity(
             source_publisher_id, normalized_body, resolved_event_date,
             opportunity_type, publication_state, moderation_state,
             freshness_renewed_at, created_at, updated_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', 'none', %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s)
         ON CONFLICT (cluster_key) DO UPDATE
         SET freshness_renewed_at = CASE
                 WHEN %s THEN GREATEST(
@@ -11505,6 +12282,14 @@ def _reconcile_exact_repost_for_opportunity(
                     EXCLUDED.freshness_renewed_at
                 )
                 ELSE application_exact_repost_clusters.freshness_renewed_at
+            END,
+            moderation_state = CASE
+                WHEN application_exact_repost_clusters.moderation_state =
+                     'suppressed' THEN 'suppressed'
+                WHEN application_exact_repost_clusters.moderation_state =
+                     'held_for_review' THEN 'held_for_review'
+                WHEN %s THEN 'held_for_review'
+                ELSE application_exact_repost_clusters.moderation_state
             END,
             updated_at = EXCLUDED.updated_at
         """,
@@ -11516,10 +12301,12 @@ def _reconcile_exact_repost_for_opportunity(
             normalized_body,
             cluster_identity,
             opportunity_type,
+            "held_for_review" if moderation_triggered else "none",
             freshness_anchor,
             recorded_at,
             recorded_at,
             renewal_requested,
+            moderation_triggered,
         ),
     )
     connection.execute(
@@ -11553,12 +12340,16 @@ def _reconcile_exact_repost_for_opportunity(
         correlation_id=incoming.correlation_id,
         recorded_at=recorded_at,
     )
-    current_state = "active"
-    current_reason: str | None = None
-    for change in changes:
-        if change["opportunity_id"] == opportunity_id:
-            current_state = change["publication_state"]
-            current_reason = change["publication_reason"]
+    current = connection.execute(
+        """
+        SELECT publication_state, publication_reason
+        FROM football_runtime.application_opportunities
+        WHERE opportunity_id = %s
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    current_state = current[0] if current is not None else "active"
+    current_reason = current[1] if current is not None else None
     outgoings.extend(
         _exact_repost_changes_to_outgoings(
             changes=changes,

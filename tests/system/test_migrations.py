@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_coaching_range() -> None:
     """Keep post-main coaching migrations in the first free numeric range."""
     assert [path.name for path in _migration_paths()][-10:] == [
-        "0032_source_message_lifecycle_hardening.sql",
         "0033_source_message_retention_and_projection_barrier.sql",
         "0034_source_chat_pause_removal_barrier.sql",
         "0035_coaching_opportunities.sql",
@@ -57,6 +56,7 @@ def test_live_main_migrations_precede_the_contiguous_coaching_range() -> None:
         "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
         "0040_coaching_ingestion_role_projection_gate.sql",
         "0041_exact_repost_referee_generic_projection.sql",
+        "0042_moderation_review_events.sql",
     ]
 
 
