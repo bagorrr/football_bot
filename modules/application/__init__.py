@@ -13571,6 +13571,8 @@ class RuntimeApplication:
         """Apply moderation only for the configured Telegram administrator."""
         if self.role is not RuntimeRole.APPLICATION:
             raise RuntimeError("only Application moderates Opportunities")
+        if decision not in {"approve", "suppress"}:
+            return False
         if (
             self.telegram_admin_user_id is None
             or telegram_user_id != self.telegram_admin_user_id
@@ -13593,8 +13595,9 @@ class RuntimeApplication:
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
         if self.role is RuntimeRole.APPLICATION:
-            self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
             self.store.expire_moderation_reviews(as_of=self.clock.now())
+            self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
+            self.store.cleanup_expired_moderation_events(as_of=self.clock.now())
         claimed = self.store.claim_next(
             supported_versions=self.supported_versions,
             claimed_at=self.clock.now(),

@@ -2,7 +2,7 @@
 
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Event, Thread
 
 import psycopg
@@ -1158,6 +1158,59 @@ def test_admin_can_approve_a_non_cluster_opportunity() -> None:
     assert probe.system.recommendation_opportunities()[0].publication_state == "active"
 
 
+def test_moderation_audit_is_retained_until_the_90_day_boundary() -> None:
+    probe = _probe()
+    revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=715,
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunity = probe.system.opportunities()[0]
+    assert probe.system.moderate_opportunity(
+        opportunity_id=opportunity.opportunity_id,
+        opportunity_revision_id=opportunity.opportunity_revision_id,
+        decision="suppress",
+        telegram_user_id=probe.administrator_id,
+    )
+    retained_events = probe.system.moderation_events()
+    assert retained_events
+    retention_boundary = min(event.expires_at for event in retained_events)
+
+    probe.clock.advance_to(retention_boundary - timedelta(microseconds=1))
+    probe.system.process_opportunities_until_idle()
+    assert probe.system.moderation_events() == retained_events
+
+    probe.clock.advance_to(retention_boundary)
+    probe.system.process_opportunities_until_idle()
+    assert probe.system.moderation_events() == ()
+
+
+def test_protected_moderation_rejects_undeclared_decisions_without_side_effects() -> (
+    None
+):
+    probe = _probe()
+    revision, _ = probe.source_event(
+        body=CONTROLLED_LIFECYCLE_BODY,
+        operation_number=1,
+        telegram_message_id=716,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert revision is not None
+    opportunity = probe.system.opportunities()[0]
+    for decision in ("hold", "reject"):
+        assert not probe.system.moderate_opportunity(
+            opportunity_id=opportunity.opportunity_id,
+            opportunity_revision_id=opportunity.opportunity_revision_id,
+            decision=decision,
+            telegram_user_id=probe.administrator_id,
+        )
+    assert probe.system.opportunities()[0] == opportunity
+    assert probe.system.moderation_events() == ()
+
+
 def test_removing_a_telegram_signal_does_not_reactivate_the_revision() -> None:
     probe = _probe({"kind": "edit", "source": CONTROLLED_COSMETIC_EDIT_BODY})
     first_revision, _ = probe.source_event(
@@ -1193,6 +1246,43 @@ def test_removing_a_telegram_signal_does_not_reactivate_the_revision() -> None:
         opportunity_revision
         for opportunity_revision in (f"{current.opportunity_id}:revision:1",)
     }
+
+    triggered_event = next(
+        event
+        for event in probe.system.moderation_events()
+        if event.event_kind == "triggered"
+    )
+    probe.clock.advance_to(triggered_event.recorded_at + timedelta(days=30))
+    assert probe.system.expire_moderation_reviews() == 1
+    assert probe.system.expire_moderation_reviews() == 0
+    while probe.system.process_next_contract_handoff(RuntimeRole.RECOMMENDATION):
+        pass
+
+    timed_out = probe.system.opportunities()[0]
+    assert timed_out.opportunity_id == current.opportunity_id
+    assert timed_out.opportunity_revision_id == current.opportunity_revision_id
+    assert timed_out.publication_state == "suppressed"
+    assert timed_out.publication_reason == "review_timeout"
+    recommendation = next(
+        item
+        for item in probe.system.recommendation_opportunities()
+        if item.opportunity_revision_id == timed_out.opportunity_revision_id
+    )
+    assert recommendation.publication_reason == "review_timeout"
+    assert any(
+        outcome.source_message_revision_id == edited_revision
+        and outcome.disposition == "unresolved"
+        and outcome.route == "unresolved"
+        and outcome.reason_code == "review_timeout"
+        for outcome in probe.system.classification_routing_outcomes()
+    )
+    timeout_events = [
+        event
+        for event in probe.system.moderation_events()
+        if event.event_kind == "review_timeout"
+    ]
+    assert len(timeout_events) == 1
+    assert timeout_events[0].trigger == "telegram_scam"
 
 
 def test_telegram_signal_holds_every_compound_opportunity() -> None:

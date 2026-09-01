@@ -4134,6 +4134,25 @@ class PostgresRoleStore:
             ).fetchone()
         return int(row[0]) if row is not None else 0
 
+    def cleanup_expired_moderation_events(self, *, as_of: datetime) -> int:
+        """Physically delete body-free moderation events after 90 days."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                WITH deleted AS (
+                    DELETE FROM football_runtime.application_moderation_events
+                    WHERE expires_at <= %s
+                    RETURNING moderation_event_id
+                )
+                SELECT count(*)::integer
+                FROM deleted
+                """,
+                (as_of,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def scrub_source_message_contracts(
         self, source_message_id: str, *, recorded_at: datetime
     ) -> None:
@@ -6605,7 +6624,9 @@ class PostgresRoleStore:
         """Apply one protected, current-revision moderation decision."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
-        _moderation_publication_transition(decision)
+        if decision not in {"approve", "suppress"}:
+            return False
+        _moderation_operator_transition(decision)
         if not isinstance(telegram_user_id, int) or telegram_user_id <= 0:
             raise ValueError("moderation administrator identity is invalid")
         with psycopg.connect(self._database_url) as connection:
@@ -6681,7 +6702,7 @@ class PostgresRoleStore:
                 )
                 return changed
             _moderation_state, publication_state, publication_reason = (
-                _moderation_publication_transition(decision)
+                _moderation_operator_transition(decision)
             )
             if row[4] == publication_state and row[5] == publication_reason:
                 return False
@@ -6735,13 +6756,7 @@ class PostgresRoleStore:
                     (opportunity_id, opportunity_revision_id, row[2], row[13]),
                 ),
                 exact_repost_cluster_id=None,
-                event_kind=(
-                    "approved"
-                    if decision == "approve"
-                    else "suppressed"
-                    if decision == "suppress"
-                    else "triggered"
-                ),
+                event_kind=("approved" if decision == "approve" else "suppressed"),
                 decision=decision,
                 telegram_user_id=telegram_user_id,
                 reason=publication_reason,
@@ -6768,8 +6783,6 @@ class PostgresRoleStore:
                  AND NOT source.tombstoned
                 JOIN football_runtime.application_moderation_events AS event
                   ON event.opportunity_id = opportunity.opportunity_id
-                 AND event.opportunity_revision_id =
-                     opportunity.opportunity_revision_id
                 WHERE opportunity.publication_state = 'held_for_review'
                   AND opportunity.publication_reason = 'moderation_held'
                   AND event.event_kind = 'triggered'
@@ -6779,11 +6792,10 @@ class PostgresRoleStore:
                       SELECT 1
                       FROM football_runtime.application_moderation_events AS done
                       WHERE done.opportunity_id = opportunity.opportunity_id
-                        AND done.opportunity_revision_id =
-                            opportunity.opportunity_revision_id
                         AND done.event_kind IN (
                             'approved', 'suppressed', 'review_timeout'
                         )
+                        AND done.recorded_at >= event.recorded_at
                   )
                 ORDER BY opportunity.opportunity_id
                 """,
@@ -11490,7 +11502,7 @@ def _exact_repost_publication_outgoing(
 def _moderation_publication_transition(
     decision: str,
 ) -> tuple[str, str, str | None]:
-    """Map one protected operator outcome to durable publication state."""
+    """Map one application moderation outcome to durable publication state."""
     transitions = {
         "approve": ("approved", "active", None),
         "hold": ("held_for_review", "held_for_review", "moderation_held"),
@@ -11500,6 +11512,15 @@ def _moderation_publication_transition(
     if transition is None:
         raise ValueError("moderation decision is invalid")
     return transition
+
+
+def _moderation_operator_transition(
+    decision: str,
+) -> tuple[str, str, str | None]:
+    """Map the protected operator's closed decision set."""
+    if decision not in {"approve", "suppress"}:
+        raise ValueError("operator moderation decision is invalid")
+    return _moderation_publication_transition(decision)
 
 
 def _opportunity_revision_number(opportunity_revision_id: str) -> int:
@@ -11658,9 +11679,16 @@ def _insert_moderation_transition_events(
         source_message_revision_id,
         metadata,
     ) in opportunity_rows:
-        triggers = telegram_moderation_triggers(
-            metadata if isinstance(metadata, Mapping) else {}
-        )
+        if event_kind == "review_timeout":
+            triggers = _active_moderation_trigger_lineage(
+                connection,
+                opportunity_id=opportunity_id,
+                as_of=recorded_at,
+            )
+        else:
+            triggers = telegram_moderation_triggers(
+                metadata if isinstance(metadata, Mapping) else {}
+            )
         if not triggers:
             triggers = ("operator",)
         for trigger in triggers:
@@ -11677,6 +11705,37 @@ def _insert_moderation_transition_events(
                 recorded_at=recorded_at,
                 event_key=f"{decision}:{recorded_at.isoformat()}",
             )
+
+
+def _active_moderation_trigger_lineage(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_id: str,
+    as_of: datetime,
+) -> tuple[str, ...]:
+    """Read unresolved Telegram trigger lineage across Opportunity revisions."""
+    rows = connection.execute(
+        """
+        SELECT event.trigger
+        FROM football_runtime.application_moderation_events AS event
+        WHERE event.opportunity_id = %s
+          AND event.event_kind = 'triggered'
+          AND event.trigger IN ('telegram_scam', 'telegram_fake')
+          AND event.recorded_at <= %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM football_runtime.application_moderation_events AS done
+              WHERE done.opportunity_id = event.opportunity_id
+                AND done.event_kind IN (
+                    'approved', 'suppressed', 'review_timeout'
+                )
+                AND done.recorded_at >= event.recorded_at
+          )
+        ORDER BY event.recorded_at, event.moderation_event_id
+        """,
+        (opportunity_id, as_of),
+    ).fetchall()
+    return tuple(row[0] for row in rows)
 
 
 def _insert_review_timeout_routing_outcome(

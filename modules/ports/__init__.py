@@ -877,6 +877,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Delete body-free Source Message tombstones past their retention bound."""
         ...
 
+    def cleanup_expired_moderation_events(self, *, as_of: datetime) -> int:
+        """Delete body-free moderation audit events past their retention bound."""
+        ...
+
     def scrub_source_message_contracts(
         self, source_message_id: str, *, recorded_at: datetime
     ) -> None:
