@@ -10,10 +10,28 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    name: quality
+  quality_shards:
+    name: quality / ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: classifier-regression
+            pytest_args: tests/classifier_regression
+          - shard: classification-routing-and-player-match
+            pytest_args: >-
+              tests/system/test_classification_routing_outcomes.py
+              tests/system/test_player_match_availability.py
+          - shard: coaching-system
+            pytest_args: tests/system/test_coaching_search.py
+          - shard: remaining-system-unit
+            pytest_args: >-
+              --ignore=tests/classifier_regression
+              --ignore=tests/system/test_classification_routing_outcomes.py
+              --ignore=tests/system/test_player_match_availability.py
+              --ignore=tests/system/test_coaching_search.py
     services:
       postgres:
         image: postgres:16-alpine
@@ -36,5 +54,26 @@ jobs:
           cache: pip
       - name: Install locked development dependencies
         run: python -m pip install --requirement requirements-dev.txt
-      - name: Run repository quality checks
-        run: ./quality
+      - name: Run repository static quality checks
+        if: ${{ matrix.shard == 'remaining-system-unit' }}
+        run: |
+          python3 -m ruff check .
+          python3 -m ruff format --check .
+          python3 -m mypy
+      - name: Run test shard
+        run: python3 -m pytest ${{ matrix.pytest_args }}
+
+  quality:
+    name: quality
+    if: ${{ always() }}
+    needs: quality_shards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every quality shard to pass
+        env:
+          SHARDS_RESULT: ${{ needs.quality_shards.result }}
+        run: |
+          if [[ "${SHARDS_RESULT}" != "success" ]]; then
+            echo "quality shard result: ${SHARDS_RESULT}"
+            exit 1
+          fi
