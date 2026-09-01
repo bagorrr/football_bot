@@ -1366,6 +1366,83 @@ def test_compound_publication_cannot_bypass_an_existing_cluster_hold() -> None:
     )
 
 
+def test_compound_publication_cannot_bypass_an_existing_cluster_suppression() -> None:
+    compound_body = (
+        f"{CONTROLLED_COMPOUND_BODY}\n"
+        "controlled-case:exact-repost-regression:operation:1"
+    )
+    probe = _probe({"kind": "compound"})
+    first_revision, _ = probe.source_event(
+        body=compound_body,
+        operation_number=1,
+        telegram_message_id=717,
+        source_publisher_id="publisher:one",
+        telegram_scam=True,
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    assert first_revision is not None
+    first_opportunities = probe.system.opportunities()
+    assert len(first_opportunities) == 2
+    first_opportunity = first_opportunities[0]
+    assert probe.system.moderate_opportunity(
+        opportunity_id=first_opportunity.opportunity_id,
+        opportunity_revision_id=first_opportunity.opportunity_revision_id,
+        decision="suppress",
+        telegram_user_id=probe.administrator_id,
+    )
+    probe.system.process_opportunities_until_idle()
+    suppressed_cluster = _cluster(probe)
+    assert suppressed_cluster.moderation_state == "suppressed"
+    assert suppressed_cluster.publication_state == "suppressed"
+    assert all(
+        opportunity.publication_state == "suppressed"
+        and opportunity.publication_reason == "moderation_suppressed"
+        for opportunity in probe.system.opportunities()
+    )
+
+    probe.clock.advance_to(datetime(2026, 8, 18, 9, 7, tzinfo=UTC))
+    second_revision, _ = probe.source_event(
+        body=compound_body,
+        operation_number=2,
+        telegram_message_id=718,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    assert second_revision is not None
+    batch = next(
+        publication
+        for publication in probe.system.opportunity_publication_contracts(
+            second_revision
+        )
+        if publication.contract_version == 3
+    )
+    assert isinstance(batch.payload, dict)
+    assert batch.payload["publication_state"] == "suppressed"
+    assert batch.payload["publication_reason"] == "moderation_suppressed"
+    second_opportunities = [
+        opportunity
+        for opportunity in probe.system.opportunities()
+        if opportunity.source_message_revision_id == second_revision
+    ]
+    assert len(second_opportunities) == 2
+    assert all(
+        opportunity.publication_state == "suppressed"
+        and opportunity.publication_reason == "moderation_suppressed"
+        for opportunity in second_opportunities
+    )
+    second_recommendations = [
+        opportunity
+        for opportunity in probe.system.recommendation_opportunities()
+        if opportunity.source_message_revision_id == second_revision
+    ]
+    assert len(second_recommendations) == 2
+    assert all(
+        opportunity.publication_state == "suppressed"
+        and opportunity.publication_reason == "moderation_suppressed"
+        for opportunity in second_recommendations
+    )
+
+
 def test_unresolved_moderation_review_times_out_as_unresolved() -> None:
     timeout_body = CONTROLLED_LIFECYCLE_BODY.replace("2026-12-01", "2026-08-18")
     probe = _probe({"kind": "repost", "source": timeout_body})

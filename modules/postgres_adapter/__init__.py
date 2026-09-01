@@ -6553,8 +6553,9 @@ class PostgresRoleStore:
             )
             cluster_outgoings: list[ContractEnvelope] = []
             cluster_held = False
+            cluster_suppressed = False
             for opportunity in opportunities:
-                candidate_outgoings, candidate_state, _, _ = (
+                candidate_outgoings, candidate_state, candidate_reason, _ = (
                     _reconcile_exact_repost_for_opportunity(
                         connection,
                         opportunity=opportunity,
@@ -6564,6 +6565,10 @@ class PostgresRoleStore:
                 )
                 cluster_outgoings.extend(candidate_outgoings)
                 cluster_held = cluster_held or candidate_state == "held_for_review"
+                cluster_suppressed = cluster_suppressed or (
+                    candidate_state == "suppressed"
+                    and candidate_reason == "moderation_suppressed"
+                )
                 _insert_moderation_trigger_events(
                     connection,
                     opportunity_id=cast(str, opportunity["opportunity_id"]),
@@ -6575,13 +6580,17 @@ class PostgresRoleStore:
                     ),
                     recorded_at=received_at,
                 )
-            if cluster_held:
+            if cluster_suppressed or cluster_held:
                 batch_payload = outgoing.payload
                 if not isinstance(batch_payload, dict):
                     raise TypeError("compound publication payload must be an object")
                 batch_payload = dict(batch_payload)
-                batch_payload["publication_state"] = "held_for_review"
-                batch_payload["publication_reason"] = "moderation_held"
+                if cluster_suppressed:
+                    batch_payload["publication_state"] = "suppressed"
+                    batch_payload["publication_reason"] = "moderation_suppressed"
+                else:
+                    batch_payload["publication_state"] = "held_for_review"
+                    batch_payload["publication_reason"] = "moderation_held"
                 outgoing = replace(
                     outgoing,
                     payload=cast(JsonValue, batch_payload),
