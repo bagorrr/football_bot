@@ -14,7 +14,7 @@ from modules.testkit import (
     FrozenClock,
     InjectedTelegramDeliveryError,
     OwnershipViolationError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -38,7 +38,7 @@ def telegram_delivery() -> ControlledTelegramDeliveryAdapter:
 def spine(
     telegram_delivery: ControlledTelegramDeliveryAdapter,
 ) -> AcceptanceSpine:
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 4, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -456,7 +456,7 @@ def test_reselecting_the_confirmed_terminal_user_intent_is_a_no_op(
 
 def test_every_bot_user_action_restarts_the_draft_inactivity_window() -> None:
     clock = _AdjustableClock(datetime(2026, 8, 4, 12, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=ControlledTelegramDeliveryAdapter(),
@@ -496,7 +496,7 @@ def test_every_bot_user_action_restarts_the_draft_inactivity_window() -> None:
 def test_thirty_inactive_days_expire_only_the_discovery_draft() -> None:
     clock = _AdjustableClock(datetime(2026, 8, 4, 12, 0, tzinfo=UTC))
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram_delivery,

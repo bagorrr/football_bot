@@ -42,7 +42,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     ControlledTimezoneDataAdapter,
     FrozenClock,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
     semantic_proof_result_for,
 )
 
@@ -61,7 +61,7 @@ def test_untyped_classifier_peer_fails_closed_before_model_and_replay() -> None:
         identity=source_identity,
         transport_boundary="channel-pts:4900",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -201,7 +201,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
             ),
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
@@ -457,7 +457,7 @@ def test_tournament_search_details_are_durable_and_preserve_product_order() -> N
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram_delivery,
@@ -565,7 +565,7 @@ def test_semantically_negated_open_match_has_no_postgres_publication_effect() ->
             ),
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,
@@ -959,7 +959,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         version="controlled-tzdb-v1",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,

@@ -32,6 +32,12 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
+from modules.player_promotion_runtime import (
+    PROMOTION_GATE_EVENT_TIME,
+    DurableAcceptanceProbe,
+    controlled_publication_gate_model,
+    controlled_publication_gate_operation_groups,
+)
 from modules.ports import (
     ClassifierAdapterResult,
     ClassifierAuthenticationError,
@@ -50,7 +56,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     FrozenClock,
     InjectedClassifierCrash,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
     semantic_proof_result_for,
 )
 from tests.system.test_open_match_game_search import (
@@ -58,6 +64,101 @@ from tests.system.test_open_match_game_search import (
     _minimal_classifier_result,
     _register_source_chat,
 )
+
+
+def test_primary_gate_blocks_missing_and_failed_publication_for_all_types() -> None:
+    """All canonical types stay suppressed for missing and failed approval."""
+    database_url = os.environ["TEST_DATABASE_URL"]
+    missing_groups = dict(controlled_publication_gate_operation_groups(state="missing"))
+    failed_groups = dict(controlled_publication_gate_operation_groups(state="failed"))
+    assert missing_groups.keys() == failed_groups.keys()
+    operation_groups = tuple(
+        (artifact_family, group_missing, failed_groups[artifact_family])
+        for artifact_family, group_missing in missing_groups.items()
+    )
+
+    def assert_suppressed(snapshot: dict[str, JsonValue]) -> None:
+        assert snapshot["routing_reasons"] == ["application_validation_failed"]
+        assert snapshot["publication_state"] == "suppressed"
+        assert snapshot["publication_effects"] == 0
+        assert snapshot["opportunity_ids"] == []
+
+    covered_types: set[str] = set()
+    for group_number, (artifact_family, group_missing, group_failed) in enumerate(
+        operation_groups, start=1
+    ):
+        group_operations = group_missing + group_failed
+        probe = DurableAcceptanceProbe(
+            database_url=database_url,
+            execution_id=(
+                f"classification-routing-promotion-gate:{artifact_family}:{group_number}"
+            ),
+            case_id=f"classification-routing-promotion-gate-{artifact_family}",
+            operations=group_operations,
+            model=controlled_publication_gate_model(
+                group_operations,
+                artifact_family=artifact_family,
+            ),
+        )
+        revision_ids: list[str] = []
+        for operation_number, operation in enumerate(group_missing, start=1):
+            source = operation["source"]
+            opportunity_type = operation["opportunity_type"]
+            assert isinstance(source, str)
+            assert isinstance(opportunity_type, str)
+            revision_id, snapshot = probe.source_event(
+                body=source,
+                operation_number=operation_number,
+                event_time=PROMOTION_GATE_EVENT_TIME,
+                process=True,
+            )
+            assert isinstance(revision_id, str)
+            revision_ids.append(revision_id)
+            covered_types.add(opportunity_type)
+            assert_suppressed(snapshot)
+            proposals = probe.system.classification_proposals_for_revision(revision_id)
+            assert proposals
+            assert isinstance(proposals[-1].payload, dict)
+        assert not probe.system.opportunities()
+
+        probe.system.record_player_classifier_promotion()
+        approval = probe.system.player_classifier_promotion()
+        assert approval is not None
+        approval_contract = probe.system.classifier_promotion_contract()
+        assert isinstance(approval_contract.payload, dict)
+        assert approval_contract.payload.get("state") == "approved"
+        probe.system.invalidate_contract_payload(
+            message_id=approval_contract.message_id,
+            payload_updates={"state": "failed"},
+        )
+        assert probe.system.player_classifier_promotion() is None
+
+        for operation_number, operation in enumerate(
+            group_failed, start=len(group_missing) + 1
+        ):
+            source = operation["source"]
+            opportunity_type = operation["opportunity_type"]
+            assert isinstance(source, str)
+            assert isinstance(opportunity_type, str)
+            revision_id, snapshot = probe.source_event(
+                body=source,
+                operation_number=operation_number,
+                event_time=PROMOTION_GATE_EVENT_TIME,
+                process=True,
+            )
+            assert isinstance(revision_id, str)
+            revision_ids.append(revision_id)
+            covered_types.add(opportunity_type)
+            assert_suppressed(snapshot)
+        assert not probe.system.opportunities()
+        assert all(
+            probe.system.opportunity_publication_contracts(revision_id) == ()
+            for revision_id in revision_ids
+        )
+
+    from modules.classifier_promotion import CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES
+
+    assert covered_types == set(CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES)
 
 
 @dataclass(slots=True)
@@ -260,7 +361,7 @@ def test_irrelevant_classifier_outcome_is_durable_and_unpublished() -> None:
     )
     body = "Weather announcement, not a football opportunity"
     classifier.return_for(body=body, result=_irrelevant_classifier_result())
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -346,7 +447,7 @@ def test_stale_classification_proposal_cannot_publish_after_newer_edit(
         else _legacy_v1_accepted_result(body=body)
     )
     classifier.return_for(body=body, result=accepted)
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -473,7 +574,7 @@ def test_schema_invalid_primary_retries_as_owned_queue_attempts_without_proposal
             output_tokens=20,
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -2059,7 +2160,7 @@ def test_primary_effective_provenance_is_retryable_before_any_classification(
         output_tokens=20,
     )
     classifier.return_for(body=body, result=invalid_result)
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -2635,7 +2736,7 @@ def test_adjacent_second_pass_uses_only_application_selected_bounded_context() -
                 output_tokens=20,
             ),
         )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -2844,7 +2945,7 @@ def test_deterministic_ambiguity_runs_once_then_publishes_with_separate_proof(
             body=body,
             result=replace(valid_proof, effective_model="wrong-model"),
         )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -3178,7 +3279,7 @@ def test_v4_missing_ambiguity_provenance_routes_before_publication() -> None:
         body=body,
         result=semantic_proof_result_for(output=accepted_output, body=body),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -3392,7 +3493,7 @@ def test_independent_compound_candidates_publish_as_one_explicit_batch() -> None
                 body=body,
             ),
         )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -3925,7 +4026,7 @@ def test_source_edit_and_delete_immediately_suppress_all_prior_projections() -> 
             body=body,
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -4233,7 +4334,7 @@ def test_response_route_loss_suppresses_contact_and_recovers_on_later_edit() -> 
             body=initial_body,
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -4443,7 +4544,7 @@ def test_competing_interpretations_stay_on_one_unresolved_candidate() -> None:
             output_tokens=20,
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -4540,7 +4641,7 @@ def test_second_pass_is_bounded_by_context_and_cannot_recurse() -> None:
         body=body_recursive,
         result=second_pass_request(required_context="refined_prompt"),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -4650,7 +4751,7 @@ def test_prompt_injection_routes_to_unpublished_review_without_body_telemetry() 
             output_tokens=20,
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram,
@@ -5169,7 +5270,7 @@ def _stage_v2_source_delivery(
         transport_boundary=f"channel-pts:{checkpoint}",
     )
     controlled_clock = clock or FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=controlled_clock,
         telegram_ingestion=telegram,

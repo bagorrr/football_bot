@@ -31,7 +31,7 @@ from modules.testkit import (
     InjectedTelegramDeliveryError,
     InjectedTelegramDeliveryInterruptionError,
     OwnershipViolationError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -44,7 +44,7 @@ def telegram_delivery() -> ControlledTelegramDeliveryAdapter:
 def spine(
     telegram_delivery: ControlledTelegramDeliveryAdapter,
 ) -> AcceptanceSpine:
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -431,7 +431,7 @@ class _AdjustableClock:
 def test_post_effect_interruption_reconciles_one_stable_presentation() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram_delivery,
@@ -470,7 +470,7 @@ def test_post_effect_interruption_reconciles_one_stable_presentation() -> None:
 
 def test_lost_send_confirmation_reconciles_without_an_external_replay() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -508,7 +508,7 @@ class _UnreconcilableTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
 def test_unknown_delivery_without_reconciliation_stops_blind_resend() -> None:
     telegram_delivery = _UnreconcilableTelegramDeliveryAdapter()
     clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram_delivery,
@@ -557,7 +557,7 @@ class _UnclassifiedPostEffectFailureAdapter(_UnreconcilableTelegramDeliveryAdapt
 
 def test_unclassified_send_failure_defaults_to_unknown_without_resend() -> None:
     telegram_delivery = _UnclassifiedPostEffectFailureAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -590,7 +590,7 @@ def test_unclassified_send_failure_defaults_to_unknown_without_resend() -> None:
 def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram_delivery,
@@ -626,7 +626,7 @@ def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
 
 def test_current_screen_precedes_superseded_reconciliation() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -736,7 +736,7 @@ def test_migration_recovers_a_legacy_claim_as_outcome_unknown(
         )
 
     PostgresAcceptanceMigrator(fresh_database_url).migrate()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=fresh_database_url,
         clock=clock,
         telegram_delivery=telegram_delivery,
@@ -749,7 +749,7 @@ def test_migration_recovers_a_legacy_claim_as_outcome_unknown(
 
 def test_competing_dispatchers_claim_one_pending_language_presentation() -> None:
     telegram_delivery = _ConcurrentTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -785,7 +785,7 @@ def test_competing_dispatchers_claim_one_pending_language_presentation() -> None
 
 def test_superseded_inflight_presentation_records_success_without_activation() -> None:
     telegram_delivery = _BlockingTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -978,7 +978,7 @@ class _UntrustedFixedLanguageAdapter:
 
 def test_application_forces_reviewed_copy_for_free_text_fixed_language() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1026,7 +1026,7 @@ class _UnknownLocaleAdapter(_UntrustedFixedLanguageAdapter):
 
 def test_application_rejects_an_unowned_free_text_locale() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1081,7 +1081,7 @@ def test_application_accepts_recognized_free_text_language_catalog_entries(
     language_name: str,
 ) -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1137,7 +1137,7 @@ class _CountingRenderLanguageAdapter(_RecognizedFreeTextLocaleAdapter):
 def test_replayed_start_does_not_repeat_free_text_language_rendering() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     language_adapter = _CountingRenderLanguageAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1181,7 +1181,7 @@ def test_replayed_start_does_not_repeat_free_text_language_rendering() -> None:
 def test_replayed_ambiguous_update_does_not_repeat_semantic_interpretation() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     language_adapter = _CountingAmbiguousLanguageAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,
@@ -1247,7 +1247,7 @@ def test_stale_language_callback_preserves_state_and_reconstructs_current_view(
 
 def test_competing_language_callbacks_preserve_the_winning_current_view() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram_delivery,

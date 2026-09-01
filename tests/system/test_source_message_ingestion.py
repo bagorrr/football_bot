@@ -38,7 +38,7 @@ from modules.testkit import (
     FrozenClock,
     InjectedFailureError,
     OwnershipViolationError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -131,7 +131,7 @@ def test_account_difference_commits_checkpoint_event_and_application_effect() ->
         identity=identity,
         transport_boundary="chat-sequence:460",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -217,7 +217,7 @@ def test_account_difference_discards_pre_boundary_create_without_retaining_body(
         identity=identity,
         transport_boundary="chat-sequence:460",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -294,7 +294,7 @@ def test_ineligible_account_event_advances_body_free_and_does_not_wedge_restart(
         identity=eligible_identity,
         transport_boundary="chat-sequence:461",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -389,7 +389,7 @@ def test_generation_replacement_serializes_before_account_ingestion_commit() -> 
         identity=identity,
         transport_boundary="chat-sequence:900",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -526,7 +526,7 @@ def test_account_and_channel_differences_advance_independently() -> None:
         identity=channel_identity,
         transport_boundary="channel-pts:8100",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -647,7 +647,7 @@ def test_reregistered_generation_has_distinct_classification_identity_and_replay
                 output_tokens=2,
             ),
         )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -762,7 +762,7 @@ def test_cross_route_replay_is_idempotent_and_divergence_fails_closed() -> None:
         identity=identity,
         transport_boundary="channel-pts:8200",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -852,7 +852,7 @@ def test_ordinary_eligible_event_becomes_one_authoritative_source_message() -> N
         identity=identity,
         transport_boundary="channel-pts:4700",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -926,7 +926,7 @@ def test_protected_event_is_body_free_and_future_permitted_event_resumes() -> No
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1070,7 +1070,7 @@ def test_source_event_recorded_v4_semantic_incompatibility_fails_closed(
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1124,7 +1124,7 @@ def test_source_event_recorded_v4_semantic_incompatibility_fails_closed(
 
 
 def test_source_stream_stopped_v1_unknown_scope_fails_closed() -> None:
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 14, 9, 20, tzinfo=UTC)),
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -1163,7 +1163,7 @@ def test_replayed_protected_event_is_idempotent_and_permitted_events_resume() ->
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1246,7 +1246,7 @@ def test_protected_lifecycle_events_each_have_a_body_free_durable_outcome() -> N
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1351,7 +1351,7 @@ def test_permitted_edit_after_protected_create_enters_application_lifecycle() ->
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1449,7 +1449,7 @@ def test_permitted_delete_after_protected_create_enters_application_lifecycle() 
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1556,7 +1556,7 @@ def test_persistent_protection_failure_stops_only_the_affected_stream() -> None:
         identity=identity,
         transport_boundary="channel-pts:4810",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1716,7 +1716,7 @@ def test_account_route_protection_failure_never_advances_shared_checkpoint() -> 
         identity=identity,
         transport_boundary="chat-sequence:481",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1784,7 +1784,7 @@ def test_account_route_protection_failure_never_advances_shared_checkpoint() -> 
 def test_missing_account_checkpoint_stops_only_the_account_stream() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     clock = FrozenClock(datetime(2026, 8, 14, 11, 0, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1836,7 +1836,7 @@ def test_concurrent_duplicate_account_stream_stops_keep_the_first_observation() 
         reason="access_lost",
     )
     telethon.pause_account_difference_results()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1921,7 +1921,7 @@ def test_account_stream_stop_wins_before_eligible_event_commit() -> None:
         ),
     )
     telethon.pause_account_difference_results()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2003,7 +2003,7 @@ def test_account_stream_stop_wins_before_ineligible_event_discard() -> None:
         ),
     )
     telethon.pause_account_difference_results()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2055,7 +2055,7 @@ def test_account_route_gap_failure_stops_with_a_durable_body_free_outcome(
         checkpoint=checkpoint,
         reason=failure_reason,
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2102,7 +2102,7 @@ def test_missing_channel_checkpoint_stops_without_replay_or_backfill() -> None:
         identity=identity,
         transport_boundary="channel-pts:4815",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2176,7 +2176,7 @@ def test_corrupt_channel_checkpoint_stops_its_source_stream() -> None:
         identity=identity,
         transport_boundary="channel-pts:corrupt",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2242,7 +2242,7 @@ def test_access_loss_stops_only_the_affected_source_stream() -> None:
         identity=continuing_identity,
         transport_boundary="channel-pts:4830",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2336,7 +2336,7 @@ def test_concurrent_duplicate_source_stream_stops_keep_the_first_observation() -
         identity=identity,
         transport_boundary="channel-pts:4835",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2412,7 +2412,7 @@ def test_unrecoverable_difference_and_gap_stop_their_source_streams() -> None:
         identity=gap_identity,
         transport_boundary="channel-pts:4850",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2515,7 +2515,7 @@ def test_session_revocation_stops_the_whole_ingestion_role() -> None:
         identity=identity,
         transport_boundary="channel-pts:4860",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2593,7 +2593,7 @@ def test_account_poll_authentication_loss_stops_the_whole_ingestion_role() -> No
         seq=487,
         date=clock.now(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2635,7 +2635,7 @@ def test_concurrent_duplicate_ingestion_role_stops_keep_the_first_observation() 
         seq=487,
         date=clock.now(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2694,7 +2694,7 @@ def test_transport_proven_post_boundary_event_ignores_earlier_event_time_on_retr
         identity=identity,
         transport_boundary="channel-pts:4800",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2768,7 +2768,7 @@ def test_pre_boundary_message_edit_advances_without_retaining_content() -> None:
         identity=identity,
         transport_boundary="channel-pts:4810",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2829,7 +2829,7 @@ def test_irrelevant_event_is_recorded_without_content_pre_screening() -> None:
         identity=identity,
         transport_boundary="channel-pts:4710",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2899,7 +2899,7 @@ def test_edit_transport_event_replaces_the_authoritative_current_revision() -> N
         identity=identity,
         transport_boundary="channel-pts:4720",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2992,7 +2992,7 @@ def test_leased_older_revision_is_preserved_without_regressing_current_state() -
         identity=identity,
         transport_boundary="channel-pts:4820",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3085,7 +3085,7 @@ def test_out_of_order_delete_does_not_tombstone_a_newer_revision() -> None:
         identity=identity,
         transport_boundary="channel-pts:4830",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3208,7 +3208,7 @@ def test_delivered_deletion_transport_event_creates_a_body_free_tombstone() -> N
         identity=identity,
         transport_boundary="channel-pts:4730",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3292,7 +3292,7 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
         identity=identity,
         transport_boundary="channel-pts:4750",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3588,7 +3588,7 @@ def test_first_seen_post_boundary_edit_or_delete_is_recorded_before_checkpoint(
         identity=identity,
         transport_boundary=f"channel-pts:{boundary}",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3710,7 +3710,7 @@ def test_post_model_classification_interruption_releases_source_lifecycle_lock(
         identity=identity,
         transport_boundary=f"channel-pts:{boundary}",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3801,7 +3801,7 @@ def test_duplicate_transport_delivery_creates_no_duplicate_revision_effect() -> 
         identity=identity,
         transport_boundary="channel-pts:4740",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3885,7 +3885,7 @@ def test_database_failure_rolls_back_event_outbox_and_checkpoint_for_retry() -> 
         identity=identity,
         transport_boundary="channel-pts:4750",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3958,7 +3958,7 @@ def test_application_restart_and_outbox_replay_preserve_one_message_effect() -> 
         identity=identity,
         transport_boundary="channel-pts:4760",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -4026,7 +4026,7 @@ def test_live_callback_only_wakes_and_restart_recovers_the_difference() -> None:
         identity=identity,
         transport_boundary="channel-pts:4770",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -4103,7 +4103,7 @@ def test_unsupported_source_event_version_stays_recoverable_and_alerts() -> None
         identity=identity,
         transport_boundary="channel-pts:4780",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -4171,7 +4171,7 @@ def test_source_ingestion_and_message_state_enforce_role_and_rls_boundaries() ->
         identity=identity,
         transport_boundary="channel-pts:4790",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,

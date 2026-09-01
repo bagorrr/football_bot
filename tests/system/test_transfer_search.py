@@ -28,7 +28,7 @@ from modules.testkit import (
     ControlledTelegramDeliveryAdapter,
     ControlledTelegramIngestionAdapter,
     FrozenClock,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 from tests.system.test_open_match_game_search import (
     _minimal_classifier_result,
@@ -184,7 +184,7 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         text="on Petrogradskaya",
         resolution=_transfer_location_resolution(),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telegram_ingestion,

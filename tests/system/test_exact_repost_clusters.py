@@ -32,6 +32,10 @@ def _probe(
         execution_id="exact-repost-regression",
         case_id="exact-repost-regression",
         operations=tuple(operations) or ({"kind": "repost"},),
+        # This versioned fixture predates the shared promotion gate; keep its
+        # compatibility behavior explicit while the promotion worker probes
+        # the fail-closed public boundary separately.
+        require_classifier_promotion=False,
     )
 
 

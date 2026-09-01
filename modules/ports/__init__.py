@@ -961,6 +961,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Run and record an Application-owned classifier promotion attestation."""
         ...
 
+    def check_classifier_publication_gate(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity_type: str,
+    ) -> None:
+        """Check one Application publication type without committing effects."""
+        ...
+
     def proposition_opportunity_ids(
         self, source_message_id: str
     ) -> tuple[tuple[int, str], ...]:
@@ -1217,6 +1226,13 @@ class AcceptanceObserver(Protocol):
 
     def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover one durable envelope."""
+        ...
+
+    def classifier_promotion_contract(
+        self,
+        release_name: str,
+    ) -> RawContractEnvelope:
+        """Observe one durable classifier-promotion approval envelope."""
         ...
 
     def source_messages(self) -> tuple[SourceMessage, ...]:

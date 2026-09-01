@@ -2327,6 +2327,28 @@ class AcceptanceSpine:
             release_name=PLAYER_CLASSIFIER_RELEASE_NAME
         )
 
+    def record_classifier_promotion(
+        self,
+        *,
+        release_fingerprint: str | None = None,
+        state: str = "approved",
+    ) -> None:
+        """Run and record the reviewed classifier promotion gate."""
+        self.record_player_classifier_promotion(
+            release_fingerprint=release_fingerprint,
+            state=state,
+        )
+
+    def classifier_promotion(self) -> dict[str, JsonValue] | None:
+        """Observe shared classifier promotion evidence through Application."""
+        return self.player_classifier_promotion()
+
+    def classifier_promotion_contract(self) -> RawContractEnvelope:
+        """Observe the shared approval envelope through the admin testkit seam."""
+        return self._observer.classifier_promotion_contract(
+            PLAYER_CLASSIFIER_RELEASE_NAME
+        )
+
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()
@@ -4120,6 +4142,7 @@ def boot_acceptance_spine(
     *,
     admin_database_url: str,
     clock: Clock,
+    require_classifier_promotion: bool = True,
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
@@ -4129,7 +4152,13 @@ def boot_acceptance_spine(
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
 ) -> AcceptanceSpine:
-    """Provision the administrative test seam and boot each role separately."""
+    """Provision the administrative test seam and boot each role separately.
+
+    The primary acceptance composition defaults to the fail-closed classifier
+    promotion requirement.  Historical controlled fixtures that intentionally
+    exercise pre-promotion behavior must use the explicitly named legacy
+    compatibility helper below.
+    """
     from apps.system_acceptance import boot_acceptance_role
     from modules.postgres_adapter import (
         PostgresAcceptanceMigrator,
@@ -4172,6 +4201,7 @@ def boot_acceptance_spine(
             role=role,
             database_url=role_urls[role],
             promotion_gate_database_url=admin_database_url,
+            require_classifier_promotion=require_classifier_promotion,
             clock=clock,
             telegram_ingestion=(
                 controlled_ingestion if role is RuntimeRole.INGESTION else None
@@ -4213,6 +4243,35 @@ def boot_acceptance_spine(
         restart_role=restart_role,
         clock=clock,
         admin_database_url=admin_database_url,
+    )
+
+
+def boot_legacy_acceptance_spine(
+    *,
+    admin_database_url: str,
+    clock: Clock,
+    telegram_ingestion: TelegramIngestionAdapter | None = None,
+    telegram_delivery: TelegramDeliveryAdapter | None = None,
+    model: ModelAdapter | None = None,
+    location_resolver: LocationResolverAdapter | None = None,
+    conversation_language: ConversationLanguageAdapter | None = None,
+    date_interpretation: DateInterpretationAdapter | None = None,
+    timezone_data: TimezoneDataAdapter | None = None,
+    telegram_admin_user_id: int | None = None,
+) -> AcceptanceSpine:
+    """Boot a named legacy fixture with its compatibility opt-out enabled."""
+    return boot_acceptance_spine(
+        admin_database_url=admin_database_url,
+        clock=clock,
+        require_classifier_promotion=False,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=telegram_delivery,
+        model=model,
+        location_resolver=location_resolver,
+        conversation_language=conversation_language,
+        date_interpretation=date_interpretation,
+        timezone_data=timezone_data,
+        telegram_admin_user_id=telegram_admin_user_id,
     )
 
 

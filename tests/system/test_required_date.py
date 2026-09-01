@@ -24,7 +24,7 @@ from modules.testkit import (
     ControlledTelegramDeliveryAdapter,
     ControlledTimezoneDataAdapter,
     FrozenClock,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 from modules.timezone_data_adapter import InstalledTimezoneDataAdapter
 
@@ -46,7 +46,7 @@ def test_relative_date_uses_the_confirmed_city_local_calendar() -> None:
     )
     timezone_data = InstalledTimezoneDataAdapter()
     real_timezone_data_version = timezone_data.resolve("Europe/Moscow").version
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
         telegram_delivery=telegram,
@@ -107,7 +107,7 @@ def test_timezone_data_version_comes_from_the_package_fallback_with_the_zone() -
         version="fallback-source-version",
         timezones=("Europe/Moscow",),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
         date_interpretation=dates,
@@ -155,7 +155,7 @@ def test_mismatched_timezone_data_fails_without_temporal_persistence() -> None:
         returned_timezone="UTC",
         version="mismatched-source-version",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
         date_interpretation=dates,
@@ -198,7 +198,7 @@ def test_unverifiable_timezone_data_fails_without_temporal_persistence(
     timezone_data = ControlledTimezoneDataAdapter()
     timezone_data.fail_for(iana_timezone="Europe/Moscow", failure=failure)
     telegram = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC)),
         telegram_delivery=telegram,
@@ -267,7 +267,7 @@ def test_confirming_a_different_city_invalidates_only_dependent_required_date() 
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         date_interpretation=dates,
@@ -349,7 +349,7 @@ def test_confirming_a_different_country_invalidates_required_date() -> None:
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         date_interpretation=dates,
@@ -401,7 +401,7 @@ def test_confirming_a_different_terminal_intent_clears_required_date() -> None:
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         date_interpretation=dates,
@@ -494,7 +494,7 @@ def test_unaccepted_date_outcomes_preserve_the_confirmed_date_and_stage(
             resolution=DateInterpretationResolution(interpretations=proposals),
         )
     telegram = ControlledTelegramDeliveryAdapter()
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         telegram_delivery=telegram,
@@ -532,7 +532,7 @@ def test_search_area_only_replacement_preserves_required_date() -> None:
             )
         ),
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         date_interpretation=dates,
@@ -577,7 +577,7 @@ def test_back_restart_stale_and_replayed_input_preserve_concrete_date() -> None:
                 )
             ),
         )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
         date_interpretation=dates,
@@ -635,7 +635,7 @@ def test_clock_advancement_across_restart_does_not_roll_relative_date_forward() 
         ),
     )
     clock = FrozenClock(datetime(2026, 8, 8, 21, 30, tzinfo=UTC))
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         date_interpretation=dates,
@@ -688,7 +688,7 @@ def test_clock_advancement_across_restart_does_not_roll_relative_date_forward() 
 def test_only_the_six_date_required_user_intents_enter_required_date(
     intent: str, branch: str | None, expected_stage: str
 ) -> None:
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC)),
     )

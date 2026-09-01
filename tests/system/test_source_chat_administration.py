@@ -33,7 +33,7 @@ from modules.testkit import (
     FrozenClock,
     InjectedFailureError,
     InjectedTelegramDeliveryError,
-    boot_acceptance_spine,
+    boot_legacy_acceptance_spine,
 )
 
 
@@ -42,7 +42,7 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
     clock = FrozenClock(datetime(2026, 8, 9, 12, 0, tzinfo=UTC))
     administrator_id = 46_001
     ordinary_user_id = 46_002
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram,
@@ -119,7 +119,7 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
         (("Back", f"administration:back:{telegram.messages[-1].screen_revision}"),),
     )
 
-    rotated_system = boot_acceptance_spine(
+    rotated_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram,
@@ -155,7 +155,7 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
         identity=identity,
         transport_boundary="channel-pts:7301",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -247,7 +247,7 @@ def test_malformed_public_addresses_return_localized_format_guidance_without_wor
     telethon = ControlledTelegramIngestionAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 15, tzinfo=UTC))
     administrator_id = 46_102
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -340,7 +340,7 @@ def test_unknown_registry_command_fact_is_rejected_and_recovers_its_originator()
         identity=identity,
         transport_boundary="channel-pts:7410",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -420,7 +420,7 @@ def test_schema_invalid_registry_commands_release_only_their_durable_originator(
     telegram = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 22, tzinfo=UTC))
     administrator_id = 46_128
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -539,7 +539,7 @@ def test_identity_tampered_registry_command_recovers_only_its_durable_originator
     clock = FrozenClock(datetime(2026, 8, 9, 13, 25, tzinfo=UTC))
     administrator_id = 46_125
     substituted_user_id = 46_126
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -654,7 +654,7 @@ def test_malformed_resolved_addresses_are_rejected_before_registry_persistence()
         transport_boundary="channel-pts:7421",
         current_address="https://t.me/+ ",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -743,7 +743,7 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
         identity=identity,
         transport_boundary="channel-pts:8402",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -896,7 +896,7 @@ def test_generation_two_admission_failure_preserves_the_request_revision() -> No
         transport_boundary="channel-pts:7431",
         current_address="@!",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1031,7 +1031,7 @@ def test_delayed_equal_and_lower_generations_are_terminal_noops() -> None:
         identity=identity,
         transport_boundary="channel-pts:7504",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1167,7 +1167,7 @@ def test_registration_revalidates_the_current_administrator_before_mutation() ->
         identity=identity,
         transport_boundary="channel-pts:7501",
     )
-    submitted_system = boot_acceptance_spine(
+    submitted_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1223,7 +1223,7 @@ def test_registration_revalidates_the_current_administrator_before_mutation() ->
     )
     message_count_before_rotation = len(telegram.messages)
 
-    rotated_system = boot_acceptance_spine(
+    rotated_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1261,7 +1261,7 @@ def test_registration_success_revalidates_administrator_before_bot_delivery() ->
         identity=identity,
         transport_boundary="channel-pts:7551",
     )
-    submitted_system = boot_acceptance_spine(
+    submitted_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1318,7 +1318,7 @@ def test_registration_success_revalidates_administrator_before_bot_delivery() ->
     committed_registry = submitted_system.source_chats()
     message_count_before_rotation = len(telegram.messages)
 
-    rotated_system = boot_acceptance_spine(
+    rotated_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1361,7 +1361,7 @@ def test_queued_success_revalidates_administrator_at_actual_delivery() -> None:
         identity=identity,
         transport_boundary="channel-pts:7552",
     )
-    submitted_system = boot_acceptance_spine(
+    submitted_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1419,7 +1419,7 @@ def test_queued_success_revalidates_administrator_at_actual_delivery() -> None:
     committed_registry = submitted_system.source_chats()
     message_count_before_rotation = len(telegram.messages)
 
-    rotated_system = boot_acceptance_spine(
+    rotated_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1450,7 +1450,7 @@ def test_queued_settings_revalidates_administrator_at_actual_delivery() -> None:
     clock = FrozenClock(datetime(2026, 8, 9, 13, 47, 45, tzinfo=UTC))
     former_administrator_id = 46_124
     current_administrator_id = 46_125
-    submitted_system = boot_acceptance_spine(
+    submitted_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram,
@@ -1484,7 +1484,7 @@ def test_queued_settings_revalidates_administrator_at_actual_delivery() -> None:
             action="settings",
         )
 
-    rotated_system = boot_acceptance_spine(
+    rotated_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_delivery=telegram,
@@ -1519,7 +1519,7 @@ def test_malformed_admission_request_releases_the_correlated_pending_user() -> N
     telegram = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 48, tzinfo=UTC))
     administrator_id = 46_110
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -1619,7 +1619,7 @@ def test_unsupported_admission_request_version_releases_the_durable_origin_once(
         identity=supported_identity,
         transport_boundary="channel-pts:7459",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1768,7 +1768,7 @@ def test_admission_request_rejects_substituted_tuple_and_releases_origin() -> No
         ),
         transport_boundary="channel-pts:7460",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -1937,7 +1937,7 @@ def test_mis_correlated_admission_failure_releases_the_application_requester() -
     telegram = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 49, tzinfo=UTC))
     administrator_id = 46_111
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -2018,7 +2018,7 @@ def test_unknown_admission_failure_fact_is_rejected_without_pending_poison() -> 
     telegram = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 49, 30, tzinfo=UTC))
     administrator_id = 46_112
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -2096,7 +2096,7 @@ def test_unknown_bot_failure_fact_releases_the_originating_pending_state() -> No
     telegram = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 49, 45, tzinfo=UTC))
     administrator_id = 46_113
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -2175,7 +2175,7 @@ def test_forged_bot_failure_request_id_is_rejected_for_the_durable_origin() -> N
     telegram = ControlledTelegramDeliveryAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 49, 47, tzinfo=UTC))
     administrator_id = 46_118
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=ControlledTelegramIngestionAdapter(),
@@ -2266,7 +2266,7 @@ def test_unknown_bot_success_fact_releases_the_originating_pending_state() -> No
         identity=identity,
         transport_boundary="channel-pts:7614",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2356,7 +2356,7 @@ def test_forged_success_target_releases_only_the_durable_originator() -> None:
         identity=identity,
         transport_boundary="channel-pts:7615",
     )
-    original_system = boot_acceptance_spine(
+    original_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2413,7 +2413,7 @@ def test_forged_success_target_releases_only_the_durable_originator() -> None:
     assert original_system.process_next_source_chat_registration()
     committed_registry = original_system.source_chats()
 
-    current_system = boot_acceptance_spine(
+    current_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2568,7 +2568,7 @@ def test_cross_request_success_is_rejected_for_its_actual_durable_origin() -> No
             address=address,
         )
 
-    original_system = boot_acceptance_spine(
+    original_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2602,7 +2602,7 @@ def test_cross_request_success_is_rejected_for_its_actual_durable_origin() -> No
         pass
     committed_registry = original_system.source_chats()
 
-    current_system = boot_acceptance_spine(
+    current_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2704,7 +2704,7 @@ def test_forged_admission_causation_releases_the_durable_request_without_commit(
         ),
         transport_boundary="channel-pts:7617",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2806,7 +2806,7 @@ def test_malformed_source_chat_admission_fails_closed_and_releases_pending_user(
             identity=candidate_identity,
             transport_boundary=f"channel-pts:{7602 + index}",
         )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -2938,7 +2938,7 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         ),
         transport_boundary="channel-pts:7701",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3081,7 +3081,7 @@ def test_private_invite_registration_uses_existing_account_access_without_joinin
         identity=identity,
         transport_boundary="chat-sequence:8102",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3174,7 +3174,7 @@ def test_new_address_for_the_same_identity_changes_only_the_protected_address() 
         identity=identity,
         transport_boundary="channel-pts:9999",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3284,7 +3284,7 @@ def test_failed_registration_preserves_the_previous_registry_state() -> None:
         identity=identity,
         transport_boundary="channel-pts:10304",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,
@@ -3381,7 +3381,7 @@ def test_atomic_publish_failure_rolls_back_the_registry_mutation() -> None:
         identity=identity,
         transport_boundary="channel-pts:11506",
     )
-    system = boot_acceptance_spine(
+    system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
         clock=clock,
         telegram_ingestion=telethon,

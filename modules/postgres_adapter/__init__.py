@@ -21,6 +21,7 @@ from psycopg.rows import dict_row
 from modules.classifier_promotion import (
     PLAYER_CLASSIFIER_RELEASE_NAME,
     canonical_replay_digest,
+    classifier_promotion_is_approved,
     describe_player_classifier_release,
     player_classifier_promotion_evidence,
     player_classifier_promotion_is_approved,
@@ -816,6 +817,38 @@ class PostgresAcceptanceObserver:
             row,
             validate_registered=(row["inbox_status"] != "rejected_invalid_contract"),
         )
+
+    def classifier_promotion_contract(
+        self,
+        release_name: str,
+    ) -> RawContractEnvelope:
+        """Observe one serialized classifier-promotion approval envelope."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT contract_outbox.*
+                FROM football_runtime.contract_outbox
+                WHERE contract_outbox.contract_name = %s
+                  AND contract_outbox.contract_version = 1
+                  AND contract_outbox.producer_role = %s
+                  AND contract_outbox.consumer_role IS NULL
+                  AND contract_outbox.subject_id = %s
+                ORDER BY contract_outbox.recorded_at DESC,
+                         contract_outbox.message_id DESC
+                LIMIT 1
+                """,
+                (
+                    ContractName.CLASSIFIER_RELEASE_PROMOTION_APPROVED.value,
+                    RuntimeRole.APPLICATION.value,
+                    release_name,
+                ),
+            ).fetchone()
+        if row is None:
+            raise LookupError(release_name)
+        return _row_to_envelope(row, validate_registered=False)
 
     def source_messages(self) -> tuple[SourceMessage, ...]:
         """Observe authoritative Source Messages without exposing table layout."""
@@ -2410,10 +2443,12 @@ class PostgresRoleStore:
         database_url: str,
         *,
         promotion_gate_database_url: str | None = None,
+        require_classifier_promotion: bool = True,
     ) -> None:
         self._role = role
         self._database_url = database_url
         self._promotion_gate_database_url = promotion_gate_database_url
+        self._require_classifier_promotion = require_classifier_promotion
         self._search_snapshot_hook: Callable[[], None] | None = None
         self._classification_admission_context: Any | None = None
         self._classification_admission_connection: psycopg.Connection[Any] | None = None
@@ -2423,6 +2458,11 @@ class PostgresRoleStore:
     def role(self) -> RuntimeRole:
         """Return the sole owner represented by this store."""
         return self._role
+
+    @property
+    def require_classifier_promotion(self) -> bool:
+        """Return whether every classifier publication needs promotion evidence."""
+        return self._require_classifier_promotion
 
     def commit_initial(
         self,
@@ -5826,28 +5866,47 @@ class PostgresRoleStore:
                 ),
             )
 
-    def _ensure_player_publication_approval(
+    def _ensure_classifier_publication_approval(
         self,
         *,
         incoming: ContractEnvelope,
         opportunities: Iterable[dict[str, JsonValue]],
     ) -> None:
-        """Keep the persistence boundary fail-closed for Player publications."""
-        if not any(
+        """Keep the Application publication boundary fail-closed for all types."""
+        opportunity_values = tuple(opportunities)
+        if not opportunity_values:
+            return
+        if not getattr(self, "_require_classifier_promotion", True) and not any(
             opportunity.get("opportunity_type") == "player_match_availability"
-            for opportunity in opportunities
+            for opportunity in opportunity_values
         ):
             return
         proposal = incoming.payload
-        if not isinstance(
-            proposal, dict
-        ) or not player_classifier_promotion_is_approved(
+        if not isinstance(proposal, dict) or not classifier_promotion_is_approved(
             self.classifier_release_promotion(
                 release_name=PLAYER_CLASSIFIER_RELEASE_NAME,
             ),
             proposal=proposal,
+            contract_envelope_version=getattr(incoming, "contract_version", None),
         ):
-            raise ValueError("unapproved Player classifier release cannot publish")
+            raise ValueError("unapproved classifier release cannot publish")
+
+    # Preserve the established private seam used by Player promotion tests.
+    _ensure_player_publication_approval = _ensure_classifier_publication_approval
+
+    def check_classifier_publication_gate(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        opportunity_type: str,
+    ) -> None:
+        """Check one Application publication type without committing effects."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        self._ensure_classifier_publication_approval(
+            incoming=incoming,
+            opportunities=({"opportunity_type": opportunity_type},),
+        )
 
     def proposition_opportunity_ids(
         self, source_message_id: str
