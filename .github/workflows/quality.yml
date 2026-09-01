@@ -26,17 +26,34 @@ jobs:
               tests/system/test_player_match_availability.py
           - shard: coaching-system
             pytest_args: tests/system/test_coaching_search.py
-          - shard: remaining-system-unit
+          - shard: unit-static
+            pytest_args: tests/unit
+          - shard: remaining-system-1
             pytest_args: >-
-              --ignore=tests/classifier_regression
-              --ignore=tests/system/test_classification_routing_outcomes.py
-              --ignore=tests/system/test_player_match_availability.py
-              --ignore=tests/system/test_coaching_search.py
+              tests/system/test_acceptance_spine.py
+              tests/system/test_discovery_draft.py
+              tests/system/test_migrations.py
+              tests/system/test_opponent_search.py
+              tests/system/test_required_date.py
+              tests/system/test_transfer_search.py
+          - shard: remaining-system-2
+            pytest_args: >-
+              tests/system/test_conversation_language.py
+              tests/system/test_exact_repost_clusters.py
+              tests/system/test_main_menu_settings.py
+              tests/system/test_open_match_game_search.py
+              tests/system/test_refereeing_opportunities.py
+              tests/system/test_search_area.py
+              tests/system/test_source_chat_administration.py
+              tests/system/test_source_message_ingestion.py
+              tests/system/test_zero_result_search.py
     services:
       postgres:
         image: postgres:16-alpine
         env:
+          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
@@ -54,8 +71,27 @@ jobs:
           cache: pip
       - name: Install locked development dependencies
         run: python -m pip install --requirement requirements-dev.txt
+      - name: Verify disposable PostgreSQL role
+        run: |
+          python3 - <<'PY'
+          import os
+
+          import psycopg
+
+          with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+              with connection.cursor() as cursor:
+                  cursor.execute("SELECT current_user, current_database()")
+                  current_user, current_database = cursor.fetchone()
+
+          if (current_user, current_database) != ("postgres", "postgres"):
+              raise SystemExit(
+                  "unexpected PostgreSQL identity: "
+                  f"{current_user}@{current_database}"
+              )
+
+          print("connected as postgres to database postgres")
       - name: Run repository static quality checks
-        if: ${{ matrix.shard == 'remaining-system-unit' }}
+        if: ${{ matrix.shard == 'unit-static' }}
         run: |
           python3 -m ruff check .
           python3 -m ruff format --check .
