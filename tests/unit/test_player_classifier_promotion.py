@@ -179,15 +179,17 @@ def test_classifier_publication_methods_fail_closed_without_promotion(
         )
 
 
-def test_shared_promotion_approval_binds_all_trusted_artifact_versions(
+def test_shared_promotion_approval_binds_exact_evaluated_artifact_descriptor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Promotion evidence cannot be replayed for an unknown artifact tuple."""
+    """Promotion evidence binds to the exact descriptor evaluated for release."""
     monkeypatch.setattr(
         classifier_promotion,
         "player_classifier_promotion_is_approved",
         lambda approval: True,
     )
+    release = describe_player_classifier_release()
+    assert release.evaluated_artifact_descriptor == PLAYER_MATCH_AVAILABILITY_DESCRIPTOR
     descriptors = (
         OPEN_MATCH_V1_DESCRIPTOR,
         OPEN_MATCH_V2_DESCRIPTOR,
@@ -214,7 +216,7 @@ def test_shared_promotion_approval_binds_all_trusted_artifact_versions(
             {},
             proposal=proposal,
             contract_envelope_version=descriptor.contract_envelope_version,
-        )
+        ) is (descriptor == PLAYER_MATCH_AVAILABILITY_DESCRIPTOR)
 
         proposal["routing_policy_version"] = "classifier-routing-tampered-v1"
         assert not classifier_promotion.classifier_promotion_is_approved(

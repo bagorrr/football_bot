@@ -2349,33 +2349,6 @@ class AcceptanceSpine:
             PLAYER_CLASSIFIER_RELEASE_NAME
         )
 
-    def assert_classifier_publication_gate_for_types(
-        self,
-        *,
-        proposal: RawContractEnvelope,
-        opportunity_types: tuple[str, ...],
-    ) -> None:
-        """Assert the Application gate rejects each supplied canonical type."""
-        incoming = ContractEnvelope.from_raw(proposal)
-        application = self._roles[RuntimeRole.APPLICATION]
-        for opportunity_type in opportunity_types:
-            try:
-                application.store.check_classifier_publication_gate(
-                    incoming=incoming,
-                    opportunity_type=opportunity_type,
-                )
-            except ValueError as error:
-                if str(error) != "unapproved classifier release cannot publish":
-                    raise RuntimeError(
-                        "classifier promotion gate raised an unexpected error "
-                        f"for {opportunity_type}"
-                    ) from error
-            else:
-                raise RuntimeError(
-                    "classifier promotion gate accepted publication for "
-                    f"{opportunity_type}"
-                )
-
     def opportunities(self) -> tuple[Opportunity, ...]:
         """Observe Application-authoritative accepted Opportunities."""
         return self._observer.opportunities()

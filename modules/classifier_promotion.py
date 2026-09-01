@@ -23,7 +23,11 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg import conninfo, sql
 
-from modules.classifier_contract import classifier_artifact_descriptor_for_provenance
+from modules.classifier_contract import (
+    PLAYER_MATCH_AVAILABILITY_DESCRIPTOR,
+    ClassifierArtifactDescriptor,
+    classifier_artifact_descriptor_for_provenance,
+)
 from modules.contracts import JsonValue
 
 PLAYER_CLASSIFIER_RELEASE_NAME = "player-match-evaluation-v1"
@@ -241,6 +245,7 @@ class PlayerClassifierRelease:
     release_name: str
     contract_version: str
     release_fingerprint: str
+    evaluated_artifact_descriptor: ClassifierArtifactDescriptor
     contract_sha256: str
     reviewed_corpus_path: str
     reviewed_corpus_version: str
@@ -626,6 +631,16 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
     }
     if required_artifacts != expected_artifacts:
         raise ValueError("Player release artifact pins are not exact")
+    evaluated_artifact_descriptor = classifier_artifact_descriptor_for_provenance(
+        prompt_version=cast(str, required_artifacts["primary_prompt_version"]),
+        schema_version=cast(str, required_artifacts["primary_schema_version"]),
+        routing_policy_version=cast(str, required_artifacts["routing_policy_version"]),
+        contract_envelope_version=(
+            PLAYER_MATCH_AVAILABILITY_DESCRIPTOR.contract_envelope_version
+        ),
+    )
+    if evaluated_artifact_descriptor != PLAYER_MATCH_AVAILABILITY_DESCRIPTOR:
+        raise ValueError("Player release evaluated descriptor is not exact")
 
     promotion_gate = _json_object(
         contract.get("promotion_gate"), description="promotion_gate"
@@ -863,6 +878,7 @@ def describe_player_classifier_release() -> PlayerClassifierRelease:
         release_name=PLAYER_CLASSIFIER_RELEASE_NAME,
         contract_version=contract_version,
         release_fingerprint=fingerprint,
+        evaluated_artifact_descriptor=evaluated_artifact_descriptor,
         contract_sha256=contract_digest,
         reviewed_corpus_path=corpus_path,
         reviewed_corpus_version=corpus_version,
@@ -1796,9 +1812,9 @@ def classifier_promotion_is_approved(
     """Validate shared promotion evidence and the proposal's trusted artifact.
 
     The reviewed contract is shared by every canonical Opportunity Type.  The
-    proposal still has to bind itself to one of the immutable classifier
-    descriptors shipped by the application, so approval cannot be replayed for
-    an unknown prompt, schema, routing policy, model, or reasoning setting.
+    proposal must bind itself to the exact immutable descriptor evaluated by
+    that release, so approval cannot be replayed for another shipped artifact,
+    prompt, schema, routing policy, model, or reasoning setting.
     """
     if not player_classifier_promotion_is_approved(approval):
         return False
@@ -1829,12 +1845,10 @@ def classifier_promotion_is_approved(
         for value in (prompt_version, schema_version, routing_policy_version)
     ):
         return False
-    return (
-        classifier_artifact_descriptor_for_provenance(
-            prompt_version=cast(str, prompt_version),
-            schema_version=cast(str, schema_version),
-            routing_policy_version=cast(str, routing_policy_version),
-            contract_envelope_version=contract_envelope_version,
-        )
-        is not None
+    proposal_descriptor = classifier_artifact_descriptor_for_provenance(
+        prompt_version=cast(str, prompt_version),
+        schema_version=cast(str, schema_version),
+        routing_policy_version=cast(str, routing_policy_version),
+        contract_envelope_version=contract_envelope_version,
     )
+    return proposal_descriptor == release.evaluated_artifact_descriptor

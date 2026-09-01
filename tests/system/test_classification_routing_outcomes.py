@@ -33,9 +33,10 @@ from modules.domain import (
     TelegramPeerKind,
 )
 from modules.player_promotion_runtime import (
-    CONTROLLED_LIFECYCLE_BODY,
     PROMOTION_GATE_EVENT_TIME,
     DurableAcceptanceProbe,
+    controlled_publication_gate_model,
+    controlled_publication_gate_operation_groups,
 )
 from modules.ports import (
     ClassifierAdapterResult,
@@ -65,25 +66,15 @@ from tests.system.test_open_match_game_search import (
 )
 
 
-def test_primary_gate_blocks_missing_and_failed_non_player_publication() -> None:
-    """Real PostgreSQL/Application publication stays suppressed without approval."""
+def test_primary_gate_blocks_missing_and_failed_publication_for_all_types() -> None:
+    """All canonical types stay suppressed for missing and failed approval."""
     database_url = os.environ["TEST_DATABASE_URL"]
-    probe = DurableAcceptanceProbe(
-        database_url=database_url,
-        execution_id="classification-routing-promotion-gate",
-        case_id="classification-routing-promotion-gate",
-        operations=(
-            {
-                "kind": "promotion_gate",
-                "opportunity_type": "open_match",
-                "source": CONTROLLED_LIFECYCLE_BODY,
-            },
-            {
-                "kind": "promotion_gate",
-                "opportunity_type": "open_match",
-                "source": CONTROLLED_LIFECYCLE_BODY,
-            },
-        ),
+    missing_groups = dict(controlled_publication_gate_operation_groups(state="missing"))
+    failed_groups = dict(controlled_publication_gate_operation_groups(state="failed"))
+    assert missing_groups.keys() == failed_groups.keys()
+    operation_groups = tuple(
+        (artifact_family, group_missing, failed_groups[artifact_family])
+        for artifact_family, group_missing in missing_groups.items()
     )
 
     def assert_suppressed(snapshot: dict[str, JsonValue]) -> None:
@@ -92,43 +83,82 @@ def test_primary_gate_blocks_missing_and_failed_non_player_publication() -> None
         assert snapshot["publication_effects"] == 0
         assert snapshot["opportunity_ids"] == []
 
-    missing_revision_id, missing_snapshot = probe.source_event(
-        body=CONTROLLED_LIFECYCLE_BODY,
-        operation_number=1,
-        event_time=PROMOTION_GATE_EVENT_TIME,
-        process=True,
-    )
-    assert isinstance(missing_revision_id, str)
-    assert_suppressed(missing_snapshot)
-    missing_proposals = probe.system.classification_proposals_for_revision(
-        missing_revision_id
-    )
-    assert missing_proposals
-    assert isinstance(missing_proposals[-1].payload, dict)
+    covered_types: set[str] = set()
+    for group_number, (artifact_family, group_missing, group_failed) in enumerate(
+        operation_groups, start=1
+    ):
+        group_operations = group_missing + group_failed
+        probe = DurableAcceptanceProbe(
+            database_url=database_url,
+            execution_id=(
+                f"classification-routing-promotion-gate:{artifact_family}:{group_number}"
+            ),
+            case_id=f"classification-routing-promotion-gate-{artifact_family}",
+            operations=group_operations,
+            model=controlled_publication_gate_model(
+                group_operations,
+                artifact_family=artifact_family,
+            ),
+        )
+        revision_ids: list[str] = []
+        for operation_number, operation in enumerate(group_missing, start=1):
+            source = operation["source"]
+            opportunity_type = operation["opportunity_type"]
+            assert isinstance(source, str)
+            assert isinstance(opportunity_type, str)
+            revision_id, snapshot = probe.source_event(
+                body=source,
+                operation_number=operation_number,
+                event_time=PROMOTION_GATE_EVENT_TIME,
+                process=True,
+            )
+            assert isinstance(revision_id, str)
+            revision_ids.append(revision_id)
+            covered_types.add(opportunity_type)
+            assert_suppressed(snapshot)
+            proposals = probe.system.classification_proposals_for_revision(revision_id)
+            assert proposals
+            assert isinstance(proposals[-1].payload, dict)
+        assert not probe.system.opportunities()
 
-    probe.system.record_player_classifier_promotion()
-    approval = probe.system.player_classifier_promotion()
-    assert approval is not None
-    approval_contract = probe.system.classifier_promotion_contract()
-    assert isinstance(approval_contract.payload, dict)
-    assert approval_contract.payload.get("state") == "approved"
-    probe.system.invalidate_contract_payload(
-        message_id=approval_contract.message_id,
-        payload_updates={"state": "failed"},
-    )
-    assert probe.system.player_classifier_promotion() is None
+        probe.system.record_player_classifier_promotion()
+        approval = probe.system.player_classifier_promotion()
+        assert approval is not None
+        approval_contract = probe.system.classifier_promotion_contract()
+        assert isinstance(approval_contract.payload, dict)
+        assert approval_contract.payload.get("state") == "approved"
+        probe.system.invalidate_contract_payload(
+            message_id=approval_contract.message_id,
+            payload_updates={"state": "failed"},
+        )
+        assert probe.system.player_classifier_promotion() is None
 
-    failed_revision_id, failed_snapshot = probe.source_event(
-        body=CONTROLLED_LIFECYCLE_BODY,
-        operation_number=2,
-        event_time=PROMOTION_GATE_EVENT_TIME,
-        process=True,
-    )
-    assert isinstance(failed_revision_id, str)
-    assert_suppressed(failed_snapshot)
-    assert not probe.system.opportunities()
-    assert probe.system.opportunity_publication_contracts(missing_revision_id) == ()
-    assert probe.system.opportunity_publication_contracts(failed_revision_id) == ()
+        for operation_number, operation in enumerate(
+            group_failed, start=len(group_missing) + 1
+        ):
+            source = operation["source"]
+            opportunity_type = operation["opportunity_type"]
+            assert isinstance(source, str)
+            assert isinstance(opportunity_type, str)
+            revision_id, snapshot = probe.source_event(
+                body=source,
+                operation_number=operation_number,
+                event_time=PROMOTION_GATE_EVENT_TIME,
+                process=True,
+            )
+            assert isinstance(revision_id, str)
+            revision_ids.append(revision_id)
+            covered_types.add(opportunity_type)
+            assert_suppressed(snapshot)
+        assert not probe.system.opportunities()
+        assert all(
+            probe.system.opportunity_publication_contracts(revision_id) == ()
+            for revision_id in revision_ids
+        )
+
+    from modules.classifier_promotion import CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES
+
+    assert covered_types == set(CLASSIFIER_PUBLICATION_OPPORTUNITY_TYPES)
 
 
 @dataclass(slots=True)
