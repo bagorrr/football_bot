@@ -1,3 +1,14 @@
+<!-- verification-scope-policy:v1 -->
+## Verification scope
+
+- If an existing test already reproduces the problem or verifies the changed behavior, do not add or expand tests.
+- Otherwise, add the smallest necessary check to the nearest existing test.
+- Create a new test only for a distinct uncovered behavior or failure mode.
+- Do not test unchanged behavior, speculative cases, implementation details, or coverage for its own sake.
+- Do not repeat a passing check without a relevant change.
+- Run the full local suite only for broad, high-risk, or cross-cutting changes, when focused checks cannot adequately bound the risk, or when explicitly required.
+- Before merging, run all required CI checks on the exact revision GitHub will merge.
+
 ## Agent skills
 
 ### Issue tracker
