@@ -6752,6 +6752,11 @@ class PostgresRoleStore:
             source_message_id = _source_message_id_for_lifecycle(
                 source_message_revision_id
             )
+            if _is_complete_source_chat_revision(source_message_revision_id):
+                _lock_source_chat_peer(
+                    connection,
+                    source_message_id=source_message_id,
+                )
             if _source_message_lifecycle_deleted(
                 connection,
                 source_message_id=source_message_id,
@@ -6956,9 +6961,18 @@ class PostgresRoleStore:
                 raise ValueError(
                     "compound publication requires one Source Message lineage"
                 )
+            source_message_id = next(iter(source_message_ids))
+            first_source_message_revision_id = cast(
+                tuple[str, ...], source_message_revision_ids
+            )[0]
+            if _is_complete_source_chat_revision(first_source_message_revision_id):
+                _lock_source_chat_peer(
+                    connection,
+                    source_message_id=source_message_id,
+                )
             source_deleted = _source_message_lifecycle_deleted(
                 connection,
-                source_message_id=next(iter(source_message_ids)),
+                source_message_id=source_message_id,
             )
             if source_deleted:
                 _release_claim(connection, incoming.message_id)
@@ -13960,6 +13974,23 @@ def _lock_source_message_lifecycle(
     connection.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
         (f"source-message-lifecycle:{source_message_id}",),
+    )
+
+
+def _lock_source_chat_peer(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+) -> None:
+    """Serialize Source Chat publication with lifecycle transitions."""
+    source_chat_peer_key, separator, _generation_suffix = source_message_id.partition(
+        ":generation:"
+    )
+    if not separator or not source_chat_peer_key.startswith("source-chat:"):
+        raise ValueError("Source Message identity has no Source Chat peer")
+    connection.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+        (source_chat_peer_key,),
     )
 
 

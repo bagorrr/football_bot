@@ -4352,6 +4352,194 @@ def test_source_event_racing_with_lifecycle_commit_is_not_retained_or_queued(
     system.reset()
 
 
+@pytest.mark.parametrize("lifecycle_action", ("pause", "remove"))
+def test_publication_racing_with_lifecycle_commit_is_not_retained_or_queued(
+    lifecycle_action: str,
+) -> None:
+    """Serialize Opportunity publication with a committed lifecycle stop."""
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    registered_at = datetime(2026, 9, 21, 9, 0, tzinfo=UTC)
+    lifecycle_at = registered_at + timedelta(minutes=5)
+    administrator_id = 46_505
+    telegram_chat_id = 4_650_007 if lifecycle_action == "pause" else 4_650_008
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=telegram_chat_id,
+    )
+    address = f"@pubrace_{lifecycle_action[0]}_{telegram_chat_id}"
+    body = (
+        "Football match on 22 September 2026 in whole city. Need one player. "
+        "Contact @publication_race_contact"
+    )
+    classifier.return_for(
+        body=body,
+        result=_accepted_open_match_result(
+            candidate_key=f"publication-race-{lifecycle_action}",
+            body=body,
+            contact="@publication_race_contact",
+        ),
+    )
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:7200",
+    )
+    clock = FrozenClock(datetime(2026, 8, 21, 9, 0, tzinfo=UTC))
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="in whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    whole_city=True,
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("ru", "Санкт-Петербург"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezone_data,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat_for_lifecycle(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        registered_at=registered_at,
+        address=address,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    clock.advance_to(registered_at + timedelta(minutes=1))
+    telegram_message_id = 7201
+    revision_id = (
+        f"source-chat:channel:{identity.telegram_id}:generation:1:"
+        f"message:{telegram_message_id}:revision:1"
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=7200),
+        to_checkpoint=TelegramChannelCheckpoint(pts=7201),
+        source_event_id=f"source-event:publication-race:{lifecycle_action}",
+        telegram_message_id=telegram_message_id,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=datetime(2026, 9, 21, 9, 1, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    clock.advance_to(lifecycle_at + timedelta(seconds=1))
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"publication-race-request:{lifecycle_action}",
+        telegram_user_id=administrator_id,
+        action=lifecycle_action,
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"publication-race-confirm:{lifecycle_action}",
+        telegram_user_id=administrator_id,
+        action=lifecycle_action,
+        confirm=True,
+    )
+
+    database_url = os.environ["TEST_DATABASE_URL"]
+    peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+    with (
+        ThreadPoolExecutor(max_workers=2) as executor,
+        psycopg.connect(database_url) as registry_gate,
+    ):
+        assert registry_gate.execute(
+            """
+            SELECT 1
+            FROM football_runtime.source_chat_registry
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = 1
+            FOR UPDATE
+            """,
+            (identity.kind.value, identity.telegram_id),
+        ).fetchone() == (1,)
+        lifecycle = executor.submit(system.process_next_source_chat_change_request)
+        _wait_until_advisory_lock_is_held(database_url, peer_key)
+        assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
+        assert len(system.classification_proposals_for_revision(revision_id)) == 1
+        publication = executor.submit(
+            system.process_next_contract_handoff,
+            RuntimeRole.APPLICATION,
+        )
+        _wait_for_blocked_database_sessions(database_url, minimum=2)
+
+        registry_gate.commit()
+        assert lifecycle.result(timeout=5)
+        assert publication.result(timeout=5)
+
+    expected_state = (
+        SourceChatLifecycleState.PAUSED
+        if lifecycle_action == "pause"
+        else SourceChatLifecycleState.REMOVED
+    )
+    assert system.source_chats()[0].lifecycle_state is expected_state
+    assert all(
+        opportunity.source_message_revision_id != revision_id
+        for opportunity in system.opportunities()
+    )
+    assert all(
+        opportunity.source_message_revision_id != revision_id
+        for opportunity in system.recommendation_opportunities()
+    )
+    assert system.opportunity_publication_contracts(revision_id) == ()
+    system.reset()
+
+
 def _accepted_open_match_result(
     *,
     candidate_key: str,
