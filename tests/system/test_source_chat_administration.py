@@ -4110,6 +4110,7 @@ def test_pause_cancels_unfinished_work_suppresses_routes_and_discards_gap() -> N
     )
     assert system.process_next_source_chat_change_request()
     assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.ENABLED
+    assert system.process_next_source_chat_bot_result()
     assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
@@ -4164,6 +4165,63 @@ def test_pause_cancels_unfinished_work_suppresses_routes_and_discards_gap() -> N
     )
     assert post_opportunity.publication_state == "active"
     assert post_opportunity.response_route.value == "@post_pause_contact"
+
+    second_pause_at = datetime(2026, 9, 21, 9, 13, tzinfo=UTC)
+    clock.advance_to(second_pause_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause-request:second-cycle",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause-confirm:second-cycle",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.PAUSED
+    assert system.process_next_contract_handoff(RuntimeRole.RECOMMENDATION)
+    expected_revision_ids = {active_revision_id, post_revision_id}
+    for projection in (
+        system.opportunities(),
+        system.recommendation_opportunities(),
+    ):
+        lifecycle_opportunities = tuple(
+            opportunity
+            for opportunity in projection
+            if opportunity.source_message_revision_id in expected_revision_ids
+        )
+        assert {
+            opportunity.source_message_revision_id
+            for opportunity in lifecycle_opportunities
+        } == expected_revision_ids
+        for opportunity in lifecycle_opportunities:
+            assert opportunity.publication_state == "suppressed"
+            assert opportunity.response_route.kind == "unavailable"
+            assert opportunity.response_route.value == ""
+            assert opportunity.publication_reason == "source_chat_paused"
+    assert (
+        sum(
+            contract.payload.get("publication_reason") == "source_chat_paused"
+            for contract in system.opportunity_publication_contracts(active_revision_id)
+            if isinstance(contract.payload, dict)
+        )
+        == 1
+    )
+    assert (
+        sum(
+            contract.payload.get("publication_reason") == "source_chat_paused"
+            for contract in system.opportunity_publication_contracts(post_revision_id)
+            if isinstance(contract.payload, dict)
+        )
+        == 1
+    )
+    assert system.process_next_source_chat_bot_result()
 
     remove_at = datetime(2026, 9, 21, 9, 15, tzinfo=UTC)
     clock.advance_to(remove_at)

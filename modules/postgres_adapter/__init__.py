@@ -13894,7 +13894,10 @@ def _suppress_source_chat_opportunities(
             """,
             (reason, opportunity_id),
         )
-        if reason == "source_deleted":
+        if reason == "source_deleted" or (
+            row["publication_state"] == "suppressed"
+            and row["publication_reason"] == publication_reason
+        ):
             continue
         revision_number = _opportunity_revision_number(opportunity_revision_id)
         if not isinstance(opportunity_type, str) or not opportunity_type:
