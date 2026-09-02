@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import psycopg
@@ -3764,6 +3766,46 @@ def _source_chat_lifecycle_callback(
     )
 
 
+def _wait_until_advisory_lock_is_held(database_url: str, lock_key: str) -> None:
+    """Wait until the lifecycle transaction owns the shared peer lock."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            acquired = connection.execute(
+                "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            ).fetchone()
+            assert acquired is not None
+            if not acquired[0]:
+                return
+            connection.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+        time.sleep(0.01)
+    raise AssertionError(f"PostgreSQL advisory lock was not held: {lock_key}")
+
+
+def _wait_for_blocked_database_sessions(database_url: str, *, minimum: int) -> None:
+    """Wait until both sides of the forced PostgreSQL lock race are blocked."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with psycopg.connect(database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT count(*)
+                FROM pg_catalog.pg_stat_activity
+                WHERE datname = current_database()
+                  AND wait_event_type = 'Lock'
+                """
+            ).fetchone()
+        assert row is not None
+        if row[0] >= minimum:
+            return
+        time.sleep(0.01)
+    raise AssertionError("PostgreSQL sessions did not reach the forced lock race")
+
+
 def test_source_chat_administration_projection_preserves_role_boundary() -> None:
     """Expose only the narrow Bot administration projection across runtime roles."""
     telegram = ControlledTelegramDeliveryAdapter()
@@ -4188,6 +4230,125 @@ def test_pause_cancels_unfinished_work_suppresses_routes_and_discards_gap() -> N
     assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.REMOVED
     assert len(classifier.requests) == 2
     system.process_next_source_chat_bot_result()
+    system.reset()
+
+
+@pytest.mark.parametrize("lifecycle_action", ("pause", "remove"))
+def test_source_event_racing_with_lifecycle_commit_is_not_retained_or_queued(
+    lifecycle_action: str,
+) -> None:
+    """Serialize Source Event acceptance with a committed lifecycle stop."""
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 22, 9, 0, tzinfo=UTC)
+    lifecycle_at = registered_at + timedelta(minutes=5)
+    administrator_id = 46_504
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_650_004,
+    )
+    address = f"@synthetic_acceptance_race_{lifecycle_action}"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:7100",
+    )
+    clock = FrozenClock(datetime(2026, 8, 22, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat_for_lifecycle(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        registered_at=registered_at,
+        address=address,
+    )
+
+    clock.advance_to(lifecycle_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"lifecycle-race-request:{lifecycle_action}",
+        telegram_user_id=administrator_id,
+        action=lifecycle_action,
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"lifecycle-race-confirm:{lifecycle_action}",
+        telegram_user_id=administrator_id,
+        action=lifecycle_action,
+        confirm=True,
+    )
+    clock.advance_to(lifecycle_at + timedelta(seconds=1))
+    source_event_id = f"source-event:acceptance-race:{lifecycle_action}"
+    telegram_message_id = 7101
+    event_time = lifecycle_at + timedelta(minutes=1)
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=7100),
+        to_checkpoint=TelegramChannelCheckpoint(pts=7101),
+        source_event_id=source_event_id,
+        telegram_message_id=telegram_message_id,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="This body must not cross a committed lifecycle stop.",
+        event_time=event_time,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+
+    database_url = os.environ["TEST_DATABASE_URL"]
+    peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+    with (
+        ThreadPoolExecutor(max_workers=2) as executor,
+        psycopg.connect(database_url) as registry_gate,
+    ):
+        assert registry_gate.execute(
+            """
+            SELECT 1
+            FROM football_runtime.source_chat_registry
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = 1
+            FOR UPDATE
+            """,
+            (identity.kind.value, identity.telegram_id),
+        ).fetchone() == (1,)
+
+        lifecycle = executor.submit(system.process_next_source_chat_change_request)
+        _wait_until_advisory_lock_is_held(database_url, peer_key)
+        acceptance = executor.submit(system.process_next_source_event)
+        _wait_for_blocked_database_sessions(database_url, minimum=2)
+
+        registry_gate.commit()
+        assert lifecycle.result(timeout=5)
+        assert acceptance.result(timeout=5)
+
+    expected_state = (
+        SourceChatLifecycleState.PAUSED
+        if lifecycle_action == "pause"
+        else SourceChatLifecycleState.REMOVED
+    )
+    assert system.source_chats()[0].lifecycle_state is expected_state
+    revision_id = (
+        f"source-chat:channel:{identity.telegram_id}:generation:1:"
+        f"message:{telegram_message_id}:revision:1"
+    )
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    assert system.classifier_commands_for_revision(revision_id) == ()
+    assert system.classification_proposals_for_revision(revision_id) == ()
     system.reset()
 
 

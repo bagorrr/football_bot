@@ -4227,6 +4227,14 @@ class PostgresRoleStore:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             event_time = datetime.fromisoformat(str(payload["event_time"]))
+            peer_key = (
+                f"source-chat:{payload['telegram_peer_kind']}"
+                f":{payload['telegram_chat_id']}"
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
             processable_chat = connection.execute(
                 """
                 SELECT football_runtime.source_chat_event_is_processable(
