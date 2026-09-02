@@ -801,7 +801,7 @@ def test_multilingual_venue_provision_evidence_reaches_publication() -> None:
             revision=1,
             kind=SourceEventKind.CREATE,
             body=body,
-            event_time=datetime(2026, 8, 18, 9, index, tzinfo=UTC),
+            event_time=datetime(2026, 8, 18, 9, 5 + index, tzinfo=UTC),
         )
 
     system = boot_legacy_acceptance_spine(

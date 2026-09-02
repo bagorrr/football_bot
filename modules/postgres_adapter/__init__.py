@@ -82,6 +82,9 @@ from modules.domain import (
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
     SourceChatIngestionContext,
+    SourceChatLifecycleAction,
+    SourceChatLifecycleContext,
+    SourceChatLifecycleState,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceEventKind,
@@ -175,6 +178,8 @@ _LEGACY_MIGRATION_NAMES = (
     "0040_coaching_ingestion_role_projection_gate.sql",
     "0041_exact_repost_referee_generic_projection.sql",
     "0042_moderation_review_events.sql",
+    "0043_source_chat_administration_lifecycle.sql",
+    "0044_source_chat_lifecycle_cancellation.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -221,6 +226,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "b222c3c6a41130b4062f671de0c4a4706fdf7b13c1a09ba50a6cf8929934a161",
     "7626882c2b8c0e13f539157963ee4406d3cb704901efd7a830e11365f6fa459d",
     "cc2935d5b8c9462086677646d50c793f550c9b85e694c5bc68e28f86f84889ca",
+    "62ac5af74f66169098f47a96549d4d2f7e8dc2b0ece1062a1e9dd447a3e08c6d",
+    "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -736,6 +743,8 @@ class PostgresAcceptanceObserver:
                      football_runtime.recommendation_opportunities,
                      football_runtime.application_source_message_tombstones,
                      football_runtime.application_source_message_replay_barriers,
+                     football_runtime.application_source_chat_lifecycle_events,
+                     football_runtime.source_chat_lifecycle_origins,
                      football_runtime.source_message_revisions,
                      football_runtime.source_messages,
                      football_runtime.source_event_records,
@@ -1290,11 +1299,33 @@ class PostgresAcceptanceObserver:
         ) as connection:
             rows = connection.execute(
                 """
-                SELECT opportunity_id, opportunity_revision_id,
-                       source_message_revision_id,
-                       opportunity_type, publication_state, response_route,
-                       publication_reason
-                FROM football_runtime.application_opportunities
+                SELECT opportunity.opportunity_id,
+                       opportunity.opportunity_revision_id,
+                       opportunity.source_message_revision_id,
+                       opportunity.opportunity_type,
+                       CASE
+                           WHEN source.tombstoned
+                           THEN 'suppressed'
+                           ELSE opportunity.publication_state
+                       END AS publication_state,
+                       CASE
+                           WHEN source.tombstoned
+                           THEN jsonb_build_object(
+                               'kind', 'unavailable', 'value', ''
+                           )
+                           ELSE opportunity.response_route
+                       END AS response_route,
+                       CASE
+                           WHEN source.tombstoned
+                           THEN 'source_deleted'
+                           ELSE opportunity.publication_reason
+                       END AS publication_reason
+                FROM football_runtime.application_opportunities AS opportunity
+                LEFT JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_revision_id =
+                     opportunity.source_message_revision_id
+                LEFT JOIN football_runtime.source_messages AS source
+                  ON source.source_message_id = revision.source_message_id
                 ORDER BY accepted_at, opportunity_id
                 """
             ).fetchall()
@@ -1323,28 +1354,31 @@ class PostgresAcceptanceObserver:
                        application.source_message_revision_id,
                        recommendation.opportunity_type,
                        CASE
-                           WHEN football_runtime.
-                               source_message_deleted_for_opportunity(
-                                   recommendation.opportunity_id
-                               )
+                           WHEN source.tombstoned
                            THEN 'suppressed'
                            ELSE recommendation.publication_state
                        END AS publication_state,
                        CASE
-                           WHEN football_runtime.
-                               source_message_deleted_for_opportunity(
-                                   recommendation.opportunity_id
-                               )
+                           WHEN source.tombstoned
                            THEN jsonb_build_object(
                                'kind', 'unavailable', 'value', ''
                            )
                            ELSE recommendation.response_route
                        END AS response_route,
-                       recommendation.publication_reason
+                       CASE
+                           WHEN source.tombstoned
+                           THEN 'source_deleted'
+                           ELSE recommendation.publication_reason
+                       END AS publication_reason
                 FROM football_runtime.recommendation_opportunities AS recommendation
                 LEFT JOIN football_runtime.application_opportunities AS application
                   ON application.opportunity_id =
                      recommendation.opportunity_id
+                LEFT JOIN football_runtime.source_message_revisions AS revision
+                  ON revision.source_message_revision_id =
+                     application.source_message_revision_id
+                LEFT JOIN football_runtime.source_messages AS source
+                  ON source.source_message_id = revision.source_message_id
                 ORDER BY recommendation.published_at,
                          recommendation.opportunity_id,
                          recommendation.opportunity_revision_id
@@ -1954,11 +1988,14 @@ class PostgresAcceptanceObserver:
                             SELECT opportunity.opportunity_id,
                                    opportunity.opportunity_revision_id,
                                    CASE
-                                       WHEN source_chat.source_chat_enabled
-                                        AND NOT football_runtime.
-                                            source_message_deleted_for_opportunity(
-                                                opportunity.opportunity_id
-                                            )
+                                       WHEN opportunity.opportunity_type = 'tournament'
+                                        OR (
+                                            source_chat.source_chat_enabled
+                                            AND NOT football_runtime.
+                                                source_message_deleted_for_opportunity(
+                                                    opportunity.opportunity_id
+                                                )
+                                        )
                                        THEN opportunity.publication_state
                                        ELSE 'suppressed'
                                    END AS publication_state,
@@ -1996,21 +2033,31 @@ class PostgresAcceptanceObserver:
                                    END AS current_facts,
                                    CASE
                                        WHEN opportunity.publication_state = 'active'
-                                        AND source_chat.source_chat_enabled
-                                        AND NOT football_runtime.
-                                            source_message_deleted_for_opportunity(
-                                                opportunity.opportunity_id
+                                        AND (
+                                            opportunity.opportunity_type = 'tournament'
+                                            OR (
+                                                source_chat.source_chat_enabled
+                                                AND NOT football_runtime.
+                                                    source_message_deleted_for_opportunity(
+                                                        opportunity.opportunity_id
+                                                    )
                                             )
+                                        )
                                        THEN opportunity.response_route ->> 'kind'
                                        ELSE NULL
                                    END AS response_route_kind,
                                    CASE
                                        WHEN opportunity.publication_state = 'active'
-                                        AND source_chat.source_chat_enabled
-                                        AND NOT football_runtime.
-                                            source_message_deleted_for_opportunity(
-                                                opportunity.opportunity_id
+                                        AND (
+                                            opportunity.opportunity_type = 'tournament'
+                                            OR (
+                                                source_chat.source_chat_enabled
+                                                AND NOT football_runtime.
+                                                    source_message_deleted_for_opportunity(
+                                                        opportunity.opportunity_id
+                                                    )
                                             )
+                                        )
                                        THEN opportunity.response_route ->> 'value'
                                        ELSE NULL
                                    END AS response_route_value,
@@ -2018,8 +2065,16 @@ class PostgresAcceptanceObserver:
                             FROM football_runtime.recommendation_opportunities
                                 AS opportunity
                             CROSS JOIN LATERAL (
-                                SELECT opportunity.opportunity_type = 'tournament'
-                                    OR EXISTS (
+                                SELECT COALESCE(
+                                           football_runtime.
+                                               source_chat_opportunity_enabled(
+                                                   opportunity.opportunity_id
+                                               ),
+                                           true
+                                       )
+                                    AND (
+                                        opportunity.opportunity_type = 'tournament'
+                                        OR EXISTS (
                                         SELECT 1
                                         FROM football_runtime.application_opportunities
                                             AS application
@@ -2065,6 +2120,7 @@ class PostgresAcceptanceObserver:
                                                     )
                                                 )
                                           )
+                                        )
                                     ) AS source_chat_enabled
                             ) AS source_chat
                             WHERE opportunity.opportunity_id = COALESCE(
@@ -2128,7 +2184,14 @@ class PostgresAcceptanceObserver:
                             FROM football_runtime.recommendation_opportunities
                                 AS recommendation
                             CROSS JOIN LATERAL (
-                                SELECT EXISTS (
+                                SELECT COALESCE(
+                                           football_runtime.
+                                               source_chat_opportunity_enabled(
+                                                   recommendation.opportunity_id
+                                               ),
+                                           true
+                                       )
+                                   AND EXISTS (
                                     SELECT 1
                                     FROM football_runtime.application_opportunities
                                         AS application
@@ -2154,7 +2217,7 @@ class PostgresAcceptanceObserver:
                                       AND registry.enabled
                                       AND registry.initial_consent_attestation =
                                           'confirmed'
-                                ) AS source_chat_enabled
+                                   ) AS source_chat_enabled
                             ) AS source_chat
                             WHERE recommendation.opportunity_id = COALESCE(
                                 (
@@ -2185,6 +2248,7 @@ class PostgresAcceptanceObserver:
                                    recommendation.opportunity_revision_id,
                                    CASE
                                        WHEN source_lifecycle.source_deleted
+                                            OR NOT source_lifecycle.source_chat_enabled
                                        THEN 'suppressed'
                                        ELSE recommendation.publication_state
                                    END AS publication_state,
@@ -2192,12 +2256,14 @@ class PostgresAcceptanceObserver:
                                    CASE
                                        WHEN recommendation.publication_state = 'active'
                                         AND NOT source_lifecycle.source_deleted
+                                        AND source_lifecycle.source_chat_enabled
                                        THEN recommendation.response_route ->> 'kind'
                                        ELSE NULL
                                    END AS response_route_kind,
                                    CASE
                                        WHEN recommendation.publication_state = 'active'
                                         AND NOT source_lifecycle.source_deleted
+                                        AND source_lifecycle.source_chat_enabled
                                        THEN recommendation.response_route ->> 'value'
                                        ELSE NULL
                                    END AS response_route_value
@@ -2206,9 +2272,16 @@ class PostgresAcceptanceObserver:
                                 AS recommendation
                             CROSS JOIN LATERAL (
                                 SELECT football_runtime.
-                                    source_message_deleted_for_opportunity(
-                                        recommendation.opportunity_id
-                                    ) AS source_deleted
+                                           source_message_deleted_for_opportunity(
+                                               recommendation.opportunity_id
+                                           ) AS source_deleted,
+                                       COALESCE(
+                                           football_runtime.
+                                               source_chat_opportunity_enabled(
+                                                   recommendation.opportunity_id
+                                               ),
+                                           true
+                                       ) AS source_chat_enabled
                             ) AS source_lifecycle
                             WHERE recommendation.opportunity_id = COALESCE(
                                 (
@@ -2797,7 +2870,7 @@ class PostgresRoleStore:
                 """
                 SELECT registry_generation, processing_started_at,
                        transport_boundary, initial_consent_attestation,
-                       attested_at
+                       attested_at, enabled, permanently_removed_at
                 FROM football_runtime.source_chat_registry
                 WHERE peer_kind = %s AND telegram_chat_id = %s
                 ORDER BY registry_generation DESC
@@ -2829,7 +2902,22 @@ class PostgresRoleStore:
                 if latest_generation is not None
                 else entry.attested_at
             )
-            if entry.enabled and not is_stale:
+            address_change = (
+                latest_generation is not None
+                and entry.registry_generation > latest_generation[0]
+                and latest_generation[6] is None
+            )
+            readdition = (
+                latest_generation is not None
+                and entry.registry_generation > latest_generation[0]
+                and latest_generation[6] is not None
+            )
+            if readdition:
+                processing_started_at = entry.processing_started_at
+                transport_boundary = entry.transport_boundary
+                initial_consent_attestation = entry.initial_consent_attestation.value
+                attested_at = entry.attested_at
+            if entry.enabled and not is_stale and not address_change:
                 connection.execute(
                     """
                     UPDATE football_runtime.source_chat_registry
@@ -2850,7 +2938,28 @@ class PostgresRoleStore:
                         entry.registry_generation,
                     ),
                 )
-            if not is_stale:
+            if address_change:
+                assert latest_generation is not None
+                connection.execute(
+                    """
+                    UPDATE football_runtime.source_chat_registry
+                    SET address_kind = %s,
+                        current_address = %s,
+                        updated_at = %s
+                    WHERE peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                    """,
+                    (
+                        entry.address_kind.value,
+                        entry.current_address,
+                        received_at,
+                        entry.identity.kind.value,
+                        entry.identity.telegram_id,
+                        latest_generation[0],
+                    ),
+                )
+            elif not is_stale:
                 connection.execute(
                     """
                     INSERT INTO football_runtime.source_chat_registry (
@@ -2921,7 +3030,7 @@ class PostgresRoleStore:
                        processing_started_at, transport_boundary, enabled,
                        initial_consent_attestation, attested_at,
                        classifier_timezone, classifier_country_id,
-                       classifier_city_id
+                       classifier_city_id, permanently_removed_at
                 FROM football_runtime.source_chat_registry
                 ORDER BY peer_kind, telegram_chat_id, registry_generation
                 """
@@ -2945,9 +3054,325 @@ class PostgresRoleStore:
                 classifier_timezone=row["classifier_timezone"],
                 classifier_country_id=row["classifier_country_id"],
                 classifier_city_id=row["classifier_city_id"],
+                permanently_removed_at=row["permanently_removed_at"],
             )
             for row in rows
         )
+
+    def source_chat_administration_views(
+        self,
+    ) -> tuple[SourceChatRegistryEntry, ...]:
+        """Read the narrow Bot-owned Source Chat administration projection."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id, registry_generation,
+                       address_kind, current_address,
+                       processing_started_at, transport_boundary, enabled,
+                       initial_consent_attestation, attested_at,
+                       classifier_timezone, classifier_country_id,
+                       classifier_city_id, permanently_removed_at
+                FROM football_runtime.read_source_chat_administration()
+                """
+            ).fetchall()
+        return tuple(
+            SourceChatRegistryEntry(
+                identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(row["peer_kind"]),
+                    telegram_id=row["telegram_chat_id"],
+                ),
+                registry_generation=row["registry_generation"],
+                address_kind=SourceChatAddressKind(row["address_kind"]),
+                current_address=row["current_address"],
+                processing_started_at=row["processing_started_at"],
+                transport_boundary=row["transport_boundary"],
+                enabled=row["enabled"],
+                initial_consent_attestation=InitialConsentAttestation(
+                    row["initial_consent_attestation"]
+                ),
+                attested_at=row["attested_at"],
+                classifier_timezone=row["classifier_timezone"],
+                classifier_country_id=row["classifier_country_id"],
+                classifier_city_id=row["classifier_city_id"],
+                permanently_removed_at=row["permanently_removed_at"],
+            )
+            for row in rows
+        )
+
+    def source_chat_revision_is_processable(
+        self,
+        source_message_revision_id: str,
+    ) -> bool:
+        """Check the current enabled Source Chat processing boundary."""
+        if self._role not in {
+            RuntimeRole.APPLICATION,
+            RuntimeRole.CLASSIFICATION,
+            RuntimeRole.RECOMMENDATION,
+            RuntimeRole.BOT_ASSISTANT,
+        }:
+            raise ConversationAccessDeniedError
+        if not _is_complete_source_chat_revision(source_message_revision_id):
+            return True
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.source_chat_revision_is_processable(%s)
+                """,
+                (source_message_revision_id,),
+            ).fetchone()
+        return bool(row[0]) if row is not None else False
+
+    def change_source_chat_lifecycle(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        action: SourceChatLifecycleAction,
+        telegram_user_id: int,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one administrator transition and its publication barrier."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        if incoming.contract_name is not ContractName.CHANGE_SOURCE_CHAT_REGISTRY:
+            raise ValueError("Source Chat lifecycle command has an invalid name")
+        if incoming.contract_version != 2:
+            raise ValueError("Source Chat lifecycle command has an invalid version")
+        if action not in {
+            SourceChatLifecycleAction.PAUSE,
+            SourceChatLifecycleAction.REMOVE,
+            SourceChatLifecycleAction.RE_ENABLE,
+        }:
+            raise ValueError("Source Chat lifecycle action is invalid")
+        if telegram_user_id < 1 or registry_generation < 1:
+            raise ValueError("Source Chat lifecycle identity is invalid")
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            registry = connection.execute(
+                """
+                SELECT enabled, permanently_removed_at
+                FROM football_runtime.source_chat_registry
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                FOR UPDATE
+                """,
+                (identity.kind.value, identity.telegram_id, registry_generation),
+            ).fetchone()
+            if registry is None:
+                # Registry rows are retained, but return a terminal removed
+                # state if a stale command meets an already-erased row.
+                connection.execute(
+                    """
+                    INSERT INTO
+                        football_runtime.application_source_chat_lifecycle_events (
+                        event_id, command_message_id, correlation_id,
+                        telegram_user_id, source_chat_key, telegram_peer_kind,
+                        telegram_chat_id, registry_generation, action,
+                        previous_state, lifecycle_state, recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                              'removed', 'removed', %s)
+                    ON CONFLICT (command_message_id) DO NOTHING
+                    """,
+                    (
+                        incoming.message_id,
+                        incoming.message_id,
+                        incoming.correlation_id,
+                        telegram_user_id,
+                        incoming.subject_id,
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        action.value,
+                        received_at,
+                    ),
+                )
+                outgoing_payload = outgoing.payload
+                if not isinstance(outgoing_payload, dict):
+                    raise TypeError("Source Chat lifecycle result payload is invalid")
+                _insert_outbox(
+                    connection,
+                    replace(
+                        outgoing,
+                        payload={
+                            **outgoing_payload,
+                            "lifecycle_state": SourceChatLifecycleState.REMOVED.value,
+                        },
+                    ),
+                )
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            else:
+                previous_state = (
+                    SourceChatLifecycleState.REMOVED
+                    if registry["permanently_removed_at"] is not None
+                    else (
+                        SourceChatLifecycleState.ENABLED
+                        if registry["enabled"]
+                        else SourceChatLifecycleState.PAUSED
+                    )
+                )
+                transitioned = False
+                if action is SourceChatLifecycleAction.PAUSE:
+                    transitioned = previous_state is SourceChatLifecycleState.ENABLED
+                    if transitioned:
+                        connection.execute(
+                            """
+                            UPDATE football_runtime.source_chat_registry
+                            SET enabled = FALSE, updated_at = %s
+                            WHERE peer_kind = %s
+                              AND telegram_chat_id = %s
+                              AND registry_generation = %s
+                            """,
+                            (
+                                received_at,
+                                identity.kind.value,
+                                identity.telegram_id,
+                                registry_generation,
+                            ),
+                        )
+                    resulting_state = (
+                        SourceChatLifecycleState.PAUSED
+                        if previous_state is not SourceChatLifecycleState.REMOVED
+                        else SourceChatLifecycleState.REMOVED
+                    )
+                elif action is SourceChatLifecycleAction.REMOVE:
+                    transitioned = (
+                        previous_state is not SourceChatLifecycleState.REMOVED
+                    )
+                    if transitioned:
+                        connection.execute(
+                            """
+                            UPDATE football_runtime.source_chat_registry
+                            SET enabled = FALSE,
+                                permanently_removed_at = %s,
+                                updated_at = %s
+                            WHERE peer_kind = %s
+                              AND telegram_chat_id = %s
+                              AND registry_generation = %s
+                            """,
+                            (
+                                received_at,
+                                received_at,
+                                identity.kind.value,
+                                identity.telegram_id,
+                                registry_generation,
+                            ),
+                        )
+                    resulting_state = SourceChatLifecycleState.REMOVED
+                else:
+                    transitioned = previous_state is SourceChatLifecycleState.PAUSED
+                    if transitioned:
+                        connection.execute(
+                            """
+                            UPDATE football_runtime.source_chat_registry
+                            SET enabled = TRUE,
+                                processing_started_at = %s,
+                                updated_at = %s
+                            WHERE peer_kind = %s
+                              AND telegram_chat_id = %s
+                              AND registry_generation = %s
+                              AND permanently_removed_at IS NULL
+                            """,
+                            (
+                                received_at,
+                                received_at,
+                                identity.kind.value,
+                                identity.telegram_id,
+                                registry_generation,
+                            ),
+                        )
+                    resulting_state = (
+                        SourceChatLifecycleState.ENABLED
+                        if previous_state is SourceChatLifecycleState.PAUSED
+                        else previous_state
+                    )
+                if transitioned and action in {
+                    SourceChatLifecycleAction.PAUSE,
+                    SourceChatLifecycleAction.REMOVE,
+                }:
+                    _cancel_source_chat_work(
+                        connection,
+                        identity=identity,
+                        registry_generation=registry_generation,
+                        recorded_at=received_at,
+                    )
+                    lifecycle_outgoings = _suppress_source_chat_opportunities(
+                        connection,
+                        identity=identity,
+                        registry_generation=registry_generation,
+                        publication_reason=(
+                            "source_chat_paused"
+                            if action is SourceChatLifecycleAction.PAUSE
+                            else "source_chat_removed"
+                        ),
+                        lifecycle_action=action.value,
+                        causation_id=incoming.message_id,
+                        correlation_id=incoming.correlation_id,
+                        recorded_at=received_at,
+                    )
+                    for lifecycle_outgoing in lifecycle_outgoings:
+                        _insert_outbox(connection, lifecycle_outgoing)
+                connection.execute(
+                    """
+                    INSERT INTO
+                        football_runtime.application_source_chat_lifecycle_events (
+                        event_id, command_message_id, correlation_id,
+                        telegram_user_id, source_chat_key, telegram_peer_kind,
+                        telegram_chat_id, registry_generation, action,
+                        previous_state, lifecycle_state, recorded_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (command_message_id) DO NOTHING
+                    """,
+                    (
+                        incoming.message_id,
+                        incoming.message_id,
+                        incoming.correlation_id,
+                        telegram_user_id,
+                        incoming.subject_id,
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        action.value,
+                        previous_state.value,
+                        resulting_state.value,
+                        received_at,
+                    ),
+                )
+                outgoing_payload = outgoing.payload
+                if not isinstance(outgoing_payload, dict):
+                    raise TypeError("Source Chat lifecycle result payload is invalid")
+                outgoing = replace(
+                    outgoing,
+                    payload={
+                        **outgoing_payload,
+                        "lifecycle_state": resulting_state.value,
+                    },
+                )
+                try:
+                    _insert_outbox(connection, outgoing)
+                except psycopg.errors.UniqueViolation as error:
+                    raise OutboxConflictError from error
+                _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
 
     def configure_source_chat_classifier_context(
         self,
@@ -3307,6 +3732,53 @@ class PostgresRoleStore:
             )
         )
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+
+            def advance_checkpoint() -> None:
+                if account_route:
+                    if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+                        raise TypeError("account event requires an account checkpoint")
+                    connection.execute(
+                        """
+                        UPDATE football_runtime.telegram_account_difference_checkpoints
+                        SET pts = %s, qts = %s, seq = %s,
+                            checkpoint_date = %s, advanced_at = %s
+                        WHERE singleton
+                        """,
+                        (
+                            event.to_checkpoint.pts,
+                            event.to_checkpoint.qts,
+                            event.to_checkpoint.seq,
+                            event.to_checkpoint.date,
+                            recorded_at,
+                        ),
+                    )
+                elif channel_route:
+                    if not isinstance(event.to_checkpoint, TelegramChannelCheckpoint):
+                        raise TypeError("channel event requires a channel checkpoint")
+                    connection.execute(
+                        """
+                        INSERT INTO
+                            football_runtime.telegram_channel_difference_checkpoints (
+                            peer_kind, telegram_chat_id, registry_generation,
+                            channel_pts, advanced_at
+                        ) VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                        DO UPDATE SET channel_pts = EXCLUDED.channel_pts,
+                                      advanced_at = EXCLUDED.advanced_at
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.to_checkpoint.pts,
+                            recorded_at,
+                        ),
+                    )
+                else:
+                    raise TypeError(
+                        "Telegram difference checkpoint scope is unsupported"
+                    )
+
             connection.execute(
                 "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
                 ("source-ingestion:role",),
@@ -3354,7 +3826,7 @@ class PostgresRoleStore:
                 return False
             context = connection.execute(
                 """
-                SELECT transport_boundary, channel_pts
+                SELECT processing_started_at, transport_boundary, channel_pts
                 FROM football_runtime.read_active_source_chat_ingestion_context(
                     %s, %s, %s
                 )
@@ -3366,43 +3838,56 @@ class PostgresRoleStore:
                 ),
             ).fetchone()
             if context is None:
-                if not account_route:
-                    raise RuntimeError("Source Chat generation is no longer eligible")
-                if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
-                    raise TypeError("account event requires an account checkpoint")
-                account_checkpoint = connection.execute(
-                    """
-                    SELECT pts, qts, seq, checkpoint_date
-                    FROM football_runtime.telegram_account_difference_checkpoints
-                    WHERE singleton
-                    FOR UPDATE
-                    """
-                ).fetchone()
-                if account_checkpoint is None:
-                    raise LookupError("Telegram account checkpoint is not initialized")
-                current_account_checkpoint = TelegramAccountCheckpoint(
-                    pts=account_checkpoint["pts"],
-                    qts=account_checkpoint["qts"],
-                    seq=account_checkpoint["seq"],
-                    date=account_checkpoint["checkpoint_date"],
-                )
-                if current_account_checkpoint != event.from_checkpoint:
-                    return False
-                connection.execute(
-                    """
-                    UPDATE football_runtime.telegram_account_difference_checkpoints
-                    SET pts = %s, qts = %s, seq = %s,
-                        checkpoint_date = %s, advanced_at = %s
-                    WHERE singleton
-                    """,
-                    (
-                        event.to_checkpoint.pts,
-                        event.to_checkpoint.qts,
-                        event.to_checkpoint.seq,
-                        event.to_checkpoint.date,
-                        recorded_at,
-                    ),
-                )
+                if account_route:
+                    account_checkpoint = connection.execute(
+                        """
+                        SELECT pts, qts, seq, checkpoint_date
+                        FROM football_runtime.telegram_account_difference_checkpoints
+                        WHERE singleton
+                        FOR UPDATE
+                        """
+                    ).fetchone()
+                    if account_checkpoint is None:
+                        raise LookupError(
+                            "Telegram account checkpoint is not initialized"
+                        )
+                    current_account_checkpoint = TelegramAccountCheckpoint(
+                        pts=account_checkpoint["pts"],
+                        qts=account_checkpoint["qts"],
+                        seq=account_checkpoint["seq"],
+                        date=account_checkpoint["checkpoint_date"],
+                    )
+                    if current_account_checkpoint != event.from_checkpoint:
+                        return False
+                elif channel_route:
+                    if not isinstance(event.from_checkpoint, TelegramChannelCheckpoint):
+                        raise TypeError("channel event requires a channel checkpoint")
+                    channel_checkpoint = connection.execute(
+                        """
+                        SELECT channel_pts
+                        FROM football_runtime.telegram_channel_difference_checkpoints
+                        WHERE peer_kind = %s
+                          AND telegram_chat_id = %s
+                          AND registry_generation = %s
+                        FOR UPDATE
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                        ),
+                    ).fetchone()
+                    if (
+                        channel_checkpoint is not None
+                        and channel_checkpoint["channel_pts"]
+                        != event.from_checkpoint.pts
+                    ):
+                        return False
+                else:
+                    raise TypeError(
+                        "Telegram difference checkpoint scope is unsupported"
+                    )
+                advance_checkpoint()
                 return True
             account_create_is_after_boundary = False
             channel_event_is_after_boundary = False
@@ -3514,6 +3999,23 @@ class PostgresRoleStore:
                 if channel_route
                 else account_create_is_after_boundary
             )
+            event_is_processable = connection.execute(
+                """
+                SELECT football_runtime.source_chat_event_is_processable(
+                    %s, %s, %s, %s
+                ) AS event_is_processable
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    event.event_time,
+                ),
+            ).fetchone()
+            assert event_is_processable is not None
+            if not bool(event_is_processable["event_is_processable"]):
+                advance_checkpoint()
+                return True
             known_transport_identity = (
                 event.kind is SourceEventKind.CREATE
                 and (channel_route or account_create_is_after_boundary)
@@ -3673,48 +4175,7 @@ class PostgresRoleStore:
                     }
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError
-            if account_route:
-                if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
-                    raise TypeError("account event requires an account checkpoint")
-                connection.execute(
-                    """
-                    UPDATE football_runtime.telegram_account_difference_checkpoints
-                    SET pts = %s, qts = %s, seq = %s,
-                        checkpoint_date = %s, advanced_at = %s
-                    WHERE singleton
-                    """,
-                    (
-                        event.to_checkpoint.pts,
-                        event.to_checkpoint.qts,
-                        event.to_checkpoint.seq,
-                        event.to_checkpoint.date,
-                        recorded_at,
-                    ),
-                )
-            elif channel_route:
-                if not isinstance(event.to_checkpoint, TelegramChannelCheckpoint):
-                    raise TypeError("channel event requires a channel checkpoint")
-                connection.execute(
-                    """
-                    INSERT INTO
-                        football_runtime.telegram_channel_difference_checkpoints (
-                        peer_kind, telegram_chat_id, registry_generation,
-                        channel_pts, advanced_at
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
-                    DO UPDATE SET channel_pts = EXCLUDED.channel_pts,
-                                  advanced_at = EXCLUDED.advanced_at
-                    """,
-                    (
-                        identity.kind.value,
-                        identity.telegram_id,
-                        registry_generation,
-                        event.to_checkpoint.pts,
-                        recorded_at,
-                    ),
-                )
-            else:
-                raise TypeError("Telegram difference checkpoint scope is unsupported")
+            advance_checkpoint()
         return True
 
     def accept_source_event(
@@ -3763,6 +4224,31 @@ class PostgresRoleStore:
                 ),
             )
             if payload.get("outcome") == "protected_content_skipped":
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            event_time = datetime.fromisoformat(str(payload["event_time"]))
+            peer_key = (
+                f"source-chat:{payload['telegram_peer_kind']}"
+                f":{payload['telegram_chat_id']}"
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            processable_chat = connection.execute(
+                """
+                SELECT football_runtime.source_chat_event_is_processable(
+                    %s, %s, %s, %s
+                )
+                """,
+                (
+                    payload["telegram_peer_kind"],
+                    payload["telegram_chat_id"],
+                    payload["registry_generation"],
+                    event_time,
+                ),
+            ).fetchone()
+            if processable_chat is None or not processable_chat[0]:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             event_kind = payload.get("event_kind")
@@ -4618,6 +5104,7 @@ class PostgresRoleStore:
                   ON inbox.consumer_role = %s
                  AND inbox.message_id = outbox.message_id
                 WHERE outbox.consumer_role = %s
+                  AND outbox.cancelled_at IS NULL
                   AND COALESCE(inbox.processing_status, '') NOT IN (
                       'accepted', 'rejected_invalid_contract'
                   )
@@ -5106,6 +5593,19 @@ class PostgresRoleStore:
                     commit=False,
                 )
                 return False
+            processable = connection.execute(
+                """
+                SELECT football_runtime.source_chat_revision_is_processable(%s)
+                """,
+                (attempt.source_message_revision_id,),
+            ).fetchone()
+            if processable is None or not processable[0]:
+                self._finish_classification_admission(
+                    connection=connection,
+                    context=self._classification_admission_context,
+                    commit=False,
+                )
+                return False
             connection.execute(
                 """
                 INSERT INTO football_runtime.classification_attempts (
@@ -5167,6 +5667,16 @@ class PostgresRoleStore:
                 (source_message_id,),
             ).fetchone()
             if barrier is not None and barrier[0]:
+                connection.rollback()
+                context.__exit__(None, None, None)
+                return False
+            processable = connection.execute(
+                """
+                SELECT football_runtime.source_chat_revision_is_processable(%s)
+                """,
+                (attempt.source_message_revision_id,),
+            ).fetchone()
+            if processable is None or not processable[0]:
                 connection.rollback()
                 context.__exit__(None, None, None)
                 return False
@@ -6242,6 +6752,11 @@ class PostgresRoleStore:
             source_message_id = _source_message_id_for_lifecycle(
                 source_message_revision_id
             )
+            if _is_complete_source_chat_revision(source_message_revision_id):
+                _lock_source_chat_peer(
+                    connection,
+                    source_message_id=source_message_id,
+                )
             if _source_message_lifecycle_deleted(
                 connection,
                 source_message_id=source_message_id,
@@ -6251,6 +6766,21 @@ class PostgresRoleStore:
             if not _source_message_revision_is_current(
                 connection,
                 source_message_revision_id=source_message_revision_id,
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            if not _source_chat_revision_is_processable(
+                connection,
+                source_message_revision_id=source_message_revision_id,
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            opportunity_id = opportunity.get("opportunity_id")
+            if not isinstance(opportunity_id, str):
+                raise ValueError("publication requires an opportunity id")
+            if _application_opportunity_is_lifecycle_suppressed(
+                connection,
+                opportunity_id=opportunity_id,
             ):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
@@ -6276,7 +6806,6 @@ class PostgresRoleStore:
                 )
             proposition_slot = opportunity.get("proposition_slot")
             proposition_discriminator = opportunity.get("proposition_discriminator")
-            opportunity_id = opportunity.get("opportunity_id")
             if (
                 not isinstance(proposition_slot, int)
                 or isinstance(proposition_slot, bool)
@@ -6432,9 +6961,18 @@ class PostgresRoleStore:
                 raise ValueError(
                     "compound publication requires one Source Message lineage"
                 )
+            source_message_id = next(iter(source_message_ids))
+            first_source_message_revision_id = cast(
+                tuple[str, ...], source_message_revision_ids
+            )[0]
+            if _is_complete_source_chat_revision(first_source_message_revision_id):
+                _lock_source_chat_peer(
+                    connection,
+                    source_message_id=source_message_id,
+                )
             source_deleted = _source_message_lifecycle_deleted(
                 connection,
-                source_message_id=next(iter(source_message_ids)),
+                source_message_id=source_message_id,
             )
             if source_deleted:
                 _release_claim(connection, incoming.message_id)
@@ -6450,6 +6988,27 @@ class PostgresRoleStore:
             ):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
+            if any(
+                not _source_chat_revision_is_processable(
+                    connection,
+                    source_message_revision_id=source_message_revision_id,
+                )
+                for source_message_revision_id in cast(
+                    tuple[str, ...], source_message_revision_ids
+                )
+            ):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            for opportunity in opportunities:
+                opportunity_id = opportunity.get("opportunity_id")
+                if not isinstance(opportunity_id, str):
+                    raise ValueError("compound publication requires an opportunity id")
+                if _application_opportunity_is_lifecycle_suppressed(
+                    connection,
+                    opportunity_id=opportunity_id,
+                ):
+                    _release_claim(connection, incoming.message_id)
+                    return ConsumeResult.APPLIED
             if routing_outcome is not None:
                 connection.execute(
                     """
@@ -7027,6 +7586,16 @@ class PostgresRoleStore:
                           AND recommendation_opportunities.publication_reason IS
                               DISTINCT FROM 'response_route_unavailable'
             """
+        lifecycle_reactivation_guard = """
+                          AND (
+                              recommendation_opportunities.publication_reason IS NULL
+                              OR recommendation_opportunities.publication_reason
+                                 NOT IN (
+                                  'source_chat_paused', 'source_chat_removed'
+                              )
+                              OR EXCLUDED.publication_state = 'suppressed'
+                          )
+        """
         source_revision_id = payload.get("source_message_revision_id")
         if incoming.contract_version == 3 and not isinstance(source_revision_id, str):
             source_revision_id = None
@@ -7067,6 +7636,18 @@ class PostgresRoleStore:
                             "OpportunityPublicationChanged v3 item is invalid"
                         )
                     opportunity_id = cast(str, opportunity["opportunity_id"])
+                    item_state, item_reason, item_route = (
+                        _recommendation_projection_values(
+                            connection,
+                            opportunity_id=opportunity_id,
+                            source_deleted=source_deleted,
+                            publication_state=cast(str, payload["publication_state"]),
+                            publication_reason=cast(
+                                str | None, payload.get("publication_reason")
+                            ),
+                            response_route=opportunity["response_route"],
+                        )
+                    )
                     if source_deleted:
                         _scrub_recommendation_source_deleted_projection(
                             connection,
@@ -7089,41 +7670,40 @@ class PostgresRoleStore:
                             published_at = EXCLUDED.published_at
                         WHERE recommendation_opportunities.opportunity_id =
                               EXCLUDED.opportunity_id
+                          AND (
+                              recommendation_opportunities.publication_reason IS NULL
+                              OR recommendation_opportunities.publication_reason
+                                 NOT IN (
+                                  'source_chat_paused', 'source_chat_removed'
+                              )
+                              OR EXCLUDED.publication_state = 'suppressed'
+                          )
                         """,
                         (
                             opportunity_id,
                             opportunity["opportunity_revision_id"],
                             opportunity["opportunity_type"],
-                            "suppressed"
-                            if source_deleted
-                            else payload["publication_state"],
-                            "source_deleted"
-                            if source_deleted
-                            else payload.get("publication_reason"),
+                            item_state,
+                            item_reason,
                             json.dumps(opportunity["accepted_facts"]),
-                            json.dumps(
-                                _UNAVAILABLE_RESPONSE_ROUTE
-                                if source_deleted
-                                else opportunity["response_route"]
-                            ),
+                            json.dumps(item_route),
                             received_at,
                         ),
                     )
             else:
-                publication_state = (
-                    "suppressed" if source_deleted else payload["publication_state"]
-                )
-                publication_reason = (
-                    "source_deleted"
-                    if source_deleted
-                    else payload.get("publication_reason")
-                )
-                response_route = (
-                    _UNAVAILABLE_RESPONSE_ROUTE
-                    if source_deleted
-                    else payload["response_route"]
-                )
                 opportunity_id = cast(str, payload["opportunity_id"])
+                publication_state, publication_reason, response_route = (
+                    _recommendation_projection_values(
+                        connection,
+                        opportunity_id=opportunity_id,
+                        source_deleted=source_deleted,
+                        publication_state=cast(str, payload["publication_state"]),
+                        publication_reason=cast(
+                            str | None, payload.get("publication_reason")
+                        ),
+                        response_route=payload["response_route"],
+                    )
+                )
                 if source_deleted:
                     _scrub_recommendation_source_deleted_projection(
                         connection,
@@ -7147,6 +7727,7 @@ class PostgresRoleStore:
                     WHERE recommendation_opportunities.opportunity_id =
                           EXCLUDED.opportunity_id
                     {source_suppression_guard}
+                    {lifecycle_reactivation_guard}
                     """,
                     (
                         opportunity_id,
@@ -7344,12 +7925,14 @@ class PostgresRoleStore:
                        opportunity_id, opportunity_revision_id, opportunity_type,
                        CASE
                            WHEN source_lifecycle.source_deleted
+                                OR NOT source_lifecycle.source_chat_enabled
                            THEN 'suppressed'
                            ELSE publication_state
                        END AS publication_state,
                        accepted_facts,
                        CASE
                            WHEN source_lifecycle.source_deleted
+                                OR NOT source_lifecycle.source_chat_enabled
                            THEN jsonb_build_object(
                                'kind', 'unavailable', 'value', ''
                            )
@@ -7358,13 +7941,20 @@ class PostgresRoleStore:
                 FROM football_runtime.recommendation_opportunities AS opportunity
                 CROSS JOIN LATERAL (
                     SELECT football_runtime.source_message_deleted_for_opportunity(
-                        opportunity.opportunity_id
-                    ) AS source_deleted
+                               opportunity.opportunity_id
+                           ) AS source_deleted,
+                           COALESCE(
+                               football_runtime.source_chat_opportunity_enabled(
+                                   opportunity.opportunity_id
+                               ),
+                               false
+                           ) AS source_chat_enabled
                 ) AS source_lifecycle
-                WHERE opportunity.opportunity_type NOT IN (
+                WHERE source_lifecycle.source_chat_enabled
+                  AND (opportunity.opportunity_type NOT IN (
                     'referee_availability', 'referee_request',
                     'coach_availability', 'coach_request'
-                )
+                  )
                    OR (
                        opportunity.opportunity_type IN (
                            'referee_availability', 'referee_request'
@@ -7380,7 +7970,7 @@ class PostgresRoleStore:
                        AND football_runtime.coaching_opportunity_source_chat_enabled(
                            opportunity.opportunity_id
                        )
-                   )
+                   ))
                 ORDER BY opportunity_id,
                          (substring(opportunity_revision_id
                                     FROM ':revision:([0-9]+)$'))::bigint DESC,
@@ -7531,12 +8121,14 @@ class PostgresRoleStore:
                        opportunity_id, opportunity_revision_id, opportunity_type,
                        CASE
                            WHEN source_lifecycle.source_deleted
+                                OR NOT source_lifecycle.source_chat_enabled
                            THEN 'suppressed'
                            ELSE publication_state
                        END AS publication_state,
                        accepted_facts,
                        CASE
                            WHEN source_lifecycle.source_deleted
+                                OR NOT source_lifecycle.source_chat_enabled
                            THEN jsonb_build_object(
                                'kind', 'unavailable', 'value', ''
                            )
@@ -7546,13 +8138,20 @@ class PostgresRoleStore:
                 FROM football_runtime.recommendation_opportunities AS opportunity
                 CROSS JOIN LATERAL (
                     SELECT football_runtime.source_message_deleted_for_opportunity(
-                        opportunity.opportunity_id
-                    ) AS source_deleted
+                               opportunity.opportunity_id
+                           ) AS source_deleted,
+                           COALESCE(
+                               football_runtime.source_chat_opportunity_enabled(
+                                   opportunity.opportunity_id
+                               ),
+                               false
+                           ) AS source_chat_enabled
                 ) AS source_lifecycle
-                WHERE opportunity.opportunity_type NOT IN (
+                WHERE source_lifecycle.source_chat_enabled
+                  AND (opportunity.opportunity_type NOT IN (
                     'referee_availability', 'referee_request',
                     'coach_availability', 'coach_request'
-                )
+                  )
                    OR (
                        opportunity.opportunity_type IN (
                            'referee_availability', 'referee_request'
@@ -7568,7 +8167,7 @@ class PostgresRoleStore:
                        AND football_runtime.coaching_opportunity_source_chat_enabled(
                            opportunity.opportunity_id
                        )
-                   )
+                   ))
                 ORDER BY opportunity_id,
                          (substring(opportunity_revision_id
                                     FROM ':revision:([0-9]+)$'))::bigint DESC,
@@ -8045,6 +8644,121 @@ class PostgresRoleStore:
         matches = message_matches or cause_matches
         if len(matches) > 1:
             raise RuntimeError("Bot terminal maps to multiple registration origins")
+        return matches[0] if matches else None
+
+    def source_chat_lifecycle_origin(
+        self,
+        correlation_id: UUID,
+    ) -> SourceChatLifecycleContext | None:
+        """Read one Bot-owned lifecycle command origin."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT command_message_id, correlation_id, telegram_user_id,
+                       source_chat_key, telegram_peer_kind, telegram_chat_id,
+                       registry_generation, action
+                FROM football_runtime.source_chat_lifecycle_origins
+                WHERE correlation_id = %s
+                """,
+                (correlation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        (
+            command_message_id,
+            stored_correlation_id,
+            telegram_user_id,
+            source_chat_key,
+            peer_kind,
+            telegram_chat_id,
+            registry_generation,
+            action,
+        ) = row
+        if (
+            not isinstance(command_message_id, UUID)
+            or command_message_id != stored_correlation_id
+            or stored_correlation_id != correlation_id
+            or not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+            or not isinstance(source_chat_key, str)
+            or not source_chat_key
+            or peer_kind not in {item.value for item in TelegramPeerKind}
+            or not isinstance(telegram_chat_id, int)
+            or isinstance(telegram_chat_id, bool)
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
+            or action not in {item.value for item in SourceChatLifecycleAction}
+        ):
+            raise RuntimeError("Bot Source Chat lifecycle context is invalid")
+        return SourceChatLifecycleContext(
+            correlation_id=correlation_id,
+            command_message_id=command_message_id,
+            telegram_user_id=telegram_user_id,
+            source_chat_key=source_chat_key,
+            identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind(peer_kind),
+                telegram_id=telegram_chat_id,
+            ),
+            registry_generation=registry_generation,
+            action=SourceChatLifecycleAction(action),
+        )
+
+    def source_chat_lifecycle_origin_for_terminal(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatLifecycleContext | None:
+        """Recover the one lifecycle origin proven by a terminal result."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        if incoming.contract_name is not ContractName.SOURCE_CHAT_GENERATION_CHANGED:
+            return None
+        with psycopg.connect(self._database_url) as connection:
+            rows = connection.execute(
+                """
+                SELECT command_message_id, correlation_id, telegram_user_id,
+                       source_chat_key, telegram_peer_kind, telegram_chat_id,
+                       registry_generation, action
+                FROM football_runtime.source_chat_lifecycle_origins
+                """
+            ).fetchall()
+        message_matches: list[SourceChatLifecycleContext] = []
+        cause_matches: list[SourceChatLifecycleContext] = []
+        for row in rows:
+            (
+                command_message_id,
+                correlation_id,
+                telegram_user_id,
+                source_chat_key,
+                peer_kind,
+                telegram_chat_id,
+                registry_generation,
+                action,
+            ) = row
+            context = SourceChatLifecycleContext(
+                correlation_id=correlation_id,
+                command_message_id=command_message_id,
+                telegram_user_id=telegram_user_id,
+                source_chat_key=source_chat_key,
+                identity=TelegramPeerIdentity(
+                    kind=TelegramPeerKind(peer_kind),
+                    telegram_id=telegram_chat_id,
+                ),
+                registry_generation=registry_generation,
+                action=SourceChatLifecycleAction(action),
+            )
+            expected_message_id = derive_contract_message_id(
+                command_message_id,
+                ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+            )
+            if incoming.message_id == expected_message_id:
+                message_matches.append(context)
+            if incoming.causation_id == command_message_id:
+                cause_matches.append(context)
+        matches = message_matches or cause_matches
+        if len(matches) > 1:
+            raise RuntimeError("Bot terminal maps to multiple lifecycle origins")
         return matches[0] if matches else None
 
     @contextmanager
@@ -8994,6 +9708,125 @@ class PostgresRoleStore:
             _insert_outbox(connection, command)
             return True
 
+    def commit_source_chat_lifecycle_request(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one confirmed administrator Source Chat control."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant submits Source Chat controls")
+        payload = command.payload
+        if not isinstance(payload, dict):
+            raise TypeError("ChangeSourceChatRegistry payload must be an object")
+        action = payload.get("action")
+        source_chat_key = payload.get("source_chat_key")
+        peer_kind = payload.get("telegram_peer_kind")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        registry_generation = payload.get("registry_generation")
+        control_request_id = payload.get("control_request_id")
+        if (
+            action not in {item.value for item in SourceChatLifecycleAction}
+            or not isinstance(source_chat_key, str)
+            or not source_chat_key
+            or peer_kind not in {item.value for item in TelegramPeerKind}
+            or not isinstance(telegram_chat_id, int)
+            or isinstance(telegram_chat_id, bool)
+            or telegram_chat_id < 1
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
+            or registry_generation < 1
+            or control_request_id != str(command.message_id)
+        ):
+            raise ValueError("Source Chat lifecycle command origin is incomplete")
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, state.telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    last_bot_user_action_at = %s, updated_at = %s
+                WHERE telegram_user_id = %s
+                  AND revision = %s
+                  AND stage = 'source_chats'
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    recorded_at,
+                    recorded_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    recorded_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_lifecycle_origins (
+                    command_message_id, correlation_id, telegram_user_id,
+                    source_chat_key, telegram_peer_kind, telegram_chat_id,
+                    registry_generation, action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    command.message_id,
+                    command.correlation_id,
+                    state.telegram_user_id,
+                    source_chat_key,
+                    peer_kind,
+                    telegram_chat_id,
+                    registry_generation,
+                    action,
+                    recorded_at,
+                ),
+            )
+            _insert_outbox(connection, command)
+            return True
+
     def next_source_chat_registration_generation(self) -> int:
         """Allocate the next generation from immutable Bot registration origins."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
@@ -9087,6 +9920,134 @@ class PostgresRoleStore:
                     received_at=received_at,
                 )
             if current != (expected_revision, "source_chat_registration_pending"):
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    updated_at = %s
+                WHERE telegram_user_id = %s AND revision = %s
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    received_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=received_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+            return ConsumeResult.APPLIED
+
+    def accept_source_chat_lifecycle(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        received_at: datetime,
+        invalid_contract: bool = False,
+    ) -> ConsumeResult:
+        """Consume one lifecycle result and queue its Bot administration view."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError("only Bot Assistant presents Source Chat controls")
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (message.telegram_user_id,),
+            )
+            existing = connection.execute(
+                """
+                SELECT processing_status
+                FROM football_runtime.contract_inbox
+                WHERE consumer_role = %s AND message_id = %s
+                FOR UPDATE
+                """,
+                (self._role.value, incoming.message_id),
+            ).fetchone()
+            terminal_status = (
+                "rejected_invalid_contract" if invalid_contract else "accepted"
+            )
+            if existing is not None and existing[0] == terminal_status:
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.REPLAYED
+            current = connection.execute(
+                """
+                SELECT revision, stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            if invalid_contract:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.contract_inbox (
+                        consumer_role, message_id, producer_role, contract_name,
+                        contract_version, processing_status, received_at
+                    ) VALUES (%s, %s, %s, %s, %s,
+                              'rejected_invalid_contract', %s)
+                    ON CONFLICT (consumer_role, message_id) DO UPDATE
+                    SET processing_status = 'rejected_invalid_contract',
+                        received_at = EXCLUDED.received_at
+                    """,
+                    (
+                        self._role.value,
+                        incoming.message_id,
+                        incoming.producer.value,
+                        incoming.contract_name.value,
+                        incoming.contract_version,
+                        received_at,
+                    ),
+                )
+                _insert_alert(
+                    connection,
+                    observer=self._role,
+                    incoming=incoming,
+                    consumer=self._role,
+                    failure_code=FailureCode.INVALID_CONTRACT,
+                    observed_at=received_at,
+                )
+            else:
+                _accept_contract_inbox(
+                    connection,
+                    consumer=self._role,
+                    incoming=incoming,
+                    received_at=received_at,
+                )
+            if current != (expected_revision, "source_chats"):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             changed = connection.execute(
@@ -11210,6 +12171,8 @@ _EXACT_REPOST_PUBLICATION_REASONS = frozenset(
         "source_revision_superseded",
         "source_deleted",
         "response_route_unavailable",
+        "source_chat_paused",
+        "source_chat_removed",
         "exact_repost_superseded",
         "moderation_held",
         "moderation_suppressed",
@@ -12037,6 +13000,9 @@ def _reconcile_exact_repost_cluster(
         elif moderation_state == "suppressed":
             desired_state = "suppressed"
             desired_reason = forced_publication_reason or "moderation_suppressed"
+        elif row[10] in {"source_chat_paused", "source_chat_removed"}:
+            desired_state = "suppressed"
+            desired_reason = row[10]
         elif selected is not None and selected["opportunity_id"] == opportunity_id:
             desired_state = "active"
             desired_reason = None
@@ -12793,6 +13759,215 @@ def _scrub_recommendation_source_deleted_projection(
     )
 
 
+def _cancel_source_chat_work(
+    connection: psycopg.Connection[Any],
+    *,
+    identity: TelegramPeerIdentity,
+    registry_generation: int,
+    recorded_at: datetime,
+) -> int:
+    """Cancel unconsumed classifier and publication work for one generation."""
+    row = connection.execute(
+        """
+        SELECT football_runtime.cancel_source_chat_work(%s, %s, %s, %s)
+            AS cancelled_count
+        """,
+        (
+            identity.kind.value,
+            identity.telegram_id,
+            registry_generation,
+            recorded_at,
+        ),
+    ).fetchone()
+    return int(row["cancelled_count"]) if row is not None else 0
+
+
+def _suppress_source_chat_opportunities(
+    connection: psycopg.Connection[Any],
+    *,
+    identity: TelegramPeerIdentity,
+    registry_generation: int,
+    publication_reason: str,
+    lifecycle_action: str,
+    causation_id: UUID,
+    correlation_id: UUID,
+    recorded_at: datetime,
+) -> tuple[ContractEnvelope, ...]:
+    """Suppress every retained Opportunity and route for one Source Chat."""
+    if publication_reason not in {"source_chat_paused", "source_chat_removed"}:
+        raise ValueError("Source Chat publication reason is invalid")
+    if lifecycle_action not in {"pause", "remove"}:
+        raise ValueError("Source Chat lifecycle action is invalid")
+    source_message_ids = tuple(
+        row["source_message_id"]
+        for row in connection.execute(
+            """
+            SELECT source_message_id
+            FROM football_runtime.source_messages
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            ORDER BY source_message_id
+            FOR UPDATE
+            """,
+            (identity.kind.value, identity.telegram_id, registry_generation),
+        ).fetchall()
+    )
+    for source_message_id in source_message_ids:
+        _lock_source_message_lifecycle(
+            connection,
+            source_message_id=source_message_id,
+        )
+    rows = connection.execute(
+        """
+        SELECT opportunity.opportunity_id,
+               opportunity.opportunity_revision_id,
+               opportunity.source_message_revision_id,
+               opportunity.opportunity_type,
+               opportunity.publication_state,
+               opportunity.publication_reason,
+               opportunity.accepted_facts,
+               opportunity.response_route,
+               source.tombstoned
+        FROM football_runtime.application_opportunities AS opportunity
+        JOIN football_runtime.source_message_revisions AS revision
+          ON revision.source_message_revision_id =
+             opportunity.source_message_revision_id
+        JOIN football_runtime.source_messages AS source
+          ON source.source_message_id = revision.source_message_id
+        WHERE source.peer_kind = %s
+          AND source.telegram_chat_id = %s
+          AND source.registry_generation = %s
+        ORDER BY opportunity.opportunity_id
+        FOR UPDATE OF opportunity
+        """,
+        (identity.kind.value, identity.telegram_id, registry_generation),
+    ).fetchall()
+    if not rows:
+        return ()
+    cluster_ids = tuple(
+        row["exact_repost_cluster_id"]
+        for row in connection.execute(
+            """
+            SELECT DISTINCT member.exact_repost_cluster_id
+            FROM football_runtime.application_exact_repost_cluster_members AS member
+            JOIN football_runtime.application_opportunities AS opportunity
+              ON opportunity.opportunity_id = member.opportunity_id
+            JOIN football_runtime.source_message_revisions AS revision
+              ON revision.source_message_revision_id =
+                 opportunity.source_message_revision_id
+            JOIN football_runtime.source_messages AS source
+              ON source.source_message_id = revision.source_message_id
+            WHERE source.peer_kind = %s
+              AND source.telegram_chat_id = %s
+              AND source.registry_generation = %s
+            ORDER BY member.exact_repost_cluster_id
+            """,
+            (identity.kind.value, identity.telegram_id, registry_generation),
+        ).fetchall()
+    )
+    target_ids: set[str] = set()
+    outgoings: list[ContractEnvelope] = []
+    for row in rows:
+        opportunity_id = row["opportunity_id"]
+        opportunity_revision_id = row["opportunity_revision_id"]
+        opportunity_type = row["opportunity_type"]
+        target_ids.add(opportunity_id)
+        reason = "source_deleted" if row["tombstoned"] else publication_reason
+        connection.execute(
+            """
+            UPDATE football_runtime.application_opportunities
+            SET publication_state = 'suppressed',
+                publication_reason = %s,
+                response_route = %s::jsonb
+            WHERE opportunity_id = %s
+            """,
+            (reason, json.dumps(_UNAVAILABLE_RESPONSE_ROUTE), opportunity_id),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.application_exact_repost_cluster_members
+            SET publication_state = 'suppressed',
+                publication_reason = %s,
+                is_representative = FALSE
+            WHERE opportunity_id = %s
+            """,
+            (reason, opportunity_id),
+        )
+        if reason == "source_deleted" or (
+            row["publication_state"] == "suppressed"
+            and row["publication_reason"] == publication_reason
+        ):
+            continue
+        revision_number = _opportunity_revision_number(opportunity_revision_id)
+        if not isinstance(opportunity_type, str) or not opportunity_type:
+            raise ValueError("Source Chat Opportunity type is invalid")
+        lifecycle_causation_id = uuid5(
+            NAMESPACE_URL,
+            (
+                f"football-bot:{causation_id}:source-chat-lifecycle:"
+                f"{lifecycle_action}:{opportunity_id}"
+            ),
+        )
+        outgoings.append(
+            ContractEnvelope(
+                contract_name=ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                contract_version=(
+                    4
+                    if opportunity_type in {"coach_availability", "coach_request"}
+                    else 2
+                ),
+                message_id=derive_contract_message_id(
+                    lifecycle_causation_id,
+                    ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                ),
+                producer=RuntimeRole.APPLICATION,
+                consumer=RuntimeRole.RECOMMENDATION,
+                subject_id=opportunity_id,
+                subject_revision=revision_number,
+                idempotency_key=(
+                    "opportunity-publication-source-chat-lifecycle:"
+                    f"{lifecycle_action}:{opportunity_revision_id}"
+                ),
+                causation_id=lifecycle_causation_id,
+                correlation_id=correlation_id,
+                recorded_at=recorded_at,
+                payload={
+                    "opportunity_id": opportunity_id,
+                    "opportunity_revision_id": opportunity_revision_id,
+                    "source_message_revision_id": row["source_message_revision_id"],
+                    "publication_state": "suppressed",
+                    "publication_reason": publication_reason,
+                    "opportunity_type": opportunity_type,
+                    "accepted_facts": row["accepted_facts"],
+                    "response_route": _UNAVAILABLE_RESPONSE_ROUTE,
+                },
+            )
+        )
+    for cluster_id in cluster_ids:
+        changes, transition_revision = _reconcile_exact_repost_cluster(
+            connection,
+            exact_repost_cluster_id=cluster_id,
+            causation_seed=causation_id,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+        )
+        for change in changes:
+            if change["opportunity_id"] in target_ids:
+                continue
+            outgoings.append(
+                _exact_repost_publication_outgoing(
+                    change=change,
+                    cluster_id=cluster_id,
+                    transition_revision=transition_revision,
+                    causation_seed=causation_id,
+                    correlation_id=correlation_id,
+                    recorded_at=recorded_at,
+                )
+            )
+    return tuple(outgoings)
+
+
 def _lock_source_message_lifecycle(
     connection: psycopg.Connection[Any],
     *,
@@ -12802,6 +13977,23 @@ def _lock_source_message_lifecycle(
     connection.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
         (f"source-message-lifecycle:{source_message_id}",),
+    )
+
+
+def _lock_source_chat_peer(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_id: str,
+) -> None:
+    """Serialize Source Chat publication with lifecycle transitions."""
+    source_chat_peer_key, separator, _generation_suffix = source_message_id.partition(
+        ":generation:"
+    )
+    if not separator or not source_chat_peer_key.startswith("source-chat:"):
+        raise ValueError("Source Message identity has no Source Chat peer")
+    connection.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+        (source_chat_peer_key,),
     )
 
 
@@ -12879,6 +14071,92 @@ def _source_message_revision_is_current(
     )
 
 
+def _source_chat_revision_is_processable(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_revision_id: str,
+) -> bool:
+    """Confirm a current revision belongs to an enabled post-boundary chat."""
+    if not _is_complete_source_chat_revision(source_message_revision_id):
+        return True
+    row = connection.execute(
+        """
+        SELECT football_runtime.source_chat_revision_is_processable(%s)
+        """,
+        (source_message_revision_id,),
+    ).fetchone()
+    return bool(row[0]) if row is not None else False
+
+
+def _is_complete_source_chat_revision(source_message_revision_id: str) -> bool:
+    """Identify the generation-bound revisions governed by Source Chat state."""
+    return source_message_revision_id.startswith("source-chat:")
+
+
+def _recommendation_projection_values(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_id: str,
+    source_deleted: bool,
+    publication_state: str,
+    publication_reason: str | None,
+    response_route: JsonValue,
+) -> tuple[str, str | None, JsonValue]:
+    """Apply the Source Chat suppression barrier before Recommendation writes."""
+    if source_deleted:
+        return "suppressed", "source_deleted", _UNAVAILABLE_RESPONSE_ROUTE
+    lifecycle = connection.execute(
+        """
+        SELECT football_runtime.source_chat_opportunity_lifecycle_state(%s)
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    lifecycle_state = lifecycle[0] if lifecycle is not None else None
+    if lifecycle_state in {"paused", "removed"}:
+        return (
+            "suppressed",
+            "source_chat_removed"
+            if lifecycle_state == "removed"
+            else "source_chat_paused",
+            _UNAVAILABLE_RESPONSE_ROUTE,
+        )
+    previous = connection.execute(
+        """
+        SELECT publication_reason
+        FROM football_runtime.recommendation_opportunities
+        WHERE opportunity_id = %s
+          AND publication_reason IN ('source_chat_paused', 'source_chat_removed')
+        ORDER BY published_at DESC, opportunity_revision_id DESC
+        LIMIT 1
+        """,
+        (opportunity_id,),
+    ).fetchone()
+    if previous is not None:
+        return "suppressed", previous[0], _UNAVAILABLE_RESPONSE_ROUTE
+    return publication_state, publication_reason, response_route
+
+
+def _application_opportunity_is_lifecycle_suppressed(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_id: str,
+) -> bool:
+    """Keep a previously Source Chat-suppressed Opportunity one-way suppressed."""
+    return (
+        connection.execute(
+            """
+            SELECT 1
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_id = %s
+              AND publication_reason IN ('source_chat_paused', 'source_chat_removed')
+            LIMIT 1
+            """,
+            (opportunity_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def _scrub_ingestion_source_message_data(
     connection: psycopg.Connection[Any],
     *,
@@ -12946,7 +14224,7 @@ def _accept_contract_inbox(
 
 
 def _begin_owned_contract(
-    connection: psycopg.Connection[tuple[Any, ...]],
+    connection: psycopg.Connection[Any],
     *,
     consumer: RuntimeRole,
     incoming: RawContractEnvelope,
@@ -13025,7 +14303,7 @@ def _insert_alert(
 
 
 def _release_claim(
-    connection: psycopg.Connection[tuple[Any, ...]],
+    connection: psycopg.Connection[Any],
     message_id: UUID,
 ) -> None:
     connection.execute(

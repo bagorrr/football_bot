@@ -52,6 +52,8 @@ from modules.domain import (
     SourceChatAdmissionProvenance,
     SourceChatAdmissionResolution,
     SourceChatIngestionContext,
+    SourceChatLifecycleAction,
+    SourceChatLifecycleContext,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceEventRecord,
@@ -514,6 +516,25 @@ class ConversationStore(Protocol):
         """Commit one authorized Bot update and registry command atomically."""
         ...
 
+    def commit_source_chat_lifecycle_request(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one confirmed administrator Source Chat control atomically."""
+        ...
+
+    def source_chat_administration_views(
+        self,
+    ) -> tuple[SourceChatRegistryEntry, ...]:
+        """Read the narrow Bot administration view of Source Chat state."""
+        ...
+
     def next_source_chat_registration_generation(self) -> int:
         """Return the next durable one-administrator registration generation."""
         ...
@@ -543,6 +564,33 @@ class ConversationStore(Protocol):
         incoming: RawContractEnvelope,
     ) -> SourceChatRegistrationContext | None:
         """Recover the unique durable origin proven by a terminal causation chain."""
+        ...
+
+    def source_chat_lifecycle_origin(
+        self,
+        correlation_id: UUID,
+    ) -> SourceChatLifecycleContext | None:
+        """Recover one Bot-owned Source Chat lifecycle command origin."""
+        ...
+
+    def source_chat_lifecycle_origin_for_terminal(
+        self,
+        incoming: RawContractEnvelope,
+    ) -> SourceChatLifecycleContext | None:
+        """Recover the lifecycle origin proven by one terminal result."""
+        ...
+
+    def accept_source_chat_lifecycle(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        received_at: datetime,
+        invalid_contract: bool = False,
+    ) -> ConsumeResult:
+        """Consume one lifecycle result and queue its Bot presentation atomically."""
         ...
 
     def reject_invalid_contract(
@@ -736,6 +784,33 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
 
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
         """Read application-owned Source Chats through a stable query."""
+        ...
+
+    def source_chat_administration_views(
+        self,
+    ) -> tuple[SourceChatRegistryEntry, ...]:
+        """Read the narrow Bot administration view of Source Chat state."""
+        ...
+
+    def change_source_chat_lifecycle(
+        self,
+        *,
+        incoming: RawContractEnvelope,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        action: SourceChatLifecycleAction,
+        telegram_user_id: int,
+        outgoing: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one Application-owned Source Chat lifecycle transition."""
+        ...
+
+    def source_chat_revision_is_processable(
+        self,
+        source_message_revision_id: str,
+    ) -> bool:
+        """Return whether a Source Message revision may cross classification."""
         ...
 
     def configure_source_chat_classifier_context(

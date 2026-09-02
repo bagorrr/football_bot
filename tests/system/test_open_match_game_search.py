@@ -299,7 +299,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         revision=1,
         kind=SourceEventKind.CREATE,
         body=body,
-        event_time=datetime(2026, 7, 18, 9, 6, tzinfo=UTC),
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
     )
     assert system.process_next_channel_telegram_difference(
         identity=source_identity,
@@ -352,7 +352,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
     assert isinstance(active_edit_publication.payload, dict)
     edited_facts = active_edit_publication.payload["accepted_facts"]
     assert isinstance(edited_facts, dict)
-    assert edited_facts["source_posted_at"] == "2026-07-18T09:06:00+00:00"
+    assert edited_facts["source_posted_at"] == "2026-08-18T09:06:00+00:00"
     assert edited_facts["source_edited_at"] == "2026-08-18T10:06:00+00:00"
 
     _advance_to_complete_tournament_search(system, bot_user_id=49_117)
@@ -378,7 +378,7 @@ def test_tournament_with_event_time_and_open_participation_is_published() -> Non
         "Registration deadline: 19 August 2026 · "
         "Structure: Group stage · "
         "Capacity: 16 teams · Prizes: 1, 2\n\n"
-        "Posted: 18 July 2026 at 12:06\n"
+        "Posted: 18 August 2026 at 12:06\n"
         "Edited: 18 August 2026 at 13:06\n"
         "Contact: @tournament_contact\n\n"
         "Questions? Message me. I can explain the card or help refine your search."
@@ -2380,7 +2380,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
         revision=1,
         kind=SourceEventKind.CREATE,
         body=old_parent_body,
-        event_time=datetime(2026, 8, 17, 17, 59, 59, tzinfo=UTC),
+        event_time=datetime(2026, 8, 18, 17, 59, 59, tzinfo=UTC),
     )
     assert system.process_next_channel_telegram_difference(
         identity=source_identity,
@@ -2426,7 +2426,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     assert old_reply_context is not None
     assert old_reply_context["relationship_kind"] == "direct_reply"
     assert old_reply_context["body"] == old_parent_body
-    assert old_reply_context["source_event_time"] == "2026-08-17T17:59:59+00:00"
+    assert old_reply_context["source_event_time"] == "2026-08-18T17:59:59+00:00"
     assert any(
         opportunity.source_message_revision_id
         == "source-chat:channel:4900100:generation:1:message:1021:revision:1"

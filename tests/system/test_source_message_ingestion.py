@@ -407,6 +407,12 @@ def test_generation_replacement_serializes_before_account_ingestion_commit() -> 
         address="@synthetic_registry_race_one",
         update_suffix="registry-race-one",
     )
+    _remove_source_chat(
+        system,
+        administrator_id=administrator_id,
+        identity=identity,
+        update_suffix="registry-race-remove",
+    )
     system.initialize_account_ingestion_checkpoint(initial_checkpoint)
     telethon.add_account_difference_event(
         from_checkpoint=initial_checkpoint,
@@ -683,6 +689,12 @@ def test_reregistered_generation_has_distinct_classification_identity_and_replay
     )
     system.process_opportunities_until_idle()
 
+    _remove_source_chat(
+        system,
+        administrator_id=administrator_id,
+        identity=identity,
+        update_suffix="classification-generation-remove",
+    )
     _register_source_chat(
         system,
         clock=clock,
@@ -4379,6 +4391,45 @@ def _register_source_chat(
         update_id=f"address:{update_suffix}",
         telegram_user_id=administrator_id,
         address=address,
+    )
+    system.process_source_chat_registrations_until_idle()
+
+
+def _remove_source_chat(
+    system: AcceptanceSpine,
+    *,
+    administrator_id: int,
+    identity: TelegramPeerIdentity,
+    update_suffix: str,
+) -> None:
+    """Apply the revision-bound administrative removal through the Bot seam."""
+    entry = next(
+        entry
+        for entry in system.source_chats()
+        if entry.identity == identity and entry.permanently_removed_at is None
+    )
+    current = system.conversation_state(administrator_id)
+    request_revision = current.screen_revision
+    target = (
+        f"source-chats:remove:{identity.kind.value}:{identity.telegram_id}:"
+        f"{entry.registry_generation}:{request_revision}"
+    )
+    system.select_source_chats_action(
+        update_id=f"remove:{update_suffix}",
+        telegram_user_id=administrator_id,
+        action=target,
+        screen_revision=request_revision,
+    )
+    confirmation_revision = system.conversation_state(administrator_id).screen_revision
+    confirmation = (
+        f"source-chats:confirm:remove:{identity.kind.value}:{identity.telegram_id}:"
+        f"{entry.registry_generation}:{confirmation_revision}"
+    )
+    system.select_source_chats_action(
+        update_id=f"confirm-remove:{update_suffix}",
+        telegram_user_id=administrator_id,
+        action=confirmation,
+        screen_revision=confirmation_revision,
     )
     system.process_source_chat_registrations_until_idle()
 

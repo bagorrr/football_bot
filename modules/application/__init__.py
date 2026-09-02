@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from enum import IntEnum
 from hashlib import sha256
-from typing import cast
+from typing import TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -80,6 +80,9 @@ from modules.domain import (
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
+    SourceChatLifecycleAction,
+    SourceChatLifecycleContext,
+    SourceChatLifecycleState,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceEventKind,
@@ -1853,6 +1856,73 @@ _SOURCE_CHAT_REGISTERED_COPY = {
     "fr": "✅ Source Chat enregistré.\n\nConsentement initial confirmé.",
 }
 
+
+class _SourceChatLifecycleCopy(TypedDict):
+    actions: dict[str, str]
+    states: dict[str, str]
+    confirm: str
+    pending: str
+    result: str
+    confirm_button: str
+    cancel_button: str
+    menu_button: str
+
+
+_SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
+    "en": {
+        "actions": {"pause": "pause", "remove": "remove", "re_enable": "re-enable"},
+        "states": {"enabled": "enabled", "paused": "paused", "removed": "removed"},
+        "confirm": "Confirm {action} for {address}?",
+        "pending": "Applying Source Chat {action}...",
+        "result": "Source Chat {action} complete: {state}.",
+        "confirm_button": "Confirm",
+        "cancel_button": "Cancel",
+        "menu_button": "Menu",
+    },
+    "ru": {
+        "actions": {
+            "pause": "приостановить",
+            "remove": "удалить",
+            "re_enable": "включить снова",
+        },
+        "states": {
+            "enabled": "включён",
+            "paused": "приостановлен",
+            "removed": "удалён",
+        },
+        "confirm": "Подтвердить действие «{action}» для {address}?",
+        "pending": "Применяю действие «{action}» к Source Chat…",
+        "result": "Действие «{action}» для Source Chat завершено: {state}.",
+        "confirm_button": "Подтвердить",
+        "cancel_button": "Отмена",
+        "menu_button": "Меню",
+    },
+    "es": {
+        "actions": {"pause": "pausar", "remove": "eliminar", "re_enable": "reactivar"},
+        "states": {"enabled": "activo", "paused": "pausado", "removed": "eliminado"},
+        "confirm": "¿Confirma {action} el Source Chat {address}?",
+        "pending": "Aplicando {action} el Source Chat…",
+        "result": "Source Chat {action} completado: {state}.",
+        "confirm_button": "Confirmar",
+        "cancel_button": "Cancelar",
+        "menu_button": "Menú",
+    },
+    "fr": {
+        "actions": {
+            "pause": "mettre en pause",
+            "remove": "supprimer",
+            "re_enable": "réactiver",
+        },
+        "states": {"enabled": "activé", "paused": "en pause", "removed": "supprimé"},
+        "confirm": "Confirmer {action} pour le Source Chat {address} ?",
+        "pending": "Application de l’action « {action} » au Source Chat…",
+        "result": "Action « {action} » du Source Chat terminée : {state}.",
+        "confirm_button": "Confirmer",
+        "cancel_button": "Annuler",
+        "menu_button": "Menu",
+    },
+}
+
 _SOURCE_CHAT_INVALID_ADDRESS_COPY = {
     "en": (
         "Use a valid public @username or private https://t.me/+ invite link and try "
@@ -2418,7 +2488,38 @@ class ConversationOnboarding:
                         current=current,
                     )
                 else:
-                    self._queue_current_view(update_id=update_id, state=current)
+                    entries = self._store.source_chat_administration_views()
+                    control = _parse_source_chat_control_action(
+                        action,
+                        entries=entries,
+                        screen_revision=screen_revision,
+                    )
+                    if control is None:
+                        self._queue_current_view(update_id=update_id, state=current)
+                    else:
+                        phase, lifecycle_action, entry = control
+                        if phase == "cancel":
+                            self._show_source_chats(
+                                update_id=update_id,
+                                current=current,
+                            )
+                        elif entry is None or lifecycle_action is None:
+                            self._queue_current_view(update_id=update_id, state=current)
+                        elif phase == "confirm":
+                            self._submit_source_chat_lifecycle(
+                                update_id=update_id,
+                                current=current,
+                                entry=entry,
+                                action=lifecycle_action,
+                                entries=entries,
+                            )
+                        else:
+                            self._show_source_chat_confirmation(
+                                update_id=update_id,
+                                current=current,
+                                entry=entry,
+                                action=lifecycle_action,
+                            )
         self.deliver_pending()
 
     def submit_source_chat_address(
@@ -2561,6 +2662,7 @@ class ConversationOnboarding:
                 screen_revision=state.screen_revision,
                 selection=selection,
                 text=_source_chat_registered_text(locale, selection),
+                entries=self._store.source_chat_administration_views(),
             )
         else:
             state = replace(
@@ -2578,6 +2680,71 @@ class ConversationOnboarding:
                 is_administrator=False,
             )
         self._store.accept_source_chat_registration(
+            incoming=incoming,
+            expected_revision=current.revision,
+            state=state,
+            message=message,
+            received_at=self._clock.now(),
+        )
+
+    def accept_source_chat_lifecycle(
+        self,
+        *,
+        incoming: ContractEnvelope,
+    ) -> None:
+        """Present one terminal administrative Source Chat transition."""
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("SourceChatGenerationChanged payload must be an object")
+        origin = self._store.source_chat_lifecycle_origin(incoming.correlation_id)
+        proven_origin = self._store.source_chat_lifecycle_origin_for_terminal(incoming)
+        payload = incoming.payload
+        action = payload.get("action")
+        lifecycle_state = payload.get("lifecycle_state")
+        if (
+            origin is None
+            or proven_origin != origin
+            or not _source_chat_lifecycle_terminal_matches_origin(incoming, origin)
+            or action != origin.action.value
+            or payload.get("control_request_id") != str(origin.command_message_id)
+            or payload.get("source_chat_key") != origin.source_chat_key
+            or payload.get("telegram_user_id") != origin.telegram_user_id
+            or payload.get("telegram_peer_kind") != origin.identity.kind.value
+            or payload.get("telegram_chat_id") != origin.identity.telegram_id
+            or payload.get("registry_generation") != origin.registry_generation
+            or lifecycle_state
+            not in {
+                SourceChatLifecycleState.ENABLED.value,
+                SourceChatLifecycleState.PAUSED.value,
+                SourceChatLifecycleState.REMOVED.value,
+            }
+        ):
+            self.reject_invalid_source_chat_result(incoming=incoming)
+            return
+        current = self._store.conversation_state(origin.telegram_user_id)
+        if current is None:
+            raise LookupError(origin.telegram_user_id)
+        locale = current.locale or "en"
+        selection = self._language_rendering(locale)
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHATS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        message = _source_chats_message(
+            update_id=str(incoming.message_id),
+            telegram_user_id=origin.telegram_user_id,
+            locale=locale,
+            screen_revision=state.screen_revision,
+            selection=selection,
+            text=_source_chat_lifecycle_result_text(
+                origin.action,
+                SourceChatLifecycleState(str(lifecycle_state)),
+                locale,
+            ),
+            entries=self._store.source_chat_administration_views(),
+        )
+        self._store.accept_source_chat_lifecycle(
             incoming=incoming,
             expected_revision=current.revision,
             state=state,
@@ -2668,6 +2835,63 @@ class ConversationOnboarding:
         incoming: RawContractEnvelope,
     ) -> None:
         """Reject one malformed Bot terminal and release its correlated state."""
+        lifecycle_origin = self._store.source_chat_lifecycle_origin_for_terminal(
+            incoming
+        )
+        if lifecycle_origin is not None:
+            current = self._store.conversation_state(lifecycle_origin.telegram_user_id)
+            if current is None:
+                self._store.reject_invalid_contract(
+                    incoming=incoming,
+                    received_at=self._clock.now(),
+                )
+                return
+            locale = current.locale or "en"
+            is_administrator = self._is_administrator(lifecycle_origin.telegram_user_id)
+            if is_administrator:
+                state = replace(
+                    current,
+                    stage=ConversationStage.SOURCE_CHATS,
+                    screen_revision=current.screen_revision + 1,
+                    revision=current.revision + 1,
+                )
+                message = _source_chats_message(
+                    update_id=str(incoming.message_id),
+                    telegram_user_id=lifecycle_origin.telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    selection=self._language_rendering(locale),
+                    text=(
+                        "Source Chat "
+                        f"{lifecycle_origin.action.value.replace('_', ' ')} "
+                        "failed. Please try again."
+                    ),
+                    entries=self._store.source_chat_administration_views(),
+                )
+            else:
+                state = replace(
+                    current,
+                    stage=ConversationStage.SETTINGS,
+                    screen_revision=current.screen_revision + 1,
+                    revision=current.revision + 1,
+                )
+                message = _settings_message(
+                    update_id=str(incoming.message_id),
+                    telegram_user_id=lifecycle_origin.telegram_user_id,
+                    locale=locale,
+                    screen_revision=state.screen_revision,
+                    selection=self._language_rendering(locale),
+                    is_administrator=False,
+                )
+            self._store.accept_source_chat_lifecycle(
+                incoming=incoming,
+                expected_revision=current.revision,
+                state=state,
+                message=message,
+                received_at=self._clock.now(),
+                invalid_contract=True,
+            )
+            return
         origin = self._store.source_chat_registration_origin_for_terminal(incoming)
         if origin is None:
             self._store.reject_invalid_contract(
@@ -2841,8 +3065,106 @@ class ConversationOnboarding:
                 locale=locale,
                 screen_revision=state.screen_revision,
                 selection=selection,
+                entries=self._store.source_chat_administration_views(),
             ),
             recorded_at=self._clock.now(),
+        )
+
+    def _show_source_chat_confirmation(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        entry: SourceChatRegistryEntry,
+        action: SourceChatLifecycleAction,
+    ) -> None:
+        """Require one explicit confirmation before changing Source Chat state."""
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHATS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_chat_confirmation_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                entry=entry,
+                action=action,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _submit_source_chat_lifecycle(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        entry: SourceChatRegistryEntry,
+        action: SourceChatLifecycleAction,
+        entries: tuple[SourceChatRegistryEntry, ...],
+    ) -> None:
+        """Commit the confirmed lifecycle command and its Bot origin."""
+        recorded_at = self._clock.now()
+        source_chat_key = _source_chat_key(entry.identity)
+        command_message_id = _runtime_identifier(
+            update_id,
+            f"{ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value}:{action.value}",
+        )
+        command = ContractEnvelope(
+            contract_name=ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+            contract_version=2,
+            message_id=command_message_id,
+            producer=RuntimeRole.BOT_ASSISTANT,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=source_chat_key,
+            subject_revision=entry.registry_generation,
+            idempotency_key=(
+                "source-chat-lifecycle:"
+                f"{action.value}:{source_chat_key}:generation:"
+                f"{entry.registry_generation}:{command_message_id}"
+            ),
+            causation_id=command_message_id,
+            correlation_id=command_message_id,
+            recorded_at=recorded_at,
+            payload={
+                "action": action.value,
+                "source_chat_key": source_chat_key,
+                "telegram_user_id": current.telegram_user_id,
+                "telegram_peer_kind": entry.identity.kind.value,
+                "telegram_chat_id": entry.identity.telegram_id,
+                "registry_generation": entry.registry_generation,
+                "control_request_id": str(command_message_id),
+            },
+        )
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_CHATS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        locale = current.locale or "en"
+        self._store.commit_source_chat_lifecycle_request(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_chats_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale),
+                text=_source_chat_lifecycle_pending_text(action, locale),
+                entries=entries,
+            ),
+            command=command,
+            recorded_at=recorded_at,
         )
 
     def _show_source_chat_address_input(
@@ -12510,7 +12832,11 @@ def _source_chats_message(
     screen_revision: int,
     text: str | None = None,
     selection: LanguageSelection | None = None,
+    entries: tuple[SourceChatRegistryEntry, ...] = (),
 ) -> TelegramMessage:
+    lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
+        locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
+    )
     if locale in SUPPORTED_LOCALES:
         default_text, add, back, menu = _SOURCE_CHATS_COPY[locale]
     elif (
@@ -12523,18 +12849,237 @@ def _source_chats_message(
         add, back, menu = selection.source_chats_labels
     else:
         raise RuntimeError("Conversation Language has no Source Chats rendering")
+    button_rows: list[tuple[tuple[str, str], ...]] = []
+    status_lines: list[str] = []
+    for entry in entries:
+        state = lifecycle_copy["states"][entry.lifecycle_state.value]
+        status_lines.append(f"{entry.current_address} [{state}]")
+        if entry.lifecycle_state is SourceChatLifecycleState.ENABLED:
+            button_rows.append(
+                (
+                    (
+                        lifecycle_copy["actions"][
+                            SourceChatLifecycleAction.PAUSE.value
+                        ].capitalize(),
+                        _source_chat_control_callback(
+                            SourceChatLifecycleAction.PAUSE,
+                            entry,
+                            screen_revision,
+                        ),
+                    ),
+                    (
+                        lifecycle_copy["actions"][
+                            SourceChatLifecycleAction.REMOVE.value
+                        ].capitalize(),
+                        _source_chat_control_callback(
+                            SourceChatLifecycleAction.REMOVE,
+                            entry,
+                            screen_revision,
+                        ),
+                    ),
+                )
+            )
+        elif entry.lifecycle_state is SourceChatLifecycleState.PAUSED:
+            button_rows.append(
+                (
+                    (
+                        lifecycle_copy["actions"][
+                            SourceChatLifecycleAction.RE_ENABLE.value
+                        ].capitalize(),
+                        _source_chat_control_callback(
+                            SourceChatLifecycleAction.RE_ENABLE,
+                            entry,
+                            screen_revision,
+                        ),
+                    ),
+                    (
+                        lifecycle_copy["actions"][
+                            SourceChatLifecycleAction.REMOVE.value
+                        ].capitalize(),
+                        _source_chat_control_callback(
+                            SourceChatLifecycleAction.REMOVE,
+                            entry,
+                            screen_revision,
+                        ),
+                    ),
+                )
+            )
+    if entries:
+        default_text = default_text + "\n\n" + "\n".join(status_lines)
+    button_rows.extend(
+        (
+            ((add, f"source-chats:add:{screen_revision}"),),
+            ((back, f"source-chats:back:{screen_revision}"),),
+        )
+    )
+    rendered_text = text or default_text
+    if text is not None and entries:
+        rendered_text = text + "\n\n" + "\n".join(status_lines)
     return TelegramMessage(
         delivery_id=f"source-chats:{update_id}",
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
-        text=text or default_text,
-        button_rows=(
-            ((add, f"source-chats:add:{screen_revision}"),),
-            ((back, f"source-chats:back:{screen_revision}"),),
-        ),
+        text=rendered_text,
+        button_rows=tuple(button_rows),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_chat_key(identity: TelegramPeerIdentity) -> str:
+    """Return the stable contract identity of one Telegram peer."""
+    return str(
+        uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{identity.kind.value}:{identity.telegram_id}:source-chat",
+        )
+    )
+
+
+def _source_chat_control_callback(
+    action: SourceChatLifecycleAction,
+    entry: SourceChatRegistryEntry,
+    screen_revision: int,
+) -> str:
+    """Encode a revision-bound Source Chat control callback."""
+    return (
+        "source-chats:"
+        f"{action.value}:{entry.identity.kind.value}:{entry.identity.telegram_id}:"
+        f"{entry.registry_generation}:{screen_revision}"
+    )
+
+
+def _parse_source_chat_control_action(
+    value: str,
+    *,
+    entries: tuple[SourceChatRegistryEntry, ...],
+    screen_revision: int,
+) -> (
+    tuple[
+        str,
+        SourceChatLifecycleAction | None,
+        SourceChatRegistryEntry | None,
+    ]
+    | None
+):
+    """Parse one revision-bound Source Chats control callback."""
+    parts = value.strip().split(":")
+    if len(parts) < 3 or parts[0] != "source-chats":
+        return None
+    if parts[1] == "cancel":
+        if len(parts) != 3 or parts[2] != str(screen_revision):
+            return None
+        return "cancel", None, None
+    if parts[1] == "confirm":
+        phase = "confirm"
+        action_text = parts[2]
+        target_parts = parts[3:]
+    else:
+        phase = "request"
+        action_text = parts[1]
+        target_parts = parts[2:]
+    if len(target_parts) != 4:
+        return None
+    try:
+        action = SourceChatLifecycleAction(action_text)
+    except ValueError:
+        return None
+    peer_kind_text, chat_id_text, generation_text, callback_revision_text = target_parts
+    try:
+        peer_kind = TelegramPeerKind(peer_kind_text)
+        chat_id = int(chat_id_text)
+        generation = int(generation_text)
+        callback_revision = int(callback_revision_text)
+    except (TypeError, ValueError):
+        return None
+    if callback_revision != screen_revision:
+        return None
+    return (
+        phase,
+        action,
+        next(
+            (
+                entry
+                for entry in entries
+                if entry.identity.kind is peer_kind
+                and entry.identity.telegram_id == chat_id
+                and entry.registry_generation == generation
+            ),
+            None,
+        ),
+    )
+
+
+def _source_chat_confirmation_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    entry: SourceChatRegistryEntry,
+    action: SourceChatLifecycleAction,
+) -> TelegramMessage:
+    """Render the explicit confirmation required by Source Chat controls."""
+    lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
+        locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
+    )
+    return TelegramMessage(
+        delivery_id=f"source-chat-confirm:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=lifecycle_copy["confirm"].format(
+            action=lifecycle_copy["actions"][action.value],
+            address=entry.current_address,
+        ),
+        button_rows=(
+            (
+                (
+                    lifecycle_copy["confirm_button"],
+                    "source-chats:confirm:"
+                    f"{action.value}:{entry.identity.kind.value}:"
+                    f"{entry.identity.telegram_id}:{entry.registry_generation}:"
+                    f"{screen_revision}",
+                ),
+            ),
+            (
+                (
+                    lifecycle_copy["cancel_button"],
+                    f"source-chats:cancel:{screen_revision}",
+                ),
+            ),
+        ),
+        reply_button=lifecycle_copy["menu_button"],
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_chat_lifecycle_pending_text(
+    action: SourceChatLifecycleAction,
+    locale: str,
+) -> str:
+    """Render the short pending status for one durable control command."""
+    lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
+        locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
+    )
+    return lifecycle_copy["pending"].format(
+        action=lifecycle_copy["actions"][action.value],
+    )
+
+
+def _source_chat_lifecycle_result_text(
+    action: SourceChatLifecycleAction,
+    state: SourceChatLifecycleState,
+    locale: str,
+) -> str:
+    """Render the terminal state returned by Application."""
+    lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
+        locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
+    )
+    return lifecycle_copy["result"].format(
+        action=lifecycle_copy["actions"][action.value],
+        state=lifecycle_copy["states"][state.value],
     )
 
 
@@ -12941,6 +13486,14 @@ class RuntimeApplication:
                         ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
                     }
                     and definition.version in {2, 3, 4, 5, 6, 7}
+                )
+                or (
+                    definition.name
+                    in {
+                        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+                        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+                    }
+                    and definition.version == 2
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -13536,6 +14089,22 @@ class RuntimeApplication:
             )
             return result is ConsumeResult.APPLIED
         if (
+            self.role is RuntimeRole.CLASSIFICATION
+            and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and isinstance(incoming.payload, dict)
+        ):
+            revision_id = incoming.payload.get("source_message_revision_id")
+            if isinstance(
+                revision_id, str
+            ) and not self.store.source_chat_revision_is_processable(revision_id):
+                result = self.store.consume(
+                    incoming=incoming,
+                    supported_versions=self.versions_for(incoming.contract_name),
+                    received_at=self.clock.now(),
+                    outgoing=None,
+                )
+                return result is ConsumeResult.APPLIED
+        if (
             self.role is RuntimeRole.APPLICATION
             and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
             and isinstance(incoming.payload, dict)
@@ -13544,6 +14113,14 @@ class RuntimeApplication:
             if isinstance(revision_id, str) and ":revision:" in revision_id:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
                 if self.store.source_message_deletion_barrier(source_message_id):
+                    result = self.store.consume(
+                        incoming=incoming,
+                        supported_versions=self.versions_for(incoming.contract_name),
+                        received_at=self.clock.now(),
+                        outgoing=None,
+                    )
+                    return result is ConsumeResult.APPLIED
+                if not self.store.source_chat_revision_is_processable(revision_id):
                     result = self.store.consume(
                         incoming=incoming,
                         supported_versions=self.versions_for(incoming.contract_name),
@@ -13629,6 +14206,22 @@ class RuntimeApplication:
             )
             return True
         if (
+            self.role is RuntimeRole.CLASSIFICATION
+            and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
+            and isinstance(incoming.payload, dict)
+        ):
+            revision_id = incoming.payload.get("source_message_revision_id")
+            if isinstance(
+                revision_id, str
+            ) and not self.store.source_chat_revision_is_processable(revision_id):
+                self.store.consume(
+                    incoming=incoming,
+                    supported_versions=self.versions_for(incoming.contract_name),
+                    received_at=self.clock.now(),
+                    outgoing=None,
+                )
+                return True
+        if (
             self.role is RuntimeRole.APPLICATION
             and incoming.contract_name is ContractName.CLASSIFICATION_PROPOSAL
             and isinstance(incoming.payload, dict)
@@ -13637,6 +14230,14 @@ class RuntimeApplication:
             if isinstance(revision_id, str) and ":revision:" in revision_id:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
                 if self.store.source_message_deletion_barrier(source_message_id):
+                    self.store.consume(
+                        incoming=incoming,
+                        supported_versions=self.versions_for(incoming.contract_name),
+                        received_at=self.clock.now(),
+                        outgoing=None,
+                    )
+                    return True
+                if not self.store.source_chat_revision_is_processable(revision_id):
                     self.store.consume(
                         incoming=incoming,
                         supported_versions=self.versions_for(incoming.contract_name),
@@ -13984,6 +14585,16 @@ class RuntimeApplication:
             return True
         if (
             incoming.contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY
+            and incoming.contract_version == 2
+            and supported_incoming is not None
+        ):
+            self._change_source_chat_lifecycle(
+                supported_incoming,
+                inject_outbox_conflict=inject_outbox_conflict,
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY
             and supported_incoming is not None
         ):
             self._request_source_chat_admission(
@@ -14036,6 +14647,15 @@ class RuntimeApplication:
             and supported_incoming is not None
         ):
             self._conversation_onboarding().accept_source_chat_registration_failure(
+                incoming=supported_incoming
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED
+            and incoming.contract_version == 2
+            and supported_incoming is not None
+        ):
+            self._conversation_onboarding().accept_source_chat_lifecycle(
                 incoming=supported_incoming
             )
             return True
@@ -14133,6 +14753,18 @@ class RuntimeApplication:
                 outgoing=None,
             )
             return
+        if isinstance(incoming.payload, dict):
+            revision_id = incoming.payload.get("source_message_revision_id")
+            if isinstance(
+                revision_id, str
+            ) and not self.store.source_chat_revision_is_processable(revision_id):
+                self.store.consume(
+                    incoming=incoming,
+                    supported_versions=self.versions_for(incoming.contract_name),
+                    received_at=self.clock.now(),
+                    outgoing=None,
+                )
+                return
         artifact_descriptor = self.model.artifact_descriptor
         if (
             not classifier_artifact_descriptor_is_trusted(artifact_descriptor)
@@ -14162,6 +14794,14 @@ class RuntimeApplication:
         body = payload.get("body")
         if not isinstance(revision_id, str) or not isinstance(body, str):
             raise ValueError("classifier command requires revision identity and body")
+        if not self.store.source_chat_revision_is_processable(revision_id):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
         request = ClassifierRequest(
             source_message_revision_id=_opaque_classifier_reference(
                 revision_id, kind="revision"
@@ -14822,6 +15462,14 @@ class RuntimeApplication:
         body = payload.get("body")
         if not isinstance(revision_id, str) or not isinstance(body, str):
             raise ValueError("classifier command requires revision identity and body")
+        if not self.store.source_chat_revision_is_processable(revision_id):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
 
         routing_policy_version = descriptor.routing_policy_version
         request = ClassifierRequest(
@@ -16110,6 +16758,16 @@ class RuntimeApplication:
         revision_id = payload.get("source_message_revision_id")
         if not isinstance(revision_id, str):
             raise ValueError("ClassificationProposal requires revision identity")
+        if not self.store.source_chat_revision_is_processable(revision_id):
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(
+                    ContractName.CLASSIFICATION_PROPOSAL
+                ),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
         source_revision = self.store.source_message_revision(revision_id)
         if source_revision is None or source_revision.body is None:
             self.store.consume(
@@ -17009,6 +17667,93 @@ class RuntimeApplication:
         if self.role is not RuntimeRole.RECOMMENDATION:
             raise RuntimeError("only Recommendation executes Search")
         self.search_failures_remaining += 1
+
+    def _change_source_chat_lifecycle(
+        self,
+        incoming: ContractEnvelope,
+        *,
+        inject_outbox_conflict: bool = False,
+    ) -> None:
+        """Apply one exact-administrator Source Chat lifecycle command."""
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application changes Source Chat lifecycle")
+        if not isinstance(incoming.payload, dict):
+            raise TypeError("ChangeSourceChatRegistry payload must be an object")
+        raw_action = incoming.payload.get("action")
+        raw_peer_kind = incoming.payload.get("telegram_peer_kind")
+        telegram_user_id = incoming.payload["telegram_user_id"]
+        telegram_chat_id = incoming.payload["telegram_chat_id"]
+        registry_generation = incoming.payload["registry_generation"]
+        if not isinstance(raw_action, str) or not isinstance(raw_peer_kind, str):
+            raise TypeError("Source Chat lifecycle identity is invalid")
+        if (
+            not isinstance(telegram_user_id, int)
+            or isinstance(telegram_user_id, bool)
+            or not isinstance(telegram_chat_id, int)
+            or isinstance(telegram_chat_id, bool)
+            or not isinstance(registry_generation, int)
+            or isinstance(registry_generation, bool)
+        ):
+            raise TypeError("Source Chat lifecycle identity is invalid")
+        action = SourceChatLifecycleAction(raw_action)
+        identity = TelegramPeerIdentity(
+            kind=TelegramPeerKind(raw_peer_kind),
+            telegram_id=telegram_chat_id,
+        )
+        if telegram_user_id != self.telegram_admin_user_id:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return
+        resulting_state = {
+            SourceChatLifecycleAction.PAUSE: SourceChatLifecycleState.PAUSED,
+            SourceChatLifecycleAction.REMOVE: SourceChatLifecycleState.REMOVED,
+            SourceChatLifecycleAction.RE_ENABLE: SourceChatLifecycleState.ENABLED,
+        }[action]
+        recorded_at = self.clock.now()
+        outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+            contract_version=2,
+            message_id=derive_contract_message_id(
+                incoming.message_id,
+                ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.BOT_ASSISTANT,
+            subject_id=incoming.subject_id,
+            subject_revision=registry_generation,
+            idempotency_key=f"source-chat-lifecycle-result:{incoming.message_id}",
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "action": action.value,
+                "source_chat_key": incoming.subject_id,
+                "telegram_user_id": telegram_user_id,
+                "telegram_peer_kind": identity.kind.value,
+                "telegram_chat_id": identity.telegram_id,
+                "registry_generation": registry_generation,
+                "control_request_id": str(incoming.message_id),
+                "lifecycle_state": resulting_state.value,
+            },
+        )
+        if inject_outbox_conflict:
+            outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        try:
+            self.store.change_source_chat_lifecycle(
+                incoming=incoming,
+                identity=identity,
+                registry_generation=registry_generation,
+                action=action,
+                telegram_user_id=telegram_user_id,
+                outgoing=outgoing,
+                received_at=recorded_at,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
 
     def _request_source_chat_admission(
         self,
@@ -18906,6 +19651,24 @@ def _source_chat_terminal_matches_origin(
         return False
     return incoming.causation_id in eligible_causes and incoming.message_id == (
         derive_contract_message_id(incoming.causation_id, incoming.contract_name)
+    )
+
+
+def _source_chat_lifecycle_terminal_matches_origin(
+    incoming: RawContractEnvelope,
+    origin: SourceChatLifecycleContext,
+) -> bool:
+    """Require the v2 lifecycle result to be directly caused by its command."""
+    return (
+        incoming.contract_name is ContractName.SOURCE_CHAT_GENERATION_CHANGED
+        and incoming.contract_version == 2
+        and incoming.correlation_id == origin.correlation_id
+        and incoming.causation_id == origin.command_message_id
+        and incoming.message_id
+        == derive_contract_message_id(
+            origin.command_message_id,
+            ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+        )
     )
 
 

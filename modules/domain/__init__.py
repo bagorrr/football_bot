@@ -414,6 +414,22 @@ class SourceChatAddressKind(StrEnum):
     PRIVATE_INVITE = "private_invite"
 
 
+class SourceChatLifecycleAction(StrEnum):
+    """Explicit administrator transition for one complete Source Chat."""
+
+    PAUSE = "pause"
+    REMOVE = "remove"
+    RE_ENABLE = "re_enable"
+
+
+class SourceChatLifecycleState(StrEnum):
+    """Durable administrative state of one Source Chat registry row."""
+
+    ENABLED = "enabled"
+    PAUSED = "paused"
+    REMOVED = "removed"
+
+
 class SourceEventKind(StrEnum):
     """Account-visible Telegram change represented at the ingestion boundary."""
 
@@ -609,6 +625,7 @@ class SourceChatRegistryEntry:
     classifier_timezone: str | None = None
     classifier_country_id: str | None = None
     classifier_city_id: str | None = None
+    permanently_removed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.registry_generation < 1:
@@ -618,6 +635,17 @@ class SourceChatRegistryEntry:
             kind=self.address_kind,
         ):
             raise ValueError("Source Chat registry address is invalid")
+
+    @property
+    def lifecycle_state(self) -> SourceChatLifecycleState:
+        """Return the explicit administrative state represented by the row."""
+        if self.permanently_removed_at is not None:
+            return SourceChatLifecycleState.REMOVED
+        return (
+            SourceChatLifecycleState.ENABLED
+            if self.enabled
+            else SourceChatLifecycleState.PAUSED
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -877,6 +905,19 @@ class SourceChatRegistrationContext:
     origin_subject_id: str
     origin_subject_revision: int
     registry_generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class SourceChatLifecycleContext:
+    """Bot-owned origin facts for one explicit Source Chat control."""
+
+    correlation_id: UUID
+    command_message_id: UUID
+    telegram_user_id: int
+    source_chat_key: str
+    identity: TelegramPeerIdentity
+    registry_generation: int
+    action: SourceChatLifecycleAction
 
 
 @dataclass(frozen=True, slots=True)
