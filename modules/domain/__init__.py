@@ -488,6 +488,21 @@ def source_publisher_id_from_metadata(
     return value
 
 
+def telegram_moderation_triggers(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return current Telegram scam/fake signals without exposing accusations."""
+    triggers: list[str] = []
+    for flag in ("scam", "fake"):
+        if any(
+            isinstance(flags, list) and flag in flags
+            for flags in (
+                metadata.get("telegram_publisher_flags"),
+                metadata.get("telegram_author_flags"),
+            )
+        ):
+            triggers.append(f"telegram_{flag}")
+    return tuple(triggers)
+
+
 def is_valid_opaque_source_publisher_id(value: object) -> bool:
     """Accept only the internal, non-transport Source Publisher reference."""
     return (
@@ -3197,6 +3212,23 @@ class ClassificationRoutingOutcome:
     pass_number: int
     candidate_count: int
     recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ModerationEvent:
+    """Body-free audit event for one protected moderation transition."""
+
+    moderation_event_id: str
+    source_message_revision_id: str
+    opportunity_id: str | None
+    opportunity_revision_id: str | None
+    exact_repost_cluster_id: str | None
+    trigger: str
+    event_kind: str
+    telegram_user_id: int | None
+    reason: str | None
+    recorded_at: datetime
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

@@ -67,6 +67,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    ModerationEvent,
     Opportunity,
     ProtectedContentSkip,
     RequiredDate,
@@ -418,6 +419,14 @@ class ControlledTelegramIngestionAdapter:
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
         source_publisher_id: str | None = None,
+        telegram_publisher_flags: tuple[str, ...] = (),
+        telegram_author_flags: tuple[str, ...] = (),
+        telegram_scam: bool = False,
+        telegram_fake: bool = False,
+        telegram_restricted: bool = False,
+        telegram_author_scam: bool = False,
+        telegram_author_fake: bool = False,
+        telegram_author_restricted: bool = False,
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
@@ -431,6 +440,30 @@ class ControlledTelegramIngestionAdapter:
         }
         if source_publisher_id is not None:
             bounded_metadata["source_publisher_id"] = source_publisher_id
+        publisher_flags = list(telegram_publisher_flags)
+        publisher_flags.extend(
+            flag
+            for flag, enabled in (
+                ("scam", telegram_scam),
+                ("fake", telegram_fake),
+                ("restricted", telegram_restricted),
+            )
+            if enabled and flag not in publisher_flags
+        )
+        author_flags = list(telegram_author_flags)
+        author_flags.extend(
+            flag
+            for flag, enabled in (
+                ("scam", telegram_author_scam),
+                ("fake", telegram_author_fake),
+                ("restricted", telegram_author_restricted),
+            )
+            if enabled and flag not in author_flags
+        )
+        if publisher_flags:
+            bounded_metadata["telegram_publisher_flags"] = publisher_flags
+        if author_flags:
+            bounded_metadata["telegram_author_flags"] = author_flags
         self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
@@ -582,6 +615,14 @@ class ControlledTelegramIngestionAdapter:
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
         source_publisher_id: str | None = None,
+        telegram_publisher_flags: tuple[str, ...] = (),
+        telegram_author_flags: tuple[str, ...] = (),
+        telegram_scam: bool = False,
+        telegram_fake: bool = False,
+        telegram_restricted: bool = False,
+        telegram_author_scam: bool = False,
+        telegram_author_fake: bool = False,
+        telegram_author_restricted: bool = False,
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
@@ -595,6 +636,30 @@ class ControlledTelegramIngestionAdapter:
         }
         if source_publisher_id is not None:
             bounded_metadata["source_publisher_id"] = source_publisher_id
+        publisher_flags = list(telegram_publisher_flags)
+        publisher_flags.extend(
+            flag
+            for flag, enabled in (
+                ("scam", telegram_scam),
+                ("fake", telegram_fake),
+                ("restricted", telegram_restricted),
+            )
+            if enabled and flag not in publisher_flags
+        )
+        author_flags = list(telegram_author_flags)
+        author_flags.extend(
+            flag
+            for flag, enabled in (
+                ("scam", telegram_author_scam),
+                ("fake", telegram_author_fake),
+                ("restricted", telegram_author_restricted),
+            )
+            if enabled and flag not in author_flags
+        )
+        if publisher_flags:
+            bounded_metadata["telegram_publisher_flags"] = publisher_flags
+        if author_flags:
+            bounded_metadata["telegram_author_flags"] = author_flags
         self._channel_difference_events[(identity, from_checkpoint)] = (
             TelegramDifferenceEvent(
                 source_chat_identity=identity,
@@ -2377,6 +2442,32 @@ class AcceptanceSpine:
             decision=decision,
             recorded_at=application.clock.now(),
         )
+
+    def moderate_opportunity(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        decision: str,
+        telegram_user_id: int,
+    ) -> bool:
+        """Apply one protected moderation decision through Application."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.moderate_opportunity(
+            opportunity_id=opportunity_id,
+            opportunity_revision_id=opportunity_revision_id,
+            decision=decision,
+            telegram_user_id=telegram_user_id,
+        )
+
+    def expire_moderation_reviews(self) -> int:
+        """Run the bounded Application moderation-timeout sweep."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.expire_moderation_reviews()
+
+    def moderation_events(self) -> tuple[ModerationEvent, ...]:
+        """Observe the body-free moderation audit trail."""
+        return self._observer.moderation_events()
 
     def opportunity_publication_contracts(
         self, source_message_revision_id: str

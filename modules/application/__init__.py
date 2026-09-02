@@ -95,6 +95,7 @@ from modules.domain import (
     empty_bounded_source_metadata,
     is_valid_source_chat_address,
     render_response_route,
+    telegram_moderation_triggers,
 )
 from modules.ports import (
     AcceptanceRoleStore,
@@ -13559,10 +13560,44 @@ class RuntimeApplication:
         )
         return result is ConsumeResult.APPLIED
 
+    def moderate_opportunity(
+        self,
+        *,
+        opportunity_id: str,
+        opportunity_revision_id: str,
+        decision: str,
+        telegram_user_id: int,
+    ) -> bool:
+        """Apply moderation only for the configured Telegram administrator."""
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application moderates Opportunities")
+        if decision not in {"approve", "suppress"}:
+            return False
+        if (
+            self.telegram_admin_user_id is None
+            or telegram_user_id != self.telegram_admin_user_id
+        ):
+            return False
+        return self.store.moderate_opportunity(
+            opportunity_id=opportunity_id,
+            opportunity_revision_id=opportunity_revision_id,
+            decision=decision,
+            telegram_user_id=telegram_user_id,
+            recorded_at=self.clock.now(),
+        )
+
+    def expire_moderation_reviews(self) -> int:
+        """Finalize Application moderation reviews at the current clock time."""
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application expires moderation reviews")
+        return self.store.expire_moderation_reviews(as_of=self.clock.now())
+
     def process_next(self, *, inject_outbox_conflict: bool = False) -> bool:
         """Discover and process one durable handoff addressed to this role."""
         if self.role is RuntimeRole.APPLICATION:
+            self.store.expire_moderation_reviews(as_of=self.clock.now())
             self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
+            self.store.cleanup_expired_moderation_events(as_of=self.clock.now())
         claimed = self.store.claim_next(
             supported_versions=self.supported_versions,
             claimed_at=self.clock.now(),
@@ -16527,6 +16562,10 @@ class RuntimeApplication:
                             received_at=self.clock.now(),
                         )
                         return
+                    _apply_telegram_moderation_gate(
+                        accepted_candidate,
+                        metadata=source_revision.bounded_metadata,
+                    )
                     accepted_opportunities.append(accepted_candidate)
                 lineages = _reconcile_proposition_lineages(
                     source_message_id=source_message_id,
@@ -16673,7 +16712,19 @@ class RuntimeApplication:
                             "opportunity_id": active_opportunity_id,
                             "opportunity_revision_id": active_opportunity_revision_id,
                             "source_message_revision_id": revision_id,
-                            "publication_state": "active",
+                            "publication_state": active_opportunity[
+                                "publication_state"
+                            ],
+                            **(
+                                {
+                                    "publication_reason": active_opportunity[
+                                        "publication_reason"
+                                    ]
+                                }
+                                if active_opportunity.get("publication_reason")
+                                is not None
+                                else {}
+                            ),
                             "opportunity_type": active_opportunity["opportunity_type"],
                             "accepted_facts": active_opportunity["accepted_facts"],
                             "response_route": active_opportunity["response_route"],
@@ -16751,10 +16802,27 @@ class RuntimeApplication:
                     recorded_at=self.clock.now(),
                     payload={
                         "source_message_revision_id": revision_id,
-                        "publication_state": "active",
+                        "publication_state": (
+                            "held_for_review"
+                            if any(
+                                item.get("publication_state") == "held_for_review"
+                                for item in accepted_opportunities
+                            )
+                            else "active"
+                        ),
                         "opportunities": cast(JsonValue, publication_items),
                     },
                 )
+                if any(
+                    item.get("publication_state") == "held_for_review"
+                    for item in accepted_opportunities
+                ):
+                    batch_payload = cast(dict[str, JsonValue], batch_outgoing.payload)
+                    batch_payload["publication_reason"] = "moderation_held"
+                    batch_outgoing = replace(
+                        batch_outgoing,
+                        payload=cast(JsonValue, batch_payload),
+                    )
                 self.store.publish_opportunities(
                     incoming=incoming,
                     opportunities=tuple(accepted_opportunities),
@@ -16830,6 +16898,10 @@ class RuntimeApplication:
                 received_at=self.clock.now(),
             )
             return
+        _apply_telegram_moderation_gate(
+            accepted,
+            metadata=source_revision.bounded_metadata,
+        )
         source_message_id = revision_id.rsplit(":revision:", 1)[0]
         lineages = _reconcile_proposition_lineages(
             source_message_id=source_message_id,
@@ -16905,7 +16977,12 @@ class RuntimeApplication:
                 "opportunity_id": opportunity_id,
                 "opportunity_revision_id": opportunity_revision_id,
                 "source_message_revision_id": revision_id,
-                "publication_state": "active",
+                "publication_state": accepted["publication_state"],
+                **(
+                    {"publication_reason": accepted["publication_reason"]}
+                    if accepted.get("publication_reason") is not None
+                    else {}
+                ),
                 "opportunity_type": accepted["opportunity_type"],
                 "accepted_facts": accepted["accepted_facts"],
                 "response_route": accepted["response_route"],
@@ -19882,6 +19959,17 @@ def _classification_validation_reason(payload: dict[str, JsonValue]) -> str:
 def _response_route_is_unavailable(value: JsonValue | None) -> bool:
     """Recognize the body-free route state used when direct contact is lost."""
     return value == {"kind": "unavailable", "value": ""}
+
+
+def _apply_telegram_moderation_gate(
+    opportunity: dict[str, JsonValue],
+    *,
+    metadata: Mapping[str, object],
+) -> None:
+    """Hold an otherwise accepted opportunity for a current scam/fake signal."""
+    if telegram_moderation_triggers(metadata):
+        opportunity["publication_state"] = "held_for_review"
+        opportunity["publication_reason"] = "moderation_held"
 
 
 def _classification_routing_outcome(

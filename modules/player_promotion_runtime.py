@@ -1823,6 +1823,14 @@ class DurableAcceptanceProbe:
         event_time: datetime | None = None,
         process: bool = True,
         inject_database_failure: bool = False,
+        telegram_publisher_flags: tuple[str, ...] = (),
+        telegram_author_flags: tuple[str, ...] = (),
+        telegram_scam: bool = False,
+        telegram_fake: bool = False,
+        telegram_restricted: bool = False,
+        telegram_author_scam: bool = False,
+        telegram_author_fake: bool = False,
+        telegram_author_restricted: bool = False,
     ) -> tuple[str | None, dict[str, JsonValue]]:
         message_id = telegram_message_id or (100_000 + uuid4().int % 1_000_000_000)
         checkpoint = self.system.channel_ingestion_checkpoint(
@@ -1842,6 +1850,14 @@ class DurableAcceptanceProbe:
             body=body,
             event_time=event_time or self.clock.now(),
             source_publisher_id=source_publisher_id,
+            telegram_publisher_flags=telegram_publisher_flags,
+            telegram_author_flags=telegram_author_flags,
+            telegram_scam=telegram_scam,
+            telegram_fake=telegram_fake,
+            telegram_restricted=telegram_restricted,
+            telegram_author_scam=telegram_author_scam,
+            telegram_author_fake=telegram_author_fake,
+            telegram_author_restricted=telegram_author_restricted,
             reply_to_telegram_message_id=reply_to_telegram_message_id,
         )
         try:
