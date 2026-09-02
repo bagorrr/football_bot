@@ -354,6 +354,14 @@ SUPPORTED_CONTRACTS = (
         ("telegram_user_id",),
     ),
     ContractDefinition(
+        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        2,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.APPLICATION,
+        "source_chat_key",
+        ("telegram_user_id", "telegram_chat_id", "registry_generation"),
+    ),
+    ContractDefinition(
         ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
         1,
         RuntimeRole.APPLICATION,
@@ -386,6 +394,14 @@ SUPPORTED_CONTRACTS = (
     ContractDefinition(
         ContractName.SOURCE_CHAT_GENERATION_CHANGED,
         1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "source_chat_key",
+        ("telegram_user_id", "telegram_chat_id", "registry_generation"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+        2,
         RuntimeRole.APPLICATION,
         RuntimeRole.BOT_ASSISTANT,
         "source_chat_key",
@@ -587,10 +603,12 @@ class ContractEnvelope(RawContractEnvelope):
         }:
             _validate_source_chat_contract(
                 self.contract_name,
+                self.contract_version,
                 self.payload,
                 message_id=self.message_id,
                 causation_id=self.causation_id,
                 correlation_id=self.correlation_id,
+                idempotency_key=self.idempotency_key,
                 subject_id=self.subject_id,
                 subject_revision=self.subject_revision,
             )
@@ -2521,6 +2539,8 @@ def _validate_opportunity_publication_changed(
             "moderation_held",
             "moderation_suppressed",
             "review_timeout",
+            "source_chat_paused",
+            "source_chat_removed",
         }:
             raise ValueError("Opportunity publication reason is invalid")
         if (
@@ -2554,6 +2574,8 @@ def _validate_opportunity_publication_changed(
             "source_revision_superseded",
             "source_deleted",
             "response_route_unavailable",
+            "source_chat_paused",
+            "source_chat_removed",
         }
         and route == {"kind": "unavailable", "value": ""}
     ):
@@ -2597,6 +2619,12 @@ def _validate_opportunity_publication_changed(
     if re.fullmatch(
         rf"opportunity-publication-moderation:{re.escape(opportunity_revision_id)}"
         r":[0-9a-f-]{36}",
+        envelope.idempotency_key,
+    ):
+        allowed_idempotency_keys.add(envelope.idempotency_key)
+    if re.fullmatch(
+        rf"opportunity-publication-source-chat-lifecycle:(?:pause|remove):"
+        rf"{re.escape(opportunity_revision_id)}",
         envelope.idempotency_key,
     ):
         allowed_idempotency_keys.add(envelope.idempotency_key)
@@ -2647,6 +2675,8 @@ def _validate_opportunity_publication_batch_changed(
         "moderation_held",
         "moderation_suppressed",
         "review_timeout",
+        "source_chat_paused",
+        "source_chat_removed",
     }:
         raise ValueError(
             "OpportunityPublicationChanged v3 publication reason is invalid"
@@ -2813,6 +2843,8 @@ def _validate_opportunity_publication_changed_with_types(
             "moderation_suppressed",
             "response_route_unavailable",
             "review_timeout",
+            "source_chat_paused",
+            "source_chat_removed",
         }:
             raise ValueError("Opportunity publication reason is invalid")
         if (
@@ -2839,7 +2871,12 @@ def _validate_opportunity_publication_changed_with_types(
         raise TypeError("response_route must contain kind and value")
     route_kind = route["kind"]
     route_value = route["value"]
+    publication_state = payload["publication_state"]
     valid_route = (
+        publication_state == "suppressed"
+        and publication_reason in {"source_chat_paused", "source_chat_removed"}
+        and route == {"kind": "unavailable", "value": ""}
+    ) or (
         isinstance(route_value, str)
         and bool(route_value)
         and (
@@ -2876,6 +2913,12 @@ def _validate_opportunity_publication_changed_with_types(
     if re.fullmatch(
         rf"opportunity-publication-moderation:{re.escape(opportunity_revision_id)}"
         r":[0-9a-f-]{36}",
+        envelope.idempotency_key,
+    ):
+        allowed_idempotency_keys.add(envelope.idempotency_key)
+    if re.fullmatch(
+        rf"opportunity-publication-source-chat-lifecycle:(?:pause|remove):"
+        rf"{re.escape(opportunity_revision_id)}",
         envelope.idempotency_key,
     ):
         allowed_idempotency_keys.add(envelope.idempotency_key)
@@ -2939,6 +2982,8 @@ def _validate_opportunity_publication_batch_changed_with_types(
         "moderation_held",
         "moderation_suppressed",
         "review_timeout",
+        "source_chat_paused",
+        "source_chat_removed",
     }:
         raise ValueError(
             "OpportunityPublicationChanged v3 publication reason is invalid"
@@ -4077,14 +4122,31 @@ def _validate_source_stream_stopped(
 
 def _validate_source_chat_contract(
     contract_name: ContractName,
+    contract_version: int,
     payload: dict[str, JsonValue],
     *,
     message_id: UUID,
     causation_id: UUID,
     correlation_id: UUID,
+    idempotency_key: str,
     subject_id: str,
     subject_revision: int,
 ) -> None:
+    if contract_version == 2 and contract_name in {
+        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+    }:
+        _validate_source_chat_lifecycle_contract(
+            contract_name,
+            payload,
+            message_id=message_id,
+            causation_id=causation_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            subject_id=subject_id,
+            subject_revision=subject_revision,
+        )
+        return
     if contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY:
         if set(payload) - {
             "address",
@@ -4258,6 +4320,99 @@ def _validate_source_chat_contract(
         raise ValueError("Source Chat contract requires a supported address kind")
     if not _required_text(payload, "transport_boundary").strip():
         raise ValueError("Source Chat contract requires a transport boundary")
+
+
+def _validate_source_chat_lifecycle_contract(
+    contract_name: ContractName,
+    payload: dict[str, JsonValue],
+    *,
+    message_id: UUID,
+    causation_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    subject_id: str,
+    subject_revision: int,
+) -> None:
+    """Validate the v2 administrative Source Chat state transition wire."""
+    command_fields = {
+        "action",
+        "source_chat_key",
+        "telegram_user_id",
+        "telegram_peer_kind",
+        "telegram_chat_id",
+        "registry_generation",
+        "control_request_id",
+    }
+    result_fields = command_fields | {"lifecycle_state"}
+    expected_fields = (
+        command_fields
+        if contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY
+        else result_fields
+    )
+    if set(payload) != expected_fields:
+        raise ValueError("Source Chat lifecycle contract has incomplete semantics")
+    action = _required_text(payload, "action")
+    if action not in {"pause", "remove", "re_enable"}:
+        raise ValueError("Source Chat lifecycle action is invalid")
+    peer_kind = _required_text(payload, "telegram_peer_kind")
+    if peer_kind not in {"chat", "channel"}:
+        raise ValueError("Source Chat lifecycle peer kind is invalid")
+    telegram_chat_id = payload.get("telegram_chat_id")
+    registry_generation = payload.get("registry_generation")
+    telegram_user_id = payload.get("telegram_user_id")
+    for field_name, value in (
+        ("telegram_user_id", telegram_user_id),
+        ("telegram_chat_id", telegram_chat_id),
+        ("registry_generation", registry_generation),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"Source Chat lifecycle {field_name} must be positive")
+    assert isinstance(telegram_chat_id, int)
+    assert isinstance(registry_generation, int)
+    expected_key = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{peer_kind}:{telegram_chat_id}:source-chat",
+        )
+    )
+    source_chat_key = _required_text(payload, "source_chat_key")
+    if source_chat_key != expected_key or source_chat_key != subject_id:
+        raise ValueError("Source Chat lifecycle key is inconsistent")
+    if registry_generation != subject_revision:
+        raise ValueError("Source Chat lifecycle generation is inconsistent")
+    control_request_id = _required_text(payload, "control_request_id")
+    if contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY:
+        if message_id != causation_id or message_id != correlation_id:
+            raise ValueError(
+                "Source Chat lifecycle command causation and correlation must match"
+            )
+        if control_request_id != str(message_id):
+            raise ValueError("Source Chat lifecycle command identity is inconsistent")
+        if (
+            re.fullmatch(
+                rf"source-chat-lifecycle:{re.escape(action)}:{re.escape(source_chat_key)}"
+                rf":generation:{registry_generation}:[0-9a-f-]{{36}}",
+                idempotency_key,
+            )
+            is None
+        ):
+            raise ValueError("Source Chat lifecycle command idempotency is invalid")
+        if not correlation_id == message_id:
+            raise ValueError("Source Chat lifecycle command correlation is invalid")
+        return
+    if payload.get("lifecycle_state") not in {"enabled", "paused", "removed"}:
+        raise ValueError("Source Chat lifecycle state is invalid")
+    if control_request_id != str(causation_id):
+        raise ValueError("Source Chat lifecycle result identity is inconsistent")
+    if message_id != derive_contract_message_id(
+        causation_id,
+        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+    ):
+        raise ValueError("Source Chat lifecycle result message identity is invalid")
+    if correlation_id != causation_id:
+        raise ValueError("Source Chat lifecycle result correlation is invalid")
+    if idempotency_key != f"source-chat-lifecycle-result:{causation_id}":
+        raise ValueError("Source Chat lifecycle result idempotency is invalid")
 
 
 def _validate_source_chat_address(address: str) -> None:

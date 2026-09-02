@@ -3820,6 +3820,15 @@ class AcceptanceSpine:
         """Observe the application-owned Source Chat registry."""
         return self._roles[RuntimeRole.APPLICATION].store.source_chats()
 
+    def source_chat_administration_views(
+        self, actor: RuntimeRole
+    ) -> tuple[SourceChatRegistryEntry, ...]:
+        """Probe the narrow Bot-owned Source Chat administration projection."""
+        try:
+            return self._roles[actor].store.source_chat_administration_views()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+
     def eligible_source_chat_generation(
         self,
         *,

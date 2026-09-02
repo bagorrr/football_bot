@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
@@ -44,9 +44,9 @@ def _migration_paths() -> list[Path]:
     return sorted(migration_root.glob("*.sql"))
 
 
-def test_live_main_migrations_precede_the_contiguous_coaching_range() -> None:
-    """Keep post-main coaching migrations in the first free numeric range."""
-    assert [path.name for path in _migration_paths()][-10:] == [
+def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
+    """Keep post-main migrations in one contiguous numeric range."""
+    assert [path.name for path in _migration_paths()][-12:] == [
         "0033_source_message_retention_and_projection_barrier.sql",
         "0034_source_chat_pause_removal_barrier.sql",
         "0035_coaching_opportunities.sql",
@@ -57,6 +57,8 @@ def test_live_main_migrations_precede_the_contiguous_coaching_range() -> None:
         "0040_coaching_ingestion_role_projection_gate.sql",
         "0041_exact_repost_referee_generic_projection.sql",
         "0042_moderation_review_events.sql",
+        "0043_source_chat_administration_lifecycle.sql",
+        "0044_source_chat_lifecycle_cancellation.sql",
     ]
 
 
@@ -840,7 +842,12 @@ def test_bot_assistant_result_projection_follows_current_exact_repost_representa
                 %s, 'channel-pts:1', true, 'confirmed', %s, %s, %s
             )
             """,
-            (recorded_at, recorded_at, recorded_at, recorded_at),
+            (
+                recorded_at - timedelta(minutes=1),
+                recorded_at,
+                recorded_at,
+                recorded_at,
+            ),
         )
         for source_message_id, telegram_message_id, body in (
             (old_source_message_id, 501, "old repost"),

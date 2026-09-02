@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID
 
+import psycopg
 import pytest
 
 from modules.contracts import (
@@ -18,21 +19,31 @@ from modules.contracts import (
 )
 from modules.domain import (
     ConversationStage,
+    GeographicType,
     InitialConsentAttestation,
+    LocationCandidate,
+    LocationInterpretation,
+    LocationResolution,
     SourceChatAddressKind,
+    SourceChatLifecycleState,
     SourceChatRegistryEntry,
+    SourceEventKind,
+    TelegramChannelCheckpoint,
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
+from modules.ports import ClassifierAdapterResult
 from modules.testkit import (
     AcceptanceSpine,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
     ControlledTelegramIngestionAdapter,
+    ControlledTimezoneDataAdapter,
     FrozenClock,
     InjectedFailureError,
     InjectedTelegramDeliveryError,
+    OwnershipViolationError,
     boot_legacy_acceptance_spine,
 )
 
@@ -235,7 +246,8 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
     assert telethon.join_requests == []
     assert telethon.history_requests == []
     assert telegram.messages[-1].text == (
-        "✅ Source Chat registered.\n\nInitial consent confirmed."
+        "✅ Source Chat registered.\n\nInitial consent confirmed.\n\n"
+        "@synthetic_public_source [enabled]"
     )
     system.reset()
 
@@ -800,6 +812,22 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
     assert initial_generation.registry_generation == 1
 
     clock.advance_to(later_time)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="remove:registry-generation",
+        telegram_user_id=administrator_id,
+        action="remove",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="confirm-remove:registry-generation",
+        telegram_user_id=administrator_id,
+        action="remove",
+        confirm=True,
+    )
+    system.process_source_chat_registrations_until_idle()
     system.select_source_chats_action(
         update_id="add:registry-generation-two",
         telegram_user_id=administrator_id,
@@ -818,15 +846,19 @@ def test_only_the_current_source_chat_generation_is_event_eligible() -> None:
         registry_generation=2,
         address_kind=SourceChatAddressKind.PRIVATE_INVITE,
         current_address=second_address,
-        processing_started_at=initial_time,
-        transport_boundary="channel-pts:7401",
+        processing_started_at=later_time,
+        transport_boundary="channel-pts:8402",
         enabled=True,
         initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
-        attested_at=initial_time,
+        attested_at=later_time,
     )
 
     assert system.source_chats() == (
-        replace(initial_generation, enabled=False),
+        replace(
+            initial_generation,
+            enabled=False,
+            permanently_removed_at=later_time,
+        ),
         later_generation,
     )
     assert (
@@ -1081,6 +1113,22 @@ def test_delayed_equal_and_lower_generations_are_terminal_noops() -> None:
         update_id="address:generation-order-one",
         telegram_user_id=administrator_id,
         address=addresses[0],
+    )
+    system.process_source_chat_registrations_until_idle()
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="remove:generation-order",
+        telegram_user_id=administrator_id,
+        action="remove",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="confirm-remove:generation-order",
+        telegram_user_id=administrator_id,
+        action="remove",
+        confirm=True,
     )
     system.process_source_chat_registrations_until_idle()
     system.select_source_chats_action(
@@ -3043,7 +3091,8 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     registered = telegram.messages[-1]
     assert registered.display_locale == "de"
     assert registered.text == (
-        "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt."
+        "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt.\n\n"
+        "@synthetic_german_source [enabled]"
     )
 
     system.select_source_chats_action(
@@ -3244,17 +3293,6 @@ def test_new_address_for_the_same_identity_changes_only_the_protected_address() 
         SourceChatRegistryEntry(
             identity,
             1,
-            SourceChatAddressKind.PUBLIC_USERNAME,
-            "@synthetic_old_address",
-            initial_time,
-            "channel-pts:9203",
-            False,
-            InitialConsentAttestation.CONFIRMED,
-            initial_time,
-        ),
-        SourceChatRegistryEntry(
-            identity,
-            2,
             SourceChatAddressKind.PRIVATE_INVITE,
             "https://t.me/+synthetic-new-address",
             initial_time,
@@ -3455,3 +3493,753 @@ def test_atomic_publish_failure_rolls_back_the_registry_mutation() -> None:
 
     assert system.source_chats() == previous_registry
     system.reset()
+
+
+def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> None:
+    """Exercise the administrator pause, re-enable, and removal state machine."""
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 20, 10, 0, tzinfo=UTC)
+    paused_at = datetime(2026, 9, 20, 10, 5, tzinfo=UTC)
+    re_enabled_at = datetime(2026, 9, 20, 10, 10, tzinfo=UTC)
+    removed_at = datetime(2026, 9, 20, 10, 15, tzinfo=UTC)
+    administrator_id = 46_500
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_650_000,
+    )
+    address = "@synthetic_lifecycle_source"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:6500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 20, 10, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat_for_lifecycle(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        registered_at=registered_at,
+        address=address,
+    )
+
+    initial = system.source_chats()[0]
+    assert initial.lifecycle_state is SourceChatLifecycleState.ENABLED
+    assert initial.initial_consent_attestation is InitialConsentAttestation.CONFIRMED
+
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause-request:lifecycle",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    assert telegram.messages[-1].text == f"Confirm pause for {address}?"
+    assert system.source_chats() == (initial,)
+
+    pause_confirmation_callback = _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause-confirm:lifecycle",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    assert telegram.messages[-1].text.startswith("Applying Source Chat pause")
+    assert system.source_chats() == (initial,)
+
+    clock.advance_to(paused_at)
+    assert system.process_next_source_chat_change_request()
+    paused = system.source_chats()[0]
+    assert paused.lifecycle_state is SourceChatLifecycleState.PAUSED
+    assert paused.processing_started_at == initial.processing_started_at
+    assert paused.attested_at == initial.attested_at
+    assert paused.permanently_removed_at is None
+    assert system.process_next_source_chat_bot_result()
+    assert "Source Chat pause complete: paused." in telegram.messages[-1].text
+    assert not system.process_next_source_chat_change_request()
+
+    terminal_pause_count = sum(
+        message.text == "Source Chat pause complete: paused."
+        for message in telegram.messages
+    )
+    system.select_source_chats_action(
+        update_id="pause-confirm:lifecycle",
+        telegram_user_id=administrator_id,
+        action=pause_confirmation_callback,
+        screen_revision=telegram.messages[-1].screen_revision,
+    )
+    assert (
+        sum(
+            message.text == "Source Chat pause complete: paused."
+            for message in telegram.messages
+        )
+        == terminal_pause_count
+    )
+    assert system.source_chats()[0] == paused
+
+    clock.advance_to(re_enabled_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="re-enable-request:lifecycle",
+        telegram_user_id=administrator_id,
+        action="re_enable",
+    )
+    assert telegram.messages[-1].text == f"Confirm re-enable for {address}?"
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="re-enable-confirm:lifecycle",
+        telegram_user_id=administrator_id,
+        action="re_enable",
+        confirm=True,
+    )
+    assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.PAUSED
+    system.restart(RuntimeRole.APPLICATION)
+    assert system.process_next_source_chat_change_request()
+    re_enabled = system.source_chats()[0]
+    assert re_enabled.lifecycle_state is SourceChatLifecycleState.ENABLED
+    assert re_enabled.processing_started_at == re_enabled_at
+    assert re_enabled.attested_at == initial.attested_at
+    assert system.process_next_source_chat_bot_result()
+    assert "Source Chat re-enable complete: enabled." in telegram.messages[-1].text
+
+    clock.advance_to(removed_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="remove-request:lifecycle",
+        telegram_user_id=administrator_id,
+        action="remove",
+    )
+    assert telegram.messages[-1].text == f"Confirm remove for {address}?"
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="remove-confirm:lifecycle",
+        telegram_user_id=administrator_id,
+        action="remove",
+        confirm=True,
+    )
+    system.process_source_chat_registrations_until_idle()
+    removed = system.source_chats()[0]
+    assert removed.lifecycle_state is SourceChatLifecycleState.REMOVED
+    assert removed.enabled is False
+    assert removed.permanently_removed_at == removed_at
+    assert removed.processing_started_at == re_enabled_at
+    assert removed.attested_at == initial.attested_at
+
+    removed_screen_revision = telegram.messages[-1].screen_revision
+    assert all(
+        not callback.startswith("source-chats:re_enable:")
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+    )
+    system.select_source_chats_action(
+        update_id="re-enable-removed-request:lifecycle",
+        telegram_user_id=administrator_id,
+        action=_source_chat_lifecycle_callback(
+            removed,
+            action="re_enable",
+            screen_revision=removed_screen_revision,
+        ),
+        screen_revision=removed_screen_revision,
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="re-enable-removed-confirm:lifecycle",
+        telegram_user_id=administrator_id,
+        action="re_enable",
+        confirm=True,
+    )
+    system.process_source_chat_registrations_until_idle()
+    assert system.source_chats() == (removed,)
+    assert "Source Chat re-enable complete: removed." in telegram.messages[-1].text
+    system.reset()
+
+
+def _register_source_chat_for_lifecycle(
+    system: AcceptanceSpine,
+    *,
+    clock: FrozenClock,
+    administrator_id: int,
+    registered_at: datetime,
+    address: str,
+) -> None:
+    """Register one controlled Source Chat through the administrator UI seam."""
+    system.start_bot_user(
+        update_id="start:lifecycle",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:lifecycle",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(registered_at)
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:lifecycle",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:lifecycle",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:lifecycle",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:lifecycle",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id="add-source-chat:lifecycle",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id="address:lifecycle",
+        telegram_user_id=administrator_id,
+        address=address,
+    )
+    system.process_source_chat_registrations_until_idle()
+
+
+def _click_source_chat_lifecycle_control(
+    system: AcceptanceSpine,
+    telegram: ControlledTelegramDeliveryAdapter,
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    action: str,
+    confirm: bool = False,
+) -> str:
+    """Click the exact lifecycle callback rendered by the current Source Chats view."""
+    prefix = f"source-chats:{'confirm:' if confirm else ''}{action}:"
+    callback = next(
+        callback
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+        if callback.startswith(prefix)
+    )
+    system.select_source_chats_action(
+        update_id=update_id,
+        telegram_user_id=telegram_user_id,
+        action=callback,
+        screen_revision=telegram.messages[-1].screen_revision,
+    )
+    return callback
+
+
+def _source_chat_lifecycle_callback(
+    entry: SourceChatRegistryEntry,
+    *,
+    action: str,
+    screen_revision: int,
+    confirm: bool = False,
+) -> str:
+    """Build one exact callback for a deliberate forged-control regression."""
+    return (
+        "source-chats:"
+        f"{'confirm:' if confirm else ''}{action}:{entry.identity.kind.value}:"
+        f"{entry.identity.telegram_id}:{entry.registry_generation}:{screen_revision}"
+    )
+
+
+def test_source_chat_administration_projection_preserves_role_boundary() -> None:
+    """Expose only the narrow Bot administration projection across runtime roles."""
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 21, 10, 0, tzinfo=UTC)
+    administrator_id = 46_502
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_650_002,
+    )
+    address = "@synthetic_administration_projection_source"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:8000",
+    )
+    clock = FrozenClock(datetime(2026, 8, 21, 10, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat_for_lifecycle(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        registered_at=registered_at,
+        address=address,
+    )
+
+    assert system.source_chat_administration_views(RuntimeRole.BOT_ASSISTANT) == (
+        system.source_chats()
+    )
+    for actor in RuntimeRole:
+        if actor is RuntimeRole.BOT_ASSISTANT:
+            continue
+        with pytest.raises(OwnershipViolationError):
+            system.source_chat_administration_views(actor)
+    system.reset()
+
+
+def test_pause_cancels_unfinished_work_suppresses_routes_and_discards_gap() -> None:
+    """Keep paused Source Chat work and publication state fail-closed."""
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    classifier = ControlledModelAdapter()
+    registered_at = datetime(2026, 9, 21, 9, 0, tzinfo=UTC)
+    paused_at = datetime(2026, 9, 21, 9, 5, tzinfo=UTC)
+    re_enabled_at = datetime(2026, 9, 21, 9, 10, tzinfo=UTC)
+    administrator_id = 46_501
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_650_001,
+    )
+    address = "@synthetic_pause_boundary_source"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:7000",
+    )
+    active_body = (
+        "Football match on 22 September 2026 in whole city. Need one player. "
+        "Contact @active_pause_contact"
+    )
+    pending_body = (
+        "Football match on 22 September 2026 in whole city. Need one player. "
+        "Contact @pending_pause_contact"
+    )
+    post_pause_body = (
+        "Football match on 22 September 2026 in whole city. Need one player. "
+        "Contact @post_pause_contact"
+    )
+    for body, candidate_key, contact in (
+        (active_body, "active-pause", "@active_pause_contact"),
+        (pending_body, "pending-pause", "@pending_pause_contact"),
+        (post_pause_body, "post-pause", "@post_pause_contact"),
+    ):
+        classifier.return_for(
+            body=body,
+            result=_accepted_open_match_result(
+                candidate_key=candidate_key,
+                body=body,
+                contact=contact,
+            ),
+        )
+    clock = FrozenClock(datetime(2026, 8, 21, 9, 0, tzinfo=UTC))
+    timezone_data = ControlledTimezoneDataAdapter()
+    timezone_data.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="in whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    whole_city=True,
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("ru", "Санкт-Петербург"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=classifier,
+        location_resolver=resolver,
+        timezone_data=timezone_data,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat_for_lifecycle(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        registered_at=registered_at,
+        address=address,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=7000),
+        to_checkpoint=TelegramChannelCheckpoint(pts=7001),
+        source_event_id="source-event:pause-boundary:active",
+        telegram_message_id=7001,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=active_body,
+        event_time=datetime(2026, 9, 21, 9, 1, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+    active_revision_id = (
+        "source-chat:channel:4650001:generation:1:message:7001:revision:1"
+    )
+    active_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id == active_revision_id
+    )
+    assert active_opportunity.publication_state == "active"
+    assert active_opportunity.response_route.value == "@active_pause_contact"
+
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=7001),
+        to_checkpoint=TelegramChannelCheckpoint(pts=7002),
+        source_event_id="source-event:pause-boundary:pending",
+        telegram_message_id=7002,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=pending_body,
+        event_time=datetime(2026, 9, 21, 9, 2, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    pending_revision_id = (
+        "source-chat:channel:4650001:generation:1:message:7002:revision:1"
+    )
+    assert len(system.classifier_commands_for_revision(pending_revision_id)) == 1
+    assert len(classifier.requests) == 1
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.classification_proof_work (
+                source_message_revision_id, ambiguity_output,
+                ambiguity_pass_execution, ambiguity_adjacent_context,
+                semantic_proofs, semantic_proof_executions, updated_at
+            ) VALUES (
+                %s, '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
+                '[]'::jsonb, '[]'::jsonb, %s
+            )
+            """,
+            (pending_revision_id, clock.now()),
+        )
+
+    clock.advance_to(paused_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause-request:boundary",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause-confirm:boundary",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.PAUSED
+    assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION) is False
+    assert system.process_next_contract_handoff(RuntimeRole.RECOMMENDATION)
+    assert len(classifier.requests) == 1
+    assert system.classification_proposals_for_revision(pending_revision_id) == ()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM football_runtime.classification_proof_work
+            WHERE source_message_revision_id = %s
+            """,
+            (pending_revision_id,),
+        ).fetchone() == (0,)
+
+    paused_application = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id == active_revision_id
+    )
+    paused_recommendation = next(
+        opportunity
+        for opportunity in system.recommendation_opportunities()
+        if opportunity.source_message_revision_id == active_revision_id
+    )
+    for opportunity in (paused_application, paused_recommendation):
+        assert opportunity.publication_state == "suppressed"
+        assert opportunity.response_route.kind == "unavailable"
+        assert opportunity.response_route.value == ""
+        assert opportunity.publication_reason == "source_chat_paused"
+    lifecycle_publications = [
+        contract
+        for contract in system.opportunity_publication_contracts(active_revision_id)
+        if isinstance(contract.payload, dict)
+        and contract.payload.get("publication_reason") == "source_chat_paused"
+    ]
+    assert len(lifecycle_publications) == 1
+    assert system.process_next_source_chat_bot_result()
+
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=7002),
+        to_checkpoint=TelegramChannelCheckpoint(pts=7003),
+        source_event_id="source-event:pause-boundary:gap",
+        telegram_message_id=7003,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="21 September 2026 need one player @gap_contact",
+        event_time=datetime(2026, 9, 21, 9, 6, tzinfo=UTC),
+    )
+    clock.advance_to(re_enabled_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="re-enable-request:boundary",
+        telegram_user_id=administrator_id,
+        action="re_enable",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="re-enable-confirm:boundary",
+        telegram_user_id=administrator_id,
+        action="re_enable",
+        confirm=True,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.ENABLED
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert all(
+        event.source_event_id != "source-event:pause-boundary:gap"
+        for event in system.source_events()
+    )
+    assert all(
+        revision.source_event_id != "source-event:pause-boundary:gap"
+        for revision in system.source_message_revisions()
+    )
+
+    clock.advance_to(datetime(2026, 9, 21, 9, 11, tzinfo=UTC))
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=7003),
+        to_checkpoint=TelegramChannelCheckpoint(pts=7004),
+        source_event_id="source-event:pause-boundary:post",
+        telegram_message_id=7004,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=post_pause_body,
+        event_time=datetime(2026, 9, 21, 9, 11, tzinfo=UTC),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    system.process_opportunities_until_idle()
+    assert len(classifier.requests) == 2
+    assert {event.source_event_id for event in system.source_events()} == {
+        "source-event:pause-boundary:active",
+        "source-event:pause-boundary:pending",
+        "source-event:pause-boundary:post",
+    }
+    post_revision_id = (
+        "source-chat:channel:4650001:generation:1:message:7004:revision:1"
+    )
+    assert (
+        next(
+            opportunity
+            for opportunity in system.opportunities()
+            if opportunity.source_message_revision_id == active_revision_id
+        ).publication_state
+        == "suppressed"
+    )
+    post_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id == post_revision_id
+    )
+    assert post_opportunity.publication_state == "active"
+    assert post_opportunity.response_route.value == "@post_pause_contact"
+
+    remove_at = datetime(2026, 9, 21, 9, 15, tzinfo=UTC)
+    clock.advance_to(remove_at)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="remove-request:boundary",
+        telegram_user_id=administrator_id,
+        action="remove",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="remove-confirm:boundary",
+        telegram_user_id=administrator_id,
+        action="remove",
+        confirm=True,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.REMOVED
+    assert system.process_next_contract_handoff(RuntimeRole.RECOMMENDATION)
+    assert system.source_chats()[0].permanently_removed_at == remove_at
+    for opportunity in system.opportunities():
+        assert opportunity.publication_state == "suppressed"
+        assert opportunity.response_route.kind == "unavailable"
+        assert opportunity.response_route.value == ""
+        assert opportunity.publication_reason == "source_chat_removed"
+    assert (
+        next(
+            opportunity
+            for opportunity in system.recommendation_opportunities()
+            if opportunity.source_message_revision_id == post_revision_id
+        ).publication_state
+        == "suppressed"
+    )
+    assert len(classifier.requests) == 2
+    system.process_next_source_chat_bot_result()
+
+    removed_screen_revision = telegram.messages[-1].screen_revision
+    assert all(
+        not callback.startswith("source-chats:re_enable:")
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+    )
+    system.select_source_chats_action(
+        update_id="re-enable-removed-request:boundary",
+        telegram_user_id=administrator_id,
+        action=_source_chat_lifecycle_callback(
+            system.source_chats()[0],
+            action="re_enable",
+            screen_revision=removed_screen_revision,
+        ),
+        screen_revision=removed_screen_revision,
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="re-enable-removed-confirm:boundary",
+        telegram_user_id=administrator_id,
+        action="re_enable",
+        confirm=True,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.source_chats()[0].lifecycle_state is SourceChatLifecycleState.REMOVED
+    assert len(classifier.requests) == 2
+    system.process_next_source_chat_bot_result()
+    system.reset()
+
+
+def _accepted_open_match_result(
+    *,
+    candidate_key: str,
+    body: str,
+    contact: str,
+) -> ClassifierAdapterResult:
+    """Return one deterministic accepted open-match result for lifecycle tests."""
+    return ClassifierAdapterResult(
+        output={
+            "schema_version": "source-message-classification-v1",
+            "disposition": "accepted",
+            "candidates": [
+                {
+                    "candidate_key": candidate_key,
+                    "opportunity_type": "open_match",
+                    "evidence": {
+                        "opportunity": "Need one player",
+                        "event_time": "22 September 2026",
+                        "location": "in whole city",
+                        "open_places": "one player",
+                    },
+                    "location": {
+                        "mention": "in whole city",
+                        "place_id": "city:ru:saint-petersburg",
+                        "country_id": "country:ru",
+                        "city_id": "city:ru:saint-petersburg",
+                    },
+                    "event_time": {
+                        "start_local_date": "2026-09-22",
+                        "end_local_date": "2026-09-22",
+                        "iana_timezone": "Europe/Moscow",
+                    },
+                    "open_places": 1,
+                    "response_routes": [
+                        {
+                            "kind": "explicit_telegram_username",
+                            "value": contact,
+                            "evidence": contact,
+                        }
+                    ],
+                }
+            ],
+        },
+        effective_model="gpt-5.6-sol",
+        effective_reasoning_effort="high",
+        codex_version="controlled-offline",
+        adapter_kind="controlled_recording",
+        adapter_version="classifier-recording-v1",
+        duration_ms=3,
+        input_tokens=len(body),
+        output_tokens=20,
+    )

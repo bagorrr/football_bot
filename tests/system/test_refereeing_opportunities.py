@@ -534,7 +534,7 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
             revision=1,
             kind=SourceEventKind.CREATE,
             body=body,
-            event_time=datetime(2026, 8, 10, 9, 6 + offset, tzinfo=UTC),
+            event_time=datetime(2026, 8, 18, 9, 6 + offset, tzinfo=UTC),
             source_publisher_id=source_publisher_id,
         )
         assert system.process_next_channel_telegram_difference(
@@ -623,7 +623,7 @@ def test_referee_availability_and_request_are_published_and_matched() -> None:
             revision=1,
             kind=SourceEventKind.CREATE,
             body=body,
-            event_time=datetime(2026, 8, 10, 10 + offset, tzinfo=UTC),
+            event_time=datetime(2026, 8, 18, 10 + offset, tzinfo=UTC),
             source_publisher_id=f"publisher:{team_format}",
         )
         assert system.process_next_channel_telegram_difference(
