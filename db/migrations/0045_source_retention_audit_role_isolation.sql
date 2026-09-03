@@ -213,6 +213,27 @@ ALTER TABLE football_runtime.recommendation_opportunities
         )
     );
 
+ALTER TABLE football_runtime.application_exact_repost_cluster_members
+    DROP CONSTRAINT IF EXISTS application_exact_repost_cluster_members_publication_reason_check,
+    DROP CONSTRAINT IF EXISTS application_moderation_publication_reason_check;
+
+ALTER TABLE football_runtime.application_exact_repost_cluster_members
+    ADD CONSTRAINT application_moderation_publication_reason_check CHECK (
+        publication_reason IS NULL
+        OR publication_reason IN (
+            'source_revision_superseded',
+            'source_deleted',
+            'response_route_unavailable',
+            'exact_repost_superseded',
+            'moderation_held',
+            'moderation_suppressed',
+            'review_timeout',
+            'source_chat_paused',
+            'source_chat_removed',
+            'opportunity_expired'
+        )
+    );
+
 CREATE FUNCTION football_runtime.record_source_retention_audit(
     requested_source_message_id text,
     requested_source_message_revision_id text,

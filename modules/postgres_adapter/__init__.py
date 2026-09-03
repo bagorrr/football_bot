@@ -230,7 +230,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "cc2935d5b8c9462086677646d50c793f550c9b85e694c5bc68e28f86f84889ca",
     "62ac5af74f66169098f47a96549d4d2f7e8dc2b0ece1062a1e9dd447a3e08c6d",
     "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
-    "acb7f4f66164c85929079d5f901545605cf7a4109a736a22a18fbba42d756717",
+    "0e093cab18680850cc3c32804fd493956264367dade632aa009393e01a1bdb1a",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -4647,12 +4647,116 @@ class PostgresRoleStore:
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         with psycopg.connect(self._database_url) as connection:
+            cluster_ids = tuple(
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT cluster.exact_repost_cluster_id
+                    FROM football_runtime.application_exact_repost_clusters AS cluster
+                    JOIN football_runtime.application_exact_repost_cluster_members
+                        AS member
+                      ON member.exact_repost_cluster_id =
+                         cluster.exact_repost_cluster_id
+                    JOIN football_runtime.application_opportunities AS opportunity
+                      ON opportunity.opportunity_id = member.opportunity_id
+                    WHERE (
+                        opportunity.publication_state = 'active'
+                        AND football_runtime.opportunity_expiry_at(
+                            opportunity.opportunity_type,
+                            opportunity.accepted_facts
+                        ) <= %s
+                    ) OR (
+                        opportunity.publication_state = 'expired'
+                        AND (
+                            opportunity.publication_reason IS NULL
+                            OR opportunity.publication_reason = 'opportunity_expired'
+                        )
+                    )
+                    GROUP BY cluster.exact_repost_cluster_id
+                    ORDER BY cluster.exact_repost_cluster_id
+                    """,
+                    (as_of,),
+                ).fetchall()
+            )
+            for cluster_id in cluster_ids:
+                connection.execute(
+                    """
+                    SELECT exact_repost_cluster_id
+                    FROM football_runtime.application_exact_repost_clusters
+                    WHERE exact_repost_cluster_id = %s
+                    FOR UPDATE
+                    """,
+                    (cluster_id,),
+                )
             row = connection.execute(
                 """
                 SELECT football_runtime.cleanup_expired_source_data(%s)
                 """,
                 (as_of,),
             ).fetchone()
+            if cluster_ids:
+                connection.execute(
+                    """
+                    SELECT pg_catalog.set_config(
+                        'football_runtime.source_retention_as_of', %s, true
+                    )
+                    """,
+                    (as_of.isoformat(),),
+                )
+                for cluster_id in cluster_ids:
+                    causation_seed = uuid5(
+                        NAMESPACE_URL,
+                        "football-bot:source-retention-expiry:"
+                        f"{cluster_id}:{as_of.isoformat()}",
+                    )
+                    changes, transition_revision = _reconcile_exact_repost_cluster(
+                        connection,
+                        exact_repost_cluster_id=cluster_id,
+                        causation_seed=causation_seed,
+                        correlation_id=causation_seed,
+                        recorded_at=as_of,
+                        forced_publication_reason="opportunity_expired",
+                    )
+                    for outgoing in _exact_repost_changes_to_outgoings(
+                        changes=changes,
+                        cluster_id=cluster_id,
+                        transition_revision=transition_revision,
+                        causation_seed=causation_seed,
+                        correlation_id=causation_seed,
+                        recorded_at=as_of,
+                    ):
+                        payload = outgoing.payload
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("publication_state") == "expired"
+                            and payload.get("publication_reason")
+                            == "opportunity_expired"
+                        ):
+                            opportunity_revision_id = payload.get(
+                                "opportunity_revision_id"
+                            )
+                            if isinstance(opportunity_revision_id, str):
+                                direct_expiry = connection.execute(
+                                    """
+                                    SELECT EXISTS (
+                                        SELECT 1
+                                        FROM football_runtime.contract_outbox
+                                        WHERE producer_role = 'application'
+                                          AND consumer_role = 'recommendation'
+                                          AND contract_name =
+                                              'OpportunityPublicationChanged'
+                                          AND cancelled_at IS NULL
+                                          AND idempotency_key = %s
+                                    )
+                                    """,
+                                    (
+                                        "opportunity-publication-expiry:"
+                                        f"{opportunity_revision_id}",
+                                    ),
+                                ).fetchone()
+                                if direct_expiry is not None and direct_expiry[0]:
+                                    continue
+                        _insert_outbox(connection, outgoing)
         return int(row[0]) if row is not None else 0
 
     def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
@@ -12973,7 +13077,11 @@ def _reconcile_exact_repost_cluster(
     ).fetchone()
     if cluster is None:
         return (), 0
-    if forced_publication_reason not in {None, "review_timeout"}:
+    if forced_publication_reason not in {
+        None,
+        "review_timeout",
+        "opportunity_expired",
+    }:
         raise ValueError("exact repost forced publication reason is invalid")
     rows = connection.execute(
         """
@@ -13065,7 +13173,11 @@ def _reconcile_exact_repost_cluster(
             desired_reason = "moderation_held"
         elif moderation_state == "suppressed":
             desired_state = "suppressed"
-            desired_reason = forced_publication_reason or "moderation_suppressed"
+            desired_reason = (
+                "moderation_suppressed"
+                if forced_publication_reason == "opportunity_expired"
+                else forced_publication_reason or "moderation_suppressed"
+            )
         elif row[10] in {"source_chat_paused", "source_chat_removed"}:
             desired_state = "suppressed"
             desired_reason = row[10]
@@ -13078,7 +13190,13 @@ def _reconcile_exact_repost_cluster(
             as_of=recorded_at,
         ):
             desired_state = "expired"
-            desired_reason = None
+            desired_reason = (
+                forced_publication_reason
+                if forced_publication_reason is not None
+                else row[10]
+                if row[10] == "opportunity_expired"
+                else None
+            )
         elif row[10] == "source_revision_superseded":
             desired_state = "suppressed"
             desired_reason = "source_revision_superseded"
