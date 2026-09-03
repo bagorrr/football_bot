@@ -65,6 +65,27 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
     )
     system.reset()
 
+    audit_recorded_at = datetime(2026, 8, 9, 12, 1, tzinfo=UTC)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_source_data_audit (
+                audit_event_id, source_ref, revision_ref, action,
+                previous_state, next_state, reason_code, recorded_at, expires_at
+            ) VALUES (
+                %s, %s, %s, 'state_changed', 'pending', 'irrelevant',
+                'admin-fixture', %s, %s
+            )
+            """,
+            (
+                "source-retention:admin-fixture",
+                "source:" + "a" * 32,
+                "revision:" + "b" * 32,
+                audit_recorded_at,
+                audit_recorded_at + timedelta(days=90),
+            ),
+        )
+
     for user_id in (administrator_id, ordinary_user_id):
         system.start_bot_user(
             update_id=f"start:{user_id}",
@@ -129,7 +150,30 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
                 f"administration:source-chats:{telegram.messages[-1].screen_revision}",
             ),
         ),
+        (
+            (
+                "Source Data Audit",
+                f"administration:source-data-audit:{telegram.messages[-1].screen_revision}",
+            ),
+        ),
         (("Back", f"administration:back:{telegram.messages[-1].screen_revision}"),),
+    )
+
+    system.select_administration_action(
+        update_id="source-data-audit:administrator",
+        telegram_user_id=administrator_id,
+        action="source-data-audit",
+    )
+    audit_message = telegram.messages[-1]
+    assert audit_message.text.startswith("🧾 **Source Data Audit**")
+    assert "source:" + "a" * 32 in audit_message.text
+    assert "revision:" + "b" * 32 in audit_message.text
+    assert "state_changed" in audit_message.text
+    assert "admin-fixture" in audit_message.text
+    assert "secret source body" not in audit_message.text
+    assert "@private_contact" not in audit_message.text
+    assert audit_message.button_rows == (
+        (("Back", f"administration:back:{audit_message.screen_revision}"),),
     )
 
     rotated_system = boot_legacy_acceptance_spine(
@@ -3039,6 +3083,7 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     assert administration.display_locale == "de"
     assert administration.text == "⚙️ **Verwaltung**"
     assert administration.button_rows[0][0][0] == "Quell-Chats"
+    assert administration.button_rows[1][0][0] == "Datenaufbewahrungs-Audit"
 
     system.select_administration_action(
         update_id="source-chats:german-administration",

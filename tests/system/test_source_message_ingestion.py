@@ -3096,27 +3096,27 @@ def test_expired_replaced_revision_keeps_current_opportunity_active() -> None:
         )
 
     created_body = (
-        "Need one player for a football match on 20 September 2026 in whole city. "
+        "Need one player for a football match on 20 December 2026 in whole city. "
         "Contact @retention_current."
     )
     edited_body = (
-        "Need one player for a football match on 21 September 2026 in whole city. "
+        "Need one player for a football match on 21 December 2026 in whole city. "
         "Contact @retention_current."
     )
     model.return_for(
         body=created_body,
         result=accepted_result(
             body=created_body,
-            event_time_evidence="20 September 2026",
-            start_local_date="2026-09-20",
+            event_time_evidence="20 December 2026",
+            start_local_date="2026-12-20",
         ),
     )
     model.return_for(
         body=edited_body,
         result=accepted_result(
             body=edited_body,
-            event_time_evidence="21 September 2026",
-            start_local_date="2026-09-21",
+            event_time_evidence="21 December 2026",
+            start_local_date="2026-12-21",
         ),
     )
     resolver = ControlledLocationResolverAdapter()
@@ -3245,6 +3245,88 @@ def test_expired_replaced_revision_keeps_current_opportunity_active() -> None:
         is None
     )
 
+    with psycopg.connect(database_url) as connection:
+        old_payloads = connection.execute(
+            """
+            SELECT producer_role, contract_name, payload
+            FROM football_runtime.contract_outbox
+            WHERE payload ->> 'source_message_revision_id' = %s
+              AND producer_role IN ('ingestion', 'classification')
+            ORDER BY producer_role, contract_name
+            """,
+            (old_revision_id,),
+        ).fetchall()
+    ingestion_payload = next(
+        payload
+        for producer_role, contract_name, payload in old_payloads
+        if producer_role == "ingestion" and contract_name == "SourceEventRecorded"
+    )
+    assert ingestion_payload["body"] is None
+    assert "eligible_reply_context" not in ingestion_payload
+    classification_payload = next(
+        payload
+        for producer_role, contract_name, payload in old_payloads
+        if producer_role == "classification"
+        and contract_name == "ClassificationProposal"
+    )
+    assert not {
+        "body",
+        "bounded_metadata",
+        "source_chat_geography",
+        "eligible_reply_context",
+        "adjacent_context",
+        "output",
+        "semantic_proof",
+        "semantic_proofs",
+        "evidence",
+        "response_route",
+    }.intersection(classification_payload)
+
+    with psycopg.connect(database_url) as connection:
+        current_opportunity_row = connection.execute(
+            """
+            SELECT opportunity_id
+            FROM football_runtime.application_opportunities
+            WHERE source_message_revision_id = %s
+              AND publication_state = 'active'
+            """,
+            (current_revision_id,),
+        ).fetchone()
+    assert current_opportunity_row is not None
+    current_opportunity_id = current_opportunity_row[0]
+    with psycopg.connect(database_url) as connection:
+        connection.execute("SET SESSION AUTHORIZATION football_application")
+        suppressed_opportunity_id = "opportunity:replaced-revision-retention:suppressed"
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type,
+                publication_state, accepted_facts, evidence, response_route,
+                accepted_at, publication_reason
+            )
+            SELECT %s, %s, source_message_revision_id, opportunity_type,
+                   'suppressed', accepted_facts, evidence, response_route,
+                   accepted_at, 'moderation_suppressed'
+            FROM football_runtime.application_opportunities
+            WHERE opportunity_id = %s
+            """,
+            (
+                suppressed_opportunity_id,
+                suppressed_opportunity_id + ":revision:1",
+                current_opportunity_id,
+            ),
+        )
+        retention_state = connection.execute(
+            """
+            SELECT retention_state, content_expires_at, processing_expires_at
+            FROM football_runtime.application_source_message_retention
+            WHERE source_message_revision_id = %s
+            """,
+            (current_revision_id,),
+        ).fetchone()
+    assert retention_state == ("accepted_active", None, None)
+
     clock.advance_to(created_at + timedelta(days=90))
     assert system.cleanup_expired_source_data() > 0
     assert {
@@ -3266,9 +3348,54 @@ def test_expired_replaced_revision_keeps_current_opportunity_active() -> None:
         opportunity
         for opportunity in system.opportunities()
         if opportunity.source_message_revision_id == current_revision_id
+        and opportunity.opportunity_id == current_opportunity_id
     )
     assert current_opportunity.publication_state == "active"
     assert current_opportunity.response_route.value == "@retention_current"
+
+    opportunity_expiry = datetime(2026, 12, 22, tzinfo=ZoneInfo("Europe/Moscow"))
+    clock.advance_to(opportunity_expiry)
+    assert system.cleanup_expired_source_data() > 0
+    expired_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id == current_revision_id
+        and opportunity.opportunity_id == current_opportunity_id
+    )
+    assert expired_opportunity.publication_state == "expired"
+    assert expired_opportunity.publication_reason == "opportunity_expired"
+    assert system.source_messages()[0].body == edited_body
+    with psycopg.connect(database_url) as connection:
+        retention_state = connection.execute(
+            """
+            SELECT retention_state, content_expires_at, processing_expires_at
+            FROM football_runtime.application_source_message_retention
+            WHERE source_message_revision_id = %s
+            """,
+            (current_revision_id,),
+        ).fetchone()
+    assert retention_state == (
+        "accepted_inactive",
+        opportunity_expiry + timedelta(days=30),
+        opportunity_expiry + timedelta(days=90),
+    )
+    expiry_audits = [
+        event
+        for event in system.source_data_audit()
+        if event.reason_code == "opportunity_expired"
+        and event.next_state == "accepted_inactive"
+    ]
+    assert len(expiry_audits) == 1
+    assert expiry_audits[0].recorded_at == opportunity_expiry
+    assert expiry_audits[0].expires_at == opportunity_expiry + timedelta(days=90)
+    expired_current_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id == current_revision_id
+        and opportunity.opportunity_id == current_opportunity_id
+    )
+    assert expired_current_opportunity.publication_state == "expired"
+    assert expired_current_opportunity.response_route.value == "@retention_current"
     system.reset()
 
 

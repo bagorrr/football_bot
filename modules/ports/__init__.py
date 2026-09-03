@@ -536,6 +536,10 @@ class ConversationStore(Protocol):
         """Read the narrow Bot administration view of Source Chat state."""
         ...
 
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Read the bounded body-free Source retention audit projection."""
+        ...
+
     def next_source_chat_registration_generation(self) -> int:
         """Return the next durable one-administrator registration generation."""
         ...

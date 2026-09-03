@@ -3411,7 +3411,9 @@ class LanguageSelection:
     zero_result: tuple[str, str, str] | None = None
     administration_label: str | None = None
     administration_text: str | None = None
-    administration_labels: tuple[str, str, str] | None = None
+    administration_labels: tuple[str, str, str, str] | None = None
+    source_data_audit_text: str | None = None
+    source_data_audit_labels: tuple[str, str] | None = None
     source_chats_text: str | None = None
     source_chats_labels: tuple[str, str, str] | None = None
     source_chat_address_text: str | None = None

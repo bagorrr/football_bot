@@ -108,6 +108,89 @@ CREATE INDEX application_source_data_audit_expiry_idx
 CREATE INDEX application_source_data_audit_recorded_idx
     ON football_runtime.application_source_data_audit (recorded_at, audit_event_id);
 
+DROP POLICY IF EXISTS outbox_role_claim
+    ON football_runtime.contract_outbox;
+CREATE POLICY outbox_role_claim ON football_runtime.contract_outbox
+    FOR UPDATE
+    USING (
+        consumer_role = football_runtime.current_runtime_role()
+        OR (
+            football_runtime.current_runtime_role() = 'bot_assistant'
+            AND producer_role = 'bot_assistant'
+            AND consumer_role IS NULL
+        )
+        OR (
+            football_runtime.current_runtime_role() = 'application'
+            AND producer_role = 'application'
+        )
+        OR (
+            SESSION_USER = 'football_application'
+            AND (
+                (
+                    CURRENT_USER = 'football_ingestion'
+                    AND producer_role = 'ingestion'
+                    AND consumer_role = 'application'
+                    AND contract_name = 'SourceEventRecorded'
+                )
+                OR (
+                    CURRENT_USER = 'football_classification'
+                    AND producer_role = 'classification'
+                    AND consumer_role = 'application'
+                    AND contract_name = 'ClassificationProposal'
+                )
+            )
+        )
+    )
+    WITH CHECK (
+        consumer_role = football_runtime.current_runtime_role()
+        OR (
+            football_runtime.current_runtime_role() = 'bot_assistant'
+            AND producer_role = 'bot_assistant'
+            AND consumer_role IS NULL
+        )
+        OR (
+            football_runtime.current_runtime_role() = 'application'
+            AND producer_role = 'application'
+        )
+        OR (
+            SESSION_USER = 'football_application'
+            AND (
+                (
+                    CURRENT_USER = 'football_ingestion'
+                    AND producer_role = 'ingestion'
+                    AND consumer_role = 'application'
+                    AND contract_name = 'SourceEventRecorded'
+                )
+                OR (
+                    CURRENT_USER = 'football_classification'
+                    AND producer_role = 'classification'
+                    AND consumer_role = 'application'
+                    AND contract_name = 'ClassificationProposal'
+                )
+            )
+        )
+    );
+
+ALTER TABLE football_runtime.application_opportunities
+    DROP CONSTRAINT IF EXISTS application_opportunities_publication_reason_check;
+
+ALTER TABLE football_runtime.application_opportunities
+    ADD CONSTRAINT application_opportunities_publication_reason_check CHECK (
+        publication_reason IS NULL
+        OR publication_reason IN (
+            'source_revision_superseded',
+            'source_deleted',
+            'response_route_unavailable',
+            'exact_repost_superseded',
+            'moderation_held',
+            'moderation_suppressed',
+            'review_timeout',
+            'source_chat_paused',
+            'source_chat_removed',
+            'opportunity_expired'
+        )
+    );
+
 CREATE FUNCTION football_runtime.record_source_retention_audit(
     requested_source_message_id text,
     requested_source_message_revision_id text,
@@ -464,6 +547,257 @@ CREATE TRIGGER application_source_message_retention_routing
     FOR EACH ROW
     EXECUTE FUNCTION football_runtime.sync_source_message_retention_routing();
 
+CREATE FUNCTION football_runtime.opportunity_expiry_at(
+    requested_opportunity_type text,
+    requested_facts jsonb
+)
+RETURNS timestamptz
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    timezone_name text;
+    start_date date;
+    end_date date;
+    qualifying_at timestamptz;
+    event_expiry timestamptz;
+    registration_expiry timestamptz;
+    registration_value jsonb;
+    registration_text text;
+    exact_time text;
+    qualifying_text text;
+BEGIN
+    IF requested_facts IS NULL
+       OR jsonb_typeof(requested_facts) <> 'object' THEN
+        RETURN NULL;
+    END IF;
+    IF requested_opportunity_type IN ('referee_availability', 'referee_request')
+       AND requested_facts ->> 'referee_availability' <> 'true'
+       AND requested_facts ->> 'referee_request' <> 'true' THEN
+        RETURN NULL;
+    END IF;
+    IF requested_opportunity_type IN (
+        'roster_vacancy', 'player_transfer_availability',
+        'coach_availability', 'coach_request'
+    ) THEN
+        qualifying_text := COALESCE(
+            requested_facts ->> 'source_qualifying_assertion_at',
+            requested_facts ->> 'source_posted_at'
+        );
+        IF qualifying_text IS NULL
+           OR qualifying_text !~ '(Z|[+-][0-9]{2}:?[0-9]{2})$' THEN
+            RETURN NULL;
+        END IF;
+        qualifying_at := qualifying_text::timestamptz;
+        RETURN qualifying_at + INTERVAL '30 days';
+    END IF;
+    IF requested_opportunity_type IN ('referee_availability', 'referee_request')
+       AND requested_facts ->> 'start_local_date' IS NULL
+       AND requested_facts ->> 'end_local_date' IS NULL THEN
+        qualifying_text := requested_facts ->> 'source_qualifying_assertion_at';
+        IF qualifying_text IS NULL
+           OR qualifying_text !~ '(Z|[+-][0-9]{2}:?[0-9]{2})$' THEN
+            RETURN NULL;
+        END IF;
+        qualifying_at := qualifying_text::timestamptz;
+        RETURN qualifying_at + INTERVAL '30 days';
+    END IF;
+
+    IF requested_opportunity_type = 'tournament'
+       AND requested_facts ->> 'open_participation' <> 'true' THEN
+        RETURN NULL;
+    END IF;
+    IF requested_opportunity_type NOT IN (
+        'open_match', 'tournament', 'opponent_request',
+        'player_match_availability', 'referee_availability', 'referee_request'
+    ) THEN
+        RETURN NULL;
+    END IF;
+
+    timezone_name := requested_facts ->> 'iana_timezone';
+    start_date := (requested_facts ->> 'start_local_date')::date;
+    end_date := (requested_facts ->> 'end_local_date')::date;
+    IF timezone_name IS NULL OR start_date IS NULL OR end_date IS NULL
+       OR end_date < start_date THEN
+        RETURN NULL;
+    END IF;
+    IF start_date = end_date
+       AND jsonb_typeof(requested_facts -> 'exact_local_time') = 'string' THEN
+        exact_time := requested_facts ->> 'exact_local_time';
+        IF exact_time !~ '^([01][0-9]|2[0-3]):[0-5][0-9]$' THEN
+            RETURN NULL;
+        END IF;
+        event_expiry := (
+            (start_date + exact_time::time) AT TIME ZONE timezone_name
+        );
+    ELSE
+        event_expiry := (
+            ((end_date + 1)::timestamp) AT TIME ZONE timezone_name
+        );
+    END IF;
+
+    IF requested_opportunity_type <> 'tournament'
+       OR NOT (requested_facts ? 'registration_deadline') THEN
+        RETURN event_expiry;
+    END IF;
+    registration_value := requested_facts -> 'registration_deadline';
+    WHILE jsonb_typeof(registration_value) = 'object' LOOP
+        IF registration_value ? 'local_date' THEN
+            registration_value := registration_value -> 'local_date';
+        ELSIF registration_value ? 'date' THEN
+            registration_value := registration_value -> 'date';
+        ELSIF registration_value ? 'end_local_date' THEN
+            registration_value := registration_value -> 'end_local_date';
+        ELSE
+            RETURN NULL;
+        END IF;
+    END LOOP;
+    IF jsonb_typeof(registration_value) <> 'string' THEN
+        RETURN NULL;
+    END IF;
+    registration_text := registration_value #>> '{}';
+    IF registration_text ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
+        registration_expiry := (
+            ((registration_text::date + 1)::timestamp)
+            AT TIME ZONE timezone_name
+        );
+    ELSIF registration_text ~ '(Z|[+-][0-9]{2}:?[0-9]{2})$' THEN
+        registration_expiry := registration_text::timestamptz;
+    ELSE
+        registration_expiry := (
+            registration_text::timestamp AT TIME ZONE timezone_name
+        );
+    END IF;
+    RETURN LEAST(event_expiry, registration_expiry);
+EXCEPTION WHEN others THEN
+    RETURN NULL;
+END
+$$;
+
+ALTER FUNCTION football_runtime.opportunity_expiry_at(text, jsonb)
+    OWNER TO football_application;
+REVOKE ALL ON FUNCTION football_runtime.opportunity_expiry_at(text, jsonb)
+    FROM PUBLIC;
+
+CREATE FUNCTION football_runtime.sync_source_message_retention_opportunities(
+    requested_source_message_revision_id text,
+    requested_updated_at timestamptz,
+    requested_reason_code text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, football_runtime
+AS $$
+DECLARE
+    source_row record;
+    opportunity_summary record;
+    next_state text;
+    content_deadline timestamptz;
+    processing_deadline timestamptz;
+BEGIN
+    IF SESSION_USER NOT IN ('football_application', 'postgres')
+       OR CURRENT_USER <> 'football_application' THEN
+        RAISE EXCEPTION 'runtime role cannot sync Opportunity Source retention';
+    END IF;
+    IF requested_source_message_revision_id IS NULL
+       OR requested_updated_at IS NULL THEN
+        RAISE EXCEPTION 'Opportunity Source retention requires identity and time';
+    END IF;
+
+    SELECT source.source_message_id, source.current_revision,
+           source.tombstoned, revision.revision
+    INTO source_row
+    FROM football_runtime.source_message_revisions AS revision
+    JOIN football_runtime.source_messages AS source
+      ON source.source_message_id = revision.source_message_id
+    WHERE revision.source_message_revision_id =
+          requested_source_message_revision_id
+    FOR UPDATE OF source, revision;
+    IF NOT FOUND OR source_row.tombstoned
+       OR source_row.current_revision <> source_row.revision THEN
+        RETURN;
+    END IF;
+
+    SELECT count(*) > 0 AS has_opportunities,
+           COALESCE(bool_or(opportunity.publication_state = 'active'), false)
+               AS has_active,
+           COALESCE(
+               bool_or(opportunity.publication_state = 'held_for_review'), false
+           ) AS has_review,
+           COALESCE(
+               bool_or(opportunity.publication_reason = 'review_timeout'), false
+           ) AS has_review_timeout,
+           max(
+               CASE
+                   WHEN opportunity.publication_state = 'held_for_review'
+                   THEN opportunity.accepted_at + INTERVAL '30 days'
+                   WHEN opportunity.publication_reason = 'review_timeout'
+                   THEN opportunity.accepted_at + INTERVAL '7 days'
+                   WHEN opportunity.publication_reason = 'opportunity_expired'
+                   THEN COALESCE(
+                       football_runtime.opportunity_expiry_at(
+                           opportunity.opportunity_type, opportunity.accepted_facts
+                       ), opportunity.accepted_at
+                   ) + INTERVAL '30 days'
+                   ELSE opportunity.accepted_at + INTERVAL '30 days'
+               END
+           ) AS content_deadline,
+           max(
+               CASE
+                   WHEN opportunity.publication_state = 'active' THEN NULL
+                   WHEN opportunity.publication_reason = 'opportunity_expired'
+                   THEN COALESCE(
+                       football_runtime.opportunity_expiry_at(
+                           opportunity.opportunity_type, opportunity.accepted_facts
+                       ), opportunity.accepted_at
+                   ) + INTERVAL '90 days'
+                   ELSE opportunity.accepted_at + INTERVAL '90 days'
+               END
+           ) AS processing_deadline
+    INTO opportunity_summary
+    FROM football_runtime.application_opportunities AS opportunity
+    WHERE opportunity.source_message_revision_id =
+          requested_source_message_revision_id;
+    IF NOT opportunity_summary.has_opportunities THEN
+        RETURN;
+    END IF;
+
+    IF opportunity_summary.has_active THEN
+        next_state := 'accepted_active';
+        content_deadline := NULL;
+        processing_deadline := NULL;
+    ELSIF opportunity_summary.has_review THEN
+        next_state := 'review';
+        content_deadline := opportunity_summary.content_deadline;
+        processing_deadline := opportunity_summary.processing_deadline;
+    ELSIF opportunity_summary.has_review_timeout THEN
+        next_state := 'unresolved';
+        content_deadline := opportunity_summary.content_deadline;
+        processing_deadline := opportunity_summary.processing_deadline;
+    ELSE
+        next_state := 'accepted_inactive';
+        content_deadline := opportunity_summary.content_deadline;
+        processing_deadline := opportunity_summary.processing_deadline;
+    END IF;
+    PERFORM football_runtime.set_source_message_retention(
+        requested_source_message_revision_id, next_state, content_deadline,
+        processing_deadline, NULL, requested_updated_at,
+        COALESCE(NULLIF(requested_reason_code, ''), 'opportunity_state'),
+        'state_changed'
+    );
+END
+$$;
+
+ALTER FUNCTION football_runtime.sync_source_message_retention_opportunities(
+    text, timestamptz, text
+) OWNER TO football_application;
+REVOKE ALL ON FUNCTION football_runtime.sync_source_message_retention_opportunities(
+    text, timestamptz, text
+) FROM PUBLIC;
+
 CREATE FUNCTION football_runtime.sync_source_message_retention_opportunity()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -471,42 +805,27 @@ SECURITY DEFINER
 SET search_path = pg_catalog, football_runtime
 AS $$
 DECLARE
-    source_row record;
-    next_state text;
-    content_deadline timestamptz;
+    transitioned_at timestamptz;
 BEGIN
-    SELECT source.source_message_id, source.current_revision,
-           source.tombstoned, revision.revision
-    INTO source_row
-    FROM football_runtime.source_message_revisions AS revision
-    JOIN football_runtime.source_messages AS source
-      ON source.source_message_id = revision.source_message_id
-    WHERE revision.source_message_revision_id = NEW.source_message_revision_id;
-    IF NOT FOUND OR source_row.tombstoned
-       OR source_row.current_revision <> source_row.revision THEN
-        RETURN NEW;
+    transitioned_at := COALESCE(
+        NULLIF(
+            pg_catalog.current_setting(
+                'football_runtime.source_retention_as_of', true
+            ), ''
+        )::timestamptz,
+        NEW.accepted_at
+    );
+    IF TG_OP = 'UPDATE'
+       AND OLD.source_message_revision_id IS DISTINCT FROM
+           NEW.source_message_revision_id THEN
+        PERFORM football_runtime.sync_source_message_retention_opportunities(
+            OLD.source_message_revision_id, transitioned_at,
+            COALESCE(OLD.publication_reason, 'opportunity_state')
+        );
     END IF;
-
-    IF NEW.publication_state = 'active' THEN
-        next_state := 'accepted_active';
-        content_deadline := NULL;
-    ELSIF NEW.publication_state = 'held_for_review' THEN
-        next_state := 'review';
-        content_deadline := NEW.accepted_at + INTERVAL '30 days';
-    ELSIF NEW.publication_reason = 'review_timeout' THEN
-        next_state := 'unresolved';
-        content_deadline := NEW.accepted_at + INTERVAL '7 days';
-    ELSE
-        next_state := 'accepted_inactive';
-        content_deadline := NEW.accepted_at + INTERVAL '30 days';
-    END IF;
-    PERFORM football_runtime.set_source_message_retention(
-        NEW.source_message_revision_id, next_state, content_deadline,
-        CASE WHEN next_state = 'accepted_active' THEN NULL
-             ELSE NEW.accepted_at + INTERVAL '90 days' END,
-        NULL, NEW.accepted_at,
-        COALESCE(NEW.publication_reason, 'opportunity_state'),
-        'state_changed'
+    PERFORM football_runtime.sync_source_message_retention_opportunities(
+        NEW.source_message_revision_id, transitioned_at,
+        COALESCE(NEW.publication_reason, 'opportunity_state')
     );
     RETURN NEW;
 END
@@ -714,6 +1033,7 @@ BEGIN
         ]) || jsonb_build_object('body', NULL)
     END
     WHERE producer_role = 'ingestion'
+      AND consumer_role = 'application'
       AND contract_name = 'SourceEventRecorded'
       AND payload ->> 'source_message_revision_id' = (
           'source-chat:' || requested_peer_kind || ':'
@@ -801,6 +1121,8 @@ BEGIN
         'ambiguity_pass_execution', 'evidence', 'response_route'
     ]
     WHERE producer_role = 'classification'
+      AND consumer_role = 'application'
+      AND contract_name = 'ClassificationProposal'
       AND payload ->> 'source_message_revision_id' =
           requested_source_message_revision_id;
     GET DIAGNOSTICS scrubbed_count = ROW_COUNT;
@@ -1258,6 +1580,7 @@ DECLARE
     processing_row record;
     scrubbed_count bigint := 0;
     removed_count bigint := 0;
+    expired_count bigint := 0;
 BEGIN
     IF SESSION_USER <> 'football_application'
        OR CURRENT_USER <> 'football_application' THEN
@@ -1279,6 +1602,13 @@ BEGIN
         )
     ) AND NOT EXISTS (
         SELECT 1
+        FROM football_runtime.application_opportunities AS opportunity
+        WHERE opportunity.publication_state = 'active'
+          AND football_runtime.opportunity_expiry_at(
+              opportunity.opportunity_type, opportunity.accepted_facts
+          ) <= requested_as_of
+    ) AND NOT EXISTS (
+        SELECT 1
         FROM football_runtime.application_source_data_audit AS audit
         WHERE audit.expires_at <= requested_as_of
     ) AND NOT EXISTS (
@@ -1296,6 +1626,21 @@ BEGIN
     ) THEN
         RETURN 0;
     END IF;
+
+    PERFORM pg_catalog.set_config(
+        'football_runtime.source_retention_as_of', requested_as_of::text, true
+    );
+    UPDATE football_runtime.application_opportunities AS opportunity
+    SET publication_state = 'expired',
+        publication_reason = 'opportunity_expired'
+    WHERE opportunity.publication_state = 'active'
+      AND football_runtime.opportunity_expiry_at(
+          opportunity.opportunity_type, opportunity.accepted_facts
+      ) <= requested_as_of;
+    GET DIAGNOSTICS expired_count = ROW_COUNT;
+    PERFORM pg_catalog.set_config(
+        'football_runtime.source_retention_as_of', '', true
+    );
 
     FOR retention_row IN
         SELECT retention.source_message_revision_id,
@@ -1381,7 +1726,7 @@ BEGIN
     WHERE recorded_at + INTERVAL '90 days' <= requested_as_of;
     DELETE FROM football_runtime.application_moderation_events
     WHERE expires_at <= requested_as_of;
-    RETURN scrubbed_count + removed_count;
+    RETURN expired_count + scrubbed_count + removed_count;
 END
 $$;
 
@@ -1404,6 +1749,7 @@ DECLARE
     source_row record;
     routing_row record;
     opportunity_row record;
+    opportunity_reconciliation_row record;
     moderation_row record;
     lifecycle_row record;
 BEGIN
@@ -1530,6 +1876,26 @@ BEGIN
                 'state_changed'
             );
         END IF;
+    END LOOP;
+
+    FOR opportunity_reconciliation_row IN
+        SELECT opportunity.source_message_revision_id,
+               max(opportunity.accepted_at) AS updated_at
+        FROM football_runtime.application_opportunities AS opportunity
+        JOIN football_runtime.source_message_revisions AS revision
+          ON revision.source_message_revision_id =
+             opportunity.source_message_revision_id
+        JOIN football_runtime.source_messages AS source
+          ON source.source_message_id = revision.source_message_id
+        WHERE NOT source.tombstoned
+          AND source.current_revision = revision.revision
+        GROUP BY opportunity.source_message_revision_id
+    LOOP
+        PERFORM football_runtime.sync_source_message_retention_opportunities(
+            opportunity_reconciliation_row.source_message_revision_id,
+            opportunity_reconciliation_row.updated_at,
+            'opportunity_state'
+        );
     END LOOP;
 
     FOR moderation_row IN

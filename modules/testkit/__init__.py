@@ -1978,7 +1978,17 @@ class ControlledConversationLanguageAdapter:
             ),
             administration_label="Verwaltung",
             administration_text="⚙️ **Verwaltung**",
-            administration_labels=("Quell-Chats", "Zurück", "Menü"),
+            administration_labels=(
+                "Quell-Chats",
+                "Datenaufbewahrungs-Audit",
+                "Zurück",
+                "Menü",
+            ),
+            source_data_audit_text=(
+                "🧾 **Datenaufbewahrungs-Audit**\n\n"
+                "Ereignisse ohne Nachrichtentext werden 90 Tage aufbewahrt."
+            ),
+            source_data_audit_labels=("Zurück", "Menü"),
             source_chats_text="📡 **Quell-Chats**",
             source_chats_labels=("Quell-Chat hinzufügen", "Zurück", "Menü"),
             source_chat_address_text=(

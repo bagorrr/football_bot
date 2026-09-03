@@ -485,6 +485,13 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'football_runtime.sync_source_message_retention_tombstone()',
                                  'football_runtime.sync_source_message_retention_routing()',
                                  'football_runtime.sync_source_message_retention_opportunity()',
+                                 'football_runtime.opportunity_expiry_at('
+                                 'requested_opportunity_type text, '
+                                 'requested_facts jsonb)',
+                                 'football_runtime.sync_source_message_retention_opportunities('
+                                 'requested_source_message_revision_id text, '
+                                 'requested_updated_at timestamp with time zone, '
+                                 'requested_reason_code text)',
                                  'football_runtime.sync_source_message_retention_moderation()',
                                  'football_runtime.sync_source_message_retention_lifecycle()',
                                  'football_runtime.read_source_data_audit()',
