@@ -3364,6 +3364,19 @@ def test_expired_replaced_revision_keeps_current_opportunity_active() -> None:
     )
     assert expired_opportunity.publication_state == "expired"
     assert expired_opportunity.publication_reason == "opportunity_expired"
+    system.process_opportunities_until_idle()
+    expired_recommendation = next(
+        opportunity
+        for opportunity in system.recommendation_opportunities()
+        if opportunity.source_message_revision_id == current_revision_id
+        and opportunity.opportunity_id == current_opportunity_id
+        and opportunity.opportunity_revision_id
+        == expired_opportunity.opportunity_revision_id
+    )
+    assert expired_recommendation.publication_state == "expired"
+    assert expired_recommendation.publication_reason == "opportunity_expired"
+    assert expired_recommendation.response_route.kind == "unavailable"
+    assert expired_recommendation.response_route.value == ""
     assert system.source_messages()[0].body == edited_body
     with psycopg.connect(database_url) as connection:
         retention_state = connection.execute(

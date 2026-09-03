@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 CREATE TABLE football_runtime.application_source_message_retention (
     owner_role text NOT NULL DEFAULT 'application'
         CHECK (owner_role = 'application'),
@@ -176,6 +178,26 @@ ALTER TABLE football_runtime.application_opportunities
 
 ALTER TABLE football_runtime.application_opportunities
     ADD CONSTRAINT application_opportunities_publication_reason_check CHECK (
+        publication_reason IS NULL
+        OR publication_reason IN (
+            'source_revision_superseded',
+            'source_deleted',
+            'response_route_unavailable',
+            'exact_repost_superseded',
+            'moderation_held',
+            'moderation_suppressed',
+            'review_timeout',
+            'source_chat_paused',
+            'source_chat_removed',
+            'opportunity_expired'
+        )
+    );
+
+ALTER TABLE football_runtime.recommendation_opportunities
+    DROP CONSTRAINT IF EXISTS recommendation_opportunities_publication_reason_check;
+
+ALTER TABLE football_runtime.recommendation_opportunities
+    ADD CONSTRAINT recommendation_opportunities_publication_reason_check CHECK (
         publication_reason IS NULL
         OR publication_reason IN (
             'source_revision_superseded',
@@ -1576,8 +1598,11 @@ SECURITY DEFINER
 SET search_path = pg_catalog, football_runtime
 AS $$
 DECLARE
+    opportunity_row record;
     retention_row record;
     processing_row record;
+    expiry_causation_id uuid;
+    expiry_revision integer;
     scrubbed_count bigint := 0;
     removed_count bigint := 0;
     expired_count bigint := 0;
@@ -1630,14 +1655,78 @@ BEGIN
     PERFORM pg_catalog.set_config(
         'football_runtime.source_retention_as_of', requested_as_of::text, true
     );
-    UPDATE football_runtime.application_opportunities AS opportunity
-    SET publication_state = 'expired',
-        publication_reason = 'opportunity_expired'
-    WHERE opportunity.publication_state = 'active'
-      AND football_runtime.opportunity_expiry_at(
-          opportunity.opportunity_type, opportunity.accepted_facts
-      ) <= requested_as_of;
-    GET DIAGNOSTICS expired_count = ROW_COUNT;
+    FOR opportunity_row IN
+        SELECT opportunity.opportunity_id,
+               opportunity.opportunity_revision_id,
+               opportunity.source_message_revision_id,
+               opportunity.opportunity_type,
+               opportunity.accepted_facts
+        FROM football_runtime.application_opportunities AS opportunity
+        WHERE opportunity.publication_state = 'active'
+          AND football_runtime.opportunity_expiry_at(
+              opportunity.opportunity_type, opportunity.accepted_facts
+          ) <= requested_as_of
+        ORDER BY opportunity.opportunity_id, opportunity.opportunity_revision_id
+        FOR UPDATE
+    LOOP
+        UPDATE football_runtime.application_opportunities AS opportunity
+        SET publication_state = 'expired',
+            publication_reason = 'opportunity_expired'
+        WHERE opportunity.opportunity_revision_id =
+              opportunity_row.opportunity_revision_id
+          AND opportunity.publication_state = 'active';
+        IF FOUND THEN
+            expiry_revision := split_part(
+                opportunity_row.opportunity_revision_id, ':revision:', 2
+            )::integer;
+            expiry_causation_id := public.uuid_generate_v5(
+                '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+                'football-bot:opportunity-expiry:' ||
+                opportunity_row.opportunity_revision_id
+            );
+            INSERT INTO football_runtime.contract_outbox (
+                message_id, producer_role, consumer_role, contract_name,
+                contract_version, subject_id, subject_revision,
+                idempotency_key, causation_id, correlation_id, recorded_at,
+                payload
+            ) VALUES (
+                public.uuid_generate_v5(
+                    '6ba7b811-9dad-11d1-80b4-00c04fd430c8'::uuid,
+                    'football-bot:' || expiry_causation_id::text ||
+                    ':OpportunityPublicationChanged'
+                ),
+                'application', 'recommendation', 'OpportunityPublicationChanged',
+                CASE
+                    WHEN opportunity_row.opportunity_type IN (
+                        'coach_availability', 'coach_request'
+                    ) THEN 4
+                    ELSE 2
+                END,
+                opportunity_row.opportunity_id,
+                expiry_revision,
+                'opportunity-publication-expiry:' ||
+                    opportunity_row.opportunity_revision_id,
+                expiry_causation_id,
+                expiry_causation_id,
+                requested_as_of,
+                jsonb_build_object(
+                    'opportunity_id', opportunity_row.opportunity_id,
+                    'opportunity_revision_id',
+                        opportunity_row.opportunity_revision_id,
+                    'source_message_revision_id',
+                        opportunity_row.source_message_revision_id,
+                    'publication_state', 'expired',
+                    'publication_reason', 'opportunity_expired',
+                    'opportunity_type', opportunity_row.opportunity_type,
+                    'accepted_facts', opportunity_row.accepted_facts,
+                    'response_route',
+                        jsonb_build_object('kind', 'unavailable', 'value', '')
+                )
+            )
+            ON CONFLICT (producer_role, idempotency_key) DO NOTHING;
+            expired_count := expired_count + 1;
+        END IF;
+    END LOOP;
     PERFORM pg_catalog.set_config(
         'football_runtime.source_retention_as_of', '', true
     );

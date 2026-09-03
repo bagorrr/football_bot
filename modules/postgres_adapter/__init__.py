@@ -230,7 +230,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "cc2935d5b8c9462086677646d50c793f550c9b85e694c5bc68e28f86f84889ca",
     "62ac5af74f66169098f47a96549d4d2f7e8dc2b0ece1062a1e9dd447a3e08c6d",
     "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
-    "4ff27d6d9c8ea71d265421f98551c87afad77976e055085770f9e82cff261b09",
+    "acb7f4f66164c85929079d5f901545605cf7a4109a736a22a18fbba42d756717",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -12242,6 +12242,7 @@ _EXACT_REPOST_PUBLICATION_REASONS = frozenset(
         "moderation_held",
         "moderation_suppressed",
         "review_timeout",
+        "opportunity_expired",
     }
 )
 _EXACT_REPOST_STANDING_OPPORTUNITY_TYPES = frozenset(
