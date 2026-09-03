@@ -4260,6 +4260,30 @@ def test_pause_cancels_unfinished_work_suppresses_routes_and_discards_gap() -> N
     assert len(classifier.requests) == 2
     system.process_next_source_chat_bot_result()
 
+    source_retention_boundary = remove_at + timedelta(days=30)
+    clock.advance_to(source_retention_boundary - timedelta(microseconds=1))
+    assert system.cleanup_expired_source_data() == 0
+    assert all(message.body is not None for message in system.source_messages())
+    clock.advance_to(source_retention_boundary)
+    assert system.cleanup_expired_source_data() > 0
+    messages_by_telegram_id = {
+        message.telegram_message_id: message for message in system.source_messages()
+    }
+    assert messages_by_telegram_id[7001].body is None
+    assert messages_by_telegram_id[7002].body == pending_body
+    assert messages_by_telegram_id[7004].body is None
+    revisions_by_telegram_id = {
+        int(revision.source_message_id.rsplit(":message:", 1)[1]): revision
+        for revision in system.source_message_revisions()
+    }
+    assert revisions_by_telegram_id[7001].body is None
+    assert revisions_by_telegram_id[7002].body == pending_body
+    assert revisions_by_telegram_id[7004].body is None
+    clock.advance_to(source_retention_boundary + timedelta(days=7))
+    assert system.cleanup_expired_source_data() > 0
+    assert all(message.body is None for message in system.source_messages())
+    assert all(revision.body is None for revision in system.source_message_revisions())
+
     removed_screen_revision = telegram.messages[-1].screen_revision
     assert all(
         not callback.startswith("source-chats:re_enable:")

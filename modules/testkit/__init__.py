@@ -76,6 +76,7 @@ from modules.domain import (
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
     SourceChatRegistryEntry,
+    SourceDataAuditEvent,
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
@@ -2252,6 +2253,25 @@ class AcceptanceSpine:
     ) -> tuple[SourceMessageDeletionTombstone, ...]:
         """Observe bounded body-free deletion tombstones through the testkit."""
         return self._observer.source_message_deletion_tombstones()
+
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Observe the bounded body-free Source retention audit trail."""
+        return self._observer.source_data_audit()
+
+    def source_data_audit_as(
+        self,
+        actor: RuntimeRole,
+    ) -> tuple[SourceDataAuditEvent, ...]:
+        """Probe the role-isolated Source retention audit projection."""
+        try:
+            return self._roles[actor].store.source_data_audit()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+
+    def cleanup_expired_source_data(self) -> int:
+        """Run the Application-owned bounded Source retention cleanup."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.cleanup_expired_source_data(as_of=self._clock.now())
 
     def cleanup_expired_source_message_tombstones(self) -> int:
         """Run the Application-owned physical tombstone retention cleanup."""

@@ -14173,6 +14173,7 @@ class RuntimeApplication:
         """Discover and process one durable handoff addressed to this role."""
         if self.role is RuntimeRole.APPLICATION:
             self.store.expire_moderation_reviews(as_of=self.clock.now())
+            self.store.cleanup_expired_source_data(as_of=self.clock.now())
             self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
             self.store.cleanup_expired_moderation_events(as_of=self.clock.now())
         claimed = self.store.claim_next(

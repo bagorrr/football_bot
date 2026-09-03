@@ -2895,6 +2895,125 @@ def test_irrelevant_event_is_recorded_without_content_pre_screening() -> None:
     system.reset()
 
 
+def test_source_retention_scrubs_content_and_exposes_only_bounded_audit() -> None:
+    """Apply the exact 7-day content and 90-day lineage retention clocks."""
+    telethon = ControlledTelegramIngestionAdapter()
+    model = ControlledModelAdapter()
+    body = "The cafeteria closes at six."
+    model.return_for(
+        body=body,
+        result=ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v1",
+                "disposition": "irrelevant",
+                "candidates": [],
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="controlled_recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    clock = FrozenClock(datetime(2026, 8, 1, 9, 0, tzinfo=UTC))
+    administrator_id = 47_005
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_700_500,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_retention_source",
+        identity=identity,
+        transport_boundary="channel-pts:4750",
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=model,
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    event_at = datetime(2026, 9, 2, 9, 6, tzinfo=UTC)
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=event_at - timedelta(minutes=1),
+        administrator_id=administrator_id,
+        address="@synthetic_retention_source",
+        update_suffix="source-retention",
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4750),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4751),
+        source_event_id="source-event:retention:irrelevant",
+        telegram_message_id=47_005,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=body,
+        event_time=event_at,
+    )
+    clock.advance_to(event_at)
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+    assert system.source_messages()[0].body == body
+
+    audit = system.source_data_audit()
+    assert any(event.action == "state_changed" for event in audit)
+    assert all(
+        event.source_ref.startswith("source:")
+        and event.revision_ref.startswith("revision:")
+        and len(event.source_ref) == len("source:") + 32
+        and len(event.revision_ref) == len("revision:") + 32
+        for event in audit
+    )
+    assert system.source_data_audit_as(RuntimeRole.APPLICATION) == audit
+    assert system.source_data_audit_as(RuntimeRole.BOT_ASSISTANT) == audit
+    for actor in (
+        RuntimeRole.INGESTION,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.RECOMMENDATION,
+    ):
+        with pytest.raises(OwnershipViolationError):
+            system.source_data_audit_as(actor)
+
+    clock.advance_to(event_at + timedelta(days=6, hours=23))
+    assert system.cleanup_expired_source_data() == 0
+    assert system.source_messages()[0].body == body
+
+    clock.advance_to(event_at + timedelta(days=7))
+    assert system.cleanup_expired_source_data() == 1
+    assert system.source_messages()[0].body is None
+    assert system.source_message_revisions()[0].body is None
+    assert all(event.body is None for event in system.source_events())
+    assert any(
+        event.action == "content_scrubbed" for event in system.source_data_audit()
+    )
+
+    clock.advance_to(event_at + timedelta(days=90))
+    assert system.cleanup_expired_source_data() > 0
+    assert system.source_messages() == ()
+    assert system.source_message_revisions() == ()
+    assert system.source_events() == ()
+    assert system.source_data_audit()
+
+    clock.advance_to(event_at + timedelta(days=97))
+    system.cleanup_expired_source_data()
+    assert system.source_data_audit() == ()
+    system.reset()
+
+
 def test_edit_transport_event_replaces_the_authoritative_current_revision() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     registered_at = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)

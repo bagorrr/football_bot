@@ -87,6 +87,7 @@ from modules.domain import (
     SourceChatLifecycleState,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
+    SourceDataAuditEvent,
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
@@ -180,6 +181,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0042_moderation_review_events.sql",
     "0043_source_chat_administration_lifecycle.sql",
     "0044_source_chat_lifecycle_cancellation.sql",
+    "0045_source_retention_audit_role_isolation.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -228,6 +230,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "cc2935d5b8c9462086677646d50c793f550c9b85e694c5bc68e28f86f84889ca",
     "62ac5af74f66169098f47a96549d4d2f7e8dc2b0ece1062a1e9dd447a3e08c6d",
     "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
+    "4ae0d590ea49f53b3b79613813dc6ece49bf7485dbaab110e5864defc8c59b5e",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -737,6 +740,8 @@ class PostgresAcceptanceObserver:
                      football_runtime.application_classifier_promotion_attestations,
                      football_runtime.application_proposition_identities,
                      football_runtime.application_moderation_events,
+                     football_runtime.application_source_data_audit,
+                     football_runtime.application_source_message_retention,
                      football_runtime.application_exact_repost_cluster_members,
                      football_runtime.application_exact_repost_clusters,
                      football_runtime.application_opportunities,
@@ -1013,6 +1018,23 @@ class PostgresAcceptanceObserver:
             )
             for row in rows
         )
+
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Observe the bounded, body-free Source retention audit trail."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT audit_event_id, source_ref, revision_ref, action,
+                       previous_state, next_state, reason_code,
+                       recorded_at, expires_at
+                FROM football_runtime.application_source_data_audit
+                ORDER BY recorded_at, audit_event_id
+                """
+            ).fetchall()
+        return tuple(SourceDataAuditEvent(**row) for row in rows)
 
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:
         """Observe body-free protected-event outcomes through the testkit."""
@@ -4619,6 +4641,49 @@ class PostgresRoleStore:
                 (as_of,),
             ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def cleanup_expired_source_data(self, *, as_of: datetime) -> int:
+        """Apply the bounded Source Message content and lineage clocks."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.cleanup_expired_source_data(%s)
+                """,
+                (as_of,),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Read only the body-free audit projection allowed to this role."""
+        if self._role is RuntimeRole.APPLICATION:
+            query = """
+                SELECT audit_event_id, source_ref, revision_ref, action,
+                       previous_state, next_state, reason_code,
+                       recorded_at, expires_at
+                FROM football_runtime.application_source_data_audit
+                ORDER BY recorded_at, audit_event_id
+            """
+        elif self._role is RuntimeRole.BOT_ASSISTANT:
+            query = """
+                SELECT audit_event_id, source_ref, revision_ref, action,
+                       previous_state, next_state, reason_code,
+                       recorded_at, expires_at
+                FROM football_runtime.read_source_data_audit()
+                ORDER BY recorded_at, audit_event_id
+            """
+        else:
+            raise ConversationAccessDeniedError
+        try:
+            with psycopg.connect(
+                self._database_url,
+                row_factory=dict_row,
+            ) as connection:
+                rows = connection.execute(query).fetchall()
+        except psycopg.errors.InsufficientPrivilege as error:
+            raise ConversationAccessDeniedError from error
+        return tuple(SourceDataAuditEvent(**row) for row in rows)
 
     def cleanup_expired_moderation_events(self, *, as_of: datetime) -> int:
         """Physically delete body-free moderation events after 90 days."""
