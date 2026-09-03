@@ -1267,6 +1267,36 @@ BEGIN
         RAISE EXCEPTION 'Source retention cleanup requires an as-of time';
     END IF;
 
+    IF NOT EXISTS (
+        SELECT 1
+        FROM football_runtime.application_source_message_retention AS retention
+        WHERE (
+            retention.content_scrubbed_at IS NULL
+            AND retention.content_expires_at <= requested_as_of
+        ) OR (
+            retention.retention_state <> 'accepted_active'
+            AND retention.processing_expires_at <= requested_as_of
+        )
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM football_runtime.application_source_data_audit AS audit
+        WHERE audit.expires_at <= requested_as_of
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM football_runtime.classification_routing_outcomes AS outcome
+        WHERE outcome.recorded_at + INTERVAL '90 days' <= requested_as_of
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM football_runtime.application_source_chat_lifecycle_events AS event
+        WHERE event.recorded_at + INTERVAL '90 days' <= requested_as_of
+    ) AND NOT EXISTS (
+        SELECT 1
+        FROM football_runtime.application_moderation_events AS event
+        WHERE event.expires_at <= requested_as_of
+    ) THEN
+        RETURN 0;
+    END IF;
+
     FOR retention_row IN
         SELECT retention.source_message_revision_id,
                retention.retention_state,
