@@ -1344,10 +1344,15 @@ BEGIN
 
     FOR processing_row IN
         SELECT retention.source_message_id,
-               retention.source_message_revision_id
+               retention.source_message_revision_id,
+               source.current_revision,
+               revision.revision
         FROM football_runtime.application_source_message_retention AS retention
         JOIN football_runtime.source_messages AS source
           ON source.source_message_id = retention.source_message_id
+        JOIN football_runtime.source_message_revisions AS revision
+          ON revision.source_message_revision_id =
+             retention.source_message_revision_id
         WHERE retention.retention_state <> 'accepted_active'
           AND retention.processing_expires_at <= requested_as_of
           AND NOT source.tombstoned
@@ -1355,10 +1360,17 @@ BEGIN
                  retention.source_message_revision_id
         FOR UPDATE OF retention
     LOOP
-        removed_count := removed_count +
-            football_runtime.delete_expired_source_message(
-                processing_row.source_message_id, requested_as_of
-            );
+        IF processing_row.revision <> processing_row.current_revision THEN
+            removed_count := removed_count +
+                football_runtime.delete_source_message_revision_lineage(
+                    processing_row.source_message_revision_id, requested_as_of
+                );
+        ELSE
+            removed_count := removed_count +
+                football_runtime.delete_expired_source_message(
+                    processing_row.source_message_id, requested_as_of
+                );
+        END IF;
     END LOOP;
 
     DELETE FROM football_runtime.application_source_data_audit

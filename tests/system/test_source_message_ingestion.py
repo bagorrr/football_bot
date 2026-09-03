@@ -7,13 +7,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
 
 from modules.contracts import ContractName, FailureCode, JsonValue, RuntimeRole
 from modules.domain import (
+    ConversationStage,
+    GeographicType,
     IngestionFailureReason,
+    LocationCandidate,
+    LocationInterpretation,
+    LocationResolution,
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
@@ -35,6 +41,7 @@ from modules.testkit import (
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
     ControlledTelegramIngestionAdapter,
+    ControlledTimezoneDataAdapter,
     FrozenClock,
     InjectedFailureError,
     OwnershipViolationError,
@@ -3011,6 +3018,257 @@ def test_source_retention_scrubs_content_and_exposes_only_bounded_audit() -> Non
     clock.advance_to(event_at + timedelta(days=97))
     system.cleanup_expired_source_data()
     assert system.source_data_audit() == ()
+    system.reset()
+
+
+def test_expired_replaced_revision_keeps_current_opportunity_active() -> None:
+    """Delete an expired replaced revision without deleting its active successor."""
+    telethon = ControlledTelegramIngestionAdapter()
+    model = ControlledModelAdapter()
+    database_url = os.environ["TEST_DATABASE_URL"]
+    with psycopg.connect(database_url) as connection:
+        timezone_row = connection.execute("SHOW TIME ZONE").fetchone()
+    assert timezone_row is not None
+    source_timezone = ZoneInfo(str(timezone_row[0]))
+    registered_at = datetime(2026, 9, 2, 9, 0, tzinfo=source_timezone)
+    created_at = registered_at + timedelta(minutes=1)
+    edited_at = registered_at + timedelta(minutes=2)
+    clock = FrozenClock(datetime(2026, 8, 2, 9, 0, tzinfo=source_timezone))
+    administrator_id = 47_015
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_701_500,
+    )
+    address = "@synthetic_replaced_retention"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:4840",
+    )
+
+    def accepted_result(
+        *, body: str, event_time_evidence: str, start_local_date: str
+    ) -> ClassifierAdapterResult:
+        return ClassifierAdapterResult(
+            output={
+                "schema_version": "source-message-classification-v1",
+                "disposition": "accepted",
+                "candidates": [
+                    {
+                        "candidate_key": "replaced-revision-retention",
+                        "opportunity_type": "open_match",
+                        "evidence": {
+                            "opportunity": "Need one player",
+                            "event_time": event_time_evidence,
+                            "location": "in whole city",
+                            "open_places": "one player",
+                        },
+                        "location": {
+                            "mention": "in whole city",
+                            "place_id": "city:ru:saint-petersburg",
+                            "country_id": "country:ru",
+                            "city_id": "city:ru:saint-petersburg",
+                        },
+                        "event_time": {
+                            "start_local_date": start_local_date,
+                            "end_local_date": start_local_date,
+                            "iana_timezone": "Europe/Moscow",
+                        },
+                        "open_places": 1,
+                        "response_routes": [
+                            {
+                                "kind": "explicit_telegram_username",
+                                "value": "@retention_current",
+                                "evidence": "@retention_current",
+                            }
+                        ],
+                    }
+                ],
+            },
+            effective_model="gpt-5.6-sol",
+            effective_reasoning_effort="high",
+            codex_version="controlled-offline",
+            adapter_kind="controlled_recording",
+            adapter_version="classifier-recording-v1",
+            duration_ms=3,
+            input_tokens=len(body),
+            output_tokens=20,
+        )
+
+    created_body = (
+        "Need one player for a football match on 20 September 2026 in whole city. "
+        "Contact @retention_current."
+    )
+    edited_body = (
+        "Need one player for a football match on 21 September 2026 in whole city. "
+        "Contact @retention_current."
+    )
+    model.return_for(
+        body=created_body,
+        result=accepted_result(
+            body=created_body,
+            event_time_evidence="20 September 2026",
+            start_local_date="2026-09-20",
+        ),
+    )
+    model.return_for(
+        body=edited_body,
+        result=accepted_result(
+            body=edited_body,
+            event_time_evidence="21 September 2026",
+            start_local_date="2026-09-21",
+        ),
+    )
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="in whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                                ("ru", "Санкт-Петербург"),
+                            ),
+                        ),
+                    ),
+                    whole_city=True,
+                ),
+            )
+        ),
+    )
+    timezones = ControlledTimezoneDataAdapter()
+    timezones.add_source(version="controlled-tzdb-v1", timezones=("Europe/Moscow",))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=model,
+        location_resolver=resolver,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address=address,
+        update_suffix="replaced-revision-retention",
+    )
+    system.configure_source_chat_classifier_context(
+        identity=identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4840),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4841),
+        source_event_id="source-event:replaced-revision-retention:create",
+        telegram_message_id=1_501,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body=created_body,
+        event_time=created_at,
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4841),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4842),
+        source_event_id="source-event:replaced-revision-retention:edit",
+        telegram_message_id=1_501,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=edited_body,
+        event_time=edited_at,
+    )
+
+    clock.advance_to(created_at)
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+    assert len(system.opportunities()) == 1
+    assert system.opportunities()[0].publication_state == "active"
+
+    clock.advance_to(edited_at)
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    system.process_opportunities_until_idle()
+    source_message_id = "source-chat:channel:4701500:generation:1:message:1501"
+    old_revision_id = f"{source_message_id}:revision:1"
+    current_revision_id = f"{source_message_id}:revision:2"
+    assert {
+        revision.source_message_revision_id
+        for revision in system.source_message_revisions()
+    } == {old_revision_id, current_revision_id}
+    assert any(
+        opportunity.source_message_revision_id == current_revision_id
+        and opportunity.publication_state == "active"
+        for opportunity in system.opportunities()
+    )
+
+    clock.advance_to(edited_at + timedelta(days=7))
+    assert system.cleanup_expired_source_data() > 0
+    assert system.source_messages()[0].body == edited_body
+    assert (
+        next(
+            revision
+            for revision in system.source_message_revisions()
+            if revision.source_message_revision_id == old_revision_id
+        ).body
+        is None
+    )
+
+    clock.advance_to(created_at + timedelta(days=90))
+    assert system.cleanup_expired_source_data() > 0
+    assert {
+        revision.source_message_revision_id
+        for revision in system.source_message_revisions()
+    } == {current_revision_id}
+    assert {event.source_event_id for event in system.source_events()} == {
+        "source-event:replaced-revision-retention:edit"
+    }
+    assert {
+        attempt.source_message_revision_id
+        for attempt in system.classification_attempts()
+    } == {current_revision_id}
+    assert {
+        outcome.source_message_revision_id
+        for outcome in system.classification_routing_outcomes()
+    } == {current_revision_id}
+    current_opportunity = next(
+        opportunity
+        for opportunity in system.opportunities()
+        if opportunity.source_message_revision_id == current_revision_id
+    )
+    assert current_opportunity.publication_state == "active"
+    assert current_opportunity.response_route.value == "@retention_current"
     system.reset()
 
 
