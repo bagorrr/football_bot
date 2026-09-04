@@ -61,6 +61,52 @@ def test_run_search_rejects_noncanonical_game_detail_values(
         )
 
 
+@pytest.mark.parametrize("contract_version", [2, 3])
+def test_run_search_rejects_relaxation_without_refinement_lineage(
+    contract_version: int,
+) -> None:
+    user_id = 49_104 + contract_version
+    update_id = f"unbound-relaxation-v{contract_version}"
+    message_id = derive_run_search_message_id(user_id, update_id)
+
+    with pytest.raises(ValueError, match="refined_from_completed_search_id"):
+        ContractEnvelope(
+            contract_name=ContractName.RUN_SEARCH,
+            contract_version=contract_version,
+            message_id=message_id,
+            producer=RuntimeRole.BOT_ASSISTANT,
+            consumer=RuntimeRole.RECOMMENDATION,
+            subject_id=f"bot-user:{user_id}",
+            subject_revision=1,
+            idempotency_key=f"run-search:{user_id}:{update_id}",
+            causation_id=message_id,
+            correlation_id=message_id,
+            recorded_at=datetime(2026, 8, 14, tzinfo=UTC),
+            payload={
+                "search_update_id": update_id,
+                "telegram_user_id": user_id,
+                "discovery_draft_revision": 1,
+                "display_locale": "en",
+                "user_intent": "game_search",
+                "country_id": "country:ru",
+                "city_id": "city:ru:saint-petersburg",
+                "sub_city_area_ids": ["district:ru:spb:primorsky"],
+                "sub_city_area_geographic_types": ["administrative_district"],
+                "sub_city_area_verified_parent_ids": [
+                    ["city:ru:saint-petersburg", "country:ru"]
+                ],
+                "whole_city": False,
+                "required_date": {
+                    "start_local_date": "2026-08-20",
+                    "end_local_date": "2026-08-20",
+                    "iana_timezone": "Europe/Moscow",
+                    "timezone_data_version": "controlled-tzdb-v1",
+                },
+                "relaxed_criterion": "search_area",
+            },
+        )
+
+
 @pytest.mark.parametrize("geographic_type", ["city", "bogus"])
 def test_run_search_rejects_noncanonical_sub_city_geographic_types(
     geographic_type: str,

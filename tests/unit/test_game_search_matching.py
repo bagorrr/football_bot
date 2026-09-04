@@ -5,11 +5,11 @@ from datetime import UTC, date, datetime
 
 from modules.domain import (
     CompletedSearch,
+    DiscoveryCriterionChange,
+    DiscoveryCriterionChangeOperation,
     MatchState,
     OpportunityRevisionProjection,
     RequiredDate,
-    SearchCriterionChange,
-    SearchCriterionChangeOperation,
     UserIntent,
     evaluate_game_search,
     match_detail,
@@ -154,9 +154,9 @@ def test_clear_criterion_change_creates_a_new_immutable_search_snapshot() -> Non
 
     added = refine_completed_search(
         search,
-        SearchCriterionChange(
+        DiscoveryCriterionChange(
             criterion="positions",
-            operation=SearchCriterionChangeOperation.ADD,
+            operation=DiscoveryCriterionChangeOperation.ADD,
             value=("defender",),
         ),
         new_completed_search_id="completed-search:added",
@@ -165,9 +165,9 @@ def test_clear_criterion_change_creates_a_new_immutable_search_snapshot() -> Non
     )
     replaced = refine_completed_search(
         added,
-        SearchCriterionChange(
+        DiscoveryCriterionChange(
             criterion="positions",
-            operation=SearchCriterionChangeOperation.REPLACE,
+            operation=DiscoveryCriterionChangeOperation.REPLACE,
             value=("midfielder",),
         ),
         new_completed_search_id="completed-search:replaced",
@@ -176,9 +176,9 @@ def test_clear_criterion_change_creates_a_new_immutable_search_snapshot() -> Non
     )
     removed = refine_completed_search(
         replaced,
-        SearchCriterionChange(
+        DiscoveryCriterionChange(
             criterion="positions",
-            operation=SearchCriterionChangeOperation.REMOVE,
+            operation=DiscoveryCriterionChangeOperation.REMOVE,
         ),
         new_completed_search_id="completed-search:removed",
         new_search_update_id="game-search-removed",
@@ -213,9 +213,9 @@ def test_player_number_refinement_supports_add_replace_and_remove() -> None:
 
     added = refine_completed_search(
         search,
-        SearchCriterionChange(
+        DiscoveryCriterionChange(
             criterion="number_of_players",
-            operation=SearchCriterionChangeOperation.ADD,
+            operation=DiscoveryCriterionChangeOperation.ADD,
             value=3,
         ),
         new_completed_search_id="completed-search:player-number-added",
@@ -224,9 +224,9 @@ def test_player_number_refinement_supports_add_replace_and_remove() -> None:
     )
     replaced = refine_completed_search(
         added,
-        SearchCriterionChange(
+        DiscoveryCriterionChange(
             criterion="number_of_players",
-            operation=SearchCriterionChangeOperation.REPLACE,
+            operation=DiscoveryCriterionChangeOperation.REPLACE,
             value=4,
         ),
         new_completed_search_id="completed-search:player-number-replaced",
@@ -235,9 +235,9 @@ def test_player_number_refinement_supports_add_replace_and_remove() -> None:
     )
     removed = refine_completed_search(
         replaced,
-        SearchCriterionChange(
+        DiscoveryCriterionChange(
             criterion="number_of_players",
-            operation=SearchCriterionChangeOperation.REMOVE,
+            operation=DiscoveryCriterionChangeOperation.REMOVE,
         ),
         new_completed_search_id="completed-search:player-number-removed",
         new_search_update_id="player-number-removed",

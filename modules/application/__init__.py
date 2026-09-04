@@ -58,6 +58,7 @@ from modules.domain import (
     ConversationState,
     DateInterpretation,
     DateInterpretationQuery,
+    DiscoveryCriterionChange,
     DiscoveryDraft,
     ExplicitAmountCurrencySpan,
     GeographicType,
@@ -77,7 +78,6 @@ from modules.domain import (
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
-    SearchCriterionChange,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
@@ -3685,7 +3685,7 @@ class ConversationOnboarding:
         *,
         update_id: str,
         telegram_user_id: int,
-        change: SearchCriterionChange,
+        change: DiscoveryCriterionChange,
         relaxed_criterion: str | None = None,
     ) -> None:
         """Apply one clear Bot User change to the active immutable Search."""
@@ -18768,6 +18768,10 @@ class RuntimeApplication:
             not isinstance(relaxed_criterion, str) or not relaxed_criterion
         ):
             raise ValueError("RunSearch relaxed_criterion must be text")
+        if relaxed_criterion is not None and refined_from_completed_search_id is None:
+            raise ValueError(
+                "RunSearch relaxed_criterion requires refined Search lineage"
+            )
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("RunSearch requires telegram_user_id")
         if not isinstance(search_update_id, str) or not search_update_id:

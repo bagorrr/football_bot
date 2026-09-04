@@ -54,6 +54,7 @@ from modules.domain import (
     ConversationState,
     DateInterpretationQuery,
     DateInterpretationResolution,
+    DiscoveryCriterionChange,
     DiscoveryDraft,
     ExactRepostCluster,
     ExactRepostClusterMember,
@@ -72,7 +73,6 @@ from modules.domain import (
     ProtectedContentSkip,
     RequiredDate,
     RequiredDateConfirmationEvent,
-    SearchCriterionChange,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
@@ -2968,7 +2968,7 @@ class AcceptanceSpine:
         *,
         update_id: str,
         telegram_user_id: int,
-        change: SearchCriterionChange,
+        change: DiscoveryCriterionChange,
         relaxed_criterion: str | None = None,
     ) -> None:
         """Drive one clear Result Conversation refinement through Bot Assistant."""

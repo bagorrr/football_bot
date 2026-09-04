@@ -879,15 +879,19 @@ def _validate_run_search(
             raise ValueError(
                 f"RunSearch v{contract_version} causation/correlation is not canonical"
             )
-        for field_name in (
-            "refined_from_completed_search_id",
-            "relaxed_criterion",
-        ):
-            value = payload.get(field_name)
-            if value is not None and (not isinstance(value, str) or not value):
-                raise ValueError(
-                    f"RunSearch v{contract_version} {field_name} must be text"
-                )
+    refined_from_completed_search_id = payload.get("refined_from_completed_search_id")
+    relaxed_criterion = payload.get("relaxed_criterion")
+    for field_name, value in (
+        ("refined_from_completed_search_id", refined_from_completed_search_id),
+        ("relaxed_criterion", relaxed_criterion),
+    ):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"RunSearch v{contract_version} {field_name} must be text")
+    if relaxed_criterion is not None and refined_from_completed_search_id is None:
+        raise ValueError(
+            f"RunSearch v{contract_version} relaxed_criterion requires "
+            "refined_from_completed_search_id"
+        )
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:

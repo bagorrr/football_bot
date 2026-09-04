@@ -21,8 +21,8 @@ from modules.domain import (
     ConversationStage,
     DateInterpretation,
     DateInterpretationResolution,
-    SearchCriterionChange,
-    SearchCriterionChangeOperation,
+    DiscoveryCriterionChange,
+    DiscoveryCriterionChangeOperation,
 )
 from modules.testkit import (
     AcceptanceSpine,
@@ -143,9 +143,9 @@ def test_clear_result_change_creates_a_new_persisted_search_snapshot() -> None:
     system.refine_search(
         update_id="refined-result-search",
         telegram_user_id=user_id,
-        change=SearchCriterionChange(
+        change=DiscoveryCriterionChange(
             criterion="positions",
-            operation=SearchCriterionChangeOperation.ADD,
+            operation=DiscoveryCriterionChangeOperation.ADD,
             value=("defender",),
         ),
         relaxed_criterion="positions",
@@ -171,6 +171,67 @@ def test_clear_result_change_creates_a_new_persisted_search_snapshot() -> None:
     assert system.active_result_context(user_id).completed_search_id == (
         refined.completed_search_id
     )
+    system.reset()
+
+
+def test_unbound_search_area_relaxation_cannot_create_a_variant() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_020
+    update_id = "unbound-search-area-variant"
+    message_id = derive_run_search_message_id(user_id, update_id)
+    payload: dict[str, JsonValue] = {
+        "search_update_id": update_id,
+        "telegram_user_id": user_id,
+        "discovery_draft_revision": 1,
+        "display_locale": "en",
+        "user_intent": "game_search",
+        "country_id": "country:ru",
+        "city_id": "city:ru:saint-petersburg",
+        "sub_city_area_ids": ["district:ru:spb:primorsky"],
+        "sub_city_area_geographic_types": ["administrative_district"],
+        "sub_city_area_verified_parent_ids": [
+            ["city:ru:saint-petersburg", "country:ru"]
+        ],
+        "whole_city": False,
+        "required_date": {
+            "start_local_date": "2026-08-20",
+            "end_local_date": "2026-08-20",
+            "iana_timezone": "Europe/Moscow",
+            "timezone_data_version": "controlled-tzdb-v1",
+        },
+        "relaxed_criterion": "search_area",
+    }
+    system.record_search_event(
+        probe_id=update_id,
+        contract_name=ContractName.RUN_SEARCH,
+        contract_version=2,
+        telegram_user_id=user_id,
+        payload=payload,
+        message_id=message_id,
+        subject_id=f"bot-user:{user_id}",
+        subject_revision=1,
+        idempotency_key=f"run-search:{user_id}:{update_id}",
+        causation_id=message_id,
+        correlation_id=message_id,
+    )
+
+    assert system.process_next_search_handoff(RuntimeRole.RECOMMENDATION) is True
+
+    snapshot = system.observe(update_id, message_id=message_id)
+    assert snapshot.accepted_inbox_records == 0
+    assert snapshot.rejected_inbox_records == 1
+    assert snapshot.operator_alerts == (
+        OperatorAlert(
+            producer=RuntimeRole.BOT_ASSISTANT,
+            consumer=RuntimeRole.RECOMMENDATION,
+            contract_name=ContractName.RUN_SEARCH,
+            contract_version=2,
+            failure_code=FailureCode.INVALID_CONTRACT,
+        ),
+    )
+    assert system.completed_searches(user_id) == ()
+    assert system.search_completions(update_id) == ()
+    assert system.recoverable_contract_message(message_id).payload == payload
     system.reset()
 
 

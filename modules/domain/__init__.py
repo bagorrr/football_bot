@@ -91,7 +91,7 @@ class MatchState(StrEnum):
     CONFLICT = "conflict"
 
 
-class SearchCriterionChangeOperation(StrEnum):
+class DiscoveryCriterionChangeOperation(StrEnum):
     """One explicit immutable Discovery Criterion refinement operation."""
 
     ADD = "add"
@@ -100,11 +100,11 @@ class SearchCriterionChangeOperation(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class SearchCriterionChange:
+class DiscoveryCriterionChange:
     """One already-disambiguated Discovery Criterion change from a Bot User."""
 
     criterion: str
-    operation: SearchCriterionChangeOperation
+    operation: DiscoveryCriterionChangeOperation
     value: Any = None
 
     def __post_init__(self) -> None:
@@ -112,13 +112,13 @@ class SearchCriterionChange:
         if not isinstance(self.criterion, str) or not self.criterion.strip():
             raise ValueError("Discovery Criterion must be a non-empty string")
         try:
-            operation = SearchCriterionChangeOperation(self.operation)
+            operation = DiscoveryCriterionChangeOperation(self.operation)
         except (TypeError, ValueError) as error:
             raise ValueError(
                 "Discovery Criterion change operation is unsupported"
             ) from error
         object.__setattr__(self, "operation", operation)
-        if operation is SearchCriterionChangeOperation.REMOVE:
+        if operation is DiscoveryCriterionChangeOperation.REMOVE:
             if self.value is not None:
                 raise ValueError("Removing a Discovery Criterion cannot carry a value")
         elif self.value is None:
@@ -1525,7 +1525,7 @@ def _unknown_criterion_count(
 
 
 def _validated_search_change_value(
-    change: SearchCriterionChange,
+    change: DiscoveryCriterionChange,
     *,
     allowed_criteria: frozenset[str],
     user_intent: UserIntent,
@@ -1533,7 +1533,7 @@ def _validated_search_change_value(
     """Validate and normalize one criterion value before snapshotting it."""
     if change.criterion not in allowed_criteria:
         raise ValueError("Discovery Criterion is not available for this User Intent")
-    if change.operation is SearchCriterionChangeOperation.REMOVE:
+    if change.operation is DiscoveryCriterionChangeOperation.REMOVE:
         return None
     value = change.value
     if change.criterion == "schedule":
@@ -1569,7 +1569,7 @@ def _validated_search_change_value(
 
 def refine_completed_search(
     completed_search: CompletedSearch,
-    change: SearchCriterionChange,
+    change: DiscoveryCriterionChange,
     *,
     new_completed_search_id: str,
     new_search_update_id: str,
@@ -1602,11 +1602,14 @@ def refine_completed_search(
         if change.criterion == "number_of_players"
         else bool(current_details.get(change.criterion))
     )
-    if change.operation is SearchCriterionChangeOperation.ADD and is_selected:
+    if change.operation is DiscoveryCriterionChangeOperation.ADD and is_selected:
         raise ValueError("Cannot add an already selected Discovery Criterion")
-    if change.operation is SearchCriterionChangeOperation.REMOVE and not is_selected:
+    if change.operation is DiscoveryCriterionChangeOperation.REMOVE and not is_selected:
         raise ValueError("Cannot remove an unselected Discovery Criterion")
-    if change.operation is SearchCriterionChangeOperation.REPLACE and not is_selected:
+    if (
+        change.operation is DiscoveryCriterionChangeOperation.REPLACE
+        and not is_selected
+    ):
         raise ValueError("Cannot replace an unselected Discovery Criterion")
     normalized_value = _validated_search_change_value(
         change,
@@ -1615,7 +1618,7 @@ def refine_completed_search(
     )
     if change.criterion == "number_of_players":
         current_number_of_players = normalized_value
-    elif change.operation is SearchCriterionChangeOperation.REMOVE:
+    elif change.operation is DiscoveryCriterionChangeOperation.REMOVE:
         current_details.pop(change.criterion, None)
     else:
         current_details[change.criterion] = normalized_value
