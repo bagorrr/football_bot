@@ -2455,6 +2455,31 @@ class ConversationOnboarding:
                         text=_stale_result_callback_text(current.locale or "en"),
                     )
                 else:
+                    message = self._render_active_result_view(
+                        delivery_id=f"result-stale-view:{update_id}",
+                        state=current,
+                        context=context,
+                        selection=self._language_rendering(current.locale or "en"),
+                    )
+                    if message is not None:
+                        self._store.commit_conversation_presentation(
+                            update_id=f"result-stale-view:{update_id}",
+                            telegram_user_id=telegram_user_id,
+                            expected_revision=current.revision,
+                            message=message,
+                            recorded_at=self._clock.now(),
+                            result_context=(
+                                context
+                                if context is not None
+                                and context.current_result_id is not None
+                                else None
+                            ),
+                        )
+                    with suppress(Exception):
+                        self._telegram_delivery.remove_inline_actions(
+                            telegram_user_id=telegram_user_id,
+                            telegram_message_id=telegram_message_id,
+                        )
                     self._answer_result_callback(
                         update_id=update_id,
                         callback_id=callback_id,
@@ -2555,6 +2580,7 @@ class ConversationOnboarding:
                             current=current,
                             text="",
                         )
+        self._deliver_pending_callback()
         self.deliver_pending()
 
     def _answer_result_callback(
@@ -7819,6 +7845,8 @@ class ConversationOnboarding:
 
     def deliver_pending(self) -> bool:
         """Retry one durable Bot API presentation and confirm its success."""
+        if self._deliver_pending_callback():
+            return True
         claim_token = uuid4()
         claimed_at = self._clock.now()
         claim = self._store.claim_conversation_message(
@@ -7827,8 +7855,6 @@ class ConversationOnboarding:
             stale_before=claimed_at - timedelta(minutes=5),
         )
         if claim is None:
-            if self._deliver_pending_callback():
-                return True
             return self._cleanup_old_chat_view()
         message = claim.message
         administration_delivery = message.delivery_id.startswith(
@@ -10360,7 +10386,7 @@ def _refereeing_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}"
         )
-    is_active = facts.get("publication_state", "active") == "active"
+    is_active = facts.get("publication_state") == "active"
     route_copy = (
         render_response_route(
             facts["response_route_kind"], facts["response_route_value"], copy_locale
@@ -10974,7 +11000,7 @@ def _transfer_search_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}"
         )
-    is_active = facts.get("publication_state", "active") == "active"
+    is_active = facts.get("publication_state") == "active"
     route = (
         render_response_route(
             facts["response_route_kind"], facts["response_route_value"], copy_locale
@@ -11410,7 +11436,7 @@ def _opponent_request_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}\n"
         )
-    is_active = facts.get("publication_state", "active") == "active"
+    is_active = facts.get("publication_state") == "active"
     route_copy = (
         render_response_route(
             facts["response_route_kind"], facts["response_route_value"], copy_locale

@@ -4441,6 +4441,9 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
         target_position=int(target_position),
         telegram_message_id=initial_view.telegram_message_id,
     )
+    assert telegram_delivery.callback_notifications == [
+        ("callback-next-active-result-context", "Updated.")
+    ]
     assert len(telegram_delivery.edits) == 1
     edited_message_id, edited_message = telegram_delivery.edits[-1]
     assert edited_message_id == initial_view.telegram_message_id
@@ -4458,6 +4461,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     _, previous_action, page_two_token, page_two_screen, page_two_target = (
         page_two_callback.split(":")
     )
+    message_count = len(telegram_delivery.messages)
     system.select_result_action(
         update_id="foreign-message-active-result-context",
         callback_id="callback-foreign-message-active-result-context",
@@ -4468,7 +4472,13 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
         target_position=int(page_two_target),
         telegram_message_id="telegram:foreign-message",
     )
-    assert len(telegram_delivery.edits) == 1
+    assert len(telegram_delivery.messages) == message_count + 1
+    reconstructed_message = telegram_delivery.messages[-1]
+    assert reconstructed_message.text == edited_message.text
+    assert reconstructed_message.button_rows == edited_message.button_rows
+    assert (user_id, "telegram:foreign-message") in (
+        telegram_delivery.inline_action_removals
+    )
     assert system.active_result_context(user_id) == paged_context
     system.retry_bot_presentations()
 
@@ -4549,6 +4559,10 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
             target_position=int(current_target),
             telegram_message_id=current_view.telegram_message_id,
         )
+    assert (
+        "callback-failed-previous-active-result-context",
+        "Обновлено.",
+    ) in telegram_delivery.callback_notifications
     assert system.active_result_context(user_id).absolute_position == 2
     telegram_delivery.fail_next()
     with pytest.raises(InjectedTelegramDeliveryError):
