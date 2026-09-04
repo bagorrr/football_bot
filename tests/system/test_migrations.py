@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-12:] == [
-        "0034_source_chat_pause_removal_barrier.sql",
         "0035_coaching_opportunities.sql",
         "0036_coaching_exact_repost_clusters.sql",
         "0037_exact_repost_result_projection.sql",
@@ -59,6 +58,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0043_source_chat_administration_lifecycle.sql",
         "0044_source_chat_lifecycle_cancellation.sql",
         "0045_source_retention_audit_role_isolation.sql",
+        "0046_result_variants.sql",
     ]
 
 
@@ -1786,6 +1786,17 @@ def test_player_migration_upgrades_exact_main_ledger_transactionally(
             )
             """,
         )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_results (
+                result_id, completed_search_id, absolute_position, result_class
+            ) VALUES (
+                'result:ticket-64:variant',
+                'completed-search:ticket-52-migration', 3,
+                'variant_with_difference'
+            )
+            """,
+        )
         upgraded_application = connection.execute(
             """
             SELECT opportunity_id, opportunity_type, accepted_facts, response_route
@@ -1809,7 +1820,8 @@ def test_player_migration_upgrades_exact_main_ledger_transactionally(
             SELECT result_class
             FROM football_runtime.recommendation_results
             WHERE result_id IN (
-                'result:ticket-53:tournament', 'result:ticket-52:partial'
+                'result:ticket-53:tournament', 'result:ticket-52:partial',
+                'result:ticket-64:variant'
             )
             ORDER BY result_id
             """,
@@ -1863,7 +1875,11 @@ def test_player_migration_upgrades_exact_main_ledger_transactionally(
         "roster_vacancy",
         "player_transfer_availability",
     }
-    assert result_classes == [("partial_result",), ("confirmed_match",)]
+    assert result_classes == [
+        ("partial_result",),
+        ("confirmed_match",),
+        ("variant_with_difference",),
+    ]
     assert player_columns == [
         ("bot_discovery_drafts", "number_of_players"),
         ("bot_discovery_drafts", "player_search_number_prompt"),

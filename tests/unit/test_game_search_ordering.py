@@ -44,6 +44,36 @@ def test_possible_results_prefer_fewer_unknowns_then_location_specificity() -> N
     ]
 
 
+def test_result_classes_are_ordered_before_intra_class_tiebreakers() -> None:
+    possible = SearchResult(
+        result_id="result:z-possible",
+        completed_search_id="search:ordering",
+        absolute_position=1,
+        result_class="possible_match",
+        card_facts=(
+            ("opportunity_id", "result:z-possible"),
+            ("start_local_date", "2026-08-20"),
+            ("exact_local_time", "19:00"),
+        ),
+    )
+    variant = SearchResult(
+        result_id="result:a-variant",
+        completed_search_id="search:ordering",
+        absolute_position=1,
+        result_class="variant_with_difference",
+        card_facts=(
+            ("opportunity_id", "result:a-variant"),
+            ("start_local_date", "2026-08-20"),
+            ("exact_local_time", "19:00"),
+        ),
+    )
+
+    assert sorted([variant, possible], key=game_search_result_sort_key) == [
+        possible,
+        variant,
+    ]
+
+
 def test_event_time_order_uses_exact_time_then_canonical_day_part_lower_bound() -> None:
     def timed_result(
         result_id: str,

@@ -98,6 +98,26 @@ def test_sufficient_joint_group_is_confirmed_and_smaller_group_is_partial() -> N
     assert dict(results[1].card_facts)["available_player_contribution"] == "2/3"
 
 
+def test_explicit_player_criterion_change_returns_a_variant() -> None:
+    search = _search(number_of_players=3)
+    results = evaluate_player_search(
+        search,
+        {"positions": ("defender",)},
+        (
+            _opportunity(
+                "opportunity:different-position",
+                available_player_count=4,
+                positions=["goalkeeper"],
+            ),
+        ),
+        relaxed_criterion="positions",
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "variant_with_difference"
+    assert dict(results[0].card_facts)["difference_criterion"] == "positions"
+
+
 def test_uncertain_count_is_possible_and_never_combines_result_cards() -> None:
     results = evaluate_player_search(
         _search(number_of_players=3),

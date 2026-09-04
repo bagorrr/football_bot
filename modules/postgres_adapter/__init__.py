@@ -182,6 +182,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0043_source_chat_administration_lifecycle.sql",
     "0044_source_chat_lifecycle_cancellation.sql",
     "0045_source_retention_audit_role_isolation.sql",
+    "0046_result_variants.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -231,6 +232,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "62ac5af74f66169098f47a96549d4d2f7e8dc2b0ece1062a1e9dd447a3e08c6d",
     "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
     "dc20dc716386e45317aab14e796997068fefc98e19599819c47434e9ab071ec4",
+    "22d92678d5b515e3f9cdcdd38b738f46557fcafccf22aaa15456f3e161d0f0e1",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
