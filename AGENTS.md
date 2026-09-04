@@ -9,6 +9,10 @@
 - Run the full local suite only for broad, high-risk, or cross-cutting changes, when focused checks cannot adequately bound the risk, or when explicitly required.
 - Before merging, run all required CI checks on the exact revision GitHub will merge.
 
+## Workspace hygiene
+
+Keep the checkout that owns local `main` clean and synchronization-only. Make code, documentation, configuration, and preview changes only in a dedicated branch or worktree created from a freshly verified `origin/main`; never use the local `main` checkout as a scratch workspace. If pre-existing user changes make it dirty, preserve them and stop for explicit semantic reconciliation; never automatically discard, stash, or restore an older `AGENTS.md` over the canonical version.
+
 ## Agent skills
 
 ### Issue tracker
