@@ -23,6 +23,9 @@ from modules.player_promotion_runtime import (
     CONTROLLED_REJECTED_MATERIAL_EDIT_BODY,
     DurableAcceptanceProbe,
 )
+from modules.ports import ClassifierAdapterResult
+from modules.testkit import ControlledModelAdapter
+from tests.system.test_open_match_game_search import _minimal_classifier_result
 
 
 def _probe(
@@ -271,6 +274,164 @@ def test_cosmetic_edit_retains_cluster_identity_without_renewing_freshness() -> 
     }
     assert first_revision in revisions
     assert edited_revision in revisions
+
+
+def test_expiry_re_elects_fresh_exact_repost_successor() -> None:
+    first_body = (
+        "Long-term roster vacancy: need a goalkeeper for the 2026-2027 season "
+        "in Saint Petersburg. Message @transfer_contact"
+    )
+    cosmetic_edit_body = (
+        "⚽ Long-term roster vacancy: need a goalkeeper for the 2026-2027 season "
+        "in Saint Petersburg.  Message @transfer_contact ⚽"
+    )
+    classifier = ControlledModelAdapter()
+
+    def standing_result(body: str) -> ClassifierAdapterResult:
+        result = _minimal_classifier_result(
+            candidate_key="exact-repost-standing",
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": "@transfer_contact",
+                    "evidence": "@transfer_contact",
+                }
+            ],
+            opportunity_evidence="roster vacancy",
+            open_places_evidence="goalkeeper",
+        )
+        candidates = result.output["candidates"]
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        candidate["opportunity_type"] = "roster_vacancy"
+        candidate.pop("event_time", None)
+        candidate.pop("open_places", None)
+        candidate["roster_vacancy"] = True
+        candidate["positions"] = ["goalkeeper"]
+        candidate["seasonal_timing"] = {
+            "kind": "stated_season",
+            "value": "2026-2027",
+        }
+        evidence.pop("event_time", None)
+        evidence.pop("open_places", None)
+        evidence["location"] = "Saint Petersburg"
+        evidence["roster_vacancy"] = "roster vacancy"
+        evidence["positions"] = "goalkeeper"
+        evidence["seasonal_timing"] = "2026-2027"
+        candidate["location"] = {
+            "mention": "Saint Petersburg",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        }
+        return result
+
+    classifier.return_for(body=first_body, result=standing_result(first_body))
+    classifier.return_for(
+        body=cosmetic_edit_body,
+        result=standing_result(cosmetic_edit_body),
+    )
+    probe = DurableAcceptanceProbe(
+        database_url=os.environ["TEST_DATABASE_URL"],
+        execution_id="exact-repost-expiry-regression",
+        case_id="exact-repost-expiry-regression",
+        operations=({"kind": "edit", "source": cosmetic_edit_body},),
+        require_classifier_promotion=False,
+        model=classifier,
+    )
+    first_revision, _ = probe.source_event(
+        body=first_body,
+        operation_number=1,
+        telegram_message_id=711,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 6, tzinfo=UTC),
+    )
+    probe.clock.advance_to(datetime(2026, 8, 18, 9, 7, tzinfo=UTC))
+    second_revision, _ = probe.source_event(
+        body=first_body,
+        operation_number=2,
+        telegram_message_id=712,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 7, tzinfo=UTC),
+    )
+    probe.clock.advance_to(datetime(2026, 8, 18, 9, 8, tzinfo=UTC))
+    edited_revision, _ = probe.source_event(
+        body=cosmetic_edit_body,
+        operation_number=3,
+        kind=SourceEventKind.EDIT,
+        revision=2,
+        telegram_message_id=711,
+        source_publisher_id="publisher:one",
+        event_time=datetime(2026, 8, 18, 9, 8, tzinfo=UTC),
+    )
+    assert first_revision is not None
+    assert second_revision is not None
+    assert edited_revision == f"{_source_id(first_revision)}:revision:2"
+    first_source = _source_id(first_revision)
+    second_source = _source_id(second_revision)
+    cluster = _cluster(probe)
+    members = probe.system.exact_repost_cluster_members(cluster.exact_repost_cluster_id)
+    assert len(members) == 2
+    first_member = next(
+        member for member in members if member.source_message_id == first_source
+    )
+    second_member = next(
+        member for member in members if member.source_message_id == second_source
+    )
+    assert first_member.source_message_revision_id == edited_revision
+    assert first_member.is_representative
+    assert second_member.publication_state == "suppressed"
+
+    probe.clock.advance_to(datetime(2026, 9, 17, 9, 6, tzinfo=UTC))
+    assert probe.system.cleanup_expired_source_data() > 0
+
+    cluster = _cluster(probe)
+    members = probe.system.exact_repost_cluster_members(cluster.exact_repost_cluster_id)
+    first_member = next(
+        member for member in members if member.source_message_id == first_source
+    )
+    second_member = next(
+        member for member in members if member.source_message_id == second_source
+    )
+    assert first_member.publication_state == "expired"
+    assert first_member.publication_reason == "opportunity_expired"
+    assert not first_member.is_representative
+    assert second_member.publication_state == "active"
+    assert second_member.publication_reason is None
+    assert second_member.is_representative
+    assert cluster.publication_state == "active"
+    assert cluster.representative_source_message_id == second_source
+    assert cluster.representative_opportunity_id == second_member.opportunity_id
+
+    probe.system.process_opportunities_until_idle()
+    recommendation_by_opportunity = {
+        opportunity.opportunity_id: opportunity
+        for opportunity in probe.system.recommendation_opportunities()
+    }
+    assert (
+        recommendation_by_opportunity[first_member.opportunity_id].publication_state
+        == "expired"
+    )
+    assert (
+        recommendation_by_opportunity[first_member.opportunity_id].publication_reason
+        == "opportunity_expired"
+    )
+    assert (
+        recommendation_by_opportunity[first_member.opportunity_id].response_route.value
+        == ""
+    )
+    assert (
+        recommendation_by_opportunity[second_member.opportunity_id].publication_state
+        == "active"
+    )
+    assert (
+        recommendation_by_opportunity[second_member.opportunity_id].response_route.value
+        == "@transfer_contact"
+    )
 
 
 def test_material_publisher_edit_reconciles_to_a_new_cluster() -> None:

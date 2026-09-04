@@ -3273,6 +3273,21 @@ class ModerationEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceDataAuditEvent:
+    """Body-free Source retention transition visible to administrators."""
+
+    audit_event_id: str
+    source_ref: str
+    revision_ref: str
+    action: str
+    previous_state: str | None
+    next_state: str
+    reason_code: str
+    recorded_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ClassifierCircuitState:
     """Body-free adapter-wide execution circuit visible to operators."""
 
@@ -3396,7 +3411,9 @@ class LanguageSelection:
     zero_result: tuple[str, str, str] | None = None
     administration_label: str | None = None
     administration_text: str | None = None
-    administration_labels: tuple[str, str, str] | None = None
+    administration_labels: tuple[str, str, str, str] | None = None
+    source_data_audit_text: str | None = None
+    source_data_audit_labels: tuple[str, str] | None = None
     source_chats_text: str | None = None
     source_chats_labels: tuple[str, str, str] | None = None
     source_chat_address_text: str | None = None

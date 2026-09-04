@@ -76,6 +76,7 @@ from modules.domain import (
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
     SourceChatRegistryEntry,
+    SourceDataAuditEvent,
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
@@ -1977,7 +1978,17 @@ class ControlledConversationLanguageAdapter:
             ),
             administration_label="Verwaltung",
             administration_text="⚙️ **Verwaltung**",
-            administration_labels=("Quell-Chats", "Zurück", "Menü"),
+            administration_labels=(
+                "Quell-Chats",
+                "Datenaufbewahrungs-Audit",
+                "Zurück",
+                "Menü",
+            ),
+            source_data_audit_text=(
+                "🧾 **Datenaufbewahrungs-Audit**\n\n"
+                "Ereignisse ohne Nachrichtentext werden 90 Tage aufbewahrt."
+            ),
+            source_data_audit_labels=("Zurück", "Menü"),
             source_chats_text="📡 **Quell-Chats**",
             source_chats_labels=("Quell-Chat hinzufügen", "Zurück", "Menü"),
             source_chat_address_text=(
@@ -2252,6 +2263,25 @@ class AcceptanceSpine:
     ) -> tuple[SourceMessageDeletionTombstone, ...]:
         """Observe bounded body-free deletion tombstones through the testkit."""
         return self._observer.source_message_deletion_tombstones()
+
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Observe the bounded body-free Source retention audit trail."""
+        return self._observer.source_data_audit()
+
+    def source_data_audit_as(
+        self,
+        actor: RuntimeRole,
+    ) -> tuple[SourceDataAuditEvent, ...]:
+        """Probe the role-isolated Source retention audit projection."""
+        try:
+            return self._roles[actor].store.source_data_audit()
+        except ConversationAccessDeniedError as error:
+            raise OwnershipViolationError(UUID(int=0)) from error
+
+    def cleanup_expired_source_data(self) -> int:
+        """Run the Application-owned bounded Source retention cleanup."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.cleanup_expired_source_data(as_of=self._clock.now())
 
     def cleanup_expired_source_message_tombstones(self) -> int:
         """Run the Application-owned physical tombstone retention cleanup."""

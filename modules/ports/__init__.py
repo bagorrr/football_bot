@@ -56,6 +56,7 @@ from modules.domain import (
     SourceChatLifecycleContext,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
+    SourceDataAuditEvent,
     SourceEventRecord,
     SourceMessage,
     SourceMessageDeletionTombstone,
@@ -535,6 +536,10 @@ class ConversationStore(Protocol):
         """Read the narrow Bot administration view of Source Chat state."""
         ...
 
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Read the bounded body-free Source retention audit projection."""
+        ...
+
     def next_source_chat_registration_generation(self) -> int:
         """Return the next durable one-administrator registration generation."""
         ...
@@ -952,6 +957,14 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Delete body-free Source Message tombstones past their retention bound."""
         ...
 
+    def cleanup_expired_source_data(self, *, as_of: datetime) -> int:
+        """Apply the permitted Source Publisher and Source Message clocks."""
+        ...
+
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Read the bounded body-free Source retention audit projection."""
+        ...
+
     def cleanup_expired_moderation_events(self, *, as_of: datetime) -> int:
         """Delete body-free moderation audit events past their retention bound."""
         ...
@@ -1347,6 +1360,10 @@ class AcceptanceObserver(Protocol):
         self,
     ) -> tuple[SourceMessageDeletionTombstone, ...]:
         """Observe bounded body-free Source Message deletion tombstones."""
+        ...
+
+    def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
+        """Observe the bounded body-free Source retention audit trail."""
         ...
 
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:

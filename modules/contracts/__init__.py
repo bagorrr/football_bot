@@ -2541,6 +2541,7 @@ def _validate_opportunity_publication_changed(
             "review_timeout",
             "source_chat_paused",
             "source_chat_removed",
+            "opportunity_expired",
         }:
             raise ValueError("Opportunity publication reason is invalid")
         if (
@@ -2558,6 +2559,11 @@ def _validate_opportunity_publication_changed(
             and payload["publication_state"] != "suppressed"
         ):
             raise ValueError("review_timeout requires suppressed state")
+        if (
+            publication_reason == "opportunity_expired"
+            and payload["publication_state"] != "expired"
+        ):
+            raise ValueError("opportunity_expired requires expired state")
     accepted_facts = payload["accepted_facts"]
     if not isinstance(accepted_facts, dict):
         raise TypeError("accepted_facts must be an object")
@@ -2568,17 +2574,22 @@ def _validate_opportunity_publication_changed(
     route_kind = route["kind"]
     route_value = route["value"]
     if (
-        payload["publication_state"] == "suppressed"
-        and payload.get("publication_reason")
-        in {
-            "source_revision_superseded",
-            "source_deleted",
-            "response_route_unavailable",
-            "source_chat_paused",
-            "source_chat_removed",
-        }
-        and route == {"kind": "unavailable", "value": ""}
-    ):
+        (
+            payload["publication_state"] == "suppressed"
+            and payload.get("publication_reason")
+            in {
+                "source_revision_superseded",
+                "source_deleted",
+                "response_route_unavailable",
+                "source_chat_paused",
+                "source_chat_removed",
+            }
+        )
+        or (
+            payload["publication_state"] == "expired"
+            and payload.get("publication_reason") == "opportunity_expired"
+        )
+    ) and route == {"kind": "unavailable", "value": ""}:
         valid_route = True
     else:
         valid_route = (
@@ -2606,6 +2617,13 @@ def _validate_opportunity_publication_changed(
         raise ValueError("response_route is invalid")
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
     allowed_idempotency_keys = {f"opportunity-publication:{opportunity_revision_id}"}
+    if (
+        payload["publication_state"] == "expired"
+        and publication_reason == "opportunity_expired"
+    ):
+        allowed_idempotency_keys.add(
+            f"opportunity-publication-expiry:{opportunity_revision_id}"
+        )
     if payload["publication_state"] == "suppressed":
         allowed_idempotency_keys.add(
             f"opportunity-publication-source-suppression:{opportunity_revision_id}"
@@ -2677,6 +2695,7 @@ def _validate_opportunity_publication_batch_changed(
         "review_timeout",
         "source_chat_paused",
         "source_chat_removed",
+        "opportunity_expired",
     }:
         raise ValueError(
             "OpportunityPublicationChanged v3 publication reason is invalid"
@@ -2688,6 +2707,8 @@ def _validate_opportunity_publication_batch_changed(
         raise ValueError("moderation_held requires held_for_review state")
     if publication_reason == "review_timeout" and publication_state != "suppressed":
         raise ValueError("review_timeout requires suppressed state")
+    if publication_reason == "opportunity_expired" and publication_state != "expired":
+        raise ValueError("opportunity_expired requires expired state")
     if publication_state == "active" and publication_reason is not None:
         raise ValueError("active batch publication cannot carry a suppression reason")
     opportunities = payload["opportunities"]
@@ -2746,7 +2767,7 @@ def _validate_opportunity_publication_batch_changed(
             raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
         _validate_publication_response_route(
             route,
-            allow_unavailable=publication_state == "suppressed",
+            allow_unavailable=publication_state in {"suppressed", "expired"},
         )
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
     if envelope.idempotency_key != (
@@ -2845,6 +2866,7 @@ def _validate_opportunity_publication_changed_with_types(
             "review_timeout",
             "source_chat_paused",
             "source_chat_removed",
+            "opportunity_expired",
         }:
             raise ValueError("Opportunity publication reason is invalid")
         if (
@@ -2862,6 +2884,11 @@ def _validate_opportunity_publication_changed_with_types(
             and payload["publication_state"] != "suppressed"
         ):
             raise ValueError("review_timeout requires suppressed state")
+        if (
+            publication_reason == "opportunity_expired"
+            and payload["publication_state"] != "expired"
+        ):
+            raise ValueError("opportunity_expired requires expired state")
     accepted_facts = payload["accepted_facts"]
     if not isinstance(accepted_facts, dict):
         raise TypeError("accepted_facts must be an object")
@@ -2873,8 +2900,16 @@ def _validate_opportunity_publication_changed_with_types(
     route_value = route["value"]
     publication_state = payload["publication_state"]
     valid_route = (
-        publication_state == "suppressed"
-        and publication_reason in {"source_chat_paused", "source_chat_removed"}
+        (
+            (
+                publication_state == "suppressed"
+                and publication_reason in {"source_chat_paused", "source_chat_removed"}
+            )
+            or (
+                publication_state == "expired"
+                and publication_reason == "opportunity_expired"
+            )
+        )
         and route == {"kind": "unavailable", "value": ""}
     ) or (
         isinstance(route_value, str)
@@ -2900,6 +2935,13 @@ def _validate_opportunity_publication_changed_with_types(
         raise ValueError("response_route is invalid")
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
     allowed_idempotency_keys = {f"opportunity-publication:{opportunity_revision_id}"}
+    if (
+        payload["publication_state"] == "expired"
+        and publication_reason == "opportunity_expired"
+    ):
+        allowed_idempotency_keys.add(
+            f"opportunity-publication-expiry:{opportunity_revision_id}"
+        )
     if payload["publication_state"] == "suppressed":
         allowed_idempotency_keys.add(
             f"opportunity-publication-source-suppression:{opportunity_revision_id}"
@@ -2984,6 +3026,7 @@ def _validate_opportunity_publication_batch_changed_with_types(
         "review_timeout",
         "source_chat_paused",
         "source_chat_removed",
+        "opportunity_expired",
     }:
         raise ValueError(
             "OpportunityPublicationChanged v3 publication reason is invalid"
@@ -2995,6 +3038,8 @@ def _validate_opportunity_publication_batch_changed_with_types(
         raise ValueError("moderation_held requires held_for_review state")
     if publication_reason == "review_timeout" and publication_state != "suppressed":
         raise ValueError("review_timeout requires suppressed state")
+    if publication_reason == "opportunity_expired" and publication_state != "expired":
+        raise ValueError("opportunity_expired requires expired state")
     if publication_state == "active" and publication_reason is not None:
         raise ValueError("active batch publication cannot carry a suppression reason")
     opportunities = payload["opportunities"]
@@ -3047,7 +3092,10 @@ def _validate_opportunity_publication_batch_changed_with_types(
         route = opportunity["response_route"]
         if not isinstance(route, dict) or set(route) != {"kind", "value"}:
             raise TypeError("OpportunityPublicationChanged v3 route is incomplete")
-        _validate_publication_response_route(route)
+        _validate_publication_response_route(
+            route,
+            allow_unavailable=publication_state in {"suppressed", "expired"},
+        )
     _validate_direct_causation(envelope, ContractName.OPPORTUNITY_PUBLICATION_CHANGED)
     if envelope.idempotency_key != (
         f"opportunity-publication-batch:{source_revision_id}:"

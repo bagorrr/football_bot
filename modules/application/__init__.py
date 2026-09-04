@@ -85,6 +85,7 @@ from modules.domain import (
     SourceChatLifecycleState,
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
+    SourceDataAuditEvent,
     SourceEventKind,
     SourceMessageRevision,
     TelegramDeliveryMode,
@@ -1809,10 +1810,59 @@ _ADMINISTRATION_LABEL = {
 }
 
 _ADMINISTRATION_COPY = {
-    "en": ("⚙️ **Administration**", "Source Chats", "Back", "Menu"),
-    "ru": ("⚙️ **Администрирование**", "Source Chats", "Назад", "Меню"),
-    "es": ("⚙️ **Administración**", "Source Chats", "Atrás", "Menú"),
-    "fr": ("⚙️ **Administration**", "Source Chats", "Retour", "Menu"),
+    "en": (
+        "⚙️ **Administration**",
+        "Source Chats",
+        "Source Data Audit",
+        "Back",
+        "Menu",
+    ),
+    "ru": (
+        "⚙️ **Администрирование**",
+        "Source Chats",
+        "Аудит Source Data",
+        "Назад",
+        "Меню",
+    ),
+    "es": (
+        "⚙️ **Administración**",
+        "Source Chats",
+        "Auditoría de Source Data",
+        "Atrás",
+        "Menú",
+    ),
+    "fr": (
+        "⚙️ **Administration**",
+        "Source Chats",
+        "Audit des Source Data",
+        "Retour",
+        "Menu",
+    ),
+}
+
+_SOURCE_DATA_AUDIT_COPY = {
+    "en": (
+        "🧾 **Source Data Audit**\n\nBody-free retention events kept for 90 days.",
+        "Back",
+        "Menu",
+    ),
+    "ru": (
+        "🧾 **Аудит Source Data**\n\nСобытия хранения без тела доступны 90 дней.",
+        "Назад",
+        "Меню",
+    ),
+    "es": (
+        "🧾 **Auditoría de Source Data**\n\n"
+        "Eventos de retención sin cuerpo durante 90 días.",
+        "Atrás",
+        "Menú",
+    ),
+    "fr": (
+        "🧾 **Audit des Source Data**\n\n"
+        "Événements de rétention sans corps pendant 90 jours.",
+        "Retour",
+        "Menu",
+    ),
 }
 
 _SOURCE_CHATS_COPY = {
@@ -2455,6 +2505,8 @@ class ConversationOnboarding:
                     self._queue_current_view(update_id=update_id, state=current)
                 elif action == "source-chats":
                     self._show_source_chats(update_id=update_id, current=current)
+                elif action == "source-data-audit":
+                    self._show_source_data_audit(update_id=update_id, current=current)
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
@@ -3066,6 +3118,37 @@ class ConversationOnboarding:
                 screen_revision=state.screen_revision,
                 selection=selection,
                 entries=self._store.source_chat_administration_views(),
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_source_data_audit(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.ADMINISTRATION,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_data_audit_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale),
+                events=self._store.source_data_audit(),
             ),
             recorded_at=self._clock.now(),
         )
@@ -7427,6 +7510,7 @@ class ConversationOnboarding:
         administration_delivery = message.delivery_id.startswith(
             (
                 "administration:",
+                "source-data-audit:",
                 "source-chats:",
                 "source-chat-address:",
                 "source-chat-pending:",
@@ -12798,7 +12882,7 @@ def _administration_message(
     selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
     if locale in SUPPORTED_LOCALES:
-        text, source_chats, back, menu = _ADMINISTRATION_COPY[locale]
+        text, source_chats, source_data_audit, back, menu = _ADMINISTRATION_COPY[locale]
     elif (
         selection is not None
         and selection.locale == locale
@@ -12806,7 +12890,7 @@ def _administration_message(
         and selection.administration_labels is not None
     ):
         text = selection.administration_text
-        source_chats, back, menu = selection.administration_labels
+        source_chats, source_data_audit, back, menu = selection.administration_labels
     else:
         raise RuntimeError("Conversation Language has no Administration rendering")
     return TelegramMessage(
@@ -12817,8 +12901,62 @@ def _administration_message(
         text=text,
         button_rows=(
             ((source_chats, f"administration:source-chats:{screen_revision}"),),
+            (
+                (
+                    source_data_audit,
+                    f"administration:source-data-audit:{screen_revision}",
+                ),
+            ),
             ((back, f"administration:back:{screen_revision}"),),
         ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_data_audit_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+    events: tuple[SourceDataAuditEvent, ...] = (),
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, back, menu = _SOURCE_DATA_AUDIT_COPY[locale]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_audit_text is not None
+        and selection.source_data_audit_labels is not None
+    ):
+        text = selection.source_data_audit_text
+        back, menu = selection.source_data_audit_labels
+    else:
+        raise RuntimeError("Conversation Language has no Source Data Audit rendering")
+    lines = [text]
+    lines.extend(
+        " · ".join(
+            (
+                event.recorded_at.isoformat(),
+                event.action,
+                event.source_ref,
+                event.revision_ref,
+                f"{event.previous_state or '—'} → {event.next_state}",
+                event.reason_code,
+                event.expires_at.isoformat(),
+            )
+        )
+        for event in events
+    )
+    return TelegramMessage(
+        delivery_id=f"source-data-audit:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n\n".join(lines),
+        button_rows=(((back, f"administration:back:{screen_revision}"),),),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -14173,6 +14311,7 @@ class RuntimeApplication:
         """Discover and process one durable handoff addressed to this role."""
         if self.role is RuntimeRole.APPLICATION:
             self.store.expire_moderation_reviews(as_of=self.clock.now())
+            self.store.cleanup_expired_source_data(as_of=self.clock.now())
             self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
             self.store.cleanup_expired_moderation_events(as_of=self.clock.now())
         claimed = self.store.claim_next(

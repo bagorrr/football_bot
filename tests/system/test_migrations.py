@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-12:] == [
-        "0033_source_message_retention_and_projection_barrier.sql",
         "0034_source_chat_pause_removal_barrier.sql",
         "0035_coaching_opportunities.sql",
         "0036_coaching_exact_repost_clusters.sql",
@@ -59,6 +58,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0042_moderation_review_events.sql",
         "0043_source_chat_administration_lifecycle.sql",
         "0044_source_chat_lifecycle_cancellation.sql",
+        "0045_source_retention_audit_role_isolation.sql",
     ]
 
 
@@ -459,6 +459,69 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'requested_registry_generation bigint, '
                                  'requested_telegram_message_id bigint)',
                                  'football_runtime.cleanup_expired_source_message_tombstones('
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.record_source_retention_audit('
+                                 'requested_source_message_id text, '
+                                 'requested_source_message_revision_id text, '
+                                 'requested_action text, '
+                                 'requested_previous_state text, '
+                                 'requested_next_state text, '
+                                 'requested_reason_code text, '
+                                 'requested_recorded_at timestamp with time zone)',
+                                 'football_runtime.set_source_message_retention('
+                                 'requested_source_message_revision_id text, '
+                                 'requested_retention_state text, '
+                                 'requested_content_expires_at timestamp with '
+                                 'time zone, '
+                                 'requested_processing_expires_at timestamp with '
+                                 'time zone, '
+                                 'requested_content_scrubbed_at timestamp with '
+                                 'time zone, '
+                                 'requested_updated_at timestamp with time zone, '
+                                 'requested_reason_code text, '
+                                 'requested_action text)',
+                                 'football_runtime.sync_source_message_retention_revision()',
+                                 'football_runtime.sync_source_message_retention_source()',
+                                 'football_runtime.sync_source_message_retention_tombstone()',
+                                 'football_runtime.sync_source_message_retention_routing()',
+                                 'football_runtime.sync_source_message_retention_opportunity()',
+                                 'football_runtime.opportunity_expiry_at('
+                                 'requested_opportunity_type text, '
+                                 'requested_facts jsonb)',
+                                 'football_runtime.sync_source_message_retention_opportunities('
+                                 'requested_source_message_revision_id text, '
+                                 'requested_updated_at timestamp with time zone, '
+                                 'requested_reason_code text)',
+                                 'football_runtime.sync_source_message_retention_moderation()',
+                                 'football_runtime.sync_source_message_retention_lifecycle()',
+                                 'football_runtime.read_source_data_audit()',
+                                 'football_runtime.ingestion_scrub_source_message_revision_data('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_registry_generation bigint, '
+                                 'requested_telegram_message_id bigint, '
+                                 'requested_source_message_revision bigint)',
+                                 'football_runtime.ingestion_cleanup_source_message_revision_data('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_registry_generation bigint, '
+                                 'requested_telegram_message_id bigint, '
+                                 'requested_source_message_revision bigint)',
+                                 'football_runtime.classification_scrub_source_message_revision_data('
+                                 'requested_source_message_revision_id text)',
+                                 'football_runtime.classification_cleanup_source_message_revision_data('
+                                 'requested_source_message_revision_id text)',
+                                 'football_runtime.recommendation_cleanup_source_message_revision_data('
+                                 'requested_opportunity_revision_ids text[])',
+                                 'football_runtime.application_scrub_source_message_revision_data('
+                                 'requested_source_message_revision_id text)',
+                                 'football_runtime.delete_source_message_revision_lineage('
+                                 'requested_source_message_revision_id text, '
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.delete_expired_source_message('
+                                 'requested_source_message_id text, '
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.cleanup_expired_source_data('
                                  'requested_as_of timestamp with time zone)'
                              ])
                          )
