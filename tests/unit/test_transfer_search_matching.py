@@ -238,6 +238,29 @@ def test_transfer_search_exact_timing_rejects_adjacent_season() -> None:
     assert results == ()
 
 
+def test_explicit_timing_change_returns_variants_for_both_transfer_directions() -> None:
+    for intent, opportunity_type in (
+        (UserIntent.NEW_TEAM_SEARCH, "roster_vacancy"),
+        (UserIntent.TRANSFER_PLAYER_SEARCH, "player_transfer_availability"),
+    ):
+        search = _search(intent, timing="stated_season:2026-2027")
+        results = evaluate_transfer_search(
+            search,
+            dict(search.transfer_search_details),
+            (
+                _opportunity(
+                    opportunity_type,
+                    timing={"kind": "stated_season", "value": "2027-2028"},
+                ),
+            ),
+            relaxed_criterion="seasonal_timing",
+        )
+
+        assert len(results) == 1
+        assert results[0].result_class == "variant_with_difference"
+        assert dict(results[0].card_facts)["difference_criterion"] == "seasonal_timing"
+
+
 def test_transfer_search_orders_by_freshest_current_source_assertion() -> None:
     results = evaluate_transfer_search(
         _search(UserIntent.NEW_TEAM_SEARCH),

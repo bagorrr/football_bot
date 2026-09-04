@@ -54,6 +54,7 @@ from modules.domain import (
     ConversationState,
     DateInterpretationQuery,
     DateInterpretationResolution,
+    DiscoveryCriterionChange,
     DiscoveryDraft,
     ExactRepostCluster,
     ExactRepostClusterMember,
@@ -2960,6 +2961,22 @@ class AcceptanceSpine:
             referee_search_details=referee_search_details,
             refereeing_service_offer_details=refereeing_service_offer_details,
             coaching_search_details=coaching_search_details,
+        )
+
+    def refine_search(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        change: DiscoveryCriterionChange,
+        relaxed_criterion: str | None = None,
+    ) -> None:
+        """Drive one clear Result Conversation refinement through Bot Assistant."""
+        self._conversation_onboarding().refine_search(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            change=change,
+            relaxed_criterion=relaxed_criterion,
         )
 
     def open_game_search_details(

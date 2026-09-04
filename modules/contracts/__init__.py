@@ -828,6 +828,8 @@ def _validate_run_search(
             "transfer_search_details",
             "referee_search_details",
             "refereeing_service_offer_details",
+            "refined_from_completed_search_id",
+            "relaxed_criterion",
         }
         if contract_version == 3:
             allowed_fields.add("coaching_search_details")
@@ -877,6 +879,19 @@ def _validate_run_search(
             raise ValueError(
                 f"RunSearch v{contract_version} causation/correlation is not canonical"
             )
+    refined_from_completed_search_id = payload.get("refined_from_completed_search_id")
+    relaxed_criterion = payload.get("relaxed_criterion")
+    for field_name, value in (
+        ("refined_from_completed_search_id", refined_from_completed_search_id),
+        ("relaxed_criterion", relaxed_criterion),
+    ):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f"RunSearch v{contract_version} {field_name} must be text")
+    if relaxed_criterion is not None and refined_from_completed_search_id is None:
+        raise ValueError(
+            f"RunSearch v{contract_version} relaxed_criterion requires "
+            "refined_from_completed_search_id"
+        )
     _required_text(payload, "display_locale")
     user_intent = _required_text(payload, "user_intent")
     if user_intent not in _USER_INTENTS:
@@ -1283,8 +1298,13 @@ def _validate_search_completed(
         return
     if contract_version != 2:
         raise ValueError("SearchCompleted version has no registered semantics")
-    allowed_fields = {"completed_search_id", *search_fields}
-    if set(payload) != allowed_fields:
+    allowed_fields = {
+        "completed_search_id",
+        *search_fields,
+        "refined_from_completed_search_id",
+    }
+    required_fields = {"completed_search_id", *search_fields}
+    if not required_fields <= set(payload) or set(payload) - allowed_fields:
         raise ValueError("SearchCompleted v2 contains unsupported or missing facts")
     telegram_user_id = payload.get("telegram_user_id")
     if (
@@ -1318,6 +1338,13 @@ def _validate_search_completed(
         or envelope.correlation_id != run_search_message_id
     ):
         raise ValueError("SearchCompleted v2 causation/correlation is not canonical")
+    refined_from_completed_search_id = payload.get("refined_from_completed_search_id")
+    if refined_from_completed_search_id is not None and (
+        not isinstance(refined_from_completed_search_id, str)
+        or not refined_from_completed_search_id
+        or refined_from_completed_search_id == completed_search_id
+    ):
+        raise ValueError("SearchCompleted v2 refined Search lineage is not canonical")
 
 
 def _required_text(payload: dict[str, JsonValue], field_name: str) -> str:

@@ -208,6 +208,54 @@ def test_referee_matching_requires_a_usable_response_route() -> None:
     assert results == ()
 
 
+def test_explicit_referee_criterion_change_returns_a_variant() -> None:
+    search = _search()
+    results = evaluate_referee_search(
+        search,
+        dict(search.referee_search_details),
+        (
+            _availability(
+                "different-event",
+                dated=True,
+                extra_facts={"event_types": ["training"]},
+            ),
+        ),
+        relaxed_criterion="event_types",
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "variant_with_difference"
+    assert dict(results[0].card_facts)["difference_criterion"] == "event_types"
+
+
+def test_explicit_refereeing_offer_criterion_change_uses_the_same_variant_class() -> (
+    None
+):
+    base_search = _search()
+    search = replace(
+        base_search,
+        user_intent=UserIntent.REFEREEING_SERVICE_OFFER,
+        referee_search_details=(),
+        refereeing_service_offer_details=base_search.referee_search_details,
+    )
+    results = evaluate_refereeing_service_offer(
+        search,
+        dict(search.refereeing_service_offer_details),
+        (
+            _availability(
+                "different-offer-event",
+                dated=True,
+                opportunity_type="referee_request",
+                extra_facts={"event_types": ["training"]},
+            ),
+        ),
+        relaxed_criterion="event_types",
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "variant_with_difference"
+
+
 def test_standing_referee_results_use_freshest_qualifying_assertion() -> None:
     results = evaluate_referee_search(
         _search(),

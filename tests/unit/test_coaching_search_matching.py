@@ -241,6 +241,75 @@ def test_undated_coaching_listing_does_not_expose_assertion_as_availability_date
     }
 
 
+def test_explicit_schedule_change_returns_a_variant_for_a_later_start_date() -> None:
+    details = {
+        "coaching_types": ["individual_training"],
+        "playing_levels": ["novice"],
+        "schedule": {
+            "weekdays": ["monday"],
+            "day_parts": ["evening"],
+            "start_local_date": "2026-08-20",
+        },
+    }
+    results = evaluate_coaching_search(
+        _search(UserIntent.COACH_SEARCH, details=details),
+        details,
+        (
+            _opportunity(
+                "coach_availability",
+                schedule={
+                    "weekdays": ["monday"],
+                    "day_parts": ["evening"],
+                    "start_local_date": "2026-08-21",
+                },
+            ),
+        ),
+        relaxed_criterion="schedule",
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "variant_with_difference"
+    assert dict(results[0].card_facts)["difference_criterion"] == "schedule"
+
+
+def test_explicit_coaching_offer_criterion_change_uses_the_same_variant_class() -> None:
+    details = {"coaching_types": ["team_training"]}
+    results = evaluate_coaching_search(
+        _search(UserIntent.COACHING_SERVICE_OFFER, details=details),
+        details,
+        (_opportunity("coach_request"),),
+        relaxed_criterion="coaching_types",
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "variant_with_difference"
+    assert dict(results[0].card_facts)["difference_criterion"] == "coaching_types"
+
+
+def test_schedule_components_count_as_one_unknown_criterion() -> None:
+    details = {
+        "schedule": {
+            "weekdays": ["monday"],
+            "day_parts": ["evening"],
+            "start_local_date": "2026-08-20",
+        }
+    }
+    results = evaluate_coaching_search(
+        _search(UserIntent.COACH_SEARCH, details=details),
+        details,
+        (
+            _opportunity(
+                "coach_availability",
+                schedule={"weekdays": ["monday"], "day_parts": ["evening"]},
+            ),
+        ),
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "possible_match"
+    assert dict(results[0].card_facts)["unknown_criterion_count"] == "1"
+
+
 def test_date_only_schedule_is_rejected_at_matching_and_contract_boundaries() -> None:
     date_only: dict[str, JsonValue] = {"start_local_date": "2026-09-01"}
     states = match_coaching_schedule(

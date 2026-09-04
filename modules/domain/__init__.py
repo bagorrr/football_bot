@@ -6,10 +6,10 @@ import json
 import re
 import unicodedata
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -89,6 +89,42 @@ class MatchState(StrEnum):
     CONFIRMED = "confirmed"
     UNKNOWN = "unknown"
     CONFLICT = "conflict"
+
+
+class DiscoveryCriterionChangeOperation(StrEnum):
+    """One explicit immutable Discovery Criterion refinement operation."""
+
+    ADD = "add"
+    REMOVE = "remove"
+    REPLACE = "replace"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryCriterionChange:
+    """One already-disambiguated Discovery Criterion change from a Bot User."""
+
+    criterion: str
+    operation: DiscoveryCriterionChangeOperation
+    value: Any = None
+
+    def __post_init__(self) -> None:
+        """Reject changes that are not explicit enough for a new Search."""
+        if not isinstance(self.criterion, str) or not self.criterion.strip():
+            raise ValueError("Discovery Criterion must be a non-empty string")
+        try:
+            operation = DiscoveryCriterionChangeOperation(self.operation)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Discovery Criterion change operation is unsupported"
+            ) from error
+        object.__setattr__(self, "operation", operation)
+        if operation is DiscoveryCriterionChangeOperation.REMOVE:
+            if self.value is not None:
+                raise ValueError("Removing a Discovery Criterion cannot carry a value")
+        elif self.value is None:
+            raise ValueError(
+                "Adding or replacing a Discovery Criterion requires a value"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +317,39 @@ def render_response_route(kind: str, value: str, locale: str) -> str:
     return f"[{route_labels.get(locale, route_labels['en'])}]({value})"
 
 
+def usable_response_route(route: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return one renderable route or ``None`` for unusable contact data."""
+    if not isinstance(route, Mapping):
+        return None
+    kind = route.get("kind")
+    value = route.get("value")
+    if (
+        not isinstance(kind, str)
+        or not kind.strip()
+        or not isinstance(value, str)
+        or not value.strip()
+    ):
+        return None
+    try:
+        render_response_route(kind, value, "en")
+    except ValueError:
+        return None
+    return kind, value
+
+
+_RESULT_CLASS_ORDER = {
+    "confirmed_match": 0,
+    "partial_result": 1,
+    "possible_match": 2,
+    "variant_with_difference": 3,
+}
+
+
+def result_class_order(result_class: str) -> int:
+    """Return the canonical result-class rank shared by every direction."""
+    return _RESULT_CLASS_ORDER.get(result_class, len(_RESULT_CLASS_ORDER))
+
+
 def game_search_result_sort_key(
     result: SearchResult,
 ) -> tuple[int, int, str, int, str, int, str]:
@@ -296,7 +365,7 @@ def game_search_result_sort_key(
             "night": "22:00",
         }.get(facts.get("day_part") or "", "23:59")
     return (
-        0 if result.result_class == "confirmed_match" else 1,
+        result_class_order(result.result_class),
         int(facts.get("unknown_criterion_count", "0")),
         facts.get("sort_local_date", facts["start_local_date"]),
         1 if time_is_unknown else 0,
@@ -323,7 +392,7 @@ def transfer_search_result_sort_key(
     except (TypeError, ValueError, OverflowError):
         freshness = float("-inf")
     return (
-        0 if result.result_class == "confirmed_match" else 1,
+        result_class_order(result.result_class),
         int(facts.get("unknown_criterion_count", "0")),
         -freshness,
         -int(facts.get("location_specificity", "0")),
@@ -372,7 +441,7 @@ def _referee_result_sort_key(
     except (TypeError, ValueError, OverflowError):
         freshness = float("-inf")
     return (
-        0 if result.result_class == "confirmed_match" else 1,
+        result_class_order(result.result_class),
         int(facts.get("unknown_criterion_count", "0")),
         1 if standing else 0,
         -freshness if standing else 0.0,
@@ -1325,6 +1394,306 @@ _STANDING_OPPORTUNITY_TYPES = frozenset(
     }
 )
 
+_COACHING_SCHEDULE_MATCH_KEYS = frozenset(
+    {
+        "schedule_weekdays",
+        "schedule_time",
+        "schedule_start_date",
+        "schedule",
+    }
+)
+_GAME_SEARCH_CRITERIA = frozenset(
+    {
+        "team_formats",
+        "positions",
+        "playing_levels",
+        "venue_settings",
+        "playing_surfaces",
+        "payment",
+        "times",
+    }
+)
+_PLAYER_SEARCH_CRITERIA = frozenset((*_GAME_SEARCH_CRITERIA, "number_of_players"))
+_TOURNAMENT_SEARCH_CRITERIA = frozenset(
+    {"team_formats", "playing_levels", "venue_settings", "playing_surfaces", "payment"}
+)
+_SEARCH_DETAIL_CONFIG: dict[UserIntent, tuple[str, frozenset[str]]] = {
+    UserIntent.GAME_SEARCH: ("game_search_details", _GAME_SEARCH_CRITERIA),
+    UserIntent.PLAYER_SEARCH: ("game_search_details", _PLAYER_SEARCH_CRITERIA),
+    UserIntent.TOURNAMENT_SEARCH: (
+        "tournament_search_details",
+        _TOURNAMENT_SEARCH_CRITERIA,
+    ),
+    UserIntent.OPPONENT_SEARCH: (
+        "opponent_search_details",
+        frozenset((*_OPPONENT_SEARCH_DETAIL_KEYS, "venue_provision", "times")),
+    ),
+    UserIntent.REFEREE_SEARCH: (
+        "referee_search_details",
+        frozenset((*_REFEREE_DETAIL_KEYS, "times")),
+    ),
+    UserIntent.REFEREEING_SERVICE_OFFER: (
+        "refereeing_service_offer_details",
+        frozenset((*_REFEREE_DETAIL_KEYS, "times")),
+    ),
+    UserIntent.NEW_TEAM_SEARCH: (
+        "transfer_search_details",
+        frozenset((*_TRANSFER_SEARCH_DETAIL_KEYS, "seasonal_timing")),
+    ),
+    UserIntent.TRANSFER_PLAYER_SEARCH: (
+        "transfer_search_details",
+        frozenset((*_TRANSFER_SEARCH_DETAIL_KEYS, "seasonal_timing")),
+    ),
+    UserIntent.COACH_SEARCH: (
+        "coaching_search_details",
+        frozenset((*_COACHING_CATEGORICAL_KEYS, "schedule")),
+    ),
+    UserIntent.COACHING_SERVICE_OFFER: (
+        "coaching_search_details",
+        frozenset((*_COACHING_CATEGORICAL_KEYS, "schedule")),
+    ),
+}
+
+
+def _criterion_is_selected(
+    details: Mapping[str, Any],
+    criterion: str,
+    *,
+    completed_search: CompletedSearch,
+) -> bool:
+    if criterion == "search_area":
+        return not completed_search.whole_city and bool(
+            completed_search.sub_city_area_ids
+        )
+    if criterion == "schedule":
+        schedule = _coaching_schedule_from_details(details)
+        return schedule is not None and _coaching_schedule_mapping(schedule) is not None
+    if criterion == "number_of_players":
+        return completed_search.number_of_players is not None
+    value = details.get(criterion)
+    return bool(value)
+
+
+def _classify_detail_match(
+    detail_state_by_key: Mapping[str, MatchState],
+    *,
+    details: Mapping[str, Any],
+    completed_search: CompletedSearch,
+    relaxed_criterion: str | None,
+) -> str | None:
+    """Classify optional criteria, admitting one explicit relaxable conflict."""
+    conflict_keys = {
+        key
+        for key, state in detail_state_by_key.items()
+        if state is MatchState.CONFLICT
+    }
+    if not conflict_keys:
+        return (
+            "possible_match"
+            if MatchState.UNKNOWN in detail_state_by_key.values()
+            else "confirmed_match"
+        )
+    if relaxed_criterion is None or not _criterion_is_selected(
+        details,
+        relaxed_criterion,
+        completed_search=completed_search,
+    ):
+        return None
+    if relaxed_criterion == "schedule":
+        valid_variant = conflict_keys.issubset(_COACHING_SCHEDULE_MATCH_KEYS)
+    else:
+        valid_variant = conflict_keys == {relaxed_criterion}
+    return "variant_with_difference" if valid_variant else None
+
+
+def _unknown_criterion_count(
+    detail_state_by_key: Mapping[str, MatchState],
+    *,
+    grouped_keys: frozenset[str] = frozenset(),
+) -> int:
+    """Count unknown conceptual criteria, collapsing one optional group."""
+    unknown_count = sum(
+        state is MatchState.UNKNOWN
+        for key, state in detail_state_by_key.items()
+        if key not in grouped_keys
+    )
+    if grouped_keys and any(
+        detail_state_by_key.get(key) is MatchState.UNKNOWN for key in grouped_keys
+    ):
+        unknown_count += 1
+    return unknown_count
+
+
+def _validated_search_change_value(
+    change: DiscoveryCriterionChange,
+    *,
+    allowed_criteria: frozenset[str],
+    user_intent: UserIntent,
+) -> Any:
+    """Validate and normalize one criterion value before snapshotting it."""
+    if change.criterion not in allowed_criteria:
+        raise ValueError("Discovery Criterion is not available for this User Intent")
+    if change.operation is DiscoveryCriterionChangeOperation.REMOVE:
+        return None
+    value = change.value
+    if change.criterion == "schedule":
+        if user_intent not in {
+            UserIntent.COACH_SEARCH,
+            UserIntent.COACHING_SERVICE_OFFER,
+        } or not isinstance(value, Mapping):
+            raise ValueError("Coaching Schedule must be an object")
+        normalized_schedule = _coaching_schedule_mapping(value)
+        if normalized_schedule is None:
+            raise ValueError("Coaching Schedule is invalid")
+        return normalized_schedule
+    if change.criterion == "number_of_players":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("Number of Players must be a positive integer")
+        return value
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Discovery Criterion values must be a non-empty string list")
+    values = tuple(value)
+    if (
+        not values
+        or not all(isinstance(item, str) and item for item in values)
+        or len(values) != len(set(values))
+    ):
+        raise ValueError("Discovery Criterion values must be a non-empty string list")
+    if (
+        change.criterion in {"times", "seasonal_timing", "venue_provision"}
+        and len(values) != 1
+    ):
+        raise ValueError("This Discovery Criterion accepts exactly one value")
+    return values
+
+
+def refine_completed_search(
+    completed_search: CompletedSearch,
+    change: DiscoveryCriterionChange,
+    *,
+    new_completed_search_id: str,
+    new_search_update_id: str,
+    completed_at: datetime,
+) -> CompletedSearch:
+    """Create one immutable Search snapshot after a clear criterion change."""
+    if not isinstance(new_completed_search_id, str) or not new_completed_search_id:
+        raise ValueError("A refined Search requires new identifiers")
+    if not isinstance(new_search_update_id, str) or not new_search_update_id:
+        raise ValueError("A refined Search requires new identifiers")
+    if (
+        new_completed_search_id == completed_search.completed_search_id
+        or new_search_update_id == completed_search.search_update_id
+    ):
+        raise ValueError("A refined Search must have new identifiers")
+    if (
+        not isinstance(completed_at, datetime)
+        or completed_at.tzinfo is None
+        or completed_at.utcoffset() is None
+    ):
+        raise ValueError("A refined Search requires a timezone-aware completion time")
+    config = _SEARCH_DETAIL_CONFIG.get(completed_search.user_intent)
+    if config is None:
+        raise ValueError("Search refinement is unsupported for this User Intent")
+    detail_field, allowed_criteria = config
+    current_details = dict(getattr(completed_search, detail_field))
+    current_number_of_players = completed_search.number_of_players
+    is_selected = (
+        current_number_of_players is not None
+        if change.criterion == "number_of_players"
+        else bool(current_details.get(change.criterion))
+    )
+    if change.operation is DiscoveryCriterionChangeOperation.ADD and is_selected:
+        raise ValueError("Cannot add an already selected Discovery Criterion")
+    if change.operation is DiscoveryCriterionChangeOperation.REMOVE and not is_selected:
+        raise ValueError("Cannot remove an unselected Discovery Criterion")
+    if (
+        change.operation is DiscoveryCriterionChangeOperation.REPLACE
+        and not is_selected
+    ):
+        raise ValueError("Cannot replace an unselected Discovery Criterion")
+    normalized_value = _validated_search_change_value(
+        change,
+        allowed_criteria=allowed_criteria,
+        user_intent=completed_search.user_intent,
+    )
+    if change.criterion == "number_of_players":
+        current_number_of_players = normalized_value
+    elif change.operation is DiscoveryCriterionChangeOperation.REMOVE:
+        current_details.pop(change.criterion, None)
+    else:
+        current_details[change.criterion] = normalized_value
+    detail_values = tuple(sorted(current_details.items()))
+    if detail_field == "game_search_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            game_search_details=cast(
+                tuple[tuple[str, tuple[str, ...]], ...], detail_values
+            ),
+            number_of_players=current_number_of_players,
+        )
+    if detail_field == "tournament_search_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            tournament_search_details=cast(
+                tuple[tuple[str, tuple[str, ...]], ...], detail_values
+            ),
+        )
+    if detail_field == "opponent_search_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            opponent_search_details=cast(
+                tuple[tuple[str, tuple[str, ...]], ...], detail_values
+            ),
+        )
+    if detail_field == "referee_search_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            referee_search_details=cast(
+                tuple[tuple[str, tuple[str, ...]], ...], detail_values
+            ),
+        )
+    if detail_field == "refereeing_service_offer_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            refereeing_service_offer_details=cast(
+                tuple[tuple[str, tuple[str, ...]], ...], detail_values
+            ),
+        )
+    if detail_field == "transfer_search_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            transfer_search_details=cast(
+                tuple[tuple[str, tuple[str, ...]], ...], detail_values
+            ),
+        )
+    if detail_field == "coaching_search_details":
+        return replace(
+            completed_search,
+            completed_search_id=new_completed_search_id,
+            search_update_id=new_search_update_id,
+            completed_at=completed_at,
+            coaching_search_details=cast(tuple[tuple[str, Any], ...], detail_values),
+        )
+    raise AssertionError("Search detail configuration has an unsupported field")
+
 
 def _seasonal_timing_parts(value: Any) -> tuple[str, str | None] | None:
     """Parse one canonical Seasonal Timing value without inferring adjacent time."""
@@ -1652,6 +2021,8 @@ def evaluate_opponent_search(
     completed_search: CompletedSearch,
     opponent_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Classify, snapshot, and order one symmetric Opponent Search."""
     if (
@@ -1725,9 +2096,18 @@ def evaluate_opponent_search(
             facts=facts,
         )
         states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
+        result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=opponent_search_details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
+        )
+        if result_class is None:
             continue
-        route = opportunity.response_route
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
+            continue
+        route_kind, route_value = route
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
@@ -1738,8 +2118,8 @@ def evaluate_opponent_search(
             "sort_local_date": max(start, required.start_local_date).isoformat(),
             "iana_timezone": str(facts["iana_timezone"]),
             "source_posted_at": str(facts["source_posted_at"]),
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
                 sum(state is MatchState.UNKNOWN for state in states)
             ),
@@ -1781,16 +2161,15 @@ def evaluate_opponent_search(
         if facts.get("payment_amount") and facts.get("payment_currency"):
             card["payment_amount"] = str(facts["payment_amount"])
             card["payment_currency"] = str(facts["payment_currency"])
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
                 completed_search_id=completed_search.completed_search_id,
                 absolute_position=1,
-                result_class=(
-                    "possible_match"
-                    if MatchState.UNKNOWN in states
-                    else "confirmed_match"
-                ),
+                result_class=result_class,
                 card_facts=tuple(sorted(card.items())),
             )
         )
@@ -1805,6 +2184,8 @@ def evaluate_referee_search(
     completed_search: CompletedSearch,
     referee_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Classify Referee Search results deterministically."""
     return _evaluate_referee_opportunity(
@@ -1813,6 +2194,7 @@ def evaluate_referee_search(
         opportunities,
         expected_intent=UserIntent.REFEREE_SEARCH,
         result_sort_key=referee_search_result_sort_key,
+        relaxed_criterion=relaxed_criterion,
     )
 
 
@@ -1882,6 +2264,8 @@ def evaluate_refereeing_service_offer(
     completed_search: CompletedSearch,
     refereeing_service_offer_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Classify Refereeing Service Offer results deterministically."""
     return _evaluate_referee_opportunity(
@@ -1890,6 +2274,7 @@ def evaluate_refereeing_service_offer(
         opportunities,
         expected_intent=UserIntent.REFEREEING_SERVICE_OFFER,
         result_sort_key=refereeing_service_offer_result_sort_key,
+        relaxed_criterion=relaxed_criterion,
     )
 
 
@@ -1902,6 +2287,7 @@ def _evaluate_referee_opportunity(
     result_sort_key: Callable[
         [SearchResult], tuple[int, int, int, float, str, int, str, int, str]
     ],
+    relaxed_criterion: str | None,
 ) -> tuple[SearchResult, ...]:
     """Classify one referee direction without conflating application seams."""
     opportunity_type = _REFEREEING_OPPORTUNITY_TYPES.get(completed_search.user_intent)
@@ -1998,22 +2384,19 @@ def _evaluate_referee_opportunity(
             facts=facts,
         )
         states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
+        result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
+        )
+        if result_class is None:
             continue
 
-        route = opportunity.response_route
-        if not isinstance(route, Mapping):
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
             continue
-        route_kind = route.get("kind")
-        route_value = route.get("value")
-        if not isinstance(route_kind, str) or not route_kind:
-            continue
-        if not isinstance(route_value, str) or not route_value:
-            continue
-        try:
-            render_response_route(route_kind, route_value, "en")
-        except ValueError:
-            continue
+        route_kind, route_value = route
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
@@ -2072,6 +2455,9 @@ def _evaluate_referee_opportunity(
         if facts.get("payment_amount") and facts.get("payment_currency"):
             card["payment_amount"] = str(facts["payment_amount"])
             card["payment_currency"] = str(facts["payment_currency"])
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=(
@@ -2080,11 +2466,7 @@ def _evaluate_referee_opportunity(
                 ),
                 completed_search_id=completed_search.completed_search_id,
                 absolute_position=1,
-                result_class=(
-                    "possible_match"
-                    if MatchState.UNKNOWN in states
-                    else "confirmed_match"
-                ),
+                result_class=result_class,
                 card_facts=tuple(sorted(card.items())),
             )
         )
@@ -2099,6 +2481,8 @@ def evaluate_transfer_search(
     completed_search: CompletedSearch,
     transfer_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Classify one directional long-term transfer Search deterministically."""
     opportunity_type = _TRANSFER_OPPORTUNITY_TYPES.get(completed_search.user_intent)
@@ -2176,9 +2560,18 @@ def evaluate_transfer_search(
             facts=facts,
         )
         states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
+        result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=transfer_search_details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
+        )
+        if result_class is None:
             continue
-        route = opportunity.response_route
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
+            continue
+        route_kind, route_value = route
         source_posted_at_text = str(facts.get("source_posted_at", ""))
         source_assertion_at = str(
             facts.get("source_qualifying_assertion_at")
@@ -2198,8 +2591,8 @@ def evaluate_transfer_search(
             "timezone_data_version": str(facts.get("timezone_data_version", "")),
             "source_posted_at": source_posted_at_text,
             "source_qualifying_assertion_at": source_assertion_at,
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
                 sum(state is MatchState.UNKNOWN for state in states)
             ),
@@ -2239,6 +2632,9 @@ def evaluate_transfer_search(
         if facts.get("payment_amount") and facts.get("payment_currency"):
             card["payment_amount"] = str(facts["payment_amount"])
             card["payment_currency"] = str(facts["payment_currency"])
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=(
@@ -2247,11 +2643,7 @@ def evaluate_transfer_search(
                 ),
                 completed_search_id=completed_search.completed_search_id,
                 absolute_position=1,
-                result_class=(
-                    "possible_match"
-                    if MatchState.UNKNOWN in states
-                    else "confirmed_match"
-                ),
+                result_class=result_class,
                 card_facts=tuple(sorted(card.items())),
             )
         )
@@ -2285,6 +2677,8 @@ def evaluate_coaching_search(
     completed_search: CompletedSearch,
     coaching_search_details: Mapping[str, Any],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Classify one direction of the in-person coaching discovery flow."""
     opportunity_type = _COACHING_OPPORTUNITY_TYPES.get(completed_search.user_intent)
@@ -2374,10 +2768,18 @@ def evaluate_coaching_search(
             city_id=completed_search.city_id,
             facts=facts,
         )
-        states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
+        result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=coaching_search_details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
+        )
+        if result_class is None:
             continue
-        route = opportunity.response_route
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
+            continue
+        route_kind, route_value = route
         source_posted_at_text = str(facts["source_posted_at"])
         source_assertion_at_text = str(
             facts.get("source_qualifying_assertion_at") or source_posted_at_text
@@ -2393,10 +2795,13 @@ def evaluate_coaching_search(
             "timezone_data_version": str(facts.get("timezone_data_version", "")),
             "source_posted_at": source_posted_at_text,
             "source_qualifying_assertion_at": source_assertion_at_text,
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
-                sum(state is MatchState.UNKNOWN for state in states)
+                _unknown_criterion_count(
+                    detail_state_by_key,
+                    grouped_keys=_COACHING_SCHEDULE_MATCH_KEYS,
+                )
             ),
             "location_specificity": str(
                 _LOCATION_SPECIFICITY.get(str(facts.get("location_geographic_type")), 0)
@@ -2443,6 +2848,9 @@ def evaluate_coaching_search(
             card["payment_currency"] = str(facts["payment_currency"])
         if facts.get("source_edited_at"):
             card["source_edited_at"] = str(facts["source_edited_at"])
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=(
@@ -2451,11 +2859,7 @@ def evaluate_coaching_search(
                 ),
                 completed_search_id=completed_search.completed_search_id,
                 absolute_position=1,
-                result_class=(
-                    "possible_match"
-                    if MatchState.UNKNOWN in states
-                    else "confirmed_match"
-                ),
+                result_class=result_class,
                 card_facts=tuple(sorted(card.items())),
             )
         )
@@ -2470,6 +2874,8 @@ def evaluate_game_search(
     completed_search: CompletedSearch,
     game_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Purely classify, snapshot and order one Game Search input set."""
     if completed_search.user_intent is not UserIntent.GAME_SEARCH:
@@ -2494,8 +2900,11 @@ def evaluate_game_search(
             or facts.get("city_id") != completed_search.city_id
         ):
             continue
-        start = date.fromisoformat(str(facts["start_local_date"]))
-        end = date.fromisoformat(str(facts["end_local_date"]))
+        try:
+            start = date.fromisoformat(str(facts["start_local_date"]))
+            end = date.fromisoformat(str(facts["end_local_date"]))
+        except (KeyError, TypeError, ValueError):
+            continue
         required = completed_search.required_date
         if required is not None and (
             end < required.start_local_date or start > required.end_local_date
@@ -2537,12 +2946,18 @@ def evaluate_game_search(
             ),
         )
         states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
-            continue
-        result_class = (
-            "possible_match" if MatchState.UNKNOWN in states else "confirmed_match"
+        result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=game_search_details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
         )
-        route = opportunity.response_route
+        if result_class is None:
+            continue
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
+            continue
+        route_kind, route_value = route
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
@@ -2553,8 +2968,8 @@ def evaluate_game_search(
             else str(facts["start_local_date"]),
             "iana_timezone": str(facts["iana_timezone"]),
             "source_posted_at": str(facts["source_posted_at"]),
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
                 sum(state is MatchState.UNKNOWN for state in states)
             ),
@@ -2594,6 +3009,9 @@ def evaluate_game_search(
         if facts.get("payment_amount") and facts.get("payment_currency"):
             card["payment_amount"] = str(facts["payment_amount"])
             card["payment_currency"] = str(facts["payment_currency"])
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
@@ -2621,6 +3039,8 @@ def evaluate_tournament_search(
     completed_search: CompletedSearch,
     tournament_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Purely classify, snapshot and order one Tournament Search input set."""
     if completed_search.user_intent is not UserIntent.TOURNAMENT_SEARCH:
@@ -2646,7 +3066,7 @@ def evaluate_tournament_search(
         try:
             start = date.fromisoformat(str(facts["start_local_date"]))
             end = date.fromisoformat(str(facts["end_local_date"]))
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             continue
         required = completed_search.required_date
         if required is not None and (
@@ -2679,12 +3099,18 @@ def evaluate_tournament_search(
             facts=facts,
         )
         states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
-            continue
-        result_class = (
-            "possible_match" if MatchState.UNKNOWN in states else "confirmed_match"
+        result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=tournament_search_details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
         )
-        route = opportunity.response_route
+        if result_class is None:
+            continue
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
+            continue
+        route_kind, route_value = route
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
@@ -2697,8 +3123,8 @@ def evaluate_tournament_search(
             else str(facts["start_local_date"]),
             "iana_timezone": str(facts["iana_timezone"]),
             "source_posted_at": str(facts["source_posted_at"]),
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
                 sum(state is MatchState.UNKNOWN for state in states)
             ),
@@ -2751,6 +3177,9 @@ def evaluate_tournament_search(
                     if isinstance(value, (dict, list))
                     else str(value)
                 )
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",
@@ -2971,11 +3400,7 @@ def player_search_result_sort_key(
             "night": "22:00",
         }.get(facts.get("day_part") or "", "23:59")
     return (
-        {
-            "confirmed_match": 0,
-            "partial_result": 1,
-            "possible_match": 2,
-        }.get(result.result_class, 3),
+        result_class_order(result.result_class),
         int(facts.get("unknown_criterion_count", "0")),
         facts.get("sort_local_date", facts["start_local_date"]),
         1 if time_is_unknown else 0,
@@ -3011,6 +3436,8 @@ def evaluate_player_search(
     completed_search: CompletedSearch,
     player_search_details: Mapping[str, tuple[str, ...]],
     opportunities: tuple[OpportunityRevisionProjection, ...],
+    *,
+    relaxed_criterion: str | None = None,
 ) -> tuple[SearchResult, ...]:
     """Purely classify and order one Player Search input set.
 
@@ -3085,8 +3512,13 @@ def evaluate_player_search(
                 facts=facts,
             ),
         )
-        states = tuple(detail_state_by_key.values())
-        if MatchState.CONFLICT in states:
+        detail_result_class = _classify_detail_match(
+            detail_state_by_key,
+            details=player_search_details,
+            completed_search=completed_search,
+            relaxed_criterion=relaxed_criterion,
+        )
+        if detail_result_class is None:
             continue
 
         exact_count, minimum_count, maximum_count = _player_count_facts(facts)
@@ -3120,11 +3552,16 @@ def evaluate_player_search(
         else:
             quantity_class = "confirmed_match"
         states = tuple(detail_state_by_key.values())
-        if MatchState.UNKNOWN in states:
+        if detail_result_class == "variant_with_difference":
+            result_class = detail_result_class
+        elif MatchState.UNKNOWN in states:
             result_class = "possible_match"
         else:
             result_class = quantity_class
-        route = opportunity.response_route
+        route = usable_response_route(opportunity.response_route)
+        if route is None:
+            continue
+        route_kind, route_value = route
         card: dict[str, str] = {
             "opportunity_id": opportunity.opportunity_id,
             "opportunity_revision_id": opportunity.opportunity_revision_id,
@@ -3136,8 +3573,8 @@ def evaluate_player_search(
             else str(facts["start_local_date"]),
             "iana_timezone": str(facts["iana_timezone"]),
             "source_posted_at": str(facts["source_posted_at"]),
-            "response_route_kind": str(route["kind"]),
-            "response_route_value": str(route["value"]),
+            "response_route_kind": route_kind,
+            "response_route_value": route_value,
             "unknown_criterion_count": str(
                 sum(state is MatchState.UNKNOWN for state in states)
             ),
@@ -3184,6 +3621,9 @@ def evaluate_player_search(
             card["payment_currency"] = str(facts["payment_currency"])
         if result_class == "partial_result" and requested_count is not None:
             card["available_player_contribution"] = f"{exact_count}/{requested_count}"
+        if result_class == "variant_with_difference":
+            assert relaxed_criterion is not None
+            card["difference_criterion"] = relaxed_criterion
         matched.append(
             SearchResult(
                 result_id=f"result:{completed_search.completed_search_id}:{opportunity.opportunity_id}",

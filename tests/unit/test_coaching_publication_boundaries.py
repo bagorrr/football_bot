@@ -426,6 +426,37 @@ def test_selected_unknown_coaching_fact_is_needs_clarification_only() -> None:
     assert "Additional:" not in message.text
 
 
+def test_schedule_variant_does_not_present_confirmed_schedule_as_a_match() -> None:
+    facts = dict(_coaching_result().card_facts)
+    facts["match_states"] = json.dumps(
+        {
+            "schedule": "conflict",
+            "schedule_weekdays": "confirmed",
+            "schedule_time": "confirmed",
+            "schedule_start_date": "confirmed",
+        },
+        sort_keys=True,
+    )
+    facts["difference_criterion"] = "schedule"
+    message = _coaching_search_result_message(
+        delivery_id="delivery:coach:schedule-variant",
+        telegram_user_id=49_118,
+        locale="en",
+        screen_revision=4,
+        result=SearchResult(
+            result_id="result:coach:schedule-variant",
+            completed_search_id="completed-search:coach:schedule-variant",
+            absolute_position=1,
+            result_class="variant_with_difference",
+            card_facts=tuple(sorted(facts.items())),
+        ),
+    )
+
+    assert "Differs: schedule." in message.text
+    assert "Schedule:" not in message.text
+    assert "Matches: Schedule." not in message.text
+
+
 @pytest.mark.parametrize(
     ("locale", "any_label", "any_text"),
     (

@@ -265,6 +265,16 @@ def test_tournament_details_use_or_within_a_field_and_and_across_fields() -> Non
     )
     assert conflict == ()
 
+    variant = evaluate_tournament_search(
+        _completed_search(),
+        {"team_formats": ("11x11",)},
+        (valid,),
+        relaxed_criterion="team_formats",
+    )
+    assert len(variant) == 1
+    assert variant[0].result_class == "variant_with_difference"
+    assert dict(variant[0].card_facts)["difference_criterion"] == "team_formats"
+
 
 def test_tournament_results_are_snapshotted_and_ordered_deterministically() -> None:
     later = _tournament(

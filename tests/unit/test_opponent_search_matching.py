@@ -162,6 +162,29 @@ def test_unknown_opportunity_venue_is_possible_but_conflict_is_excluded() -> Non
     assert "Needs clarification" in message.text
 
 
+def test_explicit_venue_change_marks_one_conflicting_opportunity_as_a_variant() -> None:
+    search = _search(venue="needs_opponent_venue")
+    details = dict(search.opponent_search_details)
+    results = evaluate_opponent_search(
+        search,
+        details,
+        (_opportunity(opportunity_id="different-venue", venue="arrange_jointly"),),
+        relaxed_criterion="venue_provision",
+    )
+
+    assert len(results) == 1
+    assert results[0].result_class == "variant_with_difference"
+    assert dict(results[0].card_facts)["difference_criterion"] == "venue_provision"
+    card = _opponent_request_result_message(
+        delivery_id="variant",
+        telegram_user_id=49_540,
+        locale="en",
+        screen_revision=1,
+        result=results[0],
+    )
+    assert "Differs: venue provision." in card.text
+
+
 def test_opponent_hub_and_card_follow_the_four_language_result_contract() -> None:
     details = (
         ("team_formats", ("7x7",)),

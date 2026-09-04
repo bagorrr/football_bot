@@ -58,6 +58,7 @@ from modules.domain import (
     ConversationState,
     DateInterpretation,
     DateInterpretationQuery,
+    DiscoveryCriterionChange,
     DiscoveryDraft,
     ExplicitAmountCurrencySpan,
     GeographicType,
@@ -98,6 +99,7 @@ from modules.domain import (
     UserIntent,
     empty_bounded_source_metadata,
     is_valid_source_chat_address,
+    refine_completed_search,
     render_response_route,
     telegram_moderation_triggers,
 )
@@ -3678,6 +3680,74 @@ class ConversationOnboarding:
                     )
                 self._telegram_delivery.show_typing(telegram_user_id=telegram_user_id)
 
+    def refine_search(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        change: DiscoveryCriterionChange,
+        relaxed_criterion: str | None = None,
+    ) -> None:
+        """Apply one clear Bot User change to the active immutable Search."""
+        if relaxed_criterion is not None and (
+            not isinstance(relaxed_criterion, str) or not relaxed_criterion.strip()
+        ):
+            raise ValueError("relaxed_criterion must be a non-empty string")
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            active = self._store.active_result_context(telegram_user_id)
+            if (
+                current is None
+                or current.stage is not ConversationStage.RESULTS
+                or active is None
+                or active.telegram_user_id != telegram_user_id
+            ):
+                return
+            query_result = self._store.get_completed_search(
+                GetCompletedSearch.request_id(active.completed_search_id),
+                supported_versions=self._supported_query_versions,
+                received_at=self._clock.now(),
+            )
+            if (
+                query_result.status is not CompletedSearchQueryStatus.ACCEPTED
+                or query_result.view is None
+                or query_result.view.completed_search.completed_search_id
+                != active.completed_search_id
+                or query_result.view.completed_search.telegram_user_id
+                != telegram_user_id
+            ):
+                return
+            run_search_message_id = derive_run_search_message_id(
+                telegram_user_id, update_id
+            )
+            refined_search = refine_completed_search(
+                query_result.view.completed_search,
+                change,
+                new_completed_search_id=f"completed-search:{run_search_message_id}",
+                new_search_update_id=update_id,
+                completed_at=self._clock.now(),
+            )
+            command = _run_search_command_from_completed_search(
+                refined_search,
+                display_locale=current.locale or "en",
+                subject_revision=current.revision,
+                parent_completed_search_id=active.completed_search_id,
+                relaxed_criterion=relaxed_criterion,
+            )
+            if self._store.commit_search_refinement(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parent_completed_search_id=active.completed_search_id,
+                command=command,
+                recorded_at=self._clock.now(),
+            ):
+                self._telegram_delivery.show_typing(telegram_user_id=telegram_user_id)
+
     def open_game_search_details(
         self,
         *,
@@ -5474,14 +5544,24 @@ class ConversationOnboarding:
             raise ValueError("SearchCompleted requires search_update_id")
         current = self._store.conversation_state(telegram_user_id)
         draft = self._store.discovery_draft(telegram_user_id)
-        if current is None or draft is None:
+        active = self._store.active_result_context(telegram_user_id)
+        refinement_parent = payload.get("refined_from_completed_search_id")
+        is_refinement = (
+            current is not None
+            and current.stage is ConversationStage.RESULTS
+            and draft is None
+            and active is not None
+            and active.completed_search_id == refinement_parent
+        )
+        if current is None or (draft is None and not is_refinement):
             self._store.dispose_search_outcome(
                 incoming=incoming,
                 received_at=self._clock.now(),
             )
             return
-        if (
+        if not is_refinement and (
             current.stage is not ConversationStage.SUBMITTING
+            or draft is None
             or draft.stage is not ConversationStage.SUBMITTING
             or draft.search_submission_update_id != search_update_id
         ):
@@ -5552,7 +5632,7 @@ class ConversationOnboarding:
         self._store.accept_search_completion(
             incoming=incoming,
             expected_state_revision=current.revision,
-            expected_draft_revision=draft.revision,
+            expected_draft_revision=draft.revision if draft is not None else 0,
             message=message,
             current_result=current_result,
             received_at=self._clock.now(),
@@ -9408,6 +9488,90 @@ def _referee_detail_submenu_message(
     )
 
 
+_RESULT_DIFFERENCE_LABELS = {
+    "en": "Differs",
+    "ru": "Отличается",
+    "es": "Difiere",
+    "fr": "Diffère",
+}
+_RESULT_DIFFERENCE_CRITERIA = {
+    "en": {
+        "team_formats": "team format",
+        "positions": "position",
+        "playing_levels": "playing level",
+        "venue_provision": "venue provision",
+        "venue_settings": "venue setting",
+        "playing_surfaces": "playing surface",
+        "payment": "payment",
+        "times": "time",
+        "search_area": "search area",
+        "event_types": "event type",
+        "referee_roles": "referee role",
+        "seasonal_timing": "seasonal timing",
+        "coaching_types": "coaching type",
+        "schedule": "schedule",
+    },
+    "ru": {
+        "team_formats": "формат команд",
+        "positions": "позиция",
+        "playing_levels": "уровень игры",
+        "venue_provision": "предоставление площадки",
+        "venue_settings": "тип площадки",
+        "playing_surfaces": "покрытие",
+        "payment": "оплата",
+        "times": "время",
+        "search_area": "район поиска",
+        "event_types": "тип события",
+        "referee_roles": "роль судьи",
+        "seasonal_timing": "сезонные сроки",
+        "coaching_types": "тип тренировки",
+        "schedule": "расписание",
+    },
+    "es": {
+        "team_formats": "formato de equipos",
+        "positions": "posición",
+        "playing_levels": "nivel de juego",
+        "venue_provision": "provisión del campo",
+        "venue_settings": "tipo de recinto",
+        "playing_surfaces": "superficie de juego",
+        "payment": "pago",
+        "times": "hora",
+        "search_area": "zona de búsqueda",
+        "event_types": "tipo de evento",
+        "referee_roles": "rol del árbitro",
+        "seasonal_timing": "periodo de temporada",
+        "coaching_types": "tipo de entrenamiento",
+        "schedule": "horario",
+    },
+    "fr": {
+        "team_formats": "format d’équipes",
+        "positions": "poste",
+        "playing_levels": "niveau de jeu",
+        "venue_provision": "mise à disposition du terrain",
+        "venue_settings": "type de terrain",
+        "playing_surfaces": "revêtement",
+        "payment": "paiement",
+        "times": "heure",
+        "search_area": "zone de recherche",
+        "event_types": "type d’événement",
+        "referee_roles": "rôle de l’arbitre",
+        "seasonal_timing": "période de saison",
+        "coaching_types": "type d’entraînement",
+        "schedule": "horaires",
+    },
+}
+
+
+def _result_difference_line(facts: Mapping[str, str], locale: str) -> str | None:
+    """Render the one explicit criterion difference carried by a Variant card."""
+    criterion = facts.get("difference_criterion")
+    if not isinstance(criterion, str) or not criterion:
+        return None
+    copy_locale = locale if locale in _RESULT_DIFFERENCE_LABELS else "en"
+    name = _RESULT_DIFFERENCE_CRITERIA[copy_locale].get(criterion, criterion)
+    return f"{_RESULT_DIFFERENCE_LABELS[copy_locale]}: {name}."
+
+
 def _refereeing_result_message(
     *,
     delivery_id: str,
@@ -9675,10 +9839,15 @@ def _refereeing_result_message(
         for key in detail_order
         if match_states.get(key) == "confirmed" and key in known_values
     )
+    difference_criterion = facts.get("difference_criterion")
     additional = " · ".join(
         f"{detail_names[key]}: {known_values[key]}"
         for key in detail_order
-        if match_states.get(key) != "confirmed" and key in known_values
+        if (
+            match_states.get(key) != "confirmed"
+            and key in known_values
+            and key != difference_criterion
+        )
     )
     criterion_names = {
         "times": {
@@ -9753,6 +9922,7 @@ def _refereeing_result_message(
         possible_prefix = labels["no_exact"]
     else:
         possible_prefix = ""
+    difference_line = _result_difference_line(facts, copy_locale)
 
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts["iana_timezone"])
@@ -9788,6 +9958,8 @@ def _refereeing_result_message(
     ]
     if possible_prefix:
         sections.append(possible_prefix)
+    if difference_line:
+        sections.append(difference_line)
     sections.append("\n".join(match_lines))
     if additional:
         sections.append(f"{labels['additional']}: {additional}")
@@ -10293,7 +10465,11 @@ def _transfer_search_result_message(
     additional = " · ".join(
         f"{criterion_names[key][copy_locale]}: {known_values[key]}"
         for key in detail_order
-        if key in known_values and match_states.get(key) != "confirmed"
+        if (
+            key in known_values
+            and match_states.get(key) != "confirmed"
+            and key != facts.get("difference_criterion")
+        )
     )
     confirmed_details = " · ".join(
         known_values[key]
@@ -10378,12 +10554,15 @@ def _transfer_search_result_message(
     route = render_response_route(
         facts["response_route_kind"], facts["response_route_value"], copy_locale
     )
+    difference_line = _result_difference_line(facts, copy_locale)
     parts = [
         labels["roster_title"] if is_roster else labels["player_title"],
         f"{labels['location']}: {where}",
     ]
     if confirmed_details:
         parts.append(confirmed_details)
+    if difference_line:
+        parts.append(difference_line)
     parts.append(match_text)
     if additional:
         parts.append(f"{labels['additional']}: {additional}")
@@ -10702,7 +10881,11 @@ def _opponent_request_result_message(
     additional = " · ".join(
         f"{detail_names[key]}: {known_values[key]}"
         for key in detail_order
-        if key not in confirmed_keys and key in known_values
+        if (
+            key not in confirmed_keys
+            and key in known_values
+            and key != facts.get("difference_criterion")
+        )
     )
     criterion_copy = {
         "en": {
@@ -10777,6 +10960,8 @@ def _opponent_request_result_message(
     possible_copy = (
         f"{labels['no_exact']}\n\n" if result.result_class == "possible_match" else ""
     )
+    difference_line = _result_difference_line(facts, copy_locale)
+    difference_copy = f"{difference_line}\n\n" if difference_line else ""
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts["iana_timezone"])
     )
@@ -10801,7 +10986,7 @@ def _opponent_request_result_message(
     additional_copy = f"\n{labels['additional']}: {additional}\n" if additional else ""
     text = (
         f"⚽ {labels['title']}\n{when}\n{where}\n"
-        f"{details_copy}{possible_copy}{match_copy}\n"
+        f"{details_copy}{possible_copy}{difference_copy}{match_copy}\n"
         f"{additional_copy}{labels['posted']}: {posted}\n{edited}"
         f"{labels['contact']}: {route_copy}\n\n{labels['invitation']}"
     )
@@ -11434,10 +11619,16 @@ def _open_match_result_message(
             if player_result
             else tuple(_GAME_SEARCH_DETAIL_OPTIONS)
         )
-        if key not in confirmed_keys and known_values.get(key)
+        if (
+            key not in confirmed_keys
+            and known_values.get(key)
+            and key != facts.get("difference_criterion")
+        )
     )
     additional_copy = f"\n{labels[8]}: {additional}\n" if additional else ""
     detail_line = f"{details}\n" if details else ""
+    difference_line = _result_difference_line(facts, copy_locale)
+    difference_copy = f"{difference_line}\n\n" if difference_line else ""
     route_copy = render_response_route(
         facts["response_route_kind"],
         facts["response_route_value"],
@@ -11445,7 +11636,7 @@ def _open_match_result_message(
     )
     text = (
         f"{title}\n{when}\n{where}\n{detail_line}\n"
-        f"{possible_copy}{match_copy}\n{additional_copy}\n"
+        f"{possible_copy}{difference_copy}{match_copy}\n{additional_copy}\n"
         f"{labels[3]}: {posted}\n"
         f"{labels[4]}: {route_copy}\n\n"
         f"{labels[7]}"
@@ -11982,7 +12173,11 @@ def _tournament_result_message(
     additional_parts = [
         f"{detail_names[key]}: {known_values[key]}"
         for key in _TOURNAMENT_SEARCH_DETAIL_OPTIONS
-        if key not in confirmed_keys and key in known_values
+        if (
+            key not in confirmed_keys
+            and key in known_values
+            and key != facts.get("difference_criterion")
+        )
     ]
     additional_parts.extend(
         f"{field_labels[key]}: {known_values[key]}"
@@ -12002,6 +12197,9 @@ def _tournament_result_message(
     lines.append("")
     if result.result_class == "possible_match":
         lines.extend((labels["possible"], ""))
+    difference_line = _result_difference_line(facts, copy_locale)
+    if difference_line:
+        lines.extend((difference_line, ""))
     lines.extend(match_copy.split("\n"))
     if additional:
         lines.extend(("", f"{labels['additional']}: {additional}"))
@@ -12687,15 +12885,23 @@ def _coaching_search_result_message(
         "payment": labels["payment"],
         "search_area": labels["location"],
     }
+    schedule_state_keys = frozenset(
+        {"schedule", "schedule_weekdays", "schedule_time", "schedule_start_date"}
+    )
+    difference_criterion = facts.get("difference_criterion")
     confirmed = [
         names[key]
         for key, state in match_states.items()
-        if state == "confirmed" and key in names
+        if state == "confirmed"
+        and key in names
+        and not (difference_criterion == "schedule" and key in schedule_state_keys)
     ]
     unknown = [
         names[key]
         for key, state in match_states.items()
-        if state == "unknown" and key in names
+        if state == "unknown"
+        and key in names
+        and not (difference_criterion == "schedule" and key in schedule_state_keys)
     ]
     match_text = (
         f"{labels['matches']}: "
@@ -12711,9 +12917,6 @@ def _coaching_search_result_message(
         "venue_settings",
         "playing_surfaces",
         "payment",
-    )
-    schedule_state_keys = frozenset(
-        {"schedule", "schedule_weekdays", "schedule_time", "schedule_start_date"}
     )
     selected_detail_keys = {
         "schedule" if key in schedule_state_keys else key
@@ -12734,7 +12937,11 @@ def _coaching_search_result_message(
     additional = " · ".join(
         f"{labels[key]}: {known_values[key]}"
         for key in detail_order
-        if key in known_values and key not in selected_detail_keys
+        if (
+            key in known_values
+            and key not in selected_detail_keys
+            and key != facts.get("difference_criterion")
+        )
     )
     source_time = datetime.fromisoformat(facts["source_posted_at"]).astimezone(
         ZoneInfo(facts.get("iana_timezone", "UTC"))
@@ -12766,6 +12973,9 @@ def _coaching_search_result_message(
     parts = [f"⚽ {title}", f"{labels['location']}: {where}", *detail_lines, match_text]
     if result.result_class == "possible_match":
         parts.insert(1, labels["possible"])
+    difference_line = _result_difference_line(facts, copy_locale)
+    if difference_line:
+        parts.append(difference_line)
     if additional:
         parts.append(f"{labels['additional']}: {additional}")
     parts.extend(
@@ -13535,6 +13745,101 @@ def _required_date_payload(required_date: RequiredDate | None) -> JsonValue:
         "iana_timezone": required_date.iana_timezone,
         "timezone_data_version": required_date.timezone_data_version,
     }
+
+
+def _search_details_payload(
+    details: tuple[tuple[str, object], ...],
+) -> dict[str, JsonValue]:
+    """Serialize one immutable detail family for a new RunSearch command."""
+    payload: dict[str, JsonValue] = {}
+    for key, value in details:
+        if isinstance(value, tuple):
+            payload[key] = [cast(JsonValue, item) for item in value]
+        else:
+            payload[key] = cast(JsonValue, value)
+    return payload
+
+
+def _run_search_command_from_completed_search(
+    completed_search: CompletedSearch,
+    *,
+    display_locale: str,
+    subject_revision: int,
+    parent_completed_search_id: str,
+    relaxed_criterion: str | None,
+) -> ContractEnvelope:
+    """Build the canonical Bot-to-Recommendation refinement command."""
+    detail_field_by_intent = {
+        UserIntent.GAME_SEARCH: "game_search_details",
+        UserIntent.PLAYER_SEARCH: "game_search_details",
+        UserIntent.OPPONENT_SEARCH: "opponent_search_details",
+        UserIntent.TOURNAMENT_SEARCH: "tournament_search_details",
+        UserIntent.NEW_TEAM_SEARCH: "transfer_search_details",
+        UserIntent.TRANSFER_PLAYER_SEARCH: "transfer_search_details",
+        UserIntent.REFEREE_SEARCH: "referee_search_details",
+        UserIntent.REFEREEING_SERVICE_OFFER: "refereeing_service_offer_details",
+        UserIntent.COACH_SEARCH: "coaching_search_details",
+        UserIntent.COACHING_SERVICE_OFFER: "coaching_search_details",
+    }
+    detail_field = detail_field_by_intent[completed_search.user_intent]
+    details = _search_details_payload(
+        cast(
+            tuple[tuple[str, object], ...],
+            getattr(completed_search, detail_field),
+        )
+    )
+    run_search_message_id = derive_run_search_message_id(
+        completed_search.telegram_user_id,
+        completed_search.search_update_id,
+    )
+    payload: dict[str, JsonValue] = {
+        "search_update_id": completed_search.search_update_id,
+        "telegram_user_id": completed_search.telegram_user_id,
+        "discovery_draft_revision": subject_revision,
+        "display_locale": display_locale,
+        "user_intent": completed_search.user_intent.value,
+        "country_id": completed_search.country_id,
+        "city_id": completed_search.city_id,
+        "sub_city_area_ids": list(completed_search.sub_city_area_ids),
+        "sub_city_area_geographic_types": list(
+            completed_search.sub_city_area_geographic_types
+        ),
+        "sub_city_area_verified_parent_ids": [
+            list(parent_ids)
+            for parent_ids in completed_search.sub_city_area_verified_parent_ids
+        ],
+        "whole_city": completed_search.whole_city,
+        "required_date": _required_date_payload(completed_search.required_date),
+        "refined_from_completed_search_id": parent_completed_search_id,
+    }
+    if details:
+        payload[detail_field] = details
+    if completed_search.number_of_players is not None:
+        payload["number_of_players"] = completed_search.number_of_players
+    if relaxed_criterion is not None:
+        payload["relaxed_criterion"] = relaxed_criterion
+    return ContractEnvelope(
+        contract_name=ContractName.RUN_SEARCH,
+        contract_version=(
+            3
+            if completed_search.user_intent
+            in {UserIntent.COACH_SEARCH, UserIntent.COACHING_SERVICE_OFFER}
+            else 2
+        ),
+        message_id=run_search_message_id,
+        producer=RuntimeRole.BOT_ASSISTANT,
+        consumer=RuntimeRole.RECOMMENDATION,
+        subject_id=f"bot-user:{completed_search.telegram_user_id}",
+        subject_revision=subject_revision,
+        idempotency_key=(
+            f"run-search:{completed_search.telegram_user_id}:"
+            f"{completed_search.search_update_id}"
+        ),
+        causation_id=run_search_message_id,
+        correlation_id=run_search_message_id,
+        recorded_at=completed_search.completed_at,
+        payload=payload,
+    )
 
 
 def _valid_required_date_proposal(
@@ -18450,6 +18755,23 @@ class RuntimeApplication:
         area_parent_ids = payload.get("sub_city_area_verified_parent_ids", [])
         whole_city = payload.get("whole_city")
         number_of_players = payload.get("number_of_players")
+        refined_from_completed_search_id = payload.get(
+            "refined_from_completed_search_id"
+        )
+        relaxed_criterion = payload.get("relaxed_criterion")
+        if refined_from_completed_search_id is not None and (
+            not isinstance(refined_from_completed_search_id, str)
+            or not refined_from_completed_search_id
+        ):
+            raise ValueError("RunSearch refined Search lineage must be text")
+        if relaxed_criterion is not None and (
+            not isinstance(relaxed_criterion, str) or not relaxed_criterion
+        ):
+            raise ValueError("RunSearch relaxed_criterion must be text")
+        if relaxed_criterion is not None and refined_from_completed_search_id is None:
+            raise ValueError(
+                "RunSearch relaxed_criterion requires refined Search lineage"
+            )
         if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
             raise TypeError("RunSearch requires telegram_user_id")
         if not isinstance(search_update_id, str) or not search_update_id:
@@ -18605,6 +18927,15 @@ class RuntimeApplication:
                 "telegram_user_id": telegram_user_id,
                 "search_update_id": search_update_id,
                 "result_count": 0,
+                **(
+                    {
+                        "refined_from_completed_search_id": (
+                            refined_from_completed_search_id
+                        )
+                    }
+                    if refined_from_completed_search_id is not None
+                    else {}
+                ),
             },
         )
         query = GetCompletedSearch.from_search_completed(outgoing)
@@ -18614,6 +18945,7 @@ class RuntimeApplication:
             query=query,
             outgoing=outgoing,
             received_at=self.clock.now(),
+            relaxed_criterion=relaxed_criterion,
         )
 
     def present_next(self) -> bool:
