@@ -8,7 +8,6 @@ import json
 import os
 from dataclasses import asdict
 from datetime import UTC, date, datetime
-from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -4395,9 +4394,9 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
                 2026,
                 8,
                 18,
-                12,
+                9,
                 6 + offset,
-                tzinfo=ZoneInfo("Europe/Moscow"),
+                tzinfo=UTC,
             ),
         )
         assert system.process_next_channel_telegram_difference(
