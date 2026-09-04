@@ -164,6 +164,20 @@ class TelegramDeliveryAdapter(Protocol):
         """Return a known accepted identity without sending, or ``None``."""
         ...
 
+    def edit(self, *, telegram_message_id: str, message: TelegramMessage) -> str:
+        """Edit one existing Telegram message and return its unchanged identity.
+
+        Only a ``TelegramDeliveryPreEffectError`` proves that the edit did not
+        happen. Any other failure leaves the external outcome unknown.
+        """
+        ...
+
+    def reconcile_edit(
+        self, *, telegram_message_id: str, message: TelegramMessage
+    ) -> str | None:
+        """Return a known accepted identity for an edit, or ``None``."""
+        ...
+
     def remove_inline_actions(
         self, *, telegram_user_id: int, telegram_message_id: str
     ) -> None:
@@ -438,6 +452,7 @@ class ConversationStore(Protocol):
         draft: DiscoveryDraft | None = None,
         geography_confirmation: GeographyConfirmation | None = None,
         required_date_confirmation: RequiredDateConfirmation | None = None,
+        result_context: ActiveResultContext | None = None,
     ) -> bool:
         """Commit one idempotent Telegram update and its owned state."""
         ...
@@ -450,6 +465,7 @@ class ConversationStore(Protocol):
         expected_revision: int,
         message: TelegramMessage,
         recorded_at: datetime,
+        result_context: ActiveResultContext | None = None,
     ) -> bool:
         """Commit one idempotent presentation without changing account state."""
         ...
@@ -465,6 +481,34 @@ class ConversationStore(Protocol):
         recorded_at: datetime,
     ) -> bool:
         """Commit one callback update and its durable notification outbox."""
+        ...
+
+    def commit_result_navigation(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        expected_context_screen_revision: int,
+        telegram_message_id: str,
+        completed_search_id: str,
+        current_result_id: str,
+        absolute_position: int,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Queue one serialized result-card edit without mutating active state."""
+        ...
+
+    def replace_failed_result_navigation(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        replacement_delivery_id: str,
+        recorded_at: datetime,
+    ) -> None:
+        """Replace a pre-effect edit failure with a durable ordinary send."""
         ...
 
     def claim_conversation_callback(

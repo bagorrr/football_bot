@@ -467,6 +467,8 @@ class TelegramDeliveryMode(StrEnum):
 
     SEND = "send"
     RECONCILE = "reconcile"
+    EDIT = "edit"
+    RECONCILE_EDIT = "reconcile_edit"
 
 
 class TelegramPeerKind(StrEnum):
@@ -3796,6 +3798,7 @@ class TelegramDeliveryClaim:
 
     message: TelegramMessage
     mode: TelegramDeliveryMode
+    telegram_message_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

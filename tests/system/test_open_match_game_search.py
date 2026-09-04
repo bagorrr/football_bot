@@ -8,6 +8,7 @@ import json
 import os
 from dataclasses import asdict
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -42,6 +43,7 @@ from modules.testkit import (
     ControlledTelegramIngestionAdapter,
     ControlledTimezoneDataAdapter,
     FrozenClock,
+    InjectedTelegramDeliveryError,
     boot_legacy_acceptance_spine,
     semantic_proof_result_for,
 )
@@ -4254,6 +4256,310 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
     )
     assert stored_deleted_rows
     assert all(item.response_route.value == "" for item in stored_deleted_rows)
+    system.reset()
+
+
+def test_active_result_context_paginates_in_place_and_survives_reentry() -> None:
+    """Keep one pageable result context authoritative across Bot navigation."""
+    telegram_ingestion = ControlledTelegramIngestionAdapter()
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    classifier = ControlledModelAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    dates = ControlledDateInterpretationAdapter()
+    timezones = ControlledTimezoneDataAdapter()
+    clock = FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC))
+    administrator_id = 49_065
+    user_id = 49_066
+    source_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_900_650,
+    )
+    telegram_ingestion.allow_public_username(
+        address="@synthetic_open_match_source",
+        identity=source_identity,
+        transport_boundary="channel-pts:490650",
+    )
+    dates.return_for(
+        text="20 August",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 20),
+                    end_local_date=date(2026, 8, 20),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    timezones.add_source(version="controlled-tzdb-v1", timezones=("Europe/Moscow",))
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="whole city",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="location-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="city:ru:saint-petersburg",
+                            display_name="Saint Petersburg",
+                            geographic_type=GeographicType.CITY,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=("country:ru",),
+                            parent_display_names=("Russia",),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="controlled-resolver-v1",
+                            glossary_version="location-glossary-v1",
+                            localized_display_names=(
+                                ("en", "Saint Petersburg"),
+                                ("es", "San Petersburgo"),
+                                ("fr", "Saint-Pétersbourg"),
+                                ("ru", "Санкт-Петербург"),
+                            ),
+                        ),
+                    ),
+                    whole_city=True,
+                ),
+            ),
+        ),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telegram_ingestion,
+        telegram_delivery=telegram_delivery,
+        model=classifier,
+        location_resolver=resolver,
+        date_interpretation=dates,
+        timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+    system.configure_source_chat_classifier_context(
+        identity=source_identity,
+        registry_generation=1,
+        iana_timezone="Europe/Moscow",
+        country_id="country:ru",
+        city_id="city:ru:saint-petersburg",
+    )
+
+    for offset, contact in enumerate(("@page_one", "@page_two")):
+        body = (
+            "Football match on 20 August 2026 in whole city. "
+            f"Need one player. Contact {contact}"
+        )
+        result = _minimal_classifier_result(
+            candidate_key=contact.removeprefix("@"),
+            body=body,
+            response_routes=[
+                {
+                    "kind": "explicit_telegram_username",
+                    "value": contact,
+                    "evidence": contact,
+                }
+            ],
+            event_time_evidence="20 August 2026",
+            opportunity_evidence="Need one player",
+            open_places_evidence="one player",
+        )
+        candidates = result.output["candidates"]
+        assert isinstance(candidates, list) and len(candidates) == 1
+        candidate = candidates[0]
+        assert isinstance(candidate, dict)
+        evidence = candidate["evidence"]
+        assert isinstance(evidence, dict)
+        candidate["evidence"] = {**evidence, "location": "whole city"}
+        candidate["location"] = {
+            "mention": "whole city",
+            "place_id": "city:ru:saint-petersburg",
+            "country_id": "country:ru",
+            "city_id": "city:ru:saint-petersburg",
+        }
+        classifier.return_for(body=body, result=result)
+        telegram_ingestion.add_channel_difference_event(
+            identity=source_identity,
+            from_checkpoint=TelegramChannelCheckpoint(pts=490650 + offset),
+            to_checkpoint=TelegramChannelCheckpoint(pts=490651 + offset),
+            source_event_id=f"source-event:active-result-context:{offset}",
+            telegram_message_id=1065 + offset,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body=body,
+            event_time=datetime(
+                2026,
+                8,
+                18,
+                12,
+                6 + offset,
+                tzinfo=ZoneInfo("Europe/Moscow"),
+            ),
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=source_identity,
+            registry_generation=1,
+        )
+        system.process_opportunities_until_idle()
+
+    _advance_to_complete_game_search(system, bot_user_id=user_id)
+    system.submit_search(
+        update_id="submit-active-result-context", telegram_user_id=user_id
+    )
+    system.process_searches_until_idle()
+
+    completed = system.completed_searches(user_id)
+    assert len(completed) == 1
+    results = system.results(completed[0].completed_search_id)
+    assert len(results) == 2
+    initial_message = telegram_delivery.messages[-1]
+    assert initial_message.text.startswith(
+        "**Result 1 of 2**\nOther options are available using the arrows below.\n\n"
+    )
+    assert len(initial_message.button_rows) == 1
+    assert len(initial_message.button_rows[0]) == 1
+    initial_callback = initial_message.button_rows[0][0][1]
+    _, action, context_token, screen_revision, target_position = initial_callback.split(
+        ":"
+    )
+    assert action == "next"
+    initial_context = system.active_result_context(user_id)
+    initial_view = system.active_conversation_view(user_id)
+    assert int(screen_revision) == initial_context.screen_revision
+    assert int(target_position) == 2
+
+    system.select_result_action(
+        update_id="next-active-result-context",
+        callback_id="callback-next-active-result-context",
+        telegram_user_id=user_id,
+        action=action,
+        screen_revision=int(screen_revision),
+        context_token=context_token,
+        target_position=int(target_position),
+        telegram_message_id=initial_view.telegram_message_id,
+    )
+    assert len(telegram_delivery.edits) == 1
+    edited_message_id, edited_message = telegram_delivery.edits[-1]
+    assert edited_message_id == initial_view.telegram_message_id
+    assert edited_message.text.startswith(
+        "**Result 2 of 2**\nOther options are available using the arrows below.\n\n"
+    )
+    paged_context = system.active_result_context(user_id)
+    assert paged_context.absolute_position == 2
+    assert system.active_conversation_view(user_id).telegram_message_id == (
+        initial_view.telegram_message_id
+    )
+    system.retry_bot_presentations()
+
+    page_two_callback = edited_message.button_rows[0][0][1]
+    _, previous_action, page_two_token, page_two_screen, page_two_target = (
+        page_two_callback.split(":")
+    )
+    system.select_result_action(
+        update_id="foreign-message-active-result-context",
+        callback_id="callback-foreign-message-active-result-context",
+        telegram_user_id=user_id,
+        action=previous_action,
+        screen_revision=int(page_two_screen),
+        context_token=page_two_token,
+        target_position=int(page_two_target),
+        telegram_message_id="telegram:foreign-message",
+    )
+    assert len(telegram_delivery.edits) == 1
+    assert system.active_result_context(user_id) == paged_context
+    system.retry_bot_presentations()
+
+    edit_count = len(telegram_delivery.edits)
+    system.select_result_action(
+        update_id="stale-active-result-context",
+        callback_id="callback-stale-active-result-context",
+        telegram_user_id=user_id,
+        action="next",
+        screen_revision=int(screen_revision),
+        context_token=context_token,
+        target_position=2,
+        telegram_message_id=initial_view.telegram_message_id,
+    )
+    assert len(telegram_delivery.edits) == edit_count
+    assert system.active_result_context(user_id) == paged_context
+    system.retry_bot_presentations()
+
+    system.open_main_menu(update_id="menu-after-page-two", telegram_user_id=user_id)
+    system.select_main_menu_action(
+        update_id="reopen-page-two",
+        telegram_user_id=user_id,
+        action="search-results",
+    )
+    assert system.active_result_context(user_id).absolute_position == 2
+    assert telegram_delivery.messages[-1].text.startswith("**Result 2 of 2**")
+
+    system.restart(RuntimeRole.BOT_ASSISTANT)
+    assert system.active_result_context(user_id).absolute_position == 2
+    system.open_main_menu(update_id="menu-after-restart", telegram_user_id=user_id)
+    system.select_main_menu_action(
+        update_id="reopen-after-restart",
+        telegram_user_id=user_id,
+        action="search-results",
+    )
+    assert system.active_result_context(user_id).absolute_position == 2
+    assert telegram_delivery.messages[-1].text.startswith("**Result 2 of 2**")
+
+    system.select_main_menu_action(
+        update_id="settings-after-restart",
+        telegram_user_id=user_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="language-settings-after-restart",
+        telegram_user_id=user_id,
+        action="language",
+    )
+    system.change_controlled_conversation_language(
+        update_id="change-result-language",
+        telegram_user_id=user_id,
+        locale="ru",
+    )
+    assert system.active_result_context(user_id).absolute_position == 2
+    system.open_main_menu(update_id="menu-after-language", telegram_user_id=user_id)
+    system.select_main_menu_action(
+        update_id="reopen-after-language",
+        telegram_user_id=user_id,
+        action="search-results",
+    )
+    assert telegram_delivery.messages[-1].text.startswith("**Результат 2 из 2**")
+
+    current_message = telegram_delivery.messages[-1]
+    current_view = system.active_conversation_view(user_id)
+    current_callback = current_message.button_rows[0][0][1]
+    _, current_action, current_token, current_screen, current_target = (
+        current_callback.split(":")
+    )
+    telegram_delivery.fail_next()
+    with pytest.raises(InjectedTelegramDeliveryError):
+        system.select_result_action(
+            update_id="failed-previous-active-result-context",
+            callback_id="callback-failed-previous-active-result-context",
+            telegram_user_id=user_id,
+            action=current_action,
+            screen_revision=int(current_screen),
+            context_token=current_token,
+            target_position=int(current_target),
+            telegram_message_id=current_view.telegram_message_id,
+        )
+    assert system.active_result_context(user_id).absolute_position == 2
+    telegram_delivery.fail_next()
+    with pytest.raises(InjectedTelegramDeliveryError):
+        system.retry_bot_presentations()
+    assert system.active_result_context(user_id).absolute_position == 2
+    assert system.active_conversation_view(user_id).telegram_message_id == (
+        current_view.telegram_message_id
+    )
+    system.retry_bot_presentations()
+    assert system.active_result_context(user_id).absolute_position == 1
     system.reset()
 
 

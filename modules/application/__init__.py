@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -51,6 +51,7 @@ from modules.contracts import (
 )
 from modules.domain import (
     AcceptedLocation,
+    ActiveResultContext,
     ClassificationAttempt,
     ClassificationRoutingOutcome,
     CompletedSearch,
@@ -2400,6 +2401,183 @@ class ConversationOnboarding:
                 self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
 
+    def select_result_action(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+        context_token: str,
+        target_position: int,
+        telegram_message_id: str,
+    ) -> None:
+        """Apply one serialized arrow action against the current result context."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            context = self._store.active_result_context(telegram_user_id)
+            if current is None:
+                return
+            active_view = self._store.active_conversation_view(telegram_user_id)
+            callback_matches_current_view = (
+                _result_callback_matches_current_screen(
+                    current=current,
+                    context=context,
+                    screen_revision=screen_revision,
+                    context_token=context_token,
+                )
+                and active_view is not None
+                and active_view.screen_revision == screen_revision
+                and active_view.telegram_message_id == telegram_message_id
+            )
+            if not callback_matches_current_view:
+                same_context = (
+                    context is not None
+                    and context_token
+                    == _result_context_token(
+                        telegram_user_id, context.completed_search_id
+                    )
+                )
+                if not same_context or current.stage is not ConversationStage.RESULTS:
+                    self._queue_current_view(
+                        update_id=f"result-stale-view:{update_id}", state=current
+                    )
+                    self._answer_result_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                        text=_stale_result_callback_text(current.locale or "en"),
+                    )
+                else:
+                    self._answer_result_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                        text="",
+                    )
+            elif context is None or context.absolute_position is None:
+                self._answer_result_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                    text="",
+                )
+            else:
+                query_result = self._store.get_completed_search(
+                    GetCompletedSearch.request_id(context.completed_search_id),
+                    supported_versions=self._supported_query_versions,
+                    received_at=self._clock.now(),
+                )
+                view = query_result.view
+                if (
+                    query_result.status is not CompletedSearchQueryStatus.ACCEPTED
+                    or view is None
+                ):
+                    self._answer_result_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                        text="",
+                    )
+                else:
+                    result_count = len(view.results)
+                    current_result = next(
+                        (
+                            result
+                            for result in view.results
+                            if result.result_id == context.current_result_id
+                            and result.absolute_position == context.absolute_position
+                        ),
+                        None,
+                    )
+                    expected_target = (
+                        context.absolute_position - 1
+                        if action == "previous"
+                        else context.absolute_position + 1
+                        if action == "next"
+                        else None
+                    )
+                    target = next(
+                        (
+                            result
+                            for result in view.results
+                            if result.absolute_position == target_position
+                        ),
+                        None,
+                    )
+                    if (
+                        current_result is None
+                        or expected_target != target_position
+                        or target is None
+                        or not 1 <= target_position <= result_count
+                    ):
+                        self._answer_result_callback(
+                            update_id=update_id,
+                            callback_id=callback_id,
+                            current=current,
+                            text="",
+                        )
+                    else:
+                        next_screen_revision = current.screen_revision + 1
+                        message = _render_result_presentation(
+                            delivery_id=(
+                                f"result-navigation:{context.completed_search_id}:"
+                                f"{current.screen_revision}:{target_position}"
+                            ),
+                            telegram_user_id=telegram_user_id,
+                            locale=current.locale or "en",
+                            screen_revision=next_screen_revision,
+                            result=target,
+                            result_count=result_count,
+                            context_token=context_token,
+                        )
+                        self._store.commit_result_navigation(
+                            update_id=update_id,
+                            telegram_user_id=telegram_user_id,
+                            expected_revision=current.revision,
+                            expected_context_screen_revision=current.screen_revision,
+                            telegram_message_id=telegram_message_id,
+                            completed_search_id=context.completed_search_id,
+                            current_result_id=target.result_id,
+                            absolute_position=target.absolute_position,
+                            message=message,
+                            recorded_at=self._clock.now(),
+                        )
+                        self._answer_result_callback(
+                            update_id=update_id,
+                            callback_id=callback_id,
+                            current=current,
+                            text="",
+                        )
+        self.deliver_pending()
+
+    def _answer_result_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        current: ConversationState,
+        text: str,
+    ) -> None:
+        """Queue one result callback acknowledgement under a distinct identity."""
+        self._store.commit_conversation_callback(
+            update_id=f"result-callback:{update_id}",
+            callback_id=callback_id,
+            telegram_user_id=current.telegram_user_id,
+            expected_revision=current.revision,
+            text=text
+            or _RESULT_CALLBACK_ACK_COPY.get(
+                current.locale or "en", _RESULT_CALLBACK_ACK_COPY["en"]
+            ),
+            recorded_at=self._clock.now(),
+        )
+
     def select_settings_action(
         self,
         *,
@@ -3328,24 +3506,13 @@ class ConversationOnboarding:
             revision=current.revision + 1,
         )
         context = self._store.active_result_context(current.telegram_user_id)
-        if context is None:
-            message = _no_results_yet_message(
-                delivery_id=f"menu:{update_id}",
-                telegram_user_id=current.telegram_user_id,
-                locale=locale,
-                screen_revision=state.screen_revision,
-                selection=selection,
-            )
-        elif context.current_result_id is None:
-            message = _zero_result_message(
-                delivery_id=f"menu:{update_id}",
-                telegram_user_id=current.telegram_user_id,
-                locale=locale,
-                screen_revision=state.screen_revision,
-                selection=selection,
-            )
-        else:
-            self._queue_current_view(update_id=update_id, state=current)
+        message = self._render_active_result_view(
+            delivery_id=f"menu:{update_id}",
+            state=state,
+            context=context,
+            selection=selection,
+        )
+        if message is None:
             return
         self._store.commit_conversation_update(
             update_id=update_id,
@@ -3353,6 +3520,71 @@ class ConversationOnboarding:
             state=state,
             message=message,
             recorded_at=self._clock.now(),
+            result_context=(
+                context
+                if context is not None and context.current_result_id is not None
+                else None
+            ),
+        )
+
+    def _render_active_result_view(
+        self,
+        *,
+        delivery_id: str,
+        state: ConversationState,
+        context: ActiveResultContext | None,
+        selection: LanguageSelection | None = None,
+    ) -> TelegramMessage | None:
+        """Rebuild the current durable result presentation from immutable data."""
+        locale = state.locale or "en"
+        if context is None:
+            return _no_results_yet_message(
+                delivery_id=delivery_id,
+                telegram_user_id=state.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            )
+        if context.current_result_id is None:
+            return _zero_result_message(
+                delivery_id=delivery_id,
+                telegram_user_id=state.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=selection,
+            )
+        query_result = self._store.get_completed_search(
+            GetCompletedSearch.request_id(context.completed_search_id),
+            supported_versions=self._supported_query_versions,
+            received_at=self._clock.now(),
+        )
+        view = query_result.view
+        if (
+            query_result.status is not CompletedSearchQueryStatus.ACCEPTED
+            or view is None
+        ):
+            return None
+        result = next(
+            (
+                item
+                for item in view.results
+                if item.result_id == context.current_result_id
+                and item.absolute_position == context.absolute_position
+            ),
+            None,
+        )
+        if result is None:
+            return None
+        return _render_result_presentation(
+            delivery_id=delivery_id,
+            telegram_user_id=state.telegram_user_id,
+            locale=locale,
+            screen_revision=state.screen_revision,
+            result=result,
+            result_count=len(view.results),
+            context_token=_result_context_token(
+                state.telegram_user_id, context.completed_search_id
+            ),
         )
 
     def _show_settings(
@@ -5607,27 +5839,16 @@ class ConversationOnboarding:
                 selection=self._language_rendering(current.locale or "en"),
             )
         else:
-            opportunity_type = dict(current_result.card_facts).get("opportunity_type")
-            renderer = (
-                _opponent_request_result_message
-                if opportunity_type == "opponent_request"
-                else _tournament_result_message
-                if opportunity_type == "tournament"
-                else _transfer_search_result_message
-                if opportunity_type
-                in {"roster_vacancy", "player_transfer_availability"}
-                else _refereeing_result_message
-                if opportunity_type in {"referee_availability", "referee_request"}
-                else _coaching_search_result_message
-                if opportunity_type in {"coach_availability", "coach_request"}
-                else _open_match_result_message
-            )
-            message = renderer(
+            message = _render_result_presentation(
                 delivery_id=f"search-result:{completed_search_id}",
                 telegram_user_id=telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=current.screen_revision + 1,
                 result=current_result,
+                result_count=len(completed_search.results),
+                context_token=_result_context_token(
+                    telegram_user_id, completed_search_id
+                ),
             )
         self._store.accept_search_completion(
             incoming=incoming,
@@ -7560,6 +7781,29 @@ class ConversationOnboarding:
             and self._store.discovery_draft(state.telegram_user_id) is None
         ):
             return
+        if state.stage is ConversationStage.RESULTS:
+            context = self._store.active_result_context(state.telegram_user_id)
+            message = self._render_active_result_view(
+                delivery_id=f"result-view:{update_id}",
+                state=replace(state, screen_revision=state.screen_revision + 1),
+                context=context,
+                selection=self._language_rendering(state.locale or "en"),
+            )
+            if message is None:
+                return
+            self._store.commit_conversation_presentation(
+                update_id=update_id,
+                telegram_user_id=state.telegram_user_id,
+                expected_revision=state.revision,
+                message=message,
+                recorded_at=self._clock.now(),
+                result_context=(
+                    context
+                    if context is not None and context.current_result_id is not None
+                    else None
+                ),
+            )
+            return
         current_message = self._store.current_conversation_message(
             state.telegram_user_id
         )
@@ -7644,9 +7888,55 @@ class ConversationOnboarding:
                     observed_at=self._clock.now(),
                 )
                 raise
-        else:
+        elif claim.mode is TelegramDeliveryMode.EDIT:
+            if claim.telegram_message_id is None:
+                raise RuntimeError("result edit claim has no Telegram message target")
+            try:
+                telegram_message_id = self._telegram_delivery.edit(
+                    telegram_message_id=claim.telegram_message_id,
+                    message=message,
+                )
+            except TelegramDeliveryPreEffectError:
+                self._store.replace_failed_result_navigation(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    replacement_delivery_id=f"result-replacement:{message.delivery_id}",
+                    recorded_at=self._clock.now(),
+                )
+                raise
+            except Exception:
+                self._store.mark_conversation_message_outcome_unknown(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                raise
+        elif claim.mode is TelegramDeliveryMode.RECONCILE:
             try:
                 reconciled_message_id = self._telegram_delivery.reconcile(message)
+            except Exception:
+                self._store.mark_conversation_message_outcome_unknown(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                raise
+            if reconciled_message_id is None:
+                self._store.mark_conversation_message_reconciliation_required(
+                    delivery_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                return False
+            telegram_message_id = reconciled_message_id
+        else:
+            if claim.telegram_message_id is None:
+                raise RuntimeError("result edit reconciliation has no Telegram target")
+            try:
+                reconciled_message_id = self._telegram_delivery.reconcile_edit(
+                    telegram_message_id=claim.telegram_message_id,
+                    message=message,
+                )
             except Exception:
                 self._store.mark_conversation_message_outcome_unknown(
                     delivery_id=message.delivery_id,
@@ -9572,6 +9862,135 @@ def _result_difference_line(facts: Mapping[str, str], locale: str) -> str | None
     return f"{_RESULT_DIFFERENCE_LABELS[copy_locale]}: {name}."
 
 
+_RESULT_NAVIGATION_COPY = {
+    "en": (
+        "**Result {position} of {total}**",
+        "Other options are available using the arrows below.",
+    ),
+    "ru": (
+        "**Результат {position} из {total}**",
+        "Другие варианты — по стрелкам ниже.",
+    ),
+    "es": (
+        "**Resultado {position} de {total}**",
+        "Hay más opciones con las flechas de abajo.",
+    ),
+    "fr": (
+        "**Résultat {position} sur {total}**",
+        "D’autres options sont disponibles avec les flèches ci-dessous.",
+    ),
+}
+_STALE_RESULT_CALLBACK_COPY = {
+    "en": "This screen is stale. Open results through Menu.",
+    "ru": "Этот экран устарел. Откройте результаты через Меню.",
+    "es": "Esta pantalla está obsoleta. Abra los resultados desde el Menú.",
+    "fr": "Cet écran est obsolète. Ouvrez les résultats depuis le Menu.",
+}
+_RESULT_CALLBACK_ACK_COPY = {
+    "en": "Updated.",
+    "ru": "Обновлено.",
+    "es": "Actualizado.",
+    "fr": "Mis à jour.",
+}
+
+
+def _result_context_token(telegram_user_id: int, completed_search_id: str) -> str:
+    """Derive an opaque stable callback token for one user's immutable search."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:active-result-context:{telegram_user_id}:{completed_search_id}",
+    ).hex
+
+
+def _stale_result_callback_text(locale: str) -> str:
+    """Return the localized notification for a callback from another result view."""
+    return _STALE_RESULT_CALLBACK_COPY.get(locale, _STALE_RESULT_CALLBACK_COPY["en"])
+
+
+def _result_callback_matches_current_screen(
+    *,
+    current: ConversationState,
+    context: ActiveResultContext | None,
+    screen_revision: int,
+    context_token: str,
+) -> bool:
+    """Check the durable screen and context identity carried by one callback."""
+    return (
+        current.stage is ConversationStage.RESULTS
+        and context is not None
+        and context.screen_revision == current.screen_revision == screen_revision
+        and context_token
+        == _result_context_token(current.telegram_user_id, context.completed_search_id)
+    )
+
+
+def _result_renderer_for(result: SearchResult) -> Callable[..., TelegramMessage]:
+    """Select the existing card renderer without adding a second card model."""
+    opportunity_type = dict(result.card_facts).get("opportunity_type")
+    if opportunity_type == "opponent_request":
+        return _opponent_request_result_message
+    if opportunity_type == "tournament":
+        return _tournament_result_message
+    if opportunity_type in {"roster_vacancy", "player_transfer_availability"}:
+        return _transfer_search_result_message
+    if opportunity_type in {"referee_availability", "referee_request"}:
+        return _refereeing_result_message
+    if opportunity_type in {"coach_availability", "coach_request"}:
+        return _coaching_search_result_message
+    return _open_match_result_message
+
+
+def _render_result_presentation(
+    *,
+    delivery_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    result: SearchResult,
+    result_count: int,
+    context_token: str,
+) -> TelegramMessage:
+    """Render one canonical card and add pagination only for a multi-result set."""
+    message = _result_renderer_for(result)(
+        delivery_id=delivery_id,
+        telegram_user_id=telegram_user_id,
+        locale=locale,
+        screen_revision=screen_revision,
+        result=result,
+    )
+    if result_count <= 1:
+        return message
+    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
+    heading, instruction = _RESULT_NAVIGATION_COPY[copy_locale]
+    position = result.absolute_position
+    buttons: list[tuple[str, str]] = []
+    if position > 1:
+        buttons.append(
+            (
+                "⬅️",
+                f"results:previous:{context_token}:{screen_revision}:{position - 1}",
+            )
+        )
+    if position < result_count:
+        buttons.append(
+            (
+                "➡️",
+                f"results:next:{context_token}:{screen_revision}:{position + 1}",
+            )
+        )
+    return replace(
+        message,
+        text=(
+            heading.format(position=position, total=result_count)
+            + "\n"
+            + instruction
+            + "\n\n"
+            + message.text
+        ),
+        button_rows=(tuple(buttons),),
+    )
+
+
 def _refereeing_result_message(
     *,
     delivery_id: str,
@@ -9941,7 +10360,7 @@ def _refereeing_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}"
         )
-    is_active = facts.get("publication_state") == "active"
+    is_active = facts.get("publication_state", "active") == "active"
     route_copy = (
         render_response_route(
             facts["response_route_kind"], facts["response_route_value"], copy_locale
@@ -10286,6 +10705,7 @@ def _transfer_search_result_message(
             "posted": "Posted",
             "edited": "Edited",
             "contact": "Contact",
+            "unavailable": "Unavailable",
             "at": "at",
             "invitation": (
                 "Questions? Message me. I can explain the card or help refine "
@@ -10303,6 +10723,7 @@ def _transfer_search_result_message(
             "posted": "Пост",
             "edited": "Изменён",
             "contact": "Контакт",
+            "unavailable": "Недоступно",
             "at": "в",
             "invitation": (
                 "💬 Остались вопросы? Напишите, я объясню карточку или помогу "
@@ -10320,6 +10741,7 @@ def _transfer_search_result_message(
             "posted": "Publicado",
             "edited": "Modificado",
             "contact": "Contacto",
+            "unavailable": "No disponible",
             "at": "a las",
             "invitation": (
                 "¿Tiene alguna pregunta? Escríbame. Le explicaré la ficha o le "
@@ -10337,6 +10759,7 @@ def _transfer_search_result_message(
             "posted": "Publié",
             "edited": "Modifié",
             "contact": "Contact",
+            "unavailable": "Indisponible",
             "at": "à",
             "invitation": (
                 "Une question ? Écrivez-moi. Je peux expliquer la fiche ou vous "
@@ -10551,9 +10974,15 @@ def _transfer_search_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}"
         )
-    route = render_response_route(
-        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    is_active = facts.get("publication_state", "active") == "active"
+    route = (
+        render_response_route(
+            facts["response_route_kind"], facts["response_route_value"], copy_locale
+        )
+        if is_active
+        else labels["unavailable"]
     )
+    contact_copy = f"{labels['contact']}: {route}" if is_active else route
     difference_line = _result_difference_line(facts, copy_locale)
     parts = [
         labels["roster_title"] if is_roster else labels["player_title"],
@@ -10566,9 +10995,7 @@ def _transfer_search_result_message(
     parts.append(match_text)
     if additional:
         parts.append(f"{labels['additional']}: {additional}")
-    parts.extend(
-        [posted + edited, f"{labels['contact']}: {route}", labels["invitation"]]
-    )
+    parts.extend([posted + edited, contact_copy, labels["invitation"]])
     return TelegramMessage(
         delivery_id=delivery_id,
         telegram_user_id=telegram_user_id,
@@ -10627,6 +11054,7 @@ def _opponent_request_result_message(
             "posted": "Posted",
             "edited": "Edited",
             "contact": "Contact",
+            "unavailable": "Unavailable",
             "at": "at",
             "date_city": "date and city",
             "invitation": (
@@ -10643,6 +11071,7 @@ def _opponent_request_result_message(
             "posted": "Пост",
             "edited": "Изменён",
             "contact": "Контакт",
+            "unavailable": "Недоступно",
             "at": "в",
             "date_city": "дата и город",
             "invitation": (
@@ -10659,6 +11088,7 @@ def _opponent_request_result_message(
             "posted": "Publicado",
             "edited": "Modificado",
             "contact": "Contacto",
+            "unavailable": "No disponible",
             "at": "a las",
             "date_city": "fecha y ciudad",
             "invitation": (
@@ -10675,6 +11105,7 @@ def _opponent_request_result_message(
             "posted": "Publié",
             "edited": "Modifié",
             "contact": "Contact",
+            "unavailable": "Indisponible",
             "at": "à",
             "date_city": "date et ville",
             "invitation": (
@@ -10979,16 +11410,22 @@ def _opponent_request_result_message(
             f"{months[edited_time.month - 1]} {edited_time.year} "
             f"{labels['at']} {edited_time:%H:%M}\n"
         )
-    route_copy = render_response_route(
-        facts["response_route_kind"], facts["response_route_value"], copy_locale
+    is_active = facts.get("publication_state", "active") == "active"
+    route_copy = (
+        render_response_route(
+            facts["response_route_kind"], facts["response_route_value"], copy_locale
+        )
+        if is_active
+        else labels["unavailable"]
     )
+    contact_copy = f"{labels['contact']}: {route_copy}" if is_active else route_copy
     details_copy = f"{details}\n\n" if details else ""
     additional_copy = f"\n{labels['additional']}: {additional}\n" if additional else ""
     text = (
         f"⚽ {labels['title']}\n{when}\n{where}\n"
         f"{details_copy}{possible_copy}{difference_copy}{match_copy}\n"
         f"{additional_copy}{labels['posted']}: {posted}\n{edited}"
-        f"{labels['contact']}: {route_copy}\n\n{labels['invitation']}"
+        f"{contact_copy}\n\n{labels['invitation']}"
     )
     menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
     return TelegramMessage(
@@ -11217,6 +11654,7 @@ def _open_match_result_message(
             "Additional",
             "No exact match was found.",
             "Partially matches",
+            "Unavailable",
         ),
         "ru": (
             "Наличие игроков для матча" if player_result else "Открытая игра",
@@ -11231,6 +11669,7 @@ def _open_match_result_message(
             "Дополнительно",
             "Точного совпадения не найдено.",
             "Частично подходит",
+            "Недоступно",
         ),
         "es": (
             "Disponibilidad de jugadores" if player_result else "Partido abierto",
@@ -11245,6 +11684,7 @@ def _open_match_result_message(
             "Información adicional",
             "No se encontró una coincidencia exacta.",
             "Coincide parcialmente",
+            "No disponible",
         ),
         "fr": (
             "Disponibilité de joueurs" if player_result else "Match ouvert",
@@ -11259,6 +11699,7 @@ def _open_match_result_message(
             "Informations complémentaires",
             "Aucune correspondance exacte n’a été trouvée.",
             "Correspond partiellement",
+            "Indisponible",
         ),
     }[copy_locale]
     match_states = json.loads(facts.get("match_states", "{}"))
@@ -11629,16 +12070,22 @@ def _open_match_result_message(
     detail_line = f"{details}\n" if details else ""
     difference_line = _result_difference_line(facts, copy_locale)
     difference_copy = f"{difference_line}\n\n" if difference_line else ""
-    route_copy = render_response_route(
-        facts["response_route_kind"],
-        facts["response_route_value"],
-        copy_locale,
+    is_active = facts.get("publication_state") == "active"
+    route_copy = (
+        render_response_route(
+            facts["response_route_kind"],
+            facts["response_route_value"],
+            copy_locale,
+        )
+        if is_active
+        else labels[11]
     )
+    contact_copy = f"{labels[4]}: {route_copy}" if is_active else route_copy
     text = (
         f"{title}\n{when}\n{where}\n{detail_line}\n"
         f"{possible_copy}{difference_copy}{match_copy}\n{additional_copy}\n"
         f"{labels[3]}: {posted}\n"
-        f"{labels[4]}: {route_copy}\n\n"
+        f"{contact_copy}\n\n"
         f"{labels[7]}"
     )
     menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
