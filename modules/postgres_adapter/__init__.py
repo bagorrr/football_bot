@@ -8072,6 +8072,8 @@ class PostgresRoleStore:
         search_details: Mapping[str, tuple[str, ...]],
         transfer_search_details: Mapping[str, tuple[str, ...]] | None = None,
         coaching_search_details: Mapping[str, Any] | None = None,
+        *,
+        relaxed_criterion: str | None = None,
     ) -> tuple[SearchResult, ...]:
         """Load accepted projections and delegate deterministic evaluation."""
         if self._role is not RuntimeRole.RECOMMENDATION:
@@ -8161,32 +8163,46 @@ class PostgresRoleStore:
             for row in rows
         )
         if completed_search.user_intent is UserIntent.PLAYER_SEARCH:
-            return evaluate_player_search(completed_search, search_details, projections)
+            return evaluate_player_search(
+                completed_search,
+                search_details,
+                projections,
+                relaxed_criterion=relaxed_criterion,
+            )
         if completed_search.user_intent is UserIntent.GAME_SEARCH:
-            return evaluate_game_search(completed_search, search_details, projections)
+            return evaluate_game_search(
+                completed_search,
+                search_details,
+                projections,
+                relaxed_criterion=relaxed_criterion,
+            )
         if completed_search.user_intent is UserIntent.OPPONENT_SEARCH:
             return evaluate_opponent_search(
                 completed_search,
                 dict(completed_search.opponent_search_details),
                 projections,
+                relaxed_criterion=relaxed_criterion,
             )
         if completed_search.user_intent is UserIntent.TOURNAMENT_SEARCH:
             return evaluate_tournament_search(
                 completed_search,
                 dict(completed_search.tournament_search_details),
                 projections,
+                relaxed_criterion=relaxed_criterion,
             )
         if completed_search.user_intent is UserIntent.REFEREE_SEARCH:
             return evaluate_referee_search(
                 completed_search,
                 dict(completed_search.referee_search_details),
                 projections,
+                relaxed_criterion=relaxed_criterion,
             )
         if completed_search.user_intent is UserIntent.REFEREEING_SERVICE_OFFER:
             return evaluate_refereeing_service_offer(
                 completed_search,
                 dict(completed_search.refereeing_service_offer_details),
                 projections,
+                relaxed_criterion=relaxed_criterion,
             )
         if completed_search.user_intent in {
             UserIntent.NEW_TEAM_SEARCH,
@@ -8198,6 +8214,7 @@ class PostgresRoleStore:
                 if transfer_search_details is not None
                 else dict(completed_search.transfer_search_details),
                 projections,
+                relaxed_criterion=relaxed_criterion,
             )
         if completed_search.user_intent in {
             UserIntent.COACH_SEARCH,
@@ -8209,6 +8226,7 @@ class PostgresRoleStore:
                 if coaching_search_details is not None
                 else dict(completed_search.coaching_search_details),
                 projections,
+                relaxed_criterion=relaxed_criterion,
             )
         return ()
 
@@ -8224,6 +8242,7 @@ class PostgresRoleStore:
         query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
+        relaxed_criterion: str | None = None,
     ) -> ConsumeResult:
         """Evaluate one database snapshot and atomically commit immutable outputs."""
         with psycopg.connect(self._database_url) as connection:
@@ -8377,36 +8396,42 @@ class PostgresRoleStore:
                     completed_search,
                     dict(completed_search.game_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent is UserIntent.GAME_SEARCH:
                 results = evaluate_game_search(
                     completed_search,
                     dict(completed_search.game_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent is UserIntent.OPPONENT_SEARCH:
                 results = evaluate_opponent_search(
                     completed_search,
                     dict(completed_search.opponent_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent is UserIntent.TOURNAMENT_SEARCH:
                 results = evaluate_tournament_search(
                     completed_search,
                     dict(completed_search.tournament_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent is UserIntent.REFEREE_SEARCH:
                 results = evaluate_referee_search(
                     completed_search,
                     dict(completed_search.referee_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent is UserIntent.REFEREEING_SERVICE_OFFER:
                 results = evaluate_refereeing_service_offer(
                     completed_search,
                     dict(completed_search.refereeing_service_offer_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent in {
                 UserIntent.NEW_TEAM_SEARCH,
@@ -8416,6 +8441,7 @@ class PostgresRoleStore:
                     completed_search,
                     dict(completed_search.transfer_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             elif completed_search.user_intent in {
                 UserIntent.COACH_SEARCH,
@@ -8425,6 +8451,7 @@ class PostgresRoleStore:
                     completed_search,
                     dict(completed_search.coaching_search_details),
                     projections,
+                    relaxed_criterion=relaxed_criterion,
                 )
             else:
                 results = ()
@@ -9775,6 +9802,62 @@ class PostgresRoleStore:
             _insert_outbox(connection, command)
             return True
 
+    def commit_search_refinement(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parent_completed_search_id: str,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one Bot User refinement while retaining its active result view."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            state = connection.execute(
+                """
+                SELECT stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            active = connection.execute(
+                """
+                SELECT completed_search_id
+                FROM football_runtime.bot_active_result_contexts
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if state != (ConversationStage.RESULTS.value,) or active != (
+                parent_completed_search_id,
+            ):
+                return False
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET last_bot_user_action_at = %s, updated_at = %s
+                WHERE telegram_user_id = %s
+                """,
+                (recorded_at, recorded_at, telegram_user_id),
+            )
+            _insert_outbox(connection, command)
+            return True
+
     def commit_source_chat_registration_request(
         self,
         *,
@@ -10371,11 +10454,42 @@ class PostgresRoleStore:
                 """,
                 (message.telegram_user_id,),
             ).fetchone()
-            if state != (expected_state_revision, "submitting") or draft != (
+            refinement_parent = payload.get("refined_from_completed_search_id")
+            active_context = connection.execute(
+                """
+                SELECT completed_search_id
+                FROM football_runtime.bot_active_result_contexts
+                WHERE telegram_user_id = %s
+                """,
+                (message.telegram_user_id,),
+            ).fetchone()
+            command_parent = connection.execute(
+                """
+                SELECT payload->>'refined_from_completed_search_id'
+                FROM football_runtime.contract_outbox
+                WHERE message_id = %s
+                  AND producer_role = 'bot_assistant'
+                  AND consumer_role = 'recommendation'
+                  AND contract_name = 'RunSearch'
+                """,
+                (incoming.causation_id,),
+            ).fetchone()
+            is_refinement = (
+                state == (expected_state_revision, "results")
+                and draft is None
+                and isinstance(refinement_parent, str)
+                and active_context == (refinement_parent,)
+                and command_parent == (refinement_parent,)
+            )
+            normal_submission = state == (
+                expected_state_revision,
+                "submitting",
+            ) and draft == (
                 expected_draft_revision,
                 "submitting",
                 search_update_id,
-            ):
+            )
+            if not is_refinement and not normal_submission:
                 _accept_contract_inbox(
                     connection,
                     consumer=self._role,
@@ -11218,14 +11332,14 @@ class PostgresRoleStore:
                             revision = revision + 1,
                             updated_at = %s
                         WHERE telegram_user_id = %s
-                          AND stage = 'submitting'
+                          AND stage IN ('submitting', 'results')
                         RETURNING revision
                         """,
                         (screen_revision, delivered_at, telegram_user_id),
                     ).fetchone()
                     if changed is None:
                         raise RuntimeError(
-                            "Search result presentation lost submitting state"
+                            "Search result presentation lost active Search state"
                         )
                     connection.execute(
                         """

@@ -504,6 +504,18 @@ class ConversationStore(Protocol):
         """Commit one Search action, submitting draft, and RunSearch command."""
         ...
 
+    def commit_search_refinement(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parent_completed_search_id: str,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one clear result refinement and its RunSearch command."""
+        ...
+
     def commit_source_chat_registration_request(
         self,
         *,
@@ -1272,6 +1284,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         query: GetCompletedSearch,
         outgoing: ContractEnvelope,
         received_at: datetime,
+        relaxed_criterion: str | None = None,
     ) -> ConsumeResult:
         """Evaluate one snapshot and atomically persist Search, Results and event."""
         ...
@@ -1284,6 +1297,8 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         self,
         completed_search: CompletedSearch,
         search_details: Mapping[str, tuple[str, ...]],
+        *,
+        relaxed_criterion: str | None = None,
     ) -> tuple[SearchResult, ...]:
         """Deterministically match active Recommendation projections."""
         ...

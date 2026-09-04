@@ -197,6 +197,59 @@ def test_clear_criterion_change_creates_a_new_immutable_search_snapshot() -> Non
     assert removed.completed_at != search.completed_at
 
 
+def test_player_number_refinement_supports_add_replace_and_remove() -> None:
+    search = CompletedSearch(
+        completed_search_id="completed-search:player-number-original",
+        telegram_user_id=49_601,
+        search_update_id="player-number-original",
+        user_intent=UserIntent.PLAYER_SEARCH,
+        country_id="country:ru",
+        city_id="city:ru:spb",
+        sub_city_area_ids=(),
+        whole_city=True,
+        required_date=None,
+        completed_at=datetime(2026, 8, 18, 9, tzinfo=UTC),
+    )
+
+    added = refine_completed_search(
+        search,
+        SearchCriterionChange(
+            criterion="number_of_players",
+            operation=SearchCriterionChangeOperation.ADD,
+            value=3,
+        ),
+        new_completed_search_id="completed-search:player-number-added",
+        new_search_update_id="player-number-added",
+        completed_at=datetime(2026, 8, 18, 9, 1, tzinfo=UTC),
+    )
+    replaced = refine_completed_search(
+        added,
+        SearchCriterionChange(
+            criterion="number_of_players",
+            operation=SearchCriterionChangeOperation.REPLACE,
+            value=4,
+        ),
+        new_completed_search_id="completed-search:player-number-replaced",
+        new_search_update_id="player-number-replaced",
+        completed_at=datetime(2026, 8, 18, 9, 2, tzinfo=UTC),
+    )
+    removed = refine_completed_search(
+        replaced,
+        SearchCriterionChange(
+            criterion="number_of_players",
+            operation=SearchCriterionChangeOperation.REMOVE,
+        ),
+        new_completed_search_id="completed-search:player-number-removed",
+        new_search_update_id="player-number-removed",
+        completed_at=datetime(2026, 8, 18, 9, 3, tzinfo=UTC),
+    )
+
+    assert search.number_of_players is None
+    assert added.number_of_players == 3
+    assert replaced.number_of_players == 4
+    assert removed.number_of_players is None
+
+
 def test_detail_matching_is_confirmed_unknown_or_conflict() -> None:
     assert (
         match_detail(("defender",), ("defender", "midfielder")) is MatchState.CONFIRMED

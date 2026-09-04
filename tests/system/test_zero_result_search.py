@@ -21,6 +21,8 @@ from modules.domain import (
     ConversationStage,
     DateInterpretation,
     DateInterpretationResolution,
+    SearchCriterionChange,
+    SearchCriterionChangeOperation,
 )
 from modules.testkit import (
     AcceptanceSpine,
@@ -126,6 +128,49 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
         (("New search", f"menu:new-search:{context.screen_revision}"),),
     )
     assert result_message.reply_button == "Menu"
+    system.reset()
+
+
+def test_clear_result_change_creates_a_new_persisted_search_snapshot() -> None:
+    system, _telegram = _boot_search_system()
+    user_id = 44_019
+    _advance_to_complete_draft(system, user_id=user_id)
+
+    system.submit_search(update_id="original-result-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    original = system.completed_searches(user_id)[0]
+
+    system.refine_search(
+        update_id="refined-result-search",
+        telegram_user_id=user_id,
+        change=SearchCriterionChange(
+            criterion="positions",
+            operation=SearchCriterionChangeOperation.ADD,
+            value=("defender",),
+        ),
+        relaxed_criterion="positions",
+    )
+    system.process_searches_until_idle()
+
+    completion = system.search_completions("refined-result-search")
+    assert len(completion) == 1
+    assert isinstance(completion[0].payload, dict)
+    assert completion[0].payload["refined_from_completed_search_id"] == (
+        original.completed_search_id
+    )
+    searches = system.completed_searches(user_id)
+    assert len(searches) == 2
+    refined = next(
+        search
+        for search in searches
+        if search.search_update_id == "refined-result-search"
+    )
+    assert refined.completed_search_id != original.completed_search_id
+    assert dict(original.game_search_details) == {}
+    assert dict(refined.game_search_details) == {"positions": ("defender",)}
+    assert system.active_result_context(user_id).completed_search_id == (
+        refined.completed_search_id
+    )
     system.reset()
 
 

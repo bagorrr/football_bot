@@ -92,7 +92,7 @@ class MatchState(StrEnum):
 
 
 class SearchCriterionChangeOperation(StrEnum):
-    """One explicit immutable Search refinement operation."""
+    """One explicit immutable Discovery Criterion refinement operation."""
 
     ADD = "add"
     REMOVE = "remove"
@@ -101,7 +101,7 @@ class SearchCriterionChangeOperation(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class SearchCriterionChange:
-    """One already-disambiguated criterion change requested by a Bot User."""
+    """One already-disambiguated Discovery Criterion change from a Bot User."""
 
     criterion: str
     operation: SearchCriterionChangeOperation
@@ -110,19 +110,21 @@ class SearchCriterionChange:
     def __post_init__(self) -> None:
         """Reject changes that are not explicit enough for a new Search."""
         if not isinstance(self.criterion, str) or not self.criterion.strip():
-            raise ValueError("Search criterion must be a non-empty string")
+            raise ValueError("Discovery Criterion must be a non-empty string")
         try:
             operation = SearchCriterionChangeOperation(self.operation)
         except (TypeError, ValueError) as error:
             raise ValueError(
-                "Search criterion change operation is unsupported"
+                "Discovery Criterion change operation is unsupported"
             ) from error
         object.__setattr__(self, "operation", operation)
         if operation is SearchCriterionChangeOperation.REMOVE:
             if self.value is not None:
-                raise ValueError("Removing a Search criterion cannot carry a value")
+                raise ValueError("Removing a Discovery Criterion cannot carry a value")
         elif self.value is None:
-            raise ValueError("Adding or replacing a Search criterion requires a value")
+            raise ValueError(
+                "Adding or replacing a Discovery Criterion requires a value"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1411,12 +1413,13 @@ _GAME_SEARCH_CRITERIA = frozenset(
         "times",
     }
 )
+_PLAYER_SEARCH_CRITERIA = frozenset((*_GAME_SEARCH_CRITERIA, "number_of_players"))
 _TOURNAMENT_SEARCH_CRITERIA = frozenset(
     {"team_formats", "playing_levels", "venue_settings", "playing_surfaces", "payment"}
 )
 _SEARCH_DETAIL_CONFIG: dict[UserIntent, tuple[str, frozenset[str]]] = {
     UserIntent.GAME_SEARCH: ("game_search_details", _GAME_SEARCH_CRITERIA),
-    UserIntent.PLAYER_SEARCH: ("game_search_details", _GAME_SEARCH_CRITERIA),
+    UserIntent.PLAYER_SEARCH: ("game_search_details", _PLAYER_SEARCH_CRITERIA),
     UserIntent.TOURNAMENT_SEARCH: (
         "tournament_search_details",
         _TOURNAMENT_SEARCH_CRITERIA,
@@ -1465,6 +1468,8 @@ def _criterion_is_selected(
     if criterion == "schedule":
         schedule = _coaching_schedule_from_details(details)
         return schedule is not None and _coaching_schedule_mapping(schedule) is not None
+    if criterion == "number_of_players":
+        return completed_search.number_of_players is not None
     value = details.get(criterion)
     return bool(value)
 
@@ -1527,7 +1532,7 @@ def _validated_search_change_value(
 ) -> Any:
     """Validate and normalize one criterion value before snapshotting it."""
     if change.criterion not in allowed_criteria:
-        raise ValueError("Search criterion is not available for this User Intent")
+        raise ValueError("Discovery Criterion is not available for this User Intent")
     if change.operation is SearchCriterionChangeOperation.REMOVE:
         return None
     value = change.value
@@ -1541,20 +1546,24 @@ def _validated_search_change_value(
         if normalized_schedule is None:
             raise ValueError("Coaching Schedule is invalid")
         return normalized_schedule
+    if change.criterion == "number_of_players":
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError("Number of Players must be a positive integer")
+        return value
     if not isinstance(value, (list, tuple)):
-        raise ValueError("Search criterion values must be a non-empty string list")
+        raise ValueError("Discovery Criterion values must be a non-empty string list")
     values = tuple(value)
     if (
         not values
         or not all(isinstance(item, str) and item for item in values)
         or len(values) != len(set(values))
     ):
-        raise ValueError("Search criterion values must be a non-empty string list")
+        raise ValueError("Discovery Criterion values must be a non-empty string list")
     if (
         change.criterion in {"times", "seasonal_timing", "venue_provision"}
         and len(values) != 1
     ):
-        raise ValueError("This Search criterion accepts exactly one value")
+        raise ValueError("This Discovery Criterion accepts exactly one value")
     return values
 
 
@@ -1587,19 +1596,26 @@ def refine_completed_search(
         raise ValueError("Search refinement is unsupported for this User Intent")
     detail_field, allowed_criteria = config
     current_details = dict(getattr(completed_search, detail_field))
-    is_selected = bool(current_details.get(change.criterion))
+    current_number_of_players = completed_search.number_of_players
+    is_selected = (
+        current_number_of_players is not None
+        if change.criterion == "number_of_players"
+        else bool(current_details.get(change.criterion))
+    )
     if change.operation is SearchCriterionChangeOperation.ADD and is_selected:
-        raise ValueError("Cannot add an already selected Search criterion")
+        raise ValueError("Cannot add an already selected Discovery Criterion")
     if change.operation is SearchCriterionChangeOperation.REMOVE and not is_selected:
-        raise ValueError("Cannot remove an unselected Search criterion")
+        raise ValueError("Cannot remove an unselected Discovery Criterion")
     if change.operation is SearchCriterionChangeOperation.REPLACE and not is_selected:
-        raise ValueError("Cannot replace an unselected Search criterion")
+        raise ValueError("Cannot replace an unselected Discovery Criterion")
     normalized_value = _validated_search_change_value(
         change,
         allowed_criteria=allowed_criteria,
         user_intent=completed_search.user_intent,
     )
-    if change.operation is SearchCriterionChangeOperation.REMOVE:
+    if change.criterion == "number_of_players":
+        current_number_of_players = normalized_value
+    elif change.operation is SearchCriterionChangeOperation.REMOVE:
         current_details.pop(change.criterion, None)
     else:
         current_details[change.criterion] = normalized_value
@@ -1613,6 +1629,7 @@ def refine_completed_search(
             game_search_details=cast(
                 tuple[tuple[str, tuple[str, ...]], ...], detail_values
             ),
+            number_of_players=current_number_of_players,
         )
     if detail_field == "tournament_search_details":
         return replace(
