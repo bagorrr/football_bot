@@ -945,6 +945,7 @@ class ControlledTelegramDeliveryAdapter:
                 raise ValueError("edit delivery ID was reused for a different message")
             return recorded_message_id
         self.edits.append((telegram_message_id, message))
+        self.events.append(("edit", telegram_message_id))
         self._edit_ledger[message.delivery_id] = (message, telegram_message_id)
         if self.interruptions_after_effect_remaining:
             self.interruptions_after_effect_remaining -= 1
@@ -2053,6 +2054,14 @@ class ControlledConversationLanguageAdapter:
                 "das konfigurierte Konto bereits Zugriff hat, und versuchen Sie es "
                 "erneut."
             ),
+            result_navigation_copy=(
+                "**Ergebnis {position} von {total}**",
+                "Weitere Optionen finden Sie über die Pfeile unten.",
+            ),
+            result_stale_callback_text=(
+                "Dieser Bildschirm ist veraltet. Öffnen Sie Ergebnisse über Menü."
+            ),
+            result_callback_ack="Aktualisiert.",
         )
 
 

@@ -587,7 +587,7 @@ def test_unclassified_send_failure_defaults_to_unknown_without_resend() -> None:
     )
 
 
-def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
+def test_superseded_unknown_delivery_is_not_reconciled() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
     system = boot_legacy_acceptance_spine(
@@ -618,13 +618,13 @@ def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
     clock.advance(timedelta(minutes=5))
     system.restart(RuntimeRole.BOT_ASSISTANT)
 
-    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
     assert system.retry_bot_presentations() is False
     assert len(telegram_delivery.messages) == 3
     assert system.active_conversation_view(user_id) == winning_view
 
 
-def test_current_screen_precedes_superseded_reconciliation() -> None:
+def test_current_screen_remains_after_superseded_delivery() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
@@ -657,7 +657,7 @@ def test_current_screen_precedes_superseded_reconciliation() -> None:
     )
     assert len(telegram_delivery.messages) == 3
 
-    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
     assert system.retry_bot_presentations() is False
     assert system.active_conversation_view(user_id) == winning_view
 

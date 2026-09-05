@@ -183,6 +183,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0044_source_chat_lifecycle_cancellation.sql",
     "0045_source_retention_audit_role_isolation.sql",
     "0046_result_variants.sql",
+    "0047_allow_silent_callback_ack.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -233,6 +234,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
     "dc20dc716386e45317aab14e796997068fefc98e19599819c47434e9ab071ec4",
     "22d92678d5b515e3f9cdcdd38b738f46557fcafccf22aaa15456f3e161d0f0e1",
+    "a21ad0fc6a7cb83261ee10bf1c5d1c38a699965694ccea6a7d07e2a65162c7b5",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -9610,7 +9612,7 @@ class PostgresRoleStore:
         update_id: str,
         callback_id: str,
         telegram_user_id: int,
-        expected_revision: int,
+        expected_revision: int | None,
         text: str,
         recorded_at: datetime,
     ) -> bool:
@@ -9637,16 +9639,20 @@ class PostgresRoleStore:
                 """,
                 (telegram_user_id,),
             ).fetchone()
-            if current is None or current[0] != expected_revision:
+            if current is None:
+                if expected_revision is not None:
+                    raise RuntimeError("Conversation state changed concurrently")
+            elif expected_revision is None or current[0] != expected_revision:
                 raise RuntimeError("Conversation state changed concurrently")
-            connection.execute(
-                """
-                UPDATE football_runtime.bot_users
-                SET last_bot_user_action_at = %s
-                WHERE telegram_user_id = %s
-                """,
-                (recorded_at, telegram_user_id),
-            )
+            if current is not None:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_users
+                    SET last_bot_user_action_at = %s
+                    WHERE telegram_user_id = %s
+                    """,
+                    (recorded_at, telegram_user_id),
+                )
             connection.execute(
                 """
                 INSERT INTO football_runtime.bot_callback_outbox (
@@ -9777,8 +9783,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, telegram_message_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -9789,6 +9795,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    telegram_message_id,
                     recorded_at,
                 ),
             )
@@ -11256,11 +11263,11 @@ class PostgresRoleStore:
                     SELECT delivery_id, delivery_status
                     FROM football_runtime.bot_message_outbox
                     WHERE delivered_at IS NULL
+                      AND superseded_at IS NULL
                       AND (
                           (
                               delivery_status = 'pending'
                               AND claim_token IS NULL
-                              AND superseded_at IS NULL
                           )
                           OR (
                               delivery_status = 'attempting'
@@ -11274,7 +11281,7 @@ class PostgresRoleStore:
                               )
                           )
                       )
-                    ORDER BY (superseded_at IS NOT NULL), sequence_id
+                    ORDER BY sequence_id
                     FOR UPDATE
                     LIMIT 1
                 )
@@ -11300,27 +11307,19 @@ class PostgresRoleStore:
                           bot_message_outbox.button_rows,
                           bot_message_outbox.reply_button,
                           bot_message_outbox.reply_keyboard_action,
+                          bot_message_outbox.telegram_message_id,
                           candidate.delivery_status AS prior_delivery_status
                 """,
                 (stale_before, stale_before, claim_token, claimed_at, claimed_at),
             ).fetchone()
             if row is not None and row["delivery_id"].startswith("result-navigation:"):
-                target = connection.execute(
-                    """
-                    SELECT telegram_message_id
-                    FROM football_runtime.bot_active_chat_views
-                    WHERE telegram_user_id = %s
-                    FOR UPDATE
-                    """,
-                    (row["telegram_user_id"],),
-                ).fetchone()
-                if target is None:
-                    raise RuntimeError("result navigation has no active Telegram view")
-                edit_target_message_id = target["telegram_message_id"]
+                edit_target_message_id = row["telegram_message_id"]
         message = _telegram_message(row)
         if message is None or row is None:
             return None
         is_edit = row["delivery_id"].startswith("result-navigation:")
+        if is_edit and edit_target_message_id is None:
+            raise RuntimeError("result navigation has no bound Telegram target")
         mode = (
             TelegramDeliveryMode.EDIT
             if is_edit and row["prior_delivery_status"] == "pending"

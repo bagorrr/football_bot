@@ -3864,3 +3864,6 @@ class LanguageSelection:
     source_chat_pending_text: str | None = None
     source_chat_registered_text: str | None = None
     source_chat_failed_text: str | None = None
+    result_navigation_copy: tuple[str, str] | None = None
+    result_stale_callback_text: str | None = None
+    result_callback_ack: str | None = None

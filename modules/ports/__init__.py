@@ -476,7 +476,7 @@ class ConversationStore(Protocol):
         update_id: str,
         callback_id: str,
         telegram_user_id: int,
-        expected_revision: int,
+        expected_revision: int | None,
         text: str,
         recorded_at: datetime,
     ) -> bool:

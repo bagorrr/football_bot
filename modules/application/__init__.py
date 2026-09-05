@@ -2424,8 +2424,21 @@ class ConversationOnboarding:
             current = self._store.conversation_state(telegram_user_id)
             context = self._store.active_result_context(telegram_user_id)
             if current is None:
+                self._acknowledge_result_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    telegram_user_id=telegram_user_id,
+                    current=None,
+                    text=None,
+                )
                 return
             active_view = self._store.active_conversation_view(telegram_user_id)
+            same_context = (
+                current.stage is ConversationStage.RESULTS
+                and context is not None
+                and context_token
+                == _result_context_token(telegram_user_id, context.completed_search_id)
+            )
             callback_matches_current_view = (
                 _result_callback_matches_current_screen(
                     current=current,
@@ -2437,30 +2450,45 @@ class ConversationOnboarding:
                 and active_view.screen_revision == screen_revision
                 and active_view.telegram_message_id == telegram_message_id
             )
-            if not callback_matches_current_view:
-                same_context = (
-                    context is not None
-                    and context_token
-                    == _result_context_token(
-                        telegram_user_id, context.completed_search_id
-                    )
+            if same_context and screen_revision < current.screen_revision:
+                self._acknowledge_result_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    telegram_user_id=telegram_user_id,
+                    current=current,
+                    text="",
                 )
+            elif not callback_matches_current_view:
                 if not same_context or current.stage is not ConversationStage.RESULTS:
+                    selection = self._language_rendering(current.locale or "en")
+                    self._acknowledge_result_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        telegram_user_id=telegram_user_id,
+                        current=current,
+                        text=_stale_result_callback_text(
+                            current.locale or "en", selection=selection
+                        ),
+                    )
                     self._queue_current_view(
                         update_id=f"result-stale-view:{update_id}", state=current
                     )
-                    self._answer_result_callback(
+                else:
+                    selection = self._language_rendering(current.locale or "en")
+                    self._acknowledge_result_callback(
                         update_id=update_id,
                         callback_id=callback_id,
+                        telegram_user_id=telegram_user_id,
                         current=current,
-                        text=_stale_result_callback_text(current.locale or "en"),
+                        text=_stale_result_callback_text(
+                            current.locale or "en", selection=selection
+                        ),
                     )
-                else:
                     message = self._render_active_result_view(
                         delivery_id=f"result-stale-view:{update_id}",
                         state=current,
                         context=context,
-                        selection=self._language_rendering(current.locale or "en"),
+                        selection=selection,
                     )
                     if message is not None:
                         self._store.commit_conversation_presentation(
@@ -2476,21 +2504,24 @@ class ConversationOnboarding:
                                 else None
                             ),
                         )
-                    self._answer_result_callback(
-                        update_id=update_id,
-                        callback_id=callback_id,
-                        current=current,
-                        text="",
-                    )
                     foreign_message_id_to_cleanup = telegram_message_id
             elif context is None or context.absolute_position is None:
-                self._answer_result_callback(
+                self._acknowledge_result_callback(
                     update_id=update_id,
                     callback_id=callback_id,
+                    telegram_user_id=telegram_user_id,
                     current=current,
-                    text="",
+                    text=None,
                 )
             else:
+                selection = self._language_rendering(current.locale or "en")
+                self._acknowledge_result_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    telegram_user_id=telegram_user_id,
+                    current=current,
+                    text=None,
+                )
                 query_result = self._store.get_completed_search(
                     GetCompletedSearch.request_id(context.completed_search_id),
                     supported_versions=self._supported_query_versions,
@@ -2501,12 +2532,7 @@ class ConversationOnboarding:
                     query_result.status is not CompletedSearchQueryStatus.ACCEPTED
                     or view is None
                 ):
-                    self._answer_result_callback(
-                        update_id=update_id,
-                        callback_id=callback_id,
-                        current=current,
-                        text="",
-                    )
+                    pass
                 else:
                     result_count = len(view.results)
                     current_result = next(
@@ -2539,12 +2565,7 @@ class ConversationOnboarding:
                         or target is None
                         or not 1 <= target_position <= result_count
                     ):
-                        self._answer_result_callback(
-                            update_id=update_id,
-                            callback_id=callback_id,
-                            current=current,
-                            text="",
-                        )
+                        pass
                     else:
                         next_screen_revision = current.screen_revision + 1
                         message = _render_result_presentation(
@@ -2558,6 +2579,7 @@ class ConversationOnboarding:
                             result=target,
                             result_count=result_count,
                             context_token=context_token,
+                            selection=selection,
                         )
                         self._store.commit_result_navigation(
                             update_id=update_id,
@@ -2571,39 +2593,57 @@ class ConversationOnboarding:
                             message=message,
                             recorded_at=self._clock.now(),
                         )
-                        self._answer_result_callback(
-                            update_id=update_id,
-                            callback_id=callback_id,
-                            current=current,
-                            text="",
-                        )
         if foreign_message_id_to_cleanup is not None:
-            self._deliver_pending_callback()
             with suppress(Exception):
                 self._telegram_delivery.remove_inline_actions(
                     telegram_user_id=telegram_user_id,
                     telegram_message_id=foreign_message_id_to_cleanup,
                 )
-        self._deliver_pending_callback()
         self.deliver_pending()
+
+    def _acknowledge_result_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        current: ConversationState | None,
+        text: str | None,
+    ) -> None:
+        """Answer one result callback before any follow-up rendering work."""
+        self._answer_result_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            telegram_user_id=telegram_user_id,
+            current=current,
+            text=text,
+        )
+        while self._deliver_pending_callback():
+            pass
 
     def _answer_result_callback(
         self,
         *,
         update_id: str,
         callback_id: str,
-        current: ConversationState,
-        text: str,
+        telegram_user_id: int,
+        current: ConversationState | None,
+        text: str | None,
     ) -> None:
         """Queue one result callback acknowledgement under a distinct identity."""
+        locale = current.locale if current is not None and current.locale else "en"
         self._store.commit_conversation_callback(
             update_id=f"result-callback:{update_id}",
             callback_id=callback_id,
-            telegram_user_id=current.telegram_user_id,
-            expected_revision=current.revision,
-            text=text
-            or _RESULT_CALLBACK_ACK_COPY.get(
-                current.locale or "en", _RESULT_CALLBACK_ACK_COPY["en"]
+            telegram_user_id=telegram_user_id,
+            expected_revision=current.revision if current is not None else None,
+            text=(
+                _result_callback_ack_text(
+                    locale,
+                    selection=self._language_rendering(locale),
+                )
+                if text is None
+                else text
             ),
             recorded_at=self._clock.now(),
         )
@@ -3615,6 +3655,7 @@ class ConversationOnboarding:
             context_token=_result_context_token(
                 state.telegram_user_id, context.completed_search_id
             ),
+            selection=selection,
         )
 
     def _show_settings(
@@ -5879,6 +5920,7 @@ class ConversationOnboarding:
                 context_token=_result_context_token(
                     telegram_user_id, completed_search_id
                 ),
+                selection=self._language_rendering(current.locale or "en"),
             )
         self._store.accept_search_completion(
             incoming=incoming,
@@ -9932,9 +9974,26 @@ def _result_context_token(telegram_user_id: int, completed_search_id: str) -> st
     ).hex
 
 
-def _stale_result_callback_text(locale: str) -> str:
+def _stale_result_callback_text(
+    locale: str, *, selection: LanguageSelection | None = None
+) -> str:
     """Return the localized notification for a callback from another result view."""
-    return _STALE_RESULT_CALLBACK_COPY.get(locale, _STALE_RESULT_CALLBACK_COPY["en"])
+    if locale in SUPPORTED_LOCALES:
+        return _STALE_RESULT_CALLBACK_COPY[locale]
+    if selection is None or selection.result_stale_callback_text is None:
+        raise RuntimeError("saved Conversation Language has no stale-result copy")
+    return selection.result_stale_callback_text
+
+
+def _result_callback_ack_text(
+    locale: str, *, selection: LanguageSelection | None = None
+) -> str:
+    """Return the localized acknowledgement for one result callback."""
+    if locale in SUPPORTED_LOCALES:
+        return _RESULT_CALLBACK_ACK_COPY[locale]
+    if selection is None or selection.result_callback_ack is None:
+        raise RuntimeError("saved Conversation Language has no result ACK copy")
+    return selection.result_callback_ack
 
 
 def _result_callback_matches_current_screen(
@@ -9979,6 +10038,7 @@ def _render_result_presentation(
     result: SearchResult,
     result_count: int,
     context_token: str,
+    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
     """Render one canonical card and add pagination only for a multi-result set."""
     message = _result_renderer_for(result)(
@@ -9990,8 +10050,12 @@ def _render_result_presentation(
     )
     if result_count <= 1:
         return message
-    copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
-    heading, instruction = _RESULT_NAVIGATION_COPY[copy_locale]
+    if locale in SUPPORTED_LOCALES:
+        heading, instruction = _RESULT_NAVIGATION_COPY[locale]
+    elif selection is not None and selection.result_navigation_copy is not None:
+        heading, instruction = selection.result_navigation_copy
+    else:
+        raise RuntimeError("saved Conversation Language has no result navigation copy")
     position = result.absolute_position
     buttons: list[tuple[str, str]] = []
     if position > 1:
