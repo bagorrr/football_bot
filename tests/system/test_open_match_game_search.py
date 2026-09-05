@@ -5430,11 +5430,12 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     assert request.current_result is not None
     assert request.current_result["result_id"] == fallback_context.current_result_id
     assert request.current_result["absolute_position"] == 2
+    active_results = system.results(fallback_context.completed_search_id)
     assert [
         alternative["result_id"] for alternative in request.alternative_results
     ] == [
         result.result_id
-        for result in results
+        for result in active_results
         if result.result_id != fallback_context.current_result_id
     ]
     bounded_card_context = json.dumps(

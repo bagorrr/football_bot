@@ -625,6 +625,12 @@ def _assert_final_migration_state(database_url: str) -> None:
             "bot_required_date_confirmation_events",
             "event_sequence",
         ),
+        (
+            "bot_result_conversation_messages_sequence_id_seq",
+            "i",
+            "bot_result_conversation_messages",
+            "sequence_id",
+        ),
     ]
 
 
