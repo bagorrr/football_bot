@@ -10204,15 +10204,11 @@ class PostgresRoleStore:
                 """
                 DELETE FROM football_runtime.bot_result_conversation_messages
                 WHERE telegram_user_id = %s
-                  AND (
-                      completed_search_id <> %s
-                      OR recorded_at <= %s
-                  )
+                  AND completed_search_id <> %s
                 """,
                 (
                     telegram_user_id,
                     completed_search_id,
-                    recorded_at - timedelta(days=30),
                 ),
             )
             connection.execute(
@@ -11414,14 +11410,6 @@ class PostgresRoleStore:
             self._database_url,
             row_factory=dict_row,
         ) as connection:
-            connection.execute(
-                """
-                DELETE FROM football_runtime.bot_result_conversation_messages
-                WHERE telegram_user_id = %s
-                  AND recorded_at <= %s
-                """,
-                (telegram_user_id, as_of - timedelta(days=30)),
-            )
             context = connection.execute(
                 """
                 SELECT completed_search_id
@@ -11439,9 +11427,10 @@ class PostgresRoleStore:
                 FROM football_runtime.bot_result_conversation_messages
                 WHERE telegram_user_id = %s
                   AND completed_search_id = %s
+                  AND recorded_at > %s
                 ORDER BY sequence_id
                 """,
-                (telegram_user_id, completed_search_id),
+                (telegram_user_id, completed_search_id, as_of - timedelta(days=30)),
             ).fetchall()
         return ResultConversation(
             telegram_user_id=telegram_user_id,
@@ -11455,6 +11444,25 @@ class PostgresRoleStore:
                 for row in rows
             ),
         )
+
+    def cleanup_expired_result_conversations(self, *, as_of: datetime) -> int:
+        """Physically delete retained Result Conversation messages past 30 days."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                WITH deleted AS (
+                    DELETE FROM football_runtime.bot_result_conversation_messages
+                    WHERE recorded_at <= %s
+                    RETURNING message_id
+                )
+                SELECT count(*)::integer
+                FROM deleted
+                """,
+                (as_of - timedelta(days=30),),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
 
     def claim_conversation_message(
         self,

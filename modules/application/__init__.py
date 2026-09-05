@@ -2353,6 +2353,10 @@ class ConversationOnboarding:
             inactive_before=self._clock.now() - timedelta(days=30)
         )
 
+    def expire_result_conversations(self) -> int:
+        """Expire retained Result Conversation messages at the current clock."""
+        return self._store.cleanup_expired_result_conversations(as_of=self._clock.now())
+
     def open_main_menu(self, *, update_id: str, telegram_user_id: int) -> None:
         """Handle the native Menu text through the current logical screen."""
         with self._store.serialize_conversation_update(
@@ -10254,12 +10258,15 @@ def _validated_result_response(
         isinstance(result_id, str) and result_id for result_id in candidate_ids
     ):
         return _result_conversation_failure_text(locale), False
-    active_ids = set(result_ids)
-    if response.referenced_result_id is not None and candidate_ids:
-        return _result_conversation_failure_text(locale), False
-    if response.referenced_result_id is not None and (
-        response.referenced_result_id not in active_ids
+    referenced_result_id = response.referenced_result_id
+    if referenced_result_id is not None and (
+        not isinstance(referenced_result_id, str) or not referenced_result_id
     ):
+        return _result_conversation_failure_text(locale), False
+    active_ids = set(result_ids)
+    if referenced_result_id is not None and candidate_ids:
+        return _result_conversation_failure_text(locale), False
+    if referenced_result_id is not None and referenced_result_id not in active_ids:
         return _result_conversation_copy(
             locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY
         ), False

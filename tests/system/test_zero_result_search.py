@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor, wait
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from typing import cast
 
 import pytest
 
@@ -176,6 +177,95 @@ def test_result_turn_is_bounded_to_active_context_and_replays_once() -> None:
     assert len(telegram.messages) == before_messages + 1
     assert len(assistant.requests) == 1
     assert len(system.result_conversation(user_id).messages) == 2
+    system.reset()
+
+
+def test_result_conversation_read_preserves_expired_rows_for_explicit_cleanup() -> None:
+    system, _telegram, assistant, clock = _boot_search_system_with_assistant_model()
+    user_id = 44_101
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="retention-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    assistant.return_for(
+        text="Before expiry",
+        response=BotAssistantResponse(reply="The current card is still available."),
+    )
+    system.answer_result_message(
+        update_id="retention-turn",
+        telegram_user_id=user_id,
+        text="Before expiry",
+    )
+
+    clock.advance_to(clock.now() + timedelta(days=31))
+    assert system.result_conversation(user_id).messages == ()
+
+    assistant.return_for(
+        text="After expiry",
+        response=BotAssistantResponse(reply="The transcript has expired."),
+    )
+    system.answer_result_message(
+        update_id="retention-after-expiry",
+        telegram_user_id=user_id,
+        text="After expiry",
+    )
+    assert assistant.requests[-1].transcript == ()
+    assert system.cleanup_expired_result_conversations() >= 2
+    assert [
+        message.text for message in system.result_conversation(user_id).messages
+    ] == [
+        "After expiry",
+        "The transcript has expired.",
+    ]
+    system.reset()
+
+
+def test_malformed_result_reference_fails_closed_and_replays_once() -> None:
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_102
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(
+        update_id="malformed-reference-search", telegram_user_id=user_id
+    )
+    system.process_searches_until_idle()
+    question = "What is available?"
+    failure = "I cannot answer from the current result context right now."
+    assistant.return_for(
+        text=question,
+        response=BotAssistantResponse(
+            reply="This reply must not be committed.",
+            referenced_result_id=cast(str | None, {"bad": "id"}),
+        ),
+    )
+    before_messages = len(telegram.messages)
+
+    system.answer_result_message(
+        update_id="malformed-reference-turn",
+        telegram_user_id=user_id,
+        text=question,
+    )
+
+    assert len(telegram.messages) == before_messages + 1
+    assert telegram.messages[-1].text == failure
+    assert [
+        message.text for message in system.result_conversation(user_id).messages
+    ] == [
+        question,
+        failure,
+    ]
+
+    system.answer_result_message(
+        update_id="malformed-reference-turn",
+        telegram_user_id=user_id,
+        text=question,
+    )
+    assert len(telegram.messages) == before_messages + 1
+    assert len(assistant.requests) == 1
+    assert [
+        message.text for message in system.result_conversation(user_id).messages
+    ] == [
+        question,
+        failure,
+    ]
     system.reset()
 
 

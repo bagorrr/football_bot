@@ -4414,6 +4414,10 @@ class AcceptanceSpine:
             raise LookupError(telegram_user_id)
         return conversation
 
+    def cleanup_expired_result_conversations(self) -> int:
+        """Run the explicit Bot Assistant Result Conversation retention sweep."""
+        return self._conversation_onboarding().expire_result_conversations()
+
     def read_conversation_state_as(
         self,
         *,

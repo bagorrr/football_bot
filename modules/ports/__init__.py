@@ -804,6 +804,10 @@ class ConversationStore(Protocol):
         """Return only the retained transcript for the current active Search."""
         ...
 
+    def cleanup_expired_result_conversations(self, *, as_of: datetime) -> int:
+        """Delete retained Result Conversation messages past their bound."""
+        ...
+
     def claim_conversation_message(
         self,
         *,
