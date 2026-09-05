@@ -55,11 +55,13 @@ from modules.domain import (
     ClassificationAttempt,
     ClassificationRoutingOutcome,
     CompletedSearch,
+    CompletedSearchView,
     ConversationStage,
     ConversationState,
     DateInterpretation,
     DateInterpretationQuery,
     DiscoveryCriterionChange,
+    DiscoveryCriterionChangeOperation,
     DiscoveryDraft,
     ExplicitAmountCurrencySpan,
     GeographicType,
@@ -79,6 +81,7 @@ from modules.domain import (
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
+    ResultConversation,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
@@ -106,6 +109,9 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceRoleStore,
+    BotAssistantModelAdapter,
+    BotAssistantResponse,
+    BotAssistantTurnRequest,
     ClassificationProofWork,
     ClassifierAdapterResult,
     ClassifierAuthenticationError,
@@ -2306,6 +2312,7 @@ class ConversationOnboarding:
         date_interpretation: DateInterpretationAdapter,
         timezone_data: TimezoneDataAdapter,
         clock: Clock,
+        assistant_model: BotAssistantModelAdapter | None = None,
         telegram_admin_user_id: int | None = None,
         supported_query_versions: Iterable[int] = (1,),
     ) -> None:
@@ -2316,6 +2323,7 @@ class ConversationOnboarding:
         self._date_interpretation = date_interpretation
         self._timezone_data = timezone_data
         self._clock = clock
+        self._assistant_model = assistant_model
         self._telegram_admin_user_id = telegram_admin_user_id
         self._supported_query_versions = frozenset(supported_query_versions)
 
@@ -4082,6 +4090,123 @@ class ConversationOnboarding:
                 recorded_at=self._clock.now(),
             ):
                 self._telegram_delivery.show_typing(telegram_user_id=telegram_user_id)
+
+    def answer_result_message(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+    ) -> None:
+        """Answer one free-text turn using only the current Result Conversation."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Result Conversation messages must be non-empty")
+        committed = False
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            active = self._store.active_result_context(telegram_user_id)
+            if (
+                current is None
+                or current.stage is not ConversationStage.RESULTS
+                or active is None
+                or active.telegram_user_id != telegram_user_id
+            ):
+                return
+            query_result = self._store.get_completed_search(
+                GetCompletedSearch.request_id(active.completed_search_id),
+                supported_versions=self._supported_query_versions,
+                received_at=self._clock.now(),
+            )
+            if (
+                query_result.status is not CompletedSearchQueryStatus.ACCEPTED
+                or query_result.view is None
+                or query_result.view.completed_search.completed_search_id
+                != active.completed_search_id
+                or query_result.view.completed_search.telegram_user_id
+                != telegram_user_id
+            ):
+                return
+            conversation = self._store.result_conversation(
+                telegram_user_id,
+                as_of=self._clock.now(),
+            )
+            if (
+                conversation is None
+                or conversation.completed_search_id != active.completed_search_id
+            ):
+                return
+            if self._assistant_model is None:
+                return
+            request = _result_turn_request(
+                update_id=update_id,
+                text=text,
+                state=current,
+                context=active,
+                view=query_result.view,
+                conversation=conversation,
+                now=self._clock.now(),
+            )
+            response = self._assistant_model.respond(request)
+            reply, action_allowed = _validated_result_response(
+                response,
+                locale=current.locale or "en",
+                result_ids=tuple(
+                    result.result_id for result in query_result.view.results
+                ),
+                current_result_id=active.current_result_id,
+            )
+            command: ContractEnvelope | None = None
+            if action_allowed and isinstance(response, BotAssistantResponse):
+                try:
+                    change, relaxed_criterion = _refinement_proposal(response)
+                except (TypeError, ValueError):
+                    reply = _result_conversation_failure_text(current.locale)
+                else:
+                    if change is not None:
+                        try:
+                            run_search_message_id = derive_run_search_message_id(
+                                telegram_user_id, update_id
+                            )
+                            refined_search = refine_completed_search(
+                                query_result.view.completed_search,
+                                change,
+                                new_completed_search_id=(
+                                    f"completed-search:{run_search_message_id}"
+                                ),
+                                new_search_update_id=update_id,
+                                completed_at=self._clock.now(),
+                            )
+                            command = _run_search_command_from_completed_search(
+                                refined_search,
+                                display_locale=current.locale or "en",
+                                subject_revision=current.revision,
+                                parent_completed_search_id=active.completed_search_id,
+                                relaxed_criterion=relaxed_criterion,
+                            )
+                        except (TypeError, ValueError):
+                            reply = _result_conversation_failure_text(current.locale)
+            message = _result_conversation_message(
+                update_id=update_id,
+                state=current,
+                text=reply,
+                selection=self._language_rendering(current.locale or "en"),
+            )
+            committed = self._store.commit_result_conversation_turn(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                completed_search_id=active.completed_search_id,
+                user_message=text,
+                assistant_message=message,
+                recorded_at=self._clock.now(),
+                command=command,
+            )
+        if committed:
+            self.deliver_pending()
 
     def open_game_search_details(
         self,
@@ -10004,6 +10129,24 @@ _RESULT_CALLBACK_ACK_COPY = {
     "es": "Actualizado.",
     "fr": "Mis à jour.",
 }
+_RESULT_CONVERSATION_AMBIGUOUS_COPY = {
+    "en": "Which card do you mean?",
+    "ru": "О какой карточке речь?",
+    "es": "¿A qué ficha se refiere?",
+    "fr": "De quelle fiche parlez-vous ?",
+}
+_RESULT_CONVERSATION_UNAVAILABLE_COPY = {
+    "en": "I can only answer from the current result cards.",
+    "ru": "Я могу отвечать только по текущим карточкам результатов.",
+    "es": "Solo puedo responder sobre las fichas de resultados actuales.",
+    "fr": "Je peux répondre uniquement sur les fiches de résultats actuelles.",
+}
+_RESULT_CONVERSATION_FAILURE_COPY = {
+    "en": "I cannot answer from the current result context right now.",
+    "ru": "Сейчас я не могу ответить по текущему контексту результатов.",
+    "es": "Ahora no puedo responder desde el contexto actual de resultados.",
+    "fr": "Je ne peux pas répondre depuis le contexte actuel des résultats.",
+}
 
 
 def _result_context_token(telegram_user_id: int, completed_search_id: str) -> str:
@@ -10012,6 +10155,205 @@ def _result_context_token(telegram_user_id: int, completed_search_id: str) -> st
         NAMESPACE_URL,
         f"football-bot:active-result-context:{telegram_user_id}:{completed_search_id}",
     ).hex
+
+
+def _result_card_model_payload(result: SearchResult) -> dict[str, JsonValue]:
+    """Expose only application-accepted facts for one Result Card referent."""
+    return {
+        "result_id": result.result_id,
+        "absolute_position": result.absolute_position,
+        "result_class": result.result_class,
+        "card_facts": {key: cast(JsonValue, value) for key, value in result.card_facts},
+    }
+
+
+def _result_turn_request(
+    *,
+    update_id: str,
+    text: str,
+    state: ConversationState,
+    context: ActiveResultContext,
+    view: CompletedSearchView,
+    conversation: ResultConversation,
+    now: datetime,
+) -> BotAssistantTurnRequest:
+    """Build the bounded model input from one active Completed Search only."""
+    results_by_id = {result.result_id: result for result in view.results}
+    current_result = (
+        results_by_id.get(context.current_result_id)
+        if context.current_result_id is not None
+        else None
+    )
+    alternatives = tuple(
+        _result_card_model_payload(result)
+        for result in view.results
+        if result.result_id != context.current_result_id
+    )
+    required_date = view.completed_search.required_date
+    iana_timezone = required_date.iana_timezone if required_date is not None else None
+    local_date: str | None = None
+    if iana_timezone is not None:
+        with suppress(ZoneInfoNotFoundError):
+            local_date = now.astimezone(ZoneInfo(iana_timezone)).date().isoformat()
+    return BotAssistantTurnRequest(
+        turn_id=f"result-turn:{state.telegram_user_id}:{update_id}",
+        update_id=update_id,
+        message=text,
+        locale=state.locale or "en",
+        stage=state.stage,
+        screen_revision=context.screen_revision,
+        completed_search_id=context.completed_search_id,
+        current_result_id=context.current_result_id,
+        current_result=(
+            _result_card_model_payload(current_result)
+            if current_result is not None
+            else None
+        ),
+        alternative_results=alternatives,
+        transcript=conversation.messages,
+        current_time=now,
+        iana_timezone=iana_timezone,
+        local_date=local_date,
+        timezone_data_version=(
+            required_date.timezone_data_version if required_date is not None else None
+        ),
+        requested_model="gpt-5.6-sol",
+        requested_reasoning_effort="high",
+        prompt_version="result-conversation-v1",
+        response_contract_version="bot-assistant-response-v1",
+        context_policy_version="active-result-context-v1",
+        external_knowledge_allowed=False,
+    )
+
+
+def _result_conversation_copy(
+    locale: str,
+    catalog: Mapping[str, str],
+) -> str:
+    """Return fixed result-turn copy with an English fail-closed fallback."""
+    return catalog.get(locale, catalog["en"])
+
+
+def _result_conversation_failure_text(locale: str | None) -> str:
+    """Return the fixed unavailable reply for an invalid model response."""
+    return _result_conversation_copy(locale or "en", _RESULT_CONVERSATION_FAILURE_COPY)
+
+
+def _validated_result_response(
+    response: BotAssistantResponse,
+    *,
+    locale: str,
+    result_ids: tuple[str, ...],
+    current_result_id: str | None,
+) -> tuple[str, bool]:
+    """Validate references and free-form shape before accepting a proposal."""
+    if not isinstance(response, BotAssistantResponse):
+        return _result_conversation_failure_text(locale), False
+    candidate_ids = response.candidate_result_ids
+    if not isinstance(candidate_ids, tuple) or not all(
+        isinstance(result_id, str) and result_id for result_id in candidate_ids
+    ):
+        return _result_conversation_failure_text(locale), False
+    active_ids = set(result_ids)
+    if response.referenced_result_id is not None and candidate_ids:
+        return _result_conversation_failure_text(locale), False
+    if response.referenced_result_id is not None and (
+        response.referenced_result_id not in active_ids
+    ):
+        return _result_conversation_copy(
+            locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY
+        ), False
+    if candidate_ids and (
+        len(candidate_ids) != len(set(candidate_ids))
+        or not set(candidate_ids).issubset(active_ids)
+    ):
+        return _result_conversation_copy(
+            locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY
+        ), False
+    if len(candidate_ids) > 1:
+        return _result_conversation_copy(
+            locale, _RESULT_CONVERSATION_AMBIGUOUS_COPY
+        ), False
+    reply = response.reply
+    if (
+        not isinstance(reply, str)
+        or not reply.strip()
+        or len(reply) > 4_000
+        or "—" in reply
+        or "–" in reply
+    ):
+        return _result_conversation_failure_text(locale), False
+    if current_result_id is not None and current_result_id not in active_ids:
+        return _result_conversation_failure_text(locale), False
+    return reply.strip(), True
+
+
+def _refinement_proposal(
+    response: BotAssistantResponse,
+) -> tuple[DiscoveryCriterionChange | None, str | None]:
+    """Decode exactly one model proposal into an application domain command."""
+    action = response.proposed_action
+    if action is None:
+        if response.relaxed_criterion is not None:
+            raise ValueError("relaxed_criterion requires a refinement proposal")
+        return None, None
+    if not isinstance(action, Mapping):
+        raise TypeError("Bot Assistant action must be an object")
+    allowed_keys = {"kind", "criterion", "operation", "value", "relaxed_criterion"}
+    if any(not isinstance(key, str) or key not in allowed_keys for key in action):
+        raise ValueError("Bot Assistant action contains an unsupported field")
+    if action.get("kind") != "refine_search":
+        raise ValueError("Bot Assistant action kind is unsupported")
+    criterion = action.get("criterion")
+    operation = action.get("operation")
+    if not isinstance(criterion, str) or not criterion.strip():
+        raise ValueError("Bot Assistant refinement criterion is incomplete")
+    if not isinstance(operation, str):
+        raise ValueError("Bot Assistant refinement operation is incomplete")
+    change = DiscoveryCriterionChange(
+        criterion=criterion,
+        operation=DiscoveryCriterionChangeOperation(operation),
+        value=action.get("value"),
+    )
+    action_relaxed = action.get("relaxed_criterion")
+    if action_relaxed is not None and not isinstance(action_relaxed, str):
+        raise ValueError("Bot Assistant relaxed criterion is invalid")
+    if (
+        action_relaxed is not None
+        and response.relaxed_criterion is not None
+        and action_relaxed != response.relaxed_criterion
+    ):
+        raise ValueError("Bot Assistant refinement metadata is ambiguous")
+    relaxed_criterion = (
+        action_relaxed if action_relaxed is not None else response.relaxed_criterion
+    )
+    if relaxed_criterion is not None and not relaxed_criterion.strip():
+        raise ValueError("Bot Assistant relaxed criterion is empty")
+    return change, relaxed_criterion
+
+
+def _result_conversation_message(
+    *,
+    update_id: str,
+    state: ConversationState,
+    text: str,
+    selection: LanguageSelection | None = None,
+) -> TelegramMessage:
+    """Render one ordinary reply while keeping the persistent Menu keyboard."""
+    locale = state.locale or "en"
+    menu_label = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    if selection is not None and selection.main_menu_labels is not None:
+        menu_label = selection.main_menu_labels[3]
+    return TelegramMessage(
+        delivery_id=f"result-conversation:{update_id}",
+        telegram_user_id=state.telegram_user_id,
+        display_locale=locale,
+        screen_revision=state.screen_revision,
+        text=text,
+        button_rows=(),
+        reply_button=menu_label,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
 
 
 def _stale_result_callback_text(
@@ -14492,6 +14834,7 @@ class RuntimeApplication:
     telegram_ingestion: TelegramIngestionAdapter | None = None
     telegram_delivery: TelegramDeliveryAdapter | None = None
     model: ModelAdapter | None = None
+    assistant_model: BotAssistantModelAdapter | None = None
     location_resolver: LocationResolverAdapter | None = None
     conversation_language: ConversationLanguageAdapter | None = None
     date_interpretation: DateInterpretationAdapter | None = None
@@ -19652,6 +19995,7 @@ class RuntimeApplication:
             date_interpretation=self.date_interpretation,
             timezone_data=self.timezone_data,
             clock=self.clock,
+            assistant_model=self.assistant_model,
             telegram_admin_user_id=self.telegram_admin_user_id,
             supported_query_versions=self.versions_for(
                 ContractName.GET_COMPLETED_SEARCH

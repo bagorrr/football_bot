@@ -1,5 +1,7 @@
 """Zero-result Search behavior at the approved PostgreSQL-backed system seam."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual product copy is intentional.
+
 from __future__ import annotations
 
 import os
@@ -26,6 +28,8 @@ from modules.domain import (
 )
 from modules.testkit import (
     AcceptanceSpine,
+    BotAssistantResponse,
+    ControlledBotAssistantModelAdapter,
     ControlledDateInterpretationAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
@@ -128,6 +132,157 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
         (("New search", f"menu:new-search:{context.screen_revision}"),),
     )
     assert result_message.reply_button == "Menu"
+    system.reset()
+
+
+def test_result_turn_is_bounded_to_active_context_and_replays_once() -> None:
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_099
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="result-context-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    context = system.active_result_context(user_id)
+    assistant.return_for(
+        text="What is available?",
+        response=BotAssistantResponse(reply="No matches are available."),
+    )
+    before_messages = len(telegram.messages)
+
+    system.answer_result_message(
+        update_id="result-context-turn",
+        telegram_user_id=user_id,
+        text="What is available?",
+    )
+
+    assert len(telegram.messages) == before_messages + 1
+    assert telegram.messages[-1].text == "No matches are available."
+    assert len(assistant.requests) == 1
+    request = assistant.requests[0]
+    assert request.completed_search_id == context.completed_search_id
+    assert request.current_result is None
+    assert request.alternative_results == ()
+    assert request.external_knowledge_allowed is False
+    conversation = system.result_conversation(user_id)
+    assert [message.text for message in conversation.messages] == [
+        "What is available?",
+        "No matches are available.",
+    ]
+
+    system.answer_result_message(
+        update_id="result-context-turn",
+        telegram_user_id=user_id,
+        text="What is available?",
+    )
+    assert len(telegram.messages) == before_messages + 1
+    assert len(assistant.requests) == 1
+    assert len(system.result_conversation(user_id).messages) == 2
+    system.reset()
+
+
+def test_result_conversation_applies_one_refinement_and_replays_once() -> None:
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_100
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(
+        update_id="assistant-original-search", telegram_user_id=user_id
+    )
+    system.process_searches_until_idle()
+    original = system.completed_searches(user_id)[0]
+    assistant.return_for(
+        text="Find a defender.",
+        response=BotAssistantResponse(
+            reply="I will search for defender positions.",
+            proposed_action={
+                "kind": "refine_search",
+                "criterion": "positions",
+                "operation": "add",
+                "value": ["defender"],
+            },
+        ),
+    )
+    before_messages = len(telegram.messages)
+
+    system.answer_result_message(
+        update_id="assistant-refinement-turn",
+        telegram_user_id=user_id,
+        text="Find a defender.",
+    )
+
+    assert len(system.completed_searches(user_id)) == 1
+    assert len(telegram.messages) == before_messages + 1
+    assert telegram.messages[-1].text == "I will search for defender positions."
+    assert len(assistant.requests) == 1
+    assert system.active_result_context(user_id).completed_search_id == (
+        original.completed_search_id
+    )
+    conversation = system.result_conversation(user_id)
+    assert [message.text for message in conversation.messages] == [
+        "Find a defender.",
+        "I will search for defender positions.",
+    ]
+
+    system.process_searches_until_idle()
+
+    searches = system.completed_searches(user_id)
+    assert len(searches) == 2
+    refined = next(
+        search
+        for search in searches
+        if search.search_update_id == "assistant-refinement-turn"
+    )
+    assert refined.completed_search_id != original.completed_search_id
+    assert dict(original.game_search_details) == {}
+    assert dict(refined.game_search_details) == {"positions": ("defender",)}
+    assert system.active_result_context(user_id).completed_search_id == (
+        refined.completed_search_id
+    )
+    assert system.result_conversation(user_id).messages == ()
+    messages_after_refined_search = len(telegram.messages)
+
+    system.answer_result_message(
+        update_id="assistant-refinement-turn",
+        telegram_user_id=user_id,
+        text="Find a defender.",
+    )
+    assert len(searches) == len(system.completed_searches(user_id))
+    assert len(assistant.requests) == 1
+    assert len(telegram.messages) == messages_after_refined_search
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("locale", "question", "reply"),
+    (
+        ("en", "What is unknown?", "The current card does not state that."),
+        ("ru", "Что неизвестно?", "В текущей карточке это не указано."),
+        ("es", "¿Qué se desconoce?", "La ficha actual no lo indica."),
+        ("fr", "Qu’est-ce qui est inconnu ?", "La fiche actuelle ne l’indique pas."),
+    ),
+)
+def test_result_conversation_keeps_the_current_language(
+    locale: str, question: str, reply: str
+) -> None:
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_110 + ("en", "ru", "es", "fr").index(locale)
+    _advance_to_complete_draft(system, user_id=user_id, locale=locale)
+    system.submit_search(
+        update_id=f"language-search-{locale}", telegram_user_id=user_id
+    )
+    system.process_searches_until_idle()
+    assistant.return_for(
+        text=question,
+        response=BotAssistantResponse(reply=reply),
+    )
+
+    system.answer_result_message(
+        update_id=f"language-turn-{locale}",
+        telegram_user_id=user_id,
+        text=question,
+    )
+
+    assert assistant.requests[-1].locale == locale
+    assert telegram.messages[-1].display_locale == locale
+    assert telegram.messages[-1].text == reply
     system.reset()
 
 
@@ -1003,7 +1158,9 @@ def test_search_contract_payload_semantics_fail_closed(
     system.reset()
 
 
-def _advance_to_complete_draft(system: AcceptanceSpine, *, user_id: int) -> None:
+def _advance_to_complete_draft(
+    system: AcceptanceSpine, *, user_id: int, locale: str = "en"
+) -> None:
     system.start_bot_user(
         update_id=f"start:{user_id}",
         telegram_user_id=user_id,
@@ -1012,7 +1169,7 @@ def _advance_to_complete_draft(system: AcceptanceSpine, *, user_id: int) -> None
     system.select_fixed_language(
         update_id=f"language:{user_id}",
         telegram_user_id=user_id,
-        locale="en",
+        locale=locale,
     )
     system.select_direction(
         update_id=f"intent:{user_id}",
@@ -1115,3 +1272,44 @@ def _boot_search_system_with_clock() -> tuple[
     )
     system.reset()
     return system, telegram, clock
+
+
+def _boot_search_system_with_assistant_model() -> tuple[
+    AcceptanceSpine,
+    ControlledTelegramDeliveryAdapter,
+    ControlledBotAssistantModelAdapter,
+    FrozenClock,
+]:
+    telegram = ControlledTelegramDeliveryAdapter()
+    assistant = ControlledBotAssistantModelAdapter()
+    clock = FrozenClock(datetime(2026, 8, 8, 12, 0, tzinfo=UTC))
+    dates = ControlledDateInterpretationAdapter()
+    dates.return_for(
+        text="tomorrow",
+        resolution=DateInterpretationResolution(
+            interpretations=(
+                DateInterpretation(
+                    start_local_date=date(2026, 8, 10),
+                    end_local_date=date(2026, 8, 10),
+                    iana_timezone="Europe/Moscow",
+                ),
+            )
+        ),
+    )
+    timezones = ControlledTimezoneDataAdapter()
+    timezones.add_source(
+        version="controlled-tzdb-v1",
+        timezones=("Europe/Moscow",),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        assistant_model=assistant,
+        location_resolver=ControlledLocationResolverAdapter(),
+        date_interpretation=dates,
+        timezone_data=timezones,
+    )
+    system.reset()
+    return system, telegram, assistant, clock

@@ -29,6 +29,7 @@ from modules.domain import (
     ClassifierCircuitState,
     CompletedSearch,
     CompletedSearchView,
+    ConversationStage,
     ConversationState,
     DateInterpretationQuery,
     DateInterpretationResolution,
@@ -48,6 +49,8 @@ from modules.domain import (
     ProtectedContentSkip,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
+    ResultConversation,
+    ResultConversationMessage,
     SearchResult,
     SourceChatAdmissionProvenance,
     SourceChatAdmissionResolution,
@@ -239,6 +242,52 @@ class ModelAdapter(Protocol):
 
     def schema_smoke_test(self) -> bool:
         """Run one synthetic structured-output recovery probe."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class BotAssistantTurnRequest:
+    """Application-selected context for one direct Result Conversation turn."""
+
+    turn_id: str
+    update_id: str
+    message: str
+    locale: str
+    stage: ConversationStage
+    screen_revision: int
+    completed_search_id: str
+    current_result_id: str | None
+    current_result: dict[str, JsonValue] | None
+    alternative_results: tuple[dict[str, JsonValue], ...]
+    transcript: tuple[ResultConversationMessage, ...]
+    current_time: datetime
+    iana_timezone: str | None
+    local_date: str | None
+    timezone_data_version: str | None
+    requested_model: str
+    requested_reasoning_effort: str
+    prompt_version: str
+    response_contract_version: str
+    context_policy_version: str
+    external_knowledge_allowed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class BotAssistantResponse:
+    """Strict provider-neutral reply plus one optional proposal and references."""
+
+    reply: str
+    referenced_result_id: str | None = None
+    candidate_result_ids: tuple[str, ...] = ()
+    proposed_action: Mapping[str, JsonValue] | None = None
+    relaxed_criterion: str | None = None
+
+
+class BotAssistantModelAdapter(Protocol):
+    """Direct proposal-only model boundary for Result Conversation turns."""
+
+    def respond(self, request: BotAssistantTurnRequest) -> BotAssistantResponse:
+        """Return one bounded reply and at most one application proposal."""
         ...
 
 
@@ -561,6 +610,20 @@ class ConversationStore(Protocol):
         """Commit one clear result refinement and its RunSearch command."""
         ...
 
+    def commit_result_conversation_turn(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        completed_search_id: str,
+        user_message: str,
+        assistant_message: TelegramMessage,
+        recorded_at: datetime,
+        command: ContractEnvelope | None = None,
+    ) -> bool:
+        """Persist one protected turn and optional refinement atomically."""
+        ...
+
     def commit_source_chat_registration_request(
         self,
         *,
@@ -733,6 +796,12 @@ class ConversationStore(Protocol):
         self, telegram_user_id: int
     ) -> ActiveResultContext | None:
         """Return the latest successfully presented Completed Search."""
+        ...
+
+    def result_conversation(
+        self, telegram_user_id: int, *, as_of: datetime
+    ) -> ResultConversation | None:
+        """Return only the retained transcript for the current active Search."""
         ...
 
     def claim_conversation_message(

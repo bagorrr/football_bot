@@ -73,6 +73,7 @@ from modules.domain import (
     ProtectedContentSkip,
     RequiredDate,
     RequiredDateConfirmationEvent,
+    ResultConversation,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
@@ -96,6 +97,8 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObserver,
+    BotAssistantModelAdapter,
+    BotAssistantTurnRequest,
     ClassifierAdapterResult,
     ClassifierRequest,
     Clock,
@@ -115,6 +118,7 @@ from modules.ports import (
     TimezoneDataAdapter,
     TimezoneDataError,
 )
+from modules.ports import BotAssistantResponse as BotAssistantResponse
 from modules.timezone_data_adapter import (
     InstalledTimezoneDataAdapter,
     SourceBoundTimezoneDataAdapter,
@@ -1188,6 +1192,36 @@ class ControlledModelAdapter:
     def proposal_id(self, revision_id: str) -> str:
         """Return a stable non-authoritative proposal identity."""
         return f"proposal:{revision_id}"
+
+
+@dataclass(slots=True)
+class ControlledBotAssistantModelAdapter:
+    """Deterministic proposal-only Result Conversation adapter."""
+
+    _responses: dict[str, BotAssistantResponse] = field(default_factory=dict)
+    requests: list[BotAssistantTurnRequest] = field(default_factory=list)
+    requested_model: str = "gpt-5.6-sol"
+    requested_reasoning_effort: str = "high"
+    adapter_version: str = "result-conversation-recording-v1"
+
+    @property
+    def adapter_kind(self) -> str:
+        """Identify the isolated controlled adapter without provider access."""
+        return "controlled_recording"
+
+    def return_for(self, *, text: str, response: BotAssistantResponse) -> None:
+        """Configure one deterministic structured result-conversation response."""
+        self._responses[text] = response
+
+    def respond(self, request: BotAssistantTurnRequest) -> BotAssistantResponse:
+        """Return only configured offline output and retain the bounded request."""
+        self.requests.append(request)
+        try:
+            return self._responses[request.message]
+        except KeyError as error:
+            raise RuntimeError(
+                "controlled Result Conversation response is not configured"
+            ) from error
 
 
 def _ensure_test_proposition_evidence(
@@ -3029,6 +3063,20 @@ class AcceptanceSpine:
             relaxed_criterion=relaxed_criterion,
         )
 
+    def answer_result_message(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+    ) -> None:
+        """Drive one free-text Result Conversation turn through Bot Assistant."""
+        self._conversation_onboarding().answer_result_message(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            text=text,
+        )
+
     def open_game_search_details(
         self,
         *,
@@ -4356,6 +4404,16 @@ class AcceptanceSpine:
             raise LookupError(telegram_user_id)
         return context
 
+    def result_conversation(self, telegram_user_id: int) -> ResultConversation:
+        """Observe the retained transcript for the active Result Context."""
+        conversation = self._roles[RuntimeRole.BOT_ASSISTANT].store.result_conversation(
+            telegram_user_id,
+            as_of=self._clock.now(),
+        )
+        if conversation is None:
+            raise LookupError(telegram_user_id)
+        return conversation
+
     def read_conversation_state_as(
         self,
         *,
@@ -4399,6 +4457,7 @@ def boot_acceptance_spine(
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
+    assistant_model: BotAssistantModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
@@ -4439,6 +4498,7 @@ def boot_acceptance_spine(
     controlled_ingestion = telegram_ingestion or ControlledTelegramIngestionAdapter()
     controlled_delivery = telegram_delivery or ControlledTelegramDeliveryAdapter()
     controlled_model = model or ControlledModelAdapter()
+    controlled_assistant_model = assistant_model or ControlledBotAssistantModelAdapter()
     controlled_resolver = location_resolver or ControlledLocationResolverAdapter()
     controlled_conversation_language = (
         conversation_language or ControlledConversationLanguageAdapter()
@@ -4463,6 +4523,11 @@ def boot_acceptance_spine(
                 controlled_delivery if role is RuntimeRole.BOT_ASSISTANT else None
             ),
             model=controlled_model if role is RuntimeRole.CLASSIFICATION else None,
+            assistant_model=(
+                controlled_assistant_model
+                if role is RuntimeRole.BOT_ASSISTANT
+                else None
+            ),
             location_resolver=(
                 controlled_resolver
                 if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
@@ -4506,6 +4571,7 @@ def boot_legacy_acceptance_spine(
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
+    assistant_model: BotAssistantModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
@@ -4520,6 +4586,7 @@ def boot_legacy_acceptance_spine(
         telegram_ingestion=telegram_ingestion,
         telegram_delivery=telegram_delivery,
         model=model,
+        assistant_model=assistant_model,
         location_resolver=location_resolver,
         conversation_language=conversation_language,
         date_interpretation=date_interpretation,
@@ -4559,6 +4626,7 @@ def _conversation_onboarding_for_role(
         date_interpretation=role.date_interpretation,
         timezone_data=role.timezone_data,
         clock=role.clock,
+        assistant_model=role.assistant_model,
         telegram_admin_user_id=role.telegram_admin_user_id,
         supported_query_versions=role.versions_for(ContractName.GET_COMPLETED_SEARCH),
     )

@@ -3793,6 +3793,31 @@ class ActiveResultContext:
     screen_revision: int
 
 
+class ResultConversationMessageRole(StrEnum):
+    """Speaker identity for one protected Result Conversation message."""
+
+    USER = "user"
+    ASSISTANT = "assistant"
+
+
+@dataclass(frozen=True, slots=True)
+class ResultConversationMessage:
+    """One protected Bot User or Bot Assistant result-conversation message."""
+
+    role: ResultConversationMessageRole
+    text: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ResultConversation:
+    """The retained transcript for the one active Completed Search."""
+
+    telegram_user_id: int
+    completed_search_id: str
+    messages: tuple[ResultConversationMessage, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramDeliveryClaim:
     """One durable delivery claim and its safe external operation."""
