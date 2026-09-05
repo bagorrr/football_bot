@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from modules.application import _tournament_result_message
 from modules.domain import SearchResult
 from modules.postgres_adapter import _result_card_facts_with_current_publication_state
@@ -278,6 +280,62 @@ def test_tournament_projection_with_missing_route_fails_closed() -> None:
     overlaid = _result_card_facts_with_current_publication_state(
         dict(_result().card_facts),
         _current_projection(response_route_value=None),
+        as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_kind" not in overlaid
+    assert "response_route_value" not in overlaid
+
+
+@pytest.mark.parametrize(
+    ("opportunity_type", "response_route_kind", "response_route_value"),
+    (
+        ("open_match", "unsupported_route_kind", "@open_match_contact"),
+        ("opponent_request", "unsupported_route_kind", "@opponent_contact"),
+        ("roster_vacancy", "unsupported_route_kind", "@transfer_contact"),
+        (
+            "player_transfer_availability",
+            "unsupported_route_kind",
+            "@transfer_player_contact",
+        ),
+        ("coach_availability", "unsupported_route_kind", "@coach_contact"),
+        ("open_match", "explicit_telegram_username", " "),
+        ("opponent_request", "explicit_telegram_username", " "),
+        ("roster_vacancy", "explicit_telegram_username", " "),
+        ("player_transfer_availability", "explicit_telegram_username", " "),
+        ("coach_availability", "explicit_telegram_username", " "),
+    ),
+)
+def test_active_result_projection_requires_renderable_response_route(
+    opportunity_type: str,
+    response_route_kind: str,
+    response_route_value: str,
+) -> None:
+    current_facts: dict[str, object] = {
+        "source_qualifying_assertion_at": "2026-08-01T09:00:00+00:00",
+    }
+    if opportunity_type in {"open_match", "opponent_request"}:
+        current_facts.update(
+            {
+                "start_local_date": "2026-08-20",
+                "end_local_date": "2026-08-20",
+                "iana_timezone": "Europe/Moscow",
+            }
+        )
+    overlaid = _result_card_facts_with_current_publication_state(
+        {
+            "opportunity_id": f"opportunity:{opportunity_type}:route",
+            "opportunity_type": opportunity_type,
+            "publication_state": "active",
+        },
+        {
+            "opportunity_revision_id": f"revision:{opportunity_type}:route",
+            "publication_state": "active",
+            "current_facts": current_facts,
+            "response_route_kind": response_route_kind,
+            "response_route_value": response_route_value,
+        },
         as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
     )
 

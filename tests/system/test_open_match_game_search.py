@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from threading import Event
+from uuid import NAMESPACE_URL, uuid5
 
 import psycopg
 import pytest
@@ -70,18 +71,52 @@ class _FreeTextFallbackLanguageAdapter(ControlledConversationLanguageAdapter):
         return super().render(locale)
 
 
+class _FailingResultLanguageAdapter(ControlledConversationLanguageAdapter):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+        self._fail_next_render = False
+
+    def fail_next_render(self) -> None:
+        self._fail_next_render = True
+
+    def render(self, locale: str) -> LanguageSelection | None:
+        self._events.append("render")
+        if self._fail_next_render:
+            self._fail_next_render = False
+            raise RuntimeError("controlled result rendering failed")
+        return super().render(locale)
+
+
+class _OrderedCallbackTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def answer_callback(self, *, callback_id: str, text: str) -> None:
+        self._events.append("answer-callback")
+        super().answer_callback(callback_id=callback_id, text=text)
+
+
 class _BlockingResultEditTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
     def __init__(self) -> None:
         super().__init__()
         self.edit_started = Event()
         self.release_edit = Event()
         self._block_next_edit = False
+        self.send_started = Event()
+        self.release_send = Event()
+        self._block_next_send = False
         self._fail_next_edit = False
         self._return_unknown_edit_reconciliation = False
         self.fail_deletions = False
+        self.sent_message_ids: list[tuple[TelegramMessage, str]] = []
 
     def block_next_edit(self) -> None:
         self._block_next_edit = True
+
+    def block_next_send(self) -> None:
+        self._block_next_send = True
 
     def fail_next_edit(self) -> None:
         self._fail_next_edit = True
@@ -102,6 +137,16 @@ class _BlockingResultEditTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapt
             telegram_message_id=telegram_message_id,
             message=message,
         )
+
+    def send(self, message: TelegramMessage) -> str:
+        if self._block_next_send:
+            self._block_next_send = False
+            self.send_started.set()
+            if not self.release_send.wait(timeout=2):
+                raise TimeoutError("controlled Telegram send was not released")
+        telegram_message_id = super().send(message)
+        self.sent_message_ids.append((message, telegram_message_id))
+        return telegram_message_id
 
     def reconcile_edit(
         self, *, telegram_message_id: str, message: TelegramMessage
@@ -170,6 +215,269 @@ def test_result_callback_without_conversation_state_is_acknowledged() -> None:
     assert telegram_delivery.callback_notifications == [
         ("callback-orphan-result-callback", "Updated.")
     ]
+
+
+def test_foreign_result_callback_ack_precedes_dynamic_language_rendering() -> None:
+    events: list[str] = []
+    telegram_delivery = _OrderedCallbackTelegramDeliveryAdapter(events)
+    conversation_language = _FailingResultLanguageAdapter(events)
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        conversation_language=conversation_language,
+    )
+    system.reset()
+    telegram_user_id = 65_004
+
+    system.start_bot_user(
+        update_id="dynamic-result-language-start",
+        telegram_user_id=telegram_user_id,
+        telegram_language_hint=None,
+    )
+    system.open_language_input(
+        update_id="dynamic-result-language-input",
+        telegram_user_id=telegram_user_id,
+        screen_revision=system.conversation_state(telegram_user_id).screen_revision,
+    )
+    system.submit_language_text(
+        update_id="dynamic-result-language-submit",
+        telegram_user_id=telegram_user_id,
+        text="Deutsch",
+        screen_revision=system.conversation_state(telegram_user_id).screen_revision,
+    )
+    events.clear()
+    conversation_language.fail_next_render()
+
+    system.select_result_action(
+        update_id="dynamic-result-language-callback",
+        callback_id="callback-dynamic-result-language",
+        telegram_user_id=telegram_user_id,
+        action="next",
+        screen_revision=system.conversation_state(telegram_user_id).screen_revision,
+        context_token="stale-result-context",
+        target_position=2,
+        telegram_message_id=system.active_conversation_view(
+            telegram_user_id
+        ).telegram_message_id,
+    )
+
+    assert events == ["answer-callback"]
+    assert telegram_delivery.callback_notifications == [
+        (
+            "callback-dynamic-result-language",
+            "This screen is stale. Open results through Menu.",
+        )
+    ]
+
+
+def test_accepted_result_callback_ack_precedes_dynamic_language_rendering_failure() -> (
+    None
+):
+    events: list[str] = []
+    telegram_delivery = _OrderedCallbackTelegramDeliveryAdapter(events)
+    conversation_language = _FailingResultLanguageAdapter(events)
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        conversation_language=conversation_language,
+    )
+    system.reset()
+    telegram_user_id = 65_005
+    system.start_bot_user(
+        update_id="accepted-dynamic-language-start",
+        telegram_user_id=telegram_user_id,
+        telegram_language_hint="en",
+    )
+    active_view = system.active_conversation_view(telegram_user_id)
+    completed_search_id = "completed-search:accepted-dynamic-language"
+    context_token = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:active-result-context:{telegram_user_id}:{completed_search_id}",
+    ).hex
+    recorded_at = datetime(2026, 7, 18, 9, 0, tzinfo=UTC)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.bot_users
+            SET locale = 'de', locale_source = 'explicit', stage = 'results',
+                screen_revision = 2, revision = revision + 1, updated_at = %s
+            WHERE telegram_user_id = %s
+            """,
+            (recorded_at, telegram_user_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_active_result_contexts (
+                telegram_user_id, completed_search_id, current_result_id,
+                absolute_position, screen_revision, activated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                telegram_user_id,
+                completed_search_id,
+                "result:accepted-dynamic-language:1",
+                1,
+                2,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.bot_active_chat_views
+            SET screen_revision = 2, delivery_id = %s, activated_at = %s
+            WHERE telegram_user_id = %s
+            """,
+            ("result-current:accepted-dynamic-language", recorded_at, telegram_user_id),
+        )
+    events.clear()
+    conversation_language.fail_next_render()
+
+    with pytest.raises(RuntimeError, match="controlled result rendering failed"):
+        system.select_result_action(
+            update_id="accepted-dynamic-language-callback",
+            callback_id="callback-accepted-dynamic-language",
+            telegram_user_id=telegram_user_id,
+            action="next",
+            screen_revision=2,
+            context_token=context_token,
+            target_position=2,
+            telegram_message_id=active_view.telegram_message_id,
+        )
+
+    assert events == ["answer-callback", "render"]
+    assert telegram_delivery.callback_notifications == [
+        ("callback-accepted-dynamic-language", "Updated.")
+    ]
+
+
+def test_superseded_result_replacement_send_is_cleaned_after_late_delivery() -> None:
+    telegram_delivery = _BlockingResultEditTelegramDeliveryAdapter()
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+    telegram_user_id = 65_006
+    system.start_bot_user(
+        update_id="replacement-send-race-start",
+        telegram_user_id=telegram_user_id,
+        telegram_language_hint="en",
+    )
+    current = system.conversation_state(telegram_user_id)
+    active_view = system.active_conversation_view(telegram_user_id)
+    assert active_view is not None
+    completed_search_id = "completed-search:replacement-send-race"
+    result_navigation_delivery_id = "result-navigation:replacement-send-race"
+    replacement_delivery_id = f"result-replacement:{result_navigation_delivery_id}"
+    current_result_id = "result:replacement-send-race:1"
+    recorded_at = datetime(2026, 7, 18, 9, 0, tzinfo=UTC)
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.bot_users
+            SET stage = 'results', screen_revision = 2,
+                revision = revision + 1, updated_at = %s
+            WHERE telegram_user_id = %s
+            """,
+            (recorded_at, telegram_user_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_active_result_contexts (
+                telegram_user_id, completed_search_id, current_result_id,
+                absolute_position, screen_revision, activated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                telegram_user_id,
+                completed_search_id,
+                current_result_id,
+                1,
+                2,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.bot_active_chat_views
+            SET screen_revision = 2, delivery_id = %s, activated_at = %s
+            WHERE telegram_user_id = %s
+            """,
+            ("result-current:replacement-send-race", recorded_at, telegram_user_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_message_outbox (
+                delivery_id, telegram_user_id, display_locale, screen_revision,
+                message_text, button_rows, reply_button, reply_keyboard_action,
+                telegram_message_id, delivery_status, outcome_unknown_at,
+                recorded_at
+            ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                result_navigation_delivery_id,
+                telegram_user_id,
+                current.locale or "en",
+                2,
+                "Late replacement",
+                json.dumps([]),
+                None,
+                "remove",
+                active_view.telegram_message_id,
+                "outcome_unknown",
+                recorded_at,
+                recorded_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_search_presentations (
+                delivery_id, telegram_user_id, completed_search_id,
+                current_result_id, absolute_position, accepted_at
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                result_navigation_delivery_id,
+                telegram_user_id,
+                completed_search_id,
+                current_result_id,
+                1,
+                recorded_at,
+            ),
+        )
+
+    telegram_delivery.lose_next_edit_reconciliation()
+    assert system.retry_bot_presentations() is False
+    telegram_delivery.block_next_send()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        inflight = executor.submit(system.retry_bot_presentations)
+        assert telegram_delivery.send_started.wait(timeout=2)
+        winning_context = system.active_result_context(telegram_user_id)
+        assert winning_context is not None
+        system.open_main_menu(
+            update_id="menu-during-replacement-send-race",
+            telegram_user_id=telegram_user_id,
+        )
+        winning_view = system.active_conversation_view(telegram_user_id)
+        assert winning_view.delivery_id == ("menu:menu-during-replacement-send-race")
+        telegram_delivery.release_send.set()
+        assert inflight.result() is True
+
+    late_message, late_message_id = next(
+        (
+            message,
+            message_id,
+        )
+        for message, message_id in telegram_delivery.sent_message_ids
+        if message.delivery_id == replacement_delivery_id
+    )
+    assert late_message.delivery_id != winning_view.delivery_id
+    assert (telegram_user_id, late_message_id) in telegram_delivery.deletion_attempts
+    assert system.active_result_context(telegram_user_id) == winning_context
+    assert system.active_conversation_view(telegram_user_id) == winning_view
 
 
 def test_result_callback_ack_is_not_blocked_by_older_failed_callback() -> None:
@@ -4816,7 +5124,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     )
     assert telegram_delivery.callback_notifications[-1] == (
         "callback-foreign-dynamic-result-language",
-        "Dieser Bildschirm ist veraltet. Öffnen Sie Ergebnisse über Menü.",
+        "This screen is stale. Open results through Menu.",
     )
     assert telegram_delivery.messages[-1].text == dynamic_message.text
     system.retry_bot_presentations()
@@ -4841,7 +5149,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
         )
     assert (
         "callback-failed-previous-active-result-context",
-        "Aktualisiert.",
+        "Updated.",
     ) in telegram_delivery.callback_notifications
     assert system.active_result_context(user_id).absolute_position == 2
     telegram_delivery.fail_next()

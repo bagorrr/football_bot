@@ -119,10 +119,10 @@ from modules.domain import (
     opportunity_freshness_is_current,
     opportunity_publication_state_as_of,
     referee_publication_state_as_of,
-    render_response_route,
     source_publisher_id_from_metadata,
     telegram_moderation_triggers,
     tournament_publication_state_as_of,
+    usable_response_route,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -11663,6 +11663,37 @@ class PostgresRoleStore:
                             delivered_at,
                         ),
                     )
+            elif not is_edit:
+                previous_view = connection.execute(
+                    """
+                    SELECT delivery_id
+                    FROM football_runtime.bot_active_chat_views
+                    WHERE telegram_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+                replacement_delivery_id = (
+                    previous_view[0]
+                    if previous_view is not None and previous_view[0] != delivery_id
+                    else f"superseded:{delivery_id}"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_old_chat_views (
+                        delivery_id, telegram_user_id, telegram_message_id,
+                        replacement_delivery_id, classified_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (delivery_id) DO NOTHING
+                    """,
+                    (
+                        delivery_id,
+                        telegram_user_id,
+                        telegram_message_id,
+                        replacement_delivery_id,
+                        delivered_at,
+                    ),
+                )
 
     def claim_old_chat_view_cleanup(
         self,
@@ -11855,28 +11886,12 @@ def _result_card_facts_with_current_publication_state(
             "publication_state": publication_state,
         }
         _overlay_current_result_projection(result, current_projection)
+        route = _current_result_response_route(current_projection)
+        if publication_state == "active" and route is None:
+            publication_state = "suppressed"
         if publication_state == "active":
-            assert current_projection is not None
-            route_kind = current_projection.get("response_route_kind")
-            route_value = current_projection.get("response_route_value")
-            if (
-                not isinstance(route_kind, str)
-                or not route_kind
-                or not isinstance(route_value, str)
-                or not route_value
-            ):
-                publication_state = "suppressed"
-            else:
-                try:
-                    render_response_route(route_kind, route_value, "en")
-                except ValueError:
-                    publication_state = "suppressed"
-            if publication_state == "active":
-                result["response_route_kind"] = route_kind
-                result["response_route_value"] = route_value
-            else:
-                result.pop("response_route_kind", None)
-                result.pop("response_route_value", None)
+            assert route is not None
+            result["response_route_kind"], result["response_route_value"] = route
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
@@ -11905,19 +11920,16 @@ def _result_card_facts_with_current_publication_state(
             "publication_state": publication_state,
         }
         _overlay_current_result_projection(result, current_projection)
+        route = _current_result_response_route(current_projection)
+        if publication_state == "active" and route is None:
+            publication_state = "suppressed"
         if publication_state == "active":
-            assert current_projection is not None
-            route_kind = current_projection.get("response_route_kind")
-            route_value = current_projection.get("response_route_value")
-            if isinstance(route_kind, str) and isinstance(route_value, str):
-                result["response_route_kind"] = route_kind
-                result["response_route_value"] = route_value
-            else:
-                result.pop("response_route_kind", None)
-                result.pop("response_route_value", None)
+            assert route is not None
+            result["response_route_kind"], result["response_route_value"] = route
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
+        result["publication_state"] = publication_state
         return result
     if opportunity_type in {"referee_availability", "referee_request"}:
         current_facts = (
@@ -11952,35 +11964,13 @@ def _result_card_facts_with_current_publication_state(
                 result[timestamp_key] = current_timestamp
             else:
                 result.pop(timestamp_key, None)
-        route_kind = (
-            current_projection.get("response_route_kind")
-            if current_projection is not None
-            else None
-        )
-        route_value = (
-            current_projection.get("response_route_value")
-            if current_projection is not None
-            else None
-        )
-        if publication_state == "active":
-            if (
-                not isinstance(route_kind, str)
-                or not route_kind
-                or not isinstance(route_value, str)
-                or not route_value
-            ):
-                publication_state = "suppressed"
-            else:
-                try:
-                    render_response_route(route_kind, route_value, "en")
-                except ValueError:
-                    publication_state = "suppressed"
+        route = _current_result_response_route(current_projection)
+        if publication_state == "active" and route is None:
+            publication_state = "suppressed"
         result["publication_state"] = publication_state
         if publication_state == "active":
-            assert isinstance(route_kind, str)
-            assert isinstance(route_value, str)
-            result["response_route_kind"] = route_kind
-            result["response_route_value"] = route_value
+            assert route is not None
+            result["response_route_kind"], result["response_route_value"] = route
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
@@ -12010,25 +12000,31 @@ def _result_card_facts_with_current_publication_state(
     )
     result = {**card_facts, "publication_state": publication_state}
     _overlay_current_result_projection(result, current_projection)
-    route_kind = current_projection.get("response_route_kind")
-    route_value = current_projection.get("response_route_value")
-    if publication_state == "active" and (
-        not isinstance(route_kind, str)
-        or not route_kind
-        or not isinstance(route_value, str)
-        or not route_value
-    ):
+    route = _current_result_response_route(current_projection)
+    if publication_state == "active" and route is None:
         publication_state = "suppressed"
     result["publication_state"] = publication_state
     if publication_state == "active":
-        assert isinstance(route_kind, str)
-        assert isinstance(route_value, str)
-        result["response_route_kind"] = route_kind
-        result["response_route_value"] = route_value
+        assert route is not None
+        result["response_route_kind"], result["response_route_value"] = route
     else:
         result.pop("response_route_kind", None)
         result.pop("response_route_value", None)
     return result
+
+
+def _current_result_response_route(
+    current_projection: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return the current projection's route only when it is renderable."""
+    if current_projection is None:
+        return None
+    return usable_response_route(
+        {
+            "kind": current_projection.get("response_route_kind"),
+            "value": current_projection.get("response_route_value"),
+        }
+    )
 
 
 def _overlay_current_result_projection(

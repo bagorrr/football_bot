@@ -2461,30 +2461,25 @@ class ConversationOnboarding:
             elif not callback_matches_current_view:
                 if not same_context or current.stage is not ConversationStage.RESULTS:
                     foreign_message_id_to_cleanup = telegram_message_id
-                    selection = self._language_rendering(current.locale or "en")
                     self._acknowledge_result_callback(
                         update_id=update_id,
                         callback_id=callback_id,
                         telegram_user_id=telegram_user_id,
                         current=current,
-                        text=_stale_result_callback_text(
-                            current.locale or "en", selection=selection
-                        ),
+                        text=_stale_result_callback_text(current.locale or "en"),
                     )
                     self._queue_current_view(
                         update_id=f"result-stale-view:{update_id}", state=current
                     )
                 else:
-                    selection = self._language_rendering(current.locale or "en")
                     self._acknowledge_result_callback(
                         update_id=update_id,
                         callback_id=callback_id,
                         telegram_user_id=telegram_user_id,
                         current=current,
-                        text=_stale_result_callback_text(
-                            current.locale or "en", selection=selection
-                        ),
+                        text=_stale_result_callback_text(current.locale or "en"),
                     )
+                    selection = self._language_rendering(current.locale or "en")
                     message = self._render_active_result_view(
                         delivery_id=f"result-stale-view:{update_id}",
                         state=current,
@@ -2515,7 +2510,6 @@ class ConversationOnboarding:
                     text=None,
                 )
             else:
-                selection = self._language_rendering(current.locale or "en")
                 self._acknowledge_result_callback(
                     update_id=update_id,
                     callback_id=callback_id,
@@ -2523,6 +2517,7 @@ class ConversationOnboarding:
                     current=current,
                     text=None,
                 )
+                selection = self._language_rendering(current.locale or "en")
                 query_result = self._store.get_completed_search(
                     GetCompletedSearch.request_id(context.completed_search_id),
                     supported_versions=self._supported_query_versions,
@@ -2637,14 +2632,7 @@ class ConversationOnboarding:
             callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             expected_revision=current.revision if current is not None else None,
-            text=(
-                _result_callback_ack_text(
-                    locale,
-                    selection=self._language_rendering(locale),
-                )
-                if text is None
-                else text
-            ),
+            text=_result_callback_ack_text(locale) if text is None else text,
             recorded_at=self._clock.now(),
         )
 
@@ -9976,33 +9964,17 @@ def _result_context_token(telegram_user_id: int, completed_search_id: str) -> st
     ).hex
 
 
-def _stale_result_callback_text(
-    locale: str, *, selection: LanguageSelection | None = None
-) -> str:
+def _stale_result_callback_text(locale: str) -> str:
     """Return the localized notification for a callback from another result view."""
     if locale in SUPPORTED_LOCALES:
         return _STALE_RESULT_CALLBACK_COPY[locale]
-    if (
-        selection is not None
-        and isinstance(selection.result_stale_callback_text, str)
-        and selection.result_stale_callback_text
-    ):
-        return selection.result_stale_callback_text
     return _STALE_RESULT_CALLBACK_COPY["en"]
 
 
-def _result_callback_ack_text(
-    locale: str, *, selection: LanguageSelection | None = None
-) -> str:
+def _result_callback_ack_text(locale: str) -> str:
     """Return the localized acknowledgement for one result callback."""
     if locale in SUPPORTED_LOCALES:
         return _RESULT_CALLBACK_ACK_COPY[locale]
-    if (
-        selection is not None
-        and isinstance(selection.result_callback_ack, str)
-        and selection.result_callback_ack
-    ):
-        return selection.result_callback_ack
     return _RESULT_CALLBACK_ACK_COPY["en"]
 
 
