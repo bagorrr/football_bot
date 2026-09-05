@@ -856,6 +856,8 @@ class ControlledTelegramDeliveryAdapter:
 
     presentations: list[str] = field(default_factory=list)
     messages: list[TelegramMessage] = field(default_factory=list)
+    edits: list[tuple[str, TelegramMessage]] = field(default_factory=list)
+    events: list[tuple[str, str]] = field(default_factory=list)
     inline_action_removals: list[tuple[int, str]] = field(default_factory=list)
     typing_actions: list[int] = field(default_factory=list)
     deletion_attempts: list[tuple[int, str]] = field(default_factory=list)
@@ -868,6 +870,7 @@ class ControlledTelegramDeliveryAdapter:
     _delivery_ledger: dict[str, tuple[TelegramMessage, str]] = field(
         default_factory=dict
     )
+    _edit_ledger: dict[str, tuple[TelegramMessage, str]] = field(default_factory=dict)
     _callback_ledger: dict[str, str] = field(default_factory=dict)
 
     def fail_next(self) -> None:
@@ -927,10 +930,48 @@ class ControlledTelegramDeliveryAdapter:
             raise ValueError("delivery ID was reused for a different message")
         return telegram_message_id
 
+    def edit(self, *, telegram_message_id: str, message: TelegramMessage) -> str:
+        """Idempotently record one in-place edit with the same message identity."""
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise InjectedTelegramDeliveryError
+        recorded = self._edit_ledger.get(message.delivery_id)
+        if recorded is not None:
+            recorded_message, recorded_message_id = recorded
+            if (
+                recorded_message != message
+                or recorded_message_id != telegram_message_id
+            ):
+                raise ValueError("edit delivery ID was reused for a different message")
+            return recorded_message_id
+        self.edits.append((telegram_message_id, message))
+        self.events.append(("edit", telegram_message_id))
+        self._edit_ledger[message.delivery_id] = (message, telegram_message_id)
+        if self.interruptions_after_effect_remaining:
+            self.interruptions_after_effect_remaining -= 1
+            raise InjectedTelegramDeliveryInterruptionError
+        if self.lost_confirmations_remaining:
+            self.lost_confirmations_remaining -= 1
+            raise TelegramDeliveryOutcomeUnknownError
+        return telegram_message_id
+
+    def reconcile_edit(
+        self, *, telegram_message_id: str, message: TelegramMessage
+    ) -> str | None:
+        """Return the known identity of one accepted in-place edit."""
+        recorded = self._edit_ledger.get(message.delivery_id)
+        if recorded is None:
+            return None
+        recorded_message, recorded_message_id = recorded
+        if recorded_message != message or recorded_message_id != telegram_message_id:
+            raise ValueError("edit delivery ID was reused for a different message")
+        return recorded_message_id
+
     def remove_inline_actions(
         self, *, telegram_user_id: int, telegram_message_id: str
     ) -> None:
         """Record one idempotent removal of an existing inline keyboard."""
+        self.events.append(("remove-inline-actions", telegram_message_id))
         action = (telegram_user_id, telegram_message_id)
         if action not in self.inline_action_removals:
             self.inline_action_removals.append(action)
@@ -958,6 +999,7 @@ class ControlledTelegramDeliveryAdapter:
             if recorded_text != text:
                 raise ValueError("callback ID was reused for different text")
             return
+        self.events.append(("answer-callback", callback_id))
         self._callback_ledger[callback_id] = text
         self.callback_notifications.append((callback_id, text))
         if self.callback_interruptions_after_effect_remaining:
@@ -2012,6 +2054,14 @@ class ControlledConversationLanguageAdapter:
                 "das konfigurierte Konto bereits Zugriff hat, und versuchen Sie es "
                 "erneut."
             ),
+            result_navigation_copy=(
+                "**Ergebnis {position} von {total}**",
+                "Weitere Optionen finden Sie über die Pfeile unten.",
+            ),
+            result_stale_callback_text=(
+                "Dieser Bildschirm ist veraltet. Öffnen Sie Ergebnisse über Menü."
+            ),
+            result_callback_ack="Aktualisiert.",
         )
 
 
@@ -3735,6 +3785,30 @@ class AcceptanceSpine:
             ),
         )
 
+    def select_result_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+        context_token: str,
+        target_position: int,
+        telegram_message_id: str,
+        callback_id: str | None = None,
+    ) -> None:
+        """Drive one opaque result-pagination callback through Bot Assistant."""
+        self._conversation_onboarding().select_result_action(
+            update_id=update_id,
+            callback_id=callback_id or update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=screen_revision,
+            context_token=context_token,
+            target_position=target_position,
+            telegram_message_id=telegram_message_id,
+        )
+
     def select_settings_action(
         self,
         *,
@@ -3955,7 +4029,15 @@ class AcceptanceSpine:
         """Persist an account-language change before current-screen re-rendering."""
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
         current = self.conversation_state(telegram_user_id)
-        draft = self.discovery_draft(telegram_user_id)
+        draft = role.store.discovery_draft(telegram_user_id)
+        selection = _conversation_language(role).render(locale)
+        if selection is not None and selection.locale != locale:
+            raise RuntimeError("controlled language change rendered another locale")
+        result_context = (
+            role.store.active_result_context(telegram_user_id)
+            if current.stage is ConversationStage.RESULTS
+            else None
+        )
         now = role.clock.now()
         state = replace(
             current,
@@ -3963,12 +4045,30 @@ class AcceptanceSpine:
             locale_source=LocaleSource.EXPLICIT,
             screen_revision=current.screen_revision + 1,
             revision=current.revision + 1,
+            result_stale_callback_text=(
+                selection.result_stale_callback_text
+                if selection is not None
+                and isinstance(selection.result_stale_callback_text, str)
+                and selection.result_stale_callback_text
+                else None
+            ),
+            result_callback_ack=(
+                selection.result_callback_ack
+                if selection is not None
+                and isinstance(selection.result_callback_ack, str)
+                and selection.result_callback_ack
+                else None
+            ),
         )
-        changed_draft = replace(
-            draft,
-            screen_revision=state.screen_revision,
-            revision=draft.revision + 1,
-            last_activity_at=now,
+        changed_draft = (
+            None
+            if draft is None
+            else replace(
+                draft,
+                screen_revision=state.screen_revision,
+                revision=draft.revision + 1,
+                last_activity_at=now,
+            )
         )
         committed = role.store.commit_conversation_update(
             update_id=update_id,
@@ -3984,6 +4084,12 @@ class AcceptanceSpine:
             ),
             recorded_at=now,
             draft=changed_draft,
+            result_context=(
+                result_context
+                if result_context is not None
+                and result_context.current_result_id is not None
+                else None
+            ),
         )
         if not committed:
             raise RuntimeError("controlled language change was replayed")

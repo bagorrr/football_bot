@@ -467,6 +467,8 @@ class TelegramDeliveryMode(StrEnum):
 
     SEND = "send"
     RECONCILE = "reconcile"
+    EDIT = "edit"
+    RECONCILE_EDIT = "reconcile_edit"
 
 
 class TelegramPeerKind(StrEnum):
@@ -1016,6 +1018,8 @@ class ConversationState:
     stage: ConversationStage
     screen_revision: int
     revision: int
+    result_stale_callback_text: str | None = None
+    result_callback_ack: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2039,15 +2043,13 @@ def evaluate_opponent_search(
         if opportunity.opportunity_type != "opponent_request":
             continue
         facts = opportunity.accepted_facts
-        if (
-            opportunity_publication_state_as_of(
-                facts,
-                opportunity_type=opportunity.opportunity_type,
-                current_publication_state=opportunity.publication_state,
-                as_of=completed_search.completed_at,
-            )
-            != "active"
-        ):
+        publication_state = opportunity_publication_state_as_of(
+            facts,
+            opportunity_type=opportunity.opportunity_type,
+            current_publication_state=opportunity.publication_state,
+            as_of=completed_search.completed_at,
+        )
+        if publication_state != "active":
             continue
         if facts.get("opponent_request") is not True:
             continue
@@ -2113,6 +2115,7 @@ def evaluate_opponent_search(
             "opportunity_revision_id": opportunity.opportunity_revision_id,
             "opportunity_type": "opponent_request",
             "opponent_request": "true",
+            "publication_state": publication_state,
             "start_local_date": str(facts["start_local_date"]),
             "end_local_date": str(facts["end_local_date"]),
             "sort_local_date": max(start, required.start_local_date).isoformat(),
@@ -3796,6 +3799,7 @@ class TelegramDeliveryClaim:
 
     message: TelegramMessage
     mode: TelegramDeliveryMode
+    telegram_message_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3862,3 +3866,6 @@ class LanguageSelection:
     source_chat_pending_text: str | None = None
     source_chat_registered_text: str | None = None
     source_chat_failed_text: str | None = None
+    result_navigation_copy: tuple[str, str] | None = None
+    result_stale_callback_text: str | None = None
+    result_callback_ack: str | None = None

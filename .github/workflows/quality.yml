@@ -13,7 +13,7 @@ jobs:
   quality_shards:
     name: quality / ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.shard == 'classification-routing-and-player-match' && 25 || 15 }}
     strategy:
       fail-fast: false
       matrix:

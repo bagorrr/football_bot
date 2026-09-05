@@ -587,7 +587,7 @@ def test_unclassified_send_failure_defaults_to_unknown_without_resend() -> None:
     )
 
 
-def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
+def test_superseded_unknown_delivery_is_not_reconciled() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     clock = _AdjustableClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
     system = boot_legacy_acceptance_spine(
@@ -618,13 +618,13 @@ def test_superseded_unknown_delivery_reconciles_without_reactivation() -> None:
     clock.advance(timedelta(minutes=5))
     system.restart(RuntimeRole.BOT_ASSISTANT)
 
-    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
     assert system.retry_bot_presentations() is False
     assert len(telegram_delivery.messages) == 3
     assert system.active_conversation_view(user_id) == winning_view
 
 
-def test_current_screen_precedes_superseded_reconciliation() -> None:
+def test_current_screen_remains_after_superseded_delivery() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
@@ -657,7 +657,7 @@ def test_current_screen_precedes_superseded_reconciliation() -> None:
     )
     assert len(telegram_delivery.messages) == 3
 
-    assert system.retry_bot_presentations() is True
+    assert system.retry_bot_presentations() is False
     assert system.retry_bot_presentations() is False
     assert system.active_conversation_view(user_id) == winning_view
 
@@ -1108,6 +1108,22 @@ def test_application_accepts_recognized_free_text_language_catalog_entries(
     assert system.conversation_state(user_id).locale == locale
     assert system.conversation_state(user_id).locale_source is LocaleSource.EXPLICIT
     assert telegram_delivery.messages[-1].display_locale == locale
+
+    state = system.conversation_state(user_id)
+    system.select_result_action(
+        update_id=f"stale-result-{locale}",
+        callback_id=f"callback-stale-result-{locale}",
+        telegram_user_id=user_id,
+        action="next",
+        screen_revision=state.screen_revision,
+        context_token="missing-result-context",
+        target_position=2,
+        telegram_message_id="telegram:foreign-result",
+    )
+    assert telegram_delivery.callback_notifications[-1] == (
+        f"callback-stale-result-{locale}",
+        "This screen is stale. Open results through Menu.",
+    )
 
 
 class _CountingAmbiguousLanguageAdapter:

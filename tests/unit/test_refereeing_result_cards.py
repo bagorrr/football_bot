@@ -150,6 +150,31 @@ def test_non_active_referee_result_is_unavailable_without_contact(
     assert "@referee_contact" not in message.text
 
 
+def test_referee_result_with_missing_publication_state_is_unavailable() -> None:
+    result = _result()
+    facts = dict(result.card_facts)
+    del facts["publication_state"]
+    result = SearchResult(
+        result_id=result.result_id,
+        completed_search_id=result.completed_search_id,
+        absolute_position=result.absolute_position,
+        result_class=result.result_class,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _refereeing_result_message(
+        delivery_id="delivery:referee-missing-publication-state",
+        telegram_user_id=49_100,
+        locale="en",
+        screen_revision=2,
+        result=result,
+    )
+
+    assert "Unavailable" in message.text
+    assert "Contact" not in message.text
+    assert "@referee_contact" not in message.text
+
+
 def test_referee_result_card_covers_all_conversation_languages() -> None:
     expected_titles = {
         "en": "⚖️ Referee Availability",

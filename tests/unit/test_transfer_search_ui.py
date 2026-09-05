@@ -76,6 +76,41 @@ def test_new_team_transfer_submenu_localizes_team_playing_level(
     assert message.text == f"{expected}."
 
 
+def _transfer_result(*, include_publication_state: bool = True) -> SearchResult:
+    facts = {
+        "opportunity_id": "opportunity:transfer-card",
+        "opportunity_type": "roster_vacancy",
+        "roster_vacancy": "true",
+        "iana_timezone": "Europe/Moscow",
+        "city_display_en": "Saint Petersburg",
+        "city_display_ru": "Санкт-Петербург",
+        "city_display_es": "San Petersburgo",
+        "city_display_fr": "Saint-Pétersbourg",
+        "place_display_en": "Petrogradskaya",
+        "place_display_ru": "Петроградская",
+        "place_display_es": "Petrogradskaya",
+        "place_display_fr": "Petrogradskaya",
+        "location_specificity": "2",
+        "positions": json.dumps(["goalkeeper"]),
+        "seasonal_timing": json.dumps({"kind": "stated_season", "value": "2026-2027"}),
+        "match_states": json.dumps(
+            {"positions": "confirmed", "seasonal_timing": "confirmed"}
+        ),
+        "source_posted_at": "2026-08-18T08:00:00+00:00",
+        "response_route_kind": "explicit_telegram_username",
+        "response_route_value": "@transfer_contact",
+    }
+    if include_publication_state:
+        facts["publication_state"] = "active"
+    return SearchResult(
+        result_id="result:transfer-card",
+        completed_search_id="completed-search:transfer-card",
+        absolute_position=1,
+        result_class="confirmed_match",
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+
 @pytest.mark.parametrize(
     ("locale", "expected_title", "expected_timing"),
     (
@@ -90,41 +125,7 @@ def test_transfer_result_card_localizes_timing_and_provenance(
     expected_title: str,
     expected_timing: str,
 ) -> None:
-    result = SearchResult(
-        result_id="result:transfer-card",
-        completed_search_id="completed-search:transfer-card",
-        absolute_position=1,
-        result_class="confirmed_match",
-        card_facts=tuple(
-            sorted(
-                {
-                    "opportunity_id": "opportunity:transfer-card",
-                    "opportunity_type": "roster_vacancy",
-                    "roster_vacancy": "true",
-                    "iana_timezone": "Europe/Moscow",
-                    "city_display_en": "Saint Petersburg",
-                    "city_display_ru": "Санкт-Петербург",
-                    "city_display_es": "San Petersburgo",
-                    "city_display_fr": "Saint-Pétersbourg",
-                    "place_display_en": "Petrogradskaya",
-                    "place_display_ru": "Петроградская",
-                    "place_display_es": "Petrogradskaya",
-                    "place_display_fr": "Petrogradskaya",
-                    "location_specificity": "2",
-                    "positions": json.dumps(["goalkeeper"]),
-                    "seasonal_timing": json.dumps(
-                        {"kind": "stated_season", "value": "2026-2027"}
-                    ),
-                    "match_states": json.dumps(
-                        {"positions": "confirmed", "seasonal_timing": "confirmed"}
-                    ),
-                    "source_posted_at": "2026-08-18T08:00:00+00:00",
-                    "response_route_kind": "explicit_telegram_username",
-                    "response_route_value": "@transfer_contact",
-                }.items()
-            )
-        ),
-    )
+    result = _transfer_result()
     message = _transfer_search_result_message(
         delivery_id=f"result:{locale}",
         telegram_user_id=55_100,
@@ -135,3 +136,17 @@ def test_transfer_result_card_localizes_timing_and_provenance(
     assert expected_title in message.text
     assert expected_timing in message.text
     assert "@transfer_contact" in message.text
+
+
+def test_transfer_result_with_missing_publication_state_is_unavailable() -> None:
+    message = _transfer_search_result_message(
+        delivery_id="result:transfer-missing-publication-state",
+        telegram_user_id=55_100,
+        locale="en",
+        screen_revision=2,
+        result=_transfer_result(include_publication_state=False),
+    )
+
+    assert "Unavailable" in message.text
+    assert "Contact" not in message.text
+    assert "@transfer_contact" not in message.text

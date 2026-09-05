@@ -119,10 +119,10 @@ from modules.domain import (
     opportunity_freshness_is_current,
     opportunity_publication_state_as_of,
     referee_publication_state_as_of,
-    render_response_route,
     source_publisher_id_from_metadata,
     telegram_moderation_triggers,
     tournament_publication_state_as_of,
+    usable_response_route,
 )
 from modules.ports import (
     AcceptanceObservation,
@@ -183,6 +183,8 @@ _LEGACY_MIGRATION_NAMES = (
     "0044_source_chat_lifecycle_cancellation.sql",
     "0045_source_retention_audit_role_isolation.sql",
     "0046_result_variants.sql",
+    "0047_allow_silent_callback_ack.sql",
+    "0048_persist_dynamic_result_callback_copy.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -233,6 +235,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "4cf78c459b8dc6a27fbd9b96f09cb71387cd879ecfece03f2636c539616b8a49",
     "dc20dc716386e45317aab14e796997068fefc98e19599819c47434e9ab071ec4",
     "22d92678d5b515e3f9cdcdd38b738f46557fcafccf22aaa15456f3e161d0f0e1",
+    "a21ad0fc6a7cb83261ee10bf1c5d1c38a699965694ccea6a7d07e2a65162c7b5",
+    "aeaa5eee5c6faa87a17fe5b3ba579b40d8f865163da9a57f65d2972866c62eeb",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -8993,7 +8997,8 @@ class PostgresRoleStore:
                     """
                     SELECT telegram_user_id, locale, locale_source,
                            last_seen_language_code, stage,
-                           screen_revision, revision
+                           screen_revision, revision,
+                           result_stale_callback_text, result_callback_ack
                     FROM football_runtime.bot_users
                     WHERE telegram_user_id = %s
                     """,
@@ -9012,6 +9017,8 @@ class PostgresRoleStore:
             stage=ConversationStage(row["stage"]),
             screen_revision=row["screen_revision"],
             revision=row["revision"],
+            result_stale_callback_text=row["result_stale_callback_text"],
+            result_callback_ack=row["result_callback_ack"],
         )
 
     def discovery_draft(self, telegram_user_id: int) -> DiscoveryDraft | None:
@@ -9199,6 +9206,7 @@ class PostgresRoleStore:
         draft: DiscoveryDraft | None = None,
         geography_confirmation: GeographyConfirmation | None = None,
         required_date_confirmation: RequiredDateConfirmation | None = None,
+        result_context: ActiveResultContext | None = None,
     ) -> bool:
         """Commit one Telegram update and its account-level state atomically."""
         with psycopg.connect(self._database_url) as connection:
@@ -9221,8 +9229,9 @@ class PostgresRoleStore:
                     INSERT INTO football_runtime.bot_users (
                         telegram_user_id, locale, locale_source,
                         last_seen_language_code, stage, screen_revision,
-                        revision, last_bot_user_action_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        revision, result_stale_callback_text,
+                        result_callback_ack, last_bot_user_action_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING revision
                     """,
@@ -9234,6 +9243,8 @@ class PostgresRoleStore:
                         state.stage.value,
                         state.screen_revision,
                         state.revision,
+                        state.result_stale_callback_text,
+                        state.result_callback_ack,
                         recorded_at,
                         recorded_at,
                     ),
@@ -9248,6 +9259,8 @@ class PostgresRoleStore:
                         stage = %s,
                         screen_revision = %s,
                         revision = %s,
+                        result_stale_callback_text = %s,
+                        result_callback_ack = %s,
                         last_bot_user_action_at = %s,
                         updated_at = %s
                     WHERE telegram_user_id = %s AND revision = %s
@@ -9260,6 +9273,8 @@ class PostgresRoleStore:
                         state.stage.value,
                         state.screen_revision,
                         state.revision,
+                        state.result_stale_callback_text,
+                        state.result_callback_ack,
                         recorded_at,
                         recorded_at,
                         state.telegram_user_id,
@@ -9516,6 +9531,13 @@ class PostgresRoleStore:
                     recorded_at,
                 ),
             )
+            if result_context is not None:
+                _insert_search_presentation(
+                    connection,
+                    message=message,
+                    context=result_context,
+                    accepted_at=recorded_at,
+                )
             return True
 
     def commit_conversation_presentation(
@@ -9526,6 +9548,7 @@ class PostgresRoleStore:
         expected_revision: int,
         message: TelegramMessage,
         recorded_at: datetime,
+        result_context: ActiveResultContext | None = None,
     ) -> bool:
         """Commit a replay-safe presentation while preserving account state."""
         with psycopg.connect(self._database_url) as connection:
@@ -9586,6 +9609,13 @@ class PostgresRoleStore:
                     recorded_at,
                 ),
             )
+            if result_context is not None:
+                _insert_search_presentation(
+                    connection,
+                    message=message,
+                    context=result_context,
+                    accepted_at=recorded_at,
+                )
             return True
 
     def commit_conversation_callback(
@@ -9594,7 +9624,7 @@ class PostgresRoleStore:
         update_id: str,
         callback_id: str,
         telegram_user_id: int,
-        expected_revision: int,
+        expected_revision: int | None,
         text: str,
         recorded_at: datetime,
     ) -> bool:
@@ -9621,16 +9651,20 @@ class PostgresRoleStore:
                 """,
                 (telegram_user_id,),
             ).fetchone()
-            if current is None or current[0] != expected_revision:
+            if current is None:
+                if expected_revision is not None:
+                    raise RuntimeError("Conversation state changed concurrently")
+            elif expected_revision is None or current[0] != expected_revision:
                 raise RuntimeError("Conversation state changed concurrently")
-            connection.execute(
-                """
-                UPDATE football_runtime.bot_users
-                SET last_bot_user_action_at = %s
-                WHERE telegram_user_id = %s
-                """,
-                (recorded_at, telegram_user_id),
-            )
+            if current is not None:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_users
+                    SET last_bot_user_action_at = %s
+                    WHERE telegram_user_id = %s
+                    """,
+                    (recorded_at, telegram_user_id),
+                )
             connection.execute(
                 """
                 INSERT INTO football_runtime.bot_callback_outbox (
@@ -9650,12 +9684,252 @@ class PostgresRoleStore:
             )
             return True
 
+    def commit_result_navigation(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        expected_revision: int,
+        expected_context_screen_revision: int,
+        telegram_message_id: str,
+        completed_search_id: str,
+        current_result_id: str,
+        absolute_position: int,
+        message: TelegramMessage,
+        recorded_at: datetime,
+    ) -> bool:
+        """Queue one serialized result-card edit without changing active state."""
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            current = connection.execute(
+                """
+                SELECT revision, stage, screen_revision
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            context = connection.execute(
+                """
+                SELECT completed_search_id, current_result_id,
+                       absolute_position, screen_revision
+                FROM football_runtime.bot_active_result_contexts
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if (
+                current
+                != (
+                    expected_revision,
+                    "results",
+                    expected_context_screen_revision,
+                )
+                or context is None
+                or context[0] != completed_search_id
+                or context[3] != expected_context_screen_revision
+            ):
+                raise RuntimeError("Active Result Context changed concurrently")
+            if message.screen_revision != expected_context_screen_revision + 1:
+                raise RuntimeError("result navigation screen revision is not adjacent")
+            active_view = connection.execute(
+                """
+                SELECT telegram_message_id
+                FROM football_runtime.bot_active_chat_views
+                WHERE telegram_user_id = %s
+                  AND screen_revision = %s
+                  AND telegram_message_id = %s
+                FOR UPDATE
+                """,
+                (
+                    telegram_user_id,
+                    expected_context_screen_revision,
+                    telegram_message_id,
+                ),
+            ).fetchone()
+            if active_view is None:
+                raise RuntimeError("Active Result Context has no active Telegram view")
+            existing = connection.execute(
+                """
+                SELECT presentation.delivery_id
+                FROM football_runtime.bot_search_presentations AS presentation
+                JOIN football_runtime.bot_message_outbox AS outbox
+                  ON outbox.delivery_id = presentation.delivery_id
+                WHERE presentation.telegram_user_id = %s
+                  AND presentation.completed_search_id = %s
+                  AND presentation.current_result_id = %s
+                  AND presentation.absolute_position = %s
+                  AND outbox.delivered_at IS NULL
+                  AND outbox.superseded_at IS NULL
+                LIMIT 1
+                """,
+                (
+                    telegram_user_id,
+                    completed_search_id,
+                    current_result_id,
+                    absolute_position,
+                ),
+            ).fetchone()
+            if existing is not None:
+                return True
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, telegram_message_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    telegram_message_id,
+                    recorded_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_search_presentations (
+                    delivery_id, telegram_user_id, completed_search_id,
+                    current_result_id, absolute_position, accepted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    telegram_user_id,
+                    completed_search_id,
+                    current_result_id,
+                    absolute_position,
+                    recorded_at,
+                ),
+            )
+            return True
+
+    def replace_failed_result_navigation(
+        self,
+        *,
+        delivery_id: str,
+        claim_token: UUID,
+        replacement_delivery_id: str,
+        recorded_at: datetime,
+    ) -> None:
+        """Replace a pre-effect edit failure with a durable ordinary send."""
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT outbox.telegram_user_id, outbox.display_locale,
+                       outbox.screen_revision, outbox.message_text,
+                       outbox.button_rows::text, outbox.reply_button,
+                       outbox.reply_keyboard_action,
+                       presentation.completed_search_id,
+                       presentation.current_result_id,
+                       presentation.absolute_position,
+                       outbox.superseded_at
+                FROM football_runtime.bot_message_outbox AS outbox
+                JOIN football_runtime.bot_search_presentations AS presentation
+                  ON presentation.delivery_id = outbox.delivery_id
+                WHERE outbox.delivery_id = %s
+                  AND outbox.claim_token = %s
+                  AND outbox.delivered_at IS NULL
+                FOR UPDATE OF outbox
+                """,
+                (delivery_id, claim_token),
+            ).fetchone()
+            if row is None or not delivery_id.startswith("result-navigation:"):
+                raise RuntimeError("result navigation claim cannot be replaced")
+            if row[10] is not None:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_message_outbox
+                    SET claim_token = NULL,
+                        claimed_at = NULL,
+                        delivery_status = 'pending'
+                    WHERE delivery_id = %s AND claim_token = %s
+                    """,
+                    (delivery_id, claim_token),
+                )
+                return
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_message_outbox
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    superseded_at = COALESCE(superseded_at, %s),
+                    delivery_status = 'pending'
+                WHERE delivery_id = %s AND claim_token = %s
+                """,
+                (recorded_at, delivery_id, claim_token),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    replacement_delivery_id,
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6],
+                    recorded_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_search_presentations (
+                    delivery_id, telegram_user_id, completed_search_id,
+                    current_result_id, absolute_position, accepted_at
+                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    replacement_delivery_id,
+                    row[0],
+                    row[7],
+                    row[8],
+                    row[9],
+                    recorded_at,
+                ),
+            )
+
     def claim_conversation_callback(
         self,
         *,
         claim_token: UUID,
         claimed_at: datetime,
         stale_before: datetime,
+        callback_id: str | None = None,
     ) -> TelegramCallbackDeliveryClaim | None:
         """Claim one pending or abandoned callback notification."""
         with psycopg.connect(self._database_url) as connection:
@@ -9665,6 +9939,7 @@ class PostgresRoleStore:
                     SELECT delivery_id
                     FROM football_runtime.bot_callback_outbox
                     WHERE delivered_at IS NULL
+                      AND (%s::text IS NULL OR callback_query_id = %s::text)
                       AND (
                           claim_token IS NULL
                           OR claimed_at <= %s
@@ -9680,7 +9955,7 @@ class PostgresRoleStore:
                 RETURNING callback.delivery_id, callback.callback_query_id,
                           callback.notification_text
                 """,
-                (stale_before, claim_token, claimed_at),
+                (callback_id, callback_id, stale_before, claim_token, claimed_at),
             ).fetchone()
         if row is None:
             return None
@@ -11003,6 +11278,7 @@ class PostgresRoleStore:
         stale_before: datetime,
     ) -> TelegramDeliveryClaim | None:
         """Claim one safe initial send or reconciliation attempt."""
+        edit_target_message_id: str | None = None
         with psycopg.connect(
             self._database_url,
             row_factory=dict_row,
@@ -11014,11 +11290,11 @@ class PostgresRoleStore:
                     SELECT delivery_id, delivery_status
                     FROM football_runtime.bot_message_outbox
                     WHERE delivered_at IS NULL
+                      AND superseded_at IS NULL
                       AND (
                           (
                               delivery_status = 'pending'
                               AND claim_token IS NULL
-                              AND superseded_at IS NULL
                           )
                           OR (
                               delivery_status = 'attempting'
@@ -11032,7 +11308,7 @@ class PostgresRoleStore:
                               )
                           )
                       )
-                    ORDER BY (superseded_at IS NOT NULL), sequence_id
+                    ORDER BY sequence_id
                     FOR UPDATE
                     LIMIT 1
                 )
@@ -11058,19 +11334,33 @@ class PostgresRoleStore:
                           bot_message_outbox.button_rows,
                           bot_message_outbox.reply_button,
                           bot_message_outbox.reply_keyboard_action,
+                          bot_message_outbox.telegram_message_id,
                           candidate.delivery_status AS prior_delivery_status
                 """,
                 (stale_before, stale_before, claim_token, claimed_at, claimed_at),
             ).fetchone()
+            if row is not None and row["delivery_id"].startswith("result-navigation:"):
+                edit_target_message_id = row["telegram_message_id"]
         message = _telegram_message(row)
         if message is None or row is None:
             return None
+        is_edit = row["delivery_id"].startswith("result-navigation:")
+        if is_edit and edit_target_message_id is None:
+            raise RuntimeError("result navigation has no bound Telegram target")
         mode = (
-            TelegramDeliveryMode.SEND
+            TelegramDeliveryMode.EDIT
+            if is_edit and row["prior_delivery_status"] == "pending"
+            else TelegramDeliveryMode.RECONCILE_EDIT
+            if is_edit
+            else TelegramDeliveryMode.SEND
             if row["prior_delivery_status"] == "pending"
             else TelegramDeliveryMode.RECONCILE
         )
-        return TelegramDeliveryClaim(message=message, mode=mode)
+        return TelegramDeliveryClaim(
+            message=message,
+            mode=mode,
+            telegram_message_id=edit_target_message_id,
+        )
 
     def release_conversation_message_claim(self, *, claim_token: UUID) -> None:
         """Release a claim after a known pre-effect failure."""
@@ -11240,6 +11530,7 @@ class PostgresRoleStore:
         delivered_at: datetime,
     ) -> None:
         """Confirm delivery and activate Search state only after Telegram success."""
+        is_edit = delivery_id.startswith("result-navigation:")
         with psycopg.connect(self._database_url) as connection:
             delivered = connection.execute(
                 """
@@ -11275,6 +11566,15 @@ class PostgresRoleStore:
                     """,
                     (telegram_user_id,),
                 ).fetchone()
+                if is_edit and (
+                    previous_view is None or previous_view[1] != telegram_message_id
+                ):
+                    raise RuntimeError("result edit target changed concurrently")
+                active_telegram_message_id = (
+                    previous_view[1]
+                    if is_edit and previous_view is not None
+                    else telegram_message_id
+                )
                 connection.execute(
                     """
                     INSERT INTO football_runtime.bot_active_chat_views (
@@ -11291,11 +11591,15 @@ class PostgresRoleStore:
                         telegram_user_id,
                         screen_revision,
                         delivery_id,
-                        telegram_message_id,
+                        active_telegram_message_id,
                         delivered_at,
                     ),
                 )
-                if previous_view is not None and previous_view[0] != delivery_id:
+                if (
+                    not is_edit
+                    and previous_view is not None
+                    and previous_view[0] != delivery_id
+                ):
                     connection.execute(
                         """
                         INSERT INTO football_runtime.bot_old_chat_views (
@@ -11371,6 +11675,37 @@ class PostgresRoleStore:
                             delivered_at,
                         ),
                     )
+            elif not is_edit:
+                previous_view = connection.execute(
+                    """
+                    SELECT delivery_id
+                    FROM football_runtime.bot_active_chat_views
+                    WHERE telegram_user_id = %s
+                    FOR UPDATE
+                    """,
+                    (telegram_user_id,),
+                ).fetchone()
+                replacement_delivery_id = (
+                    previous_view[0]
+                    if previous_view is not None and previous_view[0] != delivery_id
+                    else f"superseded:{delivery_id}"
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_old_chat_views (
+                        delivery_id, telegram_user_id, telegram_message_id,
+                        replacement_delivery_id, classified_at
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (delivery_id) DO NOTHING
+                    """,
+                    (
+                        delivery_id,
+                        telegram_user_id,
+                        telegram_message_id,
+                        replacement_delivery_id,
+                        delivered_at,
+                    ),
+                )
 
     def claim_old_chat_view_cleanup(
         self,
@@ -11490,6 +11825,34 @@ def _supersede_pending_conversation_messages(
     )
 
 
+def _insert_search_presentation(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    *,
+    message: TelegramMessage,
+    context: ActiveResultContext,
+    accepted_at: datetime,
+) -> None:
+    """Attach one presentation to the immutable search pointer it renders."""
+    if context.telegram_user_id != message.telegram_user_id:
+        raise ValueError("result context belongs to another Telegram user")
+    connection.execute(
+        """
+        INSERT INTO football_runtime.bot_search_presentations (
+            delivery_id, telegram_user_id, completed_search_id,
+            current_result_id, absolute_position, accepted_at
+        ) VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            message.delivery_id,
+            message.telegram_user_id,
+            context.completed_search_id,
+            context.current_result_id,
+            context.absolute_position,
+            accepted_at,
+        ),
+    )
+
+
 def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
     if row is None:
         return None
@@ -11535,19 +11898,16 @@ def _result_card_facts_with_current_publication_state(
             "publication_state": publication_state,
         }
         _overlay_current_result_projection(result, current_projection)
+        route = _current_result_response_route(current_projection)
+        if publication_state == "active" and route is None:
+            publication_state = "suppressed"
         if publication_state == "active":
-            assert current_projection is not None
-            route_kind = current_projection.get("response_route_kind")
-            route_value = current_projection.get("response_route_value")
-            if isinstance(route_kind, str) and isinstance(route_value, str):
-                result["response_route_kind"] = route_kind
-                result["response_route_value"] = route_value
-            else:
-                result.pop("response_route_kind", None)
-                result.pop("response_route_value", None)
+            assert route is not None
+            result["response_route_kind"], result["response_route_value"] = route
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
+        result["publication_state"] = publication_state
         return result
     if card_facts.get("opportunity_type") in {
         "coach_availability",
@@ -11572,19 +11932,16 @@ def _result_card_facts_with_current_publication_state(
             "publication_state": publication_state,
         }
         _overlay_current_result_projection(result, current_projection)
+        route = _current_result_response_route(current_projection)
+        if publication_state == "active" and route is None:
+            publication_state = "suppressed"
         if publication_state == "active":
-            assert current_projection is not None
-            route_kind = current_projection.get("response_route_kind")
-            route_value = current_projection.get("response_route_value")
-            if isinstance(route_kind, str) and isinstance(route_value, str):
-                result["response_route_kind"] = route_kind
-                result["response_route_value"] = route_value
-            else:
-                result.pop("response_route_kind", None)
-                result.pop("response_route_value", None)
+            assert route is not None
+            result["response_route_kind"], result["response_route_value"] = route
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
+        result["publication_state"] = publication_state
         return result
     if opportunity_type in {"referee_availability", "referee_request"}:
         current_facts = (
@@ -11619,35 +11976,13 @@ def _result_card_facts_with_current_publication_state(
                 result[timestamp_key] = current_timestamp
             else:
                 result.pop(timestamp_key, None)
-        route_kind = (
-            current_projection.get("response_route_kind")
-            if current_projection is not None
-            else None
-        )
-        route_value = (
-            current_projection.get("response_route_value")
-            if current_projection is not None
-            else None
-        )
-        if publication_state == "active":
-            if (
-                not isinstance(route_kind, str)
-                or not route_kind
-                or not isinstance(route_value, str)
-                or not route_value
-            ):
-                publication_state = "suppressed"
-            else:
-                try:
-                    render_response_route(route_kind, route_value, "en")
-                except ValueError:
-                    publication_state = "suppressed"
+        route = _current_result_response_route(current_projection)
+        if publication_state == "active" and route is None:
+            publication_state = "suppressed"
         result["publication_state"] = publication_state
         if publication_state == "active":
-            assert isinstance(route_kind, str)
-            assert isinstance(route_value, str)
-            result["response_route_kind"] = route_kind
-            result["response_route_value"] = route_value
+            assert route is not None
+            result["response_route_kind"], result["response_route_value"] = route
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
@@ -11677,25 +12012,31 @@ def _result_card_facts_with_current_publication_state(
     )
     result = {**card_facts, "publication_state": publication_state}
     _overlay_current_result_projection(result, current_projection)
-    route_kind = current_projection.get("response_route_kind")
-    route_value = current_projection.get("response_route_value")
-    if publication_state == "active" and (
-        not isinstance(route_kind, str)
-        or not route_kind
-        or not isinstance(route_value, str)
-        or not route_value
-    ):
+    route = _current_result_response_route(current_projection)
+    if publication_state == "active" and route is None:
         publication_state = "suppressed"
     result["publication_state"] = publication_state
     if publication_state == "active":
-        assert isinstance(route_kind, str)
-        assert isinstance(route_value, str)
-        result["response_route_kind"] = route_kind
-        result["response_route_value"] = route_value
+        assert route is not None
+        result["response_route_kind"], result["response_route_value"] = route
     else:
         result.pop("response_route_kind", None)
         result.pop("response_route_value", None)
     return result
+
+
+def _current_result_response_route(
+    current_projection: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return the current projection's route only when it is renderable."""
+    if current_projection is None:
+        return None
+    return usable_response_route(
+        {
+            "kind": current_projection.get("response_route_kind"),
+            "value": current_projection.get("response_route_value"),
+        }
+    )
 
 
 def _overlay_current_result_projection(
