@@ -9835,7 +9835,8 @@ class PostgresRoleStore:
                        outbox.reply_keyboard_action,
                        presentation.completed_search_id,
                        presentation.current_result_id,
-                       presentation.absolute_position
+                       presentation.absolute_position,
+                       outbox.superseded_at
                 FROM football_runtime.bot_message_outbox AS outbox
                 JOIN football_runtime.bot_search_presentations AS presentation
                   ON presentation.delivery_id = outbox.delivery_id
@@ -9848,6 +9849,18 @@ class PostgresRoleStore:
             ).fetchone()
             if row is None or not delivery_id.startswith("result-navigation:"):
                 raise RuntimeError("result navigation claim cannot be replaced")
+            if row[10] is not None:
+                connection.execute(
+                    """
+                    UPDATE football_runtime.bot_message_outbox
+                    SET claim_token = NULL,
+                        claimed_at = NULL,
+                        delivery_status = 'pending'
+                    WHERE delivery_id = %s AND claim_token = %s
+                    """,
+                    (delivery_id, claim_token),
+                )
+                return
             connection.execute(
                 """
                 UPDATE football_runtime.bot_message_outbox
@@ -9904,6 +9917,7 @@ class PostgresRoleStore:
         claim_token: UUID,
         claimed_at: datetime,
         stale_before: datetime,
+        callback_id: str | None = None,
     ) -> TelegramCallbackDeliveryClaim | None:
         """Claim one pending or abandoned callback notification."""
         with psycopg.connect(self._database_url) as connection:
@@ -9913,6 +9927,7 @@ class PostgresRoleStore:
                     SELECT delivery_id
                     FROM football_runtime.bot_callback_outbox
                     WHERE delivered_at IS NULL
+                      AND (%s::text IS NULL OR callback_query_id = %s::text)
                       AND (
                           claim_token IS NULL
                           OR claimed_at <= %s
@@ -9928,7 +9943,7 @@ class PostgresRoleStore:
                 RETURNING callback.delivery_id, callback.callback_query_id,
                           callback.notification_text
                 """,
-                (stale_before, claim_token, claimed_at),
+                (callback_id, callback_id, stale_before, claim_token, claimed_at),
             ).fetchone()
         if row is None:
             return None
@@ -11844,7 +11859,19 @@ def _result_card_facts_with_current_publication_state(
             assert current_projection is not None
             route_kind = current_projection.get("response_route_kind")
             route_value = current_projection.get("response_route_value")
-            if isinstance(route_kind, str) and isinstance(route_value, str):
+            if (
+                not isinstance(route_kind, str)
+                or not route_kind
+                or not isinstance(route_value, str)
+                or not route_value
+            ):
+                publication_state = "suppressed"
+            else:
+                try:
+                    render_response_route(route_kind, route_value, "en")
+                except ValueError:
+                    publication_state = "suppressed"
+            if publication_state == "active":
                 result["response_route_kind"] = route_kind
                 result["response_route_value"] = route_value
             else:
@@ -11853,6 +11880,7 @@ def _result_card_facts_with_current_publication_state(
         else:
             result.pop("response_route_kind", None)
             result.pop("response_route_value", None)
+        result["publication_state"] = publication_state
         return result
     if card_facts.get("opportunity_type") in {
         "coach_availability",

@@ -188,6 +188,31 @@ def test_tournament_card_with_missing_current_projection_fails_closed() -> None:
     assert "Contact:" not in message.text
 
 
+def test_tournament_card_with_route_less_active_state_is_unavailable() -> None:
+    facts = dict(_result().card_facts)
+    facts.pop("response_route_kind")
+    facts.pop("response_route_value")
+    result = SearchResult(
+        result_id="result:tournament:route-less-active",
+        completed_search_id="completed-search:tournament:route-less-active",
+        absolute_position=1,
+        result_class="confirmed_match",
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _tournament_result_message(
+        delivery_id="delivery:tournament:route-less-active",
+        telegram_user_id=49_118,
+        locale="en",
+        screen_revision=4,
+        result=result,
+    )
+
+    assert "Unavailable" in message.text
+    assert "Contact:" not in message.text
+    assert "@tournament_contact" not in message.text
+
+
 def test_tournament_card_with_suppressed_current_projection_is_unavailable() -> None:
     message = _tournament_result_message(
         delivery_id="delivery:tournament:suppressed",
@@ -247,3 +272,15 @@ def test_historical_card_uses_current_route_when_current_revision_is_active() ->
     assert overlaid["publication_state"] == "active"
     assert overlaid["response_route_value"] == "@current_tournament_contact"
     assert "@tournament_contact" not in str(overlaid)
+
+
+def test_tournament_projection_with_missing_route_fails_closed() -> None:
+    overlaid = _result_card_facts_with_current_publication_state(
+        dict(_result().card_facts),
+        _current_projection(response_route_value=None),
+        as_of=datetime(2026, 8, 19, 0, 0, tzinfo=UTC),
+    )
+
+    assert overlaid["publication_state"] == "suppressed"
+    assert "response_route_kind" not in overlaid
+    assert "response_route_value" not in overlaid

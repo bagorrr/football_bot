@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import UTC, date, datetime
+from threading import Event
 
 import psycopg
 import pytest
@@ -29,6 +31,7 @@ from modules.domain import (
     LocationResolution,
     SourceEventKind,
     TelegramChannelCheckpoint,
+    TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
@@ -46,6 +49,68 @@ from modules.testkit import (
     boot_legacy_acceptance_spine,
     semantic_proof_result_for,
 )
+
+
+class _BlockingResultEditTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.edit_started = Event()
+        self.release_edit = Event()
+        self._block_next_edit = False
+        self._fail_next_edit = False
+        self.fail_deletions = False
+
+    def block_next_edit(self) -> None:
+        self._block_next_edit = True
+
+    def fail_next_edit(self) -> None:
+        self._fail_next_edit = True
+
+    def edit(self, *, telegram_message_id: str, message: TelegramMessage) -> str:
+        if self._block_next_edit:
+            self._block_next_edit = False
+            self.edit_started.set()
+            if not self.release_edit.wait(timeout=2):
+                raise TimeoutError("controlled Telegram edit was not released")
+        if self._fail_next_edit:
+            self._fail_next_edit = False
+            raise InjectedTelegramDeliveryError
+        return super().edit(
+            telegram_message_id=telegram_message_id,
+            message=message,
+        )
+
+    def delete_message(
+        self, *, telegram_user_id: int, telegram_message_id: str
+    ) -> bool:
+        if self.fail_deletions:
+            attempt = (telegram_user_id, telegram_message_id)
+            if attempt not in self.deletion_attempts:
+                self.deletion_attempts.append(attempt)
+            return False
+        return super().delete_message(
+            telegram_user_id=telegram_user_id,
+            telegram_message_id=telegram_message_id,
+        )
+
+
+class _SelectiveCallbackFailureTelegramDeliveryAdapter(
+    ControlledTelegramDeliveryAdapter
+):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_callback_ids: set[str] = set()
+
+    def fail_callback(self, callback_id: str) -> None:
+        self.failed_callback_ids.add(callback_id)
+
+    def allow_callback(self, callback_id: str) -> None:
+        self.failed_callback_ids.remove(callback_id)
+
+    def answer_callback(self, *, callback_id: str, text: str) -> None:
+        if callback_id in self.failed_callback_ids:
+            raise InjectedTelegramDeliveryError
+        super().answer_callback(callback_id=callback_id, text=text)
 
 
 def test_result_callback_without_conversation_state_is_acknowledged() -> None:
@@ -71,6 +136,53 @@ def test_result_callback_without_conversation_state_is_acknowledged() -> None:
     assert telegram_delivery.callback_notifications == [
         ("callback-orphan-result-callback", "Updated.")
     ]
+
+
+def test_result_callback_ack_is_not_blocked_by_older_failed_callback() -> None:
+    telegram_delivery = _SelectiveCallbackFailureTelegramDeliveryAdapter()
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 7, 18, 9, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+    )
+    system.reset()
+
+    telegram_delivery.fail_callback("callback-older-result")
+    with pytest.raises(InjectedTelegramDeliveryError):
+        system.select_result_action(
+            update_id="older-result-callback",
+            callback_id="callback-older-result",
+            telegram_user_id=65_002,
+            action="next",
+            screen_revision=1,
+            context_token="missing-context",
+            target_position=2,
+            telegram_message_id="telegram:older-message",
+        )
+
+    system.select_result_action(
+        update_id="current-result-callback",
+        callback_id="callback-current-result",
+        telegram_user_id=65_003,
+        action="next",
+        screen_revision=1,
+        context_token="missing-context",
+        target_position=2,
+        telegram_message_id="telegram:current-message",
+    )
+
+    assert ("callback-current-result", "Updated.") in (
+        telegram_delivery.callback_notifications
+    )
+    assert ("callback-older-result", "Updated.") not in (
+        telegram_delivery.callback_notifications
+    )
+
+    telegram_delivery.allow_callback("callback-older-result")
+    assert system.retry_bot_presentations() is True
+    assert ("callback-older-result", "Updated.") in (
+        telegram_delivery.callback_notifications
+    )
 
 
 def test_untyped_classifier_peer_fails_closed_before_model_and_replay() -> None:
@@ -4286,7 +4398,7 @@ def test_copy_permitted_source_message_becomes_one_open_match_result_card() -> N
 def test_active_result_context_paginates_in_place_and_survives_reentry() -> None:
     """Keep one pageable result context authoritative across Bot navigation."""
     telegram_ingestion = ControlledTelegramIngestionAdapter()
-    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    telegram_delivery = _BlockingResultEditTelegramDeliveryAdapter()
     classifier = ControlledModelAdapter()
     resolver = ControlledLocationResolverAdapter()
     dates = ControlledDateInterpretationAdapter()
@@ -4490,6 +4602,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     _, previous_action, page_two_token, page_two_screen, page_two_target = (
         page_two_callback.split(":")
     )
+
     message_count = len(telegram_delivery.messages)
     system.select_result_action(
         update_id="foreign-message-active-result-context",
@@ -4705,6 +4818,162 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     )
     system.retry_bot_presentations()
     assert system.active_result_context(user_id).absolute_position == 1
+
+    stale_result_message = telegram_delivery.messages[-1]
+    stale_result_view = system.active_conversation_view(user_id)
+    stale_result_context = system.active_result_context(user_id)
+    (
+        _,
+        stale_result_action,
+        stale_result_token,
+        stale_result_screen,
+        stale_result_target,
+    ) = stale_result_message.button_rows[0][0][1].split(":")
+    old_result_message_id = stale_result_view.telegram_message_id
+    old_result_cleanup_events = sum(
+        event == ("remove-inline-actions", old_result_message_id)
+        for event in telegram_delivery.events
+    )
+    telegram_delivery.fail_deletions = True
+    system.open_main_menu(
+        update_id="menu-before-stale-result-cleanup",
+        telegram_user_id=user_id,
+    )
+    assert (
+        sum(
+            event == ("remove-inline-actions", old_result_message_id)
+            for event in telegram_delivery.events
+        )
+        == old_result_cleanup_events + 1
+    )
+
+    system.select_result_action(
+        update_id="stale-result-in-main-menu",
+        callback_id="callback-stale-result-in-main-menu",
+        telegram_user_id=user_id,
+        action=stale_result_action,
+        screen_revision=int(stale_result_screen),
+        context_token=stale_result_token,
+        target_position=int(stale_result_target),
+        telegram_message_id=old_result_message_id,
+    )
+    assert (
+        sum(
+            event == ("remove-inline-actions", old_result_message_id)
+            for event in telegram_delivery.events
+        )
+        == old_result_cleanup_events + 2
+    )
+
+    telegram_delivery.fail_deletions = False
+    system.select_main_menu_action(
+        update_id="new-search-after-stale-result-cleanup",
+        telegram_user_id=user_id,
+        action="new-search",
+    )
+    system.select_direction(
+        update_id="new-search-different-context-intent",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    system.submit_location_text(
+        update_id="new-search-different-context-country",
+        telegram_user_id=user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id="new-search-different-context-city",
+        telegram_user_id=user_id,
+        text="Saint Petersburg",
+    )
+    system.submit_location_text(
+        update_id="new-search-different-context-area",
+        telegram_user_id=user_id,
+        text="whole city",
+    )
+    system.submit_required_date_text(
+        update_id="new-search-different-context-date",
+        telegram_user_id=user_id,
+        text="20 August",
+    )
+    system.submit_search(
+        update_id="new-search-different-context-submit",
+        telegram_user_id=user_id,
+    )
+    system.process_searches_until_idle()
+    different_context = system.active_result_context(user_id)
+    assert (
+        different_context.completed_search_id
+        != stale_result_context.completed_search_id
+    )
+
+    cleanup_events_before_different_context = sum(
+        event == ("remove-inline-actions", old_result_message_id)
+        for event in telegram_delivery.events
+    )
+    system.select_result_action(
+        update_id="stale-result-in-different-context",
+        callback_id="callback-stale-result-in-different-context",
+        telegram_user_id=user_id,
+        action=stale_result_action,
+        screen_revision=int(stale_result_screen),
+        context_token=stale_result_token,
+        target_position=int(stale_result_target),
+        telegram_message_id=old_result_message_id,
+    )
+    assert (
+        sum(
+            event == ("remove-inline-actions", old_result_message_id)
+            for event in telegram_delivery.events
+        )
+        == cleanup_events_before_different_context + 1
+    )
+
+    race_message = telegram_delivery.messages[-1]
+    race_view = system.active_conversation_view(user_id)
+    race_context = system.active_result_context(user_id)
+    _, race_action, race_token, race_screen, race_target = race_message.button_rows[0][
+        0
+    ][1].split(":")
+    telegram_delivery.block_next_edit()
+    telegram_delivery.fail_next_edit()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        inflight = executor.submit(
+            system.select_result_action,
+            update_id="inflight-result-edit-before-supersession",
+            callback_id="callback-inflight-result-edit-before-supersession",
+            telegram_user_id=user_id,
+            action=race_action,
+            screen_revision=int(race_screen),
+            context_token=race_token,
+            target_position=int(race_target),
+            telegram_message_id=race_view.telegram_message_id,
+        )
+        assert telegram_delivery.edit_started.wait(timeout=2)
+        system.open_main_menu(
+            update_id="menu-during-inflight-result-edit",
+            telegram_user_id=user_id,
+        )
+        system.select_main_menu_action(
+            update_id="reopen-during-inflight-result-edit",
+            telegram_user_id=user_id,
+            action="search-results",
+        )
+        winning_context = system.active_result_context(user_id)
+        winning_view = system.active_conversation_view(user_id)
+        assert winning_context.completed_search_id == race_context.completed_search_id
+        assert winning_context.current_result_id == race_context.current_result_id
+        assert winning_context.absolute_position == race_context.absolute_position
+        assert winning_view.delivery_id == "menu:reopen-during-inflight-result-edit"
+        telegram_delivery.release_edit.set()
+        with pytest.raises(InjectedTelegramDeliveryError):
+            inflight.result()
+
+    message_count_after_reopen = len(telegram_delivery.messages)
+    system.retry_bot_presentations()
+    assert len(telegram_delivery.messages) == message_count_after_reopen
+    assert system.active_result_context(user_id) == winning_context
+    assert system.active_conversation_view(user_id) == winning_view
     system.reset()
 
 

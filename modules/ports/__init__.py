@@ -517,6 +517,7 @@ class ConversationStore(Protocol):
         claim_token: UUID,
         claimed_at: datetime,
         stale_before: datetime,
+        callback_id: str | None = None,
     ) -> TelegramCallbackDeliveryClaim | None:
         """Claim one pending or abandoned callback notification."""
         ...

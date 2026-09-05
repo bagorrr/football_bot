@@ -2460,6 +2460,7 @@ class ConversationOnboarding:
                 )
             elif not callback_matches_current_view:
                 if not same_context or current.stage is not ConversationStage.RESULTS:
+                    foreign_message_id_to_cleanup = telegram_message_id
                     selection = self._language_rendering(current.locale or "en")
                     self._acknowledge_result_callback(
                         update_id=update_id,
@@ -2618,8 +2619,7 @@ class ConversationOnboarding:
             current=current,
             text=text,
         )
-        while self._deliver_pending_callback():
-            pass
+        self._deliver_pending_callback(callback_id=callback_id)
 
     def _answer_result_callback(
         self,
@@ -8033,7 +8033,7 @@ class ConversationOnboarding:
         self._cleanup_old_chat_view()
         return True
 
-    def _deliver_pending_callback(self) -> bool:
+    def _deliver_pending_callback(self, *, callback_id: str | None = None) -> bool:
         """Retry one durable idempotent callback-query notification."""
         claim_token = uuid4()
         claimed_at = self._clock.now()
@@ -8041,6 +8041,7 @@ class ConversationOnboarding:
             claim_token=claim_token,
             claimed_at=claimed_at,
             stale_before=claimed_at - timedelta(minutes=5),
+            callback_id=callback_id,
         )
         if claim is None:
             return False
@@ -9980,9 +9981,13 @@ def _stale_result_callback_text(
     """Return the localized notification for a callback from another result view."""
     if locale in SUPPORTED_LOCALES:
         return _STALE_RESULT_CALLBACK_COPY[locale]
-    if selection is None or selection.result_stale_callback_text is None:
-        raise RuntimeError("saved Conversation Language has no stale-result copy")
-    return selection.result_stale_callback_text
+    if (
+        selection is not None
+        and isinstance(selection.result_stale_callback_text, str)
+        and selection.result_stale_callback_text
+    ):
+        return selection.result_stale_callback_text
+    return _STALE_RESULT_CALLBACK_COPY["en"]
 
 
 def _result_callback_ack_text(
@@ -9991,9 +9996,29 @@ def _result_callback_ack_text(
     """Return the localized acknowledgement for one result callback."""
     if locale in SUPPORTED_LOCALES:
         return _RESULT_CALLBACK_ACK_COPY[locale]
-    if selection is None or selection.result_callback_ack is None:
-        raise RuntimeError("saved Conversation Language has no result ACK copy")
-    return selection.result_callback_ack
+    if (
+        selection is not None
+        and isinstance(selection.result_callback_ack, str)
+        and selection.result_callback_ack
+    ):
+        return selection.result_callback_ack
+    return _RESULT_CALLBACK_ACK_COPY["en"]
+
+
+def _result_navigation_copy(
+    locale: str, *, selection: LanguageSelection | None = None
+) -> tuple[str, str]:
+    """Return reviewed navigation copy, with English as the safe catalog fallback."""
+    if locale in SUPPORTED_LOCALES:
+        return _RESULT_NAVIGATION_COPY[locale]
+    candidate = selection.result_navigation_copy if selection is not None else None
+    if (
+        isinstance(candidate, tuple)
+        and len(candidate) == 2
+        and all(isinstance(part, str) and part for part in candidate)
+    ):
+        return candidate
+    return _RESULT_NAVIGATION_COPY["en"]
 
 
 def _result_callback_matches_current_screen(
@@ -10050,12 +10075,7 @@ def _render_result_presentation(
     )
     if result_count <= 1:
         return message
-    if locale in SUPPORTED_LOCALES:
-        heading, instruction = _RESULT_NAVIGATION_COPY[locale]
-    elif selection is not None and selection.result_navigation_copy is not None:
-        heading, instruction = selection.result_navigation_copy
-    else:
-        raise RuntimeError("saved Conversation Language has no result navigation copy")
+    heading, instruction = _result_navigation_copy(locale, selection=selection)
     position = result.absolute_position
     buttons: list[tuple[str, str]] = []
     if position > 1:
@@ -12754,16 +12774,23 @@ def _tournament_result_message(
         else None
     )
     publication_state = facts.get("publication_state")
-    contact_copy = (
-        f"{labels['contact']}: "
-        + render_response_route(
-            facts["response_route_kind"],
-            facts["response_route_value"],
-            copy_locale,
-        )
-        if publication_state == "active"
-        else labels["unavailable"]
-    )
+    route_kind = facts.get("response_route_kind")
+    route_value = facts.get("response_route_value")
+    if (
+        publication_state == "active"
+        and isinstance(route_kind, str)
+        and route_kind
+        and isinstance(route_value, str)
+        and route_value
+    ):
+        try:
+            contact_copy = f"{labels['contact']}: " + render_response_route(
+                route_kind, route_value, copy_locale
+            )
+        except ValueError:
+            contact_copy = labels["unavailable"]
+    else:
+        contact_copy = labels["unavailable"]
     lines.extend(
         (
             "",

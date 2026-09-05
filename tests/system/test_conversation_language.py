@@ -15,11 +15,13 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from modules.application import _render_result_presentation
 from modules.contracts import RuntimeRole
 from modules.domain import (
     ConversationStage,
     LanguageSelection,
     LocaleSource,
+    SearchResult,
     TelegramMessage,
 )
 from modules.ports import TelegramDeliveryOutcomeUnknownError
@@ -1108,6 +1110,69 @@ def test_application_accepts_recognized_free_text_language_catalog_entries(
     assert system.conversation_state(user_id).locale == locale
     assert system.conversation_state(user_id).locale_source is LocaleSource.EXPLICIT
     assert telegram_delivery.messages[-1].display_locale == locale
+
+    state = system.conversation_state(user_id)
+    system.select_result_action(
+        update_id=f"stale-result-{locale}",
+        callback_id=f"callback-stale-result-{locale}",
+        telegram_user_id=user_id,
+        action="next",
+        screen_revision=state.screen_revision,
+        context_token="missing-result-context",
+        target_position=2,
+        telegram_message_id="telegram:foreign-result",
+    )
+    assert telegram_delivery.callback_notifications[-1] == (
+        f"callback-stale-result-{locale}",
+        "This screen is stale. Open results through Menu.",
+    )
+
+
+def test_free_text_result_navigation_uses_reviewed_fallback_copy() -> None:
+    result = SearchResult(
+        result_id="result:free-text-navigation",
+        completed_search_id="search:free-text-navigation",
+        absolute_position=1,
+        card_facts=tuple(
+            sorted(
+                {
+                    "city_display_en": "Saint Petersburg",
+                    "iana_timezone": "Europe/Moscow",
+                    "location_specificity": "1",
+                    "match_states": '{"search_area": "confirmed"}',
+                    "opportunity_type": "open_match",
+                    "publication_state": "active",
+                    "response_route_kind": "explicit_telegram_username",
+                    "response_route_value": "@match_contact",
+                    "source_posted_at": "2026-08-19T09:00:00+00:00",
+                    "start_local_date": "2026-08-20",
+                    "team_formats": "[]",
+                }.items()
+            )
+        ),
+    )
+    selection = LanguageSelection(
+        locale="tr",
+        confirmation="confirmed:tr",
+        direction_question="direction:tr",
+        direction_labels=("bad", "bad", "bad", "bad", "bad", "bad", "bad"),
+    )
+
+    message = _render_result_presentation(
+        delivery_id="result-navigation:free-text-fallback",
+        telegram_user_id=7_101,
+        locale="tr",
+        screen_revision=4,
+        result=result,
+        result_count=2,
+        context_token="free-text-context",
+        selection=selection,
+    )
+
+    assert message.text.startswith(
+        "**Result 1 of 2**\nOther options are available using the arrows below.\n\n"
+    )
+    assert message.button_rows == ((("➡️", "results:next:free-text-context:4:2"),),)
 
 
 class _CountingAmbiguousLanguageAdapter:
