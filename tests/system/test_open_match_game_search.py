@@ -40,6 +40,8 @@ from modules.domain import (
 from modules.ports import ClassifierAdapterResult, TelegramDeliveryOutcomeUnknownError
 from modules.testkit import (
     AcceptanceSpine,
+    BotAssistantResponse,
+    ControlledBotAssistantModelAdapter,
     ControlledConversationLanguageAdapter,
     ControlledDateInterpretationAdapter,
     ControlledLocationResolverAdapter,
@@ -4747,6 +4749,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     telegram_ingestion = ControlledTelegramIngestionAdapter()
     telegram_delivery = _BlockingResultEditTelegramDeliveryAdapter()
     classifier = ControlledModelAdapter()
+    assistant = ControlledBotAssistantModelAdapter()
     resolver = ControlledLocationResolverAdapter()
     dates = ControlledDateInterpretationAdapter()
     timezones = ControlledTimezoneDataAdapter()
@@ -4813,6 +4816,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
         telegram_ingestion=telegram_ingestion,
         telegram_delivery=telegram_delivery,
         model=classifier,
+        assistant_model=assistant,
         location_resolver=resolver,
         date_interpretation=dates,
         timezone_data=timezones,
@@ -5407,6 +5411,42 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
         f"**Result {fallback_context.absolute_position} of 2**\n"
         "Other options are available using the arrows below.\n\n"
     )
+    question = "What does the current card say?"
+    assistant.return_for(
+        text=question,
+        response=BotAssistantResponse(
+            reply="The current card has one open place.",
+            referenced_result_id=fallback_context.current_result_id,
+        ),
+    )
+    system.answer_result_message(
+        update_id="active-result-context-free-text",
+        telegram_user_id=user_id,
+        text=question,
+    )
+    assert len(assistant.requests) == 1
+    request = assistant.requests[0]
+    assert request.completed_search_id == fallback_context.completed_search_id
+    assert request.current_result is not None
+    assert request.current_result["result_id"] == fallback_context.current_result_id
+    assert request.current_result["absolute_position"] == 2
+    active_results = system.results(fallback_context.completed_search_id)
+    assert [
+        alternative["result_id"] for alternative in request.alternative_results
+    ] == [
+        result.result_id
+        for result in active_results
+        if result.result_id != fallback_context.current_result_id
+    ]
+    bounded_card_context = json.dumps(
+        (request.current_result, *request.alternative_results),
+        ensure_ascii=False,
+        default=str,
+    )
+    assert "source_message" not in bounded_card_context
+    assert "source_context" not in bounded_card_context
+    assert request.external_knowledge_allowed is False
+    assert telegram_delivery.messages[-1].text == "The current card has one open place."
     system.reset()
 
 

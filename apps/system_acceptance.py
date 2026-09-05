@@ -5,6 +5,7 @@ from __future__ import annotations
 from modules.application import RuntimeApplication
 from modules.contracts import RuntimeRole
 from modules.ports import (
+    BotAssistantModelAdapter,
     Clock,
     ConversationLanguageAdapter,
     DateInterpretationAdapter,
@@ -29,6 +30,7 @@ def boot_acceptance_role(
     telegram_ingestion: TelegramIngestionAdapter | None = None,
     telegram_delivery: TelegramDeliveryAdapter | None = None,
     model: ModelAdapter | None = None,
+    assistant_model: BotAssistantModelAdapter | None = None,
     location_resolver: LocationResolverAdapter | None = None,
     conversation_language: ConversationLanguageAdapter | None = None,
     date_interpretation: DateInterpretationAdapter | None = None,
@@ -48,6 +50,7 @@ def boot_acceptance_role(
         telegram_ingestion=telegram_ingestion,
         telegram_delivery=telegram_delivery,
         model=model,
+        assistant_model=assistant_model,
         location_resolver=location_resolver,
         conversation_language=conversation_language,
         date_interpretation=date_interpretation,

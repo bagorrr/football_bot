@@ -78,6 +78,9 @@ from modules.domain import (
     RequiredDate,
     RequiredDateConfirmation,
     RequiredDateConfirmationEvent,
+    ResultConversation,
+    ResultConversationMessage,
+    ResultConversationMessageRole,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
@@ -185,6 +188,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0046_result_variants.sql",
     "0047_allow_silent_callback_ack.sql",
     "0048_persist_dynamic_result_callback_copy.sql",
+    "0049_result_conversation.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -237,6 +241,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "22d92678d5b515e3f9cdcdd38b738f46557fcafccf22aaa15456f3e161d0f0e1",
     "a21ad0fc6a7cb83261ee10bf1c5d1c38a699965694ccea6a7d07e2a65162c7b5",
     "aeaa5eee5c6faa87a17fe5b3ba579b40d8f865163da9a57f65d2972866c62eeb",
+    "0e7cabfe9789302b2478aa67b0f3c5ce284c0710903aed2ed6d53b21f9ed40bc",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -767,6 +772,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.bot_old_chat_views,
                      football_runtime.bot_search_presentations,
                      football_runtime.bot_active_result_contexts,
+                     football_runtime.bot_result_conversation_messages,
                      football_runtime.recommendation_results,
                      football_runtime.recommendation_completed_searches,
                      football_runtime.bot_active_chat_views,
@@ -10133,6 +10139,131 @@ class PostgresRoleStore:
             _insert_outbox(connection, command)
             return True
 
+    def commit_result_conversation_turn(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        completed_search_id: str,
+        user_message: str,
+        assistant_message: TelegramMessage,
+        recorded_at: datetime,
+        command: ContractEnvelope | None = None,
+    ) -> bool:
+        """Persist one protected turn and optional refinement in one transaction."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        if not user_message or len(user_message) > 4_000:
+            raise ValueError("Result Conversation user message is invalid")
+        if assistant_message.telegram_user_id != telegram_user_id:
+            raise ValueError("Result Conversation reply belongs to another user")
+        if not assistant_message.text or len(assistant_message.text) > 4_000:
+            raise ValueError("Result Conversation reply is invalid")
+        with psycopg.connect(self._database_url) as connection:
+            state = connection.execute(
+                """
+                SELECT stage
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            active = connection.execute(
+                """
+                SELECT completed_search_id
+                FROM football_runtime.bot_active_result_contexts
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if state != (ConversationStage.RESULTS.value,) or active != (
+                completed_search_id,
+            ):
+                return False
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET last_bot_user_action_at = %s, updated_at = %s
+                WHERE telegram_user_id = %s
+                """,
+                (recorded_at, recorded_at, telegram_user_id),
+            )
+            connection.execute(
+                """
+                DELETE FROM football_runtime.bot_result_conversation_messages
+                WHERE telegram_user_id = %s
+                  AND completed_search_id <> %s
+                """,
+                (
+                    telegram_user_id,
+                    completed_search_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_result_conversation_messages (
+                    message_id, telegram_user_id, completed_search_id,
+                    turn_id, speaker, message_text, recorded_at
+                ) VALUES (%s, %s, %s, %s, 'user', %s, %s),
+                         (%s, %s, %s, %s, 'assistant', %s, %s)
+                """,
+                (
+                    f"result-conversation:{update_id}:user",
+                    telegram_user_id,
+                    completed_search_id,
+                    update_id,
+                    user_message,
+                    recorded_at,
+                    f"result-conversation:{update_id}:assistant",
+                    telegram_user_id,
+                    completed_search_id,
+                    update_id,
+                    assistant_message.text,
+                    recorded_at,
+                ),
+            )
+            if command is not None:
+                _insert_outbox(connection, command)
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    assistant_message.delivery_id,
+                    assistant_message.telegram_user_id,
+                    assistant_message.display_locale,
+                    assistant_message.screen_revision,
+                    assistant_message.text,
+                    json.dumps(assistant_message.button_rows, ensure_ascii=False),
+                    assistant_message.reply_button,
+                    assistant_message.reply_keyboard_action.value,
+                    recorded_at,
+                ),
+            )
+            return True
+
     def commit_source_chat_registration_request(
         self,
         *,
@@ -11270,6 +11401,70 @@ class PostgresRoleStore:
             screen_revision=row["screen_revision"],
         )
 
+    def result_conversation(
+        self, telegram_user_id: int, *, as_of: datetime
+    ) -> ResultConversation | None:
+        """Read the retained transcript for the current Active Result Context."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            context = connection.execute(
+                """
+                SELECT completed_search_id
+                FROM football_runtime.bot_active_result_contexts
+                WHERE telegram_user_id = %s
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if context is None:
+                return None
+            completed_search_id = context["completed_search_id"]
+            rows = connection.execute(
+                """
+                SELECT speaker, message_text, recorded_at
+                FROM football_runtime.bot_result_conversation_messages
+                WHERE telegram_user_id = %s
+                  AND completed_search_id = %s
+                  AND recorded_at > %s
+                ORDER BY sequence_id
+                """,
+                (telegram_user_id, completed_search_id, as_of - timedelta(days=30)),
+            ).fetchall()
+        return ResultConversation(
+            telegram_user_id=telegram_user_id,
+            completed_search_id=completed_search_id,
+            messages=tuple(
+                ResultConversationMessage(
+                    role=ResultConversationMessageRole(row["speaker"]),
+                    text=row["message_text"],
+                    recorded_at=row["recorded_at"],
+                )
+                for row in rows
+            ),
+        )
+
+    def cleanup_expired_result_conversations(self, *, as_of: datetime) -> int:
+        """Physically delete retained Result Conversation messages past 30 days."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                WITH deleted AS (
+                    DELETE FROM football_runtime.bot_result_conversation_messages
+                    WHERE recorded_at <= %s
+                    RETURNING message_id
+                )
+                SELECT count(*)::integer
+                FROM deleted
+                """,
+                (as_of - timedelta(days=30),),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def claim_conversation_message(
         self,
         *,
@@ -11674,6 +11869,14 @@ class PostgresRoleStore:
                             screen_revision,
                             delivered_at,
                         ),
+                    )
+                    connection.execute(
+                        """
+                        DELETE FROM football_runtime.bot_result_conversation_messages
+                        WHERE telegram_user_id = %s
+                          AND completed_search_id <> %s
+                        """,
+                        (telegram_user_id, completed_search_id),
                     )
             elif not is_edit:
                 previous_view = connection.execute(
