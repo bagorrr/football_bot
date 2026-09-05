@@ -180,6 +180,47 @@ def test_result_turn_is_bounded_to_active_context_and_replays_once() -> None:
     system.reset()
 
 
+def test_acceptance_reset_clears_result_conversation_messages() -> None:
+    system, _telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_103
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="reset-result-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    assistant.return_for(
+        text="What is available?",
+        response=BotAssistantResponse(reply="No matches are available."),
+    )
+    system.answer_result_message(
+        update_id="reset-result-turn",
+        telegram_user_id=user_id,
+        text="What is available?",
+    )
+    assert [
+        message.text for message in system.result_conversation(user_id).messages
+    ] == [
+        "What is available?",
+        "No matches are available.",
+    ]
+
+    system.reset()
+
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="reset-result-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    system.answer_result_message(
+        update_id="reset-result-turn",
+        telegram_user_id=user_id,
+        text="What is available?",
+    )
+    assert [
+        message.text for message in system.result_conversation(user_id).messages
+    ] == [
+        "What is available?",
+        "No matches are available.",
+    ]
+    system.reset()
+
+
 def test_result_conversation_read_preserves_expired_rows_for_explicit_cleanup() -> None:
     system, _telegram, assistant, clock = _boot_search_system_with_assistant_model()
     user_id = 44_101

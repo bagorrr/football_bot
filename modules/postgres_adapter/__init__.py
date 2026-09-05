@@ -772,6 +772,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.bot_old_chat_views,
                      football_runtime.bot_search_presentations,
                      football_runtime.bot_active_result_contexts,
+                     football_runtime.bot_result_conversation_messages,
                      football_runtime.recommendation_results,
                      football_runtime.recommendation_completed_searches,
                      football_runtime.bot_active_chat_views,
