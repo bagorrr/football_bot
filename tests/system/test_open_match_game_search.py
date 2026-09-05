@@ -5154,7 +5154,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
         )
     assert (
         "callback-failed-previous-active-result-context",
-        "Updated.",
+        "Aktualisiert.",
     ) in telegram_delivery.callback_notifications
     assert system.active_result_context(user_id).absolute_position == 2
     telegram_delivery.fail_next()
