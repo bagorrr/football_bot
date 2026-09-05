@@ -8017,10 +8017,11 @@ class ConversationOnboarding:
                 )
                 raise
             if reconciled_message_id is None:
-                self._store.mark_conversation_message_reconciliation_required(
+                self._store.replace_failed_result_navigation(
                     delivery_id=message.delivery_id,
                     claim_token=claim_token,
-                    observed_at=self._clock.now(),
+                    replacement_delivery_id=f"result-replacement:{message.delivery_id}",
+                    recorded_at=self._clock.now(),
                 )
                 return False
             telegram_message_id = reconciled_message_id
