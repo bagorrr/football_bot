@@ -4479,6 +4479,10 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     assert (user_id, "telegram:foreign-message") in (
         telegram_delivery.inline_action_removals
     )
+    assert telegram_delivery.events[-2:] == [
+        ("answer-callback", "callback-foreign-message-active-result-context"),
+        ("remove-inline-actions", "telegram:foreign-message"),
+    ]
     assert system.active_result_context(user_id) == paged_context
     system.retry_bot_presentations()
 

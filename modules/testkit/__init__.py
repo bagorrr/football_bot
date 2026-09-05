@@ -857,6 +857,7 @@ class ControlledTelegramDeliveryAdapter:
     presentations: list[str] = field(default_factory=list)
     messages: list[TelegramMessage] = field(default_factory=list)
     edits: list[tuple[str, TelegramMessage]] = field(default_factory=list)
+    events: list[tuple[str, str]] = field(default_factory=list)
     inline_action_removals: list[tuple[int, str]] = field(default_factory=list)
     typing_actions: list[int] = field(default_factory=list)
     deletion_attempts: list[tuple[int, str]] = field(default_factory=list)
@@ -969,6 +970,7 @@ class ControlledTelegramDeliveryAdapter:
         self, *, telegram_user_id: int, telegram_message_id: str
     ) -> None:
         """Record one idempotent removal of an existing inline keyboard."""
+        self.events.append(("remove-inline-actions", telegram_message_id))
         action = (telegram_user_id, telegram_message_id)
         if action not in self.inline_action_removals:
             self.inline_action_removals.append(action)
@@ -996,6 +998,7 @@ class ControlledTelegramDeliveryAdapter:
             if recorded_text != text:
                 raise ValueError("callback ID was reused for different text")
             return
+        self.events.append(("answer-callback", callback_id))
         self._callback_ledger[callback_id] = text
         self.callback_notifications.append((callback_id, text))
         if self.callback_interruptions_after_effect_remaining:

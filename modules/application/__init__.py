@@ -2414,6 +2414,7 @@ class ConversationOnboarding:
         telegram_message_id: str,
     ) -> None:
         """Apply one serialized arrow action against the current result context."""
+        foreign_message_id_to_cleanup: str | None = None
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
@@ -2475,17 +2476,13 @@ class ConversationOnboarding:
                                 else None
                             ),
                         )
-                    with suppress(Exception):
-                        self._telegram_delivery.remove_inline_actions(
-                            telegram_user_id=telegram_user_id,
-                            telegram_message_id=telegram_message_id,
-                        )
                     self._answer_result_callback(
                         update_id=update_id,
                         callback_id=callback_id,
                         current=current,
                         text="",
                     )
+                    foreign_message_id_to_cleanup = telegram_message_id
             elif context is None or context.absolute_position is None:
                 self._answer_result_callback(
                     update_id=update_id,
@@ -2580,6 +2577,13 @@ class ConversationOnboarding:
                             current=current,
                             text="",
                         )
+        if foreign_message_id_to_cleanup is not None:
+            self._deliver_pending_callback()
+            with suppress(Exception):
+                self._telegram_delivery.remove_inline_actions(
+                    telegram_user_id=telegram_user_id,
+                    telegram_message_id=foreign_message_id_to_cleanup,
+                )
         self._deliver_pending_callback()
         self.deliver_pending()
 
