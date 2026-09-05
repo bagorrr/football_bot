@@ -4030,6 +4030,9 @@ class AcceptanceSpine:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
         current = self.conversation_state(telegram_user_id)
         draft = role.store.discovery_draft(telegram_user_id)
+        selection = _conversation_language(role).render(locale)
+        if selection is not None and selection.locale != locale:
+            raise RuntimeError("controlled language change rendered another locale")
         result_context = (
             role.store.active_result_context(telegram_user_id)
             if current.stage is ConversationStage.RESULTS
@@ -4042,6 +4045,20 @@ class AcceptanceSpine:
             locale_source=LocaleSource.EXPLICIT,
             screen_revision=current.screen_revision + 1,
             revision=current.revision + 1,
+            result_stale_callback_text=(
+                selection.result_stale_callback_text
+                if selection is not None
+                and isinstance(selection.result_stale_callback_text, str)
+                and selection.result_stale_callback_text
+                else None
+            ),
+            result_callback_ack=(
+                selection.result_callback_ack
+                if selection is not None
+                and isinstance(selection.result_callback_ack, str)
+                and selection.result_callback_ack
+                else None
+            ),
         )
         changed_draft = (
             None

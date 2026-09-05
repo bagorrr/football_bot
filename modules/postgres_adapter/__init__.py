@@ -184,6 +184,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0045_source_retention_audit_role_isolation.sql",
     "0046_result_variants.sql",
     "0047_allow_silent_callback_ack.sql",
+    "0048_persist_dynamic_result_callback_copy.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -235,6 +236,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "dc20dc716386e45317aab14e796997068fefc98e19599819c47434e9ab071ec4",
     "22d92678d5b515e3f9cdcdd38b738f46557fcafccf22aaa15456f3e161d0f0e1",
     "a21ad0fc6a7cb83261ee10bf1c5d1c38a699965694ccea6a7d07e2a65162c7b5",
+    "aeaa5eee5c6faa87a17fe5b3ba579b40d8f865163da9a57f65d2972866c62eeb",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -8995,7 +8997,8 @@ class PostgresRoleStore:
                     """
                     SELECT telegram_user_id, locale, locale_source,
                            last_seen_language_code, stage,
-                           screen_revision, revision
+                           screen_revision, revision,
+                           result_stale_callback_text, result_callback_ack
                     FROM football_runtime.bot_users
                     WHERE telegram_user_id = %s
                     """,
@@ -9014,6 +9017,8 @@ class PostgresRoleStore:
             stage=ConversationStage(row["stage"]),
             screen_revision=row["screen_revision"],
             revision=row["revision"],
+            result_stale_callback_text=row["result_stale_callback_text"],
+            result_callback_ack=row["result_callback_ack"],
         )
 
     def discovery_draft(self, telegram_user_id: int) -> DiscoveryDraft | None:
@@ -9224,8 +9229,9 @@ class PostgresRoleStore:
                     INSERT INTO football_runtime.bot_users (
                         telegram_user_id, locale, locale_source,
                         last_seen_language_code, stage, screen_revision,
-                        revision, last_bot_user_action_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        revision, result_stale_callback_text,
+                        result_callback_ack, last_bot_user_action_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING revision
                     """,
@@ -9237,6 +9243,8 @@ class PostgresRoleStore:
                         state.stage.value,
                         state.screen_revision,
                         state.revision,
+                        state.result_stale_callback_text,
+                        state.result_callback_ack,
                         recorded_at,
                         recorded_at,
                     ),
@@ -9251,6 +9259,8 @@ class PostgresRoleStore:
                         stage = %s,
                         screen_revision = %s,
                         revision = %s,
+                        result_stale_callback_text = %s,
+                        result_callback_ack = %s,
                         last_bot_user_action_at = %s,
                         updated_at = %s
                     WHERE telegram_user_id = %s AND revision = %s
@@ -9263,6 +9273,8 @@ class PostgresRoleStore:
                         state.stage.value,
                         state.screen_revision,
                         state.revision,
+                        state.result_stale_callback_text,
+                        state.result_callback_ack,
                         recorded_at,
                         recorded_at,
                         state.telegram_user_id,

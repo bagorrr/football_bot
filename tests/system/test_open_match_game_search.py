@@ -246,6 +246,7 @@ def test_foreign_result_callback_ack_precedes_dynamic_language_rendering() -> No
         text="Deutsch",
         screen_revision=system.conversation_state(telegram_user_id).screen_revision,
     )
+    system.restart(RuntimeRole.BOT_ASSISTANT)
     events.clear()
     conversation_language.fail_next_render()
 
@@ -266,7 +267,7 @@ def test_foreign_result_callback_ack_precedes_dynamic_language_rendering() -> No
     assert telegram_delivery.callback_notifications == [
         (
             "callback-dynamic-result-language",
-            "This screen is stale. Open results through Menu.",
+            "Dieser Bildschirm ist veraltet. Öffnen Sie Ergebnisse über Menü.",
         )
     ]
 
@@ -302,7 +303,10 @@ def test_accepted_result_callback_ack_precedes_dynamic_language_rendering_failur
             """
             UPDATE football_runtime.bot_users
             SET locale = 'de', locale_source = 'explicit', stage = 'results',
-                screen_revision = 2, revision = revision + 1, updated_at = %s
+                screen_revision = 2, revision = revision + 1,
+                result_stale_callback_text = 'Dieser Bildschirm ist veraltet. '
+                    || 'Öffnen Sie Ergebnisse über Menü.',
+                result_callback_ack = 'Aktualisiert.', updated_at = %s
             WHERE telegram_user_id = %s
             """,
             (recorded_at, telegram_user_id),
@@ -331,6 +335,7 @@ def test_accepted_result_callback_ack_precedes_dynamic_language_rendering_failur
             """,
             ("result-current:accepted-dynamic-language", recorded_at, telegram_user_id),
         )
+    system.restart(RuntimeRole.BOT_ASSISTANT)
     events.clear()
     conversation_language.fail_next_render()
 
@@ -348,7 +353,7 @@ def test_accepted_result_callback_ack_precedes_dynamic_language_rendering_failur
 
     assert events == ["answer-callback", "render"]
     assert telegram_delivery.callback_notifications == [
-        ("callback-accepted-dynamic-language", "Updated.")
+        ("callback-accepted-dynamic-language", "Aktualisiert.")
     ]
 
 
@@ -5124,7 +5129,7 @@ def test_active_result_context_paginates_in_place_and_survives_reentry() -> None
     )
     assert telegram_delivery.callback_notifications[-1] == (
         "callback-foreign-dynamic-result-language",
-        "This screen is stale. Open results through Menu.",
+        "Dieser Bildschirm ist veraltet. Öffnen Sie Ergebnisse über Menü.",
     )
     assert telegram_delivery.messages[-1].text == dynamic_message.text
     system.retry_bot_presentations()

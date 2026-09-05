@@ -2466,7 +2466,10 @@ class ConversationOnboarding:
                         callback_id=callback_id,
                         telegram_user_id=telegram_user_id,
                         current=current,
-                        text=_stale_result_callback_text(current.locale or "en"),
+                        text=_stale_result_callback_text(
+                            current.locale or "en",
+                            prepared_text=current.result_stale_callback_text,
+                        ),
                     )
                     self._queue_current_view(
                         update_id=f"result-stale-view:{update_id}", state=current
@@ -2477,7 +2480,10 @@ class ConversationOnboarding:
                         callback_id=callback_id,
                         telegram_user_id=telegram_user_id,
                         current=current,
-                        text=_stale_result_callback_text(current.locale or "en"),
+                        text=_stale_result_callback_text(
+                            current.locale or "en",
+                            prepared_text=current.result_stale_callback_text,
+                        ),
                     )
                     selection = self._language_rendering(current.locale or "en")
                     message = self._render_active_result_view(
@@ -2632,7 +2638,16 @@ class ConversationOnboarding:
             callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             expected_revision=current.revision if current is not None else None,
-            text=_result_callback_ack_text(locale) if text is None else text,
+            text=(
+                _result_callback_ack_text(
+                    locale,
+                    prepared_text=(
+                        current.result_callback_ack if current is not None else None
+                    ),
+                )
+                if text is None
+                else text
+            ),
             recorded_at=self._clock.now(),
         )
 
@@ -3245,6 +3260,35 @@ class ConversationOnboarding:
         if selection is None or selection.locale != locale:
             raise RuntimeError("saved Conversation Language could not be rendered")
         return selection
+
+    @staticmethod
+    def _with_language_callback_copy(
+        state: ConversationState,
+        selection: LanguageSelection | None,
+    ) -> ConversationState:
+        """Persist only the optional callback copy for the selected locale."""
+        dynamic_selection = (
+            selection
+            if selection is not None and selection.locale not in SUPPORTED_LOCALES
+            else None
+        )
+        return replace(
+            state,
+            result_stale_callback_text=(
+                dynamic_selection.result_stale_callback_text
+                if dynamic_selection is not None
+                and isinstance(dynamic_selection.result_stale_callback_text, str)
+                and dynamic_selection.result_stale_callback_text
+                else None
+            ),
+            result_callback_ack=(
+                dynamic_selection.result_callback_ack
+                if dynamic_selection is not None
+                and isinstance(dynamic_selection.result_callback_ack, str)
+                and dynamic_selection.result_callback_ack
+                else None
+            ),
+        )
 
     def _is_administrator(self, telegram_user_id: int) -> bool:
         return (
@@ -6053,6 +6097,7 @@ class ConversationOnboarding:
                     raise RuntimeError(
                         "saved Conversation Language could not be rendered"
                     )
+            state = self._with_language_callback_copy(state, selection)
             message = _discovery_message(
                 update_id=update_id,
                 telegram_user_id=telegram_user_id,
@@ -6080,6 +6125,7 @@ class ConversationOnboarding:
                 screen_revision=current.screen_revision + 1,
                 revision=current.revision + 1,
             )
+            state = self._with_language_callback_copy(state, None)
             message = _language_selection_message(
                 update_id=update_id,
                 telegram_user_id=telegram_user_id,
@@ -6143,6 +6189,7 @@ class ConversationOnboarding:
                 screen_revision=current.screen_revision + 1,
                 revision=current.revision + 1,
             )
+            state = self._with_language_callback_copy(state, None)
             self._store.commit_conversation_update(
                 update_id=update_id,
                 expected_revision=current.revision,
@@ -6171,6 +6218,7 @@ class ConversationOnboarding:
             screen_revision=current.screen_revision + 1,
             revision=current.revision + 1,
         )
+        state = self._with_language_callback_copy(state, None)
         message = _direction_message(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
@@ -7730,6 +7778,7 @@ class ConversationOnboarding:
                 screen_revision=current.screen_revision + 1,
                 revision=current.revision + 1,
             )
+            state = self._with_language_callback_copy(state, selection)
             self._store.commit_conversation_update(
                 update_id=update_id,
                 expected_revision=current.revision,
@@ -7753,6 +7802,7 @@ class ConversationOnboarding:
             screen_revision=current.screen_revision + 1,
             revision=current.revision + 1,
         )
+        state = self._with_language_callback_copy(state, selection)
         message = _direction_message(
             update_id=update_id,
             telegram_user_id=current.telegram_user_id,
@@ -9964,17 +10014,23 @@ def _result_context_token(telegram_user_id: int, completed_search_id: str) -> st
     ).hex
 
 
-def _stale_result_callback_text(locale: str) -> str:
+def _stale_result_callback_text(
+    locale: str, *, prepared_text: str | None = None
+) -> str:
     """Return the localized notification for a callback from another result view."""
     if locale in SUPPORTED_LOCALES:
         return _STALE_RESULT_CALLBACK_COPY[locale]
+    if isinstance(prepared_text, str) and prepared_text:
+        return prepared_text
     return _STALE_RESULT_CALLBACK_COPY["en"]
 
 
-def _result_callback_ack_text(locale: str) -> str:
+def _result_callback_ack_text(locale: str, *, prepared_text: str | None = None) -> str:
     """Return the localized acknowledgement for one result callback."""
     if locale in SUPPORTED_LOCALES:
         return _RESULT_CALLBACK_ACK_COPY[locale]
+    if isinstance(prepared_text, str) and prepared_text:
+        return prepared_text
     return _RESULT_CALLBACK_ACK_COPY["en"]
 
 
