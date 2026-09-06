@@ -11,6 +11,8 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from enum import IntEnum
 from hashlib import sha256
+from threading import Event, Thread
+from time import monotonic
 from typing import TypedDict, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -52,6 +54,7 @@ from modules.contracts import (
 from modules.domain import (
     AcceptedLocation,
     ActiveResultContext,
+    BotAssistantFailureRecord,
     ClassificationAttempt,
     ClassificationRoutingOutcome,
     CompletedSearch,
@@ -109,8 +112,11 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceRoleStore,
+    BotAssistantExecutionTimeoutError,
+    BotAssistantFailure,
     BotAssistantModelAdapter,
     BotAssistantResponse,
+    BotAssistantTransientError,
     BotAssistantTurnRequest,
     ClassificationProofWork,
     ClassifierAdapterResult,
@@ -2357,6 +2363,16 @@ class ConversationOnboarding:
         """Expire retained Result Conversation messages at the current clock."""
         return self._store.cleanup_expired_result_conversations(as_of=self._clock.now())
 
+    def cleanup_expired_bot_assistant_alarms(self) -> int:
+        """Delete one expired protected alarm when Telegram confirms deletion."""
+        return int(self._cleanup_expired_bot_assistant_alarm())
+
+    def cleanup_expired_bot_assistant_failure_records(self) -> int:
+        """Delete body-free Bot Assistant failure records past 90 days."""
+        return self._store.cleanup_expired_bot_assistant_failure_records(
+            as_of=self._clock.now()
+        )
+
     def open_main_menu(self, *, update_id: str, telegram_user_id: int) -> None:
         """Handle the native Menu text through the current logical screen."""
         with self._store.serialize_conversation_update(
@@ -4106,6 +4122,12 @@ class ConversationOnboarding:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Result Conversation messages must be non-empty")
         committed = False
+        turn_started_at = self._clock.now()
+        turn_started_monotonic = monotonic()
+        turn_deadline = turn_started_at + _BOT_ASSISTANT_TURN_BUDGET
+        turn_deadline_monotonic = (
+            turn_started_monotonic + _BOT_ASSISTANT_TURN_BUDGET.total_seconds()
+        )
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
@@ -4144,8 +4166,6 @@ class ConversationOnboarding:
                 or conversation.completed_search_id != active.completed_search_id
             ):
                 return
-            if self._assistant_model is None:
-                return
             request = _result_turn_request(
                 update_id=update_id,
                 text=text,
@@ -4153,47 +4173,136 @@ class ConversationOnboarding:
                 context=active,
                 view=query_result.view,
                 conversation=conversation,
-                now=self._clock.now(),
+                now=turn_started_at,
+                deadline=turn_deadline,
             )
-            response = self._assistant_model.respond(request)
-            reply, action_allowed = _validated_result_response(
-                response,
-                locale=current.locale or "en",
-                result_ids=tuple(
-                    result.result_id for result in query_result.view.results
-                ),
-                current_result_id=active.current_result_id,
-            )
+            response: BotAssistantResponse | None = None
+            failure_type: str | None = None
+            failure_stage = "model_execution"
+            attempt_count = 1
+            if self._assistant_model is None:
+                failure_type = "model_unavailable"
+            else:
+                attempt_count = 0
+                progress_shown = False
+                next_progress_at = turn_started_monotonic + 1.0
+                for attempt_number in (1, 2):
+                    if monotonic() >= turn_deadline_monotonic:
+                        failure_type = "timeout"
+                        break
+                    attempt_count = attempt_number
+                    attempt_request = replace(
+                        request,
+                        attempt_number=attempt_number,
+                    )
+                    try:
+                        (
+                            response,
+                            progress_shown,
+                            next_progress_at,
+                        ) = self._respond_with_deadline(
+                            request=attempt_request,
+                            telegram_user_id=telegram_user_id,
+                            deadline_monotonic=turn_deadline_monotonic,
+                            progress_shown=progress_shown,
+                            next_progress_at=next_progress_at,
+                        )
+                    except BaseException as error:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        if isinstance(
+                            error,
+                            (BotAssistantExecutionTimeoutError, TimeoutError),
+                        ):
+                            failure_type = "timeout"
+                            break
+                        if monotonic() >= turn_deadline_monotonic:
+                            failure_type = "timeout"
+                            break
+                        if attempt_number == 1 and isinstance(
+                            error, BotAssistantTransientError
+                        ):
+                            continue
+                        failure_type = "technical_failure"
+                        break
+                    else:
+                        break
+
             command: ContractEnvelope | None = None
-            if action_allowed and isinstance(response, BotAssistantResponse):
-                try:
-                    change, relaxed_criterion = _refinement_proposal(response)
-                except (TypeError, ValueError):
-                    reply = _result_conversation_failure_text(current.locale)
+            reply = _result_conversation_failure_text(current.locale)
+            if failure_type is None:
+                if response is None:
+                    failure_type = "invalid_response"
+                    failure_stage = "response_validation"
                 else:
-                    if change is not None:
+                    (
+                        reply,
+                        action_allowed,
+                        terminal_validation_failure,
+                    ) = _validated_result_response(
+                        response,
+                        locale=current.locale or "en",
+                        result_ids=tuple(
+                            result.result_id for result in query_result.view.results
+                        ),
+                        current_result_id=active.current_result_id,
+                    )
+                    if terminal_validation_failure:
+                        failure_type = "invalid_response"
+                        failure_stage = "response_validation"
+                    elif action_allowed and isinstance(response, BotAssistantResponse):
                         try:
-                            run_search_message_id = derive_run_search_message_id(
-                                telegram_user_id, update_id
-                            )
-                            refined_search = refine_completed_search(
-                                query_result.view.completed_search,
-                                change,
-                                new_completed_search_id=(
-                                    f"completed-search:{run_search_message_id}"
-                                ),
-                                new_search_update_id=update_id,
-                                completed_at=self._clock.now(),
-                            )
-                            command = _run_search_command_from_completed_search(
-                                refined_search,
-                                display_locale=current.locale or "en",
-                                subject_revision=current.revision,
-                                parent_completed_search_id=active.completed_search_id,
-                                relaxed_criterion=relaxed_criterion,
-                            )
+                            change, relaxed_criterion = _refinement_proposal(response)
                         except (TypeError, ValueError):
-                            reply = _result_conversation_failure_text(current.locale)
+                            failure_type = "validation_failure"
+                            failure_stage = "action_validation"
+                        else:
+                            if change is not None:
+                                try:
+                                    run_search_message_id = (
+                                        derive_run_search_message_id(
+                                            telegram_user_id, update_id
+                                        )
+                                    )
+                                    refined_search = refine_completed_search(
+                                        query_result.view.completed_search,
+                                        change,
+                                        new_completed_search_id=(
+                                            f"completed-search:{run_search_message_id}"
+                                        ),
+                                        new_search_update_id=update_id,
+                                        completed_at=self._clock.now(),
+                                    )
+                                    command = _run_search_command_from_completed_search(
+                                        refined_search,
+                                        display_locale=current.locale or "en",
+                                        subject_revision=current.revision,
+                                        parent_completed_search_id=(
+                                            active.completed_search_id
+                                        ),
+                                        relaxed_criterion=relaxed_criterion,
+                                    )
+                                except (TypeError, ValueError):
+                                    failure_type = "validation_failure"
+                                    failure_stage = "action_validation"
+                if monotonic() >= turn_deadline_monotonic:
+                    failure_type = "timeout"
+                    failure_stage = "response_validation"
+            failure: BotAssistantFailure | None = None
+            if failure_type is not None:
+                command = None
+                reply = _result_conversation_failure_text(current.locale)
+                recorded_at = self._clock.now()
+                failure = self._bot_assistant_failure(
+                    request=request,
+                    context=active,
+                    failure_type=failure_type,
+                    stage=failure_stage,
+                    attempt_count=attempt_count,
+                    failed_at=recorded_at,
+                )
+            else:
+                recorded_at = self._clock.now()
             message = _result_conversation_message(
                 update_id=update_id,
                 state=current,
@@ -4206,11 +4315,149 @@ class ConversationOnboarding:
                 completed_search_id=active.completed_search_id,
                 user_message=text,
                 assistant_message=message,
-                recorded_at=self._clock.now(),
+                recorded_at=recorded_at,
                 command=command,
+                failure=failure,
             )
         if committed:
             self.deliver_pending()
+
+    def _respond_with_deadline(
+        self,
+        *,
+        request: BotAssistantTurnRequest,
+        telegram_user_id: int,
+        deadline_monotonic: float,
+        progress_shown: bool,
+        next_progress_at: float,
+    ) -> tuple[BotAssistantResponse, bool, float]:
+        """Run one adapter attempt without exposing model output before completion."""
+        if self._assistant_model is None:
+            raise BotAssistantExecutionTimeoutError(
+                "Bot Assistant model is unavailable"
+            )
+        assistant_model = self._assistant_model
+        completed = Event()
+        responses: list[BotAssistantResponse] = []
+        failures: list[BaseException] = []
+
+        def run_model() -> None:
+            try:
+                responses.append(assistant_model.respond(request))
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        Thread(target=run_model, daemon=True).start()
+        while not completed.is_set():
+            now = monotonic()
+            if now >= deadline_monotonic:
+                raise BotAssistantExecutionTimeoutError(
+                    "Bot Assistant turn deadline elapsed"
+                )
+            wait_until = min(deadline_monotonic, next_progress_at)
+            completed.wait(max(0.0, wait_until - now))
+            if completed.is_set():
+                break
+            now = monotonic()
+            if now >= deadline_monotonic:
+                raise BotAssistantExecutionTimeoutError(
+                    "Bot Assistant turn deadline elapsed"
+                )
+            if now >= next_progress_at:
+                try:
+                    self._telegram_delivery.show_typing(
+                        telegram_user_id=telegram_user_id
+                    )
+                except Exception:
+                    pass
+                else:
+                    progress_shown = True
+                next_progress_at = now + 4.0
+        if monotonic() >= deadline_monotonic:
+            raise BotAssistantExecutionTimeoutError(
+                "Bot Assistant turn deadline elapsed"
+            )
+        if failures:
+            raise failures[0]
+        if not responses:
+            raise RuntimeError("Bot Assistant adapter returned no response")
+        return responses[0], progress_shown, next_progress_at
+
+    def _bot_assistant_failure(
+        self,
+        *,
+        request: BotAssistantTurnRequest,
+        context: ActiveResultContext,
+        failure_type: str,
+        stage: str,
+        attempt_count: int,
+        failed_at: datetime,
+    ) -> BotAssistantFailure:
+        """Build body-free metadata and one protected administrator alarm."""
+        adapter = self._assistant_model
+        effective_model = (
+            str(getattr(adapter, "effective_model", request.requested_model))
+            if adapter is not None
+            else "unavailable"
+        )
+        effective_effort = (
+            str(
+                getattr(
+                    adapter,
+                    "effective_reasoning_effort",
+                    request.requested_reasoning_effort,
+                )
+            )
+            if adapter is not None
+            else "unavailable"
+        )
+        adapter_kind = (
+            str(getattr(adapter, "adapter_kind", type(adapter).__name__))
+            if adapter is not None
+            else "unavailable"
+        )
+        adapter_version = (
+            str(getattr(adapter, "adapter_version", "unknown"))
+            if adapter is not None
+            else "unavailable"
+        )
+        return BotAssistantFailure(
+            record=BotAssistantFailureRecord(
+                turn_id=request.turn_id,
+                failed_at=failed_at,
+                failure_type=failure_type,
+                stage=stage,
+                attempt_count=max(1, attempt_count),
+                requested_model=request.requested_model,
+                effective_model=effective_model,
+                requested_reasoning_effort=request.requested_reasoning_effort,
+                effective_reasoning_effort=effective_effort,
+                prompt_version=request.prompt_version,
+                response_contract_version=request.response_contract_version,
+                context_policy_version=request.context_policy_version,
+                adapter_kind=adapter_kind,
+                adapter_version=adapter_version,
+                resolver_version=request.resolver_version,
+                timezone_data_version=request.timezone_data_version,
+            ),
+            alarm_text=_bot_assistant_alarm_text(
+                request=request,
+                context=context,
+                telegram_user_id=context.telegram_user_id,
+                failure_type=failure_type,
+                stage=stage,
+                attempt_count=max(1, attempt_count),
+                failed_at=failed_at,
+                effective_model=effective_model,
+                effective_effort=effective_effort,
+                adapter_kind=adapter_kind,
+                adapter_version=adapter_version,
+            ),
+            alarm_locale=request.locale,
+            administrator_user_id=self._telegram_admin_user_id,
+        )
 
     def open_game_search_details(
         self,
@@ -8060,6 +8307,7 @@ class ConversationOnboarding:
         """Retry one durable Bot API presentation and confirm its success."""
         if self._deliver_pending_callback():
             return True
+        alarm_delivered = self._deliver_pending_failure_alarm()
         claim_token = uuid4()
         claimed_at = self._clock.now()
         claim = self._store.claim_conversation_message(
@@ -8068,7 +8316,9 @@ class ConversationOnboarding:
             stale_before=claimed_at - timedelta(minutes=5),
         )
         if claim is None:
-            return self._cleanup_old_chat_view()
+            cleaned = self._cleanup_old_chat_view()
+            self._cleanup_expired_bot_assistant_alarm()
+            return alarm_delivered or cleaned
         message = claim.message
         administration_delivery = message.delivery_id.startswith(
             (
@@ -8199,6 +8449,94 @@ class ConversationOnboarding:
             delivered_at=self._clock.now(),
         )
         self._cleanup_old_chat_view()
+        self._cleanup_expired_bot_assistant_alarm()
+        return True
+
+    def _deliver_pending_failure_alarm(self) -> bool:
+        """Deliver one protected alarm without entering the ordinary message outbox."""
+        claim_token = uuid4()
+        claim = self._store.claim_bot_assistant_failure_alarm(
+            claim_token=claim_token,
+            claimed_at=self._clock.now(),
+            stale_before=self._clock.now() - timedelta(minutes=5),
+        )
+        if claim is None:
+            return False
+        message = claim.message
+        if claim.mode is TelegramDeliveryMode.SEND:
+            try:
+                telegram_message_id = self._telegram_delivery.send(message)
+            except TelegramDeliveryPreEffectError:
+                self._store.release_bot_assistant_failure_alarm_claim(
+                    claim_token=claim_token
+                )
+                return False
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                self._store.mark_bot_assistant_failure_alarm_outcome_unknown(
+                    alarm_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                return False
+        else:
+            try:
+                reconciled_message_id = self._telegram_delivery.reconcile(message)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                self._store.mark_bot_assistant_failure_alarm_outcome_unknown(
+                    alarm_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                )
+                return False
+            if reconciled_message_id is None:
+                self._store.mark_bot_assistant_failure_alarm_failed(
+                    alarm_id=message.delivery_id,
+                    claim_token=claim_token,
+                    observed_at=self._clock.now(),
+                    failure_code="alarm_delivery_failed",
+                )
+                return False
+            telegram_message_id = reconciled_message_id
+        self._store.mark_bot_assistant_failure_alarm_delivered(
+            alarm_id=message.delivery_id,
+            claim_token=claim_token,
+            telegram_message_id=telegram_message_id,
+            delivered_at=self._clock.now(),
+        )
+        return True
+
+    def _cleanup_expired_bot_assistant_alarm(self) -> bool:
+        """Delete one expired protected alarm and record only body-free failures."""
+        claim_token = uuid4()
+        now = self._clock.now()
+        claim = self._store.claim_expired_bot_assistant_failure_alarm(
+            claim_token=claim_token,
+            claimed_at=now,
+            stale_before=now - timedelta(minutes=5),
+            as_of=now,
+        )
+        if claim is None:
+            return False
+        try:
+            deleted = self._telegram_delivery.delete_message(
+                telegram_user_id=claim.administrator_user_id,
+                telegram_message_id=claim.telegram_message_id,
+            )
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            deleted = False
+        if deleted:
+            self._store.mark_bot_assistant_failure_alarm_deleted(claim=claim)
+        else:
+            self._store.mark_bot_assistant_failure_alarm_deletion_failed(
+                claim=claim,
+                observed_at=self._clock.now(),
+            )
         return True
 
     def _deliver_pending_callback(self, *, callback_id: str | None = None) -> bool:
@@ -10147,10 +10485,12 @@ _RESULT_CONVERSATION_UNAVAILABLE_COPY = {
 }
 _RESULT_CONVERSATION_FAILURE_COPY = {
     "en": "I cannot answer from the current result context right now.",
-    "ru": "Сейчас я не могу ответить по текущему контексту результатов.",
+    "ru": "Не удалось ответить на вопрос, попробуйте еще раз.",
     "es": "Ahora no puedo responder desde el contexto actual de resultados.",
     "fr": "Je ne peux pas répondre depuis le contexte actuel des résultats.",
 }
+
+_BOT_ASSISTANT_TURN_BUDGET = timedelta(seconds=60)
 
 
 def _result_context_token(telegram_user_id: int, completed_search_id: str) -> str:
@@ -10180,6 +10520,9 @@ def _result_turn_request(
     view: CompletedSearchView,
     conversation: ResultConversation,
     now: datetime,
+    deadline: datetime | None = None,
+    attempt_number: int = 1,
+    resolver_version: str = "not-used",
 ) -> BotAssistantTurnRequest:
     """Build the bounded model input from one active Completed Search only."""
     results_by_id = {result.result_id: result for result in view.results}
@@ -10227,6 +10570,9 @@ def _result_turn_request(
         response_contract_version="bot-assistant-response-v1",
         context_policy_version="active-result-context-v1",
         external_knowledge_allowed=False,
+        deadline=deadline,
+        attempt_number=attempt_number,
+        resolver_version=resolver_version,
     )
 
 
@@ -10243,44 +10589,91 @@ def _result_conversation_failure_text(locale: str | None) -> str:
     return _result_conversation_copy(locale or "en", _RESULT_CONVERSATION_FAILURE_COPY)
 
 
+def _bot_assistant_alarm_text(
+    *,
+    request: BotAssistantTurnRequest,
+    context: ActiveResultContext,
+    telegram_user_id: int,
+    failure_type: str,
+    stage: str,
+    attempt_count: int,
+    failed_at: datetime,
+    effective_model: str,
+    effective_effort: str,
+    adapter_kind: str,
+    adapter_version: str,
+) -> str:
+    """Render one bounded protected alarm without copying it to telemetry."""
+    prefix = "\n".join(
+        (
+            "Bot Assistant terminal failure",
+            f"Turn ID: {request.turn_id}",
+            f"Telegram user ID: {telegram_user_id}",
+            f"Conversation stage: {request.stage.value}",
+            f"Screen revision: {request.screen_revision}",
+            f"Completed Search ID: {context.completed_search_id}",
+            f"Result Card ID: {context.current_result_id or 'none'}",
+            f"Failure time: {failed_at.isoformat()}",
+            f"Failure type: {failure_type}",
+            f"Execution stage: {stage}",
+            f"Attempts: {attempt_count}",
+            f"Requested model: {request.requested_model}",
+            f"Effective model: {effective_model}",
+            f"Requested reasoning effort: {request.requested_reasoning_effort}",
+            f"Effective reasoning effort: {effective_effort}",
+            f"Adapter: {adapter_kind}",
+            f"Adapter version: {adapter_version}",
+        )
+    )
+    message_prefix = f"{prefix}\nMessage: "
+    message_limit = max(0, 4_096 - len(message_prefix))
+    return f"{message_prefix}{request.message[:message_limit]}"
+
+
 def _validated_result_response(
     response: BotAssistantResponse,
     *,
     locale: str,
     result_ids: tuple[str, ...],
     current_result_id: str | None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     """Validate references and free-form shape before accepting a proposal."""
     if not isinstance(response, BotAssistantResponse):
-        return _result_conversation_failure_text(locale), False
+        return _result_conversation_failure_text(locale), False, True
     candidate_ids = response.candidate_result_ids
     if not isinstance(candidate_ids, tuple) or not all(
         isinstance(result_id, str) and result_id for result_id in candidate_ids
     ):
-        return _result_conversation_failure_text(locale), False
+        return _result_conversation_failure_text(locale), False, True
     referenced_result_id = response.referenced_result_id
     if referenced_result_id is not None and (
         not isinstance(referenced_result_id, str) or not referenced_result_id
     ):
-        return _result_conversation_failure_text(locale), False
+        return _result_conversation_failure_text(locale), False, True
     active_ids = set(result_ids)
     if referenced_result_id is not None and candidate_ids:
-        return _result_conversation_failure_text(locale), False
+        return _result_conversation_failure_text(locale), False, True
     if referenced_result_id is not None and referenced_result_id not in active_ids:
-        return _result_conversation_copy(
-            locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY
-        ), False
+        return (
+            _result_conversation_copy(locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY),
+            False,
+            False,
+        )
     if candidate_ids and (
         len(candidate_ids) != len(set(candidate_ids))
         or not set(candidate_ids).issubset(active_ids)
     ):
-        return _result_conversation_copy(
-            locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY
-        ), False
+        return (
+            _result_conversation_copy(locale, _RESULT_CONVERSATION_UNAVAILABLE_COPY),
+            False,
+            False,
+        )
     if len(candidate_ids) > 1:
-        return _result_conversation_copy(
-            locale, _RESULT_CONVERSATION_AMBIGUOUS_COPY
-        ), False
+        return (
+            _result_conversation_copy(locale, _RESULT_CONVERSATION_AMBIGUOUS_COPY),
+            False,
+            False,
+        )
     reply = response.reply
     if (
         not isinstance(reply, str)
@@ -10289,10 +10682,10 @@ def _validated_result_response(
         or "—" in reply
         or "–" in reply
     ):
-        return _result_conversation_failure_text(locale), False
+        return _result_conversation_failure_text(locale), False, True
     if current_result_id is not None and current_result_id not in active_ids:
-        return _result_conversation_failure_text(locale), False
-    return reply.strip(), True
+        return _result_conversation_failure_text(locale), False, True
+    return reply.strip(), True, False
 
 
 def _refinement_proposal(

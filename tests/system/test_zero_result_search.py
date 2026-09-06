@@ -27,6 +27,7 @@ from modules.domain import (
     DiscoveryCriterionChange,
     DiscoveryCriterionChangeOperation,
 )
+from modules.ports import BotAssistantExecutionTimeoutError
 from modules.testkit import (
     AcceptanceSpine,
     BotAssistantResponse,
@@ -257,6 +258,186 @@ def test_result_conversation_read_preserves_expired_rows_for_explicit_cleanup() 
         "After expiry",
         "The transcript has expired.",
     ]
+    system.reset()
+
+
+def test_result_turn_retries_one_quick_failure_without_alarm() -> None:
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model(
+        administrator_id=44_120
+    )
+    user_id = 44_121
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="retry-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    assistant.return_for(
+        text="Please retry this answer.",
+        response=BotAssistantResponse(reply="The answer recovered."),
+    )
+    assistant.fail_next()
+
+    system.answer_result_message(
+        update_id="retry-turn",
+        telegram_user_id=user_id,
+        text="Please retry this answer.",
+    )
+
+    assert [request.attempt_number for request in assistant.requests] == [1, 2]
+    assert assistant.requests[0].turn_id == assistant.requests[1].turn_id
+    assert assistant.requests[0].deadline == assistant.requests[1].deadline
+    assert assistant.requests[0].deadline is not None
+    assert assistant.requests[0].deadline - assistant.requests[
+        0
+    ].current_time == timedelta(seconds=60)
+    assert telegram.messages[-1].text == "The answer recovered."
+    assert [
+        message for message in telegram.messages if message.telegram_user_id == 44_120
+    ] == []
+    assert system.bot_assistant_failure_records() == ()
+    system.reset()
+
+
+def test_result_turn_does_not_retry_arbitrary_adapter_failure() -> None:
+    administrator_id = 44_125
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model(
+        administrator_id=administrator_id
+    )
+    user_id = 44_126
+    _advance_to_complete_draft(system, user_id=user_id, locale="ru")
+    system.submit_search(update_id="fatal-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    before_state = system.conversation_state(user_id)
+    before_context = system.active_result_context(user_id)
+    question = "Покажи подробности"
+    assistant.raise_for(ValueError("controlled fatal adapter error"))
+
+    system.answer_result_message(
+        update_id="fatal-turn",
+        telegram_user_id=user_id,
+        text=question,
+    )
+
+    failure_copy = "Не удалось ответить на вопрос, попробуйте еще раз."
+    assert telegram.messages[-1].telegram_user_id == user_id
+    assert telegram.messages[-1].text == failure_copy
+    alarm_messages = [
+        message
+        for message in telegram.messages
+        if message.telegram_user_id == administrator_id
+    ]
+    assert len(alarm_messages) == 1
+    assert question in alarm_messages[0].text
+    assert system.conversation_state(user_id) == before_state
+    assert system.active_result_context(user_id) == before_context
+    assert [request.attempt_number for request in assistant.requests] == [1]
+    records = system.bot_assistant_failure_records()
+    assert len(records) == 1
+    assert records[0].failure_type == "technical_failure"
+    assert records[0].attempt_count == 1
+    assert question not in repr(records[0])
+    assert system.bot_assistant_operational_alerts() == ()
+    system.reset()
+
+
+def test_result_turn_timeout_preserves_state_and_retires_alarm() -> None:
+    administrator_id = 44_122
+    system, telegram, assistant, clock = _boot_search_system_with_assistant_model(
+        administrator_id=administrator_id
+    )
+    user_id = 44_123
+    _advance_to_complete_draft(system, user_id=user_id, locale="ru")
+    system.submit_search(update_id="timeout-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    before_state = system.conversation_state(user_id)
+    before_context = system.active_result_context(user_id)
+    question = "Покажи подробности"
+    assistant.raise_for(BotAssistantExecutionTimeoutError("controlled timeout"))
+
+    system.answer_result_message(
+        update_id="timeout-turn",
+        telegram_user_id=user_id,
+        text=question,
+    )
+
+    failure_copy = "Не удалось ответить на вопрос, попробуйте еще раз."
+    assert telegram.messages[-1].telegram_user_id == user_id
+    assert telegram.messages[-1].text == failure_copy
+    alarm_messages = [
+        message
+        for message in telegram.messages
+        if message.telegram_user_id == administrator_id
+    ]
+    assert len(alarm_messages) == 1
+    assert question in alarm_messages[0].text
+    assert system.conversation_state(user_id) == before_state
+    assert system.active_result_context(user_id) == before_context
+    assert len(assistant.requests) == 1
+    assert assistant.requests[0].attempt_number == 1
+    records = system.bot_assistant_failure_records()
+    assert len(records) == 1
+    assert records[0].failure_type == "timeout"
+    assert records[0].attempt_count == 1
+    assert question not in repr(records[0])
+    assert system.bot_assistant_operational_alerts() == ()
+
+    system.answer_result_message(
+        update_id="timeout-turn",
+        telegram_user_id=user_id,
+        text=question,
+    )
+    assert len(assistant.requests) == 1
+    assert (
+        len(
+            [
+                message
+                for message in telegram.messages
+                if message.telegram_user_id == administrator_id
+            ]
+        )
+        == 1
+    )
+
+    clock.advance_to(records[0].failed_at + timedelta(hours=24))
+    assert system.cleanup_expired_bot_assistant_alarms() == 1
+    assert (
+        len(
+            [
+                attempt
+                for attempt in telegram.deletion_attempts
+                if attempt[0] == administrator_id
+            ]
+        )
+        == 1
+    )
+    clock.advance_to(records[0].failed_at + timedelta(days=90))
+    assert system.cleanup_expired_bot_assistant_failure_records() == 1
+    assert system.bot_assistant_failure_records() == ()
+    system.reset()
+
+
+def test_result_turn_shows_typing_without_intermediate_text() -> None:
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_124
+    _advance_to_complete_draft(system, user_id=user_id)
+    system.submit_search(update_id="typing-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    assistant.return_for(
+        text="Wait for this answer.",
+        response=BotAssistantResponse(reply="The delayed answer is complete."),
+    )
+    assistant.response_delay_seconds = 1.2
+    before_messages = len(telegram.messages)
+    before_typing = len(telegram.typing_actions)
+
+    system.answer_result_message(
+        update_id="typing-turn",
+        telegram_user_id=user_id,
+        text="Wait for this answer.",
+    )
+
+    assert len(telegram.typing_actions) == before_typing + 1
+    assert telegram.typing_actions[-1] == user_id
+    assert len(telegram.messages) == before_messages + 1
+    assert telegram.messages[-1].text == "The delayed answer is complete."
     system.reset()
 
 
@@ -1405,7 +1586,9 @@ def _boot_search_system_with_clock() -> tuple[
     return system, telegram, clock
 
 
-def _boot_search_system_with_assistant_model() -> tuple[
+def _boot_search_system_with_assistant_model(
+    *, administrator_id: int | None = None
+) -> tuple[
     AcceptanceSpine,
     ControlledTelegramDeliveryAdapter,
     ControlledBotAssistantModelAdapter,
@@ -1441,6 +1624,7 @@ def _boot_search_system_with_assistant_model() -> tuple[
         location_resolver=ControlledLocationResolverAdapter(),
         date_interpretation=dates,
         timezone_data=timezones,
+        telegram_admin_user_id=administrator_id,
     )
     system.reset()
     return system, telegram, assistant, clock

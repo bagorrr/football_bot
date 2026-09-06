@@ -3819,6 +3819,37 @@ class ResultConversation:
 
 
 @dataclass(frozen=True, slots=True)
+class BotAssistantFailureRecord:
+    """Body-free technical record for one terminal Bot Assistant turn failure."""
+
+    turn_id: str
+    failed_at: datetime
+    failure_type: str
+    stage: str
+    attempt_count: int
+    requested_model: str
+    effective_model: str
+    requested_reasoning_effort: str
+    effective_reasoning_effort: str
+    prompt_version: str
+    response_contract_version: str
+    context_policy_version: str
+    adapter_kind: str
+    adapter_version: str
+    resolver_version: str
+    timezone_data_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BotAssistantOperationalAlert:
+    """Body-free operational alert for protected alarm delivery or cleanup."""
+
+    alarm_id: str
+    failure_code: str
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramDeliveryClaim:
     """One durable delivery claim and its safe external operation."""
 

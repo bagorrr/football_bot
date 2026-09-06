@@ -46,6 +46,8 @@ from modules.domain import (
     AcceptedLocation,
     ActiveChatView,
     ActiveResultContext,
+    BotAssistantFailureRecord,
+    BotAssistantOperationalAlert,
     ClassificationAttempt,
     ClassificationQueueHealth,
     ClassificationRoutingOutcome,
@@ -129,6 +131,8 @@ from modules.domain import (
 )
 from modules.ports import (
     AcceptanceObservation,
+    BotAssistantFailure,
+    BotAssistantFailureAlarmCleanup,
     ClaimedContract,
     ClassificationProofWork,
     CompletedSearchQueryResult,
@@ -189,6 +193,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0047_allow_silent_callback_ack.sql",
     "0048_persist_dynamic_result_callback_copy.sql",
     "0049_result_conversation.sql",
+    "0050_bot_assistant_execution.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -242,6 +247,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "a21ad0fc6a7cb83261ee10bf1c5d1c38a699965694ccea6a7d07e2a65162c7b5",
     "aeaa5eee5c6faa87a17fe5b3ba579b40d8f865163da9a57f65d2972866c62eeb",
     "0e7cabfe9789302b2478aa67b0f3c5ce284c0710903aed2ed6d53b21f9ed40bc",
+    "4eccd7de7171150cc9f7800a4bf17329931e35e79a2bfd81504357235ee56f4d",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -771,6 +777,9 @@ class PostgresAcceptanceObserver:
                      football_runtime.source_chat_registry,
                      football_runtime.bot_old_chat_views,
                      football_runtime.bot_search_presentations,
+                     football_runtime.bot_assistant_failure_alarms,
+                     football_runtime.bot_assistant_operational_alerts,
+                     football_runtime.bot_assistant_failure_records,
                      football_runtime.bot_active_result_contexts,
                      football_runtime.bot_result_conversation_messages,
                      football_runtime.recommendation_results,
@@ -1890,6 +1899,43 @@ class PostgresAcceptanceObserver:
                 """
             ).fetchall()
         return tuple(row[0] for row in rows)
+
+    def bot_assistant_failure_records(self) -> tuple[BotAssistantFailureRecord, ...]:
+        """Observe body-free terminal Bot Assistant failure records."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT turn_id, failed_at, failure_type, stage, attempt_count,
+                       requested_model, effective_model,
+                       requested_reasoning_effort, effective_reasoning_effort,
+                       prompt_version, response_contract_version,
+                       context_policy_version, adapter_kind, adapter_version,
+                       resolver_version, timezone_data_version
+                FROM football_runtime.bot_assistant_failure_records
+                ORDER BY failed_at, turn_id
+                """
+            ).fetchall()
+        return tuple(BotAssistantFailureRecord(**row) for row in rows)
+
+    def bot_assistant_operational_alerts(
+        self,
+    ) -> tuple[BotAssistantOperationalAlert, ...]:
+        """Observe body-free protected-alarm operational alerts."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT alarm_id, failure_code, observed_at
+                FROM football_runtime.bot_assistant_operational_alerts
+                ORDER BY sequence_id
+                """
+            ).fetchall()
+        return tuple(BotAssistantOperationalAlert(**row) for row in rows)
 
     def geography_confirmations(
         self, telegram_user_id: int
@@ -10149,8 +10195,9 @@ class PostgresRoleStore:
         assistant_message: TelegramMessage,
         recorded_at: datetime,
         command: ContractEnvelope | None = None,
+        failure: BotAssistantFailure | None = None,
     ) -> bool:
-        """Persist one protected turn and optional refinement in one transaction."""
+        """Persist one protected turn, failure details, and optional refinement."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
             raise ConversationAccessDeniedError
         if not user_message or len(user_message) > 4_000:
@@ -10159,6 +10206,13 @@ class PostgresRoleStore:
             raise ValueError("Result Conversation reply belongs to another user")
         if not assistant_message.text or len(assistant_message.text) > 4_000:
             raise ValueError("Result Conversation reply is invalid")
+        if failure is not None and (
+            not failure.record.turn_id
+            or not failure.alarm_text
+            or len(failure.alarm_text) > 4_096
+            or not failure.alarm_locale
+        ):
+            raise ValueError("Bot Assistant failure metadata is invalid")
         with psycopg.connect(self._database_url) as connection:
             state = connection.execute(
                 """
@@ -10262,6 +10316,77 @@ class PostgresRoleStore:
                     recorded_at,
                 ),
             )
+            if failure is not None:
+                record = failure.record
+                alarm_id = f"bot-assistant-alarm:{record.turn_id}"
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_assistant_failure_records (
+                        turn_id, failed_at, failure_type, stage, attempt_count,
+                        requested_model, effective_model,
+                        requested_reasoning_effort, effective_reasoning_effort,
+                        prompt_version, response_contract_version,
+                        context_policy_version, adapter_kind, adapter_version,
+                        resolver_version, timezone_data_version, expires_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s + INTERVAL '90 days'
+                    )
+                    ON CONFLICT (turn_id) DO NOTHING
+                    """,
+                    (
+                        record.turn_id,
+                        record.failed_at,
+                        record.failure_type,
+                        record.stage,
+                        record.attempt_count,
+                        record.requested_model,
+                        record.effective_model,
+                        record.requested_reasoning_effort,
+                        record.effective_reasoning_effort,
+                        record.prompt_version,
+                        record.response_contract_version,
+                        record.context_policy_version,
+                        record.adapter_kind,
+                        record.adapter_version,
+                        record.resolver_version,
+                        record.timezone_data_version,
+                        record.failed_at,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_assistant_failure_alarms (
+                        alarm_id, turn_id, administrator_user_id, display_locale,
+                        message_text, recorded_at, expires_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s + INTERVAL '24 hours'
+                    )
+                    ON CONFLICT (turn_id) DO NOTHING
+                    """,
+                    (
+                        alarm_id,
+                        record.turn_id,
+                        failure.administrator_user_id,
+                        failure.alarm_locale,
+                        failure.alarm_text,
+                        record.failed_at,
+                        record.failed_at,
+                    ),
+                )
+                if failure.administrator_user_id is None:
+                    connection.execute(
+                        """
+                        INSERT INTO football_runtime.bot_assistant_operational_alerts (
+                            alarm_id, failure_code, observed_at, expires_at
+                        ) VALUES (
+                            %s, 'administrator_not_configured', %s,
+                            %s + INTERVAL '90 days'
+                        )
+                        ON CONFLICT (alarm_id, failure_code) DO NOTHING
+                        """,
+                        (alarm_id, record.failed_at, record.failed_at),
+                    )
             return True
 
     def commit_source_chat_registration_request(
@@ -11464,6 +11589,370 @@ class PostgresRoleStore:
                 (as_of - timedelta(days=30),),
             ).fetchone()
         return int(row[0]) if row is not None else 0
+
+    def bot_assistant_failure_records(self) -> tuple[BotAssistantFailureRecord, ...]:
+        """Read body-free terminal failure records from the owning role."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT turn_id, failed_at, failure_type, stage, attempt_count,
+                       requested_model, effective_model,
+                       requested_reasoning_effort, effective_reasoning_effort,
+                       prompt_version, response_contract_version,
+                       context_policy_version, adapter_kind, adapter_version,
+                       resolver_version, timezone_data_version
+                FROM football_runtime.bot_assistant_failure_records
+                ORDER BY failed_at, turn_id
+                """
+            ).fetchall()
+        return tuple(BotAssistantFailureRecord(**row) for row in rows)
+
+    def bot_assistant_operational_alerts(
+        self,
+    ) -> tuple[BotAssistantOperationalAlert, ...]:
+        """Read body-free protected-alarm alerts from the owning role."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            rows = connection.execute(
+                """
+                SELECT alarm_id, failure_code, observed_at
+                FROM football_runtime.bot_assistant_operational_alerts
+                ORDER BY sequence_id
+                """
+            ).fetchall()
+        return tuple(BotAssistantOperationalAlert(**row) for row in rows)
+
+    def claim_bot_assistant_failure_alarm(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramDeliveryClaim | None:
+        """Claim one pending or abandoned protected administrator alarm."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(4041)")
+            row = connection.execute(
+                """
+                WITH candidate AS (
+                    SELECT alarm_id, delivery_status
+                    FROM football_runtime.bot_assistant_failure_alarms
+                    WHERE administrator_user_id IS NOT NULL
+                      AND (
+                          (
+                              delivery_status = 'pending'
+                              AND claim_token IS NULL
+                          )
+                          OR (
+                              delivery_status = 'attempting'
+                              AND claimed_at <= %s
+                          )
+                          OR (
+                              delivery_status = 'outcome_unknown'
+                              AND (
+                                  claim_token IS NULL
+                                  OR claimed_at <= %s
+                              )
+                          )
+                      )
+                    ORDER BY recorded_at, alarm_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE football_runtime.bot_assistant_failure_alarms AS alarm
+                SET claim_token = %s,
+                    claimed_at = %s,
+                    delivery_status = 'attempting'
+                FROM candidate
+                WHERE alarm.alarm_id = candidate.alarm_id
+                RETURNING alarm.alarm_id, alarm.administrator_user_id,
+                          alarm.display_locale, alarm.message_text,
+                          candidate.delivery_status AS prior_delivery_status
+                """,
+                (stale_before, stale_before, claim_token, claimed_at),
+            ).fetchone()
+        if row is None:
+            return None
+        message = TelegramMessage(
+            delivery_id=row["alarm_id"],
+            telegram_user_id=row["administrator_user_id"],
+            display_locale=row["display_locale"],
+            screen_revision=1,
+            text=row["message_text"],
+            button_rows=(),
+        )
+        return TelegramDeliveryClaim(
+            message=message,
+            mode=(
+                TelegramDeliveryMode.SEND
+                if row["prior_delivery_status"] == "pending"
+                else TelegramDeliveryMode.RECONCILE
+            ),
+        )
+
+    def release_bot_assistant_failure_alarm_claim(self, *, claim_token: UUID) -> None:
+        """Release one protected alarm after a proven pre-effect failure."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_assistant_failure_alarms
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    delivery_status = 'pending'
+                WHERE claim_token = %s
+                  AND delivery_status = 'attempting'
+                  AND delivered_at IS NULL
+                """,
+                (claim_token,),
+            )
+
+    def mark_bot_assistant_failure_alarm_delivered(
+        self,
+        *,
+        alarm_id: str,
+        claim_token: UUID,
+        telegram_message_id: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Confirm one protected administrator alarm delivery."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        if not telegram_message_id:
+            raise ValueError("Bot Assistant alarm message identity is required")
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_assistant_failure_alarms
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    delivery_status = 'confirmed',
+                    telegram_message_id = COALESCE(telegram_message_id, %s),
+                    delivered_at = COALESCE(delivered_at, %s)
+                WHERE alarm_id = %s
+                  AND claim_token = %s
+                  AND delivery_status = 'attempting'
+                RETURNING alarm_id
+                """,
+                (telegram_message_id, delivered_at, alarm_id, claim_token),
+            ).fetchone()
+        if changed is None:
+            raise RuntimeError("Bot Assistant alarm delivery claim was lost")
+
+    def mark_bot_assistant_failure_alarm_failed(
+        self,
+        *,
+        alarm_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+        failure_code: str,
+    ) -> None:
+        """Record a body-free protected-alarm delivery failure."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_assistant_failure_alarms
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    delivery_status = 'delivery_failed'
+                WHERE alarm_id = %s
+                  AND claim_token = %s
+                  AND delivery_status = 'attempting'
+                RETURNING alarm_id
+                """,
+                (alarm_id, claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Bot Assistant alarm delivery claim was lost")
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_assistant_operational_alerts (
+                    alarm_id, failure_code, observed_at, expires_at
+                ) VALUES (%s, %s, %s, %s + INTERVAL '90 days')
+                ON CONFLICT (alarm_id, failure_code) DO NOTHING
+                """,
+                (alarm_id, failure_code, observed_at, observed_at),
+            )
+
+    def mark_bot_assistant_failure_alarm_outcome_unknown(
+        self,
+        *,
+        alarm_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Retain one protected alarm for reconciliation after an unknown send."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_assistant_failure_alarms
+                SET claim_token = NULL,
+                    claimed_at = %s,
+                    delivery_status = 'outcome_unknown'
+                WHERE alarm_id = %s
+                  AND claim_token = %s
+                  AND delivery_status = 'attempting'
+                RETURNING alarm_id
+                """,
+                (observed_at, alarm_id, claim_token),
+            ).fetchone()
+        if changed is None:
+            raise RuntimeError("Bot Assistant alarm delivery claim was lost")
+
+    def claim_expired_bot_assistant_failure_alarm(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+        as_of: datetime,
+    ) -> BotAssistantFailureAlarmCleanup | None:
+        """Claim one delivered protected alarm after its 24-hour retention bound."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            connection.execute("SELECT pg_advisory_xact_lock(4042)")
+            row = connection.execute(
+                """
+                WITH candidate AS (
+                    SELECT alarm_id
+                    FROM football_runtime.bot_assistant_failure_alarms
+                    WHERE administrator_user_id IS NOT NULL
+                      AND telegram_message_id IS NOT NULL
+                      AND expires_at <= %s
+                      AND (
+                          delivery_status IN ('confirmed', 'deletion_failed')
+                          OR (
+                              delivery_status = 'deletion_attempting'
+                              AND deletion_claimed_at <= %s
+                          )
+                      )
+                    ORDER BY expires_at, alarm_id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE football_runtime.bot_assistant_failure_alarms AS alarm
+                SET deletion_claim_token = %s,
+                    deletion_claimed_at = %s,
+                    delivery_status = 'deletion_attempting'
+                FROM candidate
+                WHERE alarm.alarm_id = candidate.alarm_id
+                RETURNING alarm.alarm_id, alarm.administrator_user_id,
+                          alarm.telegram_message_id
+                """,
+                (as_of, stale_before, claim_token, claimed_at),
+            ).fetchone()
+        if row is None:
+            return None
+        return BotAssistantFailureAlarmCleanup(
+            alarm_id=row["alarm_id"],
+            administrator_user_id=row["administrator_user_id"],
+            telegram_message_id=row["telegram_message_id"],
+            claim_token=claim_token,
+        )
+
+    def mark_bot_assistant_failure_alarm_deleted(
+        self, *, claim: BotAssistantFailureAlarmCleanup
+    ) -> None:
+        """Delete one protected alarm after Telegram deletion succeeds."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            deleted = connection.execute(
+                """
+                DELETE FROM football_runtime.bot_assistant_failure_alarms
+                WHERE alarm_id = %s
+                  AND deletion_claim_token = %s
+                  AND delivery_status = 'deletion_attempting'
+                RETURNING alarm_id
+                """,
+                (claim.alarm_id, claim.claim_token),
+            ).fetchone()
+        if deleted is None:
+            raise RuntimeError("Bot Assistant alarm deletion claim was lost")
+
+    def mark_bot_assistant_failure_alarm_deletion_failed(
+        self,
+        *,
+        claim: BotAssistantFailureAlarmCleanup,
+        observed_at: datetime,
+    ) -> None:
+        """Record a body-free protected-alarm deletion failure."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_assistant_failure_alarms
+                SET deletion_claim_token = NULL,
+                    deletion_claimed_at = NULL,
+                    delivery_status = 'deletion_failed'
+                WHERE alarm_id = %s
+                  AND deletion_claim_token = %s
+                  AND delivery_status = 'deletion_attempting'
+                RETURNING alarm_id
+                """,
+                (claim.alarm_id, claim.claim_token),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Bot Assistant alarm deletion claim was lost")
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_assistant_operational_alerts (
+                    alarm_id, failure_code, observed_at, expires_at
+                ) VALUES (%s, 'alarm_deletion_failed', %s, %s + INTERVAL '90 days')
+                ON CONFLICT (alarm_id, failure_code) DO NOTHING
+                """,
+                (claim.alarm_id, observed_at, observed_at),
+            )
+
+    def cleanup_expired_bot_assistant_failure_records(self, *, as_of: datetime) -> int:
+        """Delete body-free failure records and operational alerts after 90 days."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            deleted_records = connection.execute(
+                """
+                WITH deleted AS (
+                    DELETE FROM football_runtime.bot_assistant_failure_records
+                    WHERE expires_at <= %s
+                    RETURNING turn_id
+                )
+                SELECT count(*)::integer
+                FROM deleted
+                """,
+                (as_of,),
+            ).fetchone()
+            connection.execute(
+                """
+                DELETE FROM football_runtime.bot_assistant_operational_alerts
+                WHERE expires_at <= %s
+                """,
+                (as_of,),
+            )
+        return int(deleted_records[0]) if deleted_records is not None else 0
 
     def claim_conversation_message(
         self,
