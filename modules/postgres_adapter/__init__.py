@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
@@ -201,6 +201,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0049_result_conversation.sql",
     "0050_bot_assistant_execution.sql",
     "0051_source_data_deletion.sql",
+    "0052_source_data_deletion_review_fixes.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -256,6 +257,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "0e7cabfe9789302b2478aa67b0f3c5ce284c0710903aed2ed6d53b21f9ed40bc",
     "4eccd7de7171150cc9f7800a4bf17329931e35e79a2bfd81504357235ee56f4d",
     "7b3e95833ed643458cfba5b7c7953d45ceac27c335ff1ea2b1f3b147e0c7a5a8",
+    "71525e0239993f8c0a0cd849cc37fdfbdfef5279c11b87efbfe19665cf9cfa33",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1067,7 +1069,8 @@ class PostgresAcceptanceObserver:
                        decided_at, execution_started_at, effective_at, completed_at,
                        completion_outcome, completion_proof_pointer,
                        requester_notification_status, requester_notified_at,
-                       last_reminder_at, next_reminder_at, execution_attempt
+                       last_reminder_at, next_reminder_at, reminder_count,
+                       execution_attempt
                 FROM football_runtime.application_source_data_deletion_requests
                 ORDER BY received_at, request_id
                 """
@@ -1126,7 +1129,8 @@ class PostgresAcceptanceObserver:
                 """
                 SELECT audit_event_id, source_ref, revision_ref, action,
                        previous_state, next_state, reason_code,
-                       recorded_at, expires_at
+                       recorded_at, expires_at, request_id,
+                       actor_telegram_id, notification_status
                 FROM football_runtime.application_source_data_audit
                 ORDER BY recorded_at, audit_event_id
                 """
@@ -4957,7 +4961,8 @@ class PostgresRoleStore:
             query = """
                 SELECT audit_event_id, source_ref, revision_ref, action,
                        previous_state, next_state, reason_code,
-                       recorded_at, expires_at
+                       recorded_at, expires_at, request_id,
+                       actor_telegram_id, notification_status
                 FROM football_runtime.application_source_data_audit
                 ORDER BY recorded_at, audit_event_id
             """
@@ -4965,7 +4970,8 @@ class PostgresRoleStore:
             query = """
                 SELECT audit_event_id, source_ref, revision_ref, action,
                        previous_state, next_state, reason_code,
-                       recorded_at, expires_at
+                       recorded_at, expires_at, request_id,
+                       actor_telegram_id, notification_status
                 FROM football_runtime.read_source_data_audit()
                 ORDER BY recorded_at, audit_event_id
             """
@@ -5070,6 +5076,8 @@ class PostgresRoleStore:
         source_chat_key: str,
         support_case_pointer: str,
         received_at: datetime,
+        actor_telegram_id: int | None = None,
+        _connection: psycopg.Connection[Any] | None = None,
     ) -> SourceDataDeletionRequest:
         """Persist one exact, idempotent Source Data Deletion Request."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -5081,10 +5089,12 @@ class PostgresRoleStore:
             support_case_pointer=support_case_pointer,
             received_at=received_at,
         )
-        with psycopg.connect(
-            self._database_url,
-            row_factory=dict_row,
-        ) as connection:
+        connection_context = (
+            psycopg.connect(self._database_url, row_factory=dict_row)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as connection:
             inserted = connection.execute(
                 """
                 INSERT INTO football_runtime.application_source_data_deletion_requests (
@@ -5133,6 +5143,17 @@ class PostgresRoleStore:
                 ):
                     raise ValueError("Source Data Deletion request identity conflicts")
                 inserted = existing
+            else:
+                _record_source_data_deletion_audit(
+                    connection,
+                    request_id=request_id,
+                    previous_state=None,
+                    next_state="pending_decision",
+                    reason_code="request_created",
+                    actor_telegram_id=actor_telegram_id,
+                    notification_status="pending",
+                    recorded_at=received_at,
+                )
         return _source_deletion_request_from_row(inserted)
 
     def decide_source_data_deletion_request(
@@ -5143,6 +5164,7 @@ class PostgresRoleStore:
         decision_reason: str | None,
         decided_by: int,
         decided_at: datetime,
+        _connection: psycopg.Connection[Any] | None = None,
     ) -> bool:
         """Record one explicit approval or rejection without erasing data."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -5155,7 +5177,18 @@ class PostgresRoleStore:
             raise ValueError("Source Data Deletion decision time is naive")
         if decision == "reject" and not decision_reason:
             raise ValueError("Source Data Deletion rejection requires a reason")
-        with psycopg.connect(self._database_url) as connection:
+        if decision_reason is not None and (
+            not isinstance(decision_reason, str)
+            or len(decision_reason) > 128
+            or any(character.isspace() for character in decision_reason)
+        ):
+            raise ValueError("Source Data Deletion decision reason is invalid")
+        connection_context = (
+            psycopg.connect(self._database_url, row_factory=dict_row)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as connection:
             row = connection.execute(
                 """
                 SELECT status, decision_reason, decided_by
@@ -5172,12 +5205,12 @@ class PostgresRoleStore:
                 if decision == "approve"
                 else SourceDataDeletionRequestStatus.REJECTED.value
             )
-            if row[0] == target_status:
+            if row["status"] == target_status:
                 return (
-                    cast(str | None, row[1]) == decision_reason
-                    and cast(int | None, row[2]) == decided_by
+                    cast(str | None, row["decision_reason"]) == decision_reason
+                    and cast(int | None, row["decided_by"]) == decided_by
                 )
-            if row[0] != SourceDataDeletionRequestStatus.PENDING_DECISION.value:
+            if row["status"] != SourceDataDeletionRequestStatus.PENDING_DECISION.value:
                 return False
             connection.execute(
                 """
@@ -5200,6 +5233,20 @@ class PostgresRoleStore:
                     request_id,
                 ),
             )
+            _record_source_data_deletion_audit(
+                connection,
+                request_id=request_id,
+                previous_state=cast(str, row["status"]),
+                next_state=target_status,
+                reason_code=(
+                    "decision_approved"
+                    if decision == "approve"
+                    else "decision_rejected"
+                ),
+                actor_telegram_id=decided_by,
+                notification_status="pending",
+                recorded_at=decided_at,
+            )
         return True
 
     def begin_source_data_deletion_request(
@@ -5207,16 +5254,20 @@ class PostgresRoleStore:
         *,
         request_id: str,
         effective_at: datetime,
+        actor_telegram_id: int | None = None,
+        _connection: psycopg.Connection[Any] | None = None,
     ) -> bool:
         """Start explicit suppression and enqueue one command per owner."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         if effective_at.tzinfo is None:
             raise ValueError("Source Data Deletion effective time is naive")
-        with psycopg.connect(
-            self._database_url,
-            row_factory=dict_row,
-        ) as connection:
+        connection_context = (
+            psycopg.connect(self._database_url, row_factory=dict_row)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as connection:
             request = connection.execute(
                 """
                 SELECT *
@@ -5240,7 +5291,7 @@ class PostgresRoleStore:
             ):
                 # A retry must use the first attempt's immutable target set.  Some
                 # owners may already have physically removed their rows.
-                source_rows = []
+                source_rows: list[dict[str, Any]] = []
                 source_message_ids = list(request["target_source_message_ids"])
                 source_revision_ids = list(
                     request["target_source_message_revision_ids"]
@@ -5251,6 +5302,23 @@ class PostgresRoleStore:
                     request["target_opportunity_revision_ids"]
                 )
             else:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (request["source_chat_key"],),
+                )
+                pending_rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM football_runtime.capture_source_data_deletion_pending_events(
+                        %s, %s, %s
+                    )
+                    """,
+                    (
+                        request["peer_kind"],
+                        request["telegram_chat_id"],
+                        request["source_author_telegram_id"],
+                    ),
+                ).fetchall()
                 source_rows = connection.execute(
                     """
                     SELECT DISTINCT source.source_message_id,
@@ -5275,6 +5343,24 @@ class PostgresRoleStore:
                         request["source_author_telegram_id"],
                     ),
                 ).fetchall()
+                source_rows_by_id = {
+                    row["source_message_id"]: row for row in source_rows
+                }
+                for pending_row in pending_rows:
+                    source_rows_by_id.setdefault(
+                        pending_row["source_message_id"],
+                        {
+                            "source_message_id": pending_row["source_message_id"],
+                            "peer_kind": request["peer_kind"],
+                            "telegram_chat_id": request["telegram_chat_id"],
+                            "registry_generation": pending_row["registry_generation"],
+                            "telegram_message_id": pending_row["telegram_message_id"],
+                        },
+                    )
+                source_rows = sorted(
+                    source_rows_by_id.values(),
+                    key=lambda row: row["source_message_id"],
+                )
                 source_message_ids = [row["source_message_id"] for row in source_rows]
                 revision_rows = (
                     connection.execute(
@@ -5293,6 +5379,16 @@ class PostgresRoleStore:
                     row["source_message_revision_id"] for row in revision_rows
                 ]
                 source_event_ids = [row["source_event_id"] for row in revision_rows]
+                for pending_row in pending_rows:
+                    if (
+                        pending_row["source_message_revision_id"]
+                        not in source_revision_ids
+                    ):
+                        source_revision_ids.append(
+                            pending_row["source_message_revision_id"]
+                        )
+                    if pending_row["source_event_id"] not in source_event_ids:
+                        source_event_ids.append(pending_row["source_event_id"])
                 opportunity_rows = (
                     connection.execute(
                         """
@@ -5398,6 +5494,16 @@ class PostgresRoleStore:
                     request_id,
                 ),
             )
+            _record_source_data_deletion_audit(
+                connection,
+                request_id=request_id,
+                previous_state=cast(str, request["status"]),
+                next_state="suppressing",
+                reason_code="execution_started",
+                actor_telegram_id=actor_telegram_id,
+                notification_status="pending",
+                recorded_at=effective_at,
+            )
             for owner in RuntimeRole:
                 connection.execute(
                     """
@@ -5439,13 +5545,38 @@ class PostgresRoleStore:
         *,
         request_id: str,
         notified_at: datetime,
+        actor_telegram_id: int | None = None,
+        _connection: psycopg.Connection[Any] | None = None,
     ) -> bool:
         """Record the manual requester notification gate."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         if notified_at.tzinfo is None:
             raise ValueError("Source Data Deletion notification time is naive")
-        with psycopg.connect(self._database_url) as connection:
+        connection_context = (
+            psycopg.connect(self._database_url, row_factory=dict_row)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as connection:
+            request = connection.execute(
+                """
+                SELECT status, requester_notification_status, requester_notified_at
+                FROM football_runtime.application_source_data_deletion_requests
+                WHERE request_id = %s
+                FOR UPDATE
+                """,
+                (request_id,),
+            ).fetchone()
+            if request is None or request["status"] not in {
+                "approved_awaiting_execution",
+                "suppressing",
+                "executing",
+                "execution_error",
+                "awaiting_completion",
+                "rejected",
+            }:
+                return False
             changed = connection.execute(
                 """
                 UPDATE football_runtime.application_source_data_deletion_requests
@@ -5460,6 +5591,20 @@ class PostgresRoleStore:
                 """,
                 (notified_at, request_id),
             ).fetchone()
+            if (
+                changed is not None
+                and request["requester_notification_status"] != "recorded"
+            ):
+                _record_source_data_deletion_audit(
+                    connection,
+                    request_id=request_id,
+                    previous_state=request["status"],
+                    next_state=request["status"],
+                    reason_code="requester_notification_recorded",
+                    actor_telegram_id=actor_telegram_id,
+                    notification_status="recorded",
+                    recorded_at=notified_at,
+                )
         return changed is not None
 
     def complete_source_data_deletion_request(
@@ -5469,6 +5614,8 @@ class PostgresRoleStore:
         completion_outcome: str,
         completion_proof_pointer: str,
         completed_at: datetime,
+        actor_telegram_id: int | None = None,
+        _connection: psycopg.Connection[Any] | None = None,
     ) -> bool:
         """Confirm completion only after owner, replay, and notification gates."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -5483,10 +5630,12 @@ class PostgresRoleStore:
             raise ValueError("Source Data Deletion proof pointer is invalid")
         if completed_at.tzinfo is None:
             raise ValueError("Source Data Deletion completion time is naive")
-        with psycopg.connect(
-            self._database_url,
-            row_factory=dict_row,
-        ) as connection:
+        connection_context = (
+            psycopg.connect(self._database_url, row_factory=dict_row)
+            if _connection is None
+            else nullcontext(_connection)
+        )
+        with connection_context as connection:
             request = connection.execute(
                 """
                 SELECT *
@@ -5575,15 +5724,33 @@ class PostgresRoleStore:
                     request_id,
                 ),
             )
+            _record_source_data_deletion_audit(
+                connection,
+                request_id=request_id,
+                previous_state=cast(str, request["status"]),
+                next_state="completed",
+                reason_code=(f"completion_{completion_outcome}"),
+                actor_telegram_id=actor_telegram_id,
+                notification_status="recorded",
+                recorded_at=completed_at,
+            )
         return True
 
-    def remind_source_data_deletion_requests(self, *, as_of: datetime) -> int:
-        """Record due reminders without changing approval or execution state."""
+    def remind_source_data_deletion_requests(
+        self, *, as_of: datetime, administrator_id: int | None = None
+    ) -> int:
+        """Deliver due body-free reminders without changing workflow state."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         if as_of.tzinfo is None:
             raise ValueError("Source Data Deletion reminder time is naive")
-        with psycopg.connect(self._database_url) as connection:
+        if administrator_id is not None and (
+            not isinstance(administrator_id, int)
+            or isinstance(administrator_id, bool)
+            or administrator_id < 1
+        ):
+            raise ValueError("Source Data Deletion administrator is invalid")
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             result = connection.execute(
                 """
                 UPDATE football_runtime.application_source_data_deletion_requests
@@ -5597,10 +5764,41 @@ class PostgresRoleStore:
                 )
                   AND next_reminder_at IS NOT NULL
                   AND next_reminder_at <= %s
+                RETURNING request_id, status, reminder_count,
+                          requester_notification_status,
+                          CASE
+                              WHEN status = 'pending_decision'
+                              THEN decision_due_at
+                              ELSE completion_due_at
+                          END AS deadline_at
                 """,
                 (as_of, as_of, as_of),
             )
-            return result.rowcount
+            rows = result.fetchall()
+            for row in rows:
+                if administrator_id is not None:
+                    _insert_outbox(
+                        connection,
+                        _source_data_deletion_reminder_envelope(
+                            request_id=row["request_id"],
+                            administrator_id=administrator_id,
+                            status=row["status"],
+                            reminder_at=as_of,
+                            deadline_at=row["deadline_at"],
+                            reminder_count=row["reminder_count"],
+                        ),
+                    )
+                _record_source_data_deletion_audit(
+                    connection,
+                    request_id=row["request_id"],
+                    previous_state=row["status"],
+                    next_state=row["status"],
+                    reason_code="reminder_sent",
+                    actor_telegram_id=None,
+                    notification_status=row["requester_notification_status"],
+                    recorded_at=as_of,
+                )
+            return len(rows)
 
     def process_source_scope_command(
         self,
@@ -5684,6 +5882,182 @@ class PostgresRoleStore:
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
+    def apply_source_data_deletion_admin_command(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one deterministic administrator command at its inbox boundary."""
+        if self._role is not RuntimeRole.APPLICATION:
+            raise ConversationAccessDeniedError
+        if incoming.contract_name is not ContractName.MANAGE_SOURCE_DATA_DELETION:
+            raise ValueError("not a Source Data Deletion administrator command")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("Source Data Deletion administrator payload is invalid")
+        action = cast(str, payload["action"])
+        request_id = cast(str, payload["request_id"])
+        administrator_id = cast(int, payload["telegram_admin_user_id"])
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            if action == "intake":
+                self.create_source_data_deletion_request(
+                    request_id=request_id,
+                    source_author_telegram_id=cast(
+                        int, payload["source_author_telegram_id"]
+                    ),
+                    source_chat_key=cast(str, payload["source_chat_key"]),
+                    support_case_pointer=cast(str, payload["support_case_pointer"]),
+                    received_at=datetime.fromisoformat(
+                        cast(str, payload["received_at"])
+                    ),
+                    actor_telegram_id=administrator_id,
+                    _connection=connection,
+                )
+            elif action in {"approve", "reject"}:
+                self.decide_source_data_deletion_request(
+                    request_id=request_id,
+                    decision=action,
+                    decision_reason=cast(str | None, payload["decision_reason"]),
+                    decided_by=administrator_id,
+                    decided_at=datetime.fromisoformat(cast(str, payload["decided_at"])),
+                    _connection=connection,
+                )
+            elif action == "start":
+                self.begin_source_data_deletion_request(
+                    request_id=request_id,
+                    effective_at=datetime.fromisoformat(
+                        cast(str, payload["effective_at"])
+                    ),
+                    actor_telegram_id=administrator_id,
+                    _connection=connection,
+                )
+            elif action == "notify":
+                self.record_source_data_deletion_notification(
+                    request_id=request_id,
+                    notified_at=datetime.fromisoformat(
+                        cast(str, payload["notified_at"])
+                    ),
+                    actor_telegram_id=administrator_id,
+                    _connection=connection,
+                )
+            elif action == "complete":
+                self.complete_source_data_deletion_request(
+                    request_id=request_id,
+                    completion_outcome=cast(str, payload["completion_outcome"]),
+                    completion_proof_pointer=cast(
+                        str, payload["completion_proof_pointer"]
+                    ),
+                    completed_at=datetime.fromisoformat(
+                        cast(str, payload["completed_at"])
+                    ),
+                    actor_telegram_id=administrator_id,
+                    _connection=connection,
+                )
+            else:
+                raise ValueError("Source Data Deletion administrator action is invalid")
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
+    def accept_source_data_deletion_reminder(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Queue one body-free reminder for the configured administrator."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise ConversationAccessDeniedError
+        if incoming.contract_name is not ContractName.SOURCE_DATA_DELETION_REMINDER:
+            raise ValueError("not a Source Data Deletion reminder")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("Source Data Deletion reminder payload is invalid")
+        request_id = cast(str, payload["request_id"])
+        administrator_id = cast(int, payload["telegram_admin_user_id"])
+        reminder_count = cast(int, payload["reminder_count"])
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            if not _begin_owned_contract(
+                connection,
+                consumer=self._role,
+                incoming=incoming,
+                received_at=received_at,
+            ):
+                return ConsumeResult.REPLAYED
+            bot_user = connection.execute(
+                """
+                SELECT locale, screen_revision
+                FROM football_runtime.bot_users
+                WHERE telegram_user_id = %s
+                FOR UPDATE
+                """,
+                (administrator_id,),
+            ).fetchone()
+            locale = (
+                "en"
+                if bot_user is None or bot_user["locale"] is None
+                else bot_user["locale"]
+            )
+            screen_revision = (
+                1 if bot_user is None else cast(int, bot_user["screen_revision"])
+            )
+            message = TelegramMessage(
+                delivery_id=f"source-data-deletion-reminder:{request_id}:{reminder_count}",
+                telegram_user_id=administrator_id,
+                display_locale=locale,
+                screen_revision=screen_revision,
+                text=(
+                    "⏰ Source Data Deletion reminder\n\n"
+                    f"request={request_id}\n"
+                    f"status={payload['status']}\n"
+                    f"deadline={payload['deadline_at']}\n"
+                    f"reminder={reminder_count}"
+                ),
+                button_rows=(
+                    (
+                        (
+                            "Open deletion requests",
+                            f"administration:source-data-deletion:{screen_revision}",
+                        ),
+                    ),
+                ),
+                reply_button="Menu",
+                reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (delivery_id) DO NOTHING
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    received_at,
+                ),
+            )
+            _release_claim(connection, incoming.message_id)
+        return ConsumeResult.APPLIED
+
     def accept_source_data_deletion_event(
         self,
         *,
@@ -5762,6 +6136,16 @@ class PostgresRoleStore:
                         """,
                         (request_id,),
                     )
+                    _record_source_data_deletion_audit(
+                        connection,
+                        request_id=request_id,
+                        previous_state="suppressing",
+                        next_state="executing",
+                        reason_code="suppression_completed",
+                        actor_telegram_id=None,
+                        notification_status=request["requester_notification_status"],
+                        recorded_at=received_at,
+                    )
                     for target_owner in RuntimeRole:
                         _insert_outbox(
                             connection,
@@ -5820,6 +6204,16 @@ class PostgresRoleStore:
                         """,
                         (request_id,),
                     )
+                    _record_source_data_deletion_audit(
+                        connection,
+                        request_id=request_id,
+                        previous_state="executing",
+                        next_state="awaiting_completion",
+                        reason_code="deletion_completed",
+                        actor_telegram_id=None,
+                        notification_status=request["requester_notification_status"],
+                        recorded_at=received_at,
+                    )
             else:
                 phase = cast(str, payload["phase"])
                 failure_reason = cast(str, payload["failure_reason"])
@@ -5843,10 +6237,25 @@ class PostgresRoleStore:
                     """
                     UPDATE football_runtime.application_source_data_deletion_requests
                     SET status = 'execution_error',
-                        decision_reason = COALESCE(decision_reason, %s)
+                        decision_reason = COALESCE(decision_reason, %s),
+                        next_reminder_at = %s
                     WHERE request_id = %s
                     """,
-                    (failure_reason, request_id),
+                    (failure_reason, received_at, request_id),
+                )
+                _record_source_data_deletion_audit(
+                    connection,
+                    request_id=request_id,
+                    previous_state=request["status"],
+                    next_state="execution_error",
+                    reason_code=(
+                        "suppression_failed"
+                        if phase == "suppression"
+                        else "deletion_failed"
+                    ),
+                    actor_telegram_id=None,
+                    notification_status=request["requester_notification_status"],
+                    recorded_at=received_at,
                 )
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
@@ -11616,6 +12025,98 @@ class PostgresRoleStore:
             _insert_outbox(connection, command)
             return True
 
+    def commit_source_data_deletion_command(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one bounded Bot command and its authoritative admin screen."""
+        if self._role is not RuntimeRole.BOT_ASSISTANT:
+            raise RuntimeError(
+                "only Bot Assistant submits Source Data Deletion controls"
+            )
+        if command.contract_name is not ContractName.MANAGE_SOURCE_DATA_DELETION:
+            raise ValueError("unexpected Source Data Deletion command")
+        payload = command.payload
+        if (
+            not isinstance(payload, dict)
+            or payload.get("request_id") != command.subject_id
+        ):
+            raise ValueError("Source Data Deletion command identity is incomplete")
+        if payload.get("telegram_admin_user_id") != state.telegram_user_id:
+            raise ValueError("Source Data Deletion command administrator is invalid")
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.bot_updates (
+                    update_id, telegram_user_id, recorded_at
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                RETURNING update_id
+                """,
+                (update_id, state.telegram_user_id, recorded_at),
+            ).fetchone()
+            if inserted is None:
+                return False
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_users
+                SET stage = %s, screen_revision = %s, revision = %s,
+                    last_bot_user_action_at = %s, updated_at = %s
+                WHERE telegram_user_id = %s
+                  AND revision = %s
+                  AND stage IN (
+                      'source_data_deletion_requests',
+                      'source_data_deletion_review',
+                      'source_data_deletion_input'
+                  )
+                RETURNING revision
+                """,
+                (
+                    state.stage.value,
+                    state.screen_revision,
+                    state.revision,
+                    recorded_at,
+                    recorded_at,
+                    state.telegram_user_id,
+                    expected_revision,
+                ),
+            ).fetchone()
+            if changed is None:
+                raise RuntimeError("Conversation state changed concurrently")
+            _supersede_pending_conversation_messages(
+                connection,
+                telegram_user_id=message.telegram_user_id,
+                superseded_at=recorded_at,
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.bot_message_outbox (
+                    delivery_id, telegram_user_id, display_locale, screen_revision,
+                    message_text, button_rows, reply_button,
+                    reply_keyboard_action, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    message.delivery_id,
+                    message.telegram_user_id,
+                    message.display_locale,
+                    message.screen_revision,
+                    message.text,
+                    json.dumps(message.button_rows, ensure_ascii=False),
+                    message.reply_button,
+                    message.reply_keyboard_action.value,
+                    recorded_at,
+                ),
+            )
+            _insert_outbox(connection, command)
+            return True
+
     def next_source_chat_registration_generation(self) -> int:
         """Allocate the next generation from immutable Bot registration origins."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
@@ -16577,7 +17078,14 @@ def _begin_owned_contract(
         """,
         (consumer.value, incoming.message_id),
     ).fetchone()
-    if existing is not None and existing[0] == "accepted":
+    processing_status = (
+        existing.get("processing_status")
+        if isinstance(existing, Mapping)
+        else existing[0]
+        if existing is not None
+        else None
+    )
+    if processing_status == "accepted":
         _release_claim(connection, incoming.message_id)
         return False
     _accept_contract_inbox(
@@ -16706,6 +17214,7 @@ def _source_deletion_request_from_row(
         last_reminder_at=row["last_reminder_at"],
         next_reminder_at=row["next_reminder_at"],
         execution_attempt=row["execution_attempt"],
+        reminder_count=row.get("reminder_count", 0),
     )
 
 
@@ -16913,6 +17422,75 @@ def _source_scope_lists(
     )  # type: ignore[return-value]
 
 
+def _record_source_data_deletion_audit(
+    connection: psycopg.Connection[Any],
+    *,
+    request_id: str,
+    previous_state: str | None,
+    next_state: str,
+    reason_code: str,
+    actor_telegram_id: int | None,
+    notification_status: str,
+    recorded_at: datetime,
+) -> None:
+    """Write one bounded deletion lifecycle event in the same transaction."""
+    connection.execute(
+        """
+        SELECT football_runtime.record_source_data_deletion_audit(
+            %s, %s, %s, %s, %s, %s, %s
+        )
+        """,
+        (
+            request_id,
+            previous_state,
+            next_state,
+            reason_code,
+            actor_telegram_id,
+            notification_status,
+            recorded_at,
+        ),
+    )
+
+
+def _source_data_deletion_reminder_envelope(
+    *,
+    request_id: str,
+    administrator_id: int,
+    status: str,
+    reminder_at: datetime,
+    deadline_at: datetime,
+    reminder_count: int,
+) -> ContractEnvelope:
+    """Build one canonical body-free administrator reminder."""
+    message_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:source-data-deletion:reminder:{request_id}:{reminder_count}",
+    )
+    return ContractEnvelope(
+        contract_name=ContractName.SOURCE_DATA_DELETION_REMINDER,
+        contract_version=1,
+        message_id=message_id,
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.BOT_ASSISTANT,
+        subject_id=request_id,
+        subject_revision=reminder_count,
+        idempotency_key=(
+            f"source-data-deletion-reminder:{request_id}:{reminder_count}"
+        ),
+        causation_id=message_id,
+        correlation_id=_source_deletion_request_correlation(request_id),
+        recorded_at=reminder_at,
+        payload={
+            "request_id": request_id,
+            "telegram_admin_user_id": administrator_id,
+            "status": status,
+            "reminder_at": reminder_at.isoformat(),
+            "deadline_at": deadline_at.isoformat(),
+            "reminder_count": reminder_count,
+        },
+    )
+
+
 def _scrub_source_scope_outbox(
     connection: psycopg.Connection[Any],
     *,
@@ -16923,33 +17501,220 @@ def _scrub_source_scope_outbox(
     opportunity_revision_ids: Iterable[str],
 ) -> int:
     """Remove content fields from one owner's pending source-derived outbox."""
+    source_message_id_values = list(source_message_ids)
+    source_revision_values = list(source_message_revision_ids)
+    opportunity_id_values = list(opportunity_ids)
+    opportunity_revision_values = list(opportunity_revision_ids)
     changed = connection.execute(
         """
         UPDATE football_runtime.contract_outbox
-        SET payload = payload - ARRAY[
-            'body', 'bounded_metadata', 'source_chat_geography',
-            'eligible_reply_context', 'adjacent_context', 'output',
-            'semantic_proof', 'semantic_proofs',
-            'semantic_proof_execution', 'semantic_proof_executions',
-            'ambiguity_pass_execution', 'evidence', 'response_route'
-        ]::text[]
+        SET payload = CASE
+            WHEN contract_name = 'OpportunityPublicationChanged'
+             AND contract_version IN (3, 5)
+             AND jsonb_typeof(payload -> 'opportunities') = 'array'
+            THEN jsonb_set(
+                payload,
+                '{opportunities}',
+                COALESCE(
+                    (
+                        SELECT jsonb_agg(
+                            CASE
+                                WHEN payload ->> 'source_message_revision_id' = ANY(%s)
+                                  OR item ->> 'source_message_revision_id' = ANY(%s)
+                                  OR item ->> 'opportunity_id' = ANY(%s)
+                                  OR item ->> 'opportunity_revision_id' = ANY(%s)
+                                THEN (
+                                    item - ARRAY[
+                                        'accepted_facts', 'evidence',
+                                        'response_route'
+                                    ]::text[]
+                                ) || jsonb_build_object(
+                                    'response_route', jsonb_build_object(
+                                        'kind', 'unavailable', 'value', ''
+                                    )
+                                )
+                                ELSE item
+                            END
+                            ORDER BY item_with_ordinality.ordinality
+                        )
+                        FROM jsonb_array_elements(payload -> 'opportunities')
+                            WITH ORDINALITY
+                            AS item_with_ordinality(item, ordinality)
+                    ),
+                    '[]'::jsonb
+                )
+            )
+            ELSE payload - ARRAY[
+                'body', 'bounded_metadata', 'source_chat_geography',
+                'eligible_reply_context', 'adjacent_context', 'output',
+                'semantic_proof', 'semantic_proofs',
+                'semantic_proof_execution', 'semantic_proof_executions',
+                'ambiguity_pass_execution', 'evidence', 'response_route'
+            ]::text[]
+        END
         WHERE producer_role = %s
           AND (
               payload ->> 'source_message_id' = ANY(%s)
               OR payload ->> 'source_message_revision_id' = ANY(%s)
               OR payload ->> 'opportunity_id' = ANY(%s)
               OR payload ->> 'opportunity_revision_id' = ANY(%s)
+              OR (
+                  contract_name = 'OpportunityPublicationChanged'
+                  AND contract_version IN (3, 5)
+                  AND (
+                      payload ->> 'source_message_revision_id' = ANY(%s)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(
+                              CASE
+                              WHEN jsonb_typeof(
+                                  payload -> 'opportunities'
+                              ) = 'array'
+                                  THEN payload -> 'opportunities'
+                                  ELSE '[]'::jsonb
+                              END
+                          ) AS item
+                          WHERE item ->> 'source_message_revision_id' = ANY(%s)
+                             OR item ->> 'opportunity_id' = ANY(%s)
+                             OR item ->> 'opportunity_revision_id' = ANY(%s)
+                      )
+                  )
+              )
           )
         """,
         (
+            source_revision_values,
+            source_revision_values,
+            opportunity_id_values,
+            opportunity_revision_values,
             producer_role.value,
-            list(source_message_ids),
-            list(source_message_revision_ids),
-            list(opportunity_ids),
-            list(opportunity_revision_ids),
+            source_message_id_values,
+            source_revision_values,
+            opportunity_id_values,
+            opportunity_revision_values,
+            source_revision_values,
+            source_revision_values,
+            opportunity_id_values,
+            opportunity_revision_values,
         ),
     )
     return changed.rowcount
+
+
+def _cleanup_bot_source_scope(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_ids: Iterable[str],
+    source_message_revision_ids: Iterable[str],
+    opportunity_ids: Iterable[str],
+    opportunity_revision_ids: Iterable[str],
+) -> int:
+    """Remove Bot-owned result context and retained text for deleted sources."""
+    source_message_id_values = list(source_message_ids)
+    source_revision_values = list(source_message_revision_ids)
+    opportunity_id_values = list(opportunity_ids)
+    opportunity_revision_values = list(opportunity_revision_ids)
+    affected_searches = connection.execute(
+        """
+        SELECT DISTINCT result.completed_search_id
+        FROM football_runtime.recommendation_results AS result
+        WHERE result.card_facts ->> 'opportunity_id' = ANY(%s)
+           OR result.card_facts ->> 'opportunity_revision_id' = ANY(%s)
+           OR result.card_facts ->> 'source_message_revision_id' = ANY(%s)
+        UNION
+        SELECT DISTINCT search.completed_search_id
+        FROM football_runtime.recommendation_completed_searches AS search
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE
+                WHEN jsonb_typeof(search.opportunity_revision_inputs) = 'array'
+                THEN search.opportunity_revision_inputs
+                ELSE '[]'::jsonb
+            END
+        ) AS item
+        WHERE item ->> 'opportunity_id' = ANY(%s)
+           OR item ->> 'opportunity_revision_id' = ANY(%s)
+           OR item ->> 'source_message_revision_id' = ANY(%s)
+        """,
+        (
+            opportunity_id_values,
+            opportunity_revision_values,
+            source_revision_values,
+            opportunity_id_values,
+            opportunity_revision_values,
+            source_revision_values,
+        ),
+    ).fetchall()
+    completed_search_ids = [row[0] for row in affected_searches]
+    if not completed_search_ids:
+        return _scrub_source_scope_outbox(
+            connection,
+            producer_role=RuntimeRole.BOT_ASSISTANT,
+            source_message_ids=source_message_id_values,
+            source_message_revision_ids=source_revision_values,
+            opportunity_ids=opportunity_id_values,
+            opportunity_revision_ids=opportunity_revision_values,
+        )
+
+    count = 0
+    changed = connection.execute(
+        """
+        DELETE FROM football_runtime.bot_active_result_contexts
+        WHERE completed_search_id = ANY(%s)
+        """,
+        (completed_search_ids,),
+    )
+    count += changed.rowcount
+    changed = connection.execute(
+        """
+        DELETE FROM football_runtime.bot_result_conversation_messages
+        WHERE completed_search_id = ANY(%s)
+        """,
+        (completed_search_ids,),
+    )
+    count += changed.rowcount
+    presentation_rows = connection.execute(
+        """
+        DELETE FROM football_runtime.bot_search_presentations
+        WHERE completed_search_id = ANY(%s)
+        RETURNING delivery_id
+        """,
+        (completed_search_ids,),
+    ).fetchall()
+    delivery_ids = [row[0] for row in presentation_rows]
+    count += len(delivery_ids)
+    if delivery_ids:
+        changed = connection.execute(
+            """
+            DELETE FROM football_runtime.bot_old_chat_views
+            WHERE delivery_id = ANY(%s)
+            """,
+            (delivery_ids,),
+        )
+        count += changed.rowcount
+        changed = connection.execute(
+            """
+            DELETE FROM football_runtime.bot_active_chat_views
+            WHERE delivery_id = ANY(%s)
+            """,
+            (delivery_ids,),
+        )
+        count += changed.rowcount
+        changed = connection.execute(
+            """
+            DELETE FROM football_runtime.bot_message_outbox
+            WHERE delivery_id = ANY(%s)
+            """,
+            (delivery_ids,),
+        )
+        count += changed.rowcount
+    return count + _scrub_source_scope_outbox(
+        connection,
+        producer_role=RuntimeRole.BOT_ASSISTANT,
+        source_message_ids=source_message_id_values,
+        source_message_revision_ids=source_revision_values,
+        opportunity_ids=opportunity_id_values,
+        opportunity_revision_ids=opportunity_revision_values,
+    )
 
 
 def _suppress_source_scope_for_owner(
@@ -17081,7 +17846,13 @@ def _suppress_source_scope_for_owner(
             opportunity_revision_ids=opportunity_revision_ids,
         )
     elif owner is RuntimeRole.BOT_ASSISTANT:
-        pass
+        count += _cleanup_bot_source_scope(
+            connection,
+            source_message_ids=source_message_ids,
+            source_message_revision_ids=source_message_revision_ids,
+            opportunity_ids=opportunity_ids,
+            opportunity_revision_ids=opportunity_revision_ids,
+        )
     return count
 
 
@@ -17401,5 +18172,11 @@ def _delete_source_scope_for_owner(
             opportunity_revision_ids=opportunity_revision_ids,
         )
     elif owner is RuntimeRole.BOT_ASSISTANT:
-        pass
+        count += _cleanup_bot_source_scope(
+            connection,
+            source_message_ids=source_message_ids,
+            source_message_revision_ids=source_message_revision_ids,
+            opportunity_ids=opportunity_ids,
+            opportunity_revision_ids=opportunity_revision_ids,
+        )
     return count

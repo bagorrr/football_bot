@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-12:] == [
-        "0040_coaching_ingestion_role_projection_gate.sql",
         "0041_exact_repost_referee_generic_projection.sql",
         "0042_moderation_review_events.sql",
         "0043_source_chat_administration_lifecycle.sql",
@@ -59,6 +58,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
         "0051_source_data_deletion.sql",
+        "0052_source_data_deletion_review_fixes.sql",
     ]
 
 
@@ -531,7 +531,19 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'requested_source_message_id text, '
                                  'requested_as_of timestamp with time zone)',
                                  'football_runtime.cleanup_expired_source_data('
-                                 'requested_as_of timestamp with time zone)'
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.record_source_data_deletion_audit('
+                                 'requested_request_id text, '
+                                 'requested_previous_state text, '
+                                 'requested_next_state text, '
+                                 'requested_reason_code text, '
+                                 'requested_actor_telegram_id bigint, '
+                                 'requested_notification_status text, '
+                                 'requested_recorded_at timestamp with time zone)',
+                                 'football_runtime.capture_source_data_deletion_pending_events('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_source_author_telegram_id bigint)'
                              ])
                          )
                    ),

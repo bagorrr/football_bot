@@ -38,6 +38,9 @@ class ConversationStage(StrEnum):
     MAIN_MENU = "main_menu"
     SETTINGS = "settings"
     ADMINISTRATION = "administration"
+    SOURCE_DATA_DELETION_REQUESTS = "source_data_deletion_requests"
+    SOURCE_DATA_DELETION_REVIEW = "source_data_deletion_review"
+    SOURCE_DATA_DELETION_INPUT = "source_data_deletion_input"
     SOURCE_CHATS = "source_chats"
     SOURCE_CHAT_ADDRESS_INPUT = "source_chat_address_input"
     SOURCE_CHAT_REGISTRATION_PENDING = "source_chat_registration_pending"
@@ -3779,6 +3782,9 @@ class SourceDataAuditEvent:
     reason_code: str
     recorded_at: datetime
     expires_at: datetime
+    request_id: str | None = None
+    actor_telegram_id: int | None = None
+    notification_status: str = "not_applicable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -3806,6 +3812,7 @@ class SourceDataDeletionRequest:
     last_reminder_at: datetime | None = None
     next_reminder_at: datetime | None = None
     execution_attempt: int = 0
+    reminder_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

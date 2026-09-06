@@ -2513,6 +2513,7 @@ class AcceptanceSpine:
         application = self._roles[RuntimeRole.APPLICATION]
         return application.store.remind_source_data_deletion_requests(
             as_of=as_of or self._clock.now(),
+            administrator_id=application.telegram_admin_user_id,
         )
 
     def source_data_audit_as(
@@ -4054,6 +4055,98 @@ class AcceptanceSpine:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_source_data_deletion_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one bounded Source Data Deletion callback."""
+        self._conversation_onboarding().select_source_data_deletion_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_data_deletion_request(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        source_author_telegram_id: int,
+        source_chat_key: str,
+        support_case_pointer: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive structured Source Data Deletion support intake."""
+        self._conversation_onboarding().submit_source_data_deletion_request(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            source_author_telegram_id=source_author_telegram_id,
+            source_chat_key=source_chat_key,
+            support_case_pointer=support_case_pointer,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_data_deletion_reason(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        decision_reason: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one structured Source Data Deletion rejection reason."""
+        self._conversation_onboarding().submit_source_data_deletion_reason(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            decision_reason=decision_reason,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_data_deletion_completion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        completion_outcome: str,
+        completion_proof_pointer: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one body-free manual Source Data Deletion completion."""
+        self._conversation_onboarding().submit_source_data_deletion_completion(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            completion_outcome=completion_outcome,
+            completion_proof_pointer=completion_proof_pointer,
             screen_revision=(
                 screen_revision
                 if screen_revision is not None

@@ -138,6 +138,93 @@ def test_source_deletion_status_query_rejects_extra_facts() -> None:
         )
 
 
+def _management_command(
+    action: str,
+    *,
+    request_id: str = "support-case:managed-deletion",
+    **facts: JsonValue,
+) -> ContractEnvelope:
+    idempotency_key = f"source-data-deletion:manage:{action}:{request_id}"
+    message_id = uuid5(NAMESPACE_URL, f"football-bot:{idempotency_key}")
+    payload: dict[str, JsonValue] = {
+        "request_id": request_id,
+        "action": action,
+        "telegram_admin_user_id": 46_801,
+        **facts,
+    }
+    return ContractEnvelope(
+        contract_name=ContractName.MANAGE_SOURCE_DATA_DELETION,
+        contract_version=1,
+        message_id=message_id,
+        producer=RuntimeRole.BOT_ASSISTANT,
+        consumer=RuntimeRole.APPLICATION,
+        subject_id=request_id,
+        subject_revision=1,
+        idempotency_key=idempotency_key,
+        causation_id=message_id,
+        correlation_id=uuid5(
+            NAMESPACE_URL,
+            f"football-bot:source-deletion:{request_id}",
+        ),
+        recorded_at=datetime(2026, 9, 6, tzinfo=UTC),
+        payload=payload,
+    )
+
+
+def test_management_intake_contract_is_body_free_and_canonical() -> None:
+    command = _management_command(
+        "intake",
+        source_author_telegram_id=7_001,
+        source_chat_key="source-chat:channel:4900100",
+        support_case_pointer="support-case:opaque",
+        received_at="2026-09-06T00:00:00+00:00",
+    )
+    assert command.contract_name is ContractName.MANAGE_SOURCE_DATA_DELETION
+
+
+def test_management_reject_requires_a_bounded_reason() -> None:
+    with pytest.raises(ValueError):
+        _management_command(
+            "reject",
+            decision_reason="reason with whitespace",
+            decided_at="2026-09-06T00:00:00+00:00",
+        )
+
+
+def test_reminder_contract_is_canonical_and_body_free() -> None:
+    request_id = "support-case:reminder"
+    count = 2
+    message_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:source-data-deletion:reminder:{request_id}:{count}",
+    )
+    command = ContractEnvelope(
+        contract_name=ContractName.SOURCE_DATA_DELETION_REMINDER,
+        contract_version=1,
+        message_id=message_id,
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.BOT_ASSISTANT,
+        subject_id=request_id,
+        subject_revision=count,
+        idempotency_key=f"source-data-deletion-reminder:{request_id}:{count}",
+        causation_id=message_id,
+        correlation_id=uuid5(
+            NAMESPACE_URL,
+            f"football-bot:source-deletion:{request_id}",
+        ),
+        recorded_at=datetime(2026, 9, 6, tzinfo=UTC),
+        payload={
+            "request_id": request_id,
+            "telegram_admin_user_id": 46_801,
+            "status": "pending_decision",
+            "reminder_at": "2026-09-06T00:00:00+00:00",
+            "deadline_at": "2026-09-07T00:00:00+00:00",
+            "reminder_count": count,
+        },
+    )
+    ContractEnvelope.from_raw(command)
+
+
 @pytest.mark.parametrize("value", (1, 7_001, 2**63 - 1))
 def test_source_author_identity_accepts_only_positive_telegram_ids(value: int) -> None:
     assert is_valid_source_author_telegram_id(value)

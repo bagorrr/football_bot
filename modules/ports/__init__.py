@@ -687,6 +687,19 @@ class ConversationStore(Protocol):
         """Commit one confirmed administrator Source Chat control atomically."""
         ...
 
+    def commit_source_data_deletion_command(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one bounded administrator deletion command atomically."""
+        ...
+
     def source_chat_administration_views(
         self,
     ) -> tuple[SourceChatRegistryEntry, ...]:
@@ -1235,6 +1248,24 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Record one owner acknowledgement and advance the request workflow."""
         ...
 
+    def apply_source_data_deletion_admin_command(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one Bot-owned, body-free administrator deletion command."""
+        ...
+
+    def accept_source_data_deletion_reminder(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Queue one body-free administrator reminder delivery."""
+        ...
+
     def source_data_deletion_replay_barriers(
         self,
     ) -> tuple[SourceDataDeletionReplayBarrier, ...]:
@@ -1249,6 +1280,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         source_chat_key: str,
         support_case_pointer: str,
         received_at: datetime,
+        actor_telegram_id: int | None = None,
     ) -> SourceDataDeletionRequest:
         """Persist one idempotent exact Source Author/Source Chat request."""
         ...
@@ -1270,6 +1302,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         request_id: str,
         effective_at: datetime,
+        actor_telegram_id: int | None = None,
     ) -> bool:
         """Start one explicit suppression phase and enqueue owner commands."""
         ...
@@ -1279,6 +1312,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         request_id: str,
         notified_at: datetime,
+        actor_telegram_id: int | None = None,
     ) -> bool:
         """Record requester notification state before manual completion."""
         ...
@@ -1290,11 +1324,14 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         completion_outcome: str,
         completion_proof_pointer: str,
         completed_at: datetime,
+        actor_telegram_id: int | None = None,
     ) -> bool:
         """Manually confirm completion after every owner and notification gate."""
         ...
 
-    def remind_source_data_deletion_requests(self, *, as_of: datetime) -> int:
+    def remind_source_data_deletion_requests(
+        self, *, as_of: datetime, administrator_id: int | None = None
+    ) -> int:
         """Advance due reminder state without approving or executing a request."""
         ...
 
