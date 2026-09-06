@@ -4594,8 +4594,28 @@ def _validate_source_data_deletion_contract(
         ):
             raise ValueError("ManageSourceDataDeletion correlation is invalid")
         expected_idempotency = f"source-data-deletion:manage:{action}:{request_id}"
-        if idempotency_key != expected_idempotency or message_id != uuid5(
-            NAMESPACE_URL, f"football-bot:{expected_idempotency}"
+        canonical_idempotency = expected_idempotency
+        if action == "notify" and idempotency_key.startswith(
+            f"{expected_idempotency}:phase:"
+        ):
+            notification_phase = idempotency_key.removeprefix(
+                f"{expected_idempotency}:phase:"
+            )
+            if notification_phase not in {
+                "approved_awaiting_execution",
+                "rejected",
+                "suppressing",
+                "executing",
+                "execution_error",
+                "awaiting_completion",
+                "completed",
+            }:
+                raise ValueError(
+                    "ManageSourceDataDeletion notification phase is invalid"
+                )
+            canonical_idempotency = idempotency_key
+        if idempotency_key != canonical_idempotency or message_id != uuid5(
+            NAMESPACE_URL, f"football-bot:{canonical_idempotency}"
         ):
             raise ValueError("ManageSourceDataDeletion identity is not canonical")
         for field_name in action_fields[action]:

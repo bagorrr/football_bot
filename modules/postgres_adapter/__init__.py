@@ -204,6 +204,8 @@ _LEGACY_MIGRATION_NAMES = (
     "0052_source_data_deletion_review_fixes.sql",
     "0053_source_data_deletion_p1_fixes.sql",
     "0054_source_data_deletion_replay_retention.sql",
+    "0055_source_message_deletion_boundary.sql",
+    "0056_source_data_deletion_bot_fail_closed.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -262,6 +264,8 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "71525e0239993f8c0a0cd849cc37fdfbdfef5279c11b87efbfe19665cf9cfa33",
     "38b9132d69099adb40feab0f6d87da5e7245ab2d3e9b3287a19aa4f095477059",
     "a9b4c99bc4d5bd3d7d26b439769166f55743226e669704b006f9d8e1a1831d64",
+    "7afb46e943b06aaf37111f3fc223e7fa041b569eb715a8db02a888833f6e30cf",
+    "441dea8bc764ec932169281f6ad02ac87beeb76593ff746bf968e67d478478ed",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -4112,10 +4116,13 @@ class PostgresRoleStore:
             )
             replay_barrier_active = False
             if event.kind is not SourceEventKind.DELETE:
+                replay_event_time = (
+                    event.event_time if event.kind is SourceEventKind.EDIT else None
+                )
                 barrier_row = connection.execute(
                     """
                     SELECT football_runtime.source_message_replay_barrier(
-                        %s, %s, %s, %s
+                        %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -4123,6 +4130,7 @@ class PostgresRoleStore:
                         identity.telegram_id,
                         registry_generation,
                         event.telegram_message_id,
+                        replay_event_time,
                     ),
                 ).fetchone()
                 replay_barrier_active = (
@@ -4475,9 +4483,15 @@ class PostgresRoleStore:
                 ).fetchone()
             deletion_barrier = connection.execute(
                 """
-                SELECT football_runtime.source_message_deletion_barrier(%s)
+                SELECT football_runtime.source_message_deletion_barrier(
+                    %s, %s, %s
+                )
                 """,
-                (incoming.subject_id,),
+                (
+                    incoming.subject_id,
+                    source_message_revision_id,
+                    event_time if event_kind == SourceEventKind.EDIT.value else None,
+                ),
             ).fetchone()
             deletion_barrier_active = (
                 bool(deletion_barrier[0]) if deletion_barrier is not None else False
@@ -4803,7 +4817,13 @@ class PostgresRoleStore:
             _release_claim(connection, incoming.message_id)
         return ConsumeResult.APPLIED
 
-    def source_message_deletion_barrier(self, source_message_id: str) -> bool:
+    def source_message_deletion_barrier(
+        self,
+        source_message_id: str,
+        *,
+        source_message_revision_id: str | None = None,
+        event_time: datetime | None = None,
+    ) -> bool:
         """Read the body-free deletion barrier through the role's SQL seam."""
         if self._role not in {
             RuntimeRole.INGESTION,
@@ -4812,12 +4832,16 @@ class PostgresRoleStore:
             RuntimeRole.RECOMMENDATION,
         }:
             raise ConversationAccessDeniedError
+        if event_time is not None and event_time.tzinfo is None:
+            raise ValueError("Source Message barrier time is naive")
         with psycopg.connect(self._database_url) as connection:
             row = connection.execute(
                 """
-                SELECT football_runtime.source_message_deletion_barrier(%s)
+                SELECT football_runtime.source_message_deletion_barrier(
+                    %s, %s, %s
+                )
                 """,
-                (source_message_id,),
+                (source_message_id, source_message_revision_id, event_time),
             ).fetchone()
         return bool(row[0]) if row is not None else False
 
@@ -5448,6 +5472,12 @@ class PostgresRoleStore:
                 opportunity_revision_ids = [
                     row["opportunity_revision_id"] for row in opportunity_rows
                 ]
+                bot_completed_search_ids = _capture_bot_completed_search_ids(
+                    connection,
+                    opportunity_ids=opportunity_ids,
+                    opportunity_revision_ids=opportunity_revision_ids,
+                    source_message_revision_ids=source_revision_ids,
+                )
             barrier_expires_at = effective_at + timedelta(days=90)
             if retry:
                 existing_barrier = connection.execute(
@@ -5637,25 +5667,27 @@ class PostgresRoleStore:
                 "execution_error",
                 "awaiting_completion",
                 "rejected",
+                "completed",
             }:
                 return False
             changed = connection.execute(
                 """
                 UPDATE football_runtime.application_source_data_deletion_requests
                 SET requester_notification_status = 'recorded',
-                    requester_notified_at = COALESCE(requester_notified_at, %s)
+                    requester_notified_at = %s
                 WHERE request_id = %s
                   AND status IN (
                       'approved_awaiting_execution', 'suppressing', 'executing',
-                      'execution_error', 'awaiting_completion', 'rejected'
+                      'execution_error', 'awaiting_completion', 'rejected',
+                      'completed'
                   )
                 RETURNING request_id
                 """,
                 (notified_at, request_id),
             ).fetchone()
-            if (
-                changed is not None
-                and request["requester_notification_status"] != "recorded"
+            if changed is not None and (
+                request["requester_notification_status"] != "recorded"
+                or request["status"] == "completed"
             ):
                 _record_source_data_deletion_audit(
                     connection,
@@ -7096,11 +7128,14 @@ class PostgresRoleStore:
             ):
                 return ConsumeResult.REPLAYED
             if finalize:
-                source_message_ids = tuple(
+                source_message_revisions = tuple(
                     sorted(
                         {
-                            _source_message_id_for_lifecycle(
-                                stored_attempt.source_message_revision_id
+                            (
+                                _source_message_id_for_lifecycle(
+                                    stored_attempt.source_message_revision_id
+                                ),
+                                stored_attempt.source_message_revision_id,
                             )
                             for stored_attempt in (
                                 attempt,
@@ -7116,8 +7151,11 @@ class PostgresRoleStore:
                     _source_message_lifecycle_deleted(
                         connection,
                         source_message_id=source_message_id,
+                        source_message_revision_id=source_message_revision_id,
                     )
-                    for source_message_id in source_message_ids
+                    for source_message_id, source_message_revision_id in (
+                        source_message_revisions
+                    )
                 )
                 if source_deleted:
                     # Preserve the body-free execution record, but never commit
@@ -7307,9 +7345,11 @@ class PostgresRoleStore:
             connection = self._classification_admission_connection
             barrier = connection.execute(
                 """
-                SELECT football_runtime.source_message_deletion_barrier(%s)
+                SELECT football_runtime.source_message_deletion_barrier(
+                    %s, %s, NULL
+                )
                 """,
-                (source_message_id,),
+                (source_message_id, attempt.source_message_revision_id),
             ).fetchone()
             if barrier is not None and barrier[0]:
                 self._finish_classification_admission(
@@ -7387,9 +7427,11 @@ class PostgresRoleStore:
             )
             barrier = connection.execute(
                 """
-                SELECT football_runtime.source_message_deletion_barrier(%s)
+                SELECT football_runtime.source_message_deletion_barrier(
+                    %s, %s, NULL
+                )
                 """,
-                (source_message_id,),
+                (source_message_id, attempt.source_message_revision_id),
             ).fetchone()
             if barrier is not None and barrier[0]:
                 connection.rollback()
@@ -8409,6 +8451,7 @@ class PostgresRoleStore:
                     source_message_id=_source_message_id_for_lifecycle(
                         outcome.source_message_revision_id
                     ),
+                    source_message_revision_id=outcome.source_message_revision_id,
                 )
             ):
                 _release_claim(connection, incoming.message_id)
@@ -8485,6 +8528,7 @@ class PostgresRoleStore:
             if _source_message_lifecycle_deleted(
                 connection,
                 source_message_id=source_message_id,
+                source_message_revision_id=source_message_revision_id,
             ):
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
@@ -8698,6 +8742,7 @@ class PostgresRoleStore:
             source_deleted = _source_message_lifecycle_deleted(
                 connection,
                 source_message_id=source_message_id,
+                source_message_revision_id=first_source_message_revision_id,
             )
             if source_deleted:
                 _release_claim(connection, incoming.message_id)
@@ -9346,9 +9391,11 @@ class PostgresRoleStore:
                 )
                 deleted_row = connection.execute(
                     """
-                    SELECT football_runtime.source_message_deletion_barrier(%s)
+                    SELECT football_runtime.source_message_deletion_barrier(
+                        %s, %s, NULL
+                    )
                     """,
-                    (source_message_id,),
+                    (source_message_id, source_revision_id),
                 ).fetchone()
                 source_deleted = bool(deleted_row[0]) if deleted_row else False
             if incoming.contract_version in {3, 5}:
@@ -11288,6 +11335,8 @@ class PostgresRoleStore:
                        absolute_position, screen_revision
                 FROM football_runtime.bot_active_result_contexts
                 WHERE telegram_user_id = %s
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(completed_search_id)
                 FOR UPDATE
                 """,
                 (telegram_user_id,),
@@ -11416,6 +11465,10 @@ class PostgresRoleStore:
                 WHERE outbox.delivery_id = %s
                   AND outbox.claim_token = %s
                   AND outbox.delivered_at IS NULL
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(
+                          presentation.completed_search_id
+                      )
                 FOR UPDATE OF outbox
                 """,
                 (delivery_id, claim_token),
@@ -11664,6 +11717,8 @@ class PostgresRoleStore:
                 SELECT completed_search_id
                 FROM football_runtime.bot_active_result_contexts
                 WHERE telegram_user_id = %s
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(completed_search_id)
                 """,
                 (telegram_user_id,),
             ).fetchone()
@@ -11737,6 +11792,8 @@ class PostgresRoleStore:
                 SELECT completed_search_id
                 FROM football_runtime.bot_active_result_contexts
                 WHERE telegram_user_id = %s
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(completed_search_id)
                 """,
                 (telegram_user_id,),
             ).fetchone()
@@ -12507,6 +12564,10 @@ class PostgresRoleStore:
                     WHERE presentation.telegram_user_id = %s
                       AND outbox.delivered_at IS NULL
                       AND outbox.superseded_at IS NULL
+                      AND NOT football_runtime.
+                          bot_completed_search_deletion_barrier(
+                              presentation.completed_search_id
+                          )
                 )
                 ON CONFLICT DO NOTHING
                 RETURNING update_id
@@ -12569,6 +12630,22 @@ class PostgresRoleStore:
             if existing is not None and existing[0] == "accepted":
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.REPLAYED
+            deletion_barrier = connection.execute(
+                """
+                SELECT football_runtime.
+                    bot_completed_search_deletion_barrier(%s)
+                """,
+                (completed_search_id,),
+            ).fetchone()
+            if deletion_barrier is not None and deletion_barrier[0]:
+                _accept_contract_inbox(
+                    connection,
+                    consumer=self._role,
+                    incoming=incoming,
+                    received_at=received_at,
+                )
+                _release_claim(connection, incoming.message_id)
+                return ConsumeResult.APPLIED
             state = connection.execute(
                 """
                 SELECT revision, stage
@@ -12593,6 +12670,8 @@ class PostgresRoleStore:
                 SELECT completed_search_id
                 FROM football_runtime.bot_active_result_contexts
                 WHERE telegram_user_id = %s
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(completed_search_id)
                 """,
                 (message.telegram_user_id,),
             ).fetchone()
@@ -12922,6 +13001,15 @@ class PostgresRoleStore:
             self._database_url,
             row_factory=dict_row,
         ) as connection:
+            deletion_barrier = connection.execute(
+                """
+                SELECT football_runtime.bot_completed_search_deletion_barrier(%s)
+                    AS is_deleted
+                """,
+                (completed_search_id,),
+            ).fetchone()
+            if deletion_barrier is not None and deletion_barrier["is_deleted"]:
+                return CompletedSearchQueryResult(CompletedSearchQueryStatus.MISSING)
             search_row = connection.execute(
                 """
                 SELECT completed_search_id, telegram_user_id, search_update_id,
@@ -13068,8 +13156,29 @@ class PostgresRoleStore:
                 JOIN football_runtime.bot_users AS account
                   ON account.telegram_user_id = outbox.telegram_user_id
                  AND account.screen_revision = outbox.screen_revision
+                LEFT JOIN football_runtime.bot_search_presentations AS presentation
+                  ON presentation.delivery_id = outbox.delivery_id
                 WHERE outbox.telegram_user_id = %s
                   AND outbox.superseded_at IS NULL
+                  AND (
+                      presentation.delivery_id IS NULL
+                      OR NOT football_runtime.
+                          bot_completed_search_deletion_barrier(
+                              presentation.completed_search_id
+                          )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM football_runtime.bot_result_conversation_messages
+                          AS conversation
+                      WHERE conversation.telegram_user_id = outbox.telegram_user_id
+                        AND outbox.delivery_id =
+                            'result-conversation:' || conversation.turn_id
+                        AND football_runtime.
+                            bot_completed_search_deletion_barrier(
+                                conversation.completed_search_id
+                            )
+                  )
                 ORDER BY outbox.sequence_id DESC
                 LIMIT 1
                 """,
@@ -13085,10 +13194,31 @@ class PostgresRoleStore:
         ) as connection:
             row = connection.execute(
                 """
-                SELECT telegram_user_id, screen_revision, delivery_id,
-                       telegram_message_id
-                FROM football_runtime.bot_active_chat_views
-                WHERE telegram_user_id = %s
+                SELECT view.telegram_user_id, view.screen_revision,
+                       view.delivery_id, view.telegram_message_id
+                FROM football_runtime.bot_active_chat_views AS view
+                WHERE view.telegram_user_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM football_runtime.bot_search_presentations AS presentation
+                      WHERE presentation.delivery_id = view.delivery_id
+                        AND football_runtime.
+                            bot_completed_search_deletion_barrier(
+                                presentation.completed_search_id
+                            )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM football_runtime.bot_result_conversation_messages
+                          AS conversation
+                      WHERE conversation.telegram_user_id = view.telegram_user_id
+                        AND view.delivery_id =
+                            'result-conversation:' || conversation.turn_id
+                        AND football_runtime.
+                            bot_completed_search_deletion_barrier(
+                                conversation.completed_search_id
+                            )
+                  )
                 """,
                 (telegram_user_id,),
             ).fetchone()
@@ -13115,6 +13245,8 @@ class PostgresRoleStore:
                        absolute_position, screen_revision
                 FROM football_runtime.bot_active_result_contexts
                 WHERE telegram_user_id = %s
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(completed_search_id)
                 """,
                 (telegram_user_id,),
             ).fetchone()
@@ -13143,6 +13275,8 @@ class PostgresRoleStore:
                 SELECT completed_search_id
                 FROM football_runtime.bot_active_result_contexts
                 WHERE telegram_user_id = %s
+                  AND NOT football_runtime.
+                      bot_completed_search_deletion_barrier(completed_search_id)
                 """,
                 (telegram_user_id,),
             ).fetchone()
@@ -13573,29 +13707,52 @@ class PostgresRoleStore:
             row = connection.execute(
                 """
                 WITH candidate AS (
-                    SELECT delivery_id, delivery_status
-                    FROM football_runtime.bot_message_outbox
-                    WHERE delivered_at IS NULL
-                      AND superseded_at IS NULL
+                    SELECT outbox.delivery_id, outbox.delivery_status
+                    FROM football_runtime.bot_message_outbox AS outbox
+                    LEFT JOIN football_runtime.bot_search_presentations
+                        AS presentation
+                      ON presentation.delivery_id = outbox.delivery_id
+                    WHERE outbox.delivered_at IS NULL
+                      AND outbox.superseded_at IS NULL
+                      AND (
+                          presentation.delivery_id IS NULL
+                          OR NOT football_runtime.
+                              bot_completed_search_deletion_barrier(
+                                  presentation.completed_search_id
+                              )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM football_runtime.
+                              bot_result_conversation_messages AS conversation
+                          WHERE conversation.telegram_user_id =
+                                outbox.telegram_user_id
+                            AND outbox.delivery_id =
+                                'result-conversation:' || conversation.turn_id
+                            AND football_runtime.
+                                bot_completed_search_deletion_barrier(
+                                    conversation.completed_search_id
+                                )
+                      )
                       AND (
                           (
-                              delivery_status = 'pending'
-                              AND claim_token IS NULL
+                              outbox.delivery_status = 'pending'
+                              AND outbox.claim_token IS NULL
                           )
                           OR (
-                              delivery_status = 'attempting'
-                              AND claimed_at <= %s
+                              outbox.delivery_status = 'attempting'
+                              AND outbox.claimed_at <= %s
                           )
                           OR (
-                              delivery_status = 'outcome_unknown'
+                              outbox.delivery_status = 'outcome_unknown'
                               AND (
-                                  claim_token IS NULL
-                                  OR claimed_at <= %s
+                                  outbox.claim_token IS NULL
+                                  OR outbox.claimed_at <= %s
                               )
                           )
                       )
-                    ORDER BY sequence_id
-                    FOR UPDATE
+                    ORDER BY outbox.sequence_id
+                    FOR UPDATE OF outbox
                     LIMIT 1
                 )
                 UPDATE football_runtime.bot_message_outbox
@@ -13842,6 +13999,50 @@ class PostgresRoleStore:
                 """,
                 (delivered_at, delivery_id),
             )
+            search_presentation = connection.execute(
+                """
+                SELECT completed_search_id, current_result_id, absolute_position
+                FROM football_runtime.bot_search_presentations
+                WHERE delivery_id = %s AND telegram_user_id = %s
+                """,
+                (delivery_id, telegram_user_id),
+            ).fetchone()
+            conversation_search = connection.execute(
+                """
+                SELECT conversation.completed_search_id
+                FROM football_runtime.bot_result_conversation_messages
+                    AS conversation
+                WHERE conversation.telegram_user_id = %s
+                  AND %s = 'result-conversation:' || conversation.turn_id
+                LIMIT 1
+                """,
+                (telegram_user_id, delivery_id),
+            ).fetchone()
+            source_search_id = (
+                search_presentation[0]
+                if search_presentation is not None
+                else conversation_search[0]
+                if conversation_search is not None
+                else None
+            )
+            if source_search_id is not None:
+                deletion_barrier = connection.execute(
+                    """
+                    SELECT football_runtime.
+                        bot_completed_search_deletion_barrier(%s)
+                    """,
+                    (source_search_id,),
+                ).fetchone()
+                if deletion_barrier is not None and deletion_barrier[0]:
+                    connection.execute(
+                        """
+                        UPDATE football_runtime.bot_message_outbox
+                        SET superseded_at = COALESCE(superseded_at, %s)
+                        WHERE delivery_id = %s
+                        """,
+                        (delivered_at, delivery_id),
+                    )
+                    return
             if superseded_at is None:
                 previous_view = connection.execute(
                     """
@@ -13902,14 +14103,6 @@ class PostgresRoleStore:
                             delivered_at,
                         ),
                     )
-                search_presentation = connection.execute(
-                    """
-                    SELECT completed_search_id, current_result_id, absolute_position
-                    FROM football_runtime.bot_search_presentations
-                    WHERE delivery_id = %s AND telegram_user_id = %s
-                    """,
-                    (delivery_id, telegram_user_id),
-                ).fetchone()
                 if search_presentation is not None:
                     completed_search_id = search_presentation[0]
                     current_result_id = search_presentation[1]
@@ -16968,6 +17161,7 @@ def _source_message_lifecycle_deleted(
     connection: psycopg.Connection[Any],
     *,
     source_message_id: str,
+    source_message_revision_id: str,
 ) -> bool:
     """Lock and re-check deletion immediately before a terminal source write."""
     _lock_source_message_lifecycle(
@@ -16976,9 +17170,9 @@ def _source_message_lifecycle_deleted(
     )
     deleted_row = connection.execute(
         """
-        SELECT football_runtime.source_message_deletion_barrier(%s)
+        SELECT football_runtime.source_message_deletion_barrier(%s, %s, NULL)
         """,
-        (source_message_id,),
+        (source_message_id, source_message_revision_id),
     ).fetchone()
     return bool(deleted_row[0]) if deleted_row is not None else False
 
@@ -17752,6 +17946,31 @@ def _find_bot_completed_search_ids(
     return sorted(row[0] for row in rows)
 
 
+def _capture_bot_completed_search_ids(
+    connection: psycopg.Connection[Any],
+    *,
+    opportunity_ids: Iterable[str],
+    opportunity_revision_ids: Iterable[str],
+    source_message_revision_ids: Iterable[str],
+) -> list[str]:
+    """Capture Bot searches through the Recommendation-owned SQL seam."""
+    row = connection.execute(
+        """
+        SELECT football_runtime.capture_source_data_deletion_bot_search_ids(
+            %s, %s, %s
+        ) AS completed_search_ids
+        """,
+        (
+            list(opportunity_ids),
+            list(opportunity_revision_ids),
+            list(source_message_revision_ids),
+        ),
+    ).fetchone()
+    if row is None:
+        return []
+    return sorted(cast(list[str], row["completed_search_ids"] or []))
+
+
 def _cleanup_bot_source_scope(
     connection: psycopg.Connection[Any],
     *,
@@ -17767,68 +17986,71 @@ def _cleanup_bot_source_scope(
     opportunity_id_values = list(opportunity_ids)
     opportunity_revision_values = list(opportunity_revision_ids)
     completed_search_ids = list(bot_completed_search_ids)
-    if not completed_search_ids:
-        return _scrub_source_scope_outbox(
-            connection,
-            producer_role=RuntimeRole.BOT_ASSISTANT,
-            source_message_ids=source_message_id_values,
-            source_message_revision_ids=source_revision_values,
-            opportunity_ids=opportunity_id_values,
-            opportunity_revision_ids=opportunity_revision_values,
-        )
 
     count = 0
-    changed = connection.execute(
-        """
-        DELETE FROM football_runtime.bot_active_result_contexts
-        WHERE completed_search_id = ANY(%s)
-        """,
-        (completed_search_ids,),
-    )
-    count += changed.rowcount
-    changed = connection.execute(
-        """
-        DELETE FROM football_runtime.bot_result_conversation_messages
-        WHERE completed_search_id = ANY(%s)
-        """,
-        (completed_search_ids,),
-    )
-    count += changed.rowcount
-    presentation_rows = connection.execute(
-        """
-        DELETE FROM football_runtime.bot_search_presentations
-        WHERE completed_search_id = ANY(%s)
-        RETURNING delivery_id
-        """,
-        (completed_search_ids,),
-    ).fetchall()
-    delivery_ids = [row[0] for row in presentation_rows]
-    count += len(delivery_ids)
-    if delivery_ids:
+    if completed_search_ids:
         changed = connection.execute(
             """
-            DELETE FROM football_runtime.bot_old_chat_views
-            WHERE delivery_id = ANY(%s)
+            DELETE FROM football_runtime.bot_active_result_contexts
+            WHERE completed_search_id = ANY(%s)
             """,
-            (delivery_ids,),
+            (completed_search_ids,),
         )
         count += changed.rowcount
+        conversation_delivery_rows = connection.execute(
+            """
+            SELECT DISTINCT 'result-conversation:' || turn_id
+            FROM football_runtime.bot_result_conversation_messages
+            WHERE completed_search_id = ANY(%s)
+            """,
+            (completed_search_ids,),
+        ).fetchall()
         changed = connection.execute(
             """
-            DELETE FROM football_runtime.bot_active_chat_views
-            WHERE delivery_id = ANY(%s)
+            DELETE FROM football_runtime.bot_result_conversation_messages
+            WHERE completed_search_id = ANY(%s)
             """,
-            (delivery_ids,),
+            (completed_search_ids,),
         )
         count += changed.rowcount
-        changed = connection.execute(
+        presentation_rows = connection.execute(
             """
-            DELETE FROM football_runtime.bot_message_outbox
-            WHERE delivery_id = ANY(%s)
+            DELETE FROM football_runtime.bot_search_presentations
+            WHERE completed_search_id = ANY(%s)
+            RETURNING delivery_id
             """,
-            (delivery_ids,),
+            (completed_search_ids,),
+        ).fetchall()
+        delivery_ids = sorted(
+            {row[0] for row in presentation_rows}
+            | {row[0] for row in conversation_delivery_rows}
         )
-        count += changed.rowcount
+        count += len(presentation_rows)
+        if delivery_ids:
+            changed = connection.execute(
+                """
+                DELETE FROM football_runtime.bot_old_chat_views
+                WHERE delivery_id = ANY(%s)
+                """,
+                (delivery_ids,),
+            )
+            count += changed.rowcount
+            changed = connection.execute(
+                """
+                DELETE FROM football_runtime.bot_active_chat_views
+                WHERE delivery_id = ANY(%s)
+                """,
+                (delivery_ids,),
+            )
+            count += changed.rowcount
+            changed = connection.execute(
+                """
+                DELETE FROM football_runtime.bot_message_outbox
+                WHERE delivery_id = ANY(%s)
+                """,
+                (delivery_ids,),
+            )
+            count += changed.rowcount
     return count + _scrub_source_scope_outbox(
         connection,
         producer_role=RuntimeRole.BOT_ASSISTANT,
@@ -17847,15 +18069,14 @@ def _suppress_source_scope_for_owner(
 ) -> tuple[int, list[str]]:
     """Apply only reversible suppression for one owner."""
     (
-        _source_message_ids,
+        source_message_ids,
         source_message_revision_ids,
         source_event_ids,
         opportunity_ids,
         opportunity_revision_ids,
-        _bot_completed_search_ids,
+        bot_completed_search_ids,
     ) = _source_scope_lists(payload)
     count = 0
-    bot_completed_search_ids: list[str] = []
     if owner is RuntimeRole.INGESTION:
         if source_event_ids:
             changed = connection.execute(
@@ -17969,20 +18190,22 @@ def _suppress_source_scope_for_owner(
             opportunity_revision_ids=opportunity_revision_ids,
         )
     elif owner is RuntimeRole.BOT_ASSISTANT:
-        bot_completed_search_ids = _find_bot_completed_search_ids(
+        if not bot_completed_search_ids:
+            bot_completed_search_ids = _find_bot_completed_search_ids(
+                connection,
+                opportunity_ids=opportunity_ids,
+                opportunity_revision_ids=opportunity_revision_ids,
+                source_message_revision_ids=source_message_revision_ids,
+            )
+        count += _cleanup_bot_source_scope(
             connection,
+            source_message_ids=source_message_ids,
+            source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
-            source_message_revision_ids=source_message_revision_ids,
+            bot_completed_search_ids=bot_completed_search_ids,
         )
-        count += _scrub_source_scope_outbox(
-            connection,
-            producer_role=owner,
-            source_message_ids=(),
-            source_message_revision_ids=source_message_revision_ids,
-            opportunity_ids=opportunity_ids,
-            opportunity_revision_ids=opportunity_revision_ids,
-        )
+        return count, bot_completed_search_ids
     return count, bot_completed_search_ids
 
 
@@ -18319,7 +18542,7 @@ def _delete_source_scope_for_owner(
     elif owner is RuntimeRole.BOT_ASSISTANT:
         count += _cleanup_bot_source_scope(
             connection,
-            source_message_ids=(),
+            source_message_ids=source_message_ids,
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,

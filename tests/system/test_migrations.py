@@ -46,7 +46,7 @@ def _migration_paths() -> list[Path]:
 
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
-    assert [path.name for path in _migration_paths()][-12:] == [
+    assert [path.name for path in _migration_paths()][-14:] == [
         "0043_source_chat_administration_lifecycle.sql",
         "0044_source_chat_lifecycle_cancellation.sql",
         "0045_source_retention_audit_role_isolation.sql",
@@ -59,6 +59,8 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0052_source_data_deletion_review_fixes.sql",
         "0053_source_data_deletion_p1_fixes.sql",
         "0054_source_data_deletion_replay_retention.sql",
+        "0055_source_message_deletion_boundary.sql",
+        "0056_source_data_deletion_bot_fail_closed.sql",
     ]
 
 
@@ -545,7 +547,13 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'requested_peer_kind text, '
                                  'requested_telegram_chat_id bigint, '
                                  'requested_source_author_telegram_id bigint, '
-                                 'requested_effective_at timestamp with time zone)'
+                                 'requested_effective_at timestamp with time zone)',
+                                 'football_runtime.capture_source_data_deletion_bot_search_ids('
+                                 'requested_opportunity_ids text[], '
+                                 'requested_opportunity_revision_ids text[], '
+                                 'requested_source_message_revision_ids text[])',
+                                 'football_runtime.bot_completed_search_deletion_barrier('
+                                 'requested_completed_search_id text)'
                              ])
                          )
                    ),

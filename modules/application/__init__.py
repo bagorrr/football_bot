@@ -2972,11 +2972,13 @@ class ConversationOnboarding:
                                 request=request,
                             )
                         elif phase == "notify" and request.status.value in {
+                            "approved_awaiting_execution",
                             "rejected",
                             "suppressing",
                             "executing",
                             "execution_error",
                             "awaiting_completion",
+                            "completed",
                         }:
                             self._commit_source_data_deletion_command(
                                 update_id=update_id,
@@ -3867,6 +3869,11 @@ class ConversationOnboarding:
             administrator_id=current.telegram_user_id,
             action=action,
             recorded_at=recorded_at,
+            notification_phase=(
+                request.status.value
+                if action == "notify" and request is not None
+                else None
+            ),
             decision_reason=decision_reason,
             source_author_telegram_id=source_author_telegram_id,
             source_chat_key=source_chat_key,
@@ -15091,11 +15098,16 @@ def _source_data_deletion_message(
                     ),
                 )
             )
+            if request.status.value == "approved_awaiting_execution":
+                button_rows.append(
+                    ((actions["notify"], f"sdd:notify:{token}:{screen_revision}"),)
+                )
         elif request.status.value in {
             "rejected",
             "suppressing",
             "executing",
             "awaiting_completion",
+            "completed",
         }:
             button_rows.append(
                 ((actions["notify"], f"sdd:notify:{token}:{screen_revision}"),)
@@ -16047,6 +16059,26 @@ class RuntimeApplication:
         """Return explicit versions supported by this consumer."""
         return set(self.supported_versions.get(contract_name, set()))
 
+    def _source_message_deletion_barrier(
+        self,
+        incoming: RawContractEnvelope,
+        *,
+        source_message_id: str | None = None,
+    ) -> bool:
+        """Apply a deletion boundary to one immutable Source Message revision."""
+        payload = incoming.payload
+        revision_id = (
+            payload.get("source_message_revision_id")
+            if isinstance(payload, dict)
+            else None
+        )
+        return self.store.source_message_deletion_barrier(
+            source_message_id or incoming.subject_id,
+            source_message_revision_id=(
+                revision_id if isinstance(revision_id, str) else None
+            ),
+        )
+
     def record_source_event(
         self,
         probe_id: str,
@@ -16618,7 +16650,7 @@ class RuntimeApplication:
         if (
             self.role is RuntimeRole.CLASSIFICATION
             and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
-            and self.store.source_message_deletion_barrier(incoming.subject_id)
+            and self._source_message_deletion_barrier(incoming)
         ):
             result = self.store.consume(
                 incoming=incoming,
@@ -16651,7 +16683,10 @@ class RuntimeApplication:
             revision_id = incoming.payload.get("source_message_revision_id")
             if isinstance(revision_id, str) and ":revision:" in revision_id:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
-                if self.store.source_message_deletion_barrier(source_message_id):
+                if self._source_message_deletion_barrier(
+                    incoming,
+                    source_message_id=source_message_id,
+                ):
                     result = self.store.consume(
                         incoming=incoming,
                         supported_versions=self.versions_for(incoming.contract_name),
@@ -16785,7 +16820,7 @@ class RuntimeApplication:
         if (
             self.role is RuntimeRole.CLASSIFICATION
             and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
-            and self.store.source_message_deletion_barrier(incoming.subject_id)
+            and self._source_message_deletion_barrier(incoming)
         ):
             self.store.consume(
                 incoming=incoming,
@@ -16818,7 +16853,10 @@ class RuntimeApplication:
             revision_id = incoming.payload.get("source_message_revision_id")
             if isinstance(revision_id, str) and ":revision:" in revision_id:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
-                if self.store.source_message_deletion_barrier(source_message_id):
+                if self._source_message_deletion_barrier(
+                    incoming,
+                    source_message_id=source_message_id,
+                ):
                     self.store.consume(
                         incoming=incoming,
                         supported_versions=self.versions_for(incoming.contract_name),
@@ -17393,7 +17431,7 @@ class RuntimeApplication:
     def _classify_source_message_impl(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
-        if self.store.source_message_deletion_barrier(incoming.subject_id):
+        if self._source_message_deletion_barrier(incoming):
             self.store.consume(
                 incoming=incoming,
                 supported_versions=self.versions_for(incoming.contract_name),
@@ -21339,6 +21377,7 @@ def _source_data_deletion_manage_envelope(
     administrator_id: int,
     action: str,
     recorded_at: datetime,
+    notification_phase: str | None = None,
     decision_reason: str | None = None,
     source_author_telegram_id: int | None = None,
     source_chat_key: str | None = None,
@@ -21348,6 +21387,8 @@ def _source_data_deletion_manage_envelope(
 ) -> ContractEnvelope:
     """Build one canonical deterministic Bot-to-Application admin command."""
     idempotency_key = f"source-data-deletion:manage:{action}:{request_id}"
+    if action == "notify" and notification_phase is not None:
+        idempotency_key += f":phase:{notification_phase}"
     payload: dict[str, JsonValue] = {
         "request_id": request_id,
         "action": action,

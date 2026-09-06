@@ -96,6 +96,19 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
         administrator_id=administrator_id,
         prefix="ui:refresh-after-approval",
     )
+    approval_notify_callback = _callback(delivery.messages[-1], "sdd:notify:")
+    system.select_source_data_deletion_action(
+        update_id="ui:notify-approval",
+        telegram_user_id=administrator_id,
+        action=approval_notify_callback,
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+
+    _refresh_deletion_requests(
+        system,
+        administrator_id=administrator_id,
+        prefix="ui:refresh-after-approval-notify",
+    )
     review_callback = _callback(delivery.messages[-1], "sdd:review:")
     system.select_source_data_deletion_action(
         update_id="ui:review",
@@ -161,6 +174,25 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
         event.request_id == request.request_id
         and event.actor_telegram_id == administrator_id
         and event.reason_code == "completion_completed"
+        for event in system.source_data_audit()
+    )
+    _refresh_deletion_requests(
+        system,
+        administrator_id=administrator_id,
+        prefix="ui:refresh-after-completion",
+    )
+    completed_notify_callback = _callback(delivery.messages[-1], "sdd:notify:")
+    system.select_source_data_deletion_action(
+        update_id="ui:notify-completion",
+        telegram_user_id=administrator_id,
+        action=completed_notify_callback,
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert any(
+        event.request_id == request.request_id
+        and event.actor_telegram_id == administrator_id
+        and event.next_state == "completed"
+        and event.reason_code == "requester_notification_recorded"
         for event in system.source_data_audit()
     )
     assert all("source body" not in message.text for message in delivery.messages)
@@ -879,46 +911,20 @@ def test_source_data_deletion_scopes_historical_revisions() -> None:
         effective_at=effective_at,
     )
 
-    # Model the later edit committing after the immutable target snapshot and
-    # before the owner command runs. Assertions remain at the acceptance seam.
+    # Deliver the later edit through the public Telegram ingestion and
+    # Application acceptance seams after the immutable target snapshot.
     late_edit_revision_id = f"{source_message_id}:revision:2"
-    bounded_metadata = json.dumps({"source_author_telegram_id": "78918"})
-    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
-        connection.execute("SET SESSION AUTHORIZATION football_application")
-        connection.execute(
-            """
-            INSERT INTO football_runtime.source_message_revisions (
-                source_message_revision_id, source_message_id,
-                source_event_id, revision, event_kind, body, event_time,
-                recorded_at, bounded_metadata, registry_generation
-            ) VALUES (%s, %s, %s, 2, 'edit', %s, %s, %s, %s::jsonb, 1)
-            """,
-            (
-                late_edit_revision_id,
-                source_message_id,
-                "source-event:late-edit",
-                "late edit must remain eligible",
-                edit_at,
-                edit_at,
-                bounded_metadata,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE football_runtime.source_messages
-            SET current_revision = 2, event_kind = 'edit',
-                body = %s, event_time = %s, recorded_at = %s,
-                bounded_metadata = %s::jsonb, tombstoned = false
-            WHERE source_message_id = %s
-            """,
-            (
-                "late edit must remain eligible",
-                edit_at,
-                edit_at,
-                bounded_metadata,
-                source_message_id,
-            ),
-        )
+    _ingest_source_edit(
+        edit_after_capture_system,
+        telethon=edit_after_capture_telethon,
+        identity=edit_after_capture_identity,
+        clock=edit_after_capture_clock,
+        author_id=78_918,
+        source_event_id="source-event:late-edit",
+        telegram_message_id=118,
+        body="late edit must remain eligible",
+        event_time=edit_at,
+    )
     edit_after_capture_system.process_source_data_deletion_until_idle()
 
     assert edit_after_capture_system.source_messages()[0].current_revision == 2
@@ -1122,7 +1128,9 @@ def test_source_data_deletion_reminder_delivery_and_failure_rearm(
     assert failed.next_reminder_at == clock.now()
 
 
-def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> None:
+def test_bot_source_data_cleanup_removes_result_context_and_retained_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
     administrator_id = 46_805
     author_id = 78_906
@@ -1134,10 +1142,12 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
         identity=identity,
         transport_boundary="chat-sequence:4680",
     )
+    delivery = ControlledTelegramDeliveryAdapter()
     system = _new_system(
         clock=clock,
         administrator_id=administrator_id,
         telegram_ingestion=telethon,
+        telegram_delivery=delivery,
     )
     system.reset()
     _register_source_chat(
@@ -1158,6 +1168,7 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
     completed_search_id = "completed-search:bot-cleanup"
     result_id = "result:bot-cleanup:1"
     presentation_delivery_id = "result-current:bot-cleanup"
+    conversation_delivery_id = "result-conversation:turn:bot-cleanup"
     opportunity_id = "opportunity:bot-cleanup"
     opportunity_revision_id = "opportunity:bot-cleanup:revision:1"
     recorded_at = clock.now()
@@ -1269,6 +1280,20 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
         )
         connection.execute(
             """
+            INSERT INTO football_runtime.bot_active_chat_views (
+                telegram_user_id, screen_revision, delivery_id,
+                telegram_message_id, activated_at
+            ) VALUES (%s, 3, %s, 'telegram:bot-cleanup', %s)
+            ON CONFLICT (telegram_user_id) DO UPDATE
+            SET screen_revision = EXCLUDED.screen_revision,
+                delivery_id = EXCLUDED.delivery_id,
+                telegram_message_id = EXCLUDED.telegram_message_id,
+                activated_at = EXCLUDED.activated_at
+            """,
+            (administrator_id, presentation_delivery_id, recorded_at),
+        )
+        connection.execute(
+            """
             INSERT INTO football_runtime.bot_active_result_contexts (
                 telegram_user_id, completed_search_id, current_result_id,
                 absolute_position, screen_revision, activated_at
@@ -1296,6 +1321,20 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
                 recorded_at,
             ),
         )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.bot_message_outbox (
+                delivery_id, telegram_user_id, display_locale, screen_revision,
+                message_text, button_rows, recorded_at
+            ) VALUES (%s, %s, 'en', 3, %s, '[]'::jsonb, %s)
+            """,
+            (
+                conversation_delivery_id,
+                administrator_id,
+                "retained Result Conversation text",
+                recorded_at,
+            ),
+        )
 
     request = system.create_source_data_deletion_request(
         request_id="deletion-request:bot-cleanup",
@@ -1315,7 +1354,7 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
         effective_at=clock.now(),
     )
 
-    def bot_counts() -> tuple[int, int, int, int]:
+    def bot_counts() -> tuple[int, int, int, int, int]:
         with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
             counts = connection.execute(
                 """
@@ -1331,6 +1370,9 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
                      WHERE completed_search_id = %s),
                     (SELECT count(*)
                      FROM football_runtime.bot_message_outbox
+                     WHERE delivery_id = %s),
+                    (SELECT count(*)
+                     FROM football_runtime.bot_message_outbox
                      WHERE delivery_id = %s)
                 """,
                 (
@@ -1338,50 +1380,56 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
                     completed_search_id,
                     completed_search_id,
                     presentation_delivery_id,
+                    conversation_delivery_id,
                 ),
             ).fetchone()
         assert counts is not None
         return counts
 
+    def fail_bot_cleanup(*_args: object, **_kwargs: object) -> int:
+        raise RuntimeError("controlled Bot cleanup failure")
+
+    monkeypatch.setattr(
+        "modules.postgres_adapter._cleanup_bot_source_scope",
+        fail_bot_cleanup,
+    )
     for role in RuntimeRole:
         assert system.process_next_contract_handoff(role)
     while system.source_data_deletion_requests()[0].status.value == "suppressing":
         assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
-    assert system.source_data_deletion_requests()[0].status.value == "executing"
-    assert bot_counts() == (1, 1, 2, 1)
-
-    for role in (
-        RuntimeRole.INGESTION,
-        RuntimeRole.APPLICATION,
-        RuntimeRole.CLASSIFICATION,
-        RuntimeRole.RECOMMENDATION,
-    ):
-        assert system.process_next_contract_handoff(role)
-    assert bot_counts() == (1, 1, 2, 1)
-
-    system.process_source_data_deletion_until_idle()
+    assert system.source_data_deletion_requests()[0].status.value == ("execution_error")
+    with pytest.raises(LookupError):
+        system.active_result_context(administrator_id)
+    with pytest.raises(LookupError):
+        system.result_conversation(administrator_id)
+    with pytest.raises(LookupError):
+        system.active_conversation_view(administrator_id)
+    assert bot_counts() == (1, 1, 2, 1, 1)
+    system.retry_bot_presentations()
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
-        counts = connection.execute(
+        assert connection.execute(
             """
-            SELECT
-                (SELECT count(*) FROM football_runtime.bot_active_result_contexts
-                 WHERE completed_search_id = %s),
-                (SELECT count(*) FROM football_runtime.bot_search_presentations
-                 WHERE completed_search_id = %s),
-                (SELECT count(*)
-                 FROM football_runtime.bot_result_conversation_messages
-                 WHERE completed_search_id = %s),
-                (SELECT count(*) FROM football_runtime.bot_message_outbox
-                 WHERE delivery_id = %s)
+            SELECT delivery_status, claim_token, delivered_at
+            FROM football_runtime.bot_message_outbox
+            WHERE delivery_id IN (%s, %s)
+            ORDER BY delivery_id
             """,
-            (
-                completed_search_id,
-                completed_search_id,
-                completed_search_id,
-                presentation_delivery_id,
-            ),
-        ).fetchone()
-    assert counts == (0, 0, 0, 0)
+            (conversation_delivery_id, presentation_delivery_id),
+        ).fetchall() == [
+            ("pending", None, None),
+            ("pending", None, None),
+        ]
+
+    monkeypatch.undo()
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=clock.now(),
+    )
+    system.process_source_data_deletion_until_idle()
+    assert system.source_data_deletion_requests()[0].status.value == (
+        "awaiting_completion"
+    )
+    assert bot_counts() == (0, 0, 0, 0, 0)
 
 
 def test_source_data_deletion_scrubs_nested_opportunity_batches() -> None:

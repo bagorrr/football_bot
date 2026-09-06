@@ -1335,8 +1335,14 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Advance due reminder state without approving or executing a request."""
         ...
 
-    def source_message_deletion_barrier(self, source_message_id: str) -> bool:
-        """Read the body-free cross-role deletion barrier."""
+    def source_message_deletion_barrier(
+        self,
+        source_message_id: str,
+        *,
+        source_message_revision_id: str | None = None,
+        event_time: datetime | None = None,
+    ) -> bool:
+        """Read the body-free deletion barrier for one Source Message revision."""
         ...
 
     def cleanup_expired_source_message_tombstones(self, *, as_of: datetime) -> int:
