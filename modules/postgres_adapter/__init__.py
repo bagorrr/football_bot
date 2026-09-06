@@ -5360,7 +5360,6 @@ class PostgresRoleStore:
                       ON revision.source_message_id = source.source_message_id
                     WHERE source.peer_kind = %s
                       AND source.telegram_chat_id = %s
-                      AND source.event_time <= %s
                       AND revision.event_time <= %s
                       AND revision.bounded_metadata ->>
                           'source_author_telegram_id' ~ '^[1-9][0-9]*$'
@@ -5371,7 +5370,6 @@ class PostgresRoleStore:
                     (
                         request["peer_kind"],
                         request["telegram_chat_id"],
-                        effective_at,
                         effective_at,
                         request["source_author_telegram_id"],
                     ),
@@ -5402,9 +5400,17 @@ class PostgresRoleStore:
                         FROM football_runtime.source_message_revisions
                         WHERE source_message_id = ANY(%s)
                           AND event_time <= %s
+                          AND bounded_metadata ->>
+                              'source_author_telegram_id' ~ '^[1-9][0-9]*$'
+                          AND (bounded_metadata ->>
+                               'source_author_telegram_id')::bigint = %s
                         ORDER BY source_message_revision_id
                         """,
-                        (source_message_ids, effective_at),
+                        (
+                            source_message_ids,
+                            effective_at,
+                            request["source_author_telegram_id"],
+                        ),
                     ).fetchall()
                     if source_message_ids
                     else []
@@ -17841,7 +17847,7 @@ def _suppress_source_scope_for_owner(
 ) -> tuple[int, list[str]]:
     """Apply only reversible suppression for one owner."""
     (
-        source_message_ids,
+        _source_message_ids,
         source_message_revision_ids,
         source_event_ids,
         opportunity_ids,
@@ -17903,16 +17909,15 @@ def _suppress_source_scope_for_owner(
                 SET publication_state = 'suppressed',
                     publication_reason = 'source_deleted',
                     is_representative = FALSE
-                WHERE source_message_id = ANY(%s)
-                   OR source_message_revision_id = ANY(%s)
+                WHERE source_message_revision_id = ANY(%s)
                    OR opportunity_id = ANY(%s)
                 """,
-                (source_message_ids, source_message_revision_ids, opportunity_ids),
+                (source_message_revision_ids, opportunity_ids),
             )
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -17921,7 +17926,7 @@ def _suppress_source_scope_for_owner(
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -17958,7 +17963,7 @@ def _suppress_source_scope_for_owner(
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -17973,7 +17978,7 @@ def _suppress_source_scope_for_owner(
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -18041,7 +18046,7 @@ def _delete_source_scope_for_owner(
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -18111,7 +18116,7 @@ def _delete_source_scope_for_owner(
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -18129,17 +18134,15 @@ def _delete_source_scope_for_owner(
                 (source_message_revision_ids,),
             )
             count += changed.rowcount
-        if source_message_ids:
-            for source_message_id in source_message_ids:
-                routing_cleanup = connection.execute(
-                    """
-                    SELECT football_runtime.
-                        application_cleanup_source_message_routing_outcomes(%s)
-                    """,
-                    (source_message_id,),
-                ).fetchone()
-                if routing_cleanup is not None and routing_cleanup[0] is not None:
-                    count += int(routing_cleanup[0])
+        if source_message_revision_ids:
+            changed = connection.execute(
+                """
+                DELETE FROM football_runtime.classification_routing_outcomes
+                WHERE source_message_revision_id = ANY(%s)
+                """,
+                (source_message_revision_ids,),
+            )
+            count += changed.rowcount
         if source_message_revision_ids:
             existing_revisions = connection.execute(
                 """
@@ -18171,41 +18174,21 @@ def _delete_source_scope_for_owner(
                 """
                 SELECT DISTINCT exact_repost_cluster_id
                 FROM football_runtime.application_exact_repost_cluster_members
-                WHERE source_message_id = ANY(%s)
-                   OR source_message_revision_id = ANY(%s)
+                WHERE source_message_revision_id = ANY(%s)
                    OR opportunity_id = ANY(%s)
                 ORDER BY exact_repost_cluster_id
                 """,
-                (source_message_ids, source_message_revision_ids, opportunity_ids),
+                (source_message_revision_ids, opportunity_ids),
             ).fetchall()
         )
         if cluster_ids:
             changed = connection.execute(
                 """
                 DELETE FROM football_runtime.application_exact_repost_cluster_members
-                WHERE source_message_id = ANY(%s)
-                   OR source_message_revision_id = ANY(%s)
+                WHERE source_message_revision_id = ANY(%s)
                    OR opportunity_id = ANY(%s)
                 """,
-                (source_message_ids, source_message_revision_ids, opportunity_ids),
-            )
-            count += changed.rowcount
-        if source_message_ids:
-            changed = connection.execute(
-                """
-                DELETE FROM football_runtime.application_proposition_identities
-                WHERE source_message_id = ANY(%s)
-                """,
-                (source_message_ids,),
-            )
-            count += changed.rowcount
-            changed = connection.execute(
-                """
-                DELETE FROM
-                    football_runtime.application_legacy_proposition_identity_compatibility
-                WHERE source_message_id = ANY(%s)
-                """,
-                (source_message_ids,),
+                (source_message_revision_ids, opportunity_ids),
             )
             count += changed.rowcount
         if source_message_revision_ids or opportunity_ids or opportunity_revision_ids:
@@ -18264,21 +18247,57 @@ def _delete_source_scope_for_owner(
                 recorded_at=effective_at,
             ):
                 _insert_outbox(connection, outgoing)
-        if source_message_ids:
+        fully_deleted_source_message_ids: list[str] = []
+        if source_message_revision_ids:
+            changed = connection.execute(
+                """
+                DELETE FROM football_runtime.source_message_revisions
+                WHERE source_message_revision_id = ANY(%s)
+                """,
+                (source_message_revision_ids,),
+            )
+            count += changed.rowcount
+            fully_deleted_source_message_ids = [
+                row[0]
+                for row in connection.execute(
+                    """
+                    SELECT source.source_message_id
+                    FROM football_runtime.source_messages AS source
+                    WHERE source.source_message_id = ANY(%s)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM football_runtime.source_message_revisions AS revision
+                          WHERE revision.source_message_id = source.source_message_id
+                      )
+                    ORDER BY source.source_message_id
+                    """,
+                    (source_message_ids,),
+                ).fetchall()
+            ]
+        if fully_deleted_source_message_ids:
             changed = connection.execute(
                 """
                 DELETE FROM football_runtime.application_source_message_tombstones
                 WHERE source_message_id = ANY(%s)
                 """,
-                (source_message_ids,),
+                (fully_deleted_source_message_ids,),
             )
             count += changed.rowcount
             changed = connection.execute(
                 """
-                DELETE FROM football_runtime.source_message_revisions
+                DELETE FROM football_runtime.application_proposition_identities
                 WHERE source_message_id = ANY(%s)
                 """,
-                (source_message_ids,),
+                (fully_deleted_source_message_ids,),
+            )
+            count += changed.rowcount
+            changed = connection.execute(
+                """
+                DELETE FROM
+                    football_runtime.application_legacy_proposition_identity_compatibility
+                WHERE source_message_id = ANY(%s)
+                """,
+                (fully_deleted_source_message_ids,),
             )
             count += changed.rowcount
             changed = connection.execute(
@@ -18286,13 +18305,13 @@ def _delete_source_scope_for_owner(
                 DELETE FROM football_runtime.source_messages
                 WHERE source_message_id = ANY(%s)
                 """,
-                (source_message_ids,),
+                (fully_deleted_source_message_ids,),
             )
             count += changed.rowcount
         count += _scrub_source_scope_outbox(
             connection,
             producer_role=owner,
-            source_message_ids=source_message_ids,
+            source_message_ids=fully_deleted_source_message_ids,
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
@@ -18300,7 +18319,7 @@ def _delete_source_scope_for_owner(
     elif owner is RuntimeRole.BOT_ASSISTANT:
         count += _cleanup_bot_source_scope(
             connection,
-            source_message_ids=source_message_ids,
+            source_message_ids=(),
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,

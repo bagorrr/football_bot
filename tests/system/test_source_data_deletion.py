@@ -765,6 +765,172 @@ def test_source_data_deletion_excludes_persisted_data_after_effective_at() -> No
     )
 
 
+def test_source_data_deletion_scopes_historical_revisions() -> None:
+    effective_at = datetime(2026, 9, 1, 12, 2, tzinfo=UTC)
+    edit_at = effective_at + timedelta(minutes=1)
+
+    capture_after_edit_clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    capture_after_edit_telethon = ControlledTelegramIngestionAdapter()
+    capture_after_edit_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_680_117,
+    )
+    capture_after_edit_telethon.allow_public_username(
+        address="@source_deletion_fixture",
+        identity=capture_after_edit_identity,
+        transport_boundary="chat-sequence:4680",
+    )
+    capture_after_edit_system = _new_system(
+        clock=capture_after_edit_clock,
+        administrator_id=46_815,
+        telegram_ingestion=capture_after_edit_telethon,
+    )
+    capture_after_edit_system.reset()
+    _register_source_chat(
+        capture_after_edit_system,
+        clock=capture_after_edit_clock,
+        administrator_id=46_815,
+    )
+    source_message_id, _ = _ingest_source_event(
+        capture_after_edit_system,
+        telethon=capture_after_edit_telethon,
+        identity=capture_after_edit_identity,
+        clock=capture_after_edit_clock,
+        author_id=78_917,
+        source_event_id="source-event:historical-create",
+        telegram_message_id=117,
+        body="historical body must be deleted",
+    )
+    edited_revision_id = f"{source_message_id}:revision:2"
+    _ingest_source_edit(
+        capture_after_edit_system,
+        telethon=capture_after_edit_telethon,
+        identity=capture_after_edit_identity,
+        clock=capture_after_edit_clock,
+        author_id=78_917,
+        source_event_id="source-event:historical-edit",
+        telegram_message_id=117,
+        body="post-boundary edit remains eligible",
+        event_time=edit_at,
+    )
+    _approve_and_begin_source_data_deletion(
+        capture_after_edit_system,
+        request_id="deletion-request:historical-capture-after-edit",
+        author_id=78_917,
+        chat_id=4_680_117,
+        administrator_id=46_815,
+        effective_at=effective_at,
+    )
+    capture_after_edit_system.process_source_data_deletion_until_idle()
+
+    assert capture_after_edit_system.source_messages()[0].current_revision == 2
+    assert capture_after_edit_system.source_messages()[0].body == (
+        "post-boundary edit remains eligible"
+    )
+    assert [
+        revision.source_message_revision_id
+        for revision in capture_after_edit_system.source_message_revisions()
+    ] == [edited_revision_id]
+    assert capture_after_edit_system.source_events()[0].source_event_id == (
+        "source-event:historical-edit"
+    )
+    assert capture_after_edit_system.source_events()[0].body == (
+        "post-boundary edit remains eligible"
+    )
+    edit_after_capture_clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    edit_after_capture_telethon = ControlledTelegramIngestionAdapter()
+    edit_after_capture_identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_680_118,
+    )
+    edit_after_capture_telethon.allow_public_username(
+        address="@source_deletion_fixture",
+        identity=edit_after_capture_identity,
+        transport_boundary="chat-sequence:4680",
+    )
+    edit_after_capture_system = _new_system(
+        clock=edit_after_capture_clock,
+        administrator_id=46_816,
+        telegram_ingestion=edit_after_capture_telethon,
+    )
+    edit_after_capture_system.reset()
+    _register_source_chat(
+        edit_after_capture_system,
+        clock=edit_after_capture_clock,
+        administrator_id=46_816,
+    )
+    source_message_id, _ = _ingest_source_event(
+        edit_after_capture_system,
+        telethon=edit_after_capture_telethon,
+        identity=edit_after_capture_identity,
+        clock=edit_after_capture_clock,
+        author_id=78_918,
+        source_event_id="source-event:captured-create",
+        telegram_message_id=118,
+        body="captured body must be deleted",
+    )
+    edit_after_capture_clock.advance_to(effective_at)
+    _approve_and_begin_source_data_deletion(
+        edit_after_capture_system,
+        request_id="deletion-request:historical-edit-after-capture",
+        author_id=78_918,
+        chat_id=4_680_118,
+        administrator_id=46_816,
+        effective_at=effective_at,
+    )
+
+    # Model the later edit committing after the immutable target snapshot and
+    # before the owner command runs. Assertions remain at the acceptance seam.
+    late_edit_revision_id = f"{source_message_id}:revision:2"
+    bounded_metadata = json.dumps({"source_author_telegram_id": "78918"})
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute("SET SESSION AUTHORIZATION football_application")
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_message_revisions (
+                source_message_revision_id, source_message_id,
+                source_event_id, revision, event_kind, body, event_time,
+                recorded_at, bounded_metadata, registry_generation
+            ) VALUES (%s, %s, %s, 2, 'edit', %s, %s, %s, %s::jsonb, 1)
+            """,
+            (
+                late_edit_revision_id,
+                source_message_id,
+                "source-event:late-edit",
+                "late edit must remain eligible",
+                edit_at,
+                edit_at,
+                bounded_metadata,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE football_runtime.source_messages
+            SET current_revision = 2, event_kind = 'edit',
+                body = %s, event_time = %s, recorded_at = %s,
+                bounded_metadata = %s::jsonb, tombstoned = false
+            WHERE source_message_id = %s
+            """,
+            (
+                "late edit must remain eligible",
+                edit_at,
+                edit_at,
+                bounded_metadata,
+                source_message_id,
+            ),
+        )
+    edit_after_capture_system.process_source_data_deletion_until_idle()
+
+    assert edit_after_capture_system.source_messages()[0].current_revision == 2
+    assert edit_after_capture_system.source_messages()[0].body == (
+        "late edit must remain eligible"
+    )
+    assert [
+        revision.source_message_revision_id
+        for revision in edit_after_capture_system.source_message_revisions()
+    ] == [late_edit_revision_id]
+
+
 def test_source_data_deletion_replay_barrier_retention_follows_chat_lifecycle() -> None:
     clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
     administrator_id = 46_814
@@ -1503,6 +1669,76 @@ def _ingest_source_event(
         f"message:{telegram_message_id}"
     )
     return source_message_id, f"{source_message_id}:revision:1"
+
+
+def _ingest_source_edit(
+    system: AcceptanceSpine,
+    *,
+    telethon: ControlledTelegramIngestionAdapter,
+    identity: TelegramPeerIdentity,
+    clock: FrozenClock,
+    author_id: int,
+    source_event_id: str,
+    telegram_message_id: int,
+    body: str,
+    event_time: datetime,
+) -> None:
+    from_checkpoint = TelegramAccountCheckpoint(
+        pts=4_701,
+        qts=471,
+        seq=4_701,
+        date=event_time - timedelta(minutes=2),
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=from_checkpoint,
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=4_702,
+            qts=472,
+            seq=4_702,
+            date=event_time,
+        ),
+        identity=identity,
+        registry_generation=1,
+        source_event_id=source_event_id,
+        telegram_message_id=telegram_message_id,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body=body,
+        event_time=event_time,
+        source_author_telegram_id=author_id,
+    )
+    clock.advance_to(event_time)
+    assert system.process_next_account_telegram_difference()
+    assert system.process_next_source_event()
+
+
+def _approve_and_begin_source_data_deletion(
+    system: AcceptanceSpine,
+    *,
+    request_id: str,
+    author_id: int,
+    chat_id: int,
+    administrator_id: int,
+    effective_at: datetime,
+) -> None:
+    request = system.create_source_data_deletion_request(
+        request_id=request_id,
+        source_author_telegram_id=author_id,
+        source_chat_key=f"source-chat:chat:{chat_id}",
+        support_case_pointer=request_id.replace("deletion-request:", "support-case:"),
+        received_at=effective_at,
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=request.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+        decided_at=effective_at,
+    )
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=effective_at,
+    )
 
 
 def test_source_data_deletion_requires_approval_and_all_owner_acks() -> None:
