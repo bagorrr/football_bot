@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from threading import Condition, get_ident
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -46,6 +46,8 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
+    BotAssistantFailureRecord,
+    BotAssistantOperationalAlert,
     ClassificationAttempt,
     ClassificationQueueHealth,
     ClassificationRoutingOutcome,
@@ -98,6 +100,7 @@ from modules.domain import (
 from modules.ports import (
     AcceptanceObserver,
     BotAssistantModelAdapter,
+    BotAssistantTransientError,
     BotAssistantTurnRequest,
     ClassifierAdapterResult,
     ClassifierRequest,
@@ -1199,10 +1202,14 @@ class ControlledBotAssistantModelAdapter:
     """Deterministic proposal-only Result Conversation adapter."""
 
     _responses: dict[str, BotAssistantResponse] = field(default_factory=dict)
+    _failures: list[BaseException] = field(default_factory=list)
     requests: list[BotAssistantTurnRequest] = field(default_factory=list)
     requested_model: str = "gpt-5.6-sol"
     requested_reasoning_effort: str = "high"
+    effective_model: str = "gpt-5.6-sol"
+    effective_reasoning_effort: str = "high"
     adapter_version: str = "result-conversation-recording-v1"
+    response_delay_seconds: float = 0.0
 
     @property
     def adapter_kind(self) -> str:
@@ -1213,9 +1220,21 @@ class ControlledBotAssistantModelAdapter:
         """Configure one deterministic structured result-conversation response."""
         self._responses[text] = response
 
+    def raise_for(self, error: BaseException) -> None:
+        """Inject one controlled technical or timeout failure at the model seam."""
+        self._failures.append(error)
+
+    def fail_next(self, error: BaseException | None = None) -> None:
+        """Inject one quick technical failure before the configured response."""
+        self.raise_for(error or BotAssistantTransientError("controlled failure"))
+
     def respond(self, request: BotAssistantTurnRequest) -> BotAssistantResponse:
         """Return only configured offline output and retain the bounded request."""
         self.requests.append(request)
+        if self._failures:
+            raise self._failures.pop(0)
+        if self.response_delay_seconds > 0:
+            sleep(self.response_delay_seconds)
         try:
             return self._responses[request.message]
         except KeyError as error:
@@ -4417,6 +4436,25 @@ class AcceptanceSpine:
     def cleanup_expired_result_conversations(self) -> int:
         """Run the explicit Bot Assistant Result Conversation retention sweep."""
         return self._conversation_onboarding().expire_result_conversations()
+
+    def bot_assistant_failure_records(self) -> tuple[BotAssistantFailureRecord, ...]:
+        """Observe body-free terminal Bot Assistant failure records."""
+        return self._observer.bot_assistant_failure_records()
+
+    def bot_assistant_operational_alerts(
+        self,
+    ) -> tuple[BotAssistantOperationalAlert, ...]:
+        """Observe body-free protected-alarm operational alerts."""
+        return self._observer.bot_assistant_operational_alerts()
+
+    def cleanup_expired_bot_assistant_alarms(self) -> int:
+        """Run one protected-alarm deletion sweep through the Bot Assistant."""
+        return self._conversation_onboarding().cleanup_expired_bot_assistant_alarms()
+
+    def cleanup_expired_bot_assistant_failure_records(self) -> int:
+        """Run the body-free Bot Assistant failure-record retention sweep."""
+        onboarding = self._conversation_onboarding()
+        return onboarding.cleanup_expired_bot_assistant_failure_records()
 
     def read_conversation_state_as(
         self,

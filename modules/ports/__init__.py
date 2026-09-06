@@ -23,6 +23,8 @@ from modules.contracts import (
 from modules.domain import (
     ActiveChatView,
     ActiveResultContext,
+    BotAssistantFailureRecord,
+    BotAssistantOperationalAlert,
     ClassificationAttempt,
     ClassificationQueueHealth,
     ClassificationRoutingOutcome,
@@ -270,6 +272,9 @@ class BotAssistantTurnRequest:
     response_contract_version: str
     context_policy_version: str
     external_knowledge_allowed: bool = False
+    deadline: datetime | None = None
+    attempt_number: int = 1
+    resolver_version: str = "not-used"
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,12 +288,40 @@ class BotAssistantResponse:
     relaxed_criterion: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class BotAssistantFailure:
+    """Terminal failure metadata plus one protected administrator alarm body."""
+
+    record: BotAssistantFailureRecord
+    alarm_text: str
+    alarm_locale: str
+    administrator_user_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class BotAssistantFailureAlarmCleanup:
+    """One claimed protected alarm ready for Telegram deletion."""
+
+    alarm_id: str
+    administrator_user_id: int
+    telegram_message_id: str
+    claim_token: UUID
+
+
 class BotAssistantModelAdapter(Protocol):
     """Direct proposal-only model boundary for Result Conversation turns."""
 
     def respond(self, request: BotAssistantTurnRequest) -> BotAssistantResponse:
         """Return one bounded reply and at most one application proposal."""
         ...
+
+
+class BotAssistantTransientError(RuntimeError):
+    """A quick technical Bot Assistant failure eligible for one retry."""
+
+
+class BotAssistantExecutionTimeoutError(RuntimeError):
+    """A Bot Assistant execution reached the shared turn deadline."""
 
 
 class ClassifierProviderError(RuntimeError):
@@ -620,8 +653,9 @@ class ConversationStore(Protocol):
         assistant_message: TelegramMessage,
         recorded_at: datetime,
         command: ContractEnvelope | None = None,
+        failure: BotAssistantFailure | None = None,
     ) -> bool:
-        """Persist one protected turn and optional refinement atomically."""
+        """Persist one protected turn, failure record, and optional refinement."""
         ...
 
     def commit_source_chat_registration_request(
@@ -806,6 +840,94 @@ class ConversationStore(Protocol):
 
     def cleanup_expired_result_conversations(self, *, as_of: datetime) -> int:
         """Delete retained Result Conversation messages past their bound."""
+        ...
+
+    def bot_assistant_failure_records(
+        self,
+    ) -> tuple[BotAssistantFailureRecord, ...]:
+        """Read body-free terminal Bot Assistant failure records."""
+        ...
+
+    def bot_assistant_operational_alerts(
+        self,
+    ) -> tuple[BotAssistantOperationalAlert, ...]:
+        """Read body-free protected-alarm delivery and cleanup alerts."""
+        ...
+
+    def claim_bot_assistant_failure_alarm(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+    ) -> TelegramDeliveryClaim | None:
+        """Claim one protected administrator alarm for delivery or reconciliation."""
+        ...
+
+    def release_bot_assistant_failure_alarm_claim(self, *, claim_token: UUID) -> None:
+        """Release a protected alarm claim after a known pre-effect failure."""
+        ...
+
+    def mark_bot_assistant_failure_alarm_delivered(
+        self,
+        *,
+        alarm_id: str,
+        claim_token: UUID,
+        telegram_message_id: str,
+        delivered_at: datetime,
+    ) -> None:
+        """Confirm one protected administrator alarm delivery."""
+        ...
+
+    def mark_bot_assistant_failure_alarm_failed(
+        self,
+        *,
+        alarm_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+        failure_code: str,
+    ) -> None:
+        """Record a body-free alarm-delivery failure without another alarm."""
+        ...
+
+    def mark_bot_assistant_failure_alarm_outcome_unknown(
+        self,
+        *,
+        alarm_id: str,
+        claim_token: UUID,
+        observed_at: datetime,
+    ) -> None:
+        """Retain one protected alarm for reconciliation after an unknown send."""
+        ...
+
+    def claim_expired_bot_assistant_failure_alarm(
+        self,
+        *,
+        claim_token: UUID,
+        claimed_at: datetime,
+        stale_before: datetime,
+        as_of: datetime,
+    ) -> BotAssistantFailureAlarmCleanup | None:
+        """Claim one delivered alarm whose 24-hour retention has elapsed."""
+        ...
+
+    def mark_bot_assistant_failure_alarm_deleted(
+        self, *, claim: BotAssistantFailureAlarmCleanup
+    ) -> None:
+        """Remove one protected alarm after Telegram deletion succeeds."""
+        ...
+
+    def mark_bot_assistant_failure_alarm_deletion_failed(
+        self,
+        *,
+        claim: BotAssistantFailureAlarmCleanup,
+        observed_at: datetime,
+    ) -> None:
+        """Record a body-free alarm-deletion failure without another alarm."""
+        ...
+
+    def cleanup_expired_bot_assistant_failure_records(self, *, as_of: datetime) -> int:
+        """Delete body-free failure records after 90 days."""
         ...
 
     def claim_conversation_message(
@@ -1689,6 +1811,18 @@ class AcceptanceObserver(Protocol):
 
     def unresolved_delivery_alerts(self) -> tuple[str, ...]:
         """Observe body-free delivery identities requiring reconciliation."""
+        ...
+
+    def bot_assistant_failure_records(
+        self,
+    ) -> tuple[BotAssistantFailureRecord, ...]:
+        """Observe body-free terminal Bot Assistant failure records."""
+        ...
+
+    def bot_assistant_operational_alerts(
+        self,
+    ) -> tuple[BotAssistantOperationalAlert, ...]:
+        """Observe body-free protected-alarm operational alerts."""
         ...
 
     def geography_confirmations(

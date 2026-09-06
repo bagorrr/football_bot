@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-12:] == [
-        "0038_coaching_source_chat_projection_gate.sql",
         "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
         "0040_coaching_ingestion_role_projection_gate.sql",
         "0041_exact_repost_referee_generic_projection.sql",
@@ -59,6 +58,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0047_allow_silent_callback_ack.sql",
         "0048_persist_dynamic_result_callback_copy.sql",
         "0049_result_conversation.sql",
+        "0050_bot_assistant_execution.sql",
     ]
 
 
@@ -601,6 +601,12 @@ def _assert_final_migration_state(database_url: str) -> None:
         )
     ]
     assert sequence_dependencies == [
+        (
+            "bot_assistant_operational_alerts_sequence_id_seq",
+            "i",
+            "bot_assistant_operational_alerts",
+            "sequence_id",
+        ),
         (
             "bot_callback_outbox_sequence_id_seq",
             "i",
