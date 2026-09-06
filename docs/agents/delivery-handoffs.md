@@ -89,7 +89,7 @@ prompt for the action that actually clears the gate.
 | Product grilling / Wayfinder | One non-research decision ticket | New thread after every resolved non-research ticket | No decision, task, research result, prototype, or fog blocks a buildable specification | `$wayfinder` audit, then `$to-spec` |
 | Specification | One product specification | New thread after the Wayfinder exit gate | User approves test seams and the published specification is complete and labelled `ready-for-agent` | `$to-tickets` |
 | Ticketing | One approved specification | New thread after implementation tickets and native dependencies are published | User approves tracer-bullet granularity; at least one implementation ticket is unblocked | Create a fresh frontier coordinator |
-| Ticket readiness | One implementation ticket coordinator | Fresh coordinator for every permitted frontier after predecessor completion and exact merge-commit `main` quality | Product owner confirms the reported model/effort selection and gives the required unambiguous start approval | Automatic ticket lifecycle |
+| Ticket readiness | One implementation ticket coordinator | Fresh coordinator for every permitted native or explicitly authorized bootstrap frontier after required completion, exact merge-commit `main` quality, and applicable activation gates | Product owner confirms the reported model/effort selection and gives the required unambiguous start approval | Automatic ticket lifecycle |
 | Implementation | One implementation ticket | New implementation task for every ticket | Acceptance criteria and proportional checks pass; implementation PR and terminal callback exist | Fresh independent `$code-review` |
 | Review | One implementation PR head | Fresh review after every implementation or fix commit; fixes use a separate task | No blocking standards or specification findings remain for the exact head | Authorized merge, a separate fix task, or a stop condition |
 | Release readiness | One release candidate against the approved specification | New thread after all implementation tickets and reviews are complete | CI, acceptance, operational, privacy, rollback, migration, monitoring, and support gates pass | Explicitly authorized deployment |
@@ -203,8 +203,10 @@ End with the Next handoff block from docs/agents/delivery-handoffs.md.
 ## Implementation protocol
 
 A completed ticket coordinator creates a fresh coordinator for each next
-frontier permitted by the recomputed native graph for which it is the elected
-creator, and reconciles the elected result for the rest. The handoff names the
+frontier for which it is the native elected creator or the sole designated
+creator under the opt-in cross-specification bootstrap in
+`ticket-orchestration.md`, and reconciles the elected result for the rest.
+The handoff names the
 specification and ticket, exact `main`, dependency state, completed predecessor
 artifacts, authorization applicability, credentials or services, and scope
 constraints.
@@ -212,7 +214,9 @@ constraints.
 Creation uses the supported Codex App task-creation mechanism and belongs to
 the completing ticket's authorized lifecycle. It does not start the next
 ticket. For each frontier, `ticket-orchestration.md` elects exactly one creator
-from immutable completion facts for its direct blockers. Only that coordinator
+from immutable completion facts for its direct blockers, or uses the explicit
+source designation for an activated zero-native-blocker bootstrap. Native
+dependencies and fan-in election remain unchanged. Only that coordinator
 may create; all other completing coordinators reconcile active tasks and the
 shared durable transition, then confirm the elected result rather than create.
 The elected coordinator must not terminate until every creation it owns is
@@ -243,6 +247,31 @@ claim, dispatch, create branches or pull requests, change GitHub, or mutate
 repository or external state. Parallel frontiers use separate coordinators,
 freshness checks, and approvals.
 
+For cross-specification bootstrap, read the target's canonical owner amendment,
+the linked outgoing-authority records on the source specification and ticket,
+and the activation evidence. The reviewed policy must be merged with successful
+exact-merge-commit `main` quality; the linked permissions must be complete,
+consistent, and active. Then verify every authorized predecessor's completion,
+merge and post-merge quality, including the designated source ticket. Inactive
+permission or an incomplete source leaves bootstrap gated. A native blocker or
+material frozen-scope change requires owner reconciliation, never graph repair
+or bypass under creation authority.
+
+The designated source creates only the frozen initial tickets, one at a time,
+with the explicit settings and read-only start boundary above. Reconcile by
+target and source-anchored key, preserve existing and partially created tasks,
+and resolve uncertain or pending attempts before retrying. Record each outcome
+on its target issue and report every target in `Next handoff`; unresolved
+creation receives a bounded reconciliation prompt, not a blind recreation
+instruction. Afterward end without polling the new coordinators.
+
+Source issue/specification notices carry the amendment into its ordinary
+handoff. If activation follows source completion, only a separately authorized
+single safe resume of that same coordinator, with no active subordinate, may
+reconcile the missing transition. A process task cannot create a duplicate
+source coordinator or unelected targets. If the source coordinator does not
+exist yet, preserve the canonical notices for its ordinary future handoff.
+
 After approval, one ticket coordinator drives a strictly sequential
 callback-driven loop. A subordinate task means one fresh implementation,
 review, or fix task, not a next-frontier coordinator. At most one subordinate
@@ -267,6 +296,10 @@ Required credentials/services: <STATE>
 Known scope constraints: <CONSTRAINTS>
 Coordinator model: gpt-5.6-luna
 Coordinator reasoning effort: max
+Bootstrap, if applicable: <SOURCE SPEC/TICKET, TARGET SPEC, FROZEN INITIAL SET>
+Bootstrap authority: <TARGET AMENDMENT, SOURCE OUTGOING RECORDS, ACTIVATION>
+Policy revision and source merge anchor: <EXACT SHAS AND QUALITY EVIDENCE>
+Target creation reconciliation: <KEY, EXISTING TASK/RECEIPT, DURABLE RESULT>
 
 Perform read-only readiness checks only. Reconcile GitHub, the native graph,
 durable transition comments, branches and pull requests, and active Codex
@@ -279,6 +312,8 @@ scope and risks. Ask the product owner to confirm or revise that selection
 together with start approval. If no blocker is reported, approval may name this
 ticket or be exactly `Согласен` or `Утверждаю`. If a blocker is reported, stop
 for an explicit policy amendment and do not silently substitute settings.
+Reconcile stale readiness again before acting on a later approval; a material
+scope, graph, model, or authority change requires a fresh owner decision.
 ```
 
 After approval, take one unblocked `ready-for-agent` implementation ticket:
@@ -363,7 +398,12 @@ mergeability, both independent review axes, zero unresolved review threads,
 and the applicable product-owner merge authorization. A specification-level
 standing authorization applies only through a durable amendment that freezes
 its covered existing tickets; it excludes later tickets, material scope or
-dependency changes, process-document pull requests, and deployment.
+dependency changes, process-document pull requests, credential use, protected
+configuration migration, production mutations, release approval, and deployment.
+It does not authorize a separate release-readiness stage. Existing frozen
+implementation scope may include release artifacts and controlled checks;
+required protected live smoke still needs separate bounded authorization.
+Ordinary CI cannot replace that acceptance gate or establish ticket completion.
 
 Project-specific authorization status and historical in-flight exceptions are
 not repeated in this document. Resolve them from the latest durable amendments,
@@ -372,11 +412,12 @@ issue before every affected transition.
 
 After merge, verify ticket closure or reconcile it, publish a completion
 record, and wait for successful `quality` on the exact merge commit on `main`.
-Only then recompute the native graph, automatically create each permitted
-next-frontier coordinator for which this coordinator is elected, and confirm
+Only then recompute the native graph and reconcile active bootstrap records,
+automatically create each permitted next-frontier coordinator for which this
+coordinator is elected or designated, and confirm
 the elected result for every other frontier. The old coordinator does not
 implement the next ticket itself. It does not finish its own lifecycle until
-each creation for which it is the deterministic elected creator is confirmed,
+each creation for which it is the elected or designated creator is confirmed,
 and each creation for which it is not elected is reconciled and confirmed, or
 a real creation failure is reported with a manual-recovery prompt. A loser at
 fan-in never creates or self-promotes.
@@ -384,9 +425,14 @@ fan-in never creates or self-promotes.
 Every dispatch and mutation uses the idempotency key
 `<spec>:<ticket>:<stage>:<base-or-head>` and first reconciles GitHub, the native
 graph, durable transition comments, branches and pull requests, and active
-Codex tasks. Next-frontier creation uses the target frontier ticket,
+Codex tasks. Native next-frontier creation uses the target frontier ticket,
 `coordinator-create`, and the newest direct-blocker merge commit in `main`
-ancestry, so every fan-in candidate reconciles the same transition. One
+ancestry, so every fan-in candidate reconciles the same transition. The opt-in
+zero-native-blocker bootstrap instead anchors to the designated source-ticket
+merge SHA; for an authorized #68 to #99 transition the key is
+`99:<target>:coordinator-create:<68-merge-SHA>`. A later unrelated `main` commit
+does not change either key, and target reconciliation prevents duplicate
+creation across keys or resumes. One
 supported, one-shot, idempotent heartbeat may be used only when no subordinate
 task is active and the coordinator is waiting for a non-Codex durable
 external-state transition such as post-merge `quality` or frontier-creation
