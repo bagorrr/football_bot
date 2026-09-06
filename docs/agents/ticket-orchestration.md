@@ -22,9 +22,9 @@ a time. Every stage uses a fresh task with a self-contained handoff; a prior
 task is never reused for the next stage.
 
 A coordinator that completes a ticket is a candidate to create coordinators
-for newly permitted frontiers and creates only those for which the election
-below selects it. It may create only after all of these facts are durable and
-verified:
+for newly permitted frontiers and creates only those for which the native
+election or the opt-in cross-specification bootstrap below selects it. It may
+create only after all of these facts are durable and verified:
 
 1. the authorized implementation pull request was merged and the merge was
    verified;
@@ -32,16 +32,17 @@ verified:
    completion record on its canonical GitHub artifact; and
 3. the `quality` run for the exact merge commit on `main` succeeded.
 
-Each completing coordinator then recomputes the native dependency graph. For
-every newly permitted frontier, the elected creator automatically creates one
-fresh coordinator; non-elected coordinators confirm that result. Each new
+Each completing coordinator then recomputes the native dependency graph and
+checks applicable cross-specification bootstrap records. For every permitted
+frontier, its elected or designated creator automatically creates one fresh
+coordinator; other coordinators confirm that result. Each new
 coordinator receives a structured handoff naming the specification, ticket,
 dependency state, exact `main`, completed predecessors and artifacts,
 applicable authorization state, required credentials or services, and known
 scope constraints.
 
-Creation authority for a frontier is deterministic. If the frontier has one
-direct blocker, that blocker's coordinator is the creator. At fan-in, compute
+Native creation authority for a frontier is deterministic. If the frontier has
+one direct blocker, that blocker's coordinator is the creator. At fan-in, compute
 an eligibility timestamp for every direct blocker from the latest of its
 authorized pull request's `merged_at`, its canonical completion record's
 `created_at`, and the `completed_at` of the earliest successful `quality` run
@@ -122,7 +123,92 @@ Before that approval, the coordinator must not:
   ticket's authorization.
 
 Each parallel frontier requires its own coordinator and its own start
-approval.
+approval. If readiness becomes stale before approval or dispatch, reconcile
+the current inputs again. An earlier approval cannot authorize a materially
+changed scope, dependency graph, model selection, or authorization contract;
+report the change and obtain the required fresh owner decision before mutation.
+
+## Opt-in cross-specification bootstrap
+
+A durable product-owner amendment may designate one completing source-ticket
+coordinator as the sole creator of a frozen set of initial tickets in a named
+successor specification, each with zero native blockers. This is an explicit
+creation exception, not a native dependency or a transfer of implementation
+ownership. Tickets with native blockers retain the election above, including
+fan-in; future tickets are never implicitly enrolled.
+
+The target specification's canonical amendment and linked outgoing-authority
+records on the source specification and source ticket must agree on the
+repository, source ticket, frozen target set and scopes, unchanged native
+graph, required predecessor completions, and activation conditions. They must
+identify the reviewed process-policy PR and exact merged revision. Activation
+requires its verified merge, successful `quality` on that exact `main` merge
+commit, and a durable activation record linking the complete permission set.
+Missing, inactive, superseded, or conflicting authority permits only read-only
+reconciliation of this transition; it never enables creation or standing merge
+authority. Policy publication alone does not activate either permission.
+
+Before each creation, the designated source coordinator verifies:
+
+- every authorized prerequisite ticket is complete, with verified authorized
+  merges, durable completion evidence, and successful required post-merge
+  `quality` for the exact commits, including its own source-ticket merge;
+- the policy revision remains in current `main` and all linked owner records
+  are active and applicable;
+- the frozen target scopes, parent links, and native graph still agree with
+  the authorization, with no native blocker on any bootstrap target; and
+- the current repository/project routing, exact remote `main`, branches, pull
+  requests, target coordinators, and durable creation records are reconciled.
+
+Any changed target blocker or material frozen-contract change stops bootstrap
+for owner reconciliation; do not remove or bypass dependencies. Resolve the
+legitimate source coordinator from task ownership and durable records, never
+from a new process task's availability. No other coordinator may self-promote.
+
+Use the existing transition-key shape. For bootstrap creation, `<spec>` is the
+target specification, `<ticket>` is the target ticket, `<stage>` is
+`coordinator-create`, and `<base-or-head>` is the verified source-ticket merge
+SHA. For an authorized #68 to #99 bootstrap this is
+`99:<target>:coordinator-create:<68-merge-SHA>`. A later unrelated `main`
+commit cannot change that anchor. Reconcile by target identity as well as by
+key, including prior attempts under other keys and pending creation receipts.
+
+Create targets one at a time through the supported Codex App mechanism, using
+fresh isolated worktrees from freshly verified target `main`, explicit
+`gpt-5.6-luna` / `max`, and a complete canonical-artifact handoff without
+inherited conversation history. Record the attempt on the target issue before
+calling creation; reconcile and record its result before the next call. Retain
+the task or pending receipt identity, host/project, source merge anchor,
+authorization links, and requested/effective settings in the durable record.
+Confirm an existing coordinator instead of creating another. A pending receipt
+is not a missing task and is not a resolved thread ID.
+
+Successful partial creation survives a later failure or duplicate resume:
+reconcile all targets and create only those proven still missing with no
+unresolved attempt. An uncertain response requires live reconciliation before
+any retry; absence from one task list does not prove failure. If the outcome
+cannot be resolved, record it as uncertain and stop with a bounded recovery
+prompt to reconcile the same attempt, not recreate it. Genuine creation
+failure follows the existing durable failure/manual-recovery rule, preserving
+every confirmed result. Neither a key nor an attempt record guarantees atomic
+exactly-once creation.
+
+Every target starts with read-only readiness, its own current model-freshness
+check, and its own model/start approval. Creation does not start implementation
+or grant credential access. Readiness uses controlled configuration and fake
+adapters; protected configuration or live conformance requires separate bounded
+authorization. After recording all creation outcomes, the source ends without
+polling target readiness or becoming a specification-wide supervisor.
+
+Keep canonical notices discoverable from the source issue and specification
+for the source coordinator's ordinary handoff and completion reconciliation.
+If activation follows source completion, an explicitly authorized single safe
+resumption may wake that same coordinator to reconcile the missing transition
+with `gpt-5.6-luna` / `max`, only when no subordinate task is active. Do not
+interrupt, poll, or replace active work. If no source coordinator exists yet,
+the notices await its ordinary lifecycle creation. If the completed source's
+coordinator is genuinely unavailable, publish the recovery outcome and prompt;
+the process task must not create a replacement source or unelected targets.
 
 ## Automatic ticket lifecycle after approval
 
@@ -158,8 +244,9 @@ ordinary transitions:
 8. Verify the merge and ticket closure or reconcile them explicitly, publish
    the completion record, and wait for successful `quality` on the exact merge
    commit on `main`.
-9. Recompute the native graph; create and confirm each permitted next-frontier
-   coordinator for which this coordinator is elected, and reconcile and
+9. Recompute the native graph and reconcile active bootstrap records; create
+   and confirm each permitted next-frontier coordinator for which this
+   coordinator is elected or designated, and reconcile and
    confirm the elected result for every other newly permitted frontier. Report
    all results in the final `Next handoff` block.
 
@@ -183,11 +270,13 @@ Use this idempotency key for each coordination transition:
 <spec>:<ticket>:<stage>:<base-or-head>
 ```
 
-For next-frontier creation, `<ticket>` is the target frontier ticket,
+For native next-frontier creation, `<ticket>` is the target frontier ticket,
 `<stage>` is `coordinator-create`, and `<base-or-head>` is the newest direct-
 blocker merge commit in `main` ancestry. Thus every fan-in candidate uses the
 same key; the predecessor coordinator's own ticket and a later unrelated
-`main` commit cannot produce a second creation key.
+`main` commit cannot produce a second creation key. The zero-native-blocker
+bootstrap exception instead uses its designated source-ticket merge anchor
+and also reconciles by target identity, as specified above.
 
 Before every dispatch or mutation, the coordinator must reconcile:
 
@@ -285,7 +374,13 @@ head:
 A specification-level standing authorization is applicable only when a
 durable GitHub amendment freezes the existing tickets it covers. It excludes
 later-created tickets, material scope or dependency changes, process-document
-pull requests, release readiness, and deployment. If it does not apply, the
+pull requests, credential use, protected configuration migration, production
+mutations, release approval, and deployment. It does not authorize a separate
+release-readiness stage. A frozen implementation ticket may prepare release
+artifacts and run controlled verification within its existing scope, but any
+required protected live smoke still needs separate bounded authorization.
+Do not waive acceptance criteria or mark that ticket complete solely because
+ordinary CI passed. If standing authorization does not apply, the
 current exact authorization rule remains in force.
 
 Project-specific authorization status and historical in-flight exceptions are
