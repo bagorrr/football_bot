@@ -203,6 +203,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0051_source_data_deletion.sql",
     "0052_source_data_deletion_review_fixes.sql",
     "0053_source_data_deletion_p1_fixes.sql",
+    "0054_source_data_deletion_replay_retention.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -260,6 +261,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7b3e95833ed643458cfba5b7c7953d45ceac27c335ff1ea2b1f3b147e0c7a5a8",
     "71525e0239993f8c0a0cd849cc37fdfbdfef5279c11b87efbfe19665cf9cfa33",
     "38b9132d69099adb40feab0f6d87da5e7245ab2d3e9b3287a19aa4f095477059",
+    "a9b4c99bc4d5bd3d7d26b439769166f55743226e669704b006f9d8e1a1831d64",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -4833,8 +4835,20 @@ class PostgresRoleStore:
             author_barriers = connection.execute(
                 """
                 DELETE FROM football_runtime.
-                    application_source_data_deletion_replay_barriers
-                WHERE expires_at <= %s
+                    application_source_data_deletion_replay_barriers AS barrier
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM football_runtime.source_chat_registry AS configured
+                    WHERE configured.peer_kind = barrier.peer_kind
+                      AND configured.telegram_chat_id = barrier.telegram_chat_id
+                      AND configured.permanently_removed_at IS NULL
+                )
+                  AND (
+                      SELECT max(removed.permanently_removed_at)
+                      FROM football_runtime.source_chat_registry AS removed
+                      WHERE removed.peer_kind = barrier.peer_kind
+                        AND removed.telegram_chat_id = barrier.telegram_chat_id
+                  ) + INTERVAL '90 days' <= %s
                 """,
                 (as_of,),
             )
@@ -5286,11 +5300,19 @@ class PostgresRoleStore:
                 SourceDataDeletionRequestStatus.EXECUTION_ERROR.value,
             }:
                 return False
-            attempt = request["execution_attempt"] + 1
-            if (
+            retry = (
                 request["status"]
                 == SourceDataDeletionRequestStatus.EXECUTION_ERROR.value
-            ):
+            )
+            if retry:
+                persisted_effective_at = request["effective_at"]
+                if persisted_effective_at is None:
+                    raise RuntimeError(
+                        "Source Data Deletion retry has no persisted boundary"
+                    )
+                effective_at = persisted_effective_at
+            attempt = request["execution_attempt"] + 1
+            if retry:
                 # A retry must use the first attempt's immutable target set.  Some
                 # owners may already have physically removed their rows.
                 source_rows: list[dict[str, Any]] = []
@@ -5421,6 +5443,25 @@ class PostgresRoleStore:
                     row["opportunity_revision_id"] for row in opportunity_rows
                 ]
             barrier_expires_at = effective_at + timedelta(days=90)
+            if retry:
+                existing_barrier = connection.execute(
+                    """
+                    SELECT expires_at
+                    FROM football_runtime.
+                        application_source_data_deletion_replay_barriers
+                    WHERE source_author_telegram_id = %s
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                    FOR UPDATE
+                    """,
+                    (
+                        request["source_author_telegram_id"],
+                        request["peer_kind"],
+                        request["telegram_chat_id"],
+                    ),
+                ).fetchone()
+                if existing_barrier is not None:
+                    barrier_expires_at = existing_barrier["expires_at"]
             connection.execute(
                 """
                 INSERT INTO football_runtime.

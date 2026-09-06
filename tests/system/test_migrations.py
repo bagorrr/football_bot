@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-12:] == [
-        "0042_moderation_review_events.sql",
         "0043_source_chat_administration_lifecycle.sql",
         "0044_source_chat_lifecycle_cancellation.sql",
         "0045_source_retention_audit_role_isolation.sql",
@@ -59,6 +58,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0051_source_data_deletion.sql",
         "0052_source_data_deletion_review_fixes.sql",
         "0053_source_data_deletion_p1_fixes.sql",
+        "0054_source_data_deletion_replay_retention.sql",
     ]
 
 
@@ -501,6 +501,7 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'requested_source_author_telegram_id bigint, '
                                  'requested_event_time timestamp with time zone, '
                                  'requested_as_of timestamp with time zone)',
+                                 'football_runtime.sync_source_data_deletion_replay_barrier_for_registry()',
                                  'football_runtime.read_source_data_deletion_requests()',
                                  'football_runtime.read_source_data_deletion_owner_acks('
                                  'requested_request_id text)',

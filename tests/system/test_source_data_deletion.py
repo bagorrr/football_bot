@@ -289,6 +289,234 @@ def test_source_data_deletion_captures_pending_and_racing_ingestion() -> None:
     assert system.source_events() == ()
 
 
+def test_source_data_deletion_retry_preserves_original_boundary_for_new_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_812
+    author_id = 78_914
+    chat_id = 4_680_114
+    telethon = ControlledTelegramIngestionAdapter()
+    identity = TelegramPeerIdentity(kind=TelegramPeerKind.CHAT, telegram_id=chat_id)
+    telethon.allow_public_username(
+        address="@source_deletion_fixture",
+        identity=identity,
+        transport_boundary="chat-sequence:4680",
+    )
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_ingestion=telethon,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+
+    first_boundary = datetime(2026, 9, 1, 12, 1, tzinfo=UTC)
+    request = system.create_source_data_deletion_request(
+        request_id="deletion-request:retry-boundary",
+        source_author_telegram_id=author_id,
+        source_chat_key=f"source-chat:chat:{chat_id}",
+        support_case_pointer="support-case:retry-boundary",
+        received_at=first_boundary,
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=request.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+        decided_at=first_boundary,
+    )
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=first_boundary,
+    )
+
+    def fail_bot_scope_capture(*_args: object, **_kwargs: object) -> list[str]:
+        raise RuntimeError("controlled Bot owner failure")
+
+    monkeypatch.setattr(
+        "modules.postgres_adapter._find_bot_completed_search_ids",
+        fail_bot_scope_capture,
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.BOT_ASSISTANT)
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert system.source_data_deletion_requests()[0].status.value == ("execution_error")
+
+    retry_at = first_boundary + timedelta(hours=1)
+    delayed_event_time = first_boundary + timedelta(minutes=30)
+    clock.advance_to(retry_at)
+    monkeypatch.undo()
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=retry_at,
+    )
+
+    retry_request = system.source_data_deletion_requests()[0]
+    assert retry_request.effective_at == first_boundary
+    barrier = system.source_data_deletion_replay_barriers()[0]
+    assert barrier.effective_at == first_boundary
+    assert barrier.expires_at == first_boundary + timedelta(days=90)
+
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_680,
+        qts=468,
+        seq=4_680,
+        date=datetime(2026, 9, 1, 11, 59, tzinfo=UTC),
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=4_681,
+            qts=469,
+            seq=4_681,
+            date=delayed_event_time,
+        ),
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:retry-boundary-new-message",
+        telegram_message_id=114,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="new message remains eligible after deletion retry",
+        event_time=delayed_event_time,
+        source_author_telegram_id=author_id,
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    assert system.process_next_account_telegram_difference()
+    system.process_source_data_deletion_until_idle()
+    assert system.source_messages()[0].body == (
+        "new message remains eligible after deletion retry"
+    )
+
+
+def test_source_data_deletion_excludes_pending_data_after_effective_at() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_813
+    author_id = 78_915
+    chat_id = 4_680_115
+    telethon = ControlledTelegramIngestionAdapter()
+    identity = TelegramPeerIdentity(kind=TelegramPeerKind.CHAT, telegram_id=chat_id)
+    telethon.allow_public_username(
+        address="@source_deletion_fixture",
+        identity=identity,
+        transport_boundary="chat-sequence:4680",
+    )
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_ingestion=telethon,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_690,
+        qts=469,
+        seq=4_690,
+        date=datetime(2026, 9, 1, 11, 59, tzinfo=UTC),
+    )
+    before_boundary = datetime(2026, 9, 1, 12, 1, tzinfo=UTC)
+    effective_at = datetime(2026, 9, 1, 12, 2, tzinfo=UTC)
+    after_boundary = datetime(2026, 9, 1, 12, 3, tzinfo=UTC)
+    telethon.add_account_difference_event(
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=4_691,
+            qts=470,
+            seq=4_691,
+            date=before_boundary,
+        ),
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:pending-before-boundary",
+        telegram_message_id=115,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="pending source body before boundary",
+        event_time=before_boundary,
+        source_author_telegram_id=author_id,
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=TelegramAccountCheckpoint(
+            pts=4_691,
+            qts=470,
+            seq=4_691,
+            date=before_boundary,
+        ),
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=4_692,
+            qts=471,
+            seq=4_692,
+            date=after_boundary,
+        ),
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:pending-after-boundary",
+        telegram_message_id=116,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="pending source body after boundary",
+        event_time=after_boundary,
+        source_author_telegram_id=author_id,
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    clock.advance_to(before_boundary)
+    assert system.process_next_account_telegram_difference()
+    request = system.create_source_data_deletion_request(
+        request_id="deletion-request:pending-strict-after",
+        source_author_telegram_id=author_id,
+        source_chat_key=f"source-chat:chat:{chat_id}",
+        support_case_pointer="support-case:pending-strict-after",
+        received_at=before_boundary,
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=request.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+        decided_at=before_boundary,
+    )
+    clock.advance_to(after_boundary)
+    assert system.process_next_account_telegram_difference()
+    assert len(system.source_events()) == 2
+
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=effective_at,
+    )
+    source_message_before = f"source-chat:chat:{chat_id}:generation:1:message:115"
+    source_message_after = f"source-chat:chat:{chat_id}:generation:1:message:116"
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        target_row = connection.execute(
+            """
+            SELECT target_source_message_ids, target_source_message_revision_ids,
+                   target_source_event_ids
+            FROM football_runtime.application_source_data_deletion_requests
+            WHERE request_id = %s
+            """,
+            (request.request_id,),
+        ).fetchone()
+    assert target_row == (
+        [source_message_before],
+        [f"{source_message_before}:revision:1"],
+        ["source-event:pending-before-boundary"],
+    )
+    pending_events = {event.source_event_id: event for event in system.source_events()}
+    assert pending_events["source-event:pending-before-boundary"].body is None
+    assert pending_events["source-event:pending-after-boundary"].body == (
+        "pending source body after boundary"
+    )
+    assert source_message_after not in target_row[0]
+
+
 def test_source_data_deletion_reject_input_is_bound_to_selected_request() -> None:
     clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
     administrator_id = 46_810
@@ -535,6 +763,122 @@ def test_source_data_deletion_excludes_persisted_data_after_effective_at() -> No
         [f"{source_rows[0][0]}:revision:1"],
         [source_rows[0][2]],
     )
+
+
+def test_source_data_deletion_replay_barrier_retention_follows_chat_lifecycle() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_814
+    author_id = 78_916
+    chat_id = 4_680_116
+    telethon = ControlledTelegramIngestionAdapter()
+    identity = TelegramPeerIdentity(kind=TelegramPeerKind.CHAT, telegram_id=chat_id)
+    telethon.allow_public_username(
+        address="@source_deletion_fixture",
+        identity=identity,
+        transport_boundary="chat-sequence:4680",
+    )
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_ingestion=telethon,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+    )
+
+    first_boundary = clock.now() + timedelta(minutes=1)
+    request = system.create_source_data_deletion_request(
+        request_id="deletion-request:barrier-retention",
+        source_author_telegram_id=author_id,
+        source_chat_key=f"source-chat:chat:{chat_id}",
+        support_case_pointer="support-case:barrier-retention",
+        received_at=clock.now(),
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=request.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+        decided_at=clock.now(),
+    )
+    clock.advance_to(first_boundary)
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=first_boundary,
+    )
+    system.process_source_data_deletion_until_idle()
+    assert system.record_source_data_deletion_notification(
+        request_id=request.request_id,
+        notified_at=clock.now(),
+    )
+    assert system.complete_source_data_deletion_request(
+        request_id=request.request_id,
+        completion_outcome="data_not_found",
+        completion_proof_pointer="support-proof:barrier-retention",
+        completed_at=clock.now(),
+    )
+
+    clock.advance_to(first_boundary + timedelta(days=91))
+    assert system.cleanup_expired_source_message_tombstones() == 0
+    assert len(system.source_data_deletion_replay_barriers()) == 1
+
+    delayed_pre_boundary_event = first_boundary - timedelta(seconds=30)
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_696,
+        qts=469,
+        seq=4_696,
+        date=datetime(2026, 9, 1, 11, 59, tzinfo=UTC),
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=initial_checkpoint,
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=4_697,
+            qts=470,
+            seq=4_697,
+            date=delayed_pre_boundary_event,
+        ),
+        identity=identity,
+        registry_generation=1,
+        source_event_id="source-event:configured-barrier-retention",
+        telegram_message_id=117,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="pre-boundary replay must remain blocked",
+        event_time=delayed_pre_boundary_event,
+        source_author_telegram_id=author_id,
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+    assert system.process_next_account_telegram_difference()
+    system.process_source_data_deletion_until_idle()
+    assert system.source_events() == ()
+    assert system.source_messages() == ()
+
+    removed_at = clock.now()
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute("SET SESSION AUTHORIZATION football_application")
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET enabled = false, permanently_removed_at = %s, updated_at = %s
+            WHERE peer_kind = 'chat'
+              AND telegram_chat_id = %s
+              AND registry_generation = 1
+            """,
+            (removed_at, removed_at, chat_id),
+        )
+    assert system.source_data_deletion_replay_barriers()[0].expires_at == (
+        removed_at + timedelta(days=90)
+    )
+
+    clock.advance_to(removed_at + timedelta(days=90) - timedelta(seconds=1))
+    assert system.cleanup_expired_source_message_tombstones() == 0
+    assert len(system.source_data_deletion_replay_barriers()) == 1
+    clock.advance_to(removed_at + timedelta(days=90))
+    system.cleanup_expired_source_message_tombstones()
+    assert system.source_data_deletion_replay_barriers() == ()
 
 
 def test_source_data_deletion_reminder_delivery_and_failure_rearm(
