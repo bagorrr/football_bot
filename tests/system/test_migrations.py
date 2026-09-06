@@ -495,6 +495,15 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'football_runtime.sync_source_message_retention_moderation()',
                                  'football_runtime.sync_source_message_retention_lifecycle()',
                                  'football_runtime.read_source_data_audit()',
+                                 'football_runtime.source_author_deletion_barrier('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_source_author_telegram_id bigint, '
+                                 'requested_event_time timestamp with time zone, '
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.read_source_data_deletion_requests()',
+                                 'football_runtime.read_source_data_deletion_owner_acks('
+                                 'requested_request_id text)',
                                  'football_runtime.ingestion_scrub_source_message_revision_data('
                                  'requested_peer_kind text, '
                                  'requested_telegram_chat_id bigint, '
