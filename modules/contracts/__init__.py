@@ -4750,6 +4750,7 @@ def _validate_source_data_deletion_contract(
             "source_event_ids",
             "opportunity_ids",
             "opportunity_revision_ids",
+            "bot_completed_search_ids",
             "execution_attempt",
         }
         if set(payload) != expected_fields:
@@ -4774,6 +4775,7 @@ def _validate_source_data_deletion_contract(
             "source_event_ids",
             "opportunity_ids",
             "opportunity_revision_ids",
+            "bot_completed_search_ids",
         ):
             values = payload[field_name]
             if not isinstance(values, list) or len(values) != len(set(values)):
@@ -4832,12 +4834,28 @@ def _validate_source_data_deletion_contract(
         raise ValueError("Source Data Deletion event owner is inconsistent")
     common_fields = {"request_id", "owner_role", "execution_attempt"}
     if contract_name is ContractName.SOURCE_SCOPE_SUPPRESSED:
-        expected_fields = common_fields | {"status", "affected_count"}
+        expected_fields = common_fields | {
+            "status",
+            "affected_count",
+            "bot_completed_search_ids",
+        }
         if payload.get("status") != "suppressed":
             raise ValueError("SourceScopeSuppressed status is invalid")
         count = payload.get("affected_count")
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError("SourceScopeSuppressed count is invalid")
+        bot_completed_search_ids = payload.get("bot_completed_search_ids")
+        if (
+            not isinstance(bot_completed_search_ids, list)
+            or len(bot_completed_search_ids) != len(set(bot_completed_search_ids))
+            or not all(
+                isinstance(value, str)
+                and bool(value)
+                and not any(character.isspace() for character in value)
+                for value in bot_completed_search_ids
+            )
+        ):
+            raise ValueError("SourceScopeSuppressed Bot target list is invalid")
     elif contract_name is ContractName.SOURCE_SCOPE_DELETION_COMPLETED:
         expected_fields = common_fields | {"status", "deleted_count"}
         if payload.get("status") != "completed":

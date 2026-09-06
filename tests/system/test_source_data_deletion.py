@@ -289,6 +289,254 @@ def test_source_data_deletion_captures_pending_and_racing_ingestion() -> None:
     assert system.source_events() == ()
 
 
+def test_source_data_deletion_reject_input_is_bound_to_selected_request() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_810
+    delivery = ControlledTelegramDeliveryAdapter()
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_delivery=delivery,
+    )
+    system.reset()
+    _open_deletion_requests(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        prefix="reject-binding",
+    )
+    request_a = system.create_source_data_deletion_request(
+        request_id="deletion-request:reject-a",
+        source_author_telegram_id=78_910,
+        source_chat_key="source-chat:chat:4680110",
+        support_case_pointer="support-case:reject-a",
+    )
+    request_b = system.create_source_data_deletion_request(
+        request_id="deletion-request:reject-b",
+        source_author_telegram_id=78_911,
+        source_chat_key="source-chat:chat:4680111",
+        support_case_pointer="support-case:reject-b",
+    )
+    _refresh_deletion_requests(
+        system,
+        administrator_id=administrator_id,
+        prefix="reject-binding:refresh",
+    )
+    system.select_source_data_deletion_action(
+        update_id="reject-binding:select-a",
+        telegram_user_id=administrator_id,
+        action=_callback(delivery.messages[-1], "sdd:reject:"),
+    )
+    input_state = system.conversation_state(administrator_id)
+    assert input_state.stage is ConversationStage.SOURCE_DATA_DELETION_INPUT
+
+    system.submit_source_data_deletion_reason(
+        update_id="reject-binding:submit-b",
+        telegram_user_id=administrator_id,
+        request_id=request_b.request_id,
+        decision_reason="wrong_identity",
+        screen_revision=input_state.screen_revision,
+    )
+    assert not system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    requests = {
+        request.request_id: request
+        for request in system.source_data_deletion_requests()
+    }
+    assert requests[request_a.request_id].status.value == "pending_decision"
+    assert requests[request_b.request_id].status.value == "pending_decision"
+    assert system.conversation_state(administrator_id).stage is (
+        ConversationStage.SOURCE_DATA_DELETION_INPUT
+    )
+
+
+def test_source_data_deletion_completion_input_is_bound_to_selected_request() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_811
+    delivery = ControlledTelegramDeliveryAdapter()
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_delivery=delivery,
+    )
+    system.reset()
+    _open_deletion_requests(
+        system,
+        clock=clock,
+        administrator_id=administrator_id,
+        prefix="completion-binding",
+    )
+    request_a = system.create_source_data_deletion_request(
+        request_id="deletion-request:completion-a",
+        source_author_telegram_id=78_912,
+        source_chat_key="source-chat:chat:4680112",
+        support_case_pointer="support-case:completion-a",
+    )
+    request_b = system.create_source_data_deletion_request(
+        request_id="deletion-request:completion-b",
+        source_author_telegram_id=78_913,
+        source_chat_key="source-chat:chat:4680113",
+        support_case_pointer="support-case:completion-b",
+    )
+    for request in (request_a, request_b):
+        assert system.decide_source_data_deletion_request(
+            request_id=request.request_id,
+            decision="approve",
+            decision_reason=None,
+            decided_by=administrator_id,
+            decided_at=clock.now(),
+        )
+        assert system.begin_source_data_deletion_request(
+            request_id=request.request_id,
+            effective_at=clock.now(),
+        )
+    system.process_source_data_deletion_until_idle()
+    for request in (request_a, request_b):
+        assert (
+            system.source_data_deletion_requests()[
+                0 if request is request_a else 1
+            ].status.value
+            == "awaiting_completion"
+        )
+        assert system.record_source_data_deletion_notification(
+            request_id=request.request_id,
+            notified_at=clock.now(),
+        )
+
+    _refresh_deletion_requests(
+        system,
+        administrator_id=administrator_id,
+        prefix="completion-binding:refresh",
+    )
+    system.select_source_data_deletion_action(
+        update_id="completion-binding:select-a",
+        telegram_user_id=administrator_id,
+        action=_callback(delivery.messages[-1], "sdd:complete:"),
+    )
+    input_state = system.conversation_state(administrator_id)
+    assert input_state.stage is ConversationStage.SOURCE_DATA_DELETION_INPUT
+
+    system.submit_source_data_deletion_completion(
+        update_id="completion-binding:submit-b",
+        telegram_user_id=administrator_id,
+        request_id=request_b.request_id,
+        completion_outcome="completed",
+        completion_proof_pointer="support-proof:completion-b",
+        screen_revision=input_state.screen_revision,
+    )
+    assert not system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    requests = {
+        request.request_id: request
+        for request in system.source_data_deletion_requests()
+    }
+    assert requests[request_a.request_id].status.value == "awaiting_completion"
+    assert requests[request_b.request_id].status.value == "awaiting_completion"
+
+
+def test_source_data_deletion_excludes_persisted_data_after_effective_at() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_809
+    author_id = 78_909
+    chat_id = 4_680_109
+    effective_at = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    source_rows = (
+        (
+            "source-chat:chat:4680109:generation:1:message:109",
+            109,
+            "source-event:boundary-before",
+            effective_at - timedelta(minutes=1),
+        ),
+        (
+            "source-chat:chat:4680109:generation:1:message:110",
+            110,
+            "source-event:boundary-after",
+            effective_at + timedelta(minutes=1),
+        ),
+    )
+    system = _new_system(clock=clock, administrator_id=administrator_id)
+    system.reset()
+    bounded_metadata = json.dumps({"source_author_telegram_id": str(author_id)})
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute("SET SESSION AUTHORIZATION football_application")
+        for (
+            source_message_id,
+            telegram_message_id,
+            source_event_id,
+            event_time,
+        ) in source_rows:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_messages (
+                    source_message_id, peer_kind, telegram_chat_id,
+                    registry_generation, telegram_message_id, current_revision,
+                    event_kind, body, event_time, recorded_at, tombstoned,
+                    bounded_metadata
+                ) VALUES (%s, 'chat', %s, 1, %s, 1, 'create',
+                          'persisted source body', %s, %s, false, %s::jsonb)
+                """,
+                (
+                    source_message_id,
+                    chat_id,
+                    telegram_message_id,
+                    event_time,
+                    event_time,
+                    bounded_metadata,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_message_revisions (
+                    source_message_revision_id, source_message_id,
+                    source_event_id, revision, event_kind, body, event_time,
+                    recorded_at, bounded_metadata, registry_generation
+                ) VALUES (%s, %s, %s, 1, 'create', 'persisted source body',
+                          %s, %s, %s::jsonb, 1)
+                """,
+                (
+                    f"{source_message_id}:revision:1",
+                    source_message_id,
+                    source_event_id,
+                    event_time,
+                    event_time,
+                    bounded_metadata,
+                ),
+            )
+
+    clock.advance_to(effective_at)
+    request = system.create_source_data_deletion_request(
+        request_id="deletion-request:effective-boundary",
+        source_author_telegram_id=author_id,
+        source_chat_key=f"source-chat:chat:{chat_id}",
+        support_case_pointer="support-case:effective-boundary",
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=request.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+        decided_at=effective_at,
+    )
+    assert system.begin_source_data_deletion_request(
+        request_id=request.request_id,
+        effective_at=effective_at,
+    )
+
+    with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        target_row = connection.execute(
+            """
+            SELECT target_source_message_ids, target_source_message_revision_ids,
+                   target_source_event_ids
+            FROM football_runtime.application_source_data_deletion_requests
+            WHERE request_id = %s
+            """,
+            (request.request_id,),
+        ).fetchone()
+    assert target_row == (
+        [source_rows[0][0]],
+        [f"{source_rows[0][0]}:revision:1"],
+        [source_rows[0][2]],
+    )
+
+
 def test_source_data_deletion_reminder_delivery_and_failure_rearm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -350,12 +598,12 @@ def test_source_data_deletion_reminder_delivery_and_failure_rearm(
         effective_at=clock.now(),
     )
 
-    def fail_bot_cleanup(*_args: object, **_kwargs: object) -> int:
+    def fail_bot_scope_capture(*_args: object, **_kwargs: object) -> list[str]:
         raise RuntimeError("controlled Bot owner failure")
 
     monkeypatch.setattr(
-        "modules.postgres_adapter._cleanup_bot_source_scope",
-        fail_bot_cleanup,
+        "modules.postgres_adapter._find_bot_completed_search_ids",
+        fail_bot_scope_capture,
     )
     assert system.process_next_contract_handoff(RuntimeRole.BOT_ASSISTANT)
     assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
@@ -400,22 +648,63 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
     completed_search_id = "completed-search:bot-cleanup"
     result_id = "result:bot-cleanup:1"
     presentation_delivery_id = "result-current:bot-cleanup"
+    opportunity_id = "opportunity:bot-cleanup"
+    opportunity_revision_id = "opportunity:bot-cleanup:revision:1"
     recorded_at = clock.now()
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        connection.execute("SET SESSION AUTHORIZATION football_application")
+        connection.execute(
+            """
+            INSERT INTO football_runtime.application_opportunities (
+                opportunity_id, opportunity_revision_id,
+                source_message_revision_id, opportunity_type, publication_state,
+                accepted_facts, evidence, response_route, accepted_at
+            ) VALUES (%s, %s, %s, 'open_match', 'active',
+                      '{}'::jsonb, '{}'::jsonb,
+                      '{"kind": "url", "value": "https://source"}'::jsonb,
+                      %s)
+            """,
+            (
+                opportunity_id,
+                opportunity_revision_id,
+                source_revision_id,
+                recorded_at,
+            ),
+        )
         connection.execute("SET SESSION AUTHORIZATION football_recommendation")
+        connection.execute(
+            """
+            INSERT INTO football_runtime.recommendation_opportunities (
+                opportunity_id, opportunity_revision_id, opportunity_type,
+                publication_state, accepted_facts, response_route, published_at
+            ) VALUES (%s, %s, 'open_match', 'active', '{}'::jsonb,
+                      '{"kind": "url", "value": "https://source"}'::jsonb, %s)
+            """,
+            (opportunity_id, opportunity_revision_id, recorded_at),
+        )
         connection.execute(
             """
             INSERT INTO football_runtime.recommendation_completed_searches (
                 completed_search_id, telegram_user_id, search_update_id,
                 user_intent, country_id, city_id, sub_city_area_ids,
-                whole_city, required_date, completed_at
+                whole_city, required_date, opportunity_revision_inputs,
+                completed_at
             ) VALUES (%s, %s, %s, 'tournament_search', 'country:ru',
-                      'city:moscow', '[]', true, NULL, %s)
+                      'city:moscow', '[]', true, NULL, %s::jsonb, %s)
             """,
             (
                 completed_search_id,
                 administrator_id,
                 "search-update:bot-cleanup",
+                json.dumps(
+                    [
+                        {
+                            "opportunity_id": opportunity_id,
+                            "opportunity_revision_id": opportunity_revision_id,
+                            "source_message_revision_id": source_revision_id,
+                        }
+                    ]
+                ),
                 recorded_at,
             ),
         )
@@ -431,7 +720,8 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
                 completed_search_id,
                 json.dumps(
                     {
-                        "opportunity_id": "opportunity:bot-cleanup",
+                        "opportunity_id": opportunity_id,
+                        "opportunity_revision_id": opportunity_revision_id,
                         "source_message_revision_id": source_revision_id,
                     }
                 ),
@@ -514,6 +804,51 @@ def test_bot_source_data_cleanup_removes_result_context_and_retained_text() -> N
         request_id=request.request_id,
         effective_at=clock.now(),
     )
+
+    def bot_counts() -> tuple[int, int, int, int]:
+        with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+            counts = connection.execute(
+                """
+                SELECT
+                    (SELECT count(*)
+                     FROM football_runtime.bot_active_result_contexts
+                     WHERE completed_search_id = %s),
+                    (SELECT count(*)
+                     FROM football_runtime.bot_search_presentations
+                     WHERE completed_search_id = %s),
+                    (SELECT count(*)
+                     FROM football_runtime.bot_result_conversation_messages
+                     WHERE completed_search_id = %s),
+                    (SELECT count(*)
+                     FROM football_runtime.bot_message_outbox
+                     WHERE delivery_id = %s)
+                """,
+                (
+                    completed_search_id,
+                    completed_search_id,
+                    completed_search_id,
+                    presentation_delivery_id,
+                ),
+            ).fetchone()
+        assert counts is not None
+        return counts
+
+    for role in RuntimeRole:
+        assert system.process_next_contract_handoff(role)
+    while system.source_data_deletion_requests()[0].status.value == "suppressing":
+        assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert system.source_data_deletion_requests()[0].status.value == "executing"
+    assert bot_counts() == (1, 1, 2, 1)
+
+    for role in (
+        RuntimeRole.INGESTION,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.CLASSIFICATION,
+        RuntimeRole.RECOMMENDATION,
+    ):
+        assert system.process_next_contract_handoff(role)
+    assert bot_counts() == (1, 1, 2, 1)
+
     system.process_source_data_deletion_until_idle()
     with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
         counts = connection.execute(

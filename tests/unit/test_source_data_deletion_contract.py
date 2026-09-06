@@ -69,6 +69,7 @@ def _command(
             "opportunity_revision_ids": [
                 "opportunity:deletion-contract:1012:revision:1"
             ],
+            "bot_completed_search_ids": [],
             "execution_attempt": attempt,
         },
     )

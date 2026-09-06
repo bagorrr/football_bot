@@ -202,6 +202,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0050_bot_assistant_execution.sql",
     "0051_source_data_deletion.sql",
     "0052_source_data_deletion_review_fixes.sql",
+    "0053_source_data_deletion_p1_fixes.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -258,6 +259,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "4eccd7de7171150cc9f7800a4bf17329931e35e79a2bfd81504357235ee56f4d",
     "7b3e95833ed643458cfba5b7c7953d45ceac27c335ff1ea2b1f3b147e0c7a5a8",
     "71525e0239993f8c0a0cd849cc37fdfbdfef5279c11b87efbfe19665cf9cfa33",
+    "38b9132d69099adb40feab0f6d87da5e7245ab2d3e9b3287a19aa4f095477059",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -5301,7 +5303,11 @@ class PostgresRoleStore:
                 opportunity_revision_ids = list(
                     request["target_opportunity_revision_ids"]
                 )
+                bot_completed_search_ids = list(
+                    request["target_bot_completed_search_ids"]
+                )
             else:
+                bot_completed_search_ids = []
                 connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (request["source_chat_key"],),
@@ -5310,13 +5316,14 @@ class PostgresRoleStore:
                     """
                     SELECT *
                     FROM football_runtime.capture_source_data_deletion_pending_events(
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                     """,
                     (
                         request["peer_kind"],
                         request["telegram_chat_id"],
                         request["source_author_telegram_id"],
+                        effective_at,
                     ),
                 ).fetchall()
                 source_rows = connection.execute(
@@ -5331,6 +5338,8 @@ class PostgresRoleStore:
                       ON revision.source_message_id = source.source_message_id
                     WHERE source.peer_kind = %s
                       AND source.telegram_chat_id = %s
+                      AND source.event_time <= %s
+                      AND revision.event_time <= %s
                       AND revision.bounded_metadata ->>
                           'source_author_telegram_id' ~ '^[1-9][0-9]*$'
                       AND (revision.bounded_metadata ->>
@@ -5340,6 +5349,8 @@ class PostgresRoleStore:
                     (
                         request["peer_kind"],
                         request["telegram_chat_id"],
+                        effective_at,
+                        effective_at,
                         request["source_author_telegram_id"],
                     ),
                 ).fetchall()
@@ -5368,9 +5379,10 @@ class PostgresRoleStore:
                         SELECT source_message_revision_id, source_event_id
                         FROM football_runtime.source_message_revisions
                         WHERE source_message_id = ANY(%s)
+                          AND event_time <= %s
                         ORDER BY source_message_revision_id
                         """,
-                        (source_message_ids,),
+                        (source_message_ids, effective_at),
                     ).fetchall()
                     if source_message_ids
                     else []
@@ -5477,6 +5489,7 @@ class PostgresRoleStore:
                     target_source_event_ids = %s,
                     target_opportunity_ids = %s,
                     target_opportunity_revision_ids = %s,
+                    target_bot_completed_search_ids = %s,
                     last_reminder_at = NULL, next_reminder_at = NULL,
                     requester_notification_status = 'pending',
                     requester_notified_at = NULL
@@ -5491,6 +5504,7 @@ class PostgresRoleStore:
                     source_event_ids,
                     opportunity_ids,
                     opportunity_revision_ids,
+                    bot_completed_search_ids,
                     request_id,
                 ),
             )
@@ -5536,6 +5550,7 @@ class PostgresRoleStore:
                         source_event_ids=source_event_ids,
                         opportunity_ids=opportunity_ids,
                         opportunity_revision_ids=opportunity_revision_ids,
+                        bot_completed_search_ids=bot_completed_search_ids,
                     ),
                 )
         return True
@@ -5837,14 +5852,17 @@ class PostgresRoleStore:
             ):
                 return ConsumeResult.REPLAYED
             count = 0
+            bot_completed_search_ids: list[str] = []
             failure_reason: str | None = None
             try:
                 with connection.transaction():
                     if command_kind == "suppression":
-                        count = _suppress_source_scope_for_owner(
-                            connection,
-                            owner=self._role,
-                            payload=payload,
+                        count, bot_completed_search_ids = (
+                            _suppress_source_scope_for_owner(
+                                connection,
+                                owner=self._role,
+                                payload=payload,
+                            )
                         )
                     else:
                         count = _delete_source_scope_for_owner(
@@ -5868,6 +5886,7 @@ class PostgresRoleStore:
                     owner=self._role,
                     recorded_at=received_at,
                     count=count,
+                    bot_completed_search_ids=bot_completed_search_ids,
                 )
             else:
                 outgoing = _source_deletion_event_envelope(
@@ -6107,6 +6126,22 @@ class PostgresRoleStore:
                 return ConsumeResult.APPLIED
             if incoming.contract_name is ContractName.SOURCE_SCOPE_SUPPRESSED:
                 count = cast(int, payload["affected_count"])
+                if owner is RuntimeRole.BOT_ASSISTANT:
+                    bot_completed_search_ids = cast(
+                        list[str], payload["bot_completed_search_ids"]
+                    )
+                    connection.execute(
+                        """
+                        UPDATE football_runtime.
+                            application_source_data_deletion_requests
+                        SET target_bot_completed_search_ids = %s
+                        WHERE request_id = %s
+                        """,
+                        (bot_completed_search_ids, request_id),
+                    )
+                    request["target_bot_completed_search_ids"] = (
+                        bot_completed_search_ids
+                    )
                 connection.execute(
                     """
                     UPDATE football_runtime.application_source_data_deletion_owner_acks
@@ -6169,6 +6204,9 @@ class PostgresRoleStore:
                                 opportunity_ids=request["target_opportunity_ids"],
                                 opportunity_revision_ids=request[
                                     "target_opportunity_revision_ids"
+                                ],
+                                bot_completed_search_ids=request[
+                                    "target_bot_completed_search_ids"
                                 ],
                             ),
                         )
@@ -10463,7 +10501,8 @@ class PostgresRoleStore:
                     SELECT telegram_user_id, locale, locale_source,
                            last_seen_language_code, stage,
                            screen_revision, revision,
-                           result_stale_callback_text, result_callback_ack
+                           result_stale_callback_text, result_callback_ack,
+                           source_data_deletion_request_id
                     FROM football_runtime.bot_users
                     WHERE telegram_user_id = %s
                     """,
@@ -10484,6 +10523,7 @@ class PostgresRoleStore:
             revision=row["revision"],
             result_stale_callback_text=row["result_stale_callback_text"],
             result_callback_ack=row["result_callback_ack"],
+            source_data_deletion_request_id=row["source_data_deletion_request_id"],
         )
 
     def discovery_draft(self, telegram_user_id: int) -> DiscoveryDraft | None:
@@ -10688,6 +10728,11 @@ class PostgresRoleStore:
             if inserted is None:
                 return False
             source = state.locale_source.value if state.locale_source else None
+            source_data_deletion_request_id = (
+                state.source_data_deletion_request_id
+                if state.stage is ConversationStage.SOURCE_DATA_DELETION_INPUT
+                else None
+            )
             if expected_revision == 0:
                 changed = connection.execute(
                     """
@@ -10695,8 +10740,9 @@ class PostgresRoleStore:
                         telegram_user_id, locale, locale_source,
                         last_seen_language_code, stage, screen_revision,
                         revision, result_stale_callback_text,
-                        result_callback_ack, last_bot_user_action_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        result_callback_ack, source_data_deletion_request_id,
+                        last_bot_user_action_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT DO NOTHING
                     RETURNING revision
                     """,
@@ -10710,6 +10756,7 @@ class PostgresRoleStore:
                         state.revision,
                         state.result_stale_callback_text,
                         state.result_callback_ack,
+                        source_data_deletion_request_id,
                         recorded_at,
                         recorded_at,
                     ),
@@ -10726,6 +10773,7 @@ class PostgresRoleStore:
                         revision = %s,
                         result_stale_callback_text = %s,
                         result_callback_ack = %s,
+                        source_data_deletion_request_id = %s,
                         last_bot_user_action_at = %s,
                         updated_at = %s
                     WHERE telegram_user_id = %s AND revision = %s
@@ -10740,6 +10788,7 @@ class PostgresRoleStore:
                         state.revision,
                         state.result_stale_callback_text,
                         state.result_callback_ack,
+                        source_data_deletion_request_id,
                         recorded_at,
                         recorded_at,
                         state.telegram_user_id,
@@ -12067,6 +12116,7 @@ class PostgresRoleStore:
                 """
                 UPDATE football_runtime.bot_users
                 SET stage = %s, screen_revision = %s, revision = %s,
+                    source_data_deletion_request_id = NULL,
                     last_bot_user_action_at = %s, updated_at = %s
                 WHERE telegram_user_id = %s
                   AND revision = %s
@@ -17262,6 +17312,7 @@ def _source_deletion_command_envelope(
     source_event_ids: Iterable[str],
     opportunity_ids: Iterable[str],
     opportunity_revision_ids: Iterable[str],
+    bot_completed_search_ids: Iterable[str],
 ) -> ContractEnvelope:
     """Build one canonical body-free owner fan-out command."""
     causation_id = _source_deletion_attempt_id(request_id, attempt)
@@ -17296,6 +17347,7 @@ def _source_deletion_command_envelope(
             "source_event_ids": list(source_event_ids),
             "opportunity_ids": list(opportunity_ids),
             "opportunity_revision_ids": list(opportunity_revision_ids),
+            "bot_completed_search_ids": list(bot_completed_search_ids),
             "execution_attempt": attempt,
         },
     )
@@ -17309,6 +17361,7 @@ def _source_deletion_event_envelope(
     recorded_at: datetime,
     count_field: str | None = None,
     count: int = 0,
+    bot_completed_search_ids: Iterable[str] = (),
     phase: str | None = None,
     failure_reason: str | None = None,
 ) -> ContractEnvelope:
@@ -17319,7 +17372,13 @@ def _source_deletion_event_envelope(
         "execution_attempt": command.subject_revision,
     }
     if name is ContractName.SOURCE_SCOPE_SUPPRESSED:
-        payload.update({"status": "suppressed", "affected_count": count})
+        payload.update(
+            {
+                "status": "suppressed",
+                "affected_count": count,
+                "bot_completed_search_ids": list(bot_completed_search_ids),
+            }
+        )
     elif name is ContractName.SOURCE_SCOPE_DELETION_COMPLETED:
         payload.update({"status": "completed", "deleted_count": count})
     else:
@@ -17408,7 +17467,7 @@ def _validate_source_deletion_request_input(
 
 def _source_scope_lists(
     payload: Mapping[str, Any],
-) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str], list[str], list[str], list[str]]:
     """Read already-validated body-free target lists from a command payload."""
     return tuple(
         cast(list[str], payload[field_name])
@@ -17418,6 +17477,7 @@ def _source_scope_lists(
             "source_event_ids",
             "opportunity_ids",
             "opportunity_revision_ids",
+            "bot_completed_search_ids",
         )
     )  # type: ignore[return-value]
 
@@ -17601,20 +17661,18 @@ def _scrub_source_scope_outbox(
     return changed.rowcount
 
 
-def _cleanup_bot_source_scope(
+def _find_bot_completed_search_ids(
     connection: psycopg.Connection[Any],
     *,
-    source_message_ids: Iterable[str],
-    source_message_revision_ids: Iterable[str],
     opportunity_ids: Iterable[str],
     opportunity_revision_ids: Iterable[str],
-) -> int:
-    """Remove Bot-owned result context and retained text for deleted sources."""
-    source_message_id_values = list(source_message_ids)
-    source_revision_values = list(source_message_revision_ids)
+    source_message_revision_ids: Iterable[str],
+) -> list[str]:
+    """Capture Bot searches before Recommendation can remove their lineage."""
     opportunity_id_values = list(opportunity_ids)
     opportunity_revision_values = list(opportunity_revision_ids)
-    affected_searches = connection.execute(
+    source_revision_values = list(source_message_revision_ids)
+    rows = connection.execute(
         """
         SELECT DISTINCT result.completed_search_id
         FROM football_runtime.recommendation_results AS result
@@ -17644,7 +17702,24 @@ def _cleanup_bot_source_scope(
             source_revision_values,
         ),
     ).fetchall()
-    completed_search_ids = [row[0] for row in affected_searches]
+    return sorted(row[0] for row in rows)
+
+
+def _cleanup_bot_source_scope(
+    connection: psycopg.Connection[Any],
+    *,
+    source_message_ids: Iterable[str],
+    source_message_revision_ids: Iterable[str],
+    opportunity_ids: Iterable[str],
+    opportunity_revision_ids: Iterable[str],
+    bot_completed_search_ids: Iterable[str],
+) -> int:
+    """Remove Bot-owned result context and retained text for deleted sources."""
+    source_message_id_values = list(source_message_ids)
+    source_revision_values = list(source_message_revision_ids)
+    opportunity_id_values = list(opportunity_ids)
+    opportunity_revision_values = list(opportunity_revision_ids)
+    completed_search_ids = list(bot_completed_search_ids)
     if not completed_search_ids:
         return _scrub_source_scope_outbox(
             connection,
@@ -17722,7 +17797,7 @@ def _suppress_source_scope_for_owner(
     *,
     owner: RuntimeRole,
     payload: Mapping[str, Any],
-) -> int:
+) -> tuple[int, list[str]]:
     """Apply only reversible suppression for one owner."""
     (
         source_message_ids,
@@ -17730,8 +17805,10 @@ def _suppress_source_scope_for_owner(
         source_event_ids,
         opportunity_ids,
         opportunity_revision_ids,
+        _bot_completed_search_ids,
     ) = _source_scope_lists(payload)
     count = 0
+    bot_completed_search_ids: list[str] = []
     if owner is RuntimeRole.INGESTION:
         if source_event_ids:
             changed = connection.execute(
@@ -17846,14 +17923,21 @@ def _suppress_source_scope_for_owner(
             opportunity_revision_ids=opportunity_revision_ids,
         )
     elif owner is RuntimeRole.BOT_ASSISTANT:
-        count += _cleanup_bot_source_scope(
+        bot_completed_search_ids = _find_bot_completed_search_ids(
             connection,
+            opportunity_ids=opportunity_ids,
+            opportunity_revision_ids=opportunity_revision_ids,
+            source_message_revision_ids=source_message_revision_ids,
+        )
+        count += _scrub_source_scope_outbox(
+            connection,
+            producer_role=owner,
             source_message_ids=source_message_ids,
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
         )
-    return count
+    return count, bot_completed_search_ids
 
 
 def _delete_source_scope_for_owner(
@@ -17869,6 +17953,7 @@ def _delete_source_scope_for_owner(
         source_event_ids,
         opportunity_ids,
         opportunity_revision_ids,
+        bot_completed_search_ids,
     ) = _source_scope_lists(payload)
     count = 0
     if owner is RuntimeRole.INGESTION:
@@ -18178,5 +18263,6 @@ def _delete_source_scope_for_owner(
             source_message_revision_ids=source_message_revision_ids,
             opportunity_ids=opportunity_ids,
             opportunity_revision_ids=opportunity_revision_ids,
+            bot_completed_search_ids=bot_completed_search_ids,
         )
     return count

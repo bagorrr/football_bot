@@ -3091,7 +3091,11 @@ class ConversationOnboarding:
                 request = _source_data_deletion_request_by_id(
                     self._store.source_data_deletion_requests(), request_id
                 )
-                if current is not None and request is not None:
+                if (
+                    current is not None
+                    and current.source_data_deletion_request_id == request_id
+                    and request is not None
+                ):
                     self._commit_source_data_deletion_command(
                         update_id=update_id,
                         current=current,
@@ -3125,7 +3129,11 @@ class ConversationOnboarding:
                 request = _source_data_deletion_request_by_id(
                     self._store.source_data_deletion_requests(), request_id
                 )
-                if current is not None and request is not None:
+                if (
+                    current is not None
+                    and current.source_data_deletion_request_id == request_id
+                    and request is not None
+                ):
                     self._commit_source_data_deletion_command(
                         update_id=update_id,
                         current=current,
@@ -3793,6 +3801,9 @@ class ConversationOnboarding:
             stage=ConversationStage.SOURCE_DATA_DELETION_INPUT,
             screen_revision=current.screen_revision + 1,
             revision=current.revision + 1,
+            source_data_deletion_request_id=(
+                request.request_id if request is not None else None
+            ),
         )
         self._store.commit_conversation_update(
             update_id=update_id,
@@ -3868,6 +3879,7 @@ class ConversationOnboarding:
             stage=ConversationStage.SOURCE_DATA_DELETION_REQUESTS,
             screen_revision=current.screen_revision + 1,
             revision=current.revision + 1,
+            source_data_deletion_request_id=None,
         )
         self._store.commit_source_data_deletion_command(
             update_id=update_id,

@@ -1074,6 +1074,7 @@ class ConversationState:
     revision: int
     result_stale_callback_text: str | None = None
     result_callback_ack: str | None = None
+    source_data_deletion_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
