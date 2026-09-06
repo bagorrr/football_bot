@@ -47,7 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-12:] == [
-        "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
         "0040_coaching_ingestion_role_projection_gate.sql",
         "0041_exact_repost_referee_generic_projection.sql",
         "0042_moderation_review_events.sql",
@@ -59,6 +58,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0048_persist_dynamic_result_callback_copy.sql",
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
+        "0051_source_data_deletion.sql",
     ]
 
 

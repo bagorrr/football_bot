@@ -152,6 +152,12 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
         ),
         (
             (
+                "Source Data Deletion Requests",
+                f"administration:source-data-deletion:{telegram.messages[-1].screen_revision}",
+            ),
+        ),
+        (
+            (
                 "Source Data Audit",
                 f"administration:source-data-audit:{telegram.messages[-1].screen_revision}",
             ),
@@ -3083,7 +3089,8 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     assert administration.display_locale == "de"
     assert administration.text == "⚙️ **Verwaltung**"
     assert administration.button_rows[0][0][0] == "Quell-Chats"
-    assert administration.button_rows[1][0][0] == "Datenaufbewahrungs-Audit"
+    assert administration.button_rows[1][0][0] == "Löschanfragen für Source Data"
+    assert administration.button_rows[2][0][0] == "Datenaufbewahrungs-Audit"
 
     system.select_administration_action(
         update_id="source-chats:german-administration",

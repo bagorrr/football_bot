@@ -94,6 +94,7 @@ from modules.domain import (
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceDataAuditEvent,
+    SourceDataDeletionRequest,
     SourceEventKind,
     SourceMessageRevision,
     TelegramDeliveryMode,
@@ -1828,6 +1829,7 @@ _ADMINISTRATION_COPY = {
     "en": (
         "⚙️ **Administration**",
         "Source Chats",
+        "Source Data Deletion Requests",
         "Source Data Audit",
         "Back",
         "Menu",
@@ -1835,6 +1837,7 @@ _ADMINISTRATION_COPY = {
     "ru": (
         "⚙️ **Администрирование**",
         "Source Chats",
+        "Запросы на удаление Source Data",
         "Аудит Source Data",
         "Назад",
         "Меню",
@@ -1842,6 +1845,7 @@ _ADMINISTRATION_COPY = {
     "es": (
         "⚙️ **Administración**",
         "Source Chats",
+        "Solicitudes de eliminación de Source Data",
         "Auditoría de Source Data",
         "Atrás",
         "Menú",
@@ -1849,7 +1853,36 @@ _ADMINISTRATION_COPY = {
     "fr": (
         "⚙️ **Administration**",
         "Source Chats",
+        "Demandes de suppression de Source Data",
         "Audit des Source Data",
+        "Retour",
+        "Menu",
+    ),
+}
+
+_SOURCE_DATA_DELETION_COPY = {
+    "en": (
+        "🗑️ **Source Data Deletion Requests**\n\n"
+        "Exact Source Author and Source Chat requests. The view is body-free.",
+        "Back",
+        "Menu",
+    ),
+    "ru": (
+        "🗑️ **Запросы на удаление Source Data**\n\n"
+        "Точные запросы Source Author и Source Chat. Просмотр не содержит тела.",
+        "Назад",
+        "Меню",
+    ),
+    "es": (
+        "🗑️ **Solicitudes de eliminación de Source Data**\n\n"
+        "Solicitudes exactas de Source Author y Source Chat. "
+        "La vista no contiene cuerpos.",
+        "Atrás",
+        "Menú",
+    ),
+    "fr": (
+        "🗑️ **Demandes de suppression de Source Data**\n\n"
+        "Demandes exactes de Source Author et Source Chat. La vue est sans corps.",
         "Retour",
         "Menu",
     ),
@@ -2786,6 +2819,11 @@ class ConversationOnboarding:
                     self._queue_current_view(update_id=update_id, state=current)
                 elif action == "source-chats":
                     self._show_source_chats(update_id=update_id, current=current)
+                elif action == "source-data-deletion":
+                    self._show_source_data_deletion_requests(
+                        update_id=update_id,
+                        current=current,
+                    )
                 elif action == "source-data-audit":
                     self._show_source_data_audit(update_id=update_id, current=current)
                 else:
@@ -3459,6 +3497,37 @@ class ConversationOnboarding:
                 screen_revision=state.screen_revision,
                 selection=self._language_rendering(locale),
                 events=self._store.source_data_audit(),
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_source_data_deletion_requests(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.ADMINISTRATION,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_data_deletion_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale),
+                requests=self._store.source_data_deletion_requests(),
             ),
             recorded_at=self._clock.now(),
         )
@@ -14431,7 +14500,14 @@ def _administration_message(
     selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
     if locale in SUPPORTED_LOCALES:
-        text, source_chats, source_data_audit, back, menu = _ADMINISTRATION_COPY[locale]
+        (
+            text,
+            source_chats,
+            source_data_deletion,
+            source_data_audit,
+            back,
+            menu,
+        ) = _ADMINISTRATION_COPY[locale]
     elif (
         selection is not None
         and selection.locale == locale
@@ -14440,6 +14516,9 @@ def _administration_message(
     ):
         text = selection.administration_text
         source_chats, source_data_audit, back, menu = selection.administration_labels
+        source_data_deletion = (
+            selection.source_data_deletion_label or "Source Data Deletion Requests"
+        )
     else:
         raise RuntimeError("Conversation Language has no Administration rendering")
     return TelegramMessage(
@@ -14452,12 +14531,66 @@ def _administration_message(
             ((source_chats, f"administration:source-chats:{screen_revision}"),),
             (
                 (
+                    source_data_deletion,
+                    f"administration:source-data-deletion:{screen_revision}",
+                ),
+            ),
+            (
+                (
                     source_data_audit,
                     f"administration:source-data-audit:{screen_revision}",
                 ),
             ),
             ((back, f"administration:back:{screen_revision}"),),
         ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_data_deletion_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+    requests: tuple[SourceDataDeletionRequest, ...] = (),
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, back, menu = _SOURCE_DATA_DELETION_COPY[locale]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_text is not None
+        and selection.source_data_deletion_labels is not None
+    ):
+        text = selection.source_data_deletion_text
+        back, menu = selection.source_data_deletion_labels
+    else:
+        text, back, menu = _SOURCE_DATA_DELETION_COPY["en"]
+    lines = [text]
+    lines.extend(
+        " · ".join(
+            (
+                request.request_id,
+                f"author={request.source_author_telegram_id}",
+                request.source_chat_key,
+                f"status={request.status.value}",
+                f"decision_due={request.decision_due_at.isoformat()}",
+                f"completion_due={request.completion_due_at.isoformat()}",
+                f"notification={request.requester_notification_status}",
+            )
+        )
+        for request in requests
+    )
+    return TelegramMessage(
+        delivery_id=f"source-data-deletion:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n\n".join(lines),
+        button_rows=(((back, f"administration:back:{screen_revision}"),),),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -15247,36 +15380,47 @@ class RuntimeApplication:
         if self.supported_versions:
             return
         for definition in SUPPORTED_CONTRACTS:
-            if definition.consumer is self.role and (
-                definition.version == 1
-                or (
-                    definition.name is ContractName.SOURCE_EVENT_RECORDED
-                    and definition.version in {3, 4}
-                )
-                or (
-                    definition.name is ContractName.SEARCH_COMPLETED
-                    and definition.version == 2
-                )
-                or (
-                    definition.name is ContractName.RUN_SEARCH
-                    and definition.version in {2, 3}
-                )
-                or (
-                    definition.name
-                    in {
-                        ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
-                        ContractName.CLASSIFICATION_PROPOSAL,
-                        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                    }
-                    and definition.version in {2, 3, 4, 5, 6, 7}
-                )
-                or (
-                    definition.name
-                    in {
-                        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
-                        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
-                    }
-                    and definition.version == 2
+            is_owner_scoped_deletion_command = (
+                definition.name
+                in {
+                    ContractName.SUPPRESS_SOURCE_SCOPE,
+                    ContractName.DELETE_SOURCE_SCOPE,
+                }
+                and definition.version == 1
+            )
+            if is_owner_scoped_deletion_command or (
+                definition.consumer is self.role
+                and (
+                    definition.version == 1
+                    or (
+                        definition.name is ContractName.SOURCE_EVENT_RECORDED
+                        and definition.version in {3, 4}
+                    )
+                    or (
+                        definition.name is ContractName.SEARCH_COMPLETED
+                        and definition.version == 2
+                    )
+                    or (
+                        definition.name is ContractName.RUN_SEARCH
+                        and definition.version in {2, 3}
+                    )
+                    or (
+                        definition.name
+                        in {
+                            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+                            ContractName.CLASSIFICATION_PROPOSAL,
+                            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                        }
+                        and definition.version in {2, 3, 4, 5, 6, 7}
+                    )
+                    or (
+                        definition.name
+                        in {
+                            ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+                            ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+                        }
+                        and definition.version == 2
+                    )
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -15912,6 +16056,33 @@ class RuntimeApplication:
                     )
                     return result is ConsumeResult.APPLIED
         envelope = ContractEnvelope.from_raw(incoming)
+        if envelope.contract_name in {
+            ContractName.SUPPRESS_SOURCE_SCOPE,
+            ContractName.DELETE_SOURCE_SCOPE,
+        }:
+            result = self.store.process_source_scope_command(
+                incoming=envelope,
+                received_at=self.clock.now(),
+            )
+            return result is ConsumeResult.APPLIED
+        if self.role is RuntimeRole.APPLICATION and envelope.contract_name in {
+            ContractName.SOURCE_SCOPE_SUPPRESSED,
+            ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+            ContractName.SOURCE_SCOPE_DELETION_FAILED,
+        }:
+            result = self.store.accept_source_data_deletion_event(
+                incoming=envelope,
+                received_at=self.clock.now(),
+            )
+            return result is ConsumeResult.APPLIED
+        if envelope.contract_name is ContractName.GET_SOURCE_DELETION_STATUS:
+            result = self.store.consume(
+                incoming=envelope,
+                supported_versions=self.versions_for(envelope.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return result is ConsumeResult.APPLIED
         result = self.store.consume(
             incoming=envelope,
             supported_versions=self.versions_for(incoming.contract_name),
@@ -16449,6 +16620,45 @@ class RuntimeApplication:
         ):
             self._conversation_onboarding().accept_source_chat_registration(
                 incoming=supported_incoming
+            )
+            return True
+        if (
+            incoming.contract_name
+            in {
+                ContractName.SUPPRESS_SOURCE_SCOPE,
+                ContractName.DELETE_SOURCE_SCOPE,
+            }
+            and supported_incoming is not None
+        ):
+            self.store.process_source_scope_command(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
+            return True
+        if (
+            self.role is RuntimeRole.APPLICATION
+            and incoming.contract_name
+            in {
+                ContractName.SOURCE_SCOPE_SUPPRESSED,
+                ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+                ContractName.SOURCE_SCOPE_DELETION_FAILED,
+            }
+            and supported_incoming is not None
+        ):
+            self.store.accept_source_data_deletion_event(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.GET_SOURCE_DELETION_STATUS
+            and supported_incoming is not None
+        ):
+            self.store.consume(
+                incoming=supported_incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
             )
             return True
         if incoming.contract_name is ContractName.GET_COMPLETED_SEARCH:
