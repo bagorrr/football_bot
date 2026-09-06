@@ -116,6 +116,7 @@ from modules.ports import (
     BotAssistantFailure,
     BotAssistantModelAdapter,
     BotAssistantResponse,
+    BotAssistantTransientError,
     BotAssistantTurnRequest,
     ClassificationProofWork,
     ClassifierAdapterResult,
@@ -4218,7 +4219,9 @@ class ConversationOnboarding:
                         if monotonic() >= turn_deadline_monotonic:
                             failure_type = "timeout"
                             break
-                        if attempt_number == 1:
+                        if attempt_number == 1 and isinstance(
+                            error, BotAssistantTransientError
+                        ):
                             continue
                         failure_type = "technical_failure"
                         break

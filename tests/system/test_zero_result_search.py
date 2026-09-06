@@ -296,6 +296,48 @@ def test_result_turn_retries_one_quick_failure_without_alarm() -> None:
     system.reset()
 
 
+def test_result_turn_does_not_retry_arbitrary_adapter_failure() -> None:
+    administrator_id = 44_125
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model(
+        administrator_id=administrator_id
+    )
+    user_id = 44_126
+    _advance_to_complete_draft(system, user_id=user_id, locale="ru")
+    system.submit_search(update_id="fatal-search", telegram_user_id=user_id)
+    system.process_searches_until_idle()
+    before_state = system.conversation_state(user_id)
+    before_context = system.active_result_context(user_id)
+    question = "Покажи подробности"
+    assistant.raise_for(ValueError("controlled fatal adapter error"))
+
+    system.answer_result_message(
+        update_id="fatal-turn",
+        telegram_user_id=user_id,
+        text=question,
+    )
+
+    failure_copy = "Не удалось ответить на вопрос, попробуйте еще раз."
+    assert telegram.messages[-1].telegram_user_id == user_id
+    assert telegram.messages[-1].text == failure_copy
+    alarm_messages = [
+        message
+        for message in telegram.messages
+        if message.telegram_user_id == administrator_id
+    ]
+    assert len(alarm_messages) == 1
+    assert question in alarm_messages[0].text
+    assert system.conversation_state(user_id) == before_state
+    assert system.active_result_context(user_id) == before_context
+    assert [request.attempt_number for request in assistant.requests] == [1]
+    records = system.bot_assistant_failure_records()
+    assert len(records) == 1
+    assert records[0].failure_type == "technical_failure"
+    assert records[0].attempt_count == 1
+    assert question not in repr(records[0])
+    assert system.bot_assistant_operational_alerts() == ()
+    system.reset()
+
+
 def test_result_turn_timeout_preserves_state_and_retires_alarm() -> None:
     administrator_id = 44_122
     system, telegram, assistant, clock = _boot_search_system_with_assistant_model(
