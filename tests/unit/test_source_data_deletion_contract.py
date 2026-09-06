@@ -1,6 +1,7 @@
 """Body-free Source Data Deletion contract semantics."""
 
 from datetime import UTC, datetime
+from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from modules.contracts import (
     ContractEnvelope,
     ContractName,
+    JsonValue,
     RuntimeRole,
 )
 from modules.domain import (
@@ -79,7 +81,7 @@ def test_source_scope_commands_are_valid_for_each_owner() -> None:
 
 def test_source_scope_command_rejects_body_bearing_target_payload() -> None:
     valid = _command()
-    payload = dict(valid.payload)
+    payload = dict(cast(dict[str, JsonValue], valid.payload))
     payload["body"] = "must never cross this contract"
     with pytest.raises((TypeError, ValueError)):
         ContractEnvelope(
@@ -115,7 +117,10 @@ def test_source_deletion_status_query_rejects_extra_facts() -> None:
         payload={"request_id": request_id},
     )
     ContractEnvelope.from_raw(valid)
-    invalid_payload = {"request_id": request_id, "status": "completed"}
+    invalid_payload: dict[str, JsonValue] = {
+        "request_id": request_id,
+        "status": "completed",
+    }
     with pytest.raises(ValueError):
         ContractEnvelope(
             contract_name=valid.contract_name,
