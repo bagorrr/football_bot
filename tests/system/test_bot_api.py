@@ -15,9 +15,11 @@ from modules.bot_api import (
     BotApiIngress,
     BotApiMessage,
     BotApiPollResult,
+    BotApiRetentionEvidence,
     BotApiUpdate,
     ControlledBotApiTransport,
     PostgresBotApiContinuityStore,
+    PostgresBotApiDeliveryReconciliation,
     T1BotApiProjection,
 )
 from modules.contracts import RuntimeRole
@@ -68,6 +70,69 @@ def test_postgres_continuity_survives_restart_and_suppresses_replayed_update(
         ).fetchone() == (1,)
 
 
+def test_postgres_delivery_reconciliation_survives_restart(
+    fresh_database_url: str,
+) -> None:
+    bot_database_url = _prepare_database(fresh_database_url)
+    first_store = PostgresBotApiDeliveryReconciliation(bot_database_url)
+    restarted_store = PostgresBotApiDeliveryReconciliation(bot_database_url)
+
+    send_record, send_started = first_store.begin(
+        delivery_id="bot-api-send:restart",
+        operation="send",
+        request_fingerprint="send-fingerprint",
+        target_telegram_message_id=None,
+    )
+    assert send_started
+    assert send_record.status == "attempting"
+    first_store.mark_outcome_unknown(delivery_id=send_record.delivery_id)
+    send_recovered = restarted_store.lookup(
+        delivery_id=send_record.delivery_id,
+        operation="send",
+        request_fingerprint="send-fingerprint",
+        target_telegram_message_id=None,
+    )
+    assert send_recovered is not None
+    assert send_recovered.status == "outcome_unknown"
+    _, send_retry_started = restarted_store.begin(
+        delivery_id=send_record.delivery_id,
+        operation="send",
+        request_fingerprint="send-fingerprint",
+        target_telegram_message_id=None,
+    )
+    assert not send_retry_started
+
+    edit_record, edit_started = first_store.begin(
+        delivery_id="bot-api-edit:restart",
+        operation="edit",
+        request_fingerprint="edit-fingerprint",
+        target_telegram_message_id="7",
+    )
+    assert edit_started
+    first_store.mark_outcome_unknown(delivery_id=edit_record.delivery_id)
+    _, edit_retry_started = restarted_store.begin(
+        delivery_id=edit_record.delivery_id,
+        operation="edit",
+        request_fingerprint="edit-fingerprint",
+        target_telegram_message_id="7",
+        retry_unknown=True,
+    )
+    assert edit_retry_started
+    restarted_store.mark_confirmed(
+        delivery_id=edit_record.delivery_id,
+        telegram_message_id="7",
+    )
+    edit_recovered = first_store.lookup(
+        delivery_id=edit_record.delivery_id,
+        operation="edit",
+        request_fingerprint="edit-fingerprint",
+        target_telegram_message_id="7",
+    )
+    assert edit_recovered is not None
+    assert edit_recovered.status == "confirmed"
+    assert edit_recovered.telegram_message_id == "7"
+
+
 def test_postgres_false_consumer_release_has_the_required_delete_privilege(
     fresh_database_url: str,
 ) -> None:
@@ -98,6 +163,38 @@ def test_postgres_false_consumer_release_has_the_required_delete_privilege(
             FROM football_runtime.bot_api_updates
             """
         ).fetchone() == (True, False, 1)
+
+
+def test_postgres_failed_consumer_claim_blocks_higher_checkpoint_until_retry(
+    fresh_database_url: str,
+) -> None:
+    bot_database_url = _prepare_database(fresh_database_url)
+    transport = ControlledBotApiTransport()
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(10),)))
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(11),)))
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(10),)))
+    failed_once = True
+    handled: list[int] = []
+
+    def consumer(update: BotApiUpdate) -> None:
+        nonlocal failed_once
+        if update.update_id == 10 and failed_once:
+            failed_once = False
+            raise RuntimeError("consumer failed")
+        handled.append(update.update_id)
+
+    ingress = _ingress(bot_database_url, transport, consumer=consumer)
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        ingress.poll_once()
+    higher_result = ingress.poll_once()
+    lower_retry_result = ingress.poll_once()
+
+    assert higher_result.accepted_update_ids == (11,)
+    assert higher_result.next_offset == 0
+    assert lower_retry_result.accepted_update_ids == (10,)
+    assert lower_retry_result.next_offset == 12
+    assert handled == [11, 10]
 
 
 def test_postgres_retention_loss_alerts_once_and_stays_private(
@@ -139,6 +236,38 @@ def test_postgres_retention_loss_alerts_once_and_stays_private(
     second_result = ingress.poll_once()
     assert not second_result.retention_alert_delivered
     assert len(transport.sent_messages) == 1
+
+
+def test_postgres_elapsed_retention_alert_records_safe_outage_metadata(
+    fresh_database_url: str,
+) -> None:
+    bot_database_url = _prepare_database(fresh_database_url)
+    transport = ControlledBotApiTransport()
+    outage_started_at = datetime(2026, 9, 1, tzinfo=UTC)
+    transport.enqueue_poll(
+        BotApiPollResult(
+            retention_evidence=BotApiRetentionEvidence(
+                outage_started_at=outage_started_at,
+            )
+        )
+    )
+    ingress = _ingress(bot_database_url, transport, consumer=lambda _item: None)
+
+    result = ingress.poll_once()
+
+    assert result.retention_gap_detected
+    assert result.retention_alert_delivered
+    assert result.next_offset == 0
+    with psycopg.connect(fresh_database_url) as connection:
+        assert connection.execute(
+            """
+            SELECT affected_update_id_start, affected_update_id_end,
+                   recovery_boundary_update_id, outage_started_at
+            FROM football_runtime.bot_api_retention_alerts
+            """
+        ).fetchone() == (0, None, None, outage_started_at)
+    assert len(transport.sent_messages) == 1
+    assert "0" not in transport.sent_messages[0].text
 
 
 def test_postgres_poll_lease_allows_one_active_long_poll(

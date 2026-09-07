@@ -13,6 +13,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from threading import RLock
 from time import sleep
 from typing import Any, Protocol, TypeVar, cast
@@ -351,15 +352,30 @@ class BotApiPollResult:
     """One controlled or provider-backed ``getUpdates`` response."""
 
     updates: tuple[BotApiUpdate, ...] = ()
-    # Controlled transports may provide explicit evidence; the HTTP transport
-    # derives it only inside Telegram's documented retention window.
+    # Controlled transports may provide explicit evidence; HTTP transports add
+    # elapsed-outage evidence from the durable poll timestamp.
     oldest_available_update_id: int | None = None
+    retention_evidence: BotApiRetentionEvidence | None = None
 
     def __post_init__(self) -> None:
         if self.oldest_available_update_id is not None and (
             self.oldest_available_update_id < 0
         ):
             raise ValueError("Bot API oldest update ID cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class BotApiRetentionEvidence:
+    """Authoritative elapsed-outage evidence returned by an HTTP poll."""
+
+    outage_started_at: datetime
+    first_available_update_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.first_available_update_id is not None and (
+            self.first_available_update_id < 0
+        ):
+            raise ValueError("Bot API first available update ID cannot be negative")
 
 
 def exact_administrator(user_id: int, administrator_user_id: int) -> bool:
@@ -447,7 +463,7 @@ class BotApiTransport(Protocol):
     def reconcile_edit(
         self, *, telegram_message_id: str, message: TelegramMessage
     ) -> str | None:
-        """Find a known prior edit without issuing another edit."""
+        """Find or safely reapply a known prior edit to the same target."""
         ...
 
     def remove_inline_actions(
@@ -468,6 +484,57 @@ class BotApiTransport(Protocol):
 
     def answer_callback(self, *, callback_id: str, text: str) -> None:
         """Answer one callback query."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class BotApiDeliveryRecord:
+    """Durable provider-effect identity without retaining message content."""
+
+    delivery_id: str
+    operation: str
+    request_fingerprint: str
+    target_telegram_message_id: str | None
+    status: str
+    telegram_message_id: str | None = None
+
+
+class BotApiDeliveryReconciliation(Protocol):
+    """Shared durable/provider-backed ledger for correlated send and edit writes."""
+
+    def lookup(
+        self,
+        *,
+        delivery_id: str,
+        operation: str,
+        request_fingerprint: str,
+        target_telegram_message_id: str | None,
+    ) -> BotApiDeliveryRecord | None:
+        """Look up a provider-effect record without issuing another write."""
+        ...
+
+    def begin(
+        self,
+        *,
+        delivery_id: str,
+        operation: str,
+        request_fingerprint: str,
+        target_telegram_message_id: str | None,
+        retry_unknown: bool = False,
+    ) -> tuple[BotApiDeliveryRecord, bool]:
+        """Atomically start a write and report whether this caller may issue it."""
+        ...
+
+    def mark_pre_effect_failure(self, *, delivery_id: str) -> None:
+        """Return a proven pre-effect write to the retryable state."""
+        ...
+
+    def mark_outcome_unknown(self, *, delivery_id: str) -> None:
+        """Persist that a provider write may have taken effect."""
+        ...
+
+    def mark_confirmed(self, *, delivery_id: str, telegram_message_id: str) -> None:
+        """Persist the provider identity returned by a successful write."""
         ...
 
 
@@ -572,8 +639,9 @@ class BotApiAlertClaim:
     mode: TelegramDeliveryMode
     claim_token: UUID
     affected_update_id_start: int
-    affected_update_id_end: int
-    recovery_boundary_update_id: int
+    affected_update_id_end: int | None
+    recovery_boundary_update_id: int | None
+    outage_started_at: datetime | None = None
     telegram_message_id: str | None = None
 
 
@@ -620,10 +688,11 @@ class BotApiContinuityStore(Protocol):
         self,
         *,
         expected_offset: int,
-        first_available_update_id: int,
+        first_available_update_id: int | None,
         observed_at: datetime,
+        outage_started_at: datetime | None = None,
     ) -> None:
-        """Advance past unavailable updates and open one deduplicated incident."""
+        """Record one elapsed or explicit gap and open one deduplicated incident."""
         ...
 
     def close_retention_gap(self, *, recovered_at: datetime) -> None:
@@ -695,8 +764,8 @@ class BotApiContinuityStore(Protocol):
 
 @dataclass(slots=True)
 class _MemoryUpdateRecord:
-    claim_token: UUID
-    claimed_at: datetime
+    claim_token: UUID | None
+    claimed_at: datetime | None
     completed: bool = False
 
 
@@ -706,12 +775,187 @@ class _MemoryAlertRecord:
     delivery_id: str
     administrator_user_id: int
     affected_update_id_start: int
-    affected_update_id_end: int
-    recovery_boundary_update_id: int
+    affected_update_id_end: int | None
+    recovery_boundary_update_id: int | None
+    outage_started_at: datetime | None = None
     status: str = "pending"
     claim_token: UUID | None = None
     claimed_at: datetime | None = None
     telegram_message_id: str | None = None
+
+
+def _validate_delivery_request(
+    *,
+    delivery_id: str,
+    operation: str,
+    request_fingerprint: str,
+    target_telegram_message_id: str | None,
+) -> None:
+    if not delivery_id or operation not in {"send", "edit"}:
+        raise ValueError("Bot API delivery identity is malformed")
+    if not request_fingerprint:
+        raise ValueError("Bot API delivery fingerprint is required")
+    if operation == "edit" and not target_telegram_message_id:
+        raise ValueError("Bot API edit target is required")
+    if operation == "send" and target_telegram_message_id is not None:
+        raise ValueError("Bot API send target must be absent")
+
+
+def _validate_delivery_record(
+    record: BotApiDeliveryRecord,
+    *,
+    operation: str,
+    request_fingerprint: str,
+    target_telegram_message_id: str | None,
+) -> None:
+    if (
+        record.operation != operation
+        or record.request_fingerprint != request_fingerprint
+        or record.target_telegram_message_id != target_telegram_message_id
+    ):
+        raise ValueError("Bot API delivery ID was reused for a different request")
+
+
+def _replace_delivery_record(
+    record: BotApiDeliveryRecord,
+    *,
+    status: str,
+    telegram_message_id: str | None = None,
+) -> BotApiDeliveryRecord:
+    return BotApiDeliveryRecord(
+        delivery_id=record.delivery_id,
+        operation=record.operation,
+        request_fingerprint=record.request_fingerprint,
+        target_telegram_message_id=record.target_telegram_message_id,
+        status=status,
+        telegram_message_id=telegram_message_id,
+    )
+
+
+def _delivery_record_from_row(row: Mapping[str, object]) -> BotApiDeliveryRecord:
+    return BotApiDeliveryRecord(
+        delivery_id=cast(str, row["delivery_id"]),
+        operation=cast(str, row["operation"]),
+        request_fingerprint=cast(str, row["request_fingerprint"]),
+        target_telegram_message_id=cast(str | None, row["target_telegram_message_id"]),
+        status=cast(str, row["delivery_status"]),
+        telegram_message_id=cast(str | None, row["telegram_message_id"]),
+    )
+
+
+@dataclass(slots=True)
+class InMemoryBotApiDeliveryReconciliation:
+    """Thread-safe shared reconciliation ledger used by controlled transports."""
+
+    _records: dict[str, BotApiDeliveryRecord] = field(default_factory=dict)
+    _lock: RLock = field(default_factory=RLock, repr=False)
+
+    def lookup(
+        self,
+        *,
+        delivery_id: str,
+        operation: str,
+        request_fingerprint: str,
+        target_telegram_message_id: str | None,
+    ) -> BotApiDeliveryRecord | None:
+        _validate_delivery_request(
+            delivery_id=delivery_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=target_telegram_message_id,
+        )
+        with self._lock:
+            record = self._records.get(delivery_id)
+            if record is not None:
+                _validate_delivery_record(
+                    record,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    target_telegram_message_id=target_telegram_message_id,
+                )
+            return record
+
+    def begin(
+        self,
+        *,
+        delivery_id: str,
+        operation: str,
+        request_fingerprint: str,
+        target_telegram_message_id: str | None,
+        retry_unknown: bool = False,
+    ) -> tuple[BotApiDeliveryRecord, bool]:
+        _validate_delivery_request(
+            delivery_id=delivery_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=target_telegram_message_id,
+        )
+        with self._lock:
+            record = self._records.get(delivery_id)
+            if record is None:
+                record = BotApiDeliveryRecord(
+                    delivery_id=delivery_id,
+                    operation=operation,
+                    request_fingerprint=request_fingerprint,
+                    target_telegram_message_id=target_telegram_message_id,
+                    status="attempting",
+                )
+                self._records[delivery_id] = record
+                return record, True
+            _validate_delivery_record(
+                record,
+                operation=operation,
+                request_fingerprint=request_fingerprint,
+                target_telegram_message_id=target_telegram_message_id,
+            )
+            if record.status == "confirmed":
+                return record, False
+            if record.status == "attempting" and not retry_unknown:
+                return record, False
+            if record.status == "outcome_unknown" and not retry_unknown:
+                return record, False
+            self._records[delivery_id] = _replace_delivery_record(
+                record,
+                status="attempting",
+            )
+            return self._records[delivery_id], True
+
+    def mark_pre_effect_failure(self, *, delivery_id: str) -> None:
+        with self._lock:
+            record = self._records.get(delivery_id)
+            if record is None:
+                raise RuntimeError("Bot API delivery record was lost")
+            self._records[delivery_id] = _replace_delivery_record(
+                record,
+                status="pending",
+            )
+
+    def mark_outcome_unknown(self, *, delivery_id: str) -> None:
+        with self._lock:
+            record = self._records.get(delivery_id)
+            if record is None:
+                raise RuntimeError("Bot API delivery record was lost")
+            self._records[delivery_id] = _replace_delivery_record(
+                record,
+                status="outcome_unknown",
+            )
+
+    def mark_confirmed(self, *, delivery_id: str, telegram_message_id: str) -> None:
+        if not telegram_message_id:
+            raise ValueError("Bot API provider message ID is required")
+        with self._lock:
+            record = self._records.get(delivery_id)
+            if record is None:
+                raise RuntimeError("Bot API delivery record was lost")
+            if record.status == "confirmed":
+                if record.telegram_message_id != telegram_message_id:
+                    raise ValueError("Bot API provider identity changed")
+                return
+            self._records[delivery_id] = _replace_delivery_record(
+                record,
+                status="confirmed",
+                telegram_message_id=telegram_message_id,
+            )
 
 
 @dataclass(slots=True)
@@ -775,17 +1019,31 @@ class InMemoryBotApiContinuityStore:
         self,
         *,
         expected_offset: int,
-        first_available_update_id: int,
+        first_available_update_id: int | None,
         observed_at: datetime,
+        outage_started_at: datetime | None = None,
     ) -> None:
-        if first_available_update_id <= expected_offset:
-            raise ValueError("retention gap must advance the durable offset")
+        if (
+            first_available_update_id is None
+            or first_available_update_id <= expected_offset
+        ) and outage_started_at is None:
+            raise ValueError("retention gap evidence is incomplete")
+        if outage_started_at is not None and outage_started_at > observed_at:
+            raise ValueError("retention outage cannot start after observation")
         with self._lock:
             if self._administrator_user_id is None:
                 raise RuntimeError("Bot API administrator destination is not bound")
             affected_update_id_start = expected_offset
-            affected_update_id_end = first_available_update_id - 1
-            if first_available_update_id > self._checkpoint.next_offset:
+            affected_update_id_end = (
+                first_available_update_id - 1
+                if first_available_update_id is not None
+                and first_available_update_id > expected_offset
+                else None
+            )
+            if (
+                first_available_update_id is not None
+                and first_available_update_id > self._checkpoint.next_offset
+            ):
                 self._checkpoint = BotApiCheckpoint(
                     next_offset=first_available_update_id,
                     retention_gap_open=self._checkpoint.retention_gap_open,
@@ -802,7 +1060,13 @@ class InMemoryBotApiContinuityStore:
                     administrator_user_id=self._administrator_user_id or 0,
                     affected_update_id_start=affected_update_id_start,
                     affected_update_id_end=affected_update_id_end,
-                    recovery_boundary_update_id=first_available_update_id,
+                    recovery_boundary_update_id=(
+                        first_available_update_id
+                        if first_available_update_id is not None
+                        and first_available_update_id > expected_offset
+                        else None
+                    ),
+                    outage_started_at=outage_started_at,
                 )
             )
             self._checkpoint = BotApiCheckpoint(
@@ -838,7 +1102,11 @@ class InMemoryBotApiContinuityStore:
                 return True
             if record.completed:
                 return False
-            if record.claimed_at > stale_before:
+            if (
+                record.claim_token is not None
+                and record.claimed_at is not None
+                and record.claimed_at > stale_before
+            ):
                 return False
             record.claim_token = claim_token
             record.claimed_at = claimed_at
@@ -857,8 +1125,26 @@ class InMemoryBotApiContinuityStore:
             if record is None or record.claim_token != claim_token:
                 raise RuntimeError("Bot API update claim was lost")
             record.completed = True
+            record.claim_token = None
+            record.claimed_at = None
+            lower_incomplete = any(
+                other_id < update_id and not other.completed
+                for other_id, other in self._updates.items()
+            )
+            completed_offset = max(
+                (
+                    other_id + 1
+                    for other_id, other in self._updates.items()
+                    if other.completed
+                ),
+                default=self._checkpoint.next_offset,
+            )
             self._checkpoint = BotApiCheckpoint(
-                next_offset=max(self._checkpoint.next_offset, update_id + 1),
+                next_offset=(
+                    self._checkpoint.next_offset
+                    if lower_incomplete
+                    else max(self._checkpoint.next_offset, completed_offset)
+                ),
                 retention_gap_open=self._checkpoint.retention_gap_open,
                 last_poll_at=self._checkpoint.last_poll_at,
             )
@@ -868,7 +1154,8 @@ class InMemoryBotApiContinuityStore:
             record = self._updates.get(update_id)
             if record is None or record.claim_token != claim_token or record.completed:
                 return
-            del self._updates[update_id]
+            record.claim_token = None
+            record.claimed_at = None
 
     def claim_retention_alert(
         self,
@@ -916,6 +1203,7 @@ class InMemoryBotApiContinuityStore:
                     affected_update_id_start=record.affected_update_id_start,
                     affected_update_id_end=record.affected_update_id_end,
                     recovery_boundary_update_id=record.recovery_boundary_update_id,
+                    outage_started_at=record.outage_started_at,
                     telegram_message_id=record.telegram_message_id,
                 )
         return None
@@ -1075,11 +1363,17 @@ class PostgresBotApiContinuityStore:
         self,
         *,
         expected_offset: int,
-        first_available_update_id: int,
+        first_available_update_id: int | None,
         observed_at: datetime,
+        outage_started_at: datetime | None = None,
     ) -> None:
-        if first_available_update_id <= expected_offset:
-            raise ValueError("retention gap must advance the durable offset")
+        if (
+            first_available_update_id is None
+            or first_available_update_id <= expected_offset
+        ) and outage_started_at is None:
+            raise ValueError("retention gap evidence is incomplete")
+        if outage_started_at is not None and outage_started_at > observed_at:
+            raise ValueError("retention outage cannot start after observation")
         if self._administrator_user_id is None:
             raise RuntimeError("Bot API administrator destination is not bound")
         with psycopg.connect(self._database_url) as connection:
@@ -1095,18 +1389,34 @@ class PostgresBotApiContinuityStore:
             ).fetchone()
             if row is None:
                 raise RuntimeError("Bot API checkpoint was not initialized")
-            next_offset = max(row[0], first_available_update_id)
+            next_offset = (
+                max(row[0], first_available_update_id)
+                if first_available_update_id is not None
+                else row[0]
+            )
             affected_update_id_start = expected_offset
-            affected_update_id_end = first_available_update_id - 1
+            affected_update_id_end = (
+                first_available_update_id - 1
+                if first_available_update_id is not None
+                and first_available_update_id > expected_offset
+                else None
+            )
+            recovery_boundary_update_id = (
+                first_available_update_id
+                if first_available_update_id is not None
+                and first_available_update_id > expected_offset
+                else None
+            )
             if row[1]:
-                connection.execute(
-                    """
-                    UPDATE football_runtime.bot_api_checkpoints
-                    SET next_offset = %s, updated_at = %s
-                    WHERE checkpoint_key = %s
-                    """,
-                    (next_offset, observed_at, self._CHECKPOINT_KEY),
-                )
+                if next_offset != row[0]:
+                    connection.execute(
+                        """
+                        UPDATE football_runtime.bot_api_checkpoints
+                        SET next_offset = %s, updated_at = %s
+                        WHERE checkpoint_key = %s
+                        """,
+                        (next_offset, observed_at, self._CHECKPOINT_KEY),
+                    )
                 return
             alert_id = f"bot-api-retention-gap:{uuid4()}"
             connection.execute(
@@ -1122,8 +1432,8 @@ class PostgresBotApiContinuityStore:
                 INSERT INTO football_runtime.bot_api_retention_alerts (
                     alert_id, delivery_id, observed_at,
                     affected_update_id_start, affected_update_id_end,
-                    recovery_boundary_update_id
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    recovery_boundary_update_id, outage_started_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     alert_id,
@@ -1131,7 +1441,8 @@ class PostgresBotApiContinuityStore:
                     observed_at,
                     affected_update_id_start,
                     affected_update_id_end,
-                    first_available_update_id,
+                    recovery_boundary_update_id,
+                    outage_started_at,
                 ),
             )
 
@@ -1225,17 +1536,37 @@ class PostgresBotApiContinuityStore:
             connection.execute(
                 """
                 UPDATE football_runtime.bot_api_checkpoints
-                SET next_offset = GREATEST(next_offset, %s), updated_at = %s
+                SET next_offset = CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM football_runtime.bot_api_updates AS pending
+                            WHERE pending.update_id < %s
+                              AND pending.completed_at IS NULL
+                        ) THEN next_offset
+                        ELSE GREATEST(
+                            next_offset,
+                            COALESCE(
+                                (
+                                    SELECT MAX(completed.update_id) + 1
+                                    FROM football_runtime.bot_api_updates AS completed
+                                    WHERE completed.completed_at IS NOT NULL
+                                ),
+                                next_offset
+                            )
+                        )
+                    END,
+                    updated_at = %s
                 WHERE checkpoint_key = %s
                 """,
-                (update_id + 1, completed_at, self._CHECKPOINT_KEY),
+                (update_id, completed_at, self._CHECKPOINT_KEY),
             )
 
     def release_update_claim(self, *, update_id: int, claim_token: UUID) -> None:
         with psycopg.connect(self._database_url) as connection:
             connection.execute(
                 """
-                DELETE FROM football_runtime.bot_api_updates
+                UPDATE football_runtime.bot_api_updates
+                SET claim_token = NULL, claimed_at = NULL
                 WHERE update_id = %s AND claim_token = %s AND completed_at IS NULL
                 """,
                 (update_id, claim_token),
@@ -1257,7 +1588,7 @@ class PostgresBotApiContinuityStore:
                 SELECT alert_id, delivery_id, delivery_status,
                        claim_token, claimed_at, telegram_message_id,
                        affected_update_id_start, affected_update_id_end,
-                       recovery_boundary_update_id
+                       recovery_boundary_update_id, outage_started_at
                 FROM football_runtime.bot_api_retention_alerts
                 WHERE delivery_status IN (
                     'pending', 'outcome_unknown', 'attempting'
@@ -1314,6 +1645,7 @@ class PostgresBotApiContinuityStore:
             affected_update_id_start=selected["affected_update_id_start"],
             affected_update_id_end=selected["affected_update_id_end"],
             recovery_boundary_update_id=selected["recovery_boundary_update_id"],
+            outage_started_at=selected["outage_started_at"],
             telegram_message_id=selected["telegram_message_id"],
         )
 
@@ -1408,6 +1740,186 @@ class PostgresBotApiContinuityStore:
         )
 
 
+class PostgresBotApiDeliveryReconciliation:
+    """Bot Assistant-owned durable provider-effect ledger for HTTP writes."""
+
+    def __init__(self, database_url: str) -> None:
+        self._database_url = database_url
+
+    def lookup(
+        self,
+        *,
+        delivery_id: str,
+        operation: str,
+        request_fingerprint: str,
+        target_telegram_message_id: str | None,
+    ) -> BotApiDeliveryRecord | None:
+        _validate_delivery_request(
+            delivery_id=delivery_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=target_telegram_message_id,
+        )
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT delivery_id, operation, request_fingerprint,
+                       target_telegram_message_id, delivery_status,
+                       telegram_message_id
+                FROM football_runtime.bot_api_delivery_reconciliation
+                WHERE delivery_id = %s
+                """,
+                (delivery_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        record = _delivery_record_from_row(row)
+        _validate_delivery_record(
+            record,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=target_telegram_message_id,
+        )
+        return record
+
+    def begin(
+        self,
+        *,
+        delivery_id: str,
+        operation: str,
+        request_fingerprint: str,
+        target_telegram_message_id: str | None,
+        retry_unknown: bool = False,
+    ) -> tuple[BotApiDeliveryRecord, bool]:
+        _validate_delivery_request(
+            delivery_id=delivery_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=target_telegram_message_id,
+        )
+        now = datetime.now(UTC)
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT delivery_id, operation, request_fingerprint,
+                       target_telegram_message_id, delivery_status,
+                       telegram_message_id
+                FROM football_runtime.bot_api_delivery_reconciliation
+                WHERE delivery_id = %s
+                FOR UPDATE
+                """,
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO football_runtime.bot_api_delivery_reconciliation (
+                        delivery_id, operation, request_fingerprint,
+                        target_telegram_message_id, delivery_status, attempted_at
+                    ) VALUES (%s, %s, %s, %s, 'attempting', %s)
+                    """,
+                    (
+                        delivery_id,
+                        operation,
+                        request_fingerprint,
+                        target_telegram_message_id,
+                        now,
+                    ),
+                )
+                return (
+                    BotApiDeliveryRecord(
+                        delivery_id=delivery_id,
+                        operation=operation,
+                        request_fingerprint=request_fingerprint,
+                        target_telegram_message_id=target_telegram_message_id,
+                        status="attempting",
+                    ),
+                    True,
+                )
+            record = _delivery_record_from_row(row)
+            _validate_delivery_record(
+                record,
+                operation=operation,
+                request_fingerprint=request_fingerprint,
+                target_telegram_message_id=target_telegram_message_id,
+            )
+            if record.status == "confirmed":
+                return record, False
+            if record.status in {"attempting", "outcome_unknown"} and not retry_unknown:
+                return record, False
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_api_delivery_reconciliation
+                SET delivery_status = 'attempting', attempted_at = %s
+                WHERE delivery_id = %s
+                """,
+                (now, delivery_id),
+            )
+            return _replace_delivery_record(record, status="attempting"), True
+
+    def mark_pre_effect_failure(self, *, delivery_id: str) -> None:
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_api_delivery_reconciliation
+                SET delivery_status = 'pending', attempted_at = NULL
+                WHERE delivery_id = %s AND delivery_status = 'attempting'
+                RETURNING delivery_id
+                """,
+                (delivery_id,),
+            ).fetchone()
+        if changed is None:
+            raise RuntimeError("Bot API delivery attempt was lost")
+
+    def mark_outcome_unknown(self, *, delivery_id: str) -> None:
+        now = datetime.now(UTC)
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_api_delivery_reconciliation
+                SET delivery_status = 'outcome_unknown',
+                    outcome_unknown_at = COALESCE(outcome_unknown_at, %s)
+                WHERE delivery_id = %s AND delivery_status = 'attempting'
+                RETURNING delivery_id
+                """,
+                (now, delivery_id),
+            ).fetchone()
+        if changed is None:
+            raise RuntimeError("Bot API delivery attempt was lost")
+
+    def mark_confirmed(self, *, delivery_id: str, telegram_message_id: str) -> None:
+        if not telegram_message_id:
+            raise ValueError("Bot API provider message ID is required")
+        now = datetime.now(UTC)
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            row = connection.execute(
+                """
+                SELECT delivery_status, telegram_message_id
+                FROM football_runtime.bot_api_delivery_reconciliation
+                WHERE delivery_id = %s
+                FOR UPDATE
+                """,
+                (delivery_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Bot API delivery record was lost")
+            if row["delivery_status"] == "confirmed":
+                if row["telegram_message_id"] != telegram_message_id:
+                    raise ValueError("Bot API provider identity changed")
+                return
+            if row["delivery_status"] != "attempting":
+                raise RuntimeError("Bot API delivery attempt was lost")
+            connection.execute(
+                """
+                UPDATE football_runtime.bot_api_delivery_reconciliation
+                SET delivery_status = 'confirmed', telegram_message_id = %s,
+                    confirmed_at = %s
+                WHERE delivery_id = %s
+                """,
+                (telegram_message_id, now, delivery_id),
+            )
+
+
 class BotApiIngress:
     """Long-poll Bot API updates through durable, provider-neutral seams."""
 
@@ -1474,14 +1986,25 @@ class BotApiIngress:
                 last_poll_at=checkpoint.last_poll_at,
                 observed_at=poll_observed_at,
             )
-            if (
-                poll.oldest_available_update_id is not None
-                and poll.oldest_available_update_id > checkpoint.next_offset
+            retention_evidence = poll.retention_evidence
+            first_available_update_id = (
+                retention_evidence.first_available_update_id
+                if retention_evidence is not None
+                else poll.oldest_available_update_id
+            )
+            if retention_evidence is not None or (
+                first_available_update_id is not None
+                and first_available_update_id > checkpoint.next_offset
             ):
                 self.store.register_retention_gap(
                     expected_offset=checkpoint.next_offset,
-                    first_available_update_id=poll.oldest_available_update_id,
+                    first_available_update_id=first_available_update_id,
                     observed_at=self.clock.now(),
+                    outage_started_at=(
+                        retention_evidence.outage_started_at
+                        if retention_evidence is not None
+                        else None
+                    ),
                 )
                 retention_gap_detected = True
             self.store.record_poll(polled_at=poll_observed_at)
@@ -1503,7 +2026,15 @@ class BotApiIngress:
                 if not update.is_private_user_update:
                     ignored.append(update.update_id)
                 else:
-                    if self.consumer(update) is False:
+                    try:
+                        consumer_result = self.consumer(update)
+                    except BaseException:
+                        self.store.release_update_claim(
+                            update_id=update.update_id,
+                            claim_token=claim_token,
+                        )
+                        raise
+                    if consumer_result is False:
                         ignored.append(update.update_id)
                 self.store.complete_update(
                     update_id=update.update_id,
@@ -1874,6 +2405,7 @@ class BotApiHttpTransport:
         self,
         configuration: BotApiConfiguration,
         *,
+        reconciliation: BotApiDeliveryReconciliation,
         api_root: str = "https://api.telegram.org/bot",
         request_timeout_seconds: float = 60.0,
         opener: Callable[..., Any] = urlopen,
@@ -1886,8 +2418,7 @@ class BotApiHttpTransport:
         self._api_root = api_root
         self._request_timeout_seconds = request_timeout_seconds
         self._opener = opener
-        self._send_ledger: dict[str, tuple[TelegramMessage, str]] = {}
-        self._edit_ledger: dict[str, tuple[TelegramMessage, str, str]] = {}
+        self._reconciliation = reconciliation
 
     def get_me(self) -> BotApiIdentity:
         result = self._request("getMe", {})
@@ -1928,15 +2459,23 @@ class BotApiHttpTransport:
         )
         if len(updates) != len(result):
             raise BotApiTransportError("Bot API getUpdates result was malformed")
-        oldest_available_update_id = _http_retention_gap_evidence(
+        retention_evidence = _http_retention_gap_evidence(
             updates=updates,
             offset=offset,
             last_poll_at=last_poll_at,
             observed_at=observed_at,
         )
+        oldest_available_update_id = (
+            retention_evidence.first_available_update_id
+            if retention_evidence is not None
+            and retention_evidence.first_available_update_id is not None
+            and retention_evidence.first_available_update_id > offset
+            else None
+        )
         return BotApiPollResult(
             updates=updates,
             oldest_available_update_id=oldest_available_update_id,
+            retention_evidence=retention_evidence,
         )
 
     def get_chat(self, *, chat_id: int) -> BotApiChat:
@@ -1952,83 +2491,172 @@ class BotApiHttpTransport:
         )
 
     def send_message(self, message: TelegramMessage) -> str:
-        recorded = self._send_ledger.get(message.delivery_id)
-        if recorded is not None:
-            recorded_message, telegram_message_id = recorded
-            if recorded_message != message:
-                raise ValueError("delivery ID was reused for a different message")
-            return telegram_message_id
-        result = self._request(
-            "sendMessage",
-            {
-                "chat_id": message.telegram_user_id,
-                "text": message.text,
-                **_message_markup(message),
-            },
+        payload = {
+            "chat_id": message.telegram_user_id,
+            "text": message.text,
+            **_message_markup(message),
+        }
+        return self._write_correlated(
+            operation="send",
             delivery_id=message.delivery_id,
+            target_telegram_message_id=None,
+            payload=payload,
+            parse_result=lambda result: str(
+                _response_int(
+                    result, "message_id", error_key="result.message_id", minimum=1
+                )
+            ),
         )
-        telegram_message_id = str(
-            _response_int(
-                result, "message_id", error_key="result.message_id", minimum=1
-            )
-        )
-        self._send_ledger[message.delivery_id] = (message, telegram_message_id)
-        return telegram_message_id
 
     def reconcile_message(self, message: TelegramMessage) -> str | None:
-        recorded = self._send_ledger.get(message.delivery_id)
+        payload = {
+            "chat_id": message.telegram_user_id,
+            "text": message.text,
+            **_message_markup(message),
+        }
+        recorded = self._reconciliation.lookup(
+            delivery_id=message.delivery_id,
+            operation="send",
+            request_fingerprint=_delivery_request_fingerprint(
+                operation="send",
+                payload=payload,
+                target_telegram_message_id=None,
+            ),
+            target_telegram_message_id=None,
+        )
         if recorded is None:
             return None
-        recorded_message, telegram_message_id = recorded
-        if recorded_message != message:
-            raise ValueError("delivery ID was reused for a different message")
-        return telegram_message_id
+        if recorded.status != "confirmed":
+            return None
+        if recorded.telegram_message_id is None:
+            raise BotApiTransportError("Bot API confirmed send has no message ID")
+        return recorded.telegram_message_id
 
     def edit_message(
         self, *, telegram_message_id: str, message: TelegramMessage
     ) -> str:
-        recorded = self._edit_ledger.get(message.delivery_id)
-        if recorded is not None:
-            recorded_message, recorded_target_id, recorded_result_id = recorded
-            if recorded_message != message or recorded_target_id != telegram_message_id:
-                raise ValueError("edit delivery ID was reused for a different message")
-            return recorded_result_id
-        result = self._request(
-            "editMessageText",
-            {
-                "chat_id": message.telegram_user_id,
-                "message_id": _message_id_int(telegram_message_id),
-                "text": message.text,
-                **_inline_markup(message),
-            },
+        payload = self._edit_payload(
+            telegram_message_id=telegram_message_id,
+            message=message,
+        )
+        return self._write_correlated(
+            operation="edit",
             delivery_id=message.delivery_id,
+            target_telegram_message_id=telegram_message_id,
+            payload=payload,
+            parse_result=lambda result: self._edit_result_message_id(
+                result, telegram_message_id
+            ),
         )
-        result_message_id = (
-            telegram_message_id
-            if isinstance(result, bool)
-            else str(
-                _response_int(
-                    result, "message_id", error_key="result.message_id", minimum=1
-                )
-            )
-        )
-        self._edit_ledger[message.delivery_id] = (
-            message,
-            telegram_message_id,
-            result_message_id,
-        )
-        return result_message_id
 
     def reconcile_edit(
         self, *, telegram_message_id: str, message: TelegramMessage
     ) -> str | None:
-        recorded = self._edit_ledger.get(message.delivery_id)
+        payload = self._edit_payload(
+            telegram_message_id=telegram_message_id,
+            message=message,
+        )
+        request_fingerprint = _delivery_request_fingerprint(
+            operation="edit",
+            payload=payload,
+            target_telegram_message_id=telegram_message_id,
+        )
+        recorded = self._reconciliation.lookup(
+            delivery_id=message.delivery_id,
+            operation="edit",
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=telegram_message_id,
+        )
         if recorded is None:
             return None
-        recorded_message, recorded_target_id, recorded_result_id = recorded
-        if recorded_message != message or recorded_target_id != telegram_message_id:
-            raise ValueError("edit delivery ID was reused for a different message")
-        return recorded_result_id
+        if recorded.status == "confirmed":
+            if recorded.telegram_message_id is None:
+                raise BotApiTransportError("Bot API confirmed edit has no message ID")
+            return recorded.telegram_message_id
+        if recorded.status not in {"attempting", "outcome_unknown"}:
+            return None
+        return self._write_correlated(
+            operation="edit",
+            delivery_id=message.delivery_id,
+            target_telegram_message_id=telegram_message_id,
+            payload=payload,
+            parse_result=lambda result: self._edit_result_message_id(
+                result, telegram_message_id
+            ),
+            retry_unknown=True,
+        )
+
+    def _write_correlated(
+        self,
+        *,
+        operation: str,
+        delivery_id: str,
+        target_telegram_message_id: str | None,
+        payload: Mapping[str, object],
+        parse_result: Callable[[object], str],
+        retry_unknown: bool = False,
+    ) -> str:
+        request_fingerprint = _delivery_request_fingerprint(
+            operation=operation,
+            payload=payload,
+            target_telegram_message_id=target_telegram_message_id,
+        )
+        record, started = self._reconciliation.begin(
+            delivery_id=delivery_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            target_telegram_message_id=target_telegram_message_id,
+            retry_unknown=retry_unknown,
+        )
+        if record.status == "confirmed":
+            if record.telegram_message_id is None:
+                raise BotApiTransportError(
+                    f"Bot API confirmed {operation} has no message ID"
+                )
+            return record.telegram_message_id
+        if not started:
+            raise BotApiOutcomeUnknownError(
+                f"Bot API {operation} result is already unknown"
+            )
+        try:
+            result = self._request(
+                "sendMessage" if operation == "send" else "editMessageText",
+                payload,
+                delivery_id=delivery_id,
+            )
+            telegram_message_id = parse_result(result)
+        except BotApiPreEffectError:
+            self._reconciliation.mark_pre_effect_failure(delivery_id=delivery_id)
+            raise
+        except (BotApiOutcomeUnknownError, BotApiTransportError):
+            self._reconciliation.mark_outcome_unknown(delivery_id=delivery_id)
+            raise
+        self._reconciliation.mark_confirmed(
+            delivery_id=delivery_id,
+            telegram_message_id=telegram_message_id,
+        )
+        return telegram_message_id
+
+    @staticmethod
+    def _edit_payload(
+        *, telegram_message_id: str, message: TelegramMessage
+    ) -> dict[str, object]:
+        return {
+            "chat_id": message.telegram_user_id,
+            "message_id": _message_id_int(telegram_message_id),
+            "text": message.text,
+            **_inline_markup(message),
+        }
+
+    @staticmethod
+    def _edit_result_message_id(result: object, target_telegram_message_id: str) -> str:
+        if isinstance(result, bool):
+            return target_telegram_message_id
+        return str(
+            _response_int(
+                result, "message_id", error_key="result.message_id", minimum=1
+            )
+        )
 
     def remove_inline_actions(
         self, *, telegram_user_id: int, telegram_message_id: str
@@ -2161,28 +2789,48 @@ def _response_optional_string(
     return value
 
 
+def _delivery_request_fingerprint(
+    *,
+    operation: str,
+    payload: Mapping[str, object],
+    target_telegram_message_id: str | None,
+) -> str:
+    canonical = json.dumps(
+        {
+            "operation": operation,
+            "payload": payload,
+            "target_telegram_message_id": target_telegram_message_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _http_retention_gap_evidence(
     *,
     updates: tuple[BotApiUpdate, ...],
     offset: int,
     last_poll_at: datetime | None,
     observed_at: datetime,
-) -> int | None:
-    """Expose a gap only when Telegram's documented ID window is decisive."""
+) -> BotApiRetentionEvidence | None:
+    """Expose elapsed outage evidence after Telegram's retention horizon."""
     if offset == 0 or last_poll_at is None:
         return None
     idle_for = observed_at - last_poll_at
-    if not (
-        _TELEGRAM_UPDATE_RETENTION <= idle_for < _TELEGRAM_UPDATE_ID_RANDOMIZATION_IDLE
-    ):
+    if idle_for < _TELEGRAM_UPDATE_RETENTION:
         return None
     first_available_update_id = min(
         (update.update_id for update in updates),
         default=None,
     )
-    if first_available_update_id is None or first_available_update_id <= offset:
-        return None
-    return first_available_update_id
+    if idle_for >= _TELEGRAM_UPDATE_ID_RANDOMIZATION_IDLE:
+        first_available_update_id = None
+    return BotApiRetentionEvidence(
+        outage_started_at=last_poll_at,
+        first_available_update_id=first_available_update_id,
+    )
 
 
 def _retry_after_from_headers(headers: object) -> int:

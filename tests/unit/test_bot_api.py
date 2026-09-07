@@ -21,11 +21,13 @@ from modules.bot_api import (
     BotApiMessage,
     BotApiOutcomeUnknownError,
     BotApiPollResult,
+    BotApiRetentionEvidence,
     BotApiRuntime,
     BotApiUpdate,
     BotApiWebhookActiveError,
     ControlledBotApiTransport,
     InMemoryBotApiContinuityStore,
+    InMemoryBotApiDeliveryReconciliation,
     T1BotApiProjection,
     exact_administrator,
 )
@@ -460,6 +462,50 @@ def test_positive_update_ids_without_retention_evidence_do_not_open_a_gap() -> N
     assert transport.sent_messages == []
 
 
+def test_failed_consumer_claim_blocks_higher_checkpoint_until_retry() -> None:
+    transport = ControlledBotApiTransport()
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(10),)))
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(11),)))
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(10),)))
+    store = InMemoryBotApiContinuityStore()
+    handled: list[int] = []
+    fail_lower_update = True
+
+    def consumer(update: BotApiUpdate) -> None:
+        nonlocal fail_lower_update
+        if update.update_id == 10 and fail_lower_update:
+            fail_lower_update = False
+            raise RuntimeError("consumer failed")
+        handled.append(update.update_id)
+
+    runtime = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: transport,
+    )
+    ingress = BotApiIngress(
+        configuration=runtime.configuration,
+        transport=transport,
+        store=store,
+        consumer=consumer,
+        delivery=BotApiDeliveryAdapter(transport, retry_sleep=lambda _seconds: None),
+        clock=_FixedClock(),
+    )
+
+    with pytest.raises(RuntimeError, match="consumer failed"):
+        ingress.poll_once()
+    higher_result = ingress.poll_once()
+    lower_retry_result = ingress.poll_once()
+
+    assert higher_result.accepted_update_ids == (11,)
+    assert higher_result.next_offset == 0
+    assert lower_retry_result.accepted_update_ids == (10,)
+    assert lower_retry_result.next_offset == 12
+    assert handled == [11, 10]
+
+
 def test_long_polling_refuses_an_active_webhook_before_get_updates() -> None:
     transport = ControlledBotApiTransport(webhook_url="https://example.invalid/hook")
     store = InMemoryBotApiContinuityStore()
@@ -541,6 +587,47 @@ def test_retention_gap_skips_unavailable_updates_and_alerts_once_per_interval() 
     assert not second_result.retention_gap_detected
     assert len(store.retention_alerts) == 1
     assert len(transport.sent_messages) == 1
+
+
+def test_elapsed_retention_evidence_alerts_without_untrusted_update_boundary() -> None:
+    transport = ControlledBotApiTransport()
+    outage_started_at = datetime(2026, 9, 1, tzinfo=UTC)
+    transport.enqueue_poll(
+        BotApiPollResult(
+            retention_evidence=BotApiRetentionEvidence(
+                outage_started_at=outage_started_at,
+            )
+        )
+    )
+    store = InMemoryBotApiContinuityStore()
+    runtime = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: transport,
+    )
+    ingress = BotApiIngress(
+        configuration=runtime.configuration,
+        transport=transport,
+        store=store,
+        consumer=lambda _update: None,
+        delivery=BotApiDeliveryAdapter(transport, retry_sleep=lambda _seconds: None),
+        clock=_FixedClock(),
+    )
+
+    result = ingress.poll_once()
+
+    assert result.retention_gap_detected
+    assert result.retention_alert_delivered
+    assert result.next_offset == 0
+    assert len(store.retention_alerts) == 1
+    assert len(transport.sent_messages) == 1
+
+    transport.enqueue_poll(BotApiPollResult())
+    second_result = ingress.poll_once()
+    assert not second_result.retention_alert_delivered
+    assert len(store.retention_alerts) == 1
 
 
 def test_retention_alert_reconciles_an_ambiguous_send_without_resending() -> None:
@@ -791,6 +878,7 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
         requests.append((request_url.rsplit("/", 1)[-1], payload))
         return _Response(responses.pop(0))
 
+    reconciliation = InMemoryBotApiDeliveryReconciliation()
     configuration = BotApiRuntime.from_mapping(
         {
             "TELEGRAM_BOT_TOKEN": "123456:secret-token",
@@ -798,6 +886,7 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
         },
         transport_factory=lambda configuration: BotApiHttpTransport(
             configuration,
+            reconciliation=reconciliation,
             api_root="https://example.invalid/bot",
             opener=opener,
         ),
@@ -811,12 +900,14 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
 
     transport = BotApiHttpTransport(
         configuration,
+        reconciliation=reconciliation,
         api_root="https://example.invalid/bot",
         opener=unavailable_opener,
     )
 
     poll = BotApiHttpTransport(
         configuration,
+        reconciliation=reconciliation,
         api_root="https://example.invalid/bot",
         opener=opener,
     ).get_updates(offset=40, timeout_seconds=30)
@@ -837,6 +928,7 @@ def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:
         {"ok": True, "result": True},
     ]
     requests: list[tuple[str, str | None]] = []
+    edit_failures_remaining = [1]
 
     class _Response:
         def __enter__(self) -> _Response:
@@ -857,6 +949,12 @@ def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:
                 request.get_header("X-football-bot-delivery-id"),
             )
         )
+        if (
+            request.full_url.rsplit("/", 1)[-1] == "editMessageText"
+            and edit_failures_remaining[0]
+        ):
+            edit_failures_remaining[0] -= 1
+            raise URLError("response lost after edit")
         return _Response()
 
     configuration = BotApiRuntime.from_mapping(
@@ -866,8 +964,16 @@ def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:
         },
         transport_factory=lambda _configuration: object(),
     ).configuration
+    reconciliation = InMemoryBotApiDeliveryReconciliation()
     transport = BotApiHttpTransport(
         configuration,
+        reconciliation=reconciliation,
+        api_root="https://example.invalid/bot",
+        opener=opener,
+    )
+    restarted = BotApiHttpTransport(
+        configuration,
+        reconciliation=reconciliation,
         api_root="https://example.invalid/bot",
         opener=opener,
     )
@@ -882,13 +988,15 @@ def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:
     )
 
     assert transport.send_message(message) == "7"
-    assert transport.send_message(message) == "7"
-    assert transport.reconcile_message(message) == "7"
-    assert transport.edit_message(telegram_message_id="7", message=edit) == "7"
-    assert transport.edit_message(telegram_message_id="7", message=edit) == "7"
-    assert transport.reconcile_edit(telegram_message_id="7", message=edit) == "7"
+    assert restarted.send_message(message) == "7"
+    assert restarted.reconcile_message(message) == "7"
+    with pytest.raises(BotApiOutcomeUnknownError):
+        transport.edit_message(telegram_message_id="7", message=edit)
+    assert restarted.reconcile_edit(telegram_message_id="7", message=edit) == "7"
+    assert restarted.reconcile_edit(telegram_message_id="7", message=edit) == "7"
     assert requests == [
         ("sendMessage", "http-correlated-send"),
+        ("editMessageText", "http-correlated-edit"),
         ("editMessageText", "http-correlated-edit"),
     ]
 
@@ -917,6 +1025,7 @@ def test_http_transport_reports_only_a_decisive_retention_gap() -> None:
     def opener(_request: object, **_kwargs: object) -> _Response:
         return _Response(responses.pop(0))
 
+    reconciliation = InMemoryBotApiDeliveryReconciliation()
     configuration = BotApiRuntime.from_mapping(
         {
             "TELEGRAM_BOT_TOKEN": "123456:fake-token",
@@ -924,12 +1033,14 @@ def test_http_transport_reports_only_a_decisive_retention_gap() -> None:
         },
         transport_factory=lambda _configuration: BotApiHttpTransport(
             _configuration,
+            reconciliation=reconciliation,
             api_root="https://example.invalid/bot",
             opener=opener,
         ),
     ).configuration
     transport = BotApiHttpTransport(
         configuration,
+        reconciliation=reconciliation,
         api_root="https://example.invalid/bot",
         opener=opener,
     )
@@ -963,6 +1074,11 @@ def test_http_transport_reports_only_a_decisive_retention_gap() -> None:
     assert normal_positive.oldest_available_update_id is None
     assert retention_gap.oldest_available_update_id == 3_000
     assert post_idle.oldest_available_update_id is None
+    assert post_idle.retention_evidence is not None
+    assert post_idle.retention_evidence.outage_started_at == origin + timedelta(
+        hours=26
+    )
+    assert post_idle.retention_evidence.first_available_update_id is None
 
 
 def test_http_transport_serializes_reply_keyboard_removal() -> None:
@@ -983,6 +1099,7 @@ def test_http_transport_serializes_reply_keyboard_removal() -> None:
         requests.append(json.loads(request.data.decode("utf-8")))
         return _Response()
 
+    reconciliation = InMemoryBotApiDeliveryReconciliation()
     configuration = BotApiRuntime.from_mapping(
         {
             "TELEGRAM_BOT_TOKEN": "123456:fake-token",
@@ -990,12 +1107,14 @@ def test_http_transport_serializes_reply_keyboard_removal() -> None:
         },
         transport_factory=lambda _configuration: BotApiHttpTransport(
             _configuration,
+            reconciliation=reconciliation,
             api_root="https://example.invalid/bot",
             opener=opener,
         ),
     ).configuration
     BotApiHttpTransport(
         configuration,
+        reconciliation=reconciliation,
         api_root="https://example.invalid/bot",
         opener=opener,
     ).send_message(_message("remove-keyboard"))

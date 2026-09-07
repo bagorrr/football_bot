@@ -207,6 +207,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0055_source_message_deletion_boundary.sql",
     "0056_source_data_deletion_bot_fail_closed.sql",
     "0057_bot_api_continuity.sql",
+    "0058_bot_api_delivery_reconciliation.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -268,6 +269,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "7afb46e943b06aaf37111f3fc223e7fa041b569eb715a8db02a888833f6e30cf",
     "441dea8bc764ec932169281f6ad02ac87beeb76593ff746bf968e67d478478ed",
     "34645c5a8b188e677f153de19c82c34349a821343cc3e68f7c99911b8b7d3d80",
+    "abb90f07e2e47dca9880b07ecf514af1b38407496fbe85c51739bb76387dbd6f",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -766,6 +768,7 @@ class PostgresAcceptanceObserver:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
             TRUNCATE football_runtime.bot_callback_outbox,
+                     football_runtime.bot_api_delivery_reconciliation,
                      football_runtime.bot_api_retention_alerts,
                      football_runtime.bot_api_updates,
                      football_runtime.bot_api_checkpoints,
