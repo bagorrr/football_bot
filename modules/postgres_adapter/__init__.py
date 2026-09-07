@@ -4175,6 +4175,73 @@ class PostgresRoleStore:
             date=row["checkpoint_date"],
         )
 
+    def advance_account_difference_checkpoint(
+        self,
+        *,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance an account checkpoint for a body-free page outcome."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            ):
+                return False
+            row = connection.execute(
+                """
+                SELECT pts, qts, seq, checkpoint_date
+                FROM football_runtime.telegram_account_difference_checkpoints
+                WHERE singleton
+                FOR UPDATE
+                """
+            ).fetchone()
+            if row is None:
+                raise LookupError("Telegram account checkpoint is not initialized")
+            current = TelegramAccountCheckpoint(
+                pts=row["pts"],
+                qts=row["qts"],
+                seq=row["seq"],
+                date=row["checkpoint_date"],
+            )
+            if current != from_checkpoint:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_account_difference_checkpoints
+                SET pts = %s, qts = %s, seq = %s,
+                    checkpoint_date = %s, advanced_at = %s
+                WHERE singleton
+                """,
+                (
+                    to_checkpoint.pts,
+                    to_checkpoint.qts,
+                    to_checkpoint.seq,
+                    to_checkpoint.date,
+                    recorded_at,
+                ),
+            )
+        return True
+
     def channel_ingestion_checkpoint(
         self,
         *,
@@ -4189,6 +4256,110 @@ class PostgresRoleStore:
         if context is None or context.checkpoint is None:
             raise LookupError(identity)
         return context.checkpoint
+
+    def advance_channel_difference_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance a channel checkpoint for a body-free page outcome."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        lock_key = (
+            f"source-ingestion:{identity.kind.value}:{identity.telegram_id}:"
+            f"{registry_generation}"
+        )
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'source_stream'
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                      AND active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            context = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if context is None:
+                return False
+            current = connection.execute(
+                """
+                SELECT channel_pts
+                FROM football_runtime.telegram_channel_difference_checkpoints
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                FOR UPDATE
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if current is None:
+                raise LookupError("Telegram channel checkpoint is not initialized")
+            if current["channel_pts"] != from_checkpoint.pts:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_channel_difference_checkpoints
+                SET channel_pts = %s, advanced_at = %s
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    to_checkpoint.pts,
+                    recorded_at,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            )
+        return True
 
     def discard_account_difference_event(
         self,

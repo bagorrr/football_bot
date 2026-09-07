@@ -28,6 +28,7 @@ from modules.domain import (
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
+    TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramDifferenceResult,
@@ -674,6 +675,51 @@ def test_account_difference_commits_checkpoint_event_and_application_effect() ->
     system.restart(RuntimeRole.APPLICATION)
     assert not system.redeliver_source_event("source-event:account:1")
     assert len(system.source_messages()) == 1
+    system.reset()
+
+
+def test_account_checkpoint_only_page_outcome_advances_without_source_data(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_602,
+        qts=48,
+        seq=463,
+        date=datetime(2026, 9, 12, 9, 22, tzinfo=UTC),
+    )
+    advanced_checkpoint = TelegramAccountCheckpoint(
+        pts=4_603,
+        qts=48,
+        seq=464,
+        date=datetime(2026, 9, 12, 9, 23, tzinfo=UTC),
+    )
+    telethon.queue_account_difference_result(
+        checkpoint=initial_checkpoint,
+        result=TelegramDifferenceCheckpointAdvance(
+            from_checkpoint=initial_checkpoint,
+            to_checkpoint=advanced_checkpoint,
+            outcome_id="telegram-checkpoint:account:ignored:1",
+        ),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=FrozenClock(datetime(2026, 8, 12, 9, 22, tzinfo=UTC)),
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_002,
+    )
+    system.reset()
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == advanced_checkpoint
+    assert system.source_events() == ()
+    assert system.source_messages() == ()
+    assert system.ingestion_failures() == ()
+    assert not system.process_next_account_telegram_difference()
     system.reset()
 
 

@@ -866,6 +866,44 @@ class TelegramProtectionUnavailableEvent(_TelegramDifferenceProgress):
     persistent: bool
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramDifferenceCheckpointAdvance:
+    """Body-free page outcome that advances a durable Telegram checkpoint."""
+
+    from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
+    to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
+    outcome_id: str
+    source_chat_identity: TelegramPeerIdentity | None = None
+    registry_generation: int = 1
+    from_history: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.from_checkpoint) is not type(self.to_checkpoint):
+            raise ValueError("Telegram difference checkpoint scopes must match")
+        if self.from_history:
+            raise ValueError("Checkpoint-only Telegram outcomes cannot be historical")
+        if isinstance(self.from_checkpoint, TelegramAccountCheckpoint):
+            assert isinstance(self.to_checkpoint, TelegramAccountCheckpoint)
+            if (
+                self.to_checkpoint.pts < self.from_checkpoint.pts
+                or self.to_checkpoint.qts < self.from_checkpoint.qts
+                or self.to_checkpoint.seq < self.from_checkpoint.seq
+                or self.to_checkpoint.date < self.from_checkpoint.date
+            ):
+                raise ValueError("Telegram account checkpoint cannot regress")
+        else:
+            assert isinstance(self.from_checkpoint, TelegramChannelCheckpoint)
+            assert isinstance(self.to_checkpoint, TelegramChannelCheckpoint)
+            if self.to_checkpoint.pts < self.from_checkpoint.pts:
+                raise ValueError("Telegram channel checkpoint cannot regress")
+            if self.source_chat_identity is None:
+                raise ValueError("Channel checkpoint outcome requires a Source Chat")
+        if self.registry_generation < 1:
+            raise ValueError("Source Chat registry generation must be positive")
+        if not self.outcome_id:
+            raise ValueError("Telegram checkpoint outcome identity is required")
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramDifferenceFailure:
     """Body-free controlled failure returned at one durable checkpoint."""
@@ -879,6 +917,7 @@ TelegramDifferenceResult = (
     TelegramDifferenceEvent
     | TelegramProtectedContentEvent
     | TelegramProtectionUnavailableEvent
+    | TelegramDifferenceCheckpointAdvance
     | TelegramDifferenceFailure
 )
 

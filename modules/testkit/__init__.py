@@ -91,6 +91,7 @@ from modules.domain import (
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
+    TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramDifferenceResult,
@@ -640,6 +641,14 @@ class ControlledTelegramIngestionAdapter:
         self._account_result_gate.enter()
         return result
 
+    def acknowledge_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge a controlled account outcome after durable commit."""
+        del checkpoint, result_id
+
     def add_account_history_event(
         self,
         *,
@@ -978,6 +987,16 @@ class ControlledTelegramIngestionAdapter:
         self._channel_result_gate.enter()
         return result
 
+    def acknowledge_channel_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge a controlled channel outcome after durable commit."""
+        del identity, registry_generation, checkpoint, result_id
+
     def get_source_chat_history_event(
         self,
         identity: TelegramPeerIdentity,
@@ -1029,8 +1048,13 @@ class ControlledTelegramIngestionAdapter:
                 candidate
                 for candidate in events
                 if isinstance(candidate, TelegramDifferenceFailure)
-                or history_cursor is None
-                or candidate.telegram_message_id > history_cursor
+                or (
+                    not isinstance(candidate, TelegramDifferenceCheckpointAdvance)
+                    and (
+                        history_cursor is None
+                        or candidate.telegram_message_id > history_cursor
+                    )
+                )
             ),
             None,
         )
@@ -1092,10 +1116,15 @@ class ControlledTelegramIngestionAdapter:
         first_event = events[0] if events else None
         if isinstance(first_event, TelegramDifferenceFailure):
             raise RuntimeError("controlled history cursor contains a failure")
+        if isinstance(first_event, TelegramDifferenceCheckpointAdvance):
+            raise RuntimeError("controlled history cursor contains checkpoint progress")
         if first_event is not None and first_event.source_event_id == source_event_id:
             events.pop(0)
         elif any(
-            not isinstance(event, TelegramDifferenceFailure)
+            not isinstance(
+                event,
+                (TelegramDifferenceFailure, TelegramDifferenceCheckpointAdvance),
+            )
             and event.source_event_id == source_event_id
             for event in events
         ):

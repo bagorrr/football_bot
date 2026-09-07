@@ -100,6 +100,7 @@ from modules.domain import (
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
     TelegramDeliveryMode,
+    TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramMessage,
@@ -17321,6 +17322,31 @@ class RuntimeApplication:
                     envelope=envelope,
                 )
             raise RuntimeError("account difference failure scope is unsupported")
+        if isinstance(event, TelegramDifferenceCheckpointAdvance):
+            if not (
+                isinstance(event.from_checkpoint, TelegramAccountCheckpoint)
+                and isinstance(event.to_checkpoint, TelegramAccountCheckpoint)
+                and event.from_checkpoint == checkpoint
+            ):
+                return self._stop_account_stream_for_transport_failure(
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID
+                )
+            try:
+                advanced = self.store.advance_account_difference_checkpoint(
+                    from_checkpoint=event.from_checkpoint,
+                    to_checkpoint=event.to_checkpoint,
+                    recorded_at=self.clock.now(),
+                )
+            except (LookupError, TypeError, ValueError):
+                return self._stop_account_stream_for_transport_failure(
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID
+                )
+            if not advanced:
+                return False
+            return self._acknowledge_account_difference_event(
+                checkpoint=checkpoint,
+                result_id=event.outcome_id,
+            )
         identity = event.source_chat_identity
         registry_generation = event.registry_generation
         if self.store.source_stream_is_stopped(
@@ -17335,9 +17361,13 @@ class RuntimeApplication:
             )
             is None
         ):
-            return self.store.discard_account_difference_event(
+            discarded = self.store.discard_account_difference_event(
                 event=event,
                 recorded_at=self.clock.now(),
+            )
+            return discarded and self._acknowledge_account_difference_event(
+                checkpoint=checkpoint,
+                result_id=event.source_event_id,
             )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
         if isinstance(event, TelegramProtectionUnavailableEvent):
@@ -17351,7 +17381,7 @@ class RuntimeApplication:
         if isinstance(event, TelegramProtectedContentEvent):
             recorded_at = self.clock.now()
             try:
-                return self.store.commit_source_event(
+                committed = self.store.commit_source_event(
                     event=event,
                     registry_generation=registry_generation,
                     envelope=self._protected_content_skip_envelope(
@@ -17362,6 +17392,10 @@ class RuntimeApplication:
                     ),
                     recorded_at=recorded_at,
                     inject_database_failure=inject_database_failure,
+                )
+                return committed and self._acknowledge_account_difference_event(
+                    checkpoint=checkpoint,
+                    result_id=event.source_event_id,
                 )
             except OutboxConflictError as error:
                 raise RuntimeProcessingError from error
@@ -17404,12 +17438,16 @@ class RuntimeApplication:
             },
         )
         try:
-            return self.store.commit_source_event(
+            committed = self.store.commit_source_event(
                 event=event,
                 registry_generation=registry_generation,
                 envelope=envelope,
                 recorded_at=recorded_at,
                 inject_database_failure=inject_database_failure,
+            )
+            return committed and self._acknowledge_account_difference_event(
+                checkpoint=checkpoint,
+                result_id=event.source_event_id,
             )
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
@@ -17487,6 +17525,41 @@ class RuntimeApplication:
                 registry_generation=registry_generation,
                 reason=event.reason,
             )
+        if isinstance(event, TelegramDifferenceCheckpointAdvance):
+            if not (
+                event.source_chat_identity == identity
+                and event.registry_generation == registry_generation
+                and isinstance(event.from_checkpoint, TelegramChannelCheckpoint)
+                and isinstance(event.to_checkpoint, TelegramChannelCheckpoint)
+                and event.from_checkpoint == context.checkpoint
+            ):
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
+            try:
+                advanced = self.store.advance_channel_difference_checkpoint(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    from_checkpoint=event.from_checkpoint,
+                    to_checkpoint=event.to_checkpoint,
+                    recorded_at=self.clock.now(),
+                )
+            except (LookupError, TypeError, ValueError):
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
+            if not advanced:
+                return False
+            return self._acknowledge_channel_difference_event(
+                identity=identity,
+                registry_generation=registry_generation,
+                checkpoint=context.checkpoint,
+                result_id=event.outcome_id,
+            )
         if event.source_chat_identity != identity:
             return self._stop_source_stream_for_transport_failure(
                 identity=identity,
@@ -17553,7 +17626,7 @@ class RuntimeApplication:
         if isinstance(event, TelegramProtectedContentEvent):
             recorded_at = self.clock.now()
             try:
-                return self.store.commit_source_event(
+                committed = self.store.commit_source_event(
                     event=event,
                     registry_generation=registry_generation,
                     envelope=self._protected_content_skip_envelope(
@@ -17564,6 +17637,12 @@ class RuntimeApplication:
                     ),
                     recorded_at=recorded_at,
                     inject_database_failure=inject_database_failure,
+                )
+                return committed and self._acknowledge_channel_difference_event(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    checkpoint=context.checkpoint,
+                    result_id=event.source_event_id,
                 )
             except OutboxConflictError as error:
                 raise RuntimeProcessingError from error
@@ -17606,12 +17685,18 @@ class RuntimeApplication:
             },
         )
         try:
-            return self.store.commit_source_event(
+            committed = self.store.commit_source_event(
                 event=event,
                 registry_generation=registry_generation,
                 envelope=envelope,
                 recorded_at=recorded_at,
                 inject_database_failure=inject_database_failure,
+            )
+            return committed and self._acknowledge_channel_difference_event(
+                identity=identity,
+                registry_generation=registry_generation,
+                checkpoint=context.checkpoint,
+                result_id=event.source_event_id,
             )
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
@@ -17746,6 +17831,12 @@ class RuntimeApplication:
                 identity=identity,
                 registry_generation=registry_generation,
                 reason=event.reason,
+            )
+        if isinstance(event, TelegramDifferenceCheckpointAdvance):
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
             )
         if event.source_chat_identity != identity:
             return self._stop_source_stream_for_transport_failure(
@@ -17970,6 +18061,51 @@ class RuntimeApplication:
             ),
             envelope=envelope,
         )
+
+    def _acknowledge_account_difference_event(
+        self,
+        *,
+        checkpoint: TelegramAccountCheckpoint,
+        result_id: str,
+    ) -> bool:
+        """Release one provider page outcome after its database handoff."""
+        assert self.telegram_ingestion is not None
+        try:
+            self.telegram_ingestion.acknowledge_account_difference_event(
+                checkpoint,
+                result_id,
+            )
+        except Exception as error:
+            return self._stop_telethon_transport_failure(
+                error,
+                account_stream=True,
+            )
+        return True
+
+    def _acknowledge_channel_difference_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        result_id: str,
+    ) -> bool:
+        """Release one provider channel page outcome after its database handoff."""
+        assert self.telegram_ingestion is not None
+        try:
+            self.telegram_ingestion.acknowledge_channel_difference_event(
+                identity,
+                registry_generation,
+                checkpoint,
+                result_id,
+            )
+        except Exception as error:
+            return self._stop_telethon_transport_failure(
+                error,
+                identity=identity,
+                registry_generation=registry_generation,
+            )
+        return True
 
     def _stop_telethon_transport_failure(
         self,

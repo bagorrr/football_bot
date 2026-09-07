@@ -141,6 +141,14 @@ class TelegramIngestionAdapter(Protocol):
         """Return the next account-wide event from durable application state."""
         ...
 
+    def acknowledge_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge one account page outcome after its durable handoff."""
+        ...
+
     def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
@@ -148,6 +156,16 @@ class TelegramIngestionAdapter(Protocol):
         registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the next channel event from its typed durable pts."""
+        ...
+
+    def acknowledge_channel_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge one channel page outcome after its durable handoff."""
         ...
 
     def get_source_chat_history_event(
@@ -1166,6 +1184,16 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the durable Ingestion-owned account difference state."""
         ...
 
+    def advance_account_difference_checkpoint(
+        self,
+        *,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance an account checkpoint for a body-free page outcome."""
+        ...
+
     def channel_ingestion_checkpoint(
         self,
         *,
@@ -1173,6 +1201,18 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         registry_generation: int,
     ) -> TelegramChannelCheckpoint:
         """Read one Source Chat generation's durable channel pts."""
+        ...
+
+    def advance_channel_difference_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance a channel checkpoint for a body-free page outcome."""
         ...
 
     def discard_account_difference_event(
