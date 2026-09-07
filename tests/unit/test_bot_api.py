@@ -337,6 +337,43 @@ def test_long_polling_resumes_durable_offset_and_deduplicates_restart() -> None:
     assert transport.poll_offsets == [0, 41]
 
 
+def test_positive_update_ids_without_retention_evidence_do_not_open_a_gap() -> None:
+    transport = ControlledBotApiTransport()
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(900),)))
+    transport.enqueue_poll(BotApiPollResult(updates=(_private_update(1_900),)))
+    store = InMemoryBotApiContinuityStore()
+    handled: list[int] = []
+    runtime = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: transport,
+    )
+    ingress = BotApiIngress(
+        configuration=runtime.configuration,
+        transport=transport,
+        store=store,
+        consumer=lambda update: handled.append(update.update_id),
+        delivery=BotApiDeliveryAdapter(transport, retry_sleep=lambda _seconds: None),
+        clock=_FixedClock(),
+    )
+
+    first_result = ingress.poll_once()
+    second_result = ingress.poll_once()
+
+    assert first_result.accepted_update_ids == (900,)
+    assert second_result.accepted_update_ids == (1_900,)
+    assert not first_result.retention_gap_detected
+    assert not second_result.retention_gap_detected
+    assert not first_result.retention_alert_delivered
+    assert not second_result.retention_alert_delivered
+    assert handled == [900, 1_900]
+    assert store.checkpoint().next_offset == 1_901
+    assert store.retention_alerts == ()
+    assert transport.sent_messages == []
+
+
 def test_long_polling_refuses_an_active_webhook_before_get_updates() -> None:
     transport = ControlledBotApiTransport(webhook_url="https://example.invalid/hook")
     store = InMemoryBotApiContinuityStore()
@@ -456,6 +493,63 @@ def test_retention_alert_reconciles_an_ambiguous_send_without_resending() -> Non
     assert second_result.retention_alert_delivered
     assert store.retention_alerts[0][1] == "confirmed"
     assert len(transport.sent_messages) == 1
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [
+        ("callback", "location:other-city:1"),
+        ("callback", "details:open:team_formats:1"),
+        ("callback", "search:submit:1"),
+        ("callback", "source-chats:back:1"),
+        ("callback", "sdd:back:1"),
+        ("message", "Find a match for me"),
+    ],
+)
+def test_unaccepted_valid_bot_user_updates_are_not_acknowledged(
+    kind: str, value: str
+) -> None:
+    transport = ControlledBotApiTransport()
+    update_id = 600 + len(value)
+    update = (
+        _private_update(update_id, text=value)
+        if kind == "message"
+        else _private_callback(update_id, data=value)
+    )
+    transport.enqueue_poll(BotApiPollResult(updates=(update,)))
+    transport.enqueue_poll(BotApiPollResult(updates=(update,)))
+    store = InMemoryBotApiContinuityStore()
+    application = _RecordingApplication()
+    handler = BotApiConversationHandler(
+        application,
+        administrator_user_id=456789,
+    )
+    runtime = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: transport,
+    )
+    ingress = BotApiIngress(
+        configuration=runtime.configuration,
+        transport=transport,
+        store=store,
+        consumer=handler,
+        delivery=BotApiDeliveryAdapter(transport, retry_sleep=lambda _seconds: None),
+        clock=_FixedClock(),
+    )
+
+    result = ingress.poll_once()
+    retry_result = ingress.poll_once()
+
+    assert result.accepted_update_ids == ()
+    assert result.duplicate_update_ids == ()
+    assert retry_result.accepted_update_ids == ()
+    assert retry_result.duplicate_update_ids == ()
+    assert store.checkpoint().next_offset == 0
+    assert store.retention_alerts == ()
+    assert application.calls == []
 
 
 def test_long_polling_requires_the_configured_private_administrator_destination() -> (
@@ -585,6 +679,7 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
     ).get_updates(offset=40, timeout_seconds=30)
 
     assert poll.updates[0].update_id == 41
+    assert poll.oldest_available_update_id is None
     assert requests == [("getUpdates", {"offset": 40, "timeout": 30})]
     with pytest.raises(BotApiOutcomeUnknownError) as error:
         transport.send_message(_message("http-ambiguous"))
@@ -650,7 +745,7 @@ def _message(delivery_id: str) -> TelegramMessage:
     )
 
 
-def _private_update(update_id: int) -> BotApiUpdate:
+def _private_update(update_id: int, *, text: str = "/start") -> BotApiUpdate:
     return BotApiUpdate.from_mapping(
         {
             "update_id": update_id,
@@ -658,7 +753,24 @@ def _private_update(update_id: int) -> BotApiUpdate:
                 "message_id": update_id,
                 "from": {"id": 111222},
                 "chat": {"id": 111222, "type": "private"},
-                "text": "/start",
+                "text": text,
+            },
+        }
+    )
+
+
+def _private_callback(update_id: int, *, data: str) -> BotApiUpdate:
+    return BotApiUpdate.from_mapping(
+        {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"callback-{update_id}",
+                "from": {"id": 111222},
+                "message": {
+                    "message_id": update_id,
+                    "chat": {"id": 111222, "type": "private"},
+                },
+                "data": data,
             },
         }
     )

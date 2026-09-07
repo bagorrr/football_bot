@@ -349,6 +349,7 @@ class BotApiPollResult:
     """One controlled or provider-backed ``getUpdates`` response."""
 
     updates: tuple[BotApiUpdate, ...] = ()
+    # This is explicit provider evidence, not an inference from update IDs.
     oldest_available_update_id: int | None = None
 
     def __post_init__(self) -> None:
@@ -632,6 +633,10 @@ class BotApiContinuityStore(Protocol):
         """Atomically mark one update handled and advance the next offset."""
         ...
 
+    def release_update_claim(self, *, update_id: int, claim_token: UUID) -> None:
+        """Release an update the application has not accepted without advancing."""
+        ...
+
     def claim_retention_alert(
         self,
         *,
@@ -819,6 +824,13 @@ class InMemoryBotApiContinuityStore:
                 next_offset=max(self._checkpoint.next_offset, update_id + 1),
                 retention_gap_open=self._checkpoint.retention_gap_open,
             )
+
+    def release_update_claim(self, *, update_id: int, claim_token: UUID) -> None:
+        with self._lock:
+            record = self._updates.get(update_id)
+            if record is None or record.claim_token != claim_token or record.completed:
+                return
+            del self._updates[update_id]
 
     def claim_retention_alert(
         self,
@@ -1152,6 +1164,16 @@ class PostgresBotApiContinuityStore:
                 (update_id + 1, completed_at, self._CHECKPOINT_KEY),
             )
 
+    def release_update_claim(self, *, update_id: int, claim_token: UUID) -> None:
+        with psycopg.connect(self._database_url) as connection:
+            connection.execute(
+                """
+                DELETE FROM football_runtime.bot_api_updates
+                WHERE update_id = %s AND claim_token = %s AND completed_at IS NULL
+                """,
+                (update_id, claim_token),
+            )
+
     def claim_retention_alert(
         self,
         *,
@@ -1392,13 +1414,6 @@ class BotApiIngress:
                 if update.update_id < checkpoint.next_offset:
                     stale.append(update.update_id)
                     continue
-                if update.update_id > checkpoint.next_offset:
-                    self.store.register_retention_gap(
-                        expected_offset=checkpoint.next_offset,
-                        first_available_update_id=update.update_id,
-                        observed_at=self.clock.now(),
-                    )
-                    retention_gap_detected = True
                 claim_token = uuid4()
                 claimed = self.store.claim_update(
                     update_id=update.update_id,
@@ -1412,7 +1427,12 @@ class BotApiIngress:
                 if not update.is_private_user_update:
                     ignored.append(update.update_id)
                 else:
-                    self.consumer(update)
+                    if self.consumer(update) is False:
+                        self.store.release_update_claim(
+                            update_id=update.update_id,
+                            claim_token=claim_token,
+                        )
+                        break
                 self.store.complete_update(
                     update_id=update.update_id,
                     claim_token=claim_token,
@@ -1820,9 +1840,6 @@ class BotApiHttpTransport:
             raise BotApiTransportError("Bot API getUpdates result was malformed")
         return BotApiPollResult(
             updates=updates,
-            oldest_available_update_id=(
-                min(update.update_id for update in updates) if updates else None
-            ),
         )
 
     def get_chat(self, *, chat_id: int) -> BotApiChat:
@@ -2235,7 +2252,7 @@ class BotApiConversationHandler:
         self._administrator_user_id = administrator_user_id
 
     def __call__(self, update: BotApiUpdate) -> bool:
-        """Apply one known update; return false for an intentionally inert one."""
+        """Apply one known update; false means the application did not accept it."""
         if not update.is_private_user_update or update.user_id is None:
             return False
         update_id = str(update.update_id)
