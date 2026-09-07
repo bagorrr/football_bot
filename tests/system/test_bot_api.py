@@ -78,8 +78,9 @@ def test_postgres_false_consumer_release_has_the_required_delete_privilege(
 
     result = ingress.poll_once()
 
-    assert result.accepted_update_ids == ()
-    assert result.next_offset == 0
+    assert result.accepted_update_ids == (43,)
+    assert result.ignored_update_ids == (43,)
+    assert result.next_offset == 44
     with psycopg.connect(fresh_database_url) as connection:
         assert connection.execute(
             """
@@ -96,7 +97,7 @@ def test_postgres_false_consumer_release_has_the_required_delete_privilege(
                    count(*)
             FROM football_runtime.bot_api_updates
             """
-        ).fetchone() == (True, False, 0)
+        ).fetchone() == (True, False, 1)
 
 
 def test_postgres_retention_loss_alerts_once_and_stays_private(

@@ -628,7 +628,10 @@ def test_complete_bot_user_surface_is_forwarded_and_checkpointed() -> None:
         data="unsupported:control:1",
         callback_id="callback-unsupported",
     )
-    transport.enqueue_poll(BotApiPollResult(updates=(*valid_updates, unsupported)))
+    later_valid = _private_update(609, text="Later valid message")
+    transport.enqueue_poll(
+        BotApiPollResult(updates=(*valid_updates, unsupported, later_valid))
+    )
     transport.enqueue_poll(BotApiPollResult(updates=(unsupported,)))
     store = InMemoryBotApiContinuityStore()
     application = _RecordingApplication()
@@ -656,14 +659,16 @@ def test_complete_bot_user_surface_is_forwarded_and_checkpointed() -> None:
     retry_result = ingress.poll_once()
 
     assert result.accepted_update_ids == tuple(
-        update.update_id for update in valid_updates
+        update.update_id for update in (*valid_updates, unsupported, later_valid)
     )
+    assert result.ignored_update_ids == (unsupported.update_id,)
     assert result.duplicate_update_ids == ()
     assert retry_result.accepted_update_ids == ()
+    assert retry_result.stale_update_ids == (unsupported.update_id,)
     assert retry_result.duplicate_update_ids == ()
-    assert store.checkpoint().next_offset == unsupported.update_id
+    assert store.checkpoint().next_offset == later_valid.update_id + 1
     assert store.retention_alerts == ()
-    assert application.message_texts == ["Find a match for me"]
+    assert application.message_texts == ["Find a match for me", "Later valid message"]
     assert application.callback_ids == [
         "callback-location",
         "callback-location-suggestion",
@@ -797,12 +802,17 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
             opener=opener,
         ),
     ).configuration
+    ambiguous_methods: list[str] = []
+
+    def unavailable_opener(request: object, **_kwargs: object) -> object:
+        assert hasattr(request, "full_url")
+        ambiguous_methods.append(request.full_url.rsplit("/", 1)[-1])
+        raise URLError("network unavailable")
+
     transport = BotApiHttpTransport(
         configuration,
         api_root="https://example.invalid/bot",
-        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            URLError("network unavailable")
-        ),
+        opener=unavailable_opener,
     )
 
     poll = BotApiHttpTransport(
@@ -817,6 +827,70 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
     with pytest.raises(BotApiOutcomeUnknownError) as error:
         transport.send_message(_message("http-ambiguous"))
     assert "secret-token" not in str(error.value)
+    assert transport.reconcile_message(_message("http-ambiguous")) is None
+    assert ambiguous_methods == ["sendMessage"]
+
+
+def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:
+    responses = [
+        {"ok": True, "result": {"message_id": 7}},
+        {"ok": True, "result": True},
+    ]
+    requests: list[tuple[str, str | None]] = []
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(responses.pop(0)).encode("utf-8")
+
+    def opener(request: object, **_kwargs: object) -> _Response:
+        assert hasattr(request, "full_url")
+        assert hasattr(request, "get_header")
+        requests.append(
+            (
+                request.full_url.rsplit("/", 1)[-1],
+                request.get_header("X-football-bot-delivery-id"),
+            )
+        )
+        return _Response()
+
+    configuration = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: object(),
+    ).configuration
+    transport = BotApiHttpTransport(
+        configuration,
+        api_root="https://example.invalid/bot",
+        opener=opener,
+    )
+    message = _message("http-correlated-send")
+    edit = TelegramMessage(
+        delivery_id="http-correlated-edit",
+        telegram_user_id=message.telegram_user_id,
+        display_locale=message.display_locale,
+        screen_revision=message.screen_revision,
+        text="edited message",
+        button_rows=(),
+    )
+
+    assert transport.send_message(message) == "7"
+    assert transport.send_message(message) == "7"
+    assert transport.reconcile_message(message) == "7"
+    assert transport.edit_message(telegram_message_id="7", message=edit) == "7"
+    assert transport.edit_message(telegram_message_id="7", message=edit) == "7"
+    assert transport.reconcile_edit(telegram_message_id="7", message=edit) == "7"
+    assert requests == [
+        ("sendMessage", "http-correlated-send"),
+        ("editMessageText", "http-correlated-edit"),
+    ]
 
 
 def test_http_transport_reports_only_a_decisive_retention_gap() -> None:

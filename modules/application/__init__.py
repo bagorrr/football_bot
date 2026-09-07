@@ -2494,9 +2494,6 @@ class ConversationOnboarding:
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
             return False
-        draft = self._store.discovery_draft(telegram_user_id)
-        if draft is not None and current.stage is not draft.stage:
-            return False
         if current.stage in {
             ConversationStage.LANGUAGE_INPUT,
             ConversationStage.SETTINGS_LANGUAGE_INPUT,
@@ -2508,6 +2505,30 @@ class ConversationOnboarding:
                 screen_revision=current.screen_revision,
             )
             return True
+        if (
+            current.stage is ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+            and self._is_administrator(telegram_user_id)
+        ):
+            self.submit_source_chat_address(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                address=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            current.stage is ConversationStage.SOURCE_DATA_DELETION_INPUT
+            and self._is_administrator(telegram_user_id)
+        ):
+            return self._handle_source_data_deletion_input_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                current=current,
+                text=text,
+            )
+        draft = self._store.discovery_draft(telegram_user_id)
+        if draft is not None and current.stage is not draft.stage:
+            return False
         if (
             current.stage
             in {
@@ -2540,17 +2561,6 @@ class ConversationOnboarding:
                 update_id=update_id,
                 telegram_user_id=telegram_user_id,
                 text=text,
-            )
-            return True
-        if (
-            current.stage is ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
-            and self._is_administrator(telegram_user_id)
-        ):
-            self.submit_source_chat_address(
-                update_id=update_id,
-                telegram_user_id=telegram_user_id,
-                address=text,
-                screen_revision=current.screen_revision,
             )
             return True
         if current.stage is ConversationStage.POST_CORE and draft is not None:
@@ -2628,6 +2638,76 @@ class ConversationOnboarding:
                 return True
         return False
 
+    def _handle_source_data_deletion_input_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        current: ConversationState,
+        text: str,
+    ) -> bool:
+        """Route one current administrator deletion-input screen."""
+        current_message = self._store.current_conversation_message(telegram_user_id)
+        operation = _source_data_deletion_input_operation(
+            current=current,
+            current_message=current_message,
+        )
+        if operation is None:
+            self._queue_current_view(update_id=update_id, state=current)
+            return True
+        operation_name, request_id, completion_outcome = operation
+        if operation_name == "intake":
+            intake = _parse_source_data_deletion_intake_text(text)
+            if intake is None:
+                self._queue_current_view(update_id=update_id, state=current)
+                return True
+            (
+                request_id,
+                source_author_telegram_id,
+                source_chat_key,
+                support_case_pointer,
+            ) = intake
+            self.submit_source_data_deletion_request(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                source_author_telegram_id=source_author_telegram_id,
+                source_chat_key=source_chat_key,
+                support_case_pointer=support_case_pointer,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if request_id is None:
+            self._queue_current_view(update_id=update_id, state=current)
+            return True
+        if operation_name == "reject":
+            if _bounded_no_whitespace_text(text, maximum_length=128) is None:
+                self._queue_current_view(update_id=update_id, state=current)
+                return True
+            self.submit_source_data_deletion_reason(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                decision_reason=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            completion_outcome is None
+            or _bounded_no_whitespace_text(text, maximum_length=256) is None
+        ):
+            self._queue_current_view(update_id=update_id, state=current)
+            return True
+        self.submit_source_data_deletion_completion(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            completion_outcome=completion_outcome,
+            completion_proof_pointer=text,
+            screen_revision=current.screen_revision,
+        )
+        return True
+
     def handle_callback(
         self,
         *,
@@ -2661,6 +2741,14 @@ class ConversationOnboarding:
             telegram_user_id
         ):
             return False
+
+        # A callback in the current persisted button set is the acceptance gate.
+        # Acknowledge it before route-owned presentation work can fail.
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+        )
 
         accepted = False
         prefix = parts[0]
@@ -2803,17 +2891,7 @@ class ConversationOnboarding:
             )
             accepted = True
 
-        if not accepted:
-            return False
-        latest = self._store.conversation_state(telegram_user_id)
-        if latest is None:
-            return False
-        self._acknowledge_callback(
-            update_id=update_id,
-            callback_id=callback_id,
-            current=latest,
-        )
-        return True
+        return accepted
 
     def _handle_details_callback(
         self,
@@ -16235,8 +16313,9 @@ def _source_data_deletion_input_message(
     )
     if operation == "intake":
         prompt = (
-            "Add one request with request ID, numeric Source Author ID, exact "
-            "Source Chat key, and opaque support case pointer. Do not include a body."
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body."
         )
     elif operation == "reject":
         prompt = "Enter one bounded rejection reason without whitespace."
@@ -22407,6 +22486,98 @@ def _source_data_deletion_request_by_id(
     return next(
         (request for request in requests if request.request_id == request_id), None
     )
+
+
+def _source_data_deletion_input_operation(
+    *,
+    current: ConversationState,
+    current_message: TelegramMessage | None,
+) -> tuple[str, str | None, str | None] | None:
+    """Identify the exact operation represented by the current input prompt."""
+    if (
+        current_message is None
+        or current_message.screen_revision != current.screen_revision
+    ):
+        return None
+    prompt = current_message.text
+    if prompt.startswith("Enter exactly request_id=<opaque>"):
+        return "intake", None, None
+    request_id = current.source_data_deletion_request_id
+    if request_id is None:
+        return None
+    escaped_request_id = re.escape(request_id)
+    if re.fullmatch(
+        rf"request={escaped_request_id}\n\nEnter one bounded rejection reason "
+        rf"without whitespace\.",
+        prompt,
+    ):
+        return "reject", request_id, None
+    completion = re.fullmatch(
+        rf"request={escaped_request_id}\n\nEnter body-free completion proof "
+        rf"pointer for outcome "
+        rf"(completed|data_not_found)\.",
+        prompt,
+    )
+    if completion is not None:
+        return "complete", request_id, completion.group(1)
+    return None
+
+
+def _parse_source_data_deletion_intake_text(
+    value: str,
+) -> tuple[str, int, str, str] | None:
+    """Parse the four body-free key/value fields accepted by the intake prompt."""
+    fields: dict[str, str] = {}
+    aliases = {
+        "request": "request_id",
+        "request_id": "request_id",
+        "source_author": "source_author",
+        "source_author_id": "source_author",
+        "source_chat": "source_chat",
+        "support_case": "support_case",
+        "support_case_pointer": "support_case",
+    }
+    for token in value.split():
+        key, separator, field_value = token.partition("=")
+        canonical_key = aliases.get(key)
+        if separator != "=" or canonical_key is None or not field_value:
+            return None
+        if canonical_key in fields:
+            return None
+        fields[canonical_key] = field_value
+    if set(fields) != {
+        "request_id",
+        "source_author",
+        "source_chat",
+        "support_case",
+    }:
+        return None
+    request_id = _bounded_no_whitespace_text(fields["request_id"], maximum_length=256)
+    source_author = fields["source_author"]
+    source_chat = fields["source_chat"]
+    support_case = _bounded_no_whitespace_text(
+        fields["support_case"], maximum_length=256
+    )
+    if (
+        request_id is None
+        or support_case is None
+        or re.fullmatch(r"[1-9][0-9]*", source_author) is None
+        or re.fullmatch(r"source-chat:(?:chat|channel):[1-9][0-9]*", source_chat)
+        is None
+    ):
+        return None
+    return request_id, int(source_author), source_chat, support_case
+
+
+def _bounded_no_whitespace_text(value: str, *, maximum_length: int) -> str | None:
+    """Return one non-empty opaque token within a reviewed field bound."""
+    if (
+        not value
+        or len(value) > maximum_length
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    return value
 
 
 def _source_data_deletion_manage_envelope(

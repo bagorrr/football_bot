@@ -60,17 +60,16 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
     assert system.conversation_state(administrator_id).stage is (
         ConversationStage.SOURCE_DATA_DELETION_INPUT
     )
-    input_revision = system.conversation_state(administrator_id).screen_revision
     assert "Do not include a body" in delivery.messages[-1].text
 
-    system.submit_source_data_deletion_request(
+    assert system._conversation_onboarding().handle_message(
         update_id="ui:submit-intake",
         telegram_user_id=administrator_id,
-        request_id="deletion-request:ui",
-        source_author_telegram_id=78_902,
-        source_chat_key="source-chat:chat:4680102",
-        support_case_pointer="support-case:ui",
-        screen_revision=input_revision,
+        text=(
+            "request_id=deletion-request:ui source_author=78902 "
+            "source_chat=source-chat:chat:4680102 support_case=support-case:ui"
+        ),
+        telegram_language_hint=None,
     )
     assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
     request = system.source_data_deletion_requests()[0]
@@ -159,14 +158,11 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
         telegram_user_id=administrator_id,
         action=complete_callback,
     )
-    completion_revision = system.conversation_state(administrator_id).screen_revision
-    system.submit_source_data_deletion_completion(
+    assert system._conversation_onboarding().handle_message(
         update_id="ui:complete",
         telegram_user_id=administrator_id,
-        request_id=request.request_id,
-        completion_outcome="completed",
-        completion_proof_pointer="support-proof:ui",
-        screen_revision=completion_revision,
+        text="support-proof:ui",
+        telegram_language_hint=None,
     )
     assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
     assert system.source_data_deletion_requests()[0].status.value == "completed"

@@ -1504,11 +1504,7 @@ class BotApiIngress:
                     ignored.append(update.update_id)
                 else:
                     if self.consumer(update) is False:
-                        self.store.release_update_claim(
-                            update_id=update.update_id,
-                            claim_token=claim_token,
-                        )
-                        break
+                        ignored.append(update.update_id)
                 self.store.complete_update(
                     update_id=update.update_id,
                     claim_token=claim_token,
@@ -1890,6 +1886,8 @@ class BotApiHttpTransport:
         self._api_root = api_root
         self._request_timeout_seconds = request_timeout_seconds
         self._opener = opener
+        self._send_ledger: dict[str, tuple[TelegramMessage, str]] = {}
+        self._edit_ledger: dict[str, tuple[TelegramMessage, str, str]] = {}
 
     def get_me(self) -> BotApiIdentity:
         result = self._request("getMe", {})
@@ -1954,6 +1952,12 @@ class BotApiHttpTransport:
         )
 
     def send_message(self, message: TelegramMessage) -> str:
+        recorded = self._send_ledger.get(message.delivery_id)
+        if recorded is not None:
+            recorded_message, telegram_message_id = recorded
+            if recorded_message != message:
+                raise ValueError("delivery ID was reused for a different message")
+            return telegram_message_id
         result = self._request(
             "sendMessage",
             {
@@ -1961,20 +1965,34 @@ class BotApiHttpTransport:
                 "text": message.text,
                 **_message_markup(message),
             },
+            delivery_id=message.delivery_id,
         )
-        return str(
+        telegram_message_id = str(
             _response_int(
                 result, "message_id", error_key="result.message_id", minimum=1
             )
         )
+        self._send_ledger[message.delivery_id] = (message, telegram_message_id)
+        return telegram_message_id
 
     def reconcile_message(self, message: TelegramMessage) -> str | None:
-        del message
-        return None
+        recorded = self._send_ledger.get(message.delivery_id)
+        if recorded is None:
+            return None
+        recorded_message, telegram_message_id = recorded
+        if recorded_message != message:
+            raise ValueError("delivery ID was reused for a different message")
+        return telegram_message_id
 
     def edit_message(
         self, *, telegram_message_id: str, message: TelegramMessage
     ) -> str:
+        recorded = self._edit_ledger.get(message.delivery_id)
+        if recorded is not None:
+            recorded_message, recorded_target_id, recorded_result_id = recorded
+            if recorded_message != message or recorded_target_id != telegram_message_id:
+                raise ValueError("edit delivery ID was reused for a different message")
+            return recorded_result_id
         result = self._request(
             "editMessageText",
             {
@@ -1983,21 +2001,34 @@ class BotApiHttpTransport:
                 "text": message.text,
                 **_inline_markup(message),
             },
+            delivery_id=message.delivery_id,
         )
-        if isinstance(result, bool):
-            return telegram_message_id
-        return str(
-            _response_int(
-                result, "message_id", error_key="result.message_id", minimum=1
+        result_message_id = (
+            telegram_message_id
+            if isinstance(result, bool)
+            else str(
+                _response_int(
+                    result, "message_id", error_key="result.message_id", minimum=1
+                )
             )
         )
+        self._edit_ledger[message.delivery_id] = (
+            message,
+            telegram_message_id,
+            result_message_id,
+        )
+        return result_message_id
 
     def reconcile_edit(
         self, *, telegram_message_id: str, message: TelegramMessage
     ) -> str | None:
-        del message
-        del telegram_message_id
-        return None
+        recorded = self._edit_ledger.get(message.delivery_id)
+        if recorded is None:
+            return None
+        recorded_message, recorded_target_id, recorded_result_id = recorded
+        if recorded_message != message or recorded_target_id != telegram_message_id:
+            raise ValueError("edit delivery ID was reused for a different message")
+        return recorded_result_id
 
     def remove_inline_actions(
         self, *, telegram_user_id: int, telegram_message_id: str
@@ -2037,11 +2068,20 @@ class BotApiHttpTransport:
             {"callback_query_id": callback_id, "text": text},
         )
 
-    def _request(self, method: str, payload: Mapping[str, object]) -> object:
+    def _request(
+        self,
+        method: str,
+        payload: Mapping[str, object],
+        *,
+        delivery_id: str | None = None,
+    ) -> object:
+        headers = {"Content-Type": "application/json"}
+        if delivery_id is not None:
+            headers["X-Football-Bot-Delivery-ID"] = delivery_id
         request = Request(
             f"{self._api_root}{self._configuration.bot_token}/{method}",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
