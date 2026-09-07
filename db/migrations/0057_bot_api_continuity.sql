@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS football_runtime.bot_api_checkpoints (
         CHECK (checkpoint_key = 'telegram-bot-api'),
     next_offset bigint NOT NULL DEFAULT 0 CHECK (next_offset >= 0),
     retention_gap_open boolean NOT NULL DEFAULT false,
+    last_poll_at timestamptz,
     poller_token uuid,
     poller_lease_until timestamptz,
     updated_at timestamptz NOT NULL,
@@ -28,6 +29,11 @@ CREATE TABLE IF NOT EXISTS football_runtime.bot_api_retention_alerts (
     alert_id text PRIMARY KEY CHECK (alert_id <> ''),
     delivery_id text NOT NULL UNIQUE CHECK (delivery_id <> ''),
     observed_at timestamptz NOT NULL,
+    affected_update_id_start bigint NOT NULL CHECK (affected_update_id_start >= 0),
+    affected_update_id_end bigint NOT NULL
+        CHECK (affected_update_id_end >= affected_update_id_start),
+    recovery_boundary_update_id bigint NOT NULL
+        CHECK (recovery_boundary_update_id > affected_update_id_end),
     delivery_status text NOT NULL DEFAULT 'pending' CHECK (
         delivery_status IN (
             'pending',
@@ -99,7 +105,7 @@ CREATE POLICY bot_api_retention_alerts_owner
 
 GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_api_checkpoints
     TO football_bot_assistant;
-GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_api_updates
+GRANT SELECT, INSERT, UPDATE, DELETE ON football_runtime.bot_api_updates
     TO football_bot_assistant;
 GRANT SELECT, INSERT, UPDATE ON football_runtime.bot_api_retention_alerts
     TO football_bot_assistant;

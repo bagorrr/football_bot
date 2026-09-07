@@ -750,6 +750,54 @@ def test_placeholder_uses_callback_query_identity_not_bot_update_identity() -> N
     system.reset()
 
 
+def test_accepted_navigation_callbacks_acknowledge_their_callback_identity() -> None:
+    system, telegram, _clock = _boot_menu_system()
+    user_id = 45_015
+    _complete_zero_result_search(system, user_id=user_id)
+    system.open_main_menu(
+        update_id="menu-before-navigation-callback-ack",
+        telegram_user_id=user_id,
+    )
+    main_menu = telegram.messages[-1]
+
+    system.select_main_menu_action(
+        update_id="accepted-menu-callback",
+        callback_id="callback-menu-navigation",
+        telegram_user_id=user_id,
+        action="settings",
+        screen_revision=main_menu.screen_revision,
+    )
+    assert telegram.callback_notifications[-1] == ("callback-menu-navigation", "")
+    settings = telegram.messages[-1]
+
+    system.select_settings_action(
+        update_id="accepted-settings-callback",
+        callback_id="callback-settings-navigation",
+        telegram_user_id=user_id,
+        action="mode",
+        screen_revision=settings.screen_revision,
+    )
+    assert telegram.callback_notifications[-1] == (
+        "callback-settings-navigation",
+        "",
+    )
+
+    notifications_before_rejected = tuple(telegram.callback_notifications)
+    system.select_settings_action(
+        update_id="rejected-settings-callback",
+        callback_id="callback-rejected-settings",
+        telegram_user_id=user_id,
+        action="language",
+        screen_revision=settings.screen_revision,
+    )
+    assert tuple(telegram.callback_notifications) == notifications_before_rejected
+    assert all(
+        callback_id != "callback-rejected-settings"
+        for callback_id, _text in telegram.callback_notifications
+    )
+    system.reset()
+
+
 def test_placeholder_callback_delivery_retries_without_duplicate_effects() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     system, telegram, clock = _boot_menu_system(telegram=telegram)

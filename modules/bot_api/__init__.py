@@ -23,7 +23,7 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg.rows import dict_row
 
-from modules.domain import TelegramDeliveryMode, TelegramMessage
+from modules.domain import ReplyKeyboardAction, TelegramDeliveryMode, TelegramMessage
 from modules.ports import (
     Clock,
     TelegramDeliveryAdapter,
@@ -36,6 +36,8 @@ _RetryResult = TypeVar("_RetryResult")
 T1_CONFIGURATION_KEYS = frozenset({"TELEGRAM_BOT_TOKEN", "TELEGRAM_ADMIN_USER_ID"})
 _BOT_TOKEN_PATTERN = re.compile(r"[0-9]{1,20}:[A-Za-z0-9_-]{1,128}")
 _ADMINISTRATOR_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}")
+_TELEGRAM_UPDATE_RETENTION = timedelta(hours=24)
+_TELEGRAM_UPDATE_ID_RANDOMIZATION_IDLE = timedelta(days=7)
 
 
 class BotApiConfigurationError(ValueError):
@@ -349,7 +351,8 @@ class BotApiPollResult:
     """One controlled or provider-backed ``getUpdates`` response."""
 
     updates: tuple[BotApiUpdate, ...] = ()
-    # This is explicit provider evidence, not an inference from update IDs.
+    # Controlled transports may provide explicit evidence; the HTTP transport
+    # derives it only inside Telegram's documented retention window.
     oldest_available_update_id: int | None = None
 
     def __post_init__(self) -> None:
@@ -412,7 +415,14 @@ class BotApiTransport(Protocol):
         """Return current webhook state without configuring a webhook."""
         ...
 
-    def get_updates(self, *, offset: int, timeout_seconds: int) -> BotApiPollResult:
+    def get_updates(
+        self,
+        *,
+        offset: int,
+        timeout_seconds: int,
+        last_poll_at: datetime | None = None,
+        observed_at: datetime | None = None,
+    ) -> BotApiPollResult:
         """Long-poll Telegram for updates after the durable offset."""
         ...
 
@@ -544,6 +554,7 @@ class BotApiCheckpoint:
 
     next_offset: int = 0
     retention_gap_open: bool = False
+    last_poll_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.next_offset < 0:
@@ -560,6 +571,9 @@ class BotApiAlertClaim:
     message: TelegramMessage
     mode: TelegramDeliveryMode
     claim_token: UUID
+    affected_update_id_start: int
+    affected_update_id_end: int
+    recovery_boundary_update_id: int
     telegram_message_id: str | None = None
 
 
@@ -586,6 +600,10 @@ class BotApiContinuityStore(Protocol):
 
     def checkpoint(self) -> BotApiCheckpoint:
         """Return the current durable Bot API checkpoint."""
+        ...
+
+    def record_poll(self, *, polled_at: datetime) -> None:
+        """Persist the last successful provider poll for continuity timing."""
         ...
 
     def acquire_poll_lease(
@@ -687,6 +705,9 @@ class _MemoryAlertRecord:
     alert_id: str
     delivery_id: str
     administrator_user_id: int
+    affected_update_id_start: int
+    affected_update_id_end: int
+    recovery_boundary_update_id: int
     status: str = "pending"
     claim_token: UUID | None = None
     claimed_at: datetime | None = None
@@ -721,6 +742,14 @@ class InMemoryBotApiContinuityStore:
         with self._lock:
             return self._checkpoint
 
+    def record_poll(self, *, polled_at: datetime) -> None:
+        with self._lock:
+            self._checkpoint = BotApiCheckpoint(
+                next_offset=self._checkpoint.next_offset,
+                retention_gap_open=self._checkpoint.retention_gap_open,
+                last_poll_at=polled_at,
+            )
+
     def acquire_poll_lease(
         self, *, claim_token: UUID, claimed_at: datetime, expires_at: datetime
     ) -> bool:
@@ -754,10 +783,13 @@ class InMemoryBotApiContinuityStore:
         with self._lock:
             if self._administrator_user_id is None:
                 raise RuntimeError("Bot API administrator destination is not bound")
+            affected_update_id_start = expected_offset
+            affected_update_id_end = first_available_update_id - 1
             if first_available_update_id > self._checkpoint.next_offset:
                 self._checkpoint = BotApiCheckpoint(
                     next_offset=first_available_update_id,
                     retention_gap_open=self._checkpoint.retention_gap_open,
+                    last_poll_at=self._checkpoint.last_poll_at,
                 )
             if self._checkpoint.retention_gap_open:
                 return
@@ -768,11 +800,15 @@ class InMemoryBotApiContinuityStore:
                     alert_id=alert_id,
                     delivery_id=f"bot-api-retention-alert:{self._alert_sequence}",
                     administrator_user_id=self._administrator_user_id or 0,
+                    affected_update_id_start=affected_update_id_start,
+                    affected_update_id_end=affected_update_id_end,
+                    recovery_boundary_update_id=first_available_update_id,
                 )
             )
             self._checkpoint = BotApiCheckpoint(
                 next_offset=self._checkpoint.next_offset,
                 retention_gap_open=True,
+                last_poll_at=self._checkpoint.last_poll_at,
             )
 
     def close_retention_gap(self, *, recovered_at: datetime) -> None:
@@ -781,6 +817,7 @@ class InMemoryBotApiContinuityStore:
             self._checkpoint = BotApiCheckpoint(
                 next_offset=self._checkpoint.next_offset,
                 retention_gap_open=False,
+                last_poll_at=self._checkpoint.last_poll_at,
             )
 
     def claim_update(
@@ -823,6 +860,7 @@ class InMemoryBotApiContinuityStore:
             self._checkpoint = BotApiCheckpoint(
                 next_offset=max(self._checkpoint.next_offset, update_id + 1),
                 retention_gap_open=self._checkpoint.retention_gap_open,
+                last_poll_at=self._checkpoint.last_poll_at,
             )
 
     def release_update_claim(self, *, update_id: int, claim_token: UUID) -> None:
@@ -875,6 +913,9 @@ class InMemoryBotApiContinuityStore:
                     ),
                     mode=mode,
                     claim_token=claim_token,
+                    affected_update_id_start=record.affected_update_id_start,
+                    affected_update_id_end=record.affected_update_id_end,
+                    recovery_boundary_update_id=record.recovery_boundary_update_id,
                     telegram_message_id=record.telegram_message_id,
                 )
         return None
@@ -962,7 +1003,7 @@ class PostgresBotApiContinuityStore:
             self._ensure_checkpoint(connection, datetime.now(UTC))
             row = connection.execute(
                 """
-                SELECT next_offset, retention_gap_open
+                SELECT next_offset, retention_gap_open, last_poll_at
                 FROM football_runtime.bot_api_checkpoints
                 WHERE checkpoint_key = %s
                 """,
@@ -973,7 +1014,22 @@ class PostgresBotApiContinuityStore:
         return BotApiCheckpoint(
             next_offset=row["next_offset"],
             retention_gap_open=row["retention_gap_open"],
+            last_poll_at=row["last_poll_at"],
         )
+
+    def record_poll(self, *, polled_at: datetime) -> None:
+        with psycopg.connect(self._database_url) as connection:
+            changed = connection.execute(
+                """
+                UPDATE football_runtime.bot_api_checkpoints
+                SET last_poll_at = %s, updated_at = %s
+                WHERE checkpoint_key = %s
+                RETURNING checkpoint_key
+                """,
+                (polled_at, polled_at, self._CHECKPOINT_KEY),
+            ).fetchone()
+        if changed is None:
+            raise RuntimeError("Bot API checkpoint was not initialized")
 
     def acquire_poll_lease(
         self, *, claim_token: UUID, claimed_at: datetime, expires_at: datetime
@@ -1040,6 +1096,8 @@ class PostgresBotApiContinuityStore:
             if row is None:
                 raise RuntimeError("Bot API checkpoint was not initialized")
             next_offset = max(row[0], first_available_update_id)
+            affected_update_id_start = expected_offset
+            affected_update_id_end = first_available_update_id - 1
             if row[1]:
                 connection.execute(
                     """
@@ -1062,10 +1120,19 @@ class PostgresBotApiContinuityStore:
             connection.execute(
                 """
                 INSERT INTO football_runtime.bot_api_retention_alerts (
-                    alert_id, delivery_id, observed_at
-                ) VALUES (%s, %s, %s)
+                    alert_id, delivery_id, observed_at,
+                    affected_update_id_start, affected_update_id_end,
+                    recovery_boundary_update_id
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (alert_id, f"bot-api-retention-alert:{alert_id}", observed_at),
+                (
+                    alert_id,
+                    f"bot-api-retention-alert:{alert_id}",
+                    observed_at,
+                    affected_update_id_start,
+                    affected_update_id_end,
+                    first_available_update_id,
+                ),
             )
 
     def close_retention_gap(self, *, recovered_at: datetime) -> None:
@@ -1188,7 +1255,9 @@ class PostgresBotApiContinuityStore:
             rows = connection.execute(
                 """
                 SELECT alert_id, delivery_id, delivery_status,
-                       claim_token, claimed_at, telegram_message_id
+                       claim_token, claimed_at, telegram_message_id,
+                       affected_update_id_start, affected_update_id_end,
+                       recovery_boundary_update_id
                 FROM football_runtime.bot_api_retention_alerts
                 WHERE delivery_status IN (
                     'pending', 'outcome_unknown', 'attempting'
@@ -1242,6 +1311,9 @@ class PostgresBotApiContinuityStore:
             message=message,
             mode=mode,
             claim_token=claim_token,
+            affected_update_id_start=selected["affected_update_id_start"],
+            affected_update_id_end=selected["affected_update_id_end"],
+            recovery_boundary_update_id=selected["recovery_boundary_update_id"],
             telegram_message_id=selected["telegram_message_id"],
         )
 
@@ -1395,9 +1467,12 @@ class BotApiIngress:
         try:
             alert_delivered = self._deliver_retention_alert()
             checkpoint = self.store.checkpoint()
+            poll_observed_at = self.clock.now()
             poll = self.transport.get_updates(
                 offset=checkpoint.next_offset,
                 timeout_seconds=self.poll_timeout_seconds,
+                last_poll_at=checkpoint.last_poll_at,
+                observed_at=poll_observed_at,
             )
             if (
                 poll.oldest_available_update_id is not None
@@ -1409,6 +1484,7 @@ class BotApiIngress:
                     observed_at=self.clock.now(),
                 )
                 retention_gap_detected = True
+            self.store.record_poll(polled_at=poll_observed_at)
             for update in sorted(poll.updates, key=lambda item: item.update_id):
                 checkpoint = self.store.checkpoint()
                 if update.update_id < checkpoint.next_offset:
@@ -1684,7 +1760,14 @@ class ControlledBotApiTransport:
         self.calls.append(("getWebhookInfo", self.webhook_url))
         return BotApiWebhookInfo(url=self.webhook_url)
 
-    def get_updates(self, *, offset: int, timeout_seconds: int) -> BotApiPollResult:
+    def get_updates(
+        self,
+        *,
+        offset: int,
+        timeout_seconds: int,
+        last_poll_at: datetime | None = None,
+        observed_at: datetime | None = None,
+    ) -> BotApiPollResult:
         self.poll_offsets.append(offset)
         self.poll_timeouts.append(timeout_seconds)
         self.calls.append(("getUpdates", offset))
@@ -1822,9 +1905,18 @@ class BotApiHttpTransport:
         url = _response_string(result, "url", error_key="result.url")
         return BotApiWebhookInfo(url=url)
 
-    def get_updates(self, *, offset: int, timeout_seconds: int) -> BotApiPollResult:
+    def get_updates(
+        self,
+        *,
+        offset: int,
+        timeout_seconds: int,
+        last_poll_at: datetime | None = None,
+        observed_at: datetime | None = None,
+    ) -> BotApiPollResult:
         if offset < 0 or not 1 <= timeout_seconds <= 50:
             raise ValueError("Bot API getUpdates arguments are out of range")
+        if observed_at is None:
+            observed_at = datetime.now(UTC)
         result = self._request(
             "getUpdates",
             {"offset": offset, "timeout": timeout_seconds},
@@ -1838,8 +1930,15 @@ class BotApiHttpTransport:
         )
         if len(updates) != len(result):
             raise BotApiTransportError("Bot API getUpdates result was malformed")
+        oldest_available_update_id = _http_retention_gap_evidence(
+            updates=updates,
+            offset=offset,
+            last_poll_at=last_poll_at,
+            observed_at=observed_at,
+        )
         return BotApiPollResult(
             updates=updates,
+            oldest_available_update_id=oldest_available_update_id,
         )
 
     def get_chat(self, *, chat_id: int) -> BotApiChat:
@@ -2022,6 +2121,30 @@ def _response_optional_string(
     return value
 
 
+def _http_retention_gap_evidence(
+    *,
+    updates: tuple[BotApiUpdate, ...],
+    offset: int,
+    last_poll_at: datetime | None,
+    observed_at: datetime,
+) -> int | None:
+    """Expose a gap only when Telegram's documented ID window is decisive."""
+    if offset == 0 or last_poll_at is None:
+        return None
+    idle_for = observed_at - last_poll_at
+    if not (
+        _TELEGRAM_UPDATE_RETENTION <= idle_for < _TELEGRAM_UPDATE_ID_RANDOMIZATION_IDLE
+    ):
+        return None
+    first_available_update_id = min(
+        (update.update_id for update in updates),
+        default=None,
+    )
+    if first_available_update_id is None or first_available_update_id <= offset:
+        return None
+    return first_available_update_id
+
+
 def _retry_after_from_headers(headers: object) -> int:
     value = headers.get("Retry-After") if hasattr(headers, "get") else None
     if type(value) is int:
@@ -2034,13 +2157,17 @@ def _retry_after_from_headers(headers: object) -> int:
 def _message_markup(message: TelegramMessage) -> dict[str, object]:
     if message.button_rows:
         return _inline_markup(message)
-    if message.reply_button is not None:
+    if message.reply_keyboard_action is ReplyKeyboardAction.BUTTON:
+        if message.reply_button is None:
+            raise BotApiTransportError("reply keyboard button is missing")
         return {
             "reply_markup": {
                 "keyboard": [[{"text": message.reply_button}]],
                 "resize_keyboard": True,
             }
         }
+    if message.reply_keyboard_action is ReplyKeyboardAction.REMOVE:
+        return {"reply_markup": {"remove_keyboard": True}}
     return {}
 
 
@@ -2159,10 +2286,11 @@ class BotApiConversationApplication(Protocol):
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one Main Menu callback."""
         ...
 
@@ -2174,7 +2302,7 @@ class BotApiConversationApplication(Protocol):
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one Settings callback."""
         ...
 
@@ -2182,10 +2310,11 @@ class BotApiConversationApplication(Protocol):
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one Administration callback."""
         ...
 
@@ -2208,10 +2337,11 @@ class BotApiConversationApplication(Protocol):
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         locale: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one fixed language callback."""
         ...
 
@@ -2219,9 +2349,10 @@ class BotApiConversationApplication(Protocol):
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Open free-text language input."""
         ...
 
@@ -2229,10 +2360,11 @@ class BotApiConversationApplication(Protocol):
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         direction: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one discovery direction callback."""
         ...
 
@@ -2302,53 +2434,53 @@ class BotApiConversationHandler:
         if revision is None:
             return False
         if parts[0] == "menu" and len(parts) == 3:
-            self._application.select_main_menu_action(
-                update_id=update_id,
-                telegram_user_id=callback.sender_id,
-                action=parts[1],
-                screen_revision=revision,
-            )
-            return True
-        if parts[0] == "settings" and len(parts) == 3:
-            self._application.select_settings_action(
+            return self._application.select_main_menu_action(
                 update_id=update_id,
                 callback_id=callback.callback_id,
                 telegram_user_id=callback.sender_id,
                 action=parts[1],
                 screen_revision=revision,
             )
-            return True
-        if parts[0] == "administration" and len(parts) == 3:
-            self._application.select_administration_action(
+        if parts[0] == "settings" and len(parts) == 3:
+            return self._application.select_settings_action(
                 update_id=update_id,
+                callback_id=callback.callback_id,
                 telegram_user_id=callback.sender_id,
                 action=parts[1],
                 screen_revision=revision,
             )
-            return True
+        if parts[0] == "administration" and len(parts) == 3:
+            return self._application.select_administration_action(
+                update_id=update_id,
+                callback_id=callback.callback_id,
+                telegram_user_id=callback.sender_id,
+                action=parts[1],
+                screen_revision=revision,
+            )
         if parts[0] == "language" and len(parts) == 3:
             if parts[1] == "free-text":
-                self._application.open_language_input(
+                return self._application.open_language_input(
                     update_id=update_id,
+                    callback_id=callback.callback_id,
                     telegram_user_id=callback.sender_id,
                     screen_revision=revision,
                 )
             else:
-                self._application.select_fixed_language(
+                return self._application.select_fixed_language(
                     update_id=update_id,
+                    callback_id=callback.callback_id,
                     telegram_user_id=callback.sender_id,
                     locale=parts[1],
                     screen_revision=revision,
                 )
-            return True
         if parts[0] == "direction" and len(parts) == 3:
-            self._application.select_direction(
+            return self._application.select_direction(
                 update_id=update_id,
+                callback_id=callback.callback_id,
                 telegram_user_id=callback.sender_id,
                 direction=parts[1],
                 screen_revision=revision,
             )
-            return True
         if parts[0] == "results" and len(parts) == 5:
             if parts[1] not in {"previous", "next"} or callback.chat_id is None:
                 return False

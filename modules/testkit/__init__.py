@@ -3980,6 +3980,7 @@ class AcceptanceSpine:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int | None = None,
@@ -3987,6 +3988,7 @@ class AcceptanceSpine:
         """Drive one Main Menu callback through the Bot Assistant port."""
         self._conversation_onboarding().select_main_menu_action(
             update_id=update_id,
+            callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             action=action,
             screen_revision=(
@@ -4032,7 +4034,7 @@ class AcceptanceSpine:
         """Drive one Settings or Mode callback through the Bot Assistant port."""
         self._conversation_onboarding().select_settings_action(
             update_id=update_id,
-            callback_id=callback_id or update_id,
+            callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             action=action,
             screen_revision=(
@@ -4046,6 +4048,7 @@ class AcceptanceSpine:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int | None = None,
@@ -4053,6 +4056,7 @@ class AcceptanceSpine:
         """Drive one Administration callback through the Bot Assistant port."""
         self._conversation_onboarding().select_administration_action(
             update_id=update_id,
+            callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             action=action,
             screen_revision=(
@@ -4306,6 +4310,7 @@ class AcceptanceSpine:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         locale: str,
         screen_revision: int | None = None,
@@ -4313,6 +4318,7 @@ class AcceptanceSpine:
         """Drive one fixed-language callback through the Bot Assistant."""
         self._conversation_onboarding().select_fixed_language(
             update_id=update_id,
+            callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             locale=locale,
             screen_revision=(
@@ -4402,12 +4408,14 @@ class AcceptanceSpine:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         screen_revision: int | None = None,
     ) -> None:
         """Drive the free-text language prompt through the Bot Assistant."""
         self._conversation_onboarding().open_language_input(
             update_id=update_id,
+            callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             screen_revision=(
                 screen_revision
@@ -4420,6 +4428,7 @@ class AcceptanceSpine:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         direction: str,
         screen_revision: int | None = None,
@@ -4427,6 +4436,7 @@ class AcceptanceSpine:
         """Drive one Direction Menu callback through the Bot Assistant."""
         self._conversation_onboarding().select_direction(
             update_id=update_id,
+            callback_id=callback_id,
             telegram_user_id=telegram_user_id,
             direction=direction,
             screen_revision=(

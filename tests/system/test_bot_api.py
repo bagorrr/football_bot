@@ -68,6 +68,37 @@ def test_postgres_continuity_survives_restart_and_suppresses_replayed_update(
         ).fetchone() == (1,)
 
 
+def test_postgres_false_consumer_release_has_the_required_delete_privilege(
+    fresh_database_url: str,
+) -> None:
+    bot_database_url = _prepare_database(fresh_database_url)
+    transport = ControlledBotApiTransport()
+    transport.enqueue_update(_private_update(43))
+    ingress = _ingress(bot_database_url, transport, consumer=lambda _item: False)
+
+    result = ingress.poll_once()
+
+    assert result.accepted_update_ids == ()
+    assert result.next_offset == 0
+    with psycopg.connect(fresh_database_url) as connection:
+        assert connection.execute(
+            """
+            SELECT has_table_privilege(
+                       'football_bot_assistant',
+                       'football_runtime.bot_api_updates',
+                       'DELETE'
+                   ),
+                   has_table_privilege(
+                       'football_bot_assistant',
+                       'football_runtime.bot_api_updates',
+                       'TRUNCATE'
+                   ),
+                   count(*)
+            FROM football_runtime.bot_api_updates
+            """
+        ).fetchone() == (True, False, 0)
+
+
 def test_postgres_retention_loss_alerts_once_and_stays_private(
     fresh_database_url: str,
 ) -> None:
@@ -95,6 +126,13 @@ def test_postgres_retention_loss_alerts_once_and_stays_private(
             FROM football_runtime.bot_api_retention_alerts
             """
         ).fetchone() == (1, "confirmed", "controlled-message:1")
+        assert connection.execute(
+            """
+            SELECT affected_update_id_start, affected_update_id_end,
+                   recovery_boundary_update_id
+            FROM football_runtime.bot_api_retention_alerts
+            """
+        ).fetchone() == (0, 24, 25)
 
     transport.enqueue_poll(BotApiPollResult())
     second_result = ingress.poll_once()

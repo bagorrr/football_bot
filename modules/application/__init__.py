@@ -2485,37 +2485,58 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one current Main Menu callback."""
+        accepted = False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
             if processed:
-                return
+                return True
             current = self._store.conversation_state(telegram_user_id)
             if current is None:
-                return
+                return False
             if current.screen_revision != screen_revision:
                 self._queue_current_view(update_id=update_id, state=current)
             elif action == "new-search" and current.stage in {
                 ConversationStage.MAIN_MENU,
                 ConversationStage.RESULTS,
             }:
+                self._acknowledge_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                )
                 self._start_new_search(update_id=update_id, current=current)
+                accepted = True
             elif (
                 action == "search-results"
                 and current.stage is ConversationStage.MAIN_MENU
             ):
+                self._acknowledge_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                )
                 self._show_search_results(update_id=update_id, current=current)
+                accepted = True
             elif action == "settings" and current.stage is ConversationStage.MAIN_MENU:
+                self._acknowledge_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                )
                 self._show_settings(update_id=update_id, current=current)
+                accepted = True
             else:
                 self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def select_result_action(
         self,
@@ -2771,65 +2792,89 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
-        callback_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one current Settings or Mode callback."""
+        accepted = False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 if current is None:
-                    return
+                    return False
                 if current.screen_revision != screen_revision:
                     self._queue_current_view(update_id=update_id, state=current)
                 elif current.stage is ConversationStage.SETTINGS and action == "mode":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_mode(update_id=update_id, current=current)
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.SETTINGS and action == "language"
                 ):
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_settings_language(update_id=update_id, current=current)
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.SETTINGS and action == "premium"
                 ):
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
                         update_id=update_id,
-                        callback_id=callback_id,
+                        callback_id=callback_id or update_id,
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[1],
                     )
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.SETTINGS
                     and action == "administration"
                     and self._is_administrator(current.telegram_user_id)
                 ):
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_administration(update_id=update_id, current=current)
+                    accepted = True
                 elif current.stage is ConversationStage.MODE and action == "feed":
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
                         update_id=update_id,
-                        callback_id=callback_id,
+                        callback_id=callback_id or update_id,
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[0],
                     )
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.MODE and action == "mode-search"
                 ):
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
                         update_id=update_id,
-                        callback_id=callback_id,
+                        callback_id=callback_id or update_id,
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[2],
                     )
+                    accepted = True
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def _answer_placeholder_callback(
         self,
@@ -2839,33 +2884,54 @@ class ConversationOnboarding:
         current: ConversationState,
         text: str,
     ) -> None:
-        if self._store.commit_conversation_callback(
+        self._acknowledge_callback(
             update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+            text=text,
+        )
+
+    def _acknowledge_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str | None,
+        current: ConversationState,
+        text: str = "",
+    ) -> None:
+        """Durably answer one accepted callback through the existing outbox."""
+        if callback_id is None:
+            return
+        self._store.commit_conversation_callback(
+            update_id=f"callback-ack:{update_id}",
             callback_id=callback_id,
             telegram_user_id=current.telegram_user_id,
             expected_revision=current.revision,
             text=text,
             recorded_at=self._clock.now(),
-        ):
-            return
+        )
+        self._deliver_pending_callback(callback_id=callback_id)
 
     def select_administration_action(
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one exact-administrator Administration callback."""
+        accepted = False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 if current is None:
-                    return
+                    return False
                 if (
                     not self._is_administrator(telegram_user_id)
                     or current.screen_revision != screen_revision
@@ -2873,17 +2939,36 @@ class ConversationOnboarding:
                 ):
                     self._queue_current_view(update_id=update_id, state=current)
                 elif action == "source-chats":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_source_chats(update_id=update_id, current=current)
+                    accepted = True
                 elif action == "source-data-deletion":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_source_data_deletion_requests(
                         update_id=update_id,
                         current=current,
                     )
+                    accepted = True
                 elif action == "source-data-audit":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_source_data_audit(update_id=update_id, current=current)
+                    accepted = True
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def select_source_data_deletion_action(
         self,
@@ -7057,41 +7142,51 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         locale: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Confirm one reviewed fixed Conversation Language."""
         if locale not in SUPPORTED_LOCALES:
-            raise ValueError("fixed Conversation Language is not supported")
+            return False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
-                self._apply_fixed_language_selection(
+                accepted = self._apply_fixed_language_selection(
                     update_id=update_id,
+                    callback_id=callback_id,
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=screen_revision,
                 )
         self.deliver_pending()
+        return accepted
 
     def _apply_fixed_language_selection(
         self,
         *,
         update_id: str,
+        callback_id: str | None,
         telegram_user_id: int,
         locale: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
-            raise LookupError(telegram_user_id)
+            return False
         if (
             current.stage is ConversationStage.SETTINGS_LANGUAGE_SELECTION
             and current.screen_revision == screen_revision
         ):
+            self._acknowledge_callback(
+                update_id=update_id,
+                callback_id=callback_id,
+                current=current,
+            )
             state = replace(
                 current,
                 locale=locale,
@@ -7114,13 +7209,13 @@ class ConversationOnboarding:
                 ),
                 recorded_at=self._clock.now(),
             )
-            return
+            return True
         if (
             current.stage is not ConversationStage.LANGUAGE_SELECTION
             or current.screen_revision != screen_revision
         ):
             self._queue_current_view(update_id=update_id, state=current)
-            return
+            return False
         state = replace(
             current,
             locale=locale,
@@ -7157,6 +7252,11 @@ class ConversationOnboarding:
                 revision=current_draft.revision + 1,
                 last_activity_at=now,
             )
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+        )
         self._store.commit_conversation_update(
             update_id=update_id,
             expected_revision=current.revision,
@@ -7165,15 +7265,17 @@ class ConversationOnboarding:
             recorded_at=now,
             draft=draft,
         )
+        return True
 
     def select_direction(
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         direction: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Navigate an Intent Branch or confirm one terminal User Intent."""
         intent_branch = next(
             (branch for branch in IntentBranch if branch.value == direction),
@@ -7187,11 +7289,12 @@ class ConversationOnboarding:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 draft = self._store.discovery_draft(telegram_user_id)
                 if current is None or draft is None:
-                    return
+                    return False
                 if (
                     current.stage is not draft.stage
                     or draft.screen_revision != screen_revision
@@ -7201,24 +7304,36 @@ class ConversationOnboarding:
                     draft.stage is ConversationStage.DIRECTION_MENU
                     and intent_branch is not None
                 ):
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._open_intent_branch(
                         update_id=update_id,
                         current=current,
                         draft=draft,
                         intent_branch=intent_branch,
                     )
+                    accepted = True
                 elif (
                     draft.stage is ConversationStage.DIRECTION_MENU
                     and user_intent in _DIRECT_USER_INTENTS
                 ):
                     if user_intent is None:
                         raise AssertionError("direct User Intent is missing")
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._confirm_user_intent(
                         update_id=update_id,
                         current=current,
                         draft=draft,
                         user_intent=user_intent,
                     )
+                    accepted = True
                 elif (
                     draft.stage is ConversationStage.INTENT_BRANCH
                     and draft.intent_branch is not None
@@ -7226,15 +7341,22 @@ class ConversationOnboarding:
                 ):
                     if user_intent is None:
                         raise AssertionError("branch User Intent is missing")
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._confirm_user_intent(
                         update_id=update_id,
                         current=current,
                         draft=draft,
                         user_intent=user_intent,
                     )
+                    accepted = True
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def select_location_suggestion(
         self,
@@ -8519,36 +8641,46 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Ask for one free-text language name in the current display locale."""
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
-                self._apply_open_language_input(
+                accepted = self._apply_open_language_input(
                     update_id=update_id,
+                    callback_id=callback_id,
                     telegram_user_id=telegram_user_id,
                     screen_revision=screen_revision,
                 )
         self.deliver_pending()
+        return accepted
 
     def _apply_open_language_input(
         self,
         *,
         update_id: str,
+        callback_id: str | None,
         telegram_user_id: int,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
-            raise LookupError(telegram_user_id)
+            return False
         if (
             current.stage is ConversationStage.SETTINGS_LANGUAGE_SELECTION
             and current.screen_revision == screen_revision
         ):
+            self._acknowledge_callback(
+                update_id=update_id,
+                callback_id=callback_id,
+                current=current,
+            )
             locale = current.locale or "en"
             selection = self._language_rendering(locale)
             state = replace(
@@ -8570,13 +8702,13 @@ class ConversationOnboarding:
                 ),
                 recorded_at=self._clock.now(),
             )
-            return
+            return True
         if (
             current.stage is not ConversationStage.LANGUAGE_SELECTION
             or current.screen_revision != screen_revision
         ):
             self._queue_current_view(update_id=update_id, state=current)
-            return
+            return False
         locale = current.locale or "en"
         if locale not in SUPPORTED_LOCALES:
             locale = "en"
@@ -8606,6 +8738,11 @@ class ConversationOnboarding:
             if current_draft is not None
             else None
         )
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+        )
         self._store.commit_conversation_update(
             update_id=update_id,
             expected_revision=current.revision,
@@ -8614,6 +8751,7 @@ class ConversationOnboarding:
             recorded_at=now,
             draft=draft,
         )
+        return True
 
     def submit_language_text(
         self,

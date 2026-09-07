@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.error import URLError
 
 import pytest
@@ -183,11 +183,31 @@ def test_conversation_handler_routes_ordinary_access_and_guards_admin_callbacks(
         ("start", 111222),
         ("settings", 456789),
     ]
+    assert application.callback_ids == ["callback-22"]
+
+
+def test_rejected_callback_is_not_consumed_or_acknowledged() -> None:
+    application = _RecordingApplication(accept_callbacks=False)
+    handler = BotApiConversationHandler(
+        application,
+        administrator_user_id=456789,
+    )
+    rejected = _private_callback(
+        23,
+        data="menu:unsupported:1",
+        callback_id="callback-rejected",
+    )
+
+    assert not handler(rejected)
+    assert application.calls == []
+    assert application.callback_ids == []
 
 
 class _RecordingApplication:
-    def __init__(self) -> None:
+    def __init__(self, *, accept_callbacks: bool = True) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.callback_ids: list[str] = []
+        self.accept_callbacks = accept_callbacks
 
     def start(
         self,
@@ -207,12 +227,17 @@ class _RecordingApplication:
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         del update_id, action, screen_revision
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
         self.calls.append(("main", telegram_user_id))
+        return True
 
     def select_settings_action(
         self,
@@ -222,20 +247,29 @@ class _RecordingApplication:
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
-        del update_id, callback_id, action, screen_revision
+    ) -> bool:
+        del update_id, action, screen_revision
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
         self.calls.append(("settings", telegram_user_id))
+        return True
 
     def select_administration_action(
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         del update_id, action, screen_revision
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
         self.calls.append(("administration", telegram_user_id))
+        return True
 
     def select_result_action(
         self,
@@ -264,29 +298,48 @@ class _RecordingApplication:
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         locale: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         del update_id, locale, screen_revision
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
         self.calls.append(("language", telegram_user_id))
+        return True
 
     def open_language_input(
-        self, *, update_id: str, telegram_user_id: int, screen_revision: int
-    ) -> None:
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> bool:
         del update_id, screen_revision
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
         self.calls.append(("language-input", telegram_user_id))
+        return True
 
     def select_direction(
         self,
         *,
         update_id: str,
+        callback_id: str,
         telegram_user_id: int,
         direction: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         del update_id, direction, screen_revision
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
         self.calls.append(("direction", telegram_user_id))
+        return True
 
 
 def test_long_polling_resumes_durable_offset_and_deduplicates_restart() -> None:
@@ -686,6 +739,122 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
     assert "secret-token" not in str(error.value)
 
 
+def test_http_transport_reports_only_a_decisive_retention_gap() -> None:
+    responses = [
+        {"ok": True, "result": [{"update_id": 900}]},
+        {"ok": True, "result": [{"update_id": 1_900}]},
+        {"ok": True, "result": [{"update_id": 3_000}]},
+        {"ok": True, "result": [{"update_id": 4_000}]},
+    ]
+
+    class _Response:
+        def __init__(self, payload: object) -> None:
+            self._body = json.dumps(payload).encode("utf-8")
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return self._body
+
+    def opener(_request: object, **_kwargs: object) -> _Response:
+        return _Response(responses.pop(0))
+
+    configuration = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: BotApiHttpTransport(
+            _configuration,
+            api_root="https://example.invalid/bot",
+            opener=opener,
+        ),
+    ).configuration
+    transport = BotApiHttpTransport(
+        configuration,
+        api_root="https://example.invalid/bot",
+        opener=opener,
+    )
+    origin = datetime(2026, 9, 1, tzinfo=UTC)
+
+    initial = transport.get_updates(
+        offset=0,
+        timeout_seconds=30,
+        observed_at=origin,
+    )
+    normal_positive = transport.get_updates(
+        offset=901,
+        timeout_seconds=30,
+        last_poll_at=origin,
+        observed_at=origin + timedelta(hours=1),
+    )
+    retention_gap = transport.get_updates(
+        offset=1_901,
+        timeout_seconds=30,
+        last_poll_at=origin + timedelta(hours=1),
+        observed_at=origin + timedelta(hours=26),
+    )
+    post_idle = transport.get_updates(
+        offset=3_001,
+        timeout_seconds=30,
+        last_poll_at=origin + timedelta(hours=26),
+        observed_at=origin + timedelta(days=9),
+    )
+
+    assert initial.oldest_available_update_id is None
+    assert normal_positive.oldest_available_update_id is None
+    assert retention_gap.oldest_available_update_id == 3_000
+    assert post_idle.oldest_available_update_id is None
+
+
+def test_http_transport_serializes_reply_keyboard_removal() -> None:
+    requests: list[dict[str, object]] = []
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"ok": True, "result": {"message_id": 7}}).encode("utf-8")
+
+    def opener(request: object, **_kwargs: object) -> _Response:
+        assert hasattr(request, "data")
+        requests.append(json.loads(request.data.decode("utf-8")))
+        return _Response()
+
+    configuration = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: BotApiHttpTransport(
+            _configuration,
+            api_root="https://example.invalid/bot",
+            opener=opener,
+        ),
+    ).configuration
+    BotApiHttpTransport(
+        configuration,
+        api_root="https://example.invalid/bot",
+        opener=opener,
+    ).send_message(_message("remove-keyboard"))
+
+    assert requests == [
+        {
+            "chat_id": 456789,
+            "text": "controlled message",
+            "reply_markup": {"remove_keyboard": True},
+        }
+    ]
+
+
 def test_protected_conformance_checks_identity_and_admin_destination() -> None:
     transport = ControlledBotApiTransport()
     configuration = BotApiRuntime.from_mapping(
@@ -759,12 +928,17 @@ def _private_update(update_id: int, *, text: str = "/start") -> BotApiUpdate:
     )
 
 
-def _private_callback(update_id: int, *, data: str) -> BotApiUpdate:
+def _private_callback(
+    update_id: int,
+    *,
+    data: str,
+    callback_id: str | None = None,
+) -> BotApiUpdate:
     return BotApiUpdate.from_mapping(
         {
             "update_id": update_id,
             "callback_query": {
-                "id": f"callback-{update_id}",
+                "id": callback_id or f"callback-{update_id}",
                 "from": {"id": 111222},
                 "message": {
                     "message_id": update_id,
