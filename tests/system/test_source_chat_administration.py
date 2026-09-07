@@ -3591,6 +3591,33 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert initial.lifecycle_state is SourceChatLifecycleState.ENABLED
     assert initial.initial_consent_attestation is InitialConsentAttestation.CONFIRMED
 
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=6500),
+        to_checkpoint=TelegramChannelCheckpoint(pts=6501),
+        source_event_id="source-event:lifecycle:before-pause",
+        telegram_message_id=6501,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Live event before pause.",
+        event_time=registered_at,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=TelegramChannelCheckpoint(pts=6501),
+        source_event_id="source-event:lifecycle:during-pause",
+        telegram_message_id=6502,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="History event during pause.",
+        event_time=paused_at,
+    )
+
     _click_source_chat_lifecycle_control(
         system,
         telegram,
@@ -3668,6 +3695,11 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert re_enabled.attested_at == initial.attested_at
     assert system.process_next_source_chat_bot_result()
     assert "Source Chat re-enable complete: enabled." in telegram.messages[-1].text
+    assert not system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.history_requests == []
 
     clock.advance_to(removed_at)
     _click_source_chat_lifecycle_control(

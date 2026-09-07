@@ -148,6 +148,27 @@ class TelegramIngestionAdapter(Protocol):
         """Return the next channel event from its typed durable pts."""
         ...
 
+    def get_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> TelegramDifferenceResult | None:
+        """Return the next bounded historical event without moving the cursor."""
+        ...
+
+    def acknowledge_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        source_event_id: str,
+    ) -> None:
+        """Acknowledge one atomically committed history event for provider paging."""
+        ...
+
 
 class SourceChatAdmissionError(RuntimeError):
     """Source Chat address was invalid, inaccessible, or technically unresolved."""

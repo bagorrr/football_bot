@@ -775,10 +775,15 @@ class _TelegramDifferenceProgress:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+    from_history: bool = False
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
             raise ValueError("Telegram difference checkpoint scopes must match")
+        if type(self.from_history) is not bool:
+            raise TypeError("Telegram difference history marker must be boolean")
+        if self.from_history and self.from_checkpoint != self.to_checkpoint:
+            raise ValueError("Historical Telegram events cannot advance checkpoints")
         if isinstance(self.from_checkpoint, TelegramAccountCheckpoint):
             assert isinstance(self.to_checkpoint, TelegramAccountCheckpoint)
             if (
@@ -856,6 +861,7 @@ class SourceChatIngestionContext:
     registry_generation: int
     processing_started_at: datetime
     checkpoint: TelegramChannelCheckpoint | None
+    history_eligible: bool = True
 
 
 @dataclass(frozen=True, slots=True)

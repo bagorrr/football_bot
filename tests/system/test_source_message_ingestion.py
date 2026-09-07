@@ -111,6 +111,162 @@ def test_copy_permitted_difference_event_has_no_protected_content_capability() -
     )
 
 
+def test_source_chat_history_is_bounded_and_does_not_delay_live_ingestion(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_600_101,
+    )
+    telethon.allow_public_username(
+        address="@synthetic_history_source",
+        identity=identity,
+        transport_boundary="channel-pts:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_001,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_001,
+        address="@synthetic_history_source",
+        update_suffix="history-source",
+    )
+
+    live_event_time = registered_at
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=500),
+        to_checkpoint=TelegramChannelCheckpoint(pts=501),
+        source_event_id="source-event:history:live",
+        telegram_message_id=701,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Current live message.",
+        event_time=live_event_time,
+    )
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=TelegramChannelCheckpoint(pts=501),
+        source_event_id="source-event:history:prior",
+        telegram_message_id=700,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Prior seven-day message.",
+        event_time=registered_at - timedelta(days=1),
+    )
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=TelegramChannelCheckpoint(pts=501),
+        source_event_id="source-event:history:live",
+        telegram_message_id=701,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Current live message.",
+        event_time=live_event_time,
+    )
+    telethon.add_protected_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=501),
+        to_checkpoint=TelegramChannelCheckpoint(pts=501),
+        source_event_id="source-event:history:protected",
+        telegram_message_id=702,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        text="Protected historical text.",
+        caption=None,
+        attachment=None,
+        contact=None,
+        other_body=None,
+        event_time=registered_at - timedelta(days=2),
+        registry_generation=1,
+        from_history=True,
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    with pytest.raises(InjectedFailureError):
+        system.process_next_source_chat_history(
+            identity=identity,
+            registry_generation=1,
+            inject_database_failure=True,
+        )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=501)
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=501),
+        to_checkpoint=TelegramChannelCheckpoint(pts=502),
+        source_event_id="source-event:history:live-after-history",
+        telegram_message_id=703,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Live message after history started.",
+        event_time=registered_at + timedelta(minutes=1),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=502)
+    assert {message.body for message in system.source_messages()} == {
+        "Current live message.",
+        "Prior seven-day message.",
+        "Live message after history started.",
+    }
+    assert len(system.source_events()) == 3
+    assert len(system.protected_content_skips()) == 1
+    assert any(
+        isinstance(contract.payload, dict)
+        and contract.payload.get("source_event_id") == "source-event:history:prior"
+        and contract.payload.get("from_history") is True
+        for contract in system.source_event_contracts()
+    )
+    assert telethon.history_requests == ["source-chat:channel:4600101:generation:1"] * 4
+    assert (
+        telethon.history_window_requests
+        == [(registered_at - timedelta(days=7), registered_at)] * 4
+    )
+    assert "Protected historical text." not in repr(system.protected_content_skips())
+    system.reset()
+
+
 def test_account_difference_commits_checkpoint_event_and_application_effect() -> None:
     telethon = ControlledTelegramIngestionAdapter()
     registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)

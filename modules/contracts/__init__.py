@@ -1484,8 +1484,14 @@ def _validate_source_event_recorded(
     }
     if envelope.contract_version == 4:
         allowed |= {"bounded_metadata", "reply_to_telegram_message_id"}
-    if set(payload) != allowed:
+    allowed_with_history = (
+        allowed | {"from_history"} if envelope.contract_version == 4 else allowed
+    )
+    if set(payload) not in (allowed, allowed_with_history):
         raise ValueError("SourceEventRecorded contains unsupported or missing facts")
+    from_history = payload.get("from_history", False)
+    if not isinstance(from_history, bool):
+        raise TypeError("SourceEventRecorded history marker must be boolean")
     source_event_id = _required_text(payload, "source_event_id")
     if envelope.message_id != derive_source_event_message_id(source_event_id):
         raise ValueError("SourceEventRecorded message identity is not canonical")

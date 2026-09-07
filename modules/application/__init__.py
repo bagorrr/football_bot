@@ -97,7 +97,10 @@ from modules.domain import (
     SourceDataDeletionRequest,
     SourceEventKind,
     SourceMessageRevision,
+    TelegramAccountCheckpoint,
+    TelegramChannelCheckpoint,
     TelegramDeliveryMode,
+    TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramMessage,
     TelegramPeerIdentity,
@@ -17619,6 +17622,192 @@ class RuntimeApplication:
         if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
             raise RuntimeError("only Ingestion receives Telegram live callbacks")
         self.telegram_ingestion.notify_live_update(identity)
+
+    def process_source_chat_history(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Record one bounded history event without advancing live Telegram state."""
+        if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
+            raise RuntimeError("only Ingestion owns the Telegram history pump")
+        if self.store.ingestion_role_is_stopped() or (
+            self.store.source_stream_is_stopped(
+                identity=identity,
+                registry_generation=registry_generation,
+            )
+        ):
+            return False
+        try:
+            context = self.store.source_chat_ingestion_context(
+                identity=identity,
+                registry_generation=registry_generation,
+            )
+        except ValueError:
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
+        if context is None:
+            return False
+        if not context.history_eligible:
+            return False
+        if identity.kind is TelegramPeerKind.CHANNEL:
+            if context.checkpoint is None:
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                )
+            checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint = (
+                context.checkpoint
+            )
+        else:
+            try:
+                checkpoint = self.store.account_ingestion_checkpoint()
+            except LookupError:
+                return False
+        window_end = context.processing_started_at
+        window_start = window_end - timedelta(days=7)
+        event = self.telegram_ingestion.get_source_chat_history_event(
+            identity,
+            registry_generation,
+            checkpoint,
+            window_start,
+            window_end,
+        )
+        if event is None:
+            return False
+        if isinstance(event, TelegramDifferenceFailure):
+            if event.source_chat_identity != identity:
+                raise RuntimeError("Telegram history failed for another Source Chat")
+            if event.checkpoint != checkpoint:
+                raise RuntimeError("Telegram history failed at another checkpoint")
+            if event.reason in {
+                IngestionFailureReason.SESSION_REVOKED,
+                IngestionFailureReason.AUTHENTICATION_LOST,
+            }:
+                return self._stop_ingestion_role(event.reason)
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=event.reason,
+            )
+        if event.source_chat_identity != identity:
+            raise RuntimeError("Telegram history returned another Source Chat")
+        if event.registry_generation != registry_generation:
+            raise RuntimeError(
+                "Telegram history returned another Source Chat generation"
+            )
+        if not event.from_history or event.from_checkpoint != checkpoint:
+            raise RuntimeError("Telegram history returned an invalid checkpoint")
+        if not (window_start <= event.event_time <= window_end):
+            self.telegram_ingestion.acknowledge_source_chat_history_event(
+                identity,
+                registry_generation,
+                checkpoint,
+                event.source_event_id,
+            )
+            return True
+        if isinstance(event, TelegramProtectionUnavailableEvent):
+            if not event.persistent:
+                return False
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+            )
+        if isinstance(event, TelegramProtectedContentEvent):
+            source_chat_key = (
+                f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+            )
+            recorded_at = self.clock.now()
+            try:
+                committed = self.store.commit_source_event(
+                    event=event,
+                    registry_generation=registry_generation,
+                    envelope=self._protected_content_skip_envelope(
+                        event=event,
+                        registry_generation=registry_generation,
+                        source_chat_key=source_chat_key,
+                        recorded_at=recorded_at,
+                    ),
+                    recorded_at=recorded_at,
+                    inject_database_failure=inject_database_failure,
+                )
+                if committed:
+                    self.telegram_ingestion.acknowledge_source_chat_history_event(
+                        identity,
+                        registry_generation,
+                        checkpoint,
+                        event.source_event_id,
+                    )
+                return committed
+            except OutboxConflictError as error:
+                raise RuntimeProcessingError from error
+        if not isinstance(event, TelegramDifferenceEvent):
+            raise RuntimeError("Telegram history returned an unsupported result")
+        source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        source_message_id = canonical_source_message_id(
+            source_chat_key, registry_generation, event.telegram_message_id
+        )
+        message_id = derive_source_event_message_id(event.source_event_id)
+        correlation_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{source_chat_key}:generation:{registry_generation}",
+        )
+        recorded_at = self.clock.now()
+        envelope = ContractEnvelope(
+            contract_name=ContractName.SOURCE_EVENT_RECORDED,
+            contract_version=4,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=source_message_id,
+            subject_revision=event.revision,
+            idempotency_key=f"source-event-recorded:{event.source_event_id}",
+            causation_id=message_id,
+            correlation_id=correlation_id,
+            recorded_at=recorded_at,
+            payload={
+                "source_event_id": event.source_event_id,
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": identity.kind.value,
+                "telegram_chat_id": identity.telegram_id,
+                "registry_generation": registry_generation,
+                "telegram_message_id": event.telegram_message_id,
+                "event_kind": event.kind.value,
+                "source_message_revision_id": (
+                    f"{source_message_id}:revision:{event.revision}"
+                ),
+                "event_time": event.event_time.isoformat(),
+                "body": event.body,
+                "bounded_metadata": dict(event.bounded_metadata),
+                "reply_to_telegram_message_id": event.reply_to_telegram_message_id,
+                "from_history": True,
+            },
+        )
+        try:
+            committed = self.store.commit_source_event(
+                event=event,
+                registry_generation=registry_generation,
+                envelope=envelope,
+                recorded_at=recorded_at,
+                inject_database_failure=inject_database_failure,
+            )
+            if committed:
+                self.telegram_ingestion.acknowledge_source_chat_history_event(
+                    identity,
+                    registry_generation,
+                    checkpoint,
+                    event.source_event_id,
+                )
+            return committed
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
 
     def _protected_content_skip_envelope(
         self,
