@@ -2266,7 +2266,7 @@ class BotApiConformance:
 
 
 class BotApiConversationApplication(Protocol):
-    """Small application-facing seam for the first Bot User interactions."""
+    """Application-facing seam for the complete Bot User interaction surface."""
 
     def start(
         self,
@@ -2280,6 +2280,30 @@ class BotApiConversationApplication(Protocol):
 
     def open_main_menu(self, *, update_id: str, telegram_user_id: int) -> None:
         """Handle the persistent native Menu button."""
+        ...
+
+    def handle_message(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        telegram_language_hint: str | None,
+    ) -> bool:
+        """Route one ordinary text message through application behavior."""
+        ...
+
+    def handle_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        data: str,
+        screen_revision: int,
+        telegram_message_id: str,
+    ) -> bool:
+        """Route one non-root callback through application behavior."""
         ...
 
     def select_main_menu_action(
@@ -2416,7 +2440,12 @@ class BotApiConversationHandler:
                 telegram_user_id=message.sender_id,
             )
             return True
-        return False
+        return self._application.handle_message(
+            update_id=update_id,
+            telegram_user_id=message.sender_id,
+            text=message.text,
+            telegram_language_hint=message.language_code,
+        )
 
     def _handle_callback(
         self,
@@ -2433,6 +2462,35 @@ class BotApiConversationHandler:
         revision = _callback_revision(parts)
         if revision is None:
             return False
+        if (
+            parts[0] in {"settings", "administration", "language", "direction"}
+            and len(parts) == 3
+            and parts[1] == "back"
+        ) or (
+            parts[0]
+            in {
+                "coaching-details",
+                "details",
+                "location",
+                "location-suggestion",
+                "opponent-details",
+                "referee-search-details",
+                "refereeing-service-offer-details",
+                "search",
+                "sdd",
+                "settings-language",
+                "source-chats",
+                "transfer-details",
+            }
+        ):
+            return self._application.handle_callback(
+                update_id=update_id,
+                callback_id=callback.callback_id,
+                telegram_user_id=callback.sender_id,
+                data=callback.data,
+                screen_revision=revision,
+                telegram_message_id=str(callback.message_id),
+            )
         if parts[0] == "menu" and len(parts) == 3:
             return self._application.select_main_menu_action(
                 update_id=update_id,
@@ -2506,6 +2564,7 @@ class BotApiConversationHandler:
     def _is_administration_callback(self, parts: list[str], sender_id: int) -> bool:
         restricted = parts[0] in {
             "administration",
+            "sdd",
             "source-chats",
             "source-data-deletion",
             "source-data-audit",

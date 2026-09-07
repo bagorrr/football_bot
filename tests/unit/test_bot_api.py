@@ -207,6 +207,8 @@ class _RecordingApplication:
     def __init__(self, *, accept_callbacks: bool = True) -> None:
         self.calls: list[tuple[str, int]] = []
         self.callback_ids: list[str] = []
+        self.callback_data: list[str] = []
+        self.message_texts: list[str] = []
         self.accept_callbacks = accept_callbacks
 
     def start(
@@ -222,6 +224,37 @@ class _RecordingApplication:
     def open_main_menu(self, *, update_id: str, telegram_user_id: int) -> None:
         del update_id
         self.calls.append(("menu", telegram_user_id))
+
+    def handle_message(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        telegram_language_hint: str | None,
+    ) -> bool:
+        del update_id, telegram_language_hint
+        self.message_texts.append(text)
+        self.calls.append(("message", telegram_user_id))
+        return True
+
+    def handle_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        data: str,
+        screen_revision: int,
+        telegram_message_id: str,
+    ) -> bool:
+        del update_id, screen_revision, telegram_message_id
+        if not self.accept_callbacks:
+            return False
+        self.callback_ids.append(callback_id)
+        self.callback_data.append(data)
+        self.calls.append(("callback", telegram_user_id))
+        return True
 
     def select_main_menu_action(
         self,
@@ -548,29 +581,55 @@ def test_retention_alert_reconciles_an_ambiguous_send_without_resending() -> Non
     assert len(transport.sent_messages) == 1
 
 
-@pytest.mark.parametrize(
-    ("kind", "value"),
-    [
-        ("callback", "location:other-city:1"),
-        ("callback", "details:open:team_formats:1"),
-        ("callback", "search:submit:1"),
-        ("callback", "source-chats:back:1"),
-        ("callback", "sdd:back:1"),
-        ("message", "Find a match for me"),
-    ],
-)
-def test_unaccepted_valid_bot_user_updates_are_not_acknowledged(
-    kind: str, value: str
-) -> None:
+def test_complete_bot_user_surface_is_forwarded_and_checkpointed() -> None:
     transport = ControlledBotApiTransport()
-    update_id = 600 + len(value)
-    update = (
-        _private_update(update_id, text=value)
-        if kind == "message"
-        else _private_callback(update_id, data=value)
+    valid_updates = (
+        _private_update(600, text="Find a match for me"),
+        _private_callback(
+            601,
+            data="location:other-city:1",
+            callback_id="callback-location",
+        ),
+        _private_callback(
+            602,
+            data="location-suggestion:city:place-1:1",
+            callback_id="callback-location-suggestion",
+        ),
+        _private_callback(
+            603,
+            data="details:open:team_formats:1",
+            callback_id="callback-details",
+        ),
+        _private_callback(
+            604,
+            data="search:submit:1",
+            callback_id="callback-search",
+        ),
+        _private_callback(
+            605,
+            data="source-chats:back:1",
+            callback_id="callback-source-chats",
+            sender_id=456789,
+        ),
+        _private_callback(
+            606,
+            data="sdd:back:1",
+            callback_id="callback-source-data-deletion",
+            sender_id=456789,
+        ),
+        _private_callback(
+            607,
+            data="direction:back:1",
+            callback_id="callback-back",
+        ),
     )
-    transport.enqueue_poll(BotApiPollResult(updates=(update,)))
-    transport.enqueue_poll(BotApiPollResult(updates=(update,)))
+    unsupported = _private_callback(
+        608,
+        data="unsupported:control:1",
+        callback_id="callback-unsupported",
+    )
+    transport.enqueue_poll(BotApiPollResult(updates=(*valid_updates, unsupported)))
+    transport.enqueue_poll(BotApiPollResult(updates=(unsupported,)))
     store = InMemoryBotApiContinuityStore()
     application = _RecordingApplication()
     handler = BotApiConversationHandler(
@@ -596,13 +655,34 @@ def test_unaccepted_valid_bot_user_updates_are_not_acknowledged(
     result = ingress.poll_once()
     retry_result = ingress.poll_once()
 
-    assert result.accepted_update_ids == ()
+    assert result.accepted_update_ids == tuple(
+        update.update_id for update in valid_updates
+    )
     assert result.duplicate_update_ids == ()
     assert retry_result.accepted_update_ids == ()
     assert retry_result.duplicate_update_ids == ()
-    assert store.checkpoint().next_offset == 0
+    assert store.checkpoint().next_offset == unsupported.update_id
     assert store.retention_alerts == ()
-    assert application.calls == []
+    assert application.message_texts == ["Find a match for me"]
+    assert application.callback_ids == [
+        "callback-location",
+        "callback-location-suggestion",
+        "callback-details",
+        "callback-search",
+        "callback-source-chats",
+        "callback-source-data-deletion",
+        "callback-back",
+    ]
+    assert application.callback_data == [
+        "location:other-city:1",
+        "location-suggestion:city:place-1:1",
+        "details:open:team_formats:1",
+        "search:submit:1",
+        "source-chats:back:1",
+        "sdd:back:1",
+        "direction:back:1",
+    ]
+    assert "callback-unsupported" not in application.callback_ids
 
 
 def test_long_polling_requires_the_configured_private_administrator_destination() -> (
@@ -933,16 +1013,17 @@ def _private_callback(
     *,
     data: str,
     callback_id: str | None = None,
+    sender_id: int = 111222,
 ) -> BotApiUpdate:
     return BotApiUpdate.from_mapping(
         {
             "update_id": update_id,
             "callback_query": {
                 "id": callback_id or f"callback-{update_id}",
-                "from": {"id": 111222},
+                "from": {"id": sender_id},
                 "message": {
                     "message_id": update_id,
-                    "chat": {"id": 111222, "type": "private"},
+                    "chat": {"id": sender_id, "type": "private"},
                 },
                 "data": data,
             },

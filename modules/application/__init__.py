@@ -2481,6 +2481,906 @@ class ConversationOnboarding:
                     self._show_main_menu(update_id=update_id, current=current)
         self.deliver_pending()
 
+    def handle_message(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        text: str,
+        telegram_language_hint: str | None,
+    ) -> bool:
+        """Route one ordinary Bot User message through the current screen."""
+        del telegram_language_hint
+        current = self._store.conversation_state(telegram_user_id)
+        if current is None:
+            return False
+        draft = self._store.discovery_draft(telegram_user_id)
+        if draft is not None and current.stage is not draft.stage:
+            return False
+        if current.stage in {
+            ConversationStage.LANGUAGE_INPUT,
+            ConversationStage.SETTINGS_LANGUAGE_INPUT,
+        }:
+            self.submit_language_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            current.stage
+            in {
+                ConversationStage.COUNTRY,
+                ConversationStage.CITY,
+                ConversationStage.SEARCH_AREA,
+            }
+            and draft is not None
+        ):
+            self.submit_location_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if current.stage is ConversationStage.REQUIRED_DATE and draft is not None:
+            self.submit_required_date_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            current.stage is ConversationStage.RESULTS
+            and self._store.active_result_context(telegram_user_id) is not None
+        ):
+            self.answer_result_message(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+            )
+            return True
+        if (
+            current.stage is ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+            and self._is_administrator(telegram_user_id)
+        ):
+            self.submit_source_chat_address(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                address=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if current.stage is ConversationStage.POST_CORE and draft is not None:
+            if draft.player_search_number_prompt:
+                self.submit_player_search_number_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.game_search_exact_time_prompt:
+                self.submit_game_search_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.opponent_search_exact_time_prompt:
+                self.submit_opponent_search_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.referee_search_exact_time_prompt:
+                self.submit_referee_search_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.refereeing_service_offer_exact_time_prompt:
+                self.submit_refereeing_service_offer_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.transfer_search_seasonal_timing_prompt == "start_local_date":
+                self.submit_transfer_search_seasonal_timing_start_date_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.transfer_search_seasonal_timing_prompt == "stated_season":
+                self.submit_transfer_search_seasonal_timing_season_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if _COACHING_INTERVAL_PROMPT_TOKEN in draft.coaching_search_detail_draft:
+                self.submit_coaching_search_schedule_interval_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.coaching_search_schedule_prompt == "start_local_date":
+                self.submit_coaching_search_schedule_start_date_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+        return False
+
+    def handle_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        data: str,
+        screen_revision: int,
+        telegram_message_id: str,
+    ) -> bool:
+        """Route one non-root callback through the existing Application controls."""
+        del telegram_message_id
+        parts = data.split(":")
+        if not parts or parts[-1] != str(screen_revision):
+            return False
+        current = self._store.conversation_state(telegram_user_id)
+        if current is None or current.screen_revision != screen_revision:
+            return False
+        current_message = self._store.current_conversation_message(telegram_user_id)
+        if (
+            current_message is None
+            or current_message.screen_revision != screen_revision
+            or not any(
+                callback == data
+                for row in current_message.button_rows
+                for _label, callback in row
+            )
+        ):
+            return False
+        if parts[0] in {"sdd", "source-chats"} and not self._is_administrator(
+            telegram_user_id
+        ):
+            return False
+
+        accepted = False
+        prefix = parts[0]
+        if prefix == "settings-language" and len(parts) == 3:
+            if parts[1] in SUPPORTED_LOCALES:
+                accepted = self.select_fixed_language(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=parts[1],
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "free-text":
+                accepted = self.open_language_input(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                self.go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix in {"settings", "administration", "language"}:
+            if len(parts) == 3 and parts[1] == "back":
+                self.go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "direction" and len(parts) == 3 and parts[1] == "back":
+            self.go_back(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+            )
+            accepted = True
+        elif prefix == "location-suggestion" and len(parts) == 4:
+            if parts[1] in {"country", "city"} and parts[2]:
+                self.select_location_suggestion(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    kind=parts[1],
+                    place_id=parts[2],
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "location" and len(parts) == 3:
+            if parts[1] in {"other-country", "other-city"}:
+                self.dismiss_location_suggestion(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    kind=parts[1].removeprefix("other-"),
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "details":
+            accepted = self._handle_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "opponent-details":
+            accepted = self._handle_opponent_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix in {
+            "referee-search-details",
+            "refereeing-service-offer-details",
+        }:
+            accepted = self._handle_referee_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+                detail_family=(
+                    "referee_search"
+                    if prefix == "referee-search-details"
+                    else "refereeing_service_offer"
+                ),
+            )
+        elif prefix == "transfer-details":
+            accepted = self._handle_transfer_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "coaching-details":
+            accepted = self._handle_coaching_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "search" and len(parts) == 3:
+            if parts[1] in {"submit", "retry"}:
+                self.submit_search(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "source-chats":
+            accepted = self._handle_source_chats_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                data=data,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "sdd" and (
+            (len(parts) == 3 and parts[1] in {"back", "intake"})
+            or (
+                len(parts) == 4
+                and parts[1]
+                in {
+                    "approve",
+                    "reject",
+                    "review",
+                    "start",
+                    "notify",
+                    "complete",
+                    "data-not-found",
+                }
+                and parts[2]
+            )
+        ):
+            self.select_source_data_deletion_action(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                action=data,
+                screen_revision=screen_revision,
+            )
+            accepted = True
+
+        if not accepted:
+            return False
+        latest = self._store.conversation_state(telegram_user_id)
+        if latest is None:
+            return False
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=latest,
+        )
+        return True
+
+    def _handle_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route shared Game, Player, Tournament, and family Back callbacks."""
+        draft = self._store.discovery_draft(telegram_user_id)
+        intent = draft.user_intent if draft is not None else None
+        if intent is None:
+            return False
+        if len(parts) == 3:
+            if parts[1] == "open":
+                if intent is UserIntent.PLAYER_SEARCH:
+                    self.open_player_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                elif intent is UserIntent.TOURNAMENT_SEARCH:
+                    self.open_tournament_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                elif intent is UserIntent.GAME_SEARCH:
+                    self.open_game_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                else:
+                    return False
+                return True
+            if parts[1] == "done":
+                if intent is UserIntent.PLAYER_SEARCH:
+                    self._change_game_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                        operation="commit",
+                        user_intent=UserIntent.PLAYER_SEARCH,
+                    )
+                elif intent is UserIntent.TOURNAMENT_SEARCH:
+                    self.commit_tournament_search_detail(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                elif intent is UserIntent.GAME_SEARCH:
+                    self.commit_game_search_detail(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                else:
+                    return False
+                return True
+            if parts[1] != "back":
+                return False
+            if intent in {UserIntent.GAME_SEARCH, UserIntent.PLAYER_SEARCH}:
+                self.back_from_game_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.TOURNAMENT_SEARCH:
+                self.back_from_tournament_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.OPPONENT_SEARCH:
+                self.back_from_opponent_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent in {
+                UserIntent.NEW_TEAM_SEARCH,
+                UserIntent.TRANSFER_PLAYER_SEARCH,
+            }:
+                self.back_from_transfer_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.REFEREE_SEARCH:
+                self.back_from_referee_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.REFEREEING_SERVICE_OFFER:
+                self.back_from_refereeing_service_offer_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent in {UserIntent.COACH_SEARCH, UserIntent.COACHING_SERVICE_OFFER}:
+                self.back_from_coaching_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4 or intent not in {
+            UserIntent.GAME_SEARCH,
+            UserIntent.PLAYER_SEARCH,
+            UserIntent.TOURNAMENT_SEARCH,
+        }:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            if intent is UserIntent.PLAYER_SEARCH:
+                self.open_player_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    detail_key=value,
+                )
+            elif intent is UserIntent.TOURNAMENT_SEARCH:
+                self.open_tournament_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    detail_key=value,
+                )
+            else:
+                self.open_game_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    detail_key=value,
+                )
+            return True
+        if operation == "toggle":
+            if intent is UserIntent.PLAYER_SEARCH:
+                self._change_game_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    operation="toggle",
+                    value=value,
+                    user_intent=UserIntent.PLAYER_SEARCH,
+                )
+            elif intent is UserIntent.TOURNAMENT_SEARCH:
+                self.toggle_tournament_search_detail_value(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            else:
+                self.toggle_game_search_detail_value(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            return True
+        if operation == "time" and intent is UserIntent.GAME_SEARCH:
+            if value == "exact":
+                self.open_game_search_exact_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                self.select_game_search_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None if value == "any" else value,
+                )
+            return True
+        if operation == "number" and intent is UserIntent.PLAYER_SEARCH:
+            if value != "any":
+                return False
+            self.clear_player_search_number(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+            )
+            return True
+        return False
+
+    def _handle_opponent_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route one Opponent Search Details callback."""
+        if len(parts) == 3:
+            if parts[1] == "hub":
+                self.open_opponent_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "done":
+                self.commit_opponent_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                self.back_from_opponent_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            self.open_opponent_search_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            self.toggle_opponent_search_detail_value(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=value,
+            )
+        elif operation == "time":
+            if value == "exact":
+                self.open_opponent_search_exact_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                self.select_opponent_search_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None if value == "any" else value,
+                )
+        elif operation == "venue":
+            self.select_opponent_search_venue_provision(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=None if value == "any" else value,
+            )
+        else:
+            return False
+        return True
+
+    def _handle_referee_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+        detail_family: str,
+    ) -> bool:
+        """Route one Referee or Refereeing Service Details callback."""
+        if detail_family == "referee_search":
+            open_hub = self.open_referee_search_details
+            open_detail = self.open_referee_search_detail
+            toggle = self.toggle_referee_search_detail_value
+            commit = self.commit_referee_search_detail
+            select_time = self.select_referee_search_time
+            open_exact = self.open_referee_search_exact_time
+            go_back = self.back_from_referee_search_detail
+        elif detail_family == "refereeing_service_offer":
+            open_hub = self.open_refereeing_service_offer_details
+            open_detail = self.open_refereeing_service_offer_detail
+            toggle = self.toggle_refereeing_service_offer_detail_value
+            commit = self.commit_refereeing_service_offer_detail
+            select_time = self.select_refereeing_service_offer_time
+            open_exact = self.open_refereeing_service_offer_exact_time
+            go_back = self.back_from_refereeing_service_offer_detail
+        else:
+            return False
+        if len(parts) == 3:
+            if parts[1] == "hub":
+                open_hub(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "done":
+                commit(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            open_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            toggle(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=value,
+            )
+        elif operation == "time":
+            if value == "exact":
+                open_exact(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                select_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None if value == "any" else value,
+                )
+        else:
+            return False
+        return True
+
+    def _handle_transfer_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route one long-term transfer Details callback."""
+        if len(parts) == 3:
+            if parts[1] == "hub":
+                self.open_transfer_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "done":
+                self.commit_transfer_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                self.back_from_transfer_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            self.open_transfer_search_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            self.toggle_transfer_search_detail_value(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=value,
+            )
+        elif operation == "timing":
+            if value == "ready_now":
+                self.select_transfer_search_seasonal_timing(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            elif value == "any":
+                self.select_transfer_search_seasonal_timing(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None,
+                )
+            elif value == "start_local_date":
+                self.open_transfer_search_seasonal_timing_start_date(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif value == "stated_season":
+                self.open_transfer_search_seasonal_timing_season(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+        else:
+            return False
+        return True
+
+    def _handle_coaching_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route one Coaching Services Details callback."""
+        if len(parts) == 3:
+            operation = parts[1]
+            if operation == "hub":
+                self.open_coaching_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "done":
+                self.commit_coaching_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "back":
+                self.back_from_coaching_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "interval":
+                self.open_coaching_search_schedule_interval(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "start-date":
+                self.open_coaching_search_schedule_start_date(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "clear-start-date":
+                self.clear_coaching_search_schedule_start_date(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            self.open_coaching_search_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            if value in _COACHING_WEEKDAYS:
+                self.select_coaching_search_schedule_weekday(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            elif value in _COACHING_DAY_PARTS:
+                self.select_coaching_search_schedule_day_part(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            else:
+                self.toggle_coaching_search_detail_value(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+        else:
+            return False
+        return True
+
+    def _handle_source_chats_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        data: str,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route exact-administrator Source Chats callbacks."""
+        if len(parts) == 3 and parts[1] in {"add", "back", "cancel"}:
+            if parts[1] == "back":
+                self.go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                self.select_source_chats_action(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    action=data,
+                    screen_revision=screen_revision,
+                )
+            return True
+        if len(parts) in {6, 7} and parts[1] in {
+            "pause",
+            "remove",
+            "re_enable",
+            "confirm",
+        }:
+            if parts[1] == "confirm" and parts[2] not in {
+                "pause",
+                "remove",
+                "re_enable",
+            }:
+                return False
+            if parts[1] != "confirm" and len(parts) != 6:
+                return False
+            if parts[1] == "confirm" and len(parts) != 7:
+                return False
+            self.select_source_chats_action(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                action=data,
+                screen_revision=screen_revision,
+            )
+            return True
+        return False
+
     def select_main_menu_action(
         self,
         *,
