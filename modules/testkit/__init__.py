@@ -94,6 +94,7 @@ from modules.domain import (
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramDifferenceResult,
+    TelegramHistoryProgress,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -341,6 +342,9 @@ class ControlledTelegramIngestionAdapter:
     _channel_result_gate: _ControlledResultGate = field(
         default_factory=_ControlledResultGate
     )
+    _history_result_gate: _ControlledResultGate = field(
+        default_factory=_ControlledResultGate
+    )
     _protected_bodies: list[_ControlledProtectedBody] = field(
         default_factory=list,
         repr=False,
@@ -352,6 +356,7 @@ class ControlledTelegramIngestionAdapter:
     history_window_requests: list[tuple[datetime, datetime]] = field(
         default_factory=list
     )
+    history_cursor_requests: list[int | None] = field(default_factory=list)
     account_difference_requests: list[TelegramAccountCheckpoint] = field(
         default_factory=list
     )
@@ -964,8 +969,10 @@ class ControlledTelegramIngestionAdapter:
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the configured channel difference from typed pts."""
+        del registry_generation
         self.channel_difference_requests.append((identity, checkpoint))
         result = self._channel_difference_events.get((identity, checkpoint))
         self._channel_result_gate.enter()
@@ -978,6 +985,7 @@ class ControlledTelegramIngestionAdapter:
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         window_start: datetime,
         window_end: datetime,
+        history_cursor: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the next configured historical event without moving a cursor."""
         source_key = (
@@ -986,6 +994,7 @@ class ControlledTelegramIngestionAdapter:
         )
         self.history_requests.append(source_key)
         self.history_window_requests.append((window_start, window_end))
+        self.history_cursor_requests.append(history_cursor)
         events: list[TelegramDifferenceResult]
         if isinstance(checkpoint, TelegramAccountCheckpoint):
             events = self._account_history_events.get(
@@ -1015,10 +1024,35 @@ class ControlledTelegramIngestionAdapter:
             )
         if not events:
             return None
-        event = events[0]
+        event = next(
+            (
+                candidate
+                for candidate in events
+                if isinstance(candidate, TelegramDifferenceFailure)
+                or history_cursor is None
+                or candidate.telegram_message_id > history_cursor
+            ),
+            None,
+        )
+        if event is None:
+            return None
         if isinstance(event, TelegramDifferenceFailure):
+            self._history_result_gate.enter()
             return replace(event, checkpoint=checkpoint)
+        self._history_result_gate.enter()
         return replace(event, from_checkpoint=checkpoint, to_checkpoint=checkpoint)
+
+    def pause_source_chat_history_results(self) -> None:
+        """Pause one history result after the controlled adapter boundary."""
+        self._history_result_gate.pause()
+
+    def wait_for_source_chat_history_requests(self, count: int) -> None:
+        """Wait until history requests reach the controlled adapter boundary."""
+        self._history_result_gate.wait_for(count)
+
+    def release_source_chat_history_results(self, count: int) -> None:
+        """Release paused history results in request order."""
+        self._history_result_gate.release(count)
 
     def acknowledge_source_chat_history_event(
         self,
@@ -2533,6 +2567,21 @@ class AcceptanceSpine:
             identity=identity,
             registry_generation=registry_generation,
         )
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress:
+        """Observe one generation's durable bounded-history progress."""
+        progress = self._observer.source_chat_history_progress(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
+        if progress is None:
+            raise LookupError(identity)
+        return progress
 
     def process_next_source_chat_history(
         self,

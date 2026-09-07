@@ -17263,43 +17263,16 @@ class RuntimeApplication:
         try:
             checkpoint = self.store.account_ingestion_checkpoint()
         except LookupError:
-            recorded_at = self.clock.now()
-            message_id = uuid5(
-                NAMESPACE_URL,
-                "football-bot:account-stream-stop:checkpoint_unavailable",
+            return self._stop_account_stream_for_transport_failure(
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE
             )
-            envelope = ContractEnvelope(
-                contract_name=ContractName.SOURCE_STREAM_STOPPED,
-                contract_version=1,
-                message_id=message_id,
-                producer=RuntimeRole.INGESTION,
-                consumer=RuntimeRole.APPLICATION,
-                subject_id=f"account-stream-failure:{message_id}",
-                subject_revision=1,
-                idempotency_key=f"account-stream-failure:{message_id}",
-                causation_id=message_id,
-                correlation_id=message_id,
-                recorded_at=recorded_at,
-                payload={
-                    "source_stream_failure_id": str(message_id),
-                    "scope": IngestionFailureScope.ACCOUNT_STREAM.value,
-                    "failure_reason": (
-                        IngestionFailureReason.CHECKPOINT_UNAVAILABLE.value
-                    ),
-                },
+        try:
+            event = self.telegram_ingestion.get_account_difference_event(checkpoint)
+        except Exception as error:
+            return self._stop_telethon_transport_failure(
+                error,
+                account_stream=True,
             )
-            return self.store.stop_account_stream(
-                failure=IngestionFailure(
-                    ingestion_failure_id=message_id,
-                    scope=IngestionFailureScope.ACCOUNT_STREAM,
-                    reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
-                    source_chat_identity=None,
-                    registry_generation=None,
-                    recorded_at=recorded_at,
-                ),
-                envelope=envelope,
-            )
-        event = self.telegram_ingestion.get_account_difference_event(checkpoint)
         if event is None:
             return False
         if isinstance(event, TelegramDifferenceFailure):
@@ -17477,17 +17450,33 @@ class RuntimeApplication:
                 registry_generation=registry_generation,
                 reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
             )
-        event = self.telegram_ingestion.get_channel_difference_event(
-            identity,
-            context.checkpoint,
-        )
+        try:
+            event = self.telegram_ingestion.get_channel_difference_event(
+                identity,
+                context.checkpoint,
+                registry_generation=registry_generation,
+            )
+        except Exception as error:
+            return self._stop_telethon_transport_failure(
+                error,
+                identity=identity,
+                registry_generation=registry_generation,
+            )
         if event is None:
             return False
         if isinstance(event, TelegramDifferenceFailure):
             if event.source_chat_identity != identity:
-                raise RuntimeError("Telegram difference failed for another Source Chat")
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
             if event.checkpoint != context.checkpoint:
-                raise RuntimeError("Telegram difference failed at another checkpoint")
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
             if event.reason in {
                 IngestionFailureReason.SESSION_REVOKED,
                 IngestionFailureReason.AUTHENTICATION_LOST,
@@ -17499,7 +17488,17 @@ class RuntimeApplication:
                 reason=event.reason,
             )
         if event.source_chat_identity != identity:
-            raise RuntimeError("Telegram difference returned another Source Chat")
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
+        if event.registry_generation != registry_generation or event.from_history:
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
         source_chat_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
         if isinstance(event, TelegramProtectionUnavailableEvent):
             if not event.persistent:
@@ -17633,8 +17632,11 @@ class RuntimeApplication:
         """Record one bounded history event without advancing live Telegram state."""
         if self.role is not RuntimeRole.INGESTION or self.telegram_ingestion is None:
             raise RuntimeError("only Ingestion owns the Telegram history pump")
-        if self.store.ingestion_role_is_stopped() or (
-            self.store.source_stream_is_stopped(
+        telegram_ingestion = self.telegram_ingestion
+        if (
+            self.store.ingestion_role_is_stopped()
+            or self.store.account_stream_is_stopped()
+            or self.store.source_stream_is_stopped(
                 identity=identity,
                 registry_generation=registry_generation,
             )
@@ -17669,23 +17671,72 @@ class RuntimeApplication:
             try:
                 checkpoint = self.store.account_ingestion_checkpoint()
             except LookupError:
-                return False
+                return self._stop_account_stream_for_transport_failure(
+                    reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE
+                )
         window_end = context.processing_started_at
         window_start = window_end - timedelta(days=7)
-        event = self.telegram_ingestion.get_source_chat_history_event(
-            identity,
-            registry_generation,
-            checkpoint,
-            window_start,
-            window_end,
-        )
+        try:
+            progress = self.store.ensure_source_chat_history_progress(
+                identity=identity,
+                registry_generation=registry_generation,
+                window_start=window_start,
+                window_end=window_end,
+                initialized_at=self.clock.now(),
+            )
+        except (LookupError, ValueError):
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
+        if progress.completed:
+            return False
+        try:
+            event = self.telegram_ingestion.get_source_chat_history_event(
+                identity,
+                registry_generation,
+                checkpoint,
+                window_start,
+                window_end,
+                history_cursor=progress.last_telegram_message_id,
+            )
+        except Exception as error:
+            return self._stop_telethon_transport_failure(
+                error,
+                identity=identity,
+                registry_generation=registry_generation,
+                account_stream=isinstance(checkpoint, TelegramAccountCheckpoint),
+            )
         if event is None:
+            try:
+                self.store.complete_source_chat_history(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    window_start=window_start,
+                    window_end=window_end,
+                    completed_at=self.clock.now(),
+                )
+            except (LookupError, ValueError):
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
             return False
         if isinstance(event, TelegramDifferenceFailure):
             if event.source_chat_identity != identity:
-                raise RuntimeError("Telegram history failed for another Source Chat")
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
             if event.checkpoint != checkpoint:
-                raise RuntimeError("Telegram history failed at another checkpoint")
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
             if event.reason in {
                 IngestionFailureReason.SESSION_REVOKED,
                 IngestionFailureReason.AUTHENTICATION_LOST,
@@ -17697,21 +17748,58 @@ class RuntimeApplication:
                 reason=event.reason,
             )
         if event.source_chat_identity != identity:
-            raise RuntimeError("Telegram history returned another Source Chat")
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
         if event.registry_generation != registry_generation:
-            raise RuntimeError(
-                "Telegram history returned another Source Chat generation"
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
             )
         if not event.from_history or event.from_checkpoint != checkpoint:
-            raise RuntimeError("Telegram history returned an invalid checkpoint")
-        if not (window_start <= event.event_time <= window_end):
-            self.telegram_ingestion.acknowledge_source_chat_history_event(
-                identity,
-                registry_generation,
-                checkpoint,
-                event.source_event_id,
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
             )
+
+        def acknowledge() -> bool:
+            try:
+                telegram_ingestion.acknowledge_source_chat_history_event(
+                    identity,
+                    registry_generation,
+                    checkpoint,
+                    event.source_event_id,
+                )
+            except Exception as error:
+                return self._stop_telethon_transport_failure(
+                    error,
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    account_stream=isinstance(checkpoint, TelegramAccountCheckpoint),
+                )
             return True
+
+        if not (window_start <= event.event_time <= window_end):
+            try:
+                recorded = self.store.record_source_chat_history_outcome(
+                    event=event,
+                    registry_generation=registry_generation,
+                    window_start=window_start,
+                    window_end=window_end,
+                    outcome="out_of_window",
+                    recorded_at=self.clock.now(),
+                )
+            except (LookupError, ValueError):
+                return self._stop_source_stream_for_transport_failure(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
+            return recorded and acknowledge()
         if isinstance(event, TelegramProtectionUnavailableEvent):
             if not event.persistent:
                 return False
@@ -17738,14 +17826,7 @@ class RuntimeApplication:
                     recorded_at=recorded_at,
                     inject_database_failure=inject_database_failure,
                 )
-                if committed:
-                    self.telegram_ingestion.acknowledge_source_chat_history_event(
-                        identity,
-                        registry_generation,
-                        checkpoint,
-                        event.source_event_id,
-                    )
-                return committed
+                return committed and acknowledge()
             except OutboxConflictError as error:
                 raise RuntimeProcessingError from error
         if not isinstance(event, TelegramDifferenceEvent):
@@ -17798,14 +17879,7 @@ class RuntimeApplication:
                 recorded_at=recorded_at,
                 inject_database_failure=inject_database_failure,
             )
-            if committed:
-                self.telegram_ingestion.acknowledge_source_chat_history_event(
-                    identity,
-                    registry_generation,
-                    checkpoint,
-                    event.source_event_id,
-                )
-            return committed
+            return committed and acknowledge()
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
 
@@ -17841,6 +17915,102 @@ class RuntimeApplication:
                 "telegram_chat_id": event.source_chat_identity.telegram_id,
                 "registry_generation": registry_generation,
             },
+        )
+
+    def _stop_account_stream_for_transport_failure(
+        self,
+        *,
+        reason: IngestionFailureReason,
+    ) -> bool:
+        """Durably stop the account route without retaining provider details."""
+        if reason in {
+            IngestionFailureReason.SESSION_REVOKED,
+            IngestionFailureReason.AUTHENTICATION_LOST,
+        }:
+            return self._stop_ingestion_role(reason)
+        if reason not in {
+            IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+            IngestionFailureReason.CHECKPOINT_INVALID,
+            IngestionFailureReason.ACCESS_LOST,
+            IngestionFailureReason.DIFFERENCE_TOO_LONG,
+            IngestionFailureReason.UNRECOVERABLE_GAP,
+        }:
+            reason = IngestionFailureReason.CHECKPOINT_INVALID
+        recorded_at = self.clock.now()
+        message_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:account-stream-stop:{reason.value}",
+        )
+        envelope = ContractEnvelope(
+            contract_name=ContractName.SOURCE_STREAM_STOPPED,
+            contract_version=1,
+            message_id=message_id,
+            producer=RuntimeRole.INGESTION,
+            consumer=RuntimeRole.APPLICATION,
+            subject_id=f"account-stream-failure:{message_id}",
+            subject_revision=1,
+            idempotency_key=f"account-stream-failure:{message_id}",
+            causation_id=message_id,
+            correlation_id=message_id,
+            recorded_at=recorded_at,
+            payload={
+                "source_stream_failure_id": str(message_id),
+                "scope": IngestionFailureScope.ACCOUNT_STREAM.value,
+                "failure_reason": reason.value,
+            },
+        )
+        return self.store.stop_account_stream(
+            failure=IngestionFailure(
+                ingestion_failure_id=message_id,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+                reason=reason,
+                source_chat_identity=None,
+                registry_generation=None,
+                recorded_at=recorded_at,
+            ),
+            envelope=envelope,
+        )
+
+    def _stop_telethon_transport_failure(
+        self,
+        error: Exception,
+        *,
+        identity: TelegramPeerIdentity | None = None,
+        registry_generation: int | None = None,
+        account_stream: bool = False,
+    ) -> bool:
+        """Convert every external adapter failure into a durable stop."""
+        reason = getattr(error, "reason", IngestionFailureReason.ACCESS_LOST)
+        if not isinstance(reason, IngestionFailureReason):
+            reason = IngestionFailureReason.CHECKPOINT_INVALID
+        scope = getattr(error, "scope", None)
+        if reason in {
+            IngestionFailureReason.SESSION_REVOKED,
+            IngestionFailureReason.AUTHENTICATION_LOST,
+        }:
+            return self._stop_ingestion_role(reason)
+        if account_stream or scope is IngestionFailureScope.ACCOUNT_STREAM:
+            return self._stop_account_stream_for_transport_failure(reason=reason)
+        if identity is not None and registry_generation is not None:
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=(
+                    reason
+                    if reason
+                    in {
+                        IngestionFailureReason.PROTECTION_UNAVAILABLE,
+                        IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                        IngestionFailureReason.CHECKPOINT_INVALID,
+                        IngestionFailureReason.ACCESS_LOST,
+                        IngestionFailureReason.DIFFERENCE_TOO_LONG,
+                        IngestionFailureReason.UNRECOVERABLE_GAP,
+                    }
+                    else IngestionFailureReason.CHECKPOINT_INVALID
+                ),
+            )
+        return self._stop_account_stream_for_transport_failure(
+            reason=IngestionFailureReason.CHECKPOINT_INVALID
         )
 
     def _stop_source_stream_for_transport_failure(

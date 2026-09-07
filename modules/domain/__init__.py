@@ -704,6 +704,36 @@ class TelegramChannelCheckpoint:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramHistoryProgress:
+    """Durable per-generation cursor and outcome for bounded history paging."""
+
+    last_telegram_message_id: int | None
+    window_start: datetime
+    window_end: datetime
+    completed: bool
+    last_outcome: str
+    last_source_event_id: str | None
+    advanced_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            self.last_telegram_message_id is not None
+            and self.last_telegram_message_id < 1
+        ):
+            raise ValueError("Telegram history cursor must be positive")
+        if self.window_start.tzinfo is None or self.window_end.tzinfo is None:
+            raise ValueError("Telegram history window must be timezone-aware")
+        if self.window_end < self.window_start:
+            raise ValueError("Telegram history window cannot be reversed")
+        if not self.last_outcome:
+            raise ValueError("Telegram history outcome is required")
+        if self.last_source_event_id == "":
+            raise ValueError("Telegram history Source Event identity cannot be empty")
+        if self.advanced_at.tzinfo is None:
+            raise ValueError("Telegram history progress time must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
 class SourceChatAdmissionResolution:
     """Accessible stable identity returned without joining or history access."""
 

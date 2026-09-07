@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,6 +31,7 @@ from modules.telethon_ingestion import (
     TelethonConformance,
     TelethonConformanceError,
     TelethonIngestionAdapter,
+    TelethonProvider,
     TelethonRuntime,
     TelethonTransportError,
 )
@@ -57,8 +60,9 @@ class _RecordingTelethonSource:
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
-        del identity, checkpoint
+        del identity, checkpoint, registry_generation
         return self.result
 
     def get_source_chat_history_event(
@@ -68,8 +72,16 @@ class _RecordingTelethonSource:
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         window_start: datetime,
         window_end: datetime,
+        history_cursor: int | None = None,
     ) -> TelegramDifferenceResult | None:
-        del identity, registry_generation, checkpoint, window_start, window_end
+        del (
+            identity,
+            registry_generation,
+            checkpoint,
+            window_start,
+            window_end,
+            history_cursor,
+        )
         self.history_calls += 1
         if self.raise_on_history:
             raise RuntimeError("controlled-secret")
@@ -345,3 +357,137 @@ def test_telethon_adapter_enforces_exact_scope_and_bounded_history() -> None:
             datetime(2026, 9, 7, tzinfo=UTC),
         )
     assert "controlled-secret" not in str(transport_error.value)
+
+
+def test_telethon_adapter_canonicalizes_events_and_enforces_channel_origin() -> None:
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "789012",
+    }
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    source = _RecordingTelethonSource()
+    source.result = TelegramDifferenceEvent(
+        source_chat_identity=identity,
+        from_checkpoint=checkpoint,
+        to_checkpoint=TelegramChannelCheckpoint(pts=11),
+        source_event_id="provider-id-that-is-not-canonical",
+        telegram_message_id=7,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body="Controlled body.",
+        event_time=datetime(2026, 9, 1, tzinfo=UTC),
+        registry_generation=1,
+    )
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _: object(),
+    )
+    runtime.verify_conformance(
+        transport=ControlledTelethonTransport(),
+        approved_source_chats=(identity,),
+    )
+    adapter = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=source,
+        approved_source_chats=(identity,),
+    )
+
+    result = adapter.get_channel_difference_event(
+        identity,
+        checkpoint,
+        registry_generation=1,
+    )
+
+    assert isinstance(result, TelegramDifferenceEvent)
+    assert result.source_event_id == (
+        "telegram-event:channel:42:message:7:revision:2:kind:edit"
+    )
+
+    source.result = replace(
+        result,
+        from_checkpoint=checkpoint,
+        to_checkpoint=checkpoint,
+        from_history=True,
+    )
+    with pytest.raises(TelethonTransportError) as error:
+        adapter.get_channel_difference_event(
+            identity,
+            checkpoint,
+            registry_generation=1,
+        )
+    assert error.value.reason.value == "checkpoint_invalid"
+
+
+class _ProductionClientProbe:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.handlers: list[object] = []
+
+    def connect(self) -> None:
+        self.calls.append("connect")
+
+    def is_user_authorized(self) -> bool:
+        self.calls.append("is_user_authorized")
+        return True
+
+    def get_me(self) -> object:
+        self.calls.append("get_me")
+        return SimpleNamespace(id=789012)
+
+    def get_entity(self, entity: object) -> object:
+        self.calls.append(f"get_entity:{entity}")
+        return SimpleNamespace(id=42, broadcast=True, access_hash=9)
+
+    def add_event_handler(self, callback: object, event: object) -> None:
+        del callback
+        self.handlers.append(event)
+
+    def run_until_disconnected(self) -> None:
+        self.calls.append("run_until_disconnected")
+
+
+def test_production_telethon_provider_is_lazy_and_wires_live_client_boundary() -> None:
+    client = _ProductionClientProbe()
+    provider = TelethonProvider(client=client)
+
+    assert client.calls == []
+    assert provider.authenticate() == 789012
+    assert provider.check_source_chat_access(
+        TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    )
+    callback_identities: list[TelegramPeerIdentity] = []
+    provider.start_live_ingestion(callback_identities.append)
+    provider.run_live_ingestion()
+
+    assert client.calls[:3] == ["connect", "is_user_authorized", "get_me"]
+    assert len(client.handlers) == 3
+    assert client.calls[-1] == "run_until_disconnected"
+
+
+def test_runtime_composes_and_verifies_the_production_provider() -> None:
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "789012",
+    }
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    client = _ProductionClientProbe()
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _: client,
+    )
+
+    adapter = TelethonIngestionAdapter.from_runtime(
+        runtime=runtime,
+        approved_source_chats=(identity,),
+    )
+
+    assert runtime.ready
+    assert adapter.source_event_id("production-provider") == (
+        "source-event:production-provider"
+    )
+    assert client.calls[:3] == ["connect", "is_user_authorized", "get_me"]

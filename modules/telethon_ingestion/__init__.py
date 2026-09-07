@@ -8,22 +8,31 @@ injected transport seam.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import re
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 from modules.domain import (
+    IngestionFailureReason,
+    IngestionFailureScope,
     InitialConsentAttestation,
+    SourceChatAddressKind,
     SourceChatAdmissionResolution,
     SourceChatRegistryEntry,
     SourceEventKind,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
+    TelegramDifferenceEvent,
     TelegramDifferenceFailure,
     TelegramDifferenceResult,
     TelegramPeerIdentity,
+    TelegramPeerKind,
+    TelegramProtectedContentEvent,
+    TelegramProtectionUnavailableEvent,
 )
 from modules.ports import SourceChatAdmissionError
 
@@ -61,6 +70,17 @@ class TelethonConformanceError(RuntimeError):
 
 class TelethonTransportError(RuntimeError):
     """A body-free controlled or provider transport failure."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: IngestionFailureReason = IngestionFailureReason.ACCESS_LOST,
+        scope: IngestionFailureScope | None = None,
+    ) -> None:
+        self.reason = reason
+        self.scope = scope
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +278,7 @@ class TelethonSource(Protocol):
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Read one channel difference at the application-owned checkpoint."""
         ...
@@ -269,6 +290,7 @@ class TelethonSource(Protocol):
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         window_start: datetime,
         window_end: datetime,
+        history_cursor: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Read one event from the caller-supplied bounded history window."""
         ...
@@ -483,6 +505,19 @@ class TelethonRuntime:
         self._ready = True
         return status
 
+    def create_production_provider(
+        self,
+        *,
+        approved_source_chats: Iterable[
+            TelegramPeerIdentity | SourceChatRegistryEntry
+        ] = (),
+    ) -> TelethonProvider:
+        """Create the lazy production provider for the explicit T2 client."""
+        return TelethonProvider(
+            client=self.client,
+            approved_source_chats=approved_source_chats,
+        )
+
     @property
     def ready(self) -> bool:
         """Return whether authenticated, scoped work is currently permitted."""
@@ -502,8 +537,8 @@ class TelethonRuntime:
 def build_telethon_client(configuration: TelethonConfiguration) -> object:
     """Construct a Telethon client without authenticating or starting work."""
     try:
-        from telethon import TelegramClient  # type: ignore[import-untyped]
         from telethon.sessions import StringSession  # type: ignore[import-untyped]
+        from telethon.sync import TelegramClient  # type: ignore[import-untyped]
     except Exception:
         raise TelethonConfigurationError(
             key="T2", status="dependency_unavailable"
@@ -518,6 +553,724 @@ def build_telethon_client(configuration: TelethonConfiguration) -> object:
         raise TelethonConfigurationError(
             key="T2", status="client_construction_failed"
         ) from None
+
+
+def _telethon_failure_reason(error: Exception) -> IngestionFailureReason:
+    """Map provider exception classes to the bounded failure vocabulary."""
+    name = type(error).__name__.lower()
+    if "sessionrevoked" in name or "authkeyunregistered" in name:
+        return IngestionFailureReason.SESSION_REVOKED
+    if "unauthorized" in name or "authentication" in name:
+        return IngestionFailureReason.AUTHENTICATION_LOST
+    if "differencetoolong" in name:
+        return IngestionFailureReason.DIFFERENCE_TOO_LONG
+    if any(
+        token in name for token in ("private", "access", "forbidden", "adminrequired")
+    ):
+        return IngestionFailureReason.ACCESS_LOST
+    return IngestionFailureReason.ACCESS_LOST
+
+
+def _transport_error(
+    error: Exception,
+    message: str,
+    *,
+    reason: IngestionFailureReason,
+    scope: IngestionFailureScope,
+) -> TelethonTransportError:
+    """Keep typed provider outcomes while classifying raw boundary errors."""
+    if isinstance(error, TelethonTransportError):
+        return error
+    return TelethonTransportError(
+        message,
+        reason=_telethon_failure_reason(error)
+        if reason is IngestionFailureReason.ACCESS_LOST
+        else reason,
+        scope=scope,
+    )
+
+
+class TelethonProvider:
+    """Concrete synchronous facade over the authenticated Telethon client.
+
+    The facade keeps all Telethon objects and provider mechanics at the
+    ingestion boundary.  It never joins a chat, exposes protected bodies, or
+    advances a history iterator before the application acknowledges the
+    durable handoff.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: object,
+        approved_source_chats: Iterable[
+            TelegramPeerIdentity | SourceChatRegistryEntry
+        ] = (),
+    ) -> None:
+        self._client = client
+        self._entities: dict[TelegramPeerIdentity, object] = {}
+        self._generations: dict[TelegramPeerIdentity, int] = {}
+        self._history_pending: dict[
+            tuple[TelegramPeerIdentity, int],
+            TelegramDifferenceEvent
+            | TelegramProtectedContentEvent
+            | TelegramProtectionUnavailableEvent,
+        ] = {}
+        self._revisions: dict[tuple[TelegramPeerIdentity, int], int] = {}
+        self._live_callback: Callable[[TelegramPeerIdentity], None] | None = None
+        self.configure_source_scope(approved_source_chats)
+
+    def configure_source_scope(
+        self,
+        approved_source_chats: Iterable[TelegramPeerIdentity | SourceChatRegistryEntry],
+    ) -> None:
+        """Bind the exact approved identities used by account differences."""
+        for entry in approved_source_chats:
+            if isinstance(entry, SourceChatRegistryEntry):
+                self._generations[entry.identity] = entry.registry_generation
+            elif isinstance(entry, TelegramPeerIdentity):
+                self._generations.setdefault(entry, 1)
+            else:
+                raise TelethonConformanceError(
+                    key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+                )
+
+    def authenticate(self) -> int:
+        """Connect the configured session and prove it is authorized."""
+        try:
+            self._call("connect", scope=IngestionFailureScope.INGESTION_ROLE)
+            authorized = self._call(
+                "is_user_authorized",
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            )
+            if authorized is not True:
+                raise TelethonTransportError(
+                    "Telegram session is unauthorized",
+                    reason=IngestionFailureReason.AUTHENTICATION_LOST,
+                    scope=IngestionFailureScope.INGESTION_ROLE,
+                )
+            account = self._call(
+                "get_me",
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            )
+            account_id = getattr(account, "id", None)
+            if type(account_id) is not int or account_id < 1:
+                raise TelethonTransportError(
+                    "Telegram account identity is unavailable",
+                    reason=IngestionFailureReason.AUTHENTICATION_LOST,
+                    scope=IngestionFailureScope.INGESTION_ROLE,
+                )
+            return account_id
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram authentication failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            ) from None
+
+    def check_source_chat_access(self, identity: TelegramPeerIdentity) -> bool:
+        """Resolve one existing peer without joining it or reading its history."""
+        entity = self._entity_for_identity(identity)
+        if self._identity_from_entity(entity) != identity:
+            raise TelethonTransportError(
+                "Telegram Source Chat identity is inconsistent",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        return True
+
+    def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
+        """Resolve a public or already-accessible private address without joining."""
+        try:
+            entity = self._call(
+                "get_entity",
+                address,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+            identity = self._identity_from_entity(entity)
+            if identity is None:
+                raise SourceChatAdmissionError
+            self._entities[identity] = entity
+            address_kind = (
+                SourceChatAddressKind.PRIVATE_INVITE
+                if address.startswith("https://t.me/+")
+                else SourceChatAddressKind.PUBLIC_USERNAME
+            )
+            return SourceChatAdmissionResolution(
+                identity=identity,
+                address_kind=address_kind,
+                current_address=address,
+            )
+        except SourceChatAdmissionError:
+            raise
+        except Exception:
+            raise SourceChatAdmissionError from None
+
+    def capture_source_chat_registration_boundary(
+        self, identity: TelegramPeerIdentity
+    ) -> str:
+        """Capture a typed transport boundary after address resolution."""
+        entity = self._entity_for_identity(identity)
+        try:
+            from telethon import functions, types  # type: ignore[import-untyped]
+
+            if identity.kind.value == "channel":
+                access_hash = getattr(entity, "access_hash", None)
+                if type(access_hash) is not int:
+                    raise TelethonTransportError(
+                        "Telegram channel access hash is unavailable",
+                        reason=IngestionFailureReason.ACCESS_LOST,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    )
+                response = self._request(
+                    functions.updates.GetChannelDifferenceRequest(
+                        channel=types.InputChannel(identity.telegram_id, access_hash),
+                        filter=types.ChannelMessagesFilterEmpty(),
+                        pts=0,
+                        limit=1,
+                        force=False,
+                    ),
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+                pts = getattr(response, "pts", None)
+                if type(pts) is not int or pts < 0:
+                    raise TelethonTransportError(
+                        "Telegram channel boundary is unavailable",
+                        reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    )
+                return f"channel-pts:{pts}"
+            response = self._request(
+                functions.updates.GetStateRequest(),
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+            sequence = getattr(response, "seq", None)
+            if type(sequence) is not int or sequence < 0:
+                raise TelethonTransportError(
+                    "Telegram account boundary is unavailable",
+                    reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                )
+            return f"chat-sequence:{sequence}"
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram registration boundary failed",
+                reason=_telethon_failure_reason(error),
+                scope=(
+                    IngestionFailureScope.SOURCE_STREAM
+                    if identity.kind.value == "channel"
+                    else IngestionFailureScope.ACCOUNT_STREAM
+                ),
+            ) from None
+
+    def get_account_difference_event(
+        self, checkpoint: TelegramAccountCheckpoint
+    ) -> TelegramDifferenceResult | None:
+        """Read one account difference and normalize its first approved message."""
+        custom = getattr(self._client, "get_account_difference_event", None)
+        if callable(custom):
+            return cast(
+                TelegramDifferenceResult | None,
+                self._call(
+                    custom,
+                    checkpoint,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                ),
+            )
+        try:
+            from telethon import functions
+
+            response = self._request(
+                functions.updates.GetDifferenceRequest(
+                    pts=checkpoint.pts,
+                    date=checkpoint.date,
+                    qts=checkpoint.qts,
+                    pts_limit=100,
+                    qts_limit=100,
+                ),
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+            if self._is_difference_too_long(response):
+                return TelegramDifferenceFailure(
+                    source_chat_identity=TelegramPeerIdentity(
+                        TelegramPeerKind.CHAT,
+                        1,
+                    ),
+                    checkpoint=checkpoint,
+                    reason=IngestionFailureReason.DIFFERENCE_TOO_LONG,
+                )
+            messages = self._response_messages(response)
+            if not messages:
+                return None
+            message = messages[0]
+            identity = self._identity_from_message(message)
+            if identity is None:
+                return None
+            to_checkpoint = TelegramAccountCheckpoint(
+                pts=self._nonnegative_int(
+                    getattr(response, "pts", None), checkpoint.pts
+                ),
+                qts=self._nonnegative_int(
+                    getattr(response, "qts", None), checkpoint.qts
+                ),
+                seq=self._nonnegative_int(
+                    getattr(response, "seq", None), checkpoint.seq
+                ),
+                date=getattr(response, "date", None) or checkpoint.date,
+            )
+            return self._message_result(
+                identity=identity,
+                generation=self._generations.get(identity, 1),
+                from_checkpoint=checkpoint,
+                to_checkpoint=to_checkpoint,
+                message=message,
+                entity=self._entity_for_identity(identity),
+                from_history=False,
+            )
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram account difference failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+
+    def get_channel_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
+    ) -> TelegramDifferenceResult | None:
+        """Read one channel difference from the supplied durable pts."""
+        custom = getattr(self._client, "get_channel_difference_event", None)
+        if callable(custom):
+            return cast(
+                TelegramDifferenceResult | None,
+                self._call(
+                    custom,
+                    identity,
+                    checkpoint,
+                    registry_generation=registry_generation,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                ),
+            )
+        try:
+            from telethon import functions, types
+
+            entity = self._entity_for_identity(identity)
+            access_hash = getattr(entity, "access_hash", None)
+            if type(access_hash) is not int:
+                raise TelethonTransportError(
+                    "Telegram channel access hash is unavailable",
+                    reason=IngestionFailureReason.ACCESS_LOST,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            response = self._request(
+                functions.updates.GetChannelDifferenceRequest(
+                    channel=types.InputChannel(identity.telegram_id, access_hash),
+                    filter=types.ChannelMessagesFilterEmpty(),
+                    pts=checkpoint.pts,
+                    limit=100,
+                    force=False,
+                ),
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+            if self._is_difference_too_long(response):
+                return TelegramDifferenceFailure(
+                    source_chat_identity=identity,
+                    checkpoint=checkpoint,
+                    reason=IngestionFailureReason.DIFFERENCE_TOO_LONG,
+                )
+            messages = self._response_messages(response)
+            if not messages:
+                return None
+            return self._message_result(
+                identity=identity,
+                generation=registry_generation or self._generations.get(identity, 1),
+                from_checkpoint=checkpoint,
+                to_checkpoint=TelegramChannelCheckpoint(
+                    pts=self._nonnegative_int(
+                        getattr(response, "pts", None), checkpoint.pts
+                    )
+                ),
+                message=messages[0],
+                entity=entity,
+                from_history=False,
+            )
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram channel difference failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+
+    def get_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        window_start: datetime,
+        window_end: datetime,
+        history_cursor: int | None = None,
+    ) -> TelegramDifferenceResult | None:
+        """Read one inclusive, bounded, provider-paged historical message."""
+        key = (identity, registry_generation)
+        pending = self._history_pending.get(key)
+        if pending is not None and (
+            history_cursor is None or pending.telegram_message_id > history_cursor
+        ):
+            return pending
+        try:
+            entity = self._entity_for_identity(identity)
+            iterator = self._call(
+                "iter_messages",
+                entity,
+                limit=100,
+                offset_date=window_end,
+                min_id=history_cursor or 0,
+                reverse=True,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+            for message in cast(Iterator[Any], iterator):
+                message_id = getattr(message, "id", None)
+                if type(message_id) is not int or message_id < 1:
+                    continue
+                if history_cursor is not None and message_id <= history_cursor:
+                    continue
+                event_time = getattr(message, "date", None)
+                if not isinstance(event_time, datetime) or event_time.tzinfo is None:
+                    raise TelethonTransportError(
+                        "Telegram history event time is unavailable",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    )
+                if event_time < window_start:
+                    break
+                if event_time > window_end:
+                    continue
+                result = self._message_result(
+                    identity=identity,
+                    generation=registry_generation,
+                    from_checkpoint=checkpoint,
+                    to_checkpoint=checkpoint,
+                    message=message,
+                    entity=entity,
+                    from_history=True,
+                )
+                self._history_pending[key] = result
+                return result
+            return None
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram Source Chat history failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+
+    def acknowledge_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        source_event_id: str,
+    ) -> None:
+        """Release one provider-side page only after durable application commit."""
+        key = (identity, registry_generation)
+        pending = self._history_pending.get(key)
+        if (
+            pending is None
+            or pending.from_checkpoint != checkpoint
+            or pending.source_event_id != source_event_id
+        ):
+            raise TelethonTransportError(
+                "Telegram history acknowledgement is out of order",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        self._history_pending.pop(key, None)
+
+    def start_live_ingestion(
+        self,
+        callback: Callable[[TelegramPeerIdentity], None],
+    ) -> None:
+        """Register NewMessage, MessageEdited, and MessageDeleted wake handlers."""
+        try:
+            from telethon import events
+
+            self._live_callback = callback
+            for builder in (
+                events.NewMessage(),
+                events.MessageEdited(),
+                events.MessageDeleted(),
+            ):
+                self._call(
+                    "add_event_handler",
+                    self._live_event_callback,
+                    builder,
+                    scope=IngestionFailureScope.INGESTION_ROLE,
+                )
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram live handler registration failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            ) from None
+
+    def run_live_ingestion(self) -> None:
+        """Run Telethon's disconnect loop; handlers only wake the difference pump."""
+        self._call(
+            "run_until_disconnected",
+            scope=IngestionFailureScope.INGESTION_ROLE,
+        )
+
+    async def _live_event_callback(self, event: object) -> None:
+        if self._live_callback is None:
+            return
+        identity = self._identity_from_event(event)
+        if identity is not None and (
+            not self._generations or identity in self._generations
+        ):
+            self._live_callback(identity)
+
+    def _entity_for_identity(self, identity: TelegramPeerIdentity) -> object:
+        entity = self._entities.get(identity)
+        if entity is not None:
+            return entity
+        try:
+            from telethon import types
+
+            reference: object = (
+                types.PeerChannel(identity.telegram_id)
+                if identity.kind.value == "channel"
+                else types.PeerChat(identity.telegram_id)
+            )
+            entity = self._call(
+                "get_entity",
+                reference,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram Source Chat access failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+        self._entities[identity] = entity
+        return entity
+
+    @staticmethod
+    def _identity_from_entity(entity: object) -> TelegramPeerIdentity | None:
+        try:
+            from telethon import types
+
+            if isinstance(entity, types.Channel):
+                return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, entity.id)
+            if isinstance(entity, types.Chat):
+                return TelegramPeerIdentity(TelegramPeerKind.CHAT, entity.id)
+        except Exception:
+            pass
+        entity_id = getattr(entity, "id", None)
+        if type(entity_id) is not int or entity_id < 1:
+            return None
+        if (
+            getattr(entity, "broadcast", None) is not None
+            or getattr(entity, "megagroup", None) is not None
+        ):
+            return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, entity_id)
+        return TelegramPeerIdentity(TelegramPeerKind.CHAT, entity_id)
+
+    @classmethod
+    def _identity_from_message(cls, message: object) -> TelegramPeerIdentity | None:
+        return cls._identity_from_peer(
+            getattr(message, "peer_id", None) or getattr(message, "peer", None)
+        )
+
+    @classmethod
+    def _identity_from_event(cls, event: object) -> TelegramPeerIdentity | None:
+        message = getattr(event, "message", None)
+        identity = cls._identity_from_message(message) if message is not None else None
+        if identity is not None:
+            return identity
+        chat_id = getattr(event, "chat_id", None)
+        if type(chat_id) is not int or chat_id < 1:
+            return None
+        return TelegramPeerIdentity(TelegramPeerKind.CHAT, chat_id)
+
+    @staticmethod
+    def _identity_from_peer(peer: object) -> TelegramPeerIdentity | None:
+        channel_id = getattr(peer, "channel_id", None)
+        if type(channel_id) is int and channel_id > 0:
+            return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, channel_id)
+        chat_id = getattr(peer, "chat_id", None)
+        if type(chat_id) is int and chat_id > 0:
+            return TelegramPeerIdentity(TelegramPeerKind.CHAT, chat_id)
+        return None
+
+    @staticmethod
+    def _response_messages(response: object) -> list[object]:
+        for field_name in ("new_messages", "messages"):
+            messages = getattr(response, field_name, None)
+            if messages:
+                return list(messages)
+        return []
+
+    @staticmethod
+    def _is_difference_too_long(response: object) -> bool:
+        """Recognize Telegram's typed unrecoverable-gap response."""
+        return type(response).__name__ in {
+            "DifferenceTooLong",
+            "ChannelDifferenceTooLong",
+        }
+
+    def _message_result(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        generation: int,
+        from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        message: object,
+        entity: object,
+        from_history: bool,
+    ) -> (
+        TelegramDifferenceEvent
+        | TelegramProtectedContentEvent
+        | TelegramProtectionUnavailableEvent
+    ):
+        message_id = getattr(message, "id", None)
+        event_time = getattr(message, "date", None)
+        if type(message_id) is not int or message_id < 1:
+            raise TelethonTransportError(
+                "Telegram message identity is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        if not isinstance(event_time, datetime) or event_time.tzinfo is None:
+            raise TelethonTransportError(
+                "Telegram message time is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        protected = self._is_protected(entity, message)
+        edit_date = getattr(message, "edit_date", None)
+        revision_key = (identity, message_id)
+        revision = self._revisions.get(revision_key, 0)
+        kind = SourceEventKind.CREATE
+        if edit_date is not None:
+            kind = SourceEventKind.EDIT
+            revision = max(revision, 2)
+        else:
+            revision = max(revision, 1)
+        self._revisions[revision_key] = revision
+        source_event_id = canonical_telethon_source_event_id(
+            identity,
+            message_id,
+            revision,
+            kind,
+        )
+        if protected:
+            return TelegramProtectedContentEvent(
+                source_chat_identity=identity,
+                from_checkpoint=from_checkpoint,
+                to_checkpoint=to_checkpoint,
+                source_event_id=source_event_id,
+                telegram_message_id=message_id,
+                revision=revision,
+                kind=kind,
+                event_time=event_time,
+                registry_generation=generation,
+                from_history=from_history,
+            )
+        body = getattr(message, "message", None)
+        if body is not None and not isinstance(body, str):
+            raise TelethonTransportError(
+                "Telegram message body is malformed",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        reply_to = getattr(message, "reply_to", None)
+        reply_to_message_id = getattr(reply_to, "reply_to_msg_id", None)
+        if type(reply_to_message_id) is not int or reply_to_message_id < 1:
+            reply_to_message_id = None
+        return TelegramDifferenceEvent(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=message_id,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=event_time,
+            registry_generation=generation,
+            reply_to_telegram_message_id=reply_to_message_id,
+            from_history=from_history,
+        )
+
+    @staticmethod
+    def _is_protected(entity: object, message: object) -> bool:
+        try:
+            entity_protected = getattr(entity, "noforwards", False)
+            message_protected = getattr(message, "noforwards", False)
+        except Exception:
+            raise TelethonTransportError(
+                "Telegram copy-protection state is unavailable",
+                reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+        return entity_protected is True or message_protected is True
+
+    @staticmethod
+    def _nonnegative_int(value: object, fallback: int) -> int:
+        return value if type(value) is int and value >= 0 else fallback
+
+    def _request(self, request: object, *, scope: IngestionFailureScope) -> object:
+        return self._call(
+            cast(Callable[[object], Any], self._client), request, scope=scope
+        )
+
+    def _call(
+        self,
+        target: str | Callable[..., Any],
+        *args: Any,
+        scope: IngestionFailureScope,
+        **kwargs: Any,
+    ) -> Any:
+        if isinstance(target, str):
+            target_callable = getattr(self._client, target)
+        else:
+            target_callable = target
+        try:
+            result = target_callable(*args, **kwargs)
+            if inspect.isawaitable(result):
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
+                else:
+                    raise RuntimeError("Telethon provider cannot block a running loop")
+            return result
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram provider operation failed",
+                reason=_telethon_failure_reason(error),
+                scope=scope,
+            ) from None
 
 
 def canonical_telethon_source_event_id(
@@ -537,6 +1290,34 @@ def canonical_telethon_source_event_id(
 
 class TelethonIngestionAdapter:
     """Gate provider operations behind T2 conformance and exact Source scope."""
+
+    @classmethod
+    def from_runtime(
+        cls,
+        *,
+        runtime: TelethonRuntime,
+        approved_source_chats: Iterable[
+            TelegramPeerIdentity | SourceChatRegistryEntry
+        ] = (),
+        live_update_callback: Callable[[TelegramPeerIdentity], None] | None = None,
+    ) -> TelethonIngestionAdapter:
+        """Compose and verify the concrete provider at the T2 boundary."""
+        scope = tuple(approved_source_chats)
+        source = runtime.create_production_provider(
+            approved_source_chats=scope,
+        )
+        runtime.verify_conformance(
+            transport=source,
+            approved_source_chats=scope,
+        )
+        adapter = cls(
+            runtime=runtime,
+            source=source,
+            approved_source_chats=scope,
+            live_update_callback=live_update_callback,
+        )
+        adapter.start_live_ingestion()
+        return adapter
 
     def __init__(
         self,
@@ -572,6 +1353,42 @@ class TelethonIngestionAdapter:
         if self._live_update_callback is not None:
             self._live_update_callback(identity)
 
+    def start_live_ingestion(self) -> None:
+        """Register the provider's live wake boundary after conformance."""
+        self._runtime.require_ready()
+        start = getattr(self._source, "start_live_ingestion", None)
+        if not callable(start):
+            raise TelethonConformanceError(
+                key="T2", status="provider_live_boundary_unavailable"
+            )
+        try:
+            start(self.notify_live_update)
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram live ingestion setup failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            ) from None
+
+    def run_live_ingestion(self) -> None:
+        """Run the provider's disconnect loop after live handlers are installed."""
+        self._runtime.require_ready()
+        run = getattr(self._source, "run_live_ingestion", None)
+        if not callable(run):
+            raise TelethonConformanceError(
+                key="T2", status="provider_live_boundary_unavailable"
+            )
+        try:
+            run()
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram live ingestion failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            ) from None
+
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         """Resolve one accessible address without joining or reading history."""
         self._runtime.require_ready()
@@ -601,22 +1418,47 @@ class TelethonIngestionAdapter:
         self._runtime.require_ready()
         try:
             result = self._source.get_account_difference_event(checkpoint)
-        except Exception:
-            raise TelethonTransportError("Telegram account difference failed") from None
-        return self._scope_result(result)
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram account difference failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+        return self._scope_result(
+            result,
+            expected_checkpoint=checkpoint,
+            expected_from_history=False,
+        )
 
     def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Read one channel difference only for an approved peer."""
         self._require_approved(identity)
         try:
-            result = self._source.get_channel_difference_event(identity, checkpoint)
-        except Exception:
-            raise TelethonTransportError("Telegram channel difference failed") from None
-        return self._scope_result(result, expected_identity=identity)
+            result = self._source.get_channel_difference_event(
+                identity,
+                checkpoint,
+                registry_generation=registry_generation,
+            )
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram channel difference failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+        return self._scope_result(
+            result,
+            expected_identity=identity,
+            expected_generation=registry_generation,
+            expected_checkpoint=checkpoint,
+            expected_from_history=False,
+        )
 
     def get_source_chat_history_event(
         self,
@@ -625,6 +1467,7 @@ class TelethonIngestionAdapter:
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         window_start: datetime,
         window_end: datetime,
+        history_cursor: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Read only the exact seven-day history interval for an approved peer."""
         self._require_approved(identity)
@@ -644,12 +1487,26 @@ class TelethonIngestionAdapter:
                 checkpoint,
                 window_start,
                 window_end,
+                history_cursor=history_cursor,
             )
-        except Exception:
-            raise TelethonTransportError(
-                "Telegram Source Chat history failed"
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram Source Chat history failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=(
+                    IngestionFailureScope.ACCOUNT_STREAM
+                    if isinstance(checkpoint, TelegramAccountCheckpoint)
+                    else IngestionFailureScope.SOURCE_STREAM
+                ),
             ) from None
-        return self._scope_result(result, expected_identity=identity)
+        return self._scope_result(
+            result,
+            expected_identity=identity,
+            expected_generation=registry_generation,
+            expected_checkpoint=checkpoint,
+            expected_from_history=True,
+        )
 
     def acknowledge_source_chat_history_event(
         self,
@@ -667,9 +1524,12 @@ class TelethonIngestionAdapter:
                 checkpoint,
                 source_event_id,
             )
-        except Exception:
-            raise TelethonTransportError(
-                "Telegram Source Chat history acknowledgement failed"
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram Source Chat history acknowledgement failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.SOURCE_STREAM,
             ) from None
 
     def _require_approved(self, identity: TelegramPeerIdentity) -> None:
@@ -685,6 +1545,11 @@ class TelethonIngestionAdapter:
         result: TelegramDifferenceResult | None,
         *,
         expected_identity: TelegramPeerIdentity | None = None,
+        expected_generation: int | None = None,
+        expected_checkpoint: (
+            TelegramAccountCheckpoint | TelegramChannelCheckpoint | None
+        ) = None,
+        expected_from_history: bool | None = None,
     ) -> TelegramDifferenceResult | None:
         if result is None:
             return result
@@ -696,6 +1561,14 @@ class TelethonIngestionAdapter:
                 raise TelethonConformanceError(
                     key="APPROVED_SOURCE_CHATS", status="scope_mismatch"
                 )
+            if (
+                expected_checkpoint is not None
+                and result.checkpoint != expected_checkpoint
+            ):
+                raise TelethonTransportError(
+                    "Telegram difference returned an invalid checkpoint",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                )
             return result
         identity = result.source_chat_identity
         if expected_identity is not None and identity != expected_identity:
@@ -706,7 +1579,46 @@ class TelethonIngestionAdapter:
             raise TelethonConformanceError(
                 key="APPROVED_SOURCE_CHATS", status="scope_broadened"
             )
-        return result
+        if (
+            expected_generation is not None
+            and result.registry_generation != expected_generation
+        ):
+            raise TelethonTransportError(
+                "Telegram difference returned an invalid generation",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        if (
+            expected_checkpoint is not None
+            and result.from_checkpoint != expected_checkpoint
+        ):
+            raise TelethonTransportError(
+                "Telegram difference returned an invalid checkpoint",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=(
+                    IngestionFailureScope.ACCOUNT_STREAM
+                    if isinstance(expected_checkpoint, TelegramAccountCheckpoint)
+                    else IngestionFailureScope.SOURCE_STREAM
+                ),
+            )
+        if (
+            expected_from_history is not None
+            and result.from_history != expected_from_history
+        ):
+            raise TelethonTransportError(
+                "Telegram difference returned an invalid origin",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        return replace(
+            result,
+            source_event_id=canonical_telethon_source_event_id(
+                result.source_chat_identity,
+                result.telegram_message_id,
+                result.revision,
+                result.kind,
+            ),
+        )
 
 
 @dataclass(slots=True)

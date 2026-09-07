@@ -17,6 +17,7 @@ from modules.domain import (
     ConversationStage,
     GeographicType,
     IngestionFailureReason,
+    IngestionFailureScope,
     LocationCandidate,
     LocationInterpretation,
     LocationResolution,
@@ -29,12 +30,14 @@ from modules.domain import (
     TelegramChannelCheckpoint,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferenceResult,
     TelegramPeerIdentity,
     TelegramPeerKind,
     TelegramProtectedContentEvent,
     TelegramProtectionUnavailableEvent,
 )
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
+from modules.telethon_ingestion import TelethonTransportError
 from modules.testkit import (
     AcceptanceSpine,
     ControlledLocationResolverAdapter,
@@ -264,6 +267,326 @@ def test_source_chat_history_is_bounded_and_does_not_delay_live_ingestion(
         == [(registered_at - timedelta(days=7), registered_at)] * 4
     )
     assert "Protected historical text." not in repr(system.protected_content_skips())
+    system.reset()
+
+
+def test_source_chat_history_progress_is_durable_across_restart_and_retry(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_600_102)
+    checkpoint = TelegramChannelCheckpoint(pts=500)
+    telethon.allow_public_username(
+        address="@synthetic_history_progress",
+        identity=identity,
+        transport_boundary="channel-pts:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_002,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_002,
+        address="@synthetic_history_progress",
+        update_suffix="history-progress",
+    )
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=checkpoint,
+        source_event_id="source-event:history-progress:1",
+        telegram_message_id=700,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Durable history body.",
+        event_time=registered_at - timedelta(days=1),
+    )
+
+    with pytest.raises(InjectedFailureError):
+        system.process_next_source_chat_history(
+            identity=identity,
+            registry_generation=1,
+            inject_database_failure=True,
+        )
+    failed_progress = system.source_chat_history_progress(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert failed_progress.last_telegram_message_id is None
+    assert not failed_progress.completed
+
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    committed_progress = system.source_chat_history_progress(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert committed_progress.last_telegram_message_id == 700
+    assert committed_progress.last_outcome == "accepted"
+
+    system.restart(RuntimeRole.INGESTION)
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=checkpoint,
+        source_event_id="source-event:history-progress:2",
+        telegram_message_id=701,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="History after restart.",
+        event_time=registered_at - timedelta(hours=1),
+    )
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.history_cursor_requests[-1] == 700
+    assert (
+        system.source_chat_history_progress(
+            identity=identity,
+            registry_generation=1,
+        ).last_telegram_message_id
+        == 701
+    )
+    system.reset()
+
+
+def test_source_chat_history_stops_before_provider_when_account_stream_is_stopped(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_600_103)
+    checkpoint = TelegramAccountCheckpoint(
+        pts=500,
+        qts=50,
+        seq=500,
+        date=registered_at - timedelta(minutes=1),
+    )
+    telethon.allow_public_username(
+        address="@synthetic_history_account_stop",
+        identity=identity,
+        transport_boundary="chat-sequence:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_003,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_003,
+        address="@synthetic_history_account_stop",
+        update_suffix="history-account-stop",
+    )
+    system.initialize_account_ingestion_checkpoint(checkpoint)
+    telethon.add_account_difference_failure(
+        checkpoint=checkpoint,
+        reason="access_lost",
+    )
+    assert system.process_next_account_telegram_difference()
+
+    assert not system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.history_requests == []
+    assert any(
+        failure.scope.value == "account_stream"
+        and failure.reason is IngestionFailureReason.ACCESS_LOST
+        for failure in system.ingestion_failures()
+    )
+    system.reset()
+
+
+def test_source_chat_history_missing_account_checkpoint_stops_account_stream(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_600_104)
+    telethon.allow_public_username(
+        address="@synthetic_hist_missing",
+        identity=identity,
+        transport_boundary="chat-sequence:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_004,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_004,
+        address="@synthetic_hist_missing",
+        update_suffix="history-missing-checkpoint",
+    )
+
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.history_requests == []
+    assert [
+        failure.reason
+        for failure in system.ingestion_failures()
+        if failure.scope.value == "account_stream"
+    ] == [IngestionFailureReason.CHECKPOINT_UNAVAILABLE]
+    system.reset()
+
+
+def test_history_acknowledges_only_after_durable_inactive_lifecycle_outcome(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_600_105)
+    telethon.allow_public_username(
+        address="@synthetic_history_lifecycle_race",
+        identity=identity,
+        transport_boundary="channel-pts:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_005,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_005,
+        address="@synthetic_history_lifecycle_race",
+        update_suffix="history-lifecycle-race",
+    )
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=TelegramChannelCheckpoint(pts=500),
+        source_event_id="source-event:history-lifecycle-race:1",
+        telegram_message_id=700,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Must not be lost in a lifecycle race.",
+        event_time=registered_at - timedelta(days=1),
+    )
+    telethon.pause_source_chat_history_results()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            system.process_next_source_chat_history,
+            identity=identity,
+            registry_generation=1,
+        )
+        telethon.wait_for_source_chat_history_requests(1)
+        _remove_source_chat(
+            system,
+            administrator_id=46_005,
+            identity=identity,
+            update_suffix="history-lifecycle-race",
+        )
+        telethon.release_source_chat_history_results(1)
+        assert future.result() is True
+
+    progress = system.source_chat_history_progress(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert progress.last_telegram_message_id == 700
+    assert progress.last_outcome == "source_chat_inactive"
+    assert system.source_messages() == ()
+    system.reset()
+
+
+def test_provider_exception_durably_stops_only_the_source_stream(
+    fresh_database_url: str,
+) -> None:
+    class _FailingChannelAdapter(ControlledTelegramIngestionAdapter):
+        def get_channel_difference_event(
+            self,
+            identity: TelegramPeerIdentity,
+            checkpoint: TelegramChannelCheckpoint,
+            registry_generation: int | None = None,
+        ) -> TelegramDifferenceResult | None:
+            del identity, checkpoint, registry_generation
+            raise TelethonTransportError(
+                "controlled provider failure",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+
+    telethon = _FailingChannelAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_600_106)
+    telethon.allow_public_username(
+        address="@synthetic_provider_error",
+        identity=identity,
+        transport_boundary="channel-pts:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_006,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_006,
+        address="@synthetic_provider_error",
+        update_suffix="provider-error",
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.channel_difference_requests == []
+    assert [
+        (failure.scope, failure.reason) for failure in system.ingestion_failures()
+    ] == [
+        (
+            IngestionFailureScope.SOURCE_STREAM,
+            IngestionFailureReason.ACCESS_LOST,
+        )
+    ]
     system.reset()
 
 
@@ -745,6 +1068,7 @@ def test_account_and_channel_differences_advance_independently() -> None:
         kind=SourceEventKind.CREATE,
         body="Channel route.",
         event_time=datetime(2026, 9, 12, 9, 32, tzinfo=UTC),
+        registry_generation=2,
     )
 
     assert system.process_next_account_telegram_difference()
@@ -878,6 +1202,7 @@ def test_reregistered_generation_has_distinct_classification_identity_and_replay
         kind=SourceEventKind.CREATE,
         body="Generation two body.",
         event_time=datetime(2026, 10, 12, 9, 46, tzinfo=UTC),
+        registry_generation=2,
     )
     assert system.process_next_channel_telegram_difference(
         identity=identity,
@@ -2460,6 +2785,7 @@ def test_access_loss_stops_only_the_affected_source_stream() -> None:
         kind=SourceEventKind.CREATE,
         body="Synthetic permitted unrelated event.",
         event_time=clock.now(),
+        registry_generation=2,
     )
 
     assert system.process_next_channel_telegram_difference(

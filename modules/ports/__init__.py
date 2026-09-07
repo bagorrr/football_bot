@@ -75,6 +75,7 @@ from modules.domain import (
     TelegramDeliveryClaim,
     TelegramDifferenceEvent,
     TelegramDifferenceResult,
+    TelegramHistoryProgress,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramProtectedContentEvent,
@@ -144,6 +145,7 @@ class TelegramIngestionAdapter(Protocol):
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the next channel event from its typed durable pts."""
         ...
@@ -155,6 +157,7 @@ class TelegramIngestionAdapter(Protocol):
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         window_start: datetime,
         window_end: datetime,
+        history_cursor: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the next bounded historical event without moving the cursor."""
         ...
@@ -1197,6 +1200,56 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically record one event, its outbox, and checkpoint advance."""
         ...
 
+    def ensure_source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        initialized_at: datetime,
+    ) -> TelegramHistoryProgress:
+        """Create or read one generation's exact bounded-history progress row."""
+        ...
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress | None:
+        """Read durable bounded-history progress without changing it."""
+        ...
+
+    def record_source_chat_history_outcome(
+        self,
+        *,
+        event: (
+            TelegramDifferenceEvent
+            | TelegramProtectedContentEvent
+            | TelegramProtectionUnavailableEvent
+        ),
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        outcome: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Persist a body-free history outcome before provider acknowledgement."""
+        ...
+
+    def complete_source_chat_history(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        completed_at: datetime,
+    ) -> bool:
+        """Persist that one bounded generation history window is exhausted."""
+        ...
+
     def source_stream_is_stopped(
         self,
         *,
@@ -1766,6 +1819,15 @@ class AcceptanceObserver(Protocol):
 
     def source_events(self) -> tuple[SourceEventRecord, ...]:
         """Observe Ingestion-owned Source Events through the testkit."""
+        ...
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress | None:
+        """Observe one generation's durable bounded-history progress."""
         ...
 
     def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:
