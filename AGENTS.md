@@ -65,3 +65,8 @@ through the supported Codex App mechanism, identify that created thread and
 label the prompt as fallback documentation rather than asking the product
 owner to relay it. If supported thread creation is unavailable or fails, say
 so explicitly and provide the prompt for manual recovery.
+
+## Code design and implementation
+
+When writing code, choose the simplest and strongest solution from the outset: clear, expressive, compact, efficient, and fast code that precisely solves the current task and is easy to verify. Achieve quality through a clear idea and a minimum of entities and relationships, not through volume, unnecessary abstractions, infrastructure, bureaucracy, or activity for activity’s sake.
+Solve the current task with the smallest complete change. Do not add new entities, abstractions, infrastructure, tests, CI jobs, documents, tasks, threads, agents, or process steps without demonstrated immediate need and explicit owner approval. After the first failure, seek a simpler root-cause fix instead of expanding the work; remove or replace process complexity rather than accumulating it.
