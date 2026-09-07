@@ -2481,41 +2481,1040 @@ class ConversationOnboarding:
                     self._show_main_menu(update_id=update_id, current=current)
         self.deliver_pending()
 
-    def select_main_menu_action(
+    def handle_message(
         self,
         *,
         update_id: str,
         telegram_user_id: int,
+        text: str,
+        telegram_language_hint: str | None,
+    ) -> bool:
+        """Route one ordinary Bot User message through the current screen."""
+        del telegram_language_hint
+        current = self._store.conversation_state(telegram_user_id)
+        if current is None:
+            return False
+        if current.stage in {
+            ConversationStage.LANGUAGE_INPUT,
+            ConversationStage.SETTINGS_LANGUAGE_INPUT,
+        }:
+            self.submit_language_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            current.stage is ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
+            and self._is_administrator(telegram_user_id)
+        ):
+            self.submit_source_chat_address(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                address=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            current.stage is ConversationStage.SOURCE_DATA_DELETION_INPUT
+            and self._is_administrator(telegram_user_id)
+        ):
+            return self._handle_source_data_deletion_input_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                current=current,
+                text=text,
+            )
+        draft = self._store.discovery_draft(telegram_user_id)
+        if draft is not None and current.stage is not draft.stage:
+            return False
+        if (
+            current.stage
+            in {
+                ConversationStage.COUNTRY,
+                ConversationStage.CITY,
+                ConversationStage.SEARCH_AREA,
+            }
+            and draft is not None
+        ):
+            self.submit_location_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if current.stage is ConversationStage.REQUIRED_DATE and draft is not None:
+            self.submit_required_date_text(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            current.stage is ConversationStage.RESULTS
+            and self._store.active_result_context(telegram_user_id) is not None
+        ):
+            self.answer_result_message(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                text=text,
+            )
+            return True
+        if current.stage is ConversationStage.POST_CORE and draft is not None:
+            if draft.player_search_number_prompt:
+                self.submit_player_search_number_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.game_search_exact_time_prompt:
+                self.submit_game_search_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.opponent_search_exact_time_prompt:
+                self.submit_opponent_search_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.referee_search_exact_time_prompt:
+                self.submit_referee_search_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.refereeing_service_offer_exact_time_prompt:
+                self.submit_refereeing_service_offer_exact_time_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.transfer_search_seasonal_timing_prompt == "start_local_date":
+                self.submit_transfer_search_seasonal_timing_start_date_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.transfer_search_seasonal_timing_prompt == "stated_season":
+                self.submit_transfer_search_seasonal_timing_season_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if _COACHING_INTERVAL_PROMPT_TOKEN in draft.coaching_search_detail_draft:
+                self.submit_coaching_search_schedule_interval_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+            if draft.coaching_search_schedule_prompt == "start_local_date":
+                self.submit_coaching_search_schedule_start_date_text(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=current.screen_revision,
+                    text=text,
+                )
+                return True
+        return False
+
+    def _handle_source_data_deletion_input_text(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        current: ConversationState,
+        text: str,
+    ) -> bool:
+        """Route one current administrator deletion-input screen."""
+        current_message = self._store.current_conversation_message(telegram_user_id)
+        operation = _source_data_deletion_input_operation(
+            current=current,
+            current_message=current_message,
+        )
+        if operation is None:
+            self._queue_current_view(update_id=update_id, state=current)
+            return True
+        operation_name, request_id, completion_outcome = operation
+        if operation_name == "intake":
+            intake = _parse_source_data_deletion_intake_text(text)
+            if intake is None:
+                self._queue_current_view(update_id=update_id, state=current)
+                return True
+            (
+                request_id,
+                source_author_telegram_id,
+                source_chat_key,
+                support_case_pointer,
+            ) = intake
+            self.submit_source_data_deletion_request(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                source_author_telegram_id=source_author_telegram_id,
+                source_chat_key=source_chat_key,
+                support_case_pointer=support_case_pointer,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if request_id is None:
+            self._queue_current_view(update_id=update_id, state=current)
+            return True
+        if operation_name == "reject":
+            if _bounded_no_whitespace_text(text, maximum_length=128) is None:
+                self._queue_current_view(update_id=update_id, state=current)
+                return True
+            self.submit_source_data_deletion_reason(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                decision_reason=text,
+                screen_revision=current.screen_revision,
+            )
+            return True
+        if (
+            completion_outcome is None
+            or _bounded_no_whitespace_text(text, maximum_length=256) is None
+        ):
+            self._queue_current_view(update_id=update_id, state=current)
+            return True
+        self.submit_source_data_deletion_completion(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            completion_outcome=completion_outcome,
+            completion_proof_pointer=text,
+            screen_revision=current.screen_revision,
+        )
+        return True
+
+    def handle_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str,
+        telegram_user_id: int,
+        data: str,
+        screen_revision: int,
+        telegram_message_id: str,
+    ) -> bool:
+        """Route one non-root callback through the existing Application controls."""
+        del telegram_message_id
+        parts = data.split(":")
+        if not parts or parts[-1] != str(screen_revision):
+            return False
+        current = self._store.conversation_state(telegram_user_id)
+        if current is None or current.screen_revision != screen_revision:
+            return False
+        current_message = self._store.current_conversation_message(telegram_user_id)
+        if (
+            current_message is None
+            or current_message.screen_revision != screen_revision
+            or not any(
+                callback == data
+                for row in current_message.button_rows
+                for _label, callback in row
+            )
+        ):
+            return False
+        if parts[0] in {"sdd", "source-chats"} and not self._is_administrator(
+            telegram_user_id
+        ):
+            return False
+
+        # A callback in the current persisted button set is the acceptance gate.
+        # Acknowledge it before route-owned presentation work can fail.
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+        )
+
+        accepted = False
+        prefix = parts[0]
+        if prefix == "settings-language" and len(parts) == 3:
+            if parts[1] in SUPPORTED_LOCALES:
+                accepted = self.select_fixed_language(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    locale=parts[1],
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "free-text":
+                accepted = self.open_language_input(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                self.go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix in {"settings", "administration", "language"}:
+            if len(parts) == 3 and parts[1] == "back":
+                self.go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "direction" and len(parts) == 3 and parts[1] == "back":
+            self.go_back(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+            )
+            accepted = True
+        elif prefix == "location-suggestion" and len(parts) == 4:
+            if parts[1] in {"country", "city"} and parts[2]:
+                self.select_location_suggestion(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    kind=parts[1],
+                    place_id=parts[2],
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "location" and len(parts) == 3:
+            if parts[1] in {"other-country", "other-city"}:
+                self.dismiss_location_suggestion(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    kind=parts[1].removeprefix("other-"),
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "details":
+            accepted = self._handle_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "opponent-details":
+            accepted = self._handle_opponent_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix in {
+            "referee-search-details",
+            "refereeing-service-offer-details",
+        }:
+            accepted = self._handle_referee_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+                detail_family=(
+                    "referee_search"
+                    if prefix == "referee-search-details"
+                    else "refereeing_service_offer"
+                ),
+            )
+        elif prefix == "transfer-details":
+            accepted = self._handle_transfer_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "coaching-details":
+            accepted = self._handle_coaching_details_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "search" and len(parts) == 3:
+            if parts[1] in {"submit", "retry"}:
+                self.submit_search(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                accepted = True
+        elif prefix == "source-chats":
+            accepted = self._handle_source_chats_callback(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                data=data,
+                parts=parts,
+                screen_revision=screen_revision,
+            )
+        elif prefix == "sdd" and (
+            (len(parts) == 3 and parts[1] in {"back", "intake"})
+            or (
+                len(parts) == 4
+                and parts[1]
+                in {
+                    "approve",
+                    "reject",
+                    "review",
+                    "start",
+                    "notify",
+                    "complete",
+                    "data-not-found",
+                }
+                and parts[2]
+            )
+        ):
+            self.select_source_data_deletion_action(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                action=data,
+                screen_revision=screen_revision,
+            )
+            accepted = True
+
+        return accepted
+
+    def _handle_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route shared Game, Player, Tournament, and family Back callbacks."""
+        draft = self._store.discovery_draft(telegram_user_id)
+        intent = draft.user_intent if draft is not None else None
+        if intent is None:
+            return False
+        if len(parts) == 3:
+            if parts[1] == "open":
+                if intent is UserIntent.PLAYER_SEARCH:
+                    self.open_player_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                elif intent is UserIntent.TOURNAMENT_SEARCH:
+                    self.open_tournament_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                elif intent is UserIntent.GAME_SEARCH:
+                    self.open_game_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                else:
+                    return False
+                return True
+            if parts[1] == "done":
+                if intent is UserIntent.PLAYER_SEARCH:
+                    self._change_game_search_details(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                        operation="commit",
+                        user_intent=UserIntent.PLAYER_SEARCH,
+                    )
+                elif intent is UserIntent.TOURNAMENT_SEARCH:
+                    self.commit_tournament_search_detail(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                elif intent is UserIntent.GAME_SEARCH:
+                    self.commit_game_search_detail(
+                        update_id=update_id,
+                        telegram_user_id=telegram_user_id,
+                        screen_revision=screen_revision,
+                    )
+                else:
+                    return False
+                return True
+            if parts[1] != "back":
+                return False
+            if intent in {UserIntent.GAME_SEARCH, UserIntent.PLAYER_SEARCH}:
+                self.back_from_game_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.TOURNAMENT_SEARCH:
+                self.back_from_tournament_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.OPPONENT_SEARCH:
+                self.back_from_opponent_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent in {
+                UserIntent.NEW_TEAM_SEARCH,
+                UserIntent.TRANSFER_PLAYER_SEARCH,
+            }:
+                self.back_from_transfer_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.REFEREE_SEARCH:
+                self.back_from_referee_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent is UserIntent.REFEREEING_SERVICE_OFFER:
+                self.back_from_refereeing_service_offer_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif intent in {UserIntent.COACH_SEARCH, UserIntent.COACHING_SERVICE_OFFER}:
+                self.back_from_coaching_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4 or intent not in {
+            UserIntent.GAME_SEARCH,
+            UserIntent.PLAYER_SEARCH,
+            UserIntent.TOURNAMENT_SEARCH,
+        }:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            if intent is UserIntent.PLAYER_SEARCH:
+                self.open_player_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    detail_key=value,
+                )
+            elif intent is UserIntent.TOURNAMENT_SEARCH:
+                self.open_tournament_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    detail_key=value,
+                )
+            else:
+                self.open_game_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    detail_key=value,
+                )
+            return True
+        if operation == "toggle":
+            if intent is UserIntent.PLAYER_SEARCH:
+                self._change_game_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    operation="toggle",
+                    value=value,
+                    user_intent=UserIntent.PLAYER_SEARCH,
+                )
+            elif intent is UserIntent.TOURNAMENT_SEARCH:
+                self.toggle_tournament_search_detail_value(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            else:
+                self.toggle_game_search_detail_value(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            return True
+        if operation == "time" and intent is UserIntent.GAME_SEARCH:
+            if value == "exact":
+                self.open_game_search_exact_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                self.select_game_search_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None if value == "any" else value,
+                )
+            return True
+        if operation == "number" and intent is UserIntent.PLAYER_SEARCH:
+            if value != "any":
+                return False
+            self.clear_player_search_number(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+            )
+            return True
+        return False
+
+    def _handle_opponent_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route one Opponent Search Details callback."""
+        if len(parts) == 3:
+            if parts[1] == "hub":
+                self.open_opponent_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "done":
+                self.commit_opponent_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                self.back_from_opponent_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            self.open_opponent_search_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            self.toggle_opponent_search_detail_value(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=value,
+            )
+        elif operation == "time":
+            if value == "exact":
+                self.open_opponent_search_exact_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                self.select_opponent_search_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None if value == "any" else value,
+                )
+        elif operation == "venue":
+            self.select_opponent_search_venue_provision(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=None if value == "any" else value,
+            )
+        else:
+            return False
+        return True
+
+    def _handle_referee_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+        detail_family: str,
+    ) -> bool:
+        """Route one Referee or Refereeing Service Details callback."""
+        if detail_family == "referee_search":
+            open_hub = self.open_referee_search_details
+            open_detail = self.open_referee_search_detail
+            toggle = self.toggle_referee_search_detail_value
+            commit = self.commit_referee_search_detail
+            select_time = self.select_referee_search_time
+            open_exact = self.open_referee_search_exact_time
+            go_back = self.back_from_referee_search_detail
+        elif detail_family == "refereeing_service_offer":
+            open_hub = self.open_refereeing_service_offer_details
+            open_detail = self.open_refereeing_service_offer_detail
+            toggle = self.toggle_refereeing_service_offer_detail_value
+            commit = self.commit_refereeing_service_offer_detail
+            select_time = self.select_refereeing_service_offer_time
+            open_exact = self.open_refereeing_service_offer_exact_time
+            go_back = self.back_from_refereeing_service_offer_detail
+        else:
+            return False
+        if len(parts) == 3:
+            if parts[1] == "hub":
+                open_hub(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "done":
+                commit(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            open_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            toggle(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=value,
+            )
+        elif operation == "time":
+            if value == "exact":
+                open_exact(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                select_time(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None if value == "any" else value,
+                )
+        else:
+            return False
+        return True
+
+    def _handle_transfer_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route one long-term transfer Details callback."""
+        if len(parts) == 3:
+            if parts[1] == "hub":
+                self.open_transfer_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "done":
+                self.commit_transfer_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif parts[1] == "back":
+                self.back_from_transfer_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            self.open_transfer_search_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            self.toggle_transfer_search_detail_value(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                value=value,
+            )
+        elif operation == "timing":
+            if value == "ready_now":
+                self.select_transfer_search_seasonal_timing(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            elif value == "any":
+                self.select_transfer_search_seasonal_timing(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=None,
+                )
+            elif value == "start_local_date":
+                self.open_transfer_search_seasonal_timing_start_date(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif value == "stated_season":
+                self.open_transfer_search_seasonal_timing_season(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+        else:
+            return False
+        return True
+
+    def _handle_coaching_details_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route one Coaching Services Details callback."""
+        if len(parts) == 3:
+            operation = parts[1]
+            if operation == "hub":
+                self.open_coaching_search_details(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "done":
+                self.commit_coaching_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "back":
+                self.back_from_coaching_search_detail(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "interval":
+                self.open_coaching_search_schedule_interval(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "start-date":
+                self.open_coaching_search_schedule_start_date(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            elif operation == "clear-start-date":
+                self.clear_coaching_search_schedule_start_date(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                return False
+            return True
+        if len(parts) != 4:
+            return False
+        operation, value = parts[1], parts[2]
+        if operation == "open":
+            self.open_coaching_search_detail(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                screen_revision=screen_revision,
+                detail_key=value,
+            )
+        elif operation == "toggle":
+            if value in _COACHING_WEEKDAYS:
+                self.select_coaching_search_schedule_weekday(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            elif value in _COACHING_DAY_PARTS:
+                self.select_coaching_search_schedule_day_part(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+            else:
+                self.toggle_coaching_search_detail_value(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                    value=value,
+                )
+        else:
+            return False
+        return True
+
+    def _handle_source_chats_callback(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        data: str,
+        parts: list[str],
+        screen_revision: int,
+    ) -> bool:
+        """Route exact-administrator Source Chats callbacks."""
+        if len(parts) == 3 and parts[1] in {"add", "back", "cancel"}:
+            if parts[1] == "back":
+                self.go_back(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+            else:
+                self.select_source_chats_action(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    action=data,
+                    screen_revision=screen_revision,
+                )
+            return True
+        if len(parts) in {6, 7} and parts[1] in {
+            "pause",
+            "remove",
+            "re_enable",
+            "confirm",
+        }:
+            if parts[1] == "confirm" and parts[2] not in {
+                "pause",
+                "remove",
+                "re_enable",
+            }:
+                return False
+            if parts[1] != "confirm" and len(parts) != 6:
+                return False
+            if parts[1] == "confirm" and len(parts) != 7:
+                return False
+            self.select_source_chats_action(
+                update_id=update_id,
+                telegram_user_id=telegram_user_id,
+                action=data,
+                screen_revision=screen_revision,
+            )
+            return True
+        return False
+
+    def select_main_menu_action(
+        self,
+        *,
+        update_id: str,
+        callback_id: str | None = None,
+        telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one current Main Menu callback."""
+        accepted = False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
             if processed:
-                return
+                return True
             current = self._store.conversation_state(telegram_user_id)
             if current is None:
-                return
+                return False
             if current.screen_revision != screen_revision:
                 self._queue_current_view(update_id=update_id, state=current)
             elif action == "new-search" and current.stage in {
                 ConversationStage.MAIN_MENU,
                 ConversationStage.RESULTS,
             }:
+                self._acknowledge_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                )
                 self._start_new_search(update_id=update_id, current=current)
+                accepted = True
             elif (
                 action == "search-results"
                 and current.stage is ConversationStage.MAIN_MENU
             ):
+                self._acknowledge_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                )
                 self._show_search_results(update_id=update_id, current=current)
+                accepted = True
             elif action == "settings" and current.stage is ConversationStage.MAIN_MENU:
+                self._acknowledge_callback(
+                    update_id=update_id,
+                    callback_id=callback_id,
+                    current=current,
+                )
                 self._show_settings(update_id=update_id, current=current)
+                accepted = True
             else:
                 self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def select_result_action(
         self,
@@ -2771,65 +3770,89 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
-        callback_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one current Settings or Mode callback."""
+        accepted = False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 if current is None:
-                    return
+                    return False
                 if current.screen_revision != screen_revision:
                     self._queue_current_view(update_id=update_id, state=current)
                 elif current.stage is ConversationStage.SETTINGS and action == "mode":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_mode(update_id=update_id, current=current)
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.SETTINGS and action == "language"
                 ):
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_settings_language(update_id=update_id, current=current)
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.SETTINGS and action == "premium"
                 ):
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
                         update_id=update_id,
-                        callback_id=callback_id,
+                        callback_id=callback_id or update_id,
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[1],
                     )
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.SETTINGS
                     and action == "administration"
                     and self._is_administrator(current.telegram_user_id)
                 ):
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_administration(update_id=update_id, current=current)
+                    accepted = True
                 elif current.stage is ConversationStage.MODE and action == "feed":
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
                         update_id=update_id,
-                        callback_id=callback_id,
+                        callback_id=callback_id or update_id,
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[0],
                     )
+                    accepted = True
                 elif (
                     current.stage is ConversationStage.MODE and action == "mode-search"
                 ):
                     selection = self._language_rendering(current.locale or "en")
                     self._answer_placeholder_callback(
                         update_id=update_id,
-                        callback_id=callback_id,
+                        callback_id=callback_id or update_id,
                         current=current,
                         text=_placeholder_copy(current.locale or "en", selection)[2],
                     )
+                    accepted = True
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def _answer_placeholder_callback(
         self,
@@ -2839,33 +3862,54 @@ class ConversationOnboarding:
         current: ConversationState,
         text: str,
     ) -> None:
-        if self._store.commit_conversation_callback(
+        self._acknowledge_callback(
             update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+            text=text,
+        )
+
+    def _acknowledge_callback(
+        self,
+        *,
+        update_id: str,
+        callback_id: str | None,
+        current: ConversationState,
+        text: str = "",
+    ) -> None:
+        """Durably answer one accepted callback through the existing outbox."""
+        if callback_id is None:
+            return
+        self._store.commit_conversation_callback(
+            update_id=f"callback-ack:{update_id}",
             callback_id=callback_id,
             telegram_user_id=current.telegram_user_id,
             expected_revision=current.revision,
             text=text,
             recorded_at=self._clock.now(),
-        ):
-            return
+        )
+        self._deliver_pending_callback(callback_id=callback_id)
 
     def select_administration_action(
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         action: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Apply one exact-administrator Administration callback."""
+        accepted = False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 if current is None:
-                    return
+                    return False
                 if (
                     not self._is_administrator(telegram_user_id)
                     or current.screen_revision != screen_revision
@@ -2873,17 +3917,36 @@ class ConversationOnboarding:
                 ):
                     self._queue_current_view(update_id=update_id, state=current)
                 elif action == "source-chats":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_source_chats(update_id=update_id, current=current)
+                    accepted = True
                 elif action == "source-data-deletion":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_source_data_deletion_requests(
                         update_id=update_id,
                         current=current,
                     )
+                    accepted = True
                 elif action == "source-data-audit":
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._show_source_data_audit(update_id=update_id, current=current)
+                    accepted = True
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def select_source_data_deletion_action(
         self,
@@ -7057,41 +8120,51 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         locale: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Confirm one reviewed fixed Conversation Language."""
         if locale not in SUPPORTED_LOCALES:
-            raise ValueError("fixed Conversation Language is not supported")
+            return False
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
-                self._apply_fixed_language_selection(
+                accepted = self._apply_fixed_language_selection(
                     update_id=update_id,
+                    callback_id=callback_id,
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=screen_revision,
                 )
         self.deliver_pending()
+        return accepted
 
     def _apply_fixed_language_selection(
         self,
         *,
         update_id: str,
+        callback_id: str | None,
         telegram_user_id: int,
         locale: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
-            raise LookupError(telegram_user_id)
+            return False
         if (
             current.stage is ConversationStage.SETTINGS_LANGUAGE_SELECTION
             and current.screen_revision == screen_revision
         ):
+            self._acknowledge_callback(
+                update_id=update_id,
+                callback_id=callback_id,
+                current=current,
+            )
             state = replace(
                 current,
                 locale=locale,
@@ -7114,13 +8187,13 @@ class ConversationOnboarding:
                 ),
                 recorded_at=self._clock.now(),
             )
-            return
+            return True
         if (
             current.stage is not ConversationStage.LANGUAGE_SELECTION
             or current.screen_revision != screen_revision
         ):
             self._queue_current_view(update_id=update_id, state=current)
-            return
+            return False
         state = replace(
             current,
             locale=locale,
@@ -7157,6 +8230,11 @@ class ConversationOnboarding:
                 revision=current_draft.revision + 1,
                 last_activity_at=now,
             )
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+        )
         self._store.commit_conversation_update(
             update_id=update_id,
             expected_revision=current.revision,
@@ -7165,15 +8243,17 @@ class ConversationOnboarding:
             recorded_at=now,
             draft=draft,
         )
+        return True
 
     def select_direction(
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         direction: str,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Navigate an Intent Branch or confirm one terminal User Intent."""
         intent_branch = next(
             (branch for branch in IntentBranch if branch.value == direction),
@@ -7187,11 +8267,12 @@ class ConversationOnboarding:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
                 current = self._store.conversation_state(telegram_user_id)
                 draft = self._store.discovery_draft(telegram_user_id)
                 if current is None or draft is None:
-                    return
+                    return False
                 if (
                     current.stage is not draft.stage
                     or draft.screen_revision != screen_revision
@@ -7201,24 +8282,36 @@ class ConversationOnboarding:
                     draft.stage is ConversationStage.DIRECTION_MENU
                     and intent_branch is not None
                 ):
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._open_intent_branch(
                         update_id=update_id,
                         current=current,
                         draft=draft,
                         intent_branch=intent_branch,
                     )
+                    accepted = True
                 elif (
                     draft.stage is ConversationStage.DIRECTION_MENU
                     and user_intent in _DIRECT_USER_INTENTS
                 ):
                     if user_intent is None:
                         raise AssertionError("direct User Intent is missing")
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._confirm_user_intent(
                         update_id=update_id,
                         current=current,
                         draft=draft,
                         user_intent=user_intent,
                     )
+                    accepted = True
                 elif (
                     draft.stage is ConversationStage.INTENT_BRANCH
                     and draft.intent_branch is not None
@@ -7226,15 +8319,22 @@ class ConversationOnboarding:
                 ):
                     if user_intent is None:
                         raise AssertionError("branch User Intent is missing")
+                    self._acknowledge_callback(
+                        update_id=update_id,
+                        callback_id=callback_id,
+                        current=current,
+                    )
                     self._confirm_user_intent(
                         update_id=update_id,
                         current=current,
                         draft=draft,
                         user_intent=user_intent,
                     )
+                    accepted = True
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
         self.deliver_pending()
+        return accepted
 
     def select_location_suggestion(
         self,
@@ -8519,36 +9619,46 @@ class ConversationOnboarding:
         self,
         *,
         update_id: str,
+        callback_id: str | None = None,
         telegram_user_id: int,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         """Ask for one free-text language name in the current display locale."""
         with self._store.serialize_conversation_update(
             update_id=update_id,
             telegram_user_id=telegram_user_id,
         ) as processed:
+            accepted = processed
             if not processed:
-                self._apply_open_language_input(
+                accepted = self._apply_open_language_input(
                     update_id=update_id,
+                    callback_id=callback_id,
                     telegram_user_id=telegram_user_id,
                     screen_revision=screen_revision,
                 )
         self.deliver_pending()
+        return accepted
 
     def _apply_open_language_input(
         self,
         *,
         update_id: str,
+        callback_id: str | None,
         telegram_user_id: int,
         screen_revision: int,
-    ) -> None:
+    ) -> bool:
         current = self._store.conversation_state(telegram_user_id)
         if current is None:
-            raise LookupError(telegram_user_id)
+            return False
         if (
             current.stage is ConversationStage.SETTINGS_LANGUAGE_SELECTION
             and current.screen_revision == screen_revision
         ):
+            self._acknowledge_callback(
+                update_id=update_id,
+                callback_id=callback_id,
+                current=current,
+            )
             locale = current.locale or "en"
             selection = self._language_rendering(locale)
             state = replace(
@@ -8570,13 +9680,13 @@ class ConversationOnboarding:
                 ),
                 recorded_at=self._clock.now(),
             )
-            return
+            return True
         if (
             current.stage is not ConversationStage.LANGUAGE_SELECTION
             or current.screen_revision != screen_revision
         ):
             self._queue_current_view(update_id=update_id, state=current)
-            return
+            return False
         locale = current.locale or "en"
         if locale not in SUPPORTED_LOCALES:
             locale = "en"
@@ -8606,6 +9716,11 @@ class ConversationOnboarding:
             if current_draft is not None
             else None
         )
+        self._acknowledge_callback(
+            update_id=update_id,
+            callback_id=callback_id,
+            current=current,
+        )
         self._store.commit_conversation_update(
             update_id=update_id,
             expected_revision=current.revision,
@@ -8614,6 +9729,7 @@ class ConversationOnboarding:
             recorded_at=now,
             draft=draft,
         )
+        return True
 
     def submit_language_text(
         self,
@@ -15197,8 +16313,9 @@ def _source_data_deletion_input_message(
     )
     if operation == "intake":
         prompt = (
-            "Add one request with request ID, numeric Source Author ID, exact "
-            "Source Chat key, and opaque support case pointer. Do not include a body."
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body."
         )
     elif operation == "reject":
         prompt = "Enter one bounded rejection reason without whitespace."
@@ -21369,6 +22486,98 @@ def _source_data_deletion_request_by_id(
     return next(
         (request for request in requests if request.request_id == request_id), None
     )
+
+
+def _source_data_deletion_input_operation(
+    *,
+    current: ConversationState,
+    current_message: TelegramMessage | None,
+) -> tuple[str, str | None, str | None] | None:
+    """Identify the exact operation represented by the current input prompt."""
+    if (
+        current_message is None
+        or current_message.screen_revision != current.screen_revision
+    ):
+        return None
+    prompt = current_message.text
+    if prompt.startswith("Enter exactly request_id=<opaque>"):
+        return "intake", None, None
+    request_id = current.source_data_deletion_request_id
+    if request_id is None:
+        return None
+    escaped_request_id = re.escape(request_id)
+    if re.fullmatch(
+        rf"request={escaped_request_id}\n\nEnter one bounded rejection reason "
+        rf"without whitespace\.",
+        prompt,
+    ):
+        return "reject", request_id, None
+    completion = re.fullmatch(
+        rf"request={escaped_request_id}\n\nEnter body-free completion proof "
+        rf"pointer for outcome "
+        rf"(completed|data_not_found)\.",
+        prompt,
+    )
+    if completion is not None:
+        return "complete", request_id, completion.group(1)
+    return None
+
+
+def _parse_source_data_deletion_intake_text(
+    value: str,
+) -> tuple[str, int, str, str] | None:
+    """Parse the four body-free key/value fields accepted by the intake prompt."""
+    fields: dict[str, str] = {}
+    aliases = {
+        "request": "request_id",
+        "request_id": "request_id",
+        "source_author": "source_author",
+        "source_author_id": "source_author",
+        "source_chat": "source_chat",
+        "support_case": "support_case",
+        "support_case_pointer": "support_case",
+    }
+    for token in value.split():
+        key, separator, field_value = token.partition("=")
+        canonical_key = aliases.get(key)
+        if separator != "=" or canonical_key is None or not field_value:
+            return None
+        if canonical_key in fields:
+            return None
+        fields[canonical_key] = field_value
+    if set(fields) != {
+        "request_id",
+        "source_author",
+        "source_chat",
+        "support_case",
+    }:
+        return None
+    request_id = _bounded_no_whitespace_text(fields["request_id"], maximum_length=256)
+    source_author = fields["source_author"]
+    source_chat = fields["source_chat"]
+    support_case = _bounded_no_whitespace_text(
+        fields["support_case"], maximum_length=256
+    )
+    if (
+        request_id is None
+        or support_case is None
+        or re.fullmatch(r"[1-9][0-9]*", source_author) is None
+        or re.fullmatch(r"source-chat:(?:chat|channel):[1-9][0-9]*", source_chat)
+        is None
+    ):
+        return None
+    return request_id, int(source_author), source_chat, support_case
+
+
+def _bounded_no_whitespace_text(value: str, *, maximum_length: int) -> str | None:
+    """Return one non-empty opaque token within a reviewed field bound."""
+    if (
+        not value
+        or len(value) > maximum_length
+        or any(character.isspace() for character in value)
+    ):
+        return None
+    return value
 
 
 def _source_data_deletion_manage_envelope(

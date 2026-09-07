@@ -361,20 +361,54 @@ def test_settings_language_change_rerenders_without_changing_domain_state() -> N
         ),
         (("Back", f"settings-language:back:{selector.screen_revision}"),),
     )
-    system.select_fixed_language(
+    system.open_language_input(
+        update_id="open-settings-language-input",
+        telegram_user_id=user_id,
+        screen_revision=selector.screen_revision,
+    )
+    assert system._conversation_onboarding().handle_message(
         update_id="change-settings-language",
         telegram_user_id=user_id,
-        locale="ru",
+        text="Deutsch",
+        telegram_language_hint=None,
     )
 
     state = system.conversation_state(user_id)
-    assert state.locale == "ru"
+    assert state.locale == "de"
     assert state.stage is ConversationStage.SETTINGS
-    assert telegram.messages[-1].text == "⚙️ **Настройки**"
+    assert telegram.messages[-1].text == "⚙️ **Einstellungen**"
     assert system.discovery_draft(user_id) == paused_before
     assert system.completed_searches(user_id) == completed_before
     assert system.results(completed_before[0].completed_search_id) == ()
     assert system.active_result_context(user_id) == context_before
+    system.reset()
+
+
+def test_non_root_callback_ack_precedes_failed_presentation() -> None:
+    system, telegram, _clock = _boot_menu_system()
+    user_id = 45_016
+    _complete_zero_result_search(system, user_id=user_id)
+    _advance_repeated_search_to_post_core(system, user_id=user_id)
+    system.open_game_search_details(
+        update_id="open-details-for-callback-order",
+        telegram_user_id=user_id,
+    )
+    details = telegram.messages[-1]
+    callback_data = details.button_rows[0][0][1]
+
+    telegram.fail_next()
+    with pytest.raises(InjectedTelegramDeliveryError):
+        system._conversation_onboarding().handle_callback(
+            update_id="non-root-callback-with-failed-render",
+            callback_id="callback-non-root-order",
+            telegram_user_id=user_id,
+            data=callback_data,
+            screen_revision=details.screen_revision,
+            telegram_message_id="telegram-message:details",
+        )
+
+    assert ("callback-non-root-order", "") in telegram.callback_notifications
+    assert system.retry_bot_presentations() is True
     system.reset()
 
 
@@ -746,6 +780,54 @@ def test_placeholder_uses_callback_query_identity_not_bot_update_identity() -> N
     assert telegram.callback_notifications[-1] == (
         "telegram-callback-query-identity",
         "Feed will be available after the MVP.",
+    )
+    system.reset()
+
+
+def test_accepted_navigation_callbacks_acknowledge_their_callback_identity() -> None:
+    system, telegram, _clock = _boot_menu_system()
+    user_id = 45_015
+    _complete_zero_result_search(system, user_id=user_id)
+    system.open_main_menu(
+        update_id="menu-before-navigation-callback-ack",
+        telegram_user_id=user_id,
+    )
+    main_menu = telegram.messages[-1]
+
+    system.select_main_menu_action(
+        update_id="accepted-menu-callback",
+        callback_id="callback-menu-navigation",
+        telegram_user_id=user_id,
+        action="settings",
+        screen_revision=main_menu.screen_revision,
+    )
+    assert telegram.callback_notifications[-1] == ("callback-menu-navigation", "")
+    settings = telegram.messages[-1]
+
+    system.select_settings_action(
+        update_id="accepted-settings-callback",
+        callback_id="callback-settings-navigation",
+        telegram_user_id=user_id,
+        action="mode",
+        screen_revision=settings.screen_revision,
+    )
+    assert telegram.callback_notifications[-1] == (
+        "callback-settings-navigation",
+        "",
+    )
+
+    notifications_before_rejected = tuple(telegram.callback_notifications)
+    system.select_settings_action(
+        update_id="rejected-settings-callback",
+        callback_id="callback-rejected-settings",
+        telegram_user_id=user_id,
+        action="language",
+        screen_revision=settings.screen_revision,
+    )
+    assert tuple(telegram.callback_notifications) == notifications_before_rejected
+    assert all(
+        callback_id != "callback-rejected-settings"
+        for callback_id, _text in telegram.callback_notifications
     )
     system.reset()
 

@@ -47,8 +47,6 @@ def _migration_paths() -> list[Path]:
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-14:] == [
-        "0043_source_chat_administration_lifecycle.sql",
-        "0044_source_chat_lifecycle_cancellation.sql",
         "0045_source_retention_audit_role_isolation.sql",
         "0046_result_variants.sql",
         "0047_allow_silent_callback_ack.sql",
@@ -61,6 +59,8 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0054_source_data_deletion_replay_retention.sql",
         "0055_source_message_deletion_boundary.sql",
         "0056_source_data_deletion_bot_fail_closed.sql",
+        "0057_bot_api_continuity.sql",
+        "0058_bot_api_delivery_reconciliation.sql",
     ]
 
 
