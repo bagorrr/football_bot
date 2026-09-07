@@ -94,6 +94,7 @@ from modules.domain import (
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceDataAuditEvent,
+    SourceDataDeletionRequest,
     SourceEventKind,
     SourceMessageRevision,
     TelegramDeliveryMode,
@@ -1828,6 +1829,7 @@ _ADMINISTRATION_COPY = {
     "en": (
         "⚙️ **Administration**",
         "Source Chats",
+        "Source Data Deletion Requests",
         "Source Data Audit",
         "Back",
         "Menu",
@@ -1835,6 +1837,7 @@ _ADMINISTRATION_COPY = {
     "ru": (
         "⚙️ **Администрирование**",
         "Source Chats",
+        "Запросы на удаление Source Data",
         "Аудит Source Data",
         "Назад",
         "Меню",
@@ -1842,6 +1845,7 @@ _ADMINISTRATION_COPY = {
     "es": (
         "⚙️ **Administración**",
         "Source Chats",
+        "Solicitudes de eliminación de Source Data",
         "Auditoría de Source Data",
         "Atrás",
         "Menú",
@@ -1849,10 +1853,94 @@ _ADMINISTRATION_COPY = {
     "fr": (
         "⚙️ **Administration**",
         "Source Chats",
+        "Demandes de suppression de Source Data",
         "Audit des Source Data",
         "Retour",
         "Menu",
     ),
+}
+
+_SOURCE_DATA_DELETION_COPY = {
+    "en": (
+        "🗑️ **Source Data Deletion Requests**\n\n"
+        "Exact Source Author and Source Chat requests. The view is body-free.",
+        "Back",
+        "Menu",
+    ),
+    "ru": (
+        "🗑️ **Запросы на удаление Source Data**\n\n"
+        "Точные запросы Source Author и Source Chat. Просмотр не содержит тела.",
+        "Назад",
+        "Меню",
+    ),
+    "es": (
+        "🗑️ **Solicitudes de eliminación de Source Data**\n\n"
+        "Solicitudes exactas de Source Author y Source Chat. "
+        "La vista no contiene cuerpos.",
+        "Atrás",
+        "Menú",
+    ),
+    "fr": (
+        "🗑️ **Demandes de suppression de Source Data**\n\n"
+        "Demandes exactes de Source Author et Source Chat. La vue est sans corps.",
+        "Retour",
+        "Menu",
+    ),
+}
+
+_SOURCE_DATA_DELETION_ACTION_COPY = {
+    "en": {
+        "add": "Add Request",
+        "approve": "Approve",
+        "reject": "Reject",
+        "review": "Review Target",
+        "retry": "Review Retry",
+        "notify": "Requester Notified",
+        "complete": "Complete",
+        "data_not_found": "Data Not Found",
+        "confirm_start": "Confirm Start",
+        "back": "Back",
+        "menu": "Menu",
+    },
+    "ru": {
+        "add": "Добавить запрос",
+        "approve": "Одобрить",
+        "reject": "Отклонить",
+        "review": "Проверить цель",
+        "retry": "Повторно проверить",
+        "notify": "Уведомление отправлено",
+        "complete": "Завершить",
+        "data_not_found": "Данные не найдены",
+        "confirm_start": "Подтвердить запуск",
+        "back": "Назад",
+        "menu": "Меню",
+    },
+    "es": {
+        "add": "Añadir solicitud",
+        "approve": "Aprobar",
+        "reject": "Rechazar",
+        "review": "Revisar objetivo",
+        "retry": "Revisar de nuevo",
+        "notify": "Solicitante notificado",
+        "complete": "Completar",
+        "data_not_found": "Datos no encontrados",
+        "confirm_start": "Confirmar inicio",
+        "back": "Atrás",
+        "menu": "Menú",
+    },
+    "fr": {
+        "add": "Ajouter une demande",
+        "approve": "Approuver",
+        "reject": "Rejeter",
+        "review": "Vérifier la cible",
+        "retry": "Vérifier à nouveau",
+        "notify": "Demandeur notifié",
+        "complete": "Terminer",
+        "data_not_found": "Données introuvables",
+        "confirm_start": "Confirmer le démarrage",
+        "back": "Retour",
+        "menu": "Menu",
+    },
 }
 
 _SOURCE_DATA_AUDIT_COPY = {
@@ -2786,10 +2874,276 @@ class ConversationOnboarding:
                     self._queue_current_view(update_id=update_id, state=current)
                 elif action == "source-chats":
                     self._show_source_chats(update_id=update_id, current=current)
+                elif action == "source-data-deletion":
+                    self._show_source_data_deletion_requests(
+                        update_id=update_id,
+                        current=current,
+                    )
                 elif action == "source-data-audit":
                     self._show_source_data_audit(update_id=update_id, current=current)
                 else:
                     self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def select_source_data_deletion_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int,
+    ) -> None:
+        """Apply one bounded administrator Source Data Deletion callback."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if processed:
+                return
+            current = self._store.conversation_state(telegram_user_id)
+            if current is None:
+                return
+            if (
+                not self._is_administrator(telegram_user_id)
+                or current.screen_revision != screen_revision
+                or current.stage
+                not in {
+                    ConversationStage.SOURCE_DATA_DELETION_REQUESTS,
+                    ConversationStage.SOURCE_DATA_DELETION_REVIEW,
+                    ConversationStage.SOURCE_DATA_DELETION_INPUT,
+                }
+            ):
+                self._queue_current_view(update_id=update_id, state=current)
+            else:
+                parsed = _parse_source_data_deletion_action(
+                    action,
+                    screen_revision=screen_revision,
+                )
+                if parsed is None:
+                    self._queue_current_view(update_id=update_id, state=current)
+                else:
+                    phase, token = parsed
+                    request = _source_data_deletion_request_for_token(
+                        self._store.source_data_deletion_requests(),
+                        token,
+                    )
+                    if current.stage is ConversationStage.SOURCE_DATA_DELETION_REQUESTS:
+                        if phase == "back":
+                            self._show_administration(
+                                update_id=update_id,
+                                current=current,
+                            )
+                        elif phase == "intake":
+                            self._show_source_data_deletion_input(
+                                update_id=update_id,
+                                current=current,
+                                operation="intake",
+                            )
+                        elif request is None:
+                            self._queue_current_view(update_id=update_id, state=current)
+                        elif (
+                            phase == "approve"
+                            and request.status.value == "pending_decision"
+                        ):
+                            self._commit_source_data_deletion_command(
+                                update_id=update_id,
+                                current=current,
+                                request=request,
+                                action="approve",
+                                decision_reason=None,
+                            )
+                        elif (
+                            phase == "reject"
+                            and request.status.value == "pending_decision"
+                        ):
+                            self._show_source_data_deletion_input(
+                                update_id=update_id,
+                                current=current,
+                                operation="reject",
+                                request=request,
+                            )
+                        elif phase == "review" and request.status.value in {
+                            "approved_awaiting_execution",
+                            "execution_error",
+                        }:
+                            self._show_source_data_deletion_review(
+                                update_id=update_id,
+                                current=current,
+                                request=request,
+                            )
+                        elif phase == "notify" and request.status.value in {
+                            "approved_awaiting_execution",
+                            "rejected",
+                            "suppressing",
+                            "executing",
+                            "execution_error",
+                            "awaiting_completion",
+                            "completed",
+                        }:
+                            self._commit_source_data_deletion_command(
+                                update_id=update_id,
+                                current=current,
+                                request=request,
+                                action="notify",
+                            )
+                        elif (
+                            phase in {"complete", "data-not-found"}
+                            and request.status.value == "awaiting_completion"
+                        ):
+                            self._show_source_data_deletion_input(
+                                update_id=update_id,
+                                current=current,
+                                operation="complete",
+                                request=request,
+                                completion_outcome=(
+                                    "data_not_found"
+                                    if phase == "data-not-found"
+                                    else "completed"
+                                ),
+                            )
+                        else:
+                            self._queue_current_view(update_id=update_id, state=current)
+                    elif current.stage is ConversationStage.SOURCE_DATA_DELETION_REVIEW:
+                        if phase == "back":
+                            self._show_source_data_deletion_requests(
+                                update_id=update_id,
+                                current=current,
+                            )
+                        elif (
+                            phase == "start"
+                            and request is not None
+                            and request.status.value
+                            in {
+                                "approved_awaiting_execution",
+                                "execution_error",
+                            }
+                        ):
+                            self._commit_source_data_deletion_command(
+                                update_id=update_id,
+                                current=current,
+                                request=request,
+                                action="start",
+                            )
+                        else:
+                            self._queue_current_view(update_id=update_id, state=current)
+                    else:
+                        if phase == "back":
+                            self._show_source_data_deletion_requests(
+                                update_id=update_id,
+                                current=current,
+                            )
+                        else:
+                            self._queue_current_view(update_id=update_id, state=current)
+        self.deliver_pending()
+
+    def submit_source_data_deletion_request(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        source_author_telegram_id: int,
+        source_chat_key: str,
+        support_case_pointer: str,
+        screen_revision: int,
+    ) -> None:
+        """Submit structured support intake without passing through a model."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._current_source_data_deletion_input(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                if current is not None:
+                    self._commit_source_data_deletion_command(
+                        update_id=update_id,
+                        current=current,
+                        action="intake",
+                        request_id=request_id,
+                        source_author_telegram_id=source_author_telegram_id,
+                        source_chat_key=source_chat_key,
+                        support_case_pointer=support_case_pointer,
+                    )
+        self.deliver_pending()
+
+    def submit_source_data_deletion_reason(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        decision_reason: str,
+        screen_revision: int,
+    ) -> None:
+        """Submit one bounded rejection reason from the current input screen."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._current_source_data_deletion_input(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                request = _source_data_deletion_request_by_id(
+                    self._store.source_data_deletion_requests(), request_id
+                )
+                if (
+                    current is not None
+                    and current.source_data_deletion_request_id == request_id
+                    and request is not None
+                ):
+                    self._commit_source_data_deletion_command(
+                        update_id=update_id,
+                        current=current,
+                        request=request,
+                        action="reject",
+                        decision_reason=decision_reason,
+                    )
+        self.deliver_pending()
+
+    def submit_source_data_deletion_completion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        completion_outcome: str,
+        completion_proof_pointer: str,
+        screen_revision: int,
+    ) -> None:
+        """Submit manual completion proof through a bounded input seam."""
+        with self._store.serialize_conversation_update(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+        ) as processed:
+            if not processed:
+                current = self._current_source_data_deletion_input(
+                    update_id=update_id,
+                    telegram_user_id=telegram_user_id,
+                    screen_revision=screen_revision,
+                )
+                request = _source_data_deletion_request_by_id(
+                    self._store.source_data_deletion_requests(), request_id
+                )
+                if (
+                    current is not None
+                    and current.source_data_deletion_request_id == request_id
+                    and request is not None
+                ):
+                    self._commit_source_data_deletion_command(
+                        update_id=update_id,
+                        current=current,
+                        request=request,
+                        action="complete",
+                        completion_outcome=completion_outcome,
+                        completion_proof_pointer=completion_proof_pointer,
+                    )
         self.deliver_pending()
 
     def select_source_chats_action(
@@ -3400,6 +3754,156 @@ class ConversationOnboarding:
             recorded_at=self._clock.now(),
         )
 
+    def _show_source_data_deletion_review(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        request: SourceDataDeletionRequest,
+    ) -> None:
+        """Render the exact target set before explicit suppression confirmation."""
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_DATA_DELETION_REVIEW,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_data_deletion_review_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=current.locale or "en",
+                screen_revision=state.screen_revision,
+                request=request,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_source_data_deletion_input(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        operation: str,
+        request: SourceDataDeletionRequest | None = None,
+        completion_outcome: str | None = None,
+    ) -> None:
+        """Render a fixed structured-input prompt for one deletion operation."""
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_DATA_DELETION_INPUT,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+            source_data_deletion_request_id=(
+                request.request_id if request is not None else None
+            ),
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_data_deletion_input_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=current.locale or "en",
+                screen_revision=state.screen_revision,
+                operation=operation,
+                request=request,
+                completion_outcome=completion_outcome,
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _current_source_data_deletion_input(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        screen_revision: int,
+    ) -> ConversationState | None:
+        """Return the current authorized structured-input screen, if it is fresh."""
+        current = self._store.conversation_state(telegram_user_id)
+        if (
+            current is None
+            or not self._is_administrator(telegram_user_id)
+            or current.stage is not ConversationStage.SOURCE_DATA_DELETION_INPUT
+            or current.screen_revision != screen_revision
+        ):
+            if current is not None:
+                self._queue_current_view(update_id=update_id, state=current)
+            return None
+        return current
+
+    def _commit_source_data_deletion_command(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+        action: str,
+        request: SourceDataDeletionRequest | None = None,
+        request_id: str | None = None,
+        decision_reason: str | None = None,
+        source_author_telegram_id: int | None = None,
+        source_chat_key: str | None = None,
+        support_case_pointer: str | None = None,
+        completion_outcome: str | None = None,
+        completion_proof_pointer: str | None = None,
+    ) -> None:
+        """Commit one deterministic administrator command and return to the list."""
+        target_request_id = request.request_id if request is not None else request_id
+        if target_request_id is None:
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        recorded_at = self._clock.now()
+        command = _source_data_deletion_manage_envelope(
+            request_id=target_request_id,
+            administrator_id=current.telegram_user_id,
+            action=action,
+            recorded_at=recorded_at,
+            notification_phase=(
+                request.status.value
+                if action == "notify" and request is not None
+                else None
+            ),
+            decision_reason=decision_reason,
+            source_author_telegram_id=source_author_telegram_id,
+            source_chat_key=source_chat_key,
+            support_case_pointer=support_case_pointer,
+            completion_outcome=completion_outcome,
+            completion_proof_pointer=completion_proof_pointer,
+        )
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_DATA_DELETION_REQUESTS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+            source_data_deletion_request_id=None,
+        )
+        self._store.commit_source_data_deletion_command(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_data_deletion_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=current.locale or "en",
+                screen_revision=state.screen_revision,
+                selection=self._language_rendering(current.locale or "en"),
+                requests=self._store.source_data_deletion_requests(),
+            ),
+            command=command,
+            recorded_at=recorded_at,
+        )
+
     def _show_source_chats(
         self,
         *,
@@ -3459,6 +3963,37 @@ class ConversationOnboarding:
                 screen_revision=state.screen_revision,
                 selection=self._language_rendering(locale),
                 events=self._store.source_data_audit(),
+            ),
+            recorded_at=self._clock.now(),
+        )
+
+    def _show_source_data_deletion_requests(
+        self,
+        *,
+        update_id: str,
+        current: ConversationState,
+    ) -> None:
+        if not self._is_administrator(current.telegram_user_id):
+            self._queue_current_view(update_id=update_id, state=current)
+            return
+        locale = current.locale or "en"
+        state = replace(
+            current,
+            stage=ConversationStage.SOURCE_DATA_DELETION_REQUESTS,
+            screen_revision=current.screen_revision + 1,
+            revision=current.revision + 1,
+        )
+        self._store.commit_conversation_update(
+            update_id=update_id,
+            expected_revision=current.revision,
+            state=state,
+            message=_source_data_deletion_message(
+                update_id=update_id,
+                telegram_user_id=current.telegram_user_id,
+                locale=locale,
+                screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale),
+                requests=self._store.source_data_deletion_requests(),
             ),
             recorded_at=self._clock.now(),
         )
@@ -7749,6 +8284,16 @@ class ConversationOnboarding:
                     self._show_main_menu(update_id=update_id, current=current)
                 elif current.stage is ConversationStage.ADMINISTRATION:
                     self._show_settings(update_id=update_id, current=current)
+                elif current.stage is ConversationStage.SOURCE_DATA_DELETION_REQUESTS:
+                    self._show_administration(update_id=update_id, current=current)
+                elif current.stage in {
+                    ConversationStage.SOURCE_DATA_DELETION_REVIEW,
+                    ConversationStage.SOURCE_DATA_DELETION_INPUT,
+                }:
+                    self._show_source_data_deletion_requests(
+                        update_id=update_id,
+                        current=current,
+                    )
                 elif current.stage is ConversationStage.SOURCE_CHATS:
                     self._show_administration(update_id=update_id, current=current)
                 elif current.stage is ConversationStage.SOURCE_CHAT_ADDRESS_INPUT:
@@ -8219,6 +8764,9 @@ class ConversationOnboarding:
     def _queue_current_view(self, *, update_id: str, state: ConversationState) -> None:
         administrator_stages = {
             ConversationStage.ADMINISTRATION,
+            ConversationStage.SOURCE_DATA_DELETION_REQUESTS,
+            ConversationStage.SOURCE_DATA_DELETION_REVIEW,
+            ConversationStage.SOURCE_DATA_DELETION_INPUT,
             ConversationStage.SOURCE_CHATS,
             ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
             ConversationStage.SOURCE_CHAT_REGISTRATION_PENDING,
@@ -8257,6 +8805,9 @@ class ConversationOnboarding:
                 ConversationStage.MAIN_MENU,
                 ConversationStage.SETTINGS,
                 ConversationStage.ADMINISTRATION,
+                ConversationStage.SOURCE_DATA_DELETION_REQUESTS,
+                ConversationStage.SOURCE_DATA_DELETION_REVIEW,
+                ConversationStage.SOURCE_DATA_DELETION_INPUT,
                 ConversationStage.SOURCE_CHATS,
                 ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
                 ConversationStage.SOURCE_CHAT_REGISTRATION_PENDING,
@@ -8327,6 +8878,10 @@ class ConversationOnboarding:
                 "source-chats:",
                 "source-chat-address:",
                 "source-chat-pending:",
+                "source-data-deletion:",
+                "source-data-deletion-reminder:",
+                "source-data-deletion-review:",
+                "source-data-deletion-input:",
             )
         ) or any(
             callback.startswith("settings:administration:")
@@ -14431,7 +14986,14 @@ def _administration_message(
     selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
     if locale in SUPPORTED_LOCALES:
-        text, source_chats, source_data_audit, back, menu = _ADMINISTRATION_COPY[locale]
+        (
+            text,
+            source_chats,
+            source_data_deletion,
+            source_data_audit,
+            back,
+            menu,
+        ) = _ADMINISTRATION_COPY[locale]
     elif (
         selection is not None
         and selection.locale == locale
@@ -14440,6 +15002,9 @@ def _administration_message(
     ):
         text = selection.administration_text
         source_chats, source_data_audit, back, menu = selection.administration_labels
+        source_data_deletion = (
+            selection.source_data_deletion_label or "Source Data Deletion Requests"
+        )
     else:
         raise RuntimeError("Conversation Language has no Administration rendering")
     return TelegramMessage(
@@ -14452,12 +15017,204 @@ def _administration_message(
             ((source_chats, f"administration:source-chats:{screen_revision}"),),
             (
                 (
+                    source_data_deletion,
+                    f"administration:source-data-deletion:{screen_revision}",
+                ),
+            ),
+            (
+                (
                     source_data_audit,
                     f"administration:source-data-audit:{screen_revision}",
                 ),
             ),
             ((back, f"administration:back:{screen_revision}"),),
         ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_data_deletion_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    selection: LanguageSelection | None = None,
+    requests: tuple[SourceDataDeletionRequest, ...] = (),
+) -> TelegramMessage:
+    if locale in SUPPORTED_LOCALES:
+        text, back, menu = _SOURCE_DATA_DELETION_COPY[locale]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_text is not None
+        and selection.source_data_deletion_labels is not None
+    ):
+        text = selection.source_data_deletion_text
+        back, menu = selection.source_data_deletion_labels
+    else:
+        text, back, menu = _SOURCE_DATA_DELETION_COPY["en"]
+    actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
+    )
+    lines = [text]
+    button_rows: list[tuple[tuple[str, str], ...]] = [
+        ((actions["add"], f"sdd:intake:{screen_revision}"),),
+    ]
+    for request in requests:
+        token = _source_data_deletion_callback_token(request.request_id)
+        lines.append(
+            " · ".join(
+                (
+                    request.request_id,
+                    f"author={request.source_author_telegram_id}",
+                    request.source_chat_key,
+                    f"case={request.support_case_pointer}",
+                    f"status={request.status.value}",
+                    f"decision_due={request.decision_due_at.isoformat()}",
+                    f"completion_due={request.completion_due_at.isoformat()}",
+                    f"notification={request.requester_notification_status}",
+                )
+            )
+        )
+        if request.status.value == "pending_decision":
+            button_rows.append(
+                (
+                    (actions["approve"], f"sdd:approve:{token}:{screen_revision}"),
+                    (actions["reject"], f"sdd:reject:{token}:{screen_revision}"),
+                )
+            )
+        elif request.status.value in {"approved_awaiting_execution", "execution_error"}:
+            button_rows.append(
+                (
+                    (
+                        actions[
+                            "retry"
+                            if request.status.value == "execution_error"
+                            else "review"
+                        ],
+                        f"sdd:review:{token}:{screen_revision}",
+                    ),
+                )
+            )
+            if request.status.value == "approved_awaiting_execution":
+                button_rows.append(
+                    ((actions["notify"], f"sdd:notify:{token}:{screen_revision}"),)
+                )
+        elif request.status.value in {
+            "rejected",
+            "suppressing",
+            "executing",
+            "awaiting_completion",
+            "completed",
+        }:
+            button_rows.append(
+                ((actions["notify"], f"sdd:notify:{token}:{screen_revision}"),)
+            )
+            if request.status.value == "awaiting_completion":
+                button_rows.append(
+                    (
+                        (
+                            actions["complete"],
+                            f"sdd:complete:{token}:{screen_revision}",
+                        ),
+                        (
+                            actions["data_not_found"],
+                            f"sdd:data-not-found:{token}:{screen_revision}",
+                        ),
+                    )
+                )
+    button_rows.append(((back, f"sdd:back:{screen_revision}"),))
+    return TelegramMessage(
+        delivery_id=f"source-data-deletion:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text="\n\n".join(lines),
+        button_rows=tuple(button_rows),
+        reply_button=menu or actions["menu"],
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_data_deletion_review_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    request: SourceDataDeletionRequest,
+) -> TelegramMessage:
+    """Render a body-free exact author/chat scope before execution."""
+    actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
+    )
+    token = _source_data_deletion_callback_token(request.request_id)
+    text = (
+        "🛡️ **Review Source Data Deletion target**\n\n"
+        f"request={request.request_id}\n"
+        f"source_author={request.source_author_telegram_id}\n"
+        f"source_chat={request.source_chat_key}\n"
+        f"support_case={request.support_case_pointer}\n"
+        f"status={request.status.value}\n\n"
+        "This starts request-scoped suppression and deletion. Confirm explicitly."
+    )
+    menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    return TelegramMessage(
+        delivery_id=f"source-data-deletion-review:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=text,
+        button_rows=(
+            (
+                (
+                    actions["confirm_start"],
+                    f"sdd:start:{token}:{screen_revision}",
+                ),
+            ),
+            ((actions["back"], f"sdd:back:{screen_revision}"),),
+        ),
+        reply_button=menu,
+        reply_keyboard_action=ReplyKeyboardAction.BUTTON,
+    )
+
+
+def _source_data_deletion_input_message(
+    *,
+    update_id: str,
+    telegram_user_id: int,
+    locale: str,
+    screen_revision: int,
+    operation: str,
+    request: SourceDataDeletionRequest | None = None,
+    completion_outcome: str | None = None,
+) -> TelegramMessage:
+    """Render a fixed prompt for structured administrator input."""
+    actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
+    )
+    if operation == "intake":
+        prompt = (
+            "Add one request with request ID, numeric Source Author ID, exact "
+            "Source Chat key, and opaque support case pointer. Do not include a body."
+        )
+    elif operation == "reject":
+        prompt = "Enter one bounded rejection reason without whitespace."
+    else:
+        outcome = completion_outcome or "completed"
+        prompt = f"Enter body-free completion proof pointer for outcome {outcome}."
+    if request is not None:
+        prompt = f"request={request.request_id}\n\n{prompt}"
+    menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
+    return TelegramMessage(
+        delivery_id=f"source-data-deletion-input:{update_id}",
+        telegram_user_id=telegram_user_id,
+        display_locale=locale,
+        screen_revision=screen_revision,
+        text=prompt,
+        button_rows=(((actions["back"], f"sdd:back:{screen_revision}"),),),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -15247,36 +16004,47 @@ class RuntimeApplication:
         if self.supported_versions:
             return
         for definition in SUPPORTED_CONTRACTS:
-            if definition.consumer is self.role and (
-                definition.version == 1
-                or (
-                    definition.name is ContractName.SOURCE_EVENT_RECORDED
-                    and definition.version in {3, 4}
-                )
-                or (
-                    definition.name is ContractName.SEARCH_COMPLETED
-                    and definition.version == 2
-                )
-                or (
-                    definition.name is ContractName.RUN_SEARCH
-                    and definition.version in {2, 3}
-                )
-                or (
-                    definition.name
-                    in {
-                        ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
-                        ContractName.CLASSIFICATION_PROPOSAL,
-                        ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
-                    }
-                    and definition.version in {2, 3, 4, 5, 6, 7}
-                )
-                or (
-                    definition.name
-                    in {
-                        ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
-                        ContractName.SOURCE_CHAT_GENERATION_CHANGED,
-                    }
-                    and definition.version == 2
+            is_owner_scoped_deletion_command = (
+                definition.name
+                in {
+                    ContractName.SUPPRESS_SOURCE_SCOPE,
+                    ContractName.DELETE_SOURCE_SCOPE,
+                }
+                and definition.version == 1
+            )
+            if is_owner_scoped_deletion_command or (
+                definition.consumer is self.role
+                and (
+                    definition.version == 1
+                    or (
+                        definition.name is ContractName.SOURCE_EVENT_RECORDED
+                        and definition.version in {3, 4}
+                    )
+                    or (
+                        definition.name is ContractName.SEARCH_COMPLETED
+                        and definition.version == 2
+                    )
+                    or (
+                        definition.name is ContractName.RUN_SEARCH
+                        and definition.version in {2, 3}
+                    )
+                    or (
+                        definition.name
+                        in {
+                            ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION,
+                            ContractName.CLASSIFICATION_PROPOSAL,
+                            ContractName.OPPORTUNITY_PUBLICATION_CHANGED,
+                        }
+                        and definition.version in {2, 3, 4, 5, 6, 7}
+                    )
+                    or (
+                        definition.name
+                        in {
+                            ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
+                            ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+                        }
+                        and definition.version == 2
+                    )
                 )
             ):
                 self.supported_versions.setdefault(definition.name, set()).add(
@@ -15290,6 +16058,26 @@ class RuntimeApplication:
     def versions_for(self, contract_name: ContractName) -> set[int]:
         """Return explicit versions supported by this consumer."""
         return set(self.supported_versions.get(contract_name, set()))
+
+    def _source_message_deletion_barrier(
+        self,
+        incoming: RawContractEnvelope,
+        *,
+        source_message_id: str | None = None,
+    ) -> bool:
+        """Apply a deletion boundary to one immutable Source Message revision."""
+        payload = incoming.payload
+        revision_id = (
+            payload.get("source_message_revision_id")
+            if isinstance(payload, dict)
+            else None
+        )
+        return self.store.source_message_deletion_barrier(
+            source_message_id or incoming.subject_id,
+            source_message_revision_id=(
+                revision_id if isinstance(revision_id, str) else None
+            ),
+        )
 
     def record_source_event(
         self,
@@ -15862,7 +16650,7 @@ class RuntimeApplication:
         if (
             self.role is RuntimeRole.CLASSIFICATION
             and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
-            and self.store.source_message_deletion_barrier(incoming.subject_id)
+            and self._source_message_deletion_barrier(incoming)
         ):
             result = self.store.consume(
                 incoming=incoming,
@@ -15895,7 +16683,10 @@ class RuntimeApplication:
             revision_id = incoming.payload.get("source_message_revision_id")
             if isinstance(revision_id, str) and ":revision:" in revision_id:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
-                if self.store.source_message_deletion_barrier(source_message_id):
+                if self._source_message_deletion_barrier(
+                    incoming,
+                    source_message_id=source_message_id,
+                ):
                     result = self.store.consume(
                         incoming=incoming,
                         supported_versions=self.versions_for(incoming.contract_name),
@@ -15912,6 +16703,51 @@ class RuntimeApplication:
                     )
                     return result is ConsumeResult.APPLIED
         envelope = ContractEnvelope.from_raw(incoming)
+        if envelope.contract_name in {
+            ContractName.SUPPRESS_SOURCE_SCOPE,
+            ContractName.DELETE_SOURCE_SCOPE,
+        }:
+            result = self.store.process_source_scope_command(
+                incoming=envelope,
+                received_at=self.clock.now(),
+            )
+            return result is ConsumeResult.APPLIED
+        if (
+            self.role is RuntimeRole.APPLICATION
+            and envelope.contract_name is ContractName.MANAGE_SOURCE_DATA_DELETION
+        ):
+            result = self.store.apply_source_data_deletion_admin_command(
+                incoming=envelope,
+                received_at=self.clock.now(),
+            )
+            return result is ConsumeResult.APPLIED
+        if (
+            self.role is RuntimeRole.BOT_ASSISTANT
+            and envelope.contract_name is ContractName.SOURCE_DATA_DELETION_REMINDER
+        ):
+            result = self.store.accept_source_data_deletion_reminder(
+                incoming=envelope,
+                received_at=self.clock.now(),
+            )
+            return result is ConsumeResult.APPLIED
+        if self.role is RuntimeRole.APPLICATION and envelope.contract_name in {
+            ContractName.SOURCE_SCOPE_SUPPRESSED,
+            ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+            ContractName.SOURCE_SCOPE_DELETION_FAILED,
+        }:
+            result = self.store.accept_source_data_deletion_event(
+                incoming=envelope,
+                received_at=self.clock.now(),
+            )
+            return result is ConsumeResult.APPLIED
+        if envelope.contract_name is ContractName.GET_SOURCE_DELETION_STATUS:
+            result = self.store.consume(
+                incoming=envelope,
+                supported_versions=self.versions_for(envelope.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return result is ConsumeResult.APPLIED
         result = self.store.consume(
             incoming=envelope,
             supported_versions=self.versions_for(incoming.contract_name),
@@ -15959,6 +16795,10 @@ class RuntimeApplication:
             self.store.cleanup_expired_source_data(as_of=self.clock.now())
             self.store.cleanup_expired_source_message_tombstones(as_of=self.clock.now())
             self.store.cleanup_expired_moderation_events(as_of=self.clock.now())
+            self.store.remind_source_data_deletion_requests(
+                as_of=self.clock.now(),
+                administrator_id=self.telegram_admin_user_id,
+            )
         claimed = self.store.claim_next(
             supported_versions=self.supported_versions,
             claimed_at=self.clock.now(),
@@ -15980,7 +16820,7 @@ class RuntimeApplication:
         if (
             self.role is RuntimeRole.CLASSIFICATION
             and incoming.contract_name is ContractName.CLASSIFY_SOURCE_MESSAGE_REVISION
-            and self.store.source_message_deletion_barrier(incoming.subject_id)
+            and self._source_message_deletion_barrier(incoming)
         ):
             self.store.consume(
                 incoming=incoming,
@@ -16013,7 +16853,10 @@ class RuntimeApplication:
             revision_id = incoming.payload.get("source_message_revision_id")
             if isinstance(revision_id, str) and ":revision:" in revision_id:
                 source_message_id = revision_id.rsplit(":revision:", 1)[0]
-                if self.store.source_message_deletion_barrier(source_message_id):
+                if self._source_message_deletion_barrier(
+                    incoming,
+                    source_message_id=source_message_id,
+                ):
                     self.store.consume(
                         incoming=incoming,
                         supported_versions=self.versions_for(incoming.contract_name),
@@ -16451,6 +17294,65 @@ class RuntimeApplication:
                 incoming=supported_incoming
             )
             return True
+        if (
+            incoming.contract_name
+            in {
+                ContractName.SUPPRESS_SOURCE_SCOPE,
+                ContractName.DELETE_SOURCE_SCOPE,
+            }
+            and supported_incoming is not None
+        ):
+            self.store.process_source_scope_command(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
+            return True
+        if (
+            self.role is RuntimeRole.APPLICATION
+            and incoming.contract_name is ContractName.MANAGE_SOURCE_DATA_DELETION
+            and supported_incoming is not None
+        ):
+            self.store.apply_source_data_deletion_admin_command(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
+            return True
+        if (
+            self.role is RuntimeRole.BOT_ASSISTANT
+            and incoming.contract_name is ContractName.SOURCE_DATA_DELETION_REMINDER
+            and supported_incoming is not None
+        ):
+            self.store.accept_source_data_deletion_reminder(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
+            return True
+        if (
+            self.role is RuntimeRole.APPLICATION
+            and incoming.contract_name
+            in {
+                ContractName.SOURCE_SCOPE_SUPPRESSED,
+                ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+                ContractName.SOURCE_SCOPE_DELETION_FAILED,
+            }
+            and supported_incoming is not None
+        ):
+            self.store.accept_source_data_deletion_event(
+                incoming=supported_incoming,
+                received_at=self.clock.now(),
+            )
+            return True
+        if (
+            incoming.contract_name is ContractName.GET_SOURCE_DELETION_STATUS
+            and supported_incoming is not None
+        ):
+            self.store.consume(
+                incoming=supported_incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
+            )
+            return True
         if incoming.contract_name is ContractName.GET_COMPLETED_SEARCH:
             self.store.consume(
                 incoming=incoming,
@@ -16529,7 +17431,7 @@ class RuntimeApplication:
     def _classify_source_message_impl(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
-        if self.store.source_message_deletion_barrier(incoming.subject_id):
+        if self._source_message_deletion_barrier(incoming):
             self.store.consume(
                 incoming=incoming,
                 supported_versions=self.versions_for(incoming.contract_name),
@@ -20405,6 +21307,141 @@ class RuntimeApplication:
 
 def _runtime_identifier(probe_id: str, purpose: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"football-bot:{probe_id}:{purpose}")
+
+
+def _source_data_deletion_callback_token(request_id: str) -> str:
+    """Return a bounded callback token without exposing a long opaque request ID."""
+    return uuid5(
+        NAMESPACE_URL,
+        f"football-bot:source-data-deletion:callback:{request_id}",
+    ).hex
+
+
+def _parse_source_data_deletion_action(
+    value: str,
+    *,
+    screen_revision: int,
+) -> tuple[str, str | None] | None:
+    """Parse one short revision-bound Source Data Deletion callback."""
+    parts = value.strip().split(":")
+    if len(parts) < 3 or parts[0] != "sdd":
+        return None
+    phase = parts[1]
+    if phase in {"back", "intake"}:
+        return (phase, None) if parts[2] == str(screen_revision) else None
+    if len(parts) != 4 or parts[3] != str(screen_revision):
+        return None
+    if phase not in {
+        "approve",
+        "reject",
+        "review",
+        "start",
+        "notify",
+        "complete",
+        "data-not-found",
+    }:
+        return None
+    return phase, parts[2]
+
+
+def _source_data_deletion_request_for_token(
+    requests: Iterable[SourceDataDeletionRequest],
+    token: str | None,
+) -> SourceDataDeletionRequest | None:
+    """Resolve a callback token through the body-free request projection."""
+    if token is None:
+        return None
+    return next(
+        (
+            request
+            for request in requests
+            if _source_data_deletion_callback_token(request.request_id) == token
+        ),
+        None,
+    )
+
+
+def _source_data_deletion_request_by_id(
+    requests: Iterable[SourceDataDeletionRequest],
+    request_id: str,
+) -> SourceDataDeletionRequest | None:
+    """Resolve one exact request identity from the body-free projection."""
+    return next(
+        (request for request in requests if request.request_id == request_id), None
+    )
+
+
+def _source_data_deletion_manage_envelope(
+    *,
+    request_id: str,
+    administrator_id: int,
+    action: str,
+    recorded_at: datetime,
+    notification_phase: str | None = None,
+    decision_reason: str | None = None,
+    source_author_telegram_id: int | None = None,
+    source_chat_key: str | None = None,
+    support_case_pointer: str | None = None,
+    completion_outcome: str | None = None,
+    completion_proof_pointer: str | None = None,
+) -> ContractEnvelope:
+    """Build one canonical deterministic Bot-to-Application admin command."""
+    idempotency_key = f"source-data-deletion:manage:{action}:{request_id}"
+    if action == "notify" and notification_phase is not None:
+        idempotency_key += f":phase:{notification_phase}"
+    payload: dict[str, JsonValue] = {
+        "request_id": request_id,
+        "action": action,
+        "telegram_admin_user_id": administrator_id,
+    }
+    if action == "intake":
+        payload.update(
+            {
+                "source_author_telegram_id": source_author_telegram_id,
+                "source_chat_key": source_chat_key,
+                "support_case_pointer": support_case_pointer,
+                "received_at": recorded_at.isoformat(),
+            }
+        )
+    elif action in {"approve", "reject"}:
+        payload.update(
+            {
+                "decision_reason": decision_reason,
+                "decided_at": recorded_at.isoformat(),
+            }
+        )
+    elif action == "start":
+        payload["effective_at"] = recorded_at.isoformat()
+    elif action == "notify":
+        payload["notified_at"] = recorded_at.isoformat()
+    elif action == "complete":
+        payload.update(
+            {
+                "completion_outcome": completion_outcome,
+                "completion_proof_pointer": completion_proof_pointer,
+                "completed_at": recorded_at.isoformat(),
+            }
+        )
+    else:
+        raise ValueError("Source Data Deletion management action is invalid")
+    message_id = uuid5(NAMESPACE_URL, f"football-bot:{idempotency_key}")
+    return ContractEnvelope(
+        contract_name=ContractName.MANAGE_SOURCE_DATA_DELETION,
+        contract_version=1,
+        message_id=message_id,
+        producer=RuntimeRole.BOT_ASSISTANT,
+        consumer=RuntimeRole.APPLICATION,
+        subject_id=request_id,
+        subject_revision=1,
+        idempotency_key=idempotency_key,
+        causation_id=message_id,
+        correlation_id=uuid5(
+            NAMESPACE_URL,
+            f"football-bot:source-deletion:{request_id}",
+        ),
+        recorded_at=recorded_at,
+        payload=payload,
+    )
 
 
 def _opaque_classifier_reference(value: str, *, kind: str) -> str:

@@ -46,11 +46,7 @@ def _migration_paths() -> list[Path]:
 
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
-    assert [path.name for path in _migration_paths()][-12:] == [
-        "0039_coaching_source_chat_ingestion_failure_projection_gate.sql",
-        "0040_coaching_ingestion_role_projection_gate.sql",
-        "0041_exact_repost_referee_generic_projection.sql",
-        "0042_moderation_review_events.sql",
+    assert [path.name for path in _migration_paths()][-14:] == [
         "0043_source_chat_administration_lifecycle.sql",
         "0044_source_chat_lifecycle_cancellation.sql",
         "0045_source_retention_audit_role_isolation.sql",
@@ -59,6 +55,12 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0048_persist_dynamic_result_callback_copy.sql",
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
+        "0051_source_data_deletion.sql",
+        "0052_source_data_deletion_review_fixes.sql",
+        "0053_source_data_deletion_p1_fixes.sql",
+        "0054_source_data_deletion_replay_retention.sql",
+        "0055_source_message_deletion_boundary.sql",
+        "0056_source_data_deletion_bot_fail_closed.sql",
     ]
 
 
@@ -495,6 +497,16 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'football_runtime.sync_source_message_retention_moderation()',
                                  'football_runtime.sync_source_message_retention_lifecycle()',
                                  'football_runtime.read_source_data_audit()',
+                                 'football_runtime.source_author_deletion_barrier('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_source_author_telegram_id bigint, '
+                                 'requested_event_time timestamp with time zone, '
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.sync_source_data_deletion_replay_barrier_for_registry()',
+                                 'football_runtime.read_source_data_deletion_requests()',
+                                 'football_runtime.read_source_data_deletion_owner_acks('
+                                 'requested_request_id text)',
                                  'football_runtime.ingestion_scrub_source_message_revision_data('
                                  'requested_peer_kind text, '
                                  'requested_telegram_chat_id bigint, '
@@ -522,7 +534,26 @@ def _assert_final_migration_state(database_url: str) -> None:
                                  'requested_source_message_id text, '
                                  'requested_as_of timestamp with time zone)',
                                  'football_runtime.cleanup_expired_source_data('
-                                 'requested_as_of timestamp with time zone)'
+                                 'requested_as_of timestamp with time zone)',
+                                 'football_runtime.record_source_data_deletion_audit('
+                                 'requested_request_id text, '
+                                 'requested_previous_state text, '
+                                 'requested_next_state text, '
+                                 'requested_reason_code text, '
+                                 'requested_actor_telegram_id bigint, '
+                                 'requested_notification_status text, '
+                                 'requested_recorded_at timestamp with time zone)',
+                                 'football_runtime.capture_source_data_deletion_pending_events('
+                                 'requested_peer_kind text, '
+                                 'requested_telegram_chat_id bigint, '
+                                 'requested_source_author_telegram_id bigint, '
+                                 'requested_effective_at timestamp with time zone)',
+                                 'football_runtime.capture_source_data_deletion_bot_search_ids('
+                                 'requested_opportunity_ids text[], '
+                                 'requested_opportunity_revision_ids text[], '
+                                 'requested_source_message_revision_ids text[])',
+                                 'football_runtime.bot_completed_search_deletion_barrier('
+                                 'requested_completed_search_id text)'
                              ])
                          )
                    ),

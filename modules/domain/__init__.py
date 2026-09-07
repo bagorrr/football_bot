@@ -38,6 +38,9 @@ class ConversationStage(StrEnum):
     MAIN_MENU = "main_menu"
     SETTINGS = "settings"
     ADMINISTRATION = "administration"
+    SOURCE_DATA_DELETION_REQUESTS = "source_data_deletion_requests"
+    SOURCE_DATA_DELETION_REVIEW = "source_data_deletion_review"
+    SOURCE_DATA_DELETION_INPUT = "source_data_deletion_input"
     SOURCE_CHATS = "source_chats"
     SOURCE_CHAT_ADDRESS_INPUT = "source_chat_address_input"
     SOURCE_CHAT_REGISTRATION_PENDING = "source_chat_registration_pending"
@@ -530,6 +533,27 @@ class IngestionFailureReason(StrEnum):
     AUTHENTICATION_LOST = "authentication_lost"
 
 
+class SourceDataDeletionRequestStatus(StrEnum):
+    """Durable state of one explicit Source Data Deletion Request."""
+
+    PENDING_DECISION = "pending_decision"
+    APPROVED_AWAITING_EXECUTION = "approved_awaiting_execution"
+    SUPPRESSING = "suppressing"
+    EXECUTING = "executing"
+    EXECUTION_ERROR = "execution_error"
+    AWAITING_COMPLETION = "awaiting_completion"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+
+
+class SourceDataDeletionOwnerStatus(StrEnum):
+    """One owner's durable phase status for a deletion request."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 def empty_bounded_source_metadata() -> dict[str, Any]:
     """Return the complete bounded source-metadata shape with no usable route."""
     return {
@@ -575,6 +599,16 @@ def source_publisher_id_from_metadata(
     return value
 
 
+def source_author_telegram_id_from_metadata(
+    metadata: Mapping[str, Any],
+) -> int | None:
+    """Read the stable Telegram Source Author identity, if supplied."""
+    value = metadata.get("source_author_telegram_id")
+    if not is_valid_source_author_telegram_id(value):
+        return None
+    return value
+
+
 def telegram_moderation_triggers(metadata: Mapping[str, Any]) -> tuple[str, ...]:
     """Return current Telegram scam/fake signals without exposing accusations."""
     triggers: list[str] = []
@@ -600,6 +634,11 @@ def is_valid_opaque_source_publisher_id(value: object) -> bool:
         )
         is not None
     )
+
+
+def is_valid_source_author_telegram_id(value: object) -> bool:
+    """Accept only one positive Telegram user identifier."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def is_valid_source_chat_address(
@@ -843,6 +882,11 @@ class SourceMessage:
         """Return the source-visible publisher identity carried by metadata."""
         return source_publisher_id_from_metadata(self.bounded_metadata)
 
+    @property
+    def source_author_telegram_id(self) -> int | None:
+        """Return the stable Source Author identity carried by metadata."""
+        return source_author_telegram_id_from_metadata(self.bounded_metadata)
+
 
 @dataclass(frozen=True, slots=True)
 class SourceEventRecord:
@@ -867,6 +911,11 @@ class SourceEventRecord:
     def source_publisher_id(self) -> str | None:
         """Return the source-visible publisher identity carried by metadata."""
         return source_publisher_id_from_metadata(self.bounded_metadata)
+
+    @property
+    def source_author_telegram_id(self) -> int | None:
+        """Return the stable Source Author identity carried by metadata."""
+        return source_author_telegram_id_from_metadata(self.bounded_metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,6 +963,11 @@ class SourceMessageRevision:
     def source_publisher_id(self) -> str | None:
         """Return the source-visible publisher identity carried by metadata."""
         return source_publisher_id_from_metadata(self.bounded_metadata)
+
+    @property
+    def source_author_telegram_id(self) -> int | None:
+        """Return the stable Source Author identity carried by metadata."""
+        return source_author_telegram_id_from_metadata(self.bounded_metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1020,6 +1074,7 @@ class ConversationState:
     revision: int
     result_stale_callback_text: str | None = None
     result_callback_ack: str | None = None
+    source_data_deletion_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3728,6 +3783,62 @@ class SourceDataAuditEvent:
     reason_code: str
     recorded_at: datetime
     expires_at: datetime
+    request_id: str | None = None
+    actor_telegram_id: int | None = None
+    notification_status: str = "not_applicable"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDataDeletionRequest:
+    """Body-free Application record for one exact author/chat erasure case."""
+
+    request_id: str
+    source_author_telegram_id: int
+    source_chat_key: str
+    support_case_pointer: str
+    received_at: datetime
+    decision_due_at: datetime
+    completion_due_at: datetime
+    status: SourceDataDeletionRequestStatus
+    decision_reason: str | None = None
+    decided_by: int | None = None
+    decided_at: datetime | None = None
+    execution_started_at: datetime | None = None
+    effective_at: datetime | None = None
+    completed_at: datetime | None = None
+    completion_outcome: str | None = None
+    completion_proof_pointer: str | None = None
+    requester_notification_status: str = "pending"
+    requester_notified_at: datetime | None = None
+    last_reminder_at: datetime | None = None
+    next_reminder_at: datetime | None = None
+    execution_attempt: int = 0
+    reminder_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDataDeletionOwnerAck:
+    """Body-free suppression and deletion acknowledgement from one owner."""
+
+    request_id: str
+    owner_role: str
+    suppression_status: SourceDataDeletionOwnerStatus
+    deletion_status: SourceDataDeletionOwnerStatus
+    suppressed_count: int
+    deleted_count: int
+    failure_reason: str | None
+    suppressed_at: datetime | None
+    deleted_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDataDeletionReplayBarrier:
+    """Minimal author/chat boundary retained after physical source removal."""
+
+    source_author_telegram_id: int
+    source_chat_key: str
+    effective_at: datetime
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -3912,6 +4023,9 @@ class LanguageSelection:
     administration_label: str | None = None
     administration_text: str | None = None
     administration_labels: tuple[str, str, str, str] | None = None
+    source_data_deletion_label: str | None = None
+    source_data_deletion_text: str | None = None
+    source_data_deletion_labels: tuple[str, str] | None = None
     source_data_audit_text: str | None = None
     source_data_audit_labels: tuple[str, str] | None = None
     source_chats_text: str | None = None

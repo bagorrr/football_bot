@@ -62,6 +62,9 @@ from modules.domain import (
     SourceChatRegistrationContext,
     SourceChatRegistryEntry,
     SourceDataAuditEvent,
+    SourceDataDeletionOwnerAck,
+    SourceDataDeletionReplayBarrier,
+    SourceDataDeletionRequest,
     SourceEventRecord,
     SourceMessage,
     SourceMessageDeletionTombstone,
@@ -684,6 +687,19 @@ class ConversationStore(Protocol):
         """Commit one confirmed administrator Source Chat control atomically."""
         ...
 
+    def commit_source_data_deletion_command(
+        self,
+        *,
+        update_id: str,
+        expected_revision: int,
+        state: ConversationState,
+        message: TelegramMessage,
+        command: ContractEnvelope,
+        recorded_at: datetime,
+    ) -> bool:
+        """Commit one bounded administrator deletion command atomically."""
+        ...
+
     def source_chat_administration_views(
         self,
     ) -> tuple[SourceChatRegistryEntry, ...]:
@@ -692,6 +708,19 @@ class ConversationStore(Protocol):
 
     def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
         """Read the bounded body-free Source retention audit projection."""
+        ...
+
+    def source_data_deletion_requests(
+        self,
+    ) -> tuple[SourceDataDeletionRequest, ...]:
+        """Read body-free Source Data Deletion Request state for administrators."""
+        ...
+
+    def source_data_deletion_owner_acks(
+        self,
+        request_id: str,
+    ) -> tuple[SourceDataDeletionOwnerAck, ...]:
+        """Read body-free owner acknowledgements for one deletion request."""
         ...
 
     def next_source_chat_registration_generation(self) -> int:
@@ -1201,8 +1230,119 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Apply one Source Event to Application-owned Source Message state."""
         ...
 
-    def source_message_deletion_barrier(self, source_message_id: str) -> bool:
-        """Read the body-free cross-role deletion barrier."""
+    def process_source_scope_command(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one owner-scoped suppression/deletion command atomically."""
+        ...
+
+    def accept_source_data_deletion_event(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Record one owner acknowledgement and advance the request workflow."""
+        ...
+
+    def apply_source_data_deletion_admin_command(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Apply one Bot-owned, body-free administrator deletion command."""
+        ...
+
+    def accept_source_data_deletion_reminder(
+        self,
+        *,
+        incoming: ContractEnvelope,
+        received_at: datetime,
+    ) -> ConsumeResult:
+        """Queue one body-free administrator reminder delivery."""
+        ...
+
+    def source_data_deletion_replay_barriers(
+        self,
+    ) -> tuple[SourceDataDeletionReplayBarrier, ...]:
+        """Read minimal body-free author/chat replay barriers."""
+        ...
+
+    def create_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        source_author_telegram_id: int,
+        source_chat_key: str,
+        support_case_pointer: str,
+        received_at: datetime,
+        actor_telegram_id: int | None = None,
+    ) -> SourceDataDeletionRequest:
+        """Persist one idempotent exact Source Author/Source Chat request."""
+        ...
+
+    def decide_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        decision_reason: str | None,
+        decided_by: int,
+        decided_at: datetime,
+    ) -> bool:
+        """Record approval or rejection without executing erasure."""
+        ...
+
+    def begin_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        effective_at: datetime,
+        actor_telegram_id: int | None = None,
+    ) -> bool:
+        """Start one explicit suppression phase and enqueue owner commands."""
+        ...
+
+    def record_source_data_deletion_notification(
+        self,
+        *,
+        request_id: str,
+        notified_at: datetime,
+        actor_telegram_id: int | None = None,
+    ) -> bool:
+        """Record requester notification state before manual completion."""
+        ...
+
+    def complete_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        completion_outcome: str,
+        completion_proof_pointer: str,
+        completed_at: datetime,
+        actor_telegram_id: int | None = None,
+    ) -> bool:
+        """Manually confirm completion after every owner and notification gate."""
+        ...
+
+    def remind_source_data_deletion_requests(
+        self, *, as_of: datetime, administrator_id: int | None = None
+    ) -> int:
+        """Advance due reminder state without approving or executing a request."""
+        ...
+
+    def source_message_deletion_barrier(
+        self,
+        source_message_id: str,
+        *,
+        source_message_revision_id: str | None = None,
+        event_time: datetime | None = None,
+    ) -> bool:
+        """Read the body-free deletion barrier for one Source Message revision."""
         ...
 
     def cleanup_expired_source_message_tombstones(self, *, as_of: datetime) -> int:
@@ -1619,6 +1759,25 @@ class AcceptanceObserver(Protocol):
 
     def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
         """Observe the bounded body-free Source retention audit trail."""
+        ...
+
+    def source_data_deletion_requests(
+        self,
+    ) -> tuple[SourceDataDeletionRequest, ...]:
+        """Observe body-free Source Data Deletion Requests."""
+        ...
+
+    def source_data_deletion_owner_acks(
+        self,
+        request_id: str,
+    ) -> tuple[SourceDataDeletionOwnerAck, ...]:
+        """Observe owner acknowledgements for one deletion request."""
+        ...
+
+    def source_data_deletion_replay_barriers(
+        self,
+    ) -> tuple[SourceDataDeletionReplayBarrier, ...]:
+        """Observe minimal body-free author/chat replay barriers."""
         ...
 
     def protected_content_skips(self) -> tuple[ProtectedContentSkip, ...]:

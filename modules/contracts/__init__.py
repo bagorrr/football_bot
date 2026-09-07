@@ -19,6 +19,7 @@ from modules.classifier_contract import (
 from modules.domain import (
     SourceChatAddressKind,
     is_valid_opaque_source_publisher_id,
+    is_valid_source_author_telegram_id,
     is_valid_source_chat_address,
 )
 
@@ -61,6 +62,14 @@ class ContractName(StrEnum):
     SOURCE_CHAT_ADMISSION_FAILED = "SourceChatAdmissionFailed"
     SOURCE_CHAT_REGISTRATION_FAILED = "SourceChatRegistrationFailed"
     SOURCE_CHAT_GENERATION_CHANGED = "SourceChatGenerationChanged"
+    SUPPRESS_SOURCE_SCOPE = "SuppressSourceScope"
+    DELETE_SOURCE_SCOPE = "DeleteSourceScope"
+    SOURCE_SCOPE_SUPPRESSED = "SourceScopeSuppressed"
+    SOURCE_SCOPE_DELETION_COMPLETED = "SourceScopeDeletionCompleted"
+    SOURCE_SCOPE_DELETION_FAILED = "SourceScopeDeletionFailed"
+    GET_SOURCE_DELETION_STATUS = "GetSourceDeletionStatus"
+    MANAGE_SOURCE_DATA_DELETION = "ManageSourceDataDeletion"
+    SOURCE_DATA_DELETION_REMINDER = "SourceDataDeletionReminder"
     TELEGRAM_PRESENTATION_REQUESTED = "TelegramPresentationRequested"
     CLASSIFIER_RELEASE_PROMOTION_APPROVED = "ClassifierReleasePromotionApproved"
     OWNER_STATE_WRITE = "OwnerStateWrite"
@@ -408,6 +417,67 @@ SUPPORTED_CONTRACTS = (
         ("telegram_user_id", "telegram_chat_id", "registry_generation"),
     ),
     ContractDefinition(
+        ContractName.SUPPRESS_SOURCE_SCOPE,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.APPLICATION,
+        "request_id",
+        ("source_author_telegram_id", "telegram_chat_id", "execution_attempt"),
+    ),
+    ContractDefinition(
+        ContractName.DELETE_SOURCE_SCOPE,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.APPLICATION,
+        "request_id",
+        ("source_author_telegram_id", "telegram_chat_id", "execution_attempt"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_SCOPE_SUPPRESSED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.APPLICATION,
+        "request_id",
+        ("affected_count", "execution_attempt"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.APPLICATION,
+        "request_id",
+        ("deleted_count", "execution_attempt"),
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_SCOPE_DELETION_FAILED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.APPLICATION,
+        "request_id",
+        ("execution_attempt",),
+    ),
+    ContractDefinition(
+        ContractName.GET_SOURCE_DELETION_STATUS,
+        1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.APPLICATION,
+        "request_id",
+    ),
+    ContractDefinition(
+        ContractName.MANAGE_SOURCE_DATA_DELETION,
+        1,
+        RuntimeRole.BOT_ASSISTANT,
+        RuntimeRole.APPLICATION,
+        "request_id",
+    ),
+    ContractDefinition(
+        ContractName.SOURCE_DATA_DELETION_REMINDER,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "request_id",
+    ),
+    ContractDefinition(
         ContractName.TELEGRAM_PRESENTATION_REQUESTED,
         1,
         RuntimeRole.BOT_ASSISTANT,
@@ -506,10 +576,31 @@ class ContractEnvelope(RawContractEnvelope):
         if definition is None:
             msg = "contract name and version have no registered schema"
             raise ValueError(msg)
-        if (
-            self.producer is not definition.producer
-            or self.consumer is not definition.consumer
-        ):
+        scope_commands = {
+            ContractName.SUPPRESS_SOURCE_SCOPE,
+            ContractName.DELETE_SOURCE_SCOPE,
+        }
+        scope_events = {
+            ContractName.SOURCE_SCOPE_SUPPRESSED,
+            ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+            ContractName.SOURCE_SCOPE_DELETION_FAILED,
+        }
+        if self.contract_name in scope_commands:
+            supported_pairing = (
+                self.producer is RuntimeRole.APPLICATION
+                and self.consumer in set(RuntimeRole)
+            )
+        elif self.contract_name in scope_events:
+            supported_pairing = (
+                self.producer in set(RuntimeRole)
+                and self.consumer is RuntimeRole.APPLICATION
+            )
+        else:
+            supported_pairing = (
+                self.producer is definition.producer
+                and self.consumer is definition.consumer
+            )
+        if not supported_pairing:
             msg = "contract producer-consumer pairing is not supported"
             raise ValueError(msg)
         if not isinstance(self.payload, dict):
@@ -606,6 +697,27 @@ class ContractEnvelope(RawContractEnvelope):
                 self.contract_version,
                 self.payload,
                 message_id=self.message_id,
+                causation_id=self.causation_id,
+                correlation_id=self.correlation_id,
+                idempotency_key=self.idempotency_key,
+                subject_id=self.subject_id,
+                subject_revision=self.subject_revision,
+            )
+        elif self.contract_name in (
+            scope_commands
+            | scope_events
+            | {
+                ContractName.GET_SOURCE_DELETION_STATUS,
+                ContractName.MANAGE_SOURCE_DATA_DELETION,
+                ContractName.SOURCE_DATA_DELETION_REMINDER,
+            }
+        ):
+            _validate_source_data_deletion_contract(
+                self.contract_name,
+                self.payload,
+                message_id=self.message_id,
+                producer=self.producer,
+                consumer=self.consumer,
                 causation_id=self.causation_id,
                 correlation_id=self.correlation_id,
                 idempotency_key=self.idempotency_key,
@@ -1485,6 +1597,10 @@ _BOUNDED_METADATA_FIELDS = {
     "source_message_url",
     "source_message_reply_capable",
 }
+_BOUNDED_METADATA_OPTIONAL_FIELDS = {
+    "source_author_telegram_id",
+    "source_publisher_id",
+}
 _TELEGRAM_SIGNAL_FIELDS = {
     "telegram_publisher_flags",
     "telegram_author_flags",
@@ -1498,7 +1614,9 @@ def _is_full_bounded_metadata_shape(keys: frozenset[str]) -> bool:
         _BOUNDED_METADATA_FIELDS
         <= keys
         <= (
-            _BOUNDED_METADATA_FIELDS | {"source_publisher_id"} | _TELEGRAM_SIGNAL_FIELDS
+            _BOUNDED_METADATA_FIELDS
+            | _BOUNDED_METADATA_OPTIONAL_FIELDS
+            | _TELEGRAM_SIGNAL_FIELDS
         )
     )
 
@@ -1573,6 +1691,12 @@ def _validate_bounded_source_metadata(value: JsonValue) -> None:
         ):
             raise TypeError(
                 "source_publisher_id must be an opaque publisher reference or null"
+            )
+    if "source_author_telegram_id" in value:
+        author_id = value["source_author_telegram_id"]
+        if author_id is not None and not is_valid_source_author_telegram_id(author_id):
+            raise TypeError(
+                "source_author_telegram_id must be a positive Telegram user id"
             )
     for field_name in _TELEGRAM_SIGNAL_FIELDS:
         flags = value.get(field_name, [])
@@ -4395,6 +4519,409 @@ def _validate_source_chat_contract(
         raise ValueError("Source Chat contract requires a supported address kind")
     if not _required_text(payload, "transport_boundary").strip():
         raise ValueError("Source Chat contract requires a transport boundary")
+
+
+def _validate_source_data_deletion_contract(
+    contract_name: ContractName,
+    payload: dict[str, JsonValue],
+    *,
+    message_id: UUID,
+    producer: RuntimeRole,
+    consumer: RuntimeRole | None,
+    causation_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    subject_id: str,
+    subject_revision: int,
+) -> None:
+    """Validate the body-free, owner-fan-out deletion workflow wire."""
+    request_id = _required_text(payload, "request_id")
+    if any(character.isspace() for character in request_id) or len(request_id) > 256:
+        raise ValueError("Source Data Deletion request_id must be opaque")
+    if subject_id != request_id:
+        raise ValueError("Source Data Deletion subject must identify its request")
+
+    if contract_name is ContractName.GET_SOURCE_DELETION_STATUS:
+        if set(payload) != {"request_id"}:
+            raise ValueError("GetSourceDeletionStatus contains unsupported facts")
+        if producer is not RuntimeRole.BOT_ASSISTANT:
+            raise ValueError("GetSourceDeletionStatus producer is invalid")
+        if consumer is not RuntimeRole.APPLICATION or subject_revision != 1:
+            raise ValueError("GetSourceDeletionStatus consumer or revision is invalid")
+        return
+
+    if contract_name is ContractName.MANAGE_SOURCE_DATA_DELETION:
+        if (
+            producer is not RuntimeRole.BOT_ASSISTANT
+            or consumer is not RuntimeRole.APPLICATION
+        ):
+            raise ValueError("ManageSourceDataDeletion pairing is invalid")
+        if subject_revision != 1 or message_id != causation_id:
+            raise ValueError("ManageSourceDataDeletion identity is invalid")
+        action = _required_text(payload, "action")
+        if action not in {"intake", "approve", "reject", "start", "notify", "complete"}:
+            raise ValueError("ManageSourceDataDeletion action is invalid")
+        administrator_id = payload.get("telegram_admin_user_id")
+        if (
+            not isinstance(administrator_id, int)
+            or isinstance(administrator_id, bool)
+            or administrator_id < 1
+        ):
+            raise ValueError("ManageSourceDataDeletion administrator is invalid")
+        common_fields = {"request_id", "action", "telegram_admin_user_id"}
+        action_fields: dict[str, set[str]] = {
+            "intake": {
+                "source_author_telegram_id",
+                "source_chat_key",
+                "support_case_pointer",
+                "received_at",
+            },
+            "approve": {"decision_reason", "decided_at"},
+            "reject": {"decision_reason", "decided_at"},
+            "start": {"effective_at"},
+            "notify": {"notified_at"},
+            "complete": {
+                "completion_outcome",
+                "completion_proof_pointer",
+                "completed_at",
+            },
+        }
+        if set(payload) != common_fields | action_fields[action]:
+            raise ValueError("ManageSourceDataDeletion payload is incomplete")
+        if correlation_id != uuid5(
+            NAMESPACE_URL,
+            f"football-bot:source-deletion:{request_id}",
+        ):
+            raise ValueError("ManageSourceDataDeletion correlation is invalid")
+        expected_idempotency = f"source-data-deletion:manage:{action}:{request_id}"
+        canonical_idempotency = expected_idempotency
+        if action == "notify" and idempotency_key.startswith(
+            f"{expected_idempotency}:phase:"
+        ):
+            notification_phase = idempotency_key.removeprefix(
+                f"{expected_idempotency}:phase:"
+            )
+            if notification_phase not in {
+                "approved_awaiting_execution",
+                "rejected",
+                "suppressing",
+                "executing",
+                "execution_error",
+                "awaiting_completion",
+                "completed",
+            }:
+                raise ValueError(
+                    "ManageSourceDataDeletion notification phase is invalid"
+                )
+            canonical_idempotency = idempotency_key
+        if idempotency_key != canonical_idempotency or message_id != uuid5(
+            NAMESPACE_URL, f"football-bot:{canonical_idempotency}"
+        ):
+            raise ValueError("ManageSourceDataDeletion identity is not canonical")
+        for field_name in action_fields[action]:
+            if field_name.endswith("_at"):
+                _required_iso_datetime(payload, field_name)
+        if action == "intake":
+            author_id = payload["source_author_telegram_id"]
+            if (
+                not isinstance(author_id, int)
+                or isinstance(author_id, bool)
+                or author_id < 1
+            ):
+                raise ValueError("ManageSourceDataDeletion author is invalid")
+            source_chat_key = _required_text(payload, "source_chat_key")
+            if (
+                re.fullmatch(
+                    r"source-chat:(?:chat|channel):[1-9][0-9]*", source_chat_key
+                )
+                is None
+            ):
+                raise ValueError("ManageSourceDataDeletion Source Chat is invalid")
+            for field_name in ("support_case_pointer",):
+                value = _required_text(payload, field_name)
+                if len(value) > 256 or any(character.isspace() for character in value):
+                    raise ValueError("ManageSourceDataDeletion pointer is invalid")
+        elif action in {"approve", "reject"}:
+            reason = payload["decision_reason"]
+            if action == "approve" and reason is not None:
+                raise ValueError("approved deletion cannot carry a reason")
+            if action == "reject" and (
+                not isinstance(reason, str)
+                or not reason
+                or len(reason) > 128
+                or any(character.isspace() for character in reason)
+            ):
+                raise ValueError("rejected deletion reason is invalid")
+            if reason is not None and (
+                not isinstance(reason, str)
+                or len(reason) > 128
+                or any(character.isspace() for character in reason)
+            ):
+                raise ValueError("deletion decision reason is invalid")
+        elif action == "complete":
+            if payload["completion_outcome"] not in {"completed", "data_not_found"}:
+                raise ValueError("ManageSourceDataDeletion outcome is invalid")
+            proof = _required_text(payload, "completion_proof_pointer")
+            if len(proof) > 256 or any(character.isspace() for character in proof):
+                raise ValueError("ManageSourceDataDeletion proof pointer is invalid")
+        return
+
+    if contract_name is ContractName.SOURCE_DATA_DELETION_REMINDER:
+        if (
+            producer is not RuntimeRole.APPLICATION
+            or consumer is not RuntimeRole.BOT_ASSISTANT
+        ):
+            raise ValueError("SourceDataDeletionReminder pairing is invalid")
+        expected_fields = {
+            "request_id",
+            "telegram_admin_user_id",
+            "status",
+            "reminder_at",
+            "deadline_at",
+            "reminder_count",
+        }
+        if set(payload) != expected_fields or subject_revision != payload.get(
+            "reminder_count"
+        ):
+            raise ValueError("SourceDataDeletionReminder payload is incomplete")
+        administrator_id = payload["telegram_admin_user_id"]
+        count = payload["reminder_count"]
+        if (
+            not isinstance(administrator_id, int)
+            or isinstance(administrator_id, bool)
+            or administrator_id < 1
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+        ):
+            raise ValueError("SourceDataDeletionReminder identity is invalid")
+        if payload["status"] not in {
+            "pending_decision",
+            "approved_awaiting_execution",
+            "suppressing",
+            "executing",
+            "execution_error",
+            "awaiting_completion",
+        }:
+            raise ValueError("SourceDataDeletionReminder status is invalid")
+        _required_iso_datetime(payload, "reminder_at")
+        _required_iso_datetime(payload, "deadline_at")
+        expected_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:source-data-deletion:reminder:{request_id}:{count}",
+        )
+        if (
+            message_id != expected_id
+            or causation_id != expected_id
+            or correlation_id
+            != uuid5(
+                NAMESPACE_URL,
+                f"football-bot:source-deletion:{request_id}",
+            )
+            or idempotency_key != f"source-data-deletion-reminder:{request_id}:{count}"
+        ):
+            raise ValueError("SourceDataDeletionReminder identity is not canonical")
+        return
+
+    owner_role = _required_text(payload, "owner_role")
+    try:
+        owner = RuntimeRole(owner_role)
+    except ValueError as error:
+        raise ValueError("Source Data Deletion owner role is invalid") from error
+    attempt = payload.get("execution_attempt")
+    if (
+        not isinstance(attempt, int)
+        or isinstance(attempt, bool)
+        or attempt < 1
+        or attempt != subject_revision
+    ):
+        raise ValueError("Source Data Deletion execution attempt is invalid")
+    expected_correlation_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:source-deletion:{request_id}",
+    )
+    if correlation_id != expected_correlation_id:
+        raise ValueError("Source Data Deletion correlation is invalid")
+
+    command_names = {
+        ContractName.SUPPRESS_SOURCE_SCOPE,
+        ContractName.DELETE_SOURCE_SCOPE,
+    }
+    event_names = {
+        ContractName.SOURCE_SCOPE_SUPPRESSED,
+        ContractName.SOURCE_SCOPE_DELETION_COMPLETED,
+        ContractName.SOURCE_SCOPE_DELETION_FAILED,
+    }
+    expected_attempt_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:source-deletion:{request_id}:attempt:{attempt}",
+    )
+    if contract_name in command_names:
+        expected_fields = {
+            "request_id",
+            "owner_role",
+            "source_chat_key",
+            "telegram_peer_kind",
+            "telegram_chat_id",
+            "source_author_telegram_id",
+            "effective_at",
+            "source_message_ids",
+            "source_message_revision_ids",
+            "source_event_ids",
+            "opportunity_ids",
+            "opportunity_revision_ids",
+            "bot_completed_search_ids",
+            "execution_attempt",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("Source Data Deletion command is incomplete")
+        if producer is not RuntimeRole.APPLICATION or consumer is not owner:
+            raise ValueError("Source Data Deletion command owner is inconsistent")
+        peer_kind = _required_text(payload, "telegram_peer_kind")
+        chat_id = payload.get("telegram_chat_id")
+        author_id = payload.get("source_author_telegram_id")
+        if peer_kind not in {"chat", "channel"} or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in (chat_id, author_id)
+        ):
+            raise ValueError("Source Data Deletion identities are invalid")
+        assert isinstance(chat_id, int)
+        if payload["source_chat_key"] != f"source-chat:{peer_kind}:{chat_id}":
+            raise ValueError("Source Data Deletion Source Chat key is inconsistent")
+        _required_iso_datetime(payload, "effective_at")
+        for field_name in (
+            "source_message_ids",
+            "source_message_revision_ids",
+            "source_event_ids",
+            "opportunity_ids",
+            "opportunity_revision_ids",
+            "bot_completed_search_ids",
+        ):
+            values = payload[field_name]
+            if not isinstance(values, list) or len(values) != len(set(values)):
+                raise ValueError("Source Data Deletion target list is invalid")
+            if not all(
+                isinstance(value, str)
+                and bool(value)
+                and not any(character.isspace() for character in value)
+                for value in values
+            ):
+                raise ValueError("Source Data Deletion target list is not body-free")
+        source_message_ids = cast(list[str], payload["source_message_ids"])
+        source_revision_ids = cast(list[str], payload["source_message_revision_ids"])
+        for source_message_id in source_message_ids:
+            if (
+                re.fullmatch(
+                    r"source-chat:(?:chat|channel):[1-9][0-9]*:generation:"
+                    r"[1-9][0-9]*:message:[1-9][0-9]*",
+                    source_message_id,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "Source Data Deletion Source Message identity is invalid"
+                )
+        for revision_id in source_revision_ids:
+            if (
+                re.fullmatch(
+                    r"source-chat:(?:chat|channel):[1-9][0-9]*:generation:"
+                    r"[1-9][0-9]*:message:[1-9][0-9]*:revision:[1-9][0-9]*",
+                    revision_id,
+                )
+                is None
+            ):
+                raise ValueError("Source Data Deletion revision identity is invalid")
+        expected_message_id = uuid5(
+            NAMESPACE_URL,
+            f"football-bot:{expected_attempt_id}:{contract_name.value}:"
+            f"owner:{owner.value}",
+        )
+        if message_id != expected_message_id:
+            raise ValueError("Source Data Deletion command message identity is invalid")
+        expected_idempotency = (
+            f"source-data-deletion:{contract_name.value}:{request_id}:"
+            f"attempt:{attempt}:owner:{owner.value}"
+        )
+        if idempotency_key != expected_idempotency:
+            raise ValueError("Source Data Deletion command idempotency is invalid")
+        if causation_id != expected_attempt_id:
+            raise ValueError("Source Data Deletion command causation is invalid")
+        return
+
+    if contract_name not in event_names:
+        raise ValueError("Source Data Deletion contract is unsupported")
+    if producer is not owner or consumer is not RuntimeRole.APPLICATION:
+        raise ValueError("Source Data Deletion event owner is inconsistent")
+    common_fields = {"request_id", "owner_role", "execution_attempt"}
+    if contract_name is ContractName.SOURCE_SCOPE_SUPPRESSED:
+        expected_fields = common_fields | {
+            "status",
+            "affected_count",
+            "bot_completed_search_ids",
+        }
+        if payload.get("status") != "suppressed":
+            raise ValueError("SourceScopeSuppressed status is invalid")
+        count = payload.get("affected_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("SourceScopeSuppressed count is invalid")
+        bot_completed_search_ids = payload.get("bot_completed_search_ids")
+        if (
+            not isinstance(bot_completed_search_ids, list)
+            or len(bot_completed_search_ids) != len(set(bot_completed_search_ids))
+            or not all(
+                isinstance(value, str)
+                and bool(value)
+                and not any(character.isspace() for character in value)
+                for value in bot_completed_search_ids
+            )
+        ):
+            raise ValueError("SourceScopeSuppressed Bot target list is invalid")
+    elif contract_name is ContractName.SOURCE_SCOPE_DELETION_COMPLETED:
+        expected_fields = common_fields | {"status", "deleted_count"}
+        if payload.get("status") != "completed":
+            raise ValueError("SourceScopeDeletionCompleted status is invalid")
+        count = payload.get("deleted_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("SourceScopeDeletionCompleted count is invalid")
+    else:
+        expected_fields = common_fields | {"status", "phase", "failure_reason"}
+        if payload.get("status") != "failed":
+            raise ValueError("SourceScopeDeletionFailed status is invalid")
+        if payload.get("phase") not in {"suppression", "deletion"}:
+            raise ValueError("SourceScopeDeletionFailed phase is invalid")
+        failure_reason = payload.get("failure_reason")
+        if (
+            not isinstance(failure_reason, str)
+            or not failure_reason
+            or len(failure_reason) > 128
+            or any(character.isspace() for character in failure_reason)
+        ):
+            raise ValueError("SourceScopeDeletionFailed reason is invalid")
+    if set(payload) != expected_fields:
+        raise ValueError("Source Data Deletion event is incomplete")
+    command_name = (
+        ContractName.SUPPRESS_SOURCE_SCOPE
+        if contract_name is ContractName.SOURCE_SCOPE_SUPPRESSED
+        or (
+            contract_name is ContractName.SOURCE_SCOPE_DELETION_FAILED
+            and payload.get("phase") == "suppression"
+        )
+        else ContractName.DELETE_SOURCE_SCOPE
+    )
+    expected_command_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{expected_attempt_id}:{command_name.value}:owner:{owner.value}",
+    )
+    if causation_id != expected_command_id:
+        raise ValueError("Source Data Deletion event causation is invalid")
+    if message_id != derive_contract_message_id(expected_command_id, contract_name):
+        raise ValueError("Source Data Deletion event message identity is invalid")
+    expected_idempotency = (
+        f"source-data-deletion:{contract_name.value}:{request_id}:"
+        f"attempt:{attempt}:owner:{owner.value}"
+    )
+    if idempotency_key != expected_idempotency:
+        raise ValueError("Source Data Deletion event idempotency is invalid")
 
 
 def _validate_source_chat_lifecycle_contract(

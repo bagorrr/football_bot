@@ -81,6 +81,9 @@ from modules.domain import (
     SourceChatAdmissionResolution,
     SourceChatRegistryEntry,
     SourceDataAuditEvent,
+    SourceDataDeletionOwnerAck,
+    SourceDataDeletionReplayBarrier,
+    SourceDataDeletionRequest,
     SourceEventKind,
     SourceEventRecord,
     SourceMessage,
@@ -428,6 +431,7 @@ class ControlledTelegramIngestionAdapter:
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
         source_publisher_id: str | None = None,
+        source_author_telegram_id: int | None = None,
         telegram_publisher_flags: tuple[str, ...] = (),
         telegram_author_flags: tuple[str, ...] = (),
         telegram_scam: bool = False,
@@ -439,7 +443,7 @@ class ControlledTelegramIngestionAdapter:
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
-        bounded_metadata = {
+        bounded_metadata: dict[str, JsonValue] = {
             "message_language": message_language,
             "attachment_types": list(attachment_types),
             "source_author_dm_url": source_author_dm_url,
@@ -449,6 +453,8 @@ class ControlledTelegramIngestionAdapter:
         }
         if source_publisher_id is not None:
             bounded_metadata["source_publisher_id"] = source_publisher_id
+        if source_author_telegram_id is not None:
+            bounded_metadata["source_author_telegram_id"] = source_author_telegram_id
         publisher_flags = list(telegram_publisher_flags)
         publisher_flags.extend(
             flag
@@ -470,9 +476,11 @@ class ControlledTelegramIngestionAdapter:
             if enabled and flag not in author_flags
         )
         if publisher_flags:
-            bounded_metadata["telegram_publisher_flags"] = publisher_flags
+            bounded_metadata["telegram_publisher_flags"] = cast(
+                JsonValue, publisher_flags
+            )
         if author_flags:
-            bounded_metadata["telegram_author_flags"] = author_flags
+            bounded_metadata["telegram_author_flags"] = cast(JsonValue, author_flags)
         self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
@@ -624,6 +632,7 @@ class ControlledTelegramIngestionAdapter:
         source_message_url: str | None = None,
         source_message_reply_capable: bool = False,
         source_publisher_id: str | None = None,
+        source_author_telegram_id: int | None = None,
         telegram_publisher_flags: tuple[str, ...] = (),
         telegram_author_flags: tuple[str, ...] = (),
         telegram_scam: bool = False,
@@ -635,7 +644,7 @@ class ControlledTelegramIngestionAdapter:
         reply_to_telegram_message_id: int | None = None,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
-        bounded_metadata = {
+        bounded_metadata: dict[str, JsonValue] = {
             "message_language": message_language,
             "attachment_types": list(attachment_types),
             "source_author_dm_url": source_author_dm_url,
@@ -645,6 +654,8 @@ class ControlledTelegramIngestionAdapter:
         }
         if source_publisher_id is not None:
             bounded_metadata["source_publisher_id"] = source_publisher_id
+        if source_author_telegram_id is not None:
+            bounded_metadata["source_author_telegram_id"] = source_author_telegram_id
         publisher_flags = list(telegram_publisher_flags)
         publisher_flags.extend(
             flag
@@ -666,9 +677,11 @@ class ControlledTelegramIngestionAdapter:
             if enabled and flag not in author_flags
         )
         if publisher_flags:
-            bounded_metadata["telegram_publisher_flags"] = publisher_flags
+            bounded_metadata["telegram_publisher_flags"] = cast(
+                JsonValue, publisher_flags
+            )
         if author_flags:
-            bounded_metadata["telegram_author_flags"] = author_flags
+            bounded_metadata["telegram_author_flags"] = cast(JsonValue, author_flags)
         self._channel_difference_events[(identity, from_checkpoint)] = (
             TelegramDifferenceEvent(
                 source_chat_identity=identity,
@@ -2080,6 +2093,13 @@ class ControlledConversationLanguageAdapter:
                 "Zurück",
                 "Menü",
             ),
+            source_data_deletion_label="Löschanfragen für Source Data",
+            source_data_deletion_text=(
+                "🗑️ **Löschanfragen für Source Data**\n\n"
+                "Exakte Anfragen für Source Author und Source Chat. "
+                "Die Ansicht enthält keine Nachrichtentexte."
+            ),
+            source_data_deletion_labels=("Zurück", "Menü"),
             source_data_audit_text=(
                 "🧾 **Datenaufbewahrungs-Audit**\n\n"
                 "Ereignisse ohne Nachrichtentext werden 90 Tage aufbewahrt."
@@ -2202,7 +2222,10 @@ class AcceptanceSpine:
         if definition is None:
             msg = "cannot support a contract version without a registered schema"
             raise ValueError(msg)
-        if definition.consumer is not consumer:
+        if definition.consumer is not consumer and contract_name not in {
+            ContractName.SUPPRESS_SOURCE_SCOPE,
+            ContractName.DELETE_SOURCE_SCOPE,
+        }:
             msg = "consumer does not own this contract version"
             raise ValueError(msg)
         self._roles[consumer].supports(contract_name, version)
@@ -2371,6 +2394,127 @@ class AcceptanceSpine:
     def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
         """Observe the bounded body-free Source retention audit trail."""
         return self._observer.source_data_audit()
+
+    def source_data_deletion_requests(
+        self,
+    ) -> tuple[SourceDataDeletionRequest, ...]:
+        """Observe body-free Source Data Deletion Requests."""
+        return self._observer.source_data_deletion_requests()
+
+    def source_data_deletion_owner_acks(
+        self,
+        request_id: str,
+    ) -> tuple[SourceDataDeletionOwnerAck, ...]:
+        """Observe owner acknowledgements for one deletion request."""
+        return self._observer.source_data_deletion_owner_acks(request_id)
+
+    def source_data_deletion_replay_barriers(
+        self,
+    ) -> tuple[SourceDataDeletionReplayBarrier, ...]:
+        """Observe minimal body-free author/chat replay barriers."""
+        return self._observer.source_data_deletion_replay_barriers()
+
+    def create_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        source_author_telegram_id: int,
+        source_chat_key: str,
+        support_case_pointer: str,
+        received_at: datetime | None = None,
+    ) -> SourceDataDeletionRequest:
+        """Intake one exact Source Author/Source Chat support pointer."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.create_source_data_deletion_request(
+            request_id=request_id,
+            source_author_telegram_id=source_author_telegram_id,
+            source_chat_key=source_chat_key,
+            support_case_pointer=support_case_pointer,
+            received_at=received_at or self._clock.now(),
+        )
+
+    def decide_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        decision: str,
+        decision_reason: str | None,
+        decided_by: int,
+        decided_at: datetime | None = None,
+    ) -> bool:
+        """Approve or reject one request without executing erasure."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.decide_source_data_deletion_request(
+            request_id=request_id,
+            decision=decision,
+            decision_reason=decision_reason,
+            decided_by=decided_by,
+            decided_at=decided_at or self._clock.now(),
+        )
+
+    def begin_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        effective_at: datetime | None = None,
+    ) -> bool:
+        """Explicitly start request-scoped suppression and owner fan-out."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.begin_source_data_deletion_request(
+            request_id=request_id,
+            effective_at=effective_at or self._clock.now(),
+        )
+
+    def process_source_data_deletion_until_idle(self) -> None:
+        """Drive suppression and deletion commands through every owner."""
+        while True:
+            progressed = False
+            for role in RuntimeRole:
+                progressed = self._roles[role].process_next() or progressed
+            if not progressed:
+                return
+
+    def record_source_data_deletion_notification(
+        self,
+        *,
+        request_id: str,
+        notified_at: datetime | None = None,
+    ) -> bool:
+        """Record the manual requester-notification gate."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.record_source_data_deletion_notification(
+            request_id=request_id,
+            notified_at=notified_at or self._clock.now(),
+        )
+
+    def complete_source_data_deletion_request(
+        self,
+        *,
+        request_id: str,
+        completion_outcome: str,
+        completion_proof_pointer: str,
+        completed_at: datetime | None = None,
+    ) -> bool:
+        """Complete one request only after all owner and notification gates."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.complete_source_data_deletion_request(
+            request_id=request_id,
+            completion_outcome=completion_outcome,
+            completion_proof_pointer=completion_proof_pointer,
+            completed_at=completed_at or self._clock.now(),
+        )
+
+    def remind_source_data_deletion_requests(
+        self,
+        *,
+        as_of: datetime | None = None,
+    ) -> int:
+        """Advance due reminders without approving or executing requests."""
+        application = self._roles[RuntimeRole.APPLICATION]
+        return application.store.remind_source_data_deletion_requests(
+            as_of=as_of or self._clock.now(),
+            administrator_id=application.telegram_admin_user_id,
+        )
 
     def source_data_audit_as(
         self,
@@ -3911,6 +4055,98 @@ class AcceptanceSpine:
             update_id=update_id,
             telegram_user_id=telegram_user_id,
             action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def select_source_data_deletion_action(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        action: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one bounded Source Data Deletion callback."""
+        self._conversation_onboarding().select_source_data_deletion_action(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            action=action,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_data_deletion_request(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        source_author_telegram_id: int,
+        source_chat_key: str,
+        support_case_pointer: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive structured Source Data Deletion support intake."""
+        self._conversation_onboarding().submit_source_data_deletion_request(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            source_author_telegram_id=source_author_telegram_id,
+            source_chat_key=source_chat_key,
+            support_case_pointer=support_case_pointer,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_data_deletion_reason(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        decision_reason: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one structured Source Data Deletion rejection reason."""
+        self._conversation_onboarding().submit_source_data_deletion_reason(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            decision_reason=decision_reason,
+            screen_revision=(
+                screen_revision
+                if screen_revision is not None
+                else self.conversation_state(telegram_user_id).screen_revision
+            ),
+        )
+
+    def submit_source_data_deletion_completion(
+        self,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        request_id: str,
+        completion_outcome: str,
+        completion_proof_pointer: str,
+        screen_revision: int | None = None,
+    ) -> None:
+        """Drive one body-free manual Source Data Deletion completion."""
+        self._conversation_onboarding().submit_source_data_deletion_completion(
+            update_id=update_id,
+            telegram_user_id=telegram_user_id,
+            request_id=request_id,
+            completion_outcome=completion_outcome,
+            completion_proof_pointer=completion_proof_pointer,
             screen_revision=(
                 screen_revision
                 if screen_revision is not None
