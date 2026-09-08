@@ -1492,12 +1492,23 @@ def _validate_source_event_recorded(
         "event_time",
         "body",
     }
+    allowed_variants = {frozenset(allowed)}
     if envelope.contract_version == 4:
-        allowed |= {"bounded_metadata", "reply_to_telegram_message_id"}
-    allowed_with_history = (
-        allowed | {"from_history"} if envelope.contract_version == 4 else allowed
-    )
-    if set(payload) not in (allowed, allowed_with_history):
+        allowed_variants.clear()
+        allowed |= {
+            "bounded_metadata",
+            "reply_to_telegram_message_id",
+        }
+        allowed_variants.add(frozenset(allowed))
+        allowed_with_history = allowed | {"from_history"}
+        allowed_variants.add(frozenset(allowed_with_history))
+        allowed_with_transport = allowed | {
+            "transport_event_id",
+            "transport_order",
+        }
+        allowed_variants.add(frozenset(allowed_with_transport))
+        allowed_variants.add(frozenset(allowed_with_transport | {"from_history"}))
+    if frozenset(payload) not in allowed_variants:
         raise ValueError("SourceEventRecorded contains unsupported or missing facts")
     from_history = payload.get("from_history", False)
     if not isinstance(from_history, bool):
@@ -1548,6 +1559,23 @@ def _validate_source_event_recorded(
         raise TypeError("SourceEventRecorded body must be text or null")
     if event_kind == "delete" and body is not None:
         raise ValueError("SourceEventRecorded deletion must be body-free")
+    transport_event_id = payload.get("transport_event_id")
+    transport_order = payload.get("transport_order")
+    if (transport_event_id is None) != (transport_order is None):
+        raise ValueError("SourceEventRecorded transport identity is incomplete")
+    if transport_event_id is not None and (
+        not isinstance(transport_event_id, str)
+        or not transport_event_id
+        or len(transport_event_id) > 256
+        or any(character.isspace() for character in transport_event_id)
+    ):
+        raise ValueError("SourceEventRecorded transport identity is invalid")
+    if transport_order is not None and (
+        not isinstance(transport_order, int)
+        or isinstance(transport_order, bool)
+        or transport_order < 1
+    ):
+        raise ValueError("SourceEventRecorded transport order is invalid")
     if envelope.contract_version == 4:
         metadata = payload["bounded_metadata"]
         _validate_bounded_source_metadata(metadata)

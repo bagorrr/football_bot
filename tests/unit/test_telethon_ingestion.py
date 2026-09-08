@@ -508,7 +508,7 @@ def test_telethon_adapter_allows_durably_admitted_account_identity() -> None:
     assert isinstance(result, TelegramDifferenceEvent)
     assert result.source_chat_identity == admitted_identity
     assert result.source_event_id == (
-        "telegram-event:chat:43:message:7:revision:1:kind:create"
+        "telegram-event:chat:43:message:7:revision:1:kind:create:generation:3"
     )
 
 
@@ -790,6 +790,55 @@ def test_provider_fails_closed_for_malformed_in_scope_channel_message() -> None:
     assert error.value.reason.value == "checkpoint_invalid"
     assert error.value.scope is not None
     assert error.value.scope.value == "source_stream"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("new_messages", "messages", "other_updates"),
+)
+def test_provider_fails_closed_for_non_iterable_difference_container(
+    field_name: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    response = SimpleNamespace(pts=11)
+    setattr(response, field_name, 17)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(
+            identity,
+            TelegramChannelCheckpoint(pts=10),
+            1,
+        )
+
+    assert error.value.reason.value == "checkpoint_invalid"
+
+
+def test_provider_ignores_scheduled_updates() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    scheduled_message = _account_message(
+        message_id=1,
+        identity=identity,
+        event_time=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        body="scheduled body",
+    )
+    for update in (
+        types.UpdateNewScheduledMessage(scheduled_message),
+        types.UpdateDeleteScheduledMessages(types.PeerChannel(42), [1]),
+    ):
+        result = TelethonProvider(
+            client=_DifferenceClientProbe(
+                [SimpleNamespace(new_messages=[], other_updates=[update], pts=11)]
+            ),
+            approved_source_chats=(identity,),
+        ).get_channel_difference_event(identity, checkpoint, 1)
+
+        assert isinstance(result, TelegramDifferenceCheckpointAdvance)
+        assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
 
 
 def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:
@@ -1150,6 +1199,111 @@ def test_repeated_edits_have_monotonic_restart_stable_revisions() -> None:
     assert restarted.source_event_id == first.source_event_id
 
 
+def test_a_body_b_body_a_body_edits_are_three_transport_occurrences() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    event_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+
+    def edit_response(*, body: str, minutes: int, pts: int) -> object:
+        message = _account_message(
+            message_id=9,
+            identity=identity,
+            event_time=event_time,
+            body=body,
+        )
+        message.edit_date = event_time + timedelta(minutes=minutes)
+        return SimpleNamespace(
+            new_messages=[],
+            other_updates=[types.UpdateEditChannelMessage(message, pts, 1)],
+            pts=pts,
+        )
+
+    client = _DifferenceClientProbe(
+        [
+            edit_response(body="A", minutes=1, pts=11),
+            edit_response(body="B", minutes=2, pts=12),
+            edit_response(body="A", minutes=3, pts=13),
+        ]
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    results: list[TelegramDifferenceEvent] = []
+
+    for index in range(3):
+        checkpoint = TelegramChannelCheckpoint(pts=10 + index)
+        result = provider.get_channel_difference_event(identity, checkpoint, 1)
+        assert isinstance(result, TelegramDifferenceEvent)
+        results.append(result)
+        provider.acknowledge_channel_difference_event(
+            identity,
+            1,
+            checkpoint,
+            result.source_event_id,
+        )
+
+    assert [result.body for result in results] == ["A", "B", "A"]
+    assert [result.revision for result in results] == sorted(
+        result.revision for result in results
+    )
+    assert len({result.source_event_id for result in results}) == 3
+
+
+def test_readded_generation_does_not_reuse_generation_one_event_identity() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    event_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    message = _account_message(
+        message_id=9,
+        identity=identity,
+        event_time=event_time,
+        body="re-added source",
+    )
+
+    def response(pts: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            new_messages=[message],
+            other_updates=[],
+            pts=pts,
+        )
+
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response(11), response(12)]),
+        approved_source_chats=(identity,),
+    )
+    first_checkpoint = TelegramChannelCheckpoint(pts=10)
+    first = provider.get_channel_difference_event(identity, first_checkpoint, 1)
+    assert isinstance(first, TelegramDifferenceEvent)
+    provider.acknowledge_channel_difference_event(
+        identity,
+        1,
+        first_checkpoint,
+        first.source_event_id,
+    )
+
+    provider.refresh_source_scope(
+        (
+            SourceChatRegistryEntry(
+                identity=identity,
+                registry_generation=2,
+                address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
+                current_address="@valid_source",
+                processing_started_at=event_time,
+                transport_boundary="channel-pts:11",
+                enabled=True,
+                initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+                attested_at=event_time,
+            ),
+        )
+    )
+    second = provider.get_channel_difference_event(
+        identity,
+        TelegramChannelCheckpoint(pts=11),
+        2,
+    )
+
+    assert isinstance(second, TelegramDifferenceEvent)
+    assert first.revision == second.revision == 1
+    assert first.source_event_id != second.source_event_id
+    assert second.source_event_id.endswith(":generation:2")
+
+
 def test_same_timestamp_edits_and_a_later_delete_have_strict_revisions() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     first_checkpoint = TelegramChannelCheckpoint(pts=10)
@@ -1267,15 +1421,17 @@ def test_restarted_provider_replays_delete_time_and_allows_later_edit() -> None:
         other_updates=[types.UpdateDeleteChannelMessages(42, [9], 11, 1)],
         pts=11,
     )
-    durable_history: list[tuple[int, SourceEventKind, str | None, datetime]] = [
-        (1, SourceEventKind.CREATE, "original", message_time)
-    ]
+    durable_history: list[
+        tuple[int, SourceEventKind, str | None, datetime, str | None, int | None]
+    ] = [(1, SourceEventKind.CREATE, "original", message_time, None, None)]
 
     def revision_history(
         requested_identity: TelegramPeerIdentity,
         requested_generation: int,
         requested_message_id: int,
-    ) -> tuple[tuple[int, SourceEventKind, str | None, datetime], ...]:
+    ) -> tuple[
+        tuple[int, SourceEventKind, str | None, datetime, str | None, int | None], ...
+    ]:
         assert requested_identity == identity
         assert requested_generation == 1
         assert requested_message_id == 9
@@ -1291,13 +1447,15 @@ def test_restarted_provider_replays_delete_time_and_allows_later_edit() -> None:
     )
     assert isinstance(first_delete, TelegramDifferenceEvent)
     assert first_delete.kind is SourceEventKind.DELETE
-    assert first_delete.event_time == message_time
+    assert first_delete.event_time > message_time
     durable_history.append(
         (
             first_delete.revision,
             first_delete.kind,
             first_delete.body,
             first_delete.event_time,
+            first_delete.transport_event_id,
+            first_delete.transport_order,
         )
     )
 
@@ -1365,19 +1523,18 @@ def test_account_difference_holds_unknown_identity_until_durable_scope_is_active
         event_time=advanced.date,
         body="must wait for scope activation",
     )
+    response = SimpleNamespace(
+        new_messages=[message],
+        other_updates=[],
+        state=SimpleNamespace(
+            pts=advanced.pts,
+            qts=advanced.qts,
+            seq=advanced.seq,
+            date=advanced.date,
+        ),
+    )
     client = _DifferenceClientProbe(
-        [
-            SimpleNamespace(
-                new_messages=[message],
-                other_updates=[],
-                state=SimpleNamespace(
-                    pts=advanced.pts,
-                    qts=advanced.qts,
-                    seq=advanced.seq,
-                    date=advanced.date,
-                ),
-            )
-        ],
+        [response, response],
         entities=[_channel_entity(telegram_id=43)],
     )
     durable_scope: dict[TelegramPeerIdentity, int] = {}

@@ -142,7 +142,17 @@ class TelegramIngestionAdapter(Protocol):
         self,
         lookup: Callable[
             [TelegramPeerIdentity, int, int],
-            tuple[tuple[int, SourceEventKind, str | None, datetime], ...],
+            tuple[
+                tuple[
+                    int,
+                    SourceEventKind,
+                    str | None,
+                    datetime,
+                    str | None,
+                    int | None,
+                ],
+                ...,
+            ],
         ],
     ) -> None:
         """Bind durable Source Message revision history for restart safety."""
@@ -1237,7 +1247,17 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         identity: TelegramPeerIdentity,
         registry_generation: int,
         telegram_message_id: int,
-    ) -> tuple[tuple[int, SourceEventKind, str | None, datetime], ...]:
+    ) -> tuple[
+        tuple[
+            int,
+            SourceEventKind,
+            str | None,
+            datetime,
+            str | None,
+            int | None,
+        ],
+        ...,
+    ]:
         """Read retained Source Event revisions for provider identity recovery."""
         ...
 

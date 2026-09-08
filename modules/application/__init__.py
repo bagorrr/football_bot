@@ -17403,21 +17403,10 @@ class RuntimeApplication:
                 return self._stop_account_stream_for_transport_failure(
                     reason=IngestionFailureReason.CHECKPOINT_INVALID
                 )
-            try:
-                discarded = self.store.discard_account_difference_event(
-                    event=event,
-                    recorded_at=self.clock.now(),
-                )
-            except (LookupError, TypeError, ValueError):
-                return self._stop_account_stream_for_transport_failure(
-                    reason=IngestionFailureReason.CHECKPOINT_INVALID
-                )
-            if not discarded:
-                return False
-            return self._acknowledge_account_difference_event(
-                checkpoint=checkpoint,
-                result_id=event.source_event_id,
-            )
+            # A pending descriptor has no durable result to acknowledge.  Keep
+            # the account checkpoint unchanged until the scope becomes active
+            # and the provider refetches the page.
+            return False
         identity = event.source_chat_identity
         registry_generation = event.registry_generation
         if self.store.source_stream_is_stopped(
@@ -17432,10 +17421,15 @@ class RuntimeApplication:
             )
             is None
         ):
-            discarded = self.store.discard_account_difference_event(
-                event=event,
-                recorded_at=self.clock.now(),
-            )
+            try:
+                discarded = self.store.discard_account_difference_event(
+                    event=event,
+                    recorded_at=self.clock.now(),
+                )
+            except (LookupError, TypeError, ValueError):
+                return self._stop_account_stream_for_transport_failure(
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID
+                )
             return discarded and self._acknowledge_account_difference_event(
                 checkpoint=checkpoint,
                 result_id=event.source_event_id,
@@ -17506,6 +17500,15 @@ class RuntimeApplication:
                 "body": event.body,
                 "bounded_metadata": dict(event.bounded_metadata),
                 "reply_to_telegram_message_id": event.reply_to_telegram_message_id,
+                **(
+                    {
+                        "transport_event_id": event.transport_event_id,
+                        "transport_order": event.transport_order,
+                    }
+                    if event.transport_event_id is not None
+                    and event.transport_order is not None
+                    else {}
+                ),
             },
         )
         try:
@@ -17759,6 +17762,15 @@ class RuntimeApplication:
                 "body": event.body,
                 "bounded_metadata": dict(event.bounded_metadata),
                 "reply_to_telegram_message_id": event.reply_to_telegram_message_id,
+                **(
+                    {
+                        "transport_event_id": event.transport_event_id,
+                        "transport_order": event.transport_order,
+                    }
+                    if event.transport_event_id is not None
+                    and event.transport_order is not None
+                    else {}
+                ),
             },
         )
         try:
@@ -18043,6 +18055,15 @@ class RuntimeApplication:
                 "bounded_metadata": dict(event.bounded_metadata),
                 "reply_to_telegram_message_id": event.reply_to_telegram_message_id,
                 "from_history": True,
+                **(
+                    {
+                        "transport_event_id": event.transport_event_id,
+                        "transport_order": event.transport_order,
+                    }
+                    if event.transport_event_id is not None
+                    and event.transport_order is not None
+                    else {}
+                ),
             },
         )
         try:

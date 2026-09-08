@@ -212,6 +212,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0058_bot_api_delivery_reconciliation.sql",
     "0059_telethon_history_progress.sql",
     "0060_telethon_ingestion_scope_lookup.sql",
+    "0061_telethon_event_identity_and_progress_retention.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -276,6 +277,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "abb90f07e2e47dca9880b07ecf514af1b38407496fbe85c51739bb76387dbd6f",
     "f4f7e4fef466817d37c5c271c7f978b06d51f9a0bcda16a2812a7d9b5969149d",
     "96788c3cf2a25f912e068517a1b2f15736d1b2ab9ee64132c96c6eda05da7247",
+    "ae782f526807bf08c2daee9fe523ef72f0d17c8b6f335061597147af659db559",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1014,7 +1016,8 @@ class PostgresAcceptanceObserver:
                        registry_generation, telegram_message_id,
                        source_message_revision, event_kind, body, event_time,
                        recorded_at, bounded_metadata,
-                       reply_to_telegram_message_id
+                       reply_to_telegram_message_id, transport_event_id,
+                       transport_order
                 FROM football_runtime.source_event_records
                 ORDER BY recorded_at, source_event_id
                 """
@@ -1040,6 +1043,8 @@ class PostgresAcceptanceObserver:
                 recorded_at=row["recorded_at"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -1056,7 +1061,8 @@ class PostgresAcceptanceObserver:
                        source_event_id, revision, event_kind, body,
                        event_time, recorded_at, registry_generation,
                        bounded_metadata,
-                       reply_to_telegram_message_id
+                       reply_to_telegram_message_id, transport_event_id,
+                       transport_order
                 FROM football_runtime.source_message_revisions
                 ORDER BY source_message_id, revision
                 """
@@ -1074,6 +1080,8 @@ class PostgresAcceptanceObserver:
                 registry_generation=row["registry_generation"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -4261,14 +4269,18 @@ class PostgresRoleStore:
         identity: TelegramPeerIdentity,
         registry_generation: int,
         telegram_message_id: int,
-    ) -> tuple[tuple[int, SourceEventKind, str | None, datetime], ...]:
+    ) -> tuple[
+        tuple[int, SourceEventKind, str | None, datetime, str | None, int | None],
+        ...,
+    ]:
         """Read durable Source Event history without exposing Application tables."""
         if self._role is not RuntimeRole.INGESTION:
             raise ConversationAccessDeniedError
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             rows = connection.execute(
                 """
-                SELECT source_message_revision, event_kind, body, event_time
+                SELECT source_message_revision, event_kind, body, event_time,
+                       transport_event_id, transport_order
                 FROM football_runtime.source_event_records
                 WHERE peer_kind = %s
                   AND telegram_chat_id = %s
@@ -4289,6 +4301,8 @@ class PostgresRoleStore:
                 SourceEventKind(row["event_kind"]),
                 row["body"],
                 row["event_time"],
+                row["transport_event_id"],
+                row["transport_order"],
             )
             for row in rows
         )
@@ -5127,10 +5141,11 @@ class PostgresRoleStore:
                         registry_generation, telegram_message_id,
                         source_message_revision, event_kind, body, event_time,
                         recorded_at, bounded_metadata,
-                        reply_to_telegram_message_id
+                        reply_to_telegram_message_id,
+                        transport_event_id, transport_order
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s
+                        %s::jsonb, %s, %s, %s
                     )
                     ON CONFLICT (source_event_id) DO NOTHING
                     RETURNING source_event_id
@@ -5149,6 +5164,8 @@ class PostgresRoleStore:
                         recorded_at,
                         json.dumps(stored_metadata),
                         stored_reply_to_message_id,
+                        event.transport_event_id,
+                        event.transport_order,
                     ),
                 ).fetchone()
                 if inserted is not None:
@@ -5170,7 +5187,8 @@ class PostgresRoleStore:
                         SELECT message_id, peer_kind, telegram_chat_id,
                                registry_generation, telegram_message_id,
                                source_message_revision, event_kind, body, event_time,
-                               bounded_metadata, reply_to_telegram_message_id
+                               bounded_metadata, reply_to_telegram_message_id,
+                               transport_event_id, transport_order
                         FROM football_runtime.source_event_records
                         WHERE source_event_id = %s
                         """,
@@ -5188,6 +5206,8 @@ class PostgresRoleStore:
                         "event_time": event.event_time,
                         "bounded_metadata": stored_metadata,
                         "reply_to_telegram_message_id": (stored_reply_to_message_id),
+                        "transport_event_id": event.transport_event_id,
+                        "transport_order": event.transport_order,
                     }
                     if existing is not None and event.kind is SourceEventKind.DELETE:
                         existing_event = dict(existing)
@@ -5612,9 +5632,10 @@ class PostgresRoleStore:
                     source_event_id, revision, event_kind, body,
                     event_time, recorded_at, registry_generation,
                     bounded_metadata,
-                    reply_to_telegram_message_id
+                    reply_to_telegram_message_id,
+                    transport_event_id, transport_order
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s
                 )
                 """,
                 (
@@ -5629,6 +5650,8 @@ class PostgresRoleStore:
                     payload["registry_generation"],
                     json.dumps(bounded_metadata),
                     reply_to_message_id,
+                    payload.get("transport_event_id"),
+                    payload.get("transport_order"),
                 ),
             )
             if event_kind == SourceEventKind.DELETE.value:
@@ -5805,6 +5828,12 @@ class PostgresRoleStore:
                 """,
                 (as_of,),
             ).fetchone()
+            progress_row = connection.execute(
+                """
+                SELECT football_runtime.cleanup_expired_telethon_history_progress(%s)
+                """,
+                (as_of,),
+            ).fetchone()
             if cluster_ids:
                 connection.execute(
                     """
@@ -5868,7 +5897,9 @@ class PostgresRoleStore:
                                 if direct_expiry is not None and direct_expiry[0]:
                                     continue
                         _insert_outbox(connection, outgoing)
-        return int(row[0]) if row is not None else 0
+        return (int(row[0]) if row is not None else 0) + (
+            int(progress_row[0]) if progress_row is not None else 0
+        )
 
     def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
         """Read only the body-free audit projection allowed to this role."""
@@ -7343,7 +7374,8 @@ class PostgresRoleStore:
                            registry_generation, telegram_message_id,
                            source_message_revision, event_kind, body,
                            event_time, recorded_at, bounded_metadata,
-                           reply_to_telegram_message_id
+                           reply_to_telegram_message_id,
+                           transport_event_id, transport_order
                     FROM football_runtime.source_event_records
                     ORDER BY recorded_at, source_event_id
                     """
@@ -7371,6 +7403,8 @@ class PostgresRoleStore:
                 recorded_at=row["recorded_at"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -7438,7 +7472,9 @@ class PostgresRoleStore:
                        revision.recorded_at,
                        revision.registry_generation,
                        revision.bounded_metadata,
-                       revision.reply_to_telegram_message_id
+                       revision.reply_to_telegram_message_id,
+                       revision.transport_event_id,
+                       revision.transport_order
                 FROM football_runtime.source_message_revisions AS revision
                 JOIN football_runtime.source_messages AS message
                   ON message.source_message_id = revision.source_message_id
@@ -7463,6 +7499,8 @@ class PostgresRoleStore:
             registry_generation=row["registry_generation"],
             bounded_metadata=row["bounded_metadata"],
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            transport_event_id=row["transport_event_id"],
+            transport_order=row["transport_order"],
         )
 
     def source_message_revision_history(
@@ -7480,7 +7518,8 @@ class PostgresRoleStore:
                 SELECT source_message_revision_id, source_message_id,
                        source_event_id, revision, event_kind, body,
                        event_time, recorded_at, registry_generation,
-                       bounded_metadata, reply_to_telegram_message_id
+                       bounded_metadata, reply_to_telegram_message_id,
+                       transport_event_id, transport_order
                 FROM football_runtime.source_message_revisions
                 WHERE source_message_id = %s
                 ORDER BY revision
@@ -7500,6 +7539,8 @@ class PostgresRoleStore:
                 registry_generation=row["registry_generation"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -7549,7 +7590,9 @@ class PostgresRoleStore:
                        revision.recorded_at,
                        revision.registry_generation,
                        revision.bounded_metadata,
-                       revision.reply_to_telegram_message_id
+                       revision.reply_to_telegram_message_id,
+                       revision.transport_event_id,
+                       revision.transport_order
                 FROM football_runtime.source_messages AS message
                 JOIN football_runtime.source_message_revisions AS revision
                   ON revision.source_message_id = message.source_message_id
@@ -7590,6 +7633,8 @@ class PostgresRoleStore:
             registry_generation=row["registry_generation"],
             bounded_metadata=row["bounded_metadata"],
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            transport_event_id=row["transport_event_id"],
+            transport_order=row["transport_order"],
         )
 
     def adjacent_source_message_revisions(
@@ -7619,7 +7664,9 @@ class PostgresRoleStore:
                        revision.recorded_at,
                        revision.registry_generation,
                        revision.bounded_metadata,
-                       revision.reply_to_telegram_message_id
+                       revision.reply_to_telegram_message_id,
+                       revision.transport_event_id,
+                       revision.transport_order
                 FROM football_runtime.source_messages AS message
                 JOIN football_runtime.source_message_revisions AS revision
                   ON revision.source_message_id = message.source_message_id
@@ -7667,6 +7714,8 @@ class PostgresRoleStore:
                 registry_generation=row["registry_generation"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )

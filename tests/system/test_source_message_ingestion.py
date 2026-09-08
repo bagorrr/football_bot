@@ -7,10 +7,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
+from telethon import types  # type: ignore[import-untyped]
 
 from modules.contracts import ContractName, FailureCode, JsonValue, RuntimeRole
 from modules.domain import (
@@ -39,7 +41,12 @@ from modules.domain import (
     TelegramProtectionUnavailableEvent,
 )
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
-from modules.telethon_ingestion import TelethonTransportError
+from modules.telethon_ingestion import (
+    TelethonIngestionAdapter,
+    TelethonProvider,
+    TelethonRuntime,
+    TelethonTransportError,
+)
 from modules.testkit import (
     AcceptanceSpine,
     ControlledLocationResolverAdapter,
@@ -87,6 +94,126 @@ class _InterruptAfterModelAdapter(ControlledModelAdapter):
         result = super().classify(request)
         self._clock.interrupt_next = True
         return result
+
+
+class _RawDifferenceClient:
+    """Small raw Telethon client probe for the PostgreSQL seam test."""
+
+    def __init__(self, responses: list[object], entity: types.Channel) -> None:
+        self.responses = responses
+        self.entity = entity
+
+    def connect(self) -> None:
+        return None
+
+    def is_user_authorized(self) -> bool:
+        return True
+
+    def get_me(self) -> SimpleNamespace:
+        return SimpleNamespace(id=46_101)
+
+    def get_entity(self, _reference: object) -> types.Channel:
+        return self.entity
+
+    def __call__(self, _request: object) -> object:
+        return self.responses.pop(0)
+
+
+def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
+    fresh_database_url: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_101)
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    entity = types.Channel(
+        id=identity.telegram_id,
+        title="raw controlled channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=False,
+        access_hash=9,
+    )
+    message = SimpleNamespace(
+        id=901,
+        peer_id=types.PeerChannel(identity.telegram_id),
+        from_id=types.PeerUser(46_102),
+        post_author=None,
+        date=registered_at,
+        message="Raw provider body.",
+        noforwards=False,
+    )
+    client = _RawDifferenceClient(
+        [
+            SimpleNamespace(pts=500),
+            SimpleNamespace(
+                new_messages=[message],
+                other_updates=[],
+                pts=501,
+            ),
+        ],
+        entity,
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46101",
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+    )
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(identity,),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_101,
+        address="@raw_controlled_source",
+        update_suffix="raw-provider",
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    event = system.source_events()[0]
+    assert event.body == "Raw provider body."
+    assert event.transport_event_id == "create:message:901"
+    assert event.transport_order == 1
+    assert event.source_publisher_id is not None
+    assert event.source_author_telegram_id == 46_102
+    assert system.source_messages()[0].body == "Raw provider body."
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=501)
+    system.reset()
 
 
 def test_copy_permitted_difference_event_has_no_protected_content_capability() -> None:
@@ -361,6 +488,75 @@ def test_source_chat_history_progress_is_durable_across_restart_and_retry(
         ).last_telegram_message_id
         == 701
     )
+    system.reset()
+
+
+def test_removed_generation_history_progress_uses_source_retention_cleanup(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_102)
+    telethon.allow_public_username(
+        address="@synthetic_history_retention",
+        identity=identity,
+        transport_boundary="channel-pts:500",
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_103,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_103,
+        address="@synthetic_history_retention",
+        update_suffix="history-retention",
+    )
+
+    assert not system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.source_chat_history_progress(
+        identity=identity,
+        registry_generation=1,
+    ).completed
+
+    removed_at = registered_at + timedelta(days=1)
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET permanently_removed_at = %s, enabled = FALSE, updated_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            """,
+            (
+                removed_at,
+                removed_at,
+                identity.kind.value,
+                identity.telegram_id,
+                1,
+            ),
+        )
+    clock.advance_to(removed_at + timedelta(days=90))
+
+    assert system.cleanup_expired_source_data() >= 1
+    with pytest.raises(LookupError):
+        system.source_chat_history_progress(
+            identity=identity,
+            registry_generation=1,
+        )
     system.reset()
 
 
@@ -907,12 +1103,6 @@ def test_pending_account_difference_waits_for_durable_scope_admission(
         seq=500,
         date=datetime(2026, 9, 12, 9, 29, tzinfo=UTC),
     )
-    discarded_checkpoint = TelegramAccountCheckpoint(
-        pts=4_611,
-        qts=71,
-        seq=501,
-        date=datetime(2026, 9, 12, 9, 30, tzinfo=UTC),
-    )
     admitted_checkpoint = TelegramAccountCheckpoint(
         pts=4_612,
         qts=72,
@@ -924,7 +1114,7 @@ def test_pending_account_difference_waits_for_durable_scope_admission(
         result=TelegramDifferencePending(
             source_chat_identity=identity,
             from_checkpoint=initial_checkpoint,
-            to_checkpoint=discarded_checkpoint,
+            to_checkpoint=admitted_checkpoint,
             source_event_id="telegram-pending:before-admission",
             telegram_message_id=170,
         ),
@@ -941,38 +1131,38 @@ def test_pending_account_difference_waits_for_durable_scope_admission(
     system.reset()
     system.initialize_account_ingestion_checkpoint(initial_checkpoint)
 
-    assert system.process_next_account_telegram_difference()
-    assert system.account_ingestion_checkpoint() == discarded_checkpoint
+    assert not system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
     assert system.source_events() == ()
 
     telethon.allow_public_username(
         address="@synthetic_account_pending_race",
         identity=identity,
-        transport_boundary="chat-sequence:501",
+        transport_boundary="chat-sequence:500",
     )
     _register_source_chat(
         system,
         clock=clock,
-        registered_at=discarded_checkpoint.date,
+        registered_at=admitted_checkpoint.date - timedelta(minutes=1),
         administrator_id=46_063,
         address="@synthetic_account_pending_race",
         update_suffix="account-pending-race",
     )
     telethon.queue_account_difference_result(
-        checkpoint=discarded_checkpoint,
+        checkpoint=initial_checkpoint,
         result=TelegramDifferencePending(
             source_chat_identity=identity,
-            from_checkpoint=discarded_checkpoint,
+            from_checkpoint=initial_checkpoint,
             to_checkpoint=admitted_checkpoint,
             source_event_id="telegram-pending:during-admission",
             telegram_message_id=171,
         ),
     )
     telethon.queue_account_difference_result(
-        checkpoint=discarded_checkpoint,
+        checkpoint=initial_checkpoint,
         result=TelegramDifferenceEvent(
             source_chat_identity=identity,
-            from_checkpoint=discarded_checkpoint,
+            from_checkpoint=initial_checkpoint,
             to_checkpoint=admitted_checkpoint,
             source_event_id="source-event:account-pending-race:actual",
             telegram_message_id=171,
@@ -985,7 +1175,7 @@ def test_pending_account_difference_waits_for_durable_scope_admission(
     )
 
     assert not system.process_next_account_telegram_difference()
-    assert system.account_ingestion_checkpoint() == discarded_checkpoint
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
     assert system.source_events() == ()
     assert system.process_next_account_telegram_difference()
     assert system.account_ingestion_checkpoint() == admitted_checkpoint

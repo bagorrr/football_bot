@@ -806,6 +806,8 @@ class _TelegramDifferenceProgress:
     )
     reply_to_telegram_message_id: int | None = None
     from_history: bool = False
+    transport_event_id: str | None = None
+    transport_order: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
@@ -835,6 +837,18 @@ class _TelegramDifferenceProgress:
             raise ValueError("Source Message identity and revision must be positive")
         if self.event_time.tzinfo is None:
             raise ValueError("Source Event time must be timezone-aware")
+        if (self.transport_event_id is None) != (self.transport_order is None):
+            raise ValueError("Telegram transport identity and order must be paired")
+        if self.transport_event_id is not None and (
+            not self.transport_event_id
+            or len(self.transport_event_id) > 256
+            or any(character.isspace() for character in self.transport_event_id)
+        ):
+            raise ValueError("Telegram transport identity is invalid")
+        if self.transport_order is not None and (
+            type(self.transport_order) is not int or self.transport_order < 1
+        ):
+            raise ValueError("Telegram transport order must be positive")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1014,6 +1028,8 @@ class SourceEventRecord:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+    transport_event_id: str | None = None
+    transport_order: int | None = None
 
     @property
     def source_publisher_id(self) -> str | None:
@@ -1066,6 +1082,8 @@ class SourceMessageRevision:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+    transport_event_id: str | None = None
+    transport_order: int | None = None
 
     @property
     def source_publisher_id(self) -> str | None:

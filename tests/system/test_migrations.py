@@ -46,7 +46,7 @@ def _migration_paths() -> list[Path]:
 
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
-    assert [path.name for path in _migration_paths()][-16:] == [
+    assert [path.name for path in _migration_paths()][-17:] == [
         "0045_source_retention_audit_role_isolation.sql",
         "0046_result_variants.sql",
         "0047_allow_silent_callback_ack.sql",
@@ -63,6 +63,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0058_bot_api_delivery_reconciliation.sql",
         "0059_telethon_history_progress.sql",
         "0060_telethon_ingestion_scope_lookup.sql",
+        "0061_telethon_event_identity_and_progress_retention.sql",
     ]
 
 

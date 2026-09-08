@@ -9,6 +9,7 @@ injected transport seam.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import re
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
@@ -35,6 +36,7 @@ from modules.domain import (
     TelegramPeerKind,
     TelegramProtectedContentEvent,
     TelegramProtectionUnavailableEvent,
+    empty_bounded_source_metadata,
 )
 from modules.ports import SourceChatAdmissionError
 
@@ -57,7 +59,14 @@ _TelegramPageResult = (
 
 _API_ID_PATTERN = re.compile(r"[1-9][0-9]{0,9}")
 _ADMINISTRATOR_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}")
-_RevisionHistory = tuple[tuple[int, SourceEventKind, str | None, datetime], ...]
+_RevisionHistoryItem = (
+    tuple[int, SourceEventKind, str | None, datetime]
+    | tuple[int, SourceEventKind, str | None, datetime, str | None, int | None]
+)
+_RevisionHistory = tuple[_RevisionHistoryItem, ...]
+_NormalizedRevisionHistory = tuple[
+    tuple[int, SourceEventKind, str | None, datetime, str | None, int | None], ...
+]
 
 
 class TelethonConfigurationError(ValueError):
@@ -703,25 +712,17 @@ class TelethonProvider:
             | TelegramProtectionUnavailableEvent,
         ] = {}
         self._difference_pending: dict[
-            tuple[str, TelegramPeerIdentity | None],
+            tuple[str, TelegramPeerIdentity | None, int | None],
             list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance],
         ] = {}
-        self._revisions: dict[tuple[TelegramPeerIdentity, int], int] = {}
-        self._message_event_times: dict[tuple[TelegramPeerIdentity, int], datetime] = {}
+        self._revisions: dict[tuple[TelegramPeerIdentity, int, int], int] = {}
+        self._message_event_times: dict[
+            tuple[TelegramPeerIdentity, int, int], datetime
+        ] = {}
         self._message_identities: dict[int, TelegramPeerIdentity] = {}
         self._message_identity_lookup = message_identity_lookup
         self._source_scope_generation_lookup = source_scope_generation_lookup
         self._revision_history_lookup = revision_history_lookup
-        self._difference_raw_pending: dict[
-            tuple[str, TelegramPeerIdentity | None],
-            tuple[
-                object,
-                TelegramPeerIdentity | None,
-                int,
-                TelegramAccountCheckpoint | TelegramChannelCheckpoint,
-                TelegramAccountCheckpoint | TelegramChannelCheckpoint,
-            ],
-        ] = {}
         self._live_callback: Callable[[TelegramPeerIdentity], None] | None = None
         self.refresh_source_scope(approved_source_chats)
 
@@ -767,11 +768,13 @@ class TelethonProvider:
             key: revision
             for key, revision in self._revisions.items()
             if generations.get(key[0]) == previous_generations.get(key[0])
+            and generations.get(key[0]) == key[1]
         }
         self._message_event_times = {
             key: event_time
             for key, event_time in self._message_event_times.items()
             if generations.get(key[0]) == previous_generations.get(key[0])
+            and generations.get(key[0]) == key[1]
         }
 
     def configure_message_identity_lookup(
@@ -941,23 +944,23 @@ class TelethonProvider:
         self, checkpoint: TelegramAccountCheckpoint
     ) -> TelegramDifferenceResult | None:
         """Read one account difference page outcome at the durable checkpoint."""
-        key = ("account", None)
+        key = ("account", None, None)
         pending = self._pending_difference_result(
             route="account",
             identity=None,
             checkpoint=checkpoint,
+            generation=None,
         )
         if pending is not None:
             if isinstance(pending, TelegramDifferencePending):
-                refreshed = self._refresh_pending_account_difference(checkpoint)
-                if refreshed is not None:
-                    return refreshed
-            return pending
-        raw_pending = self._difference_raw_pending.get(key)
-        if raw_pending is not None:
-            refreshed = self._refresh_pending_account_difference(checkpoint)
-            if refreshed is not None:
-                return refreshed
+                if self._source_scope_generation(pending.source_chat_identity) is None:
+                    return pending
+                # The durable scope changed while this body-free descriptor was
+                # held.  Drop only the descriptor and refetch the page from the
+                # unchanged checkpoint; no raw Telegram response is retained.
+                self._difference_pending.pop(key, None)
+            else:
+                return pending
         custom = getattr(self._client, "get_account_difference_event", None)
         if callable(custom):
             return cast(
@@ -1001,14 +1004,6 @@ class TelethonProvider:
             if not results:
                 return None
             self._difference_pending[key] = results
-            if any(isinstance(result, TelegramDifferencePending) for result in results):
-                self._difference_raw_pending[key] = (
-                    response,
-                    None,
-                    1,
-                    checkpoint,
-                    to_checkpoint,
-                )
             return results[0]
         except TelethonTransportError:
             raise
@@ -1026,10 +1021,16 @@ class TelethonProvider:
         registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Read one channel difference page outcome from the supplied durable pts."""
+        generation = (
+            registry_generation
+            if registry_generation is not None
+            else self._generations.get(identity, 1)
+        )
         pending = self._pending_difference_result(
             route="channel",
             identity=identity,
             checkpoint=checkpoint,
+            generation=generation,
         )
         if pending is not None:
             return pending
@@ -1080,13 +1081,13 @@ class TelethonProvider:
             results = self._normalize_difference_page(
                 response=response,
                 identity=identity,
-                generation=registry_generation or self._generations.get(identity, 1),
+                generation=generation,
                 from_checkpoint=checkpoint,
                 to_checkpoint=to_checkpoint,
             )
             if not results:
                 return None
-            self._difference_pending[("channel", identity)] = results
+            self._difference_pending[("channel", identity, generation)] = results
             return results[0]
         except TelethonTransportError:
             raise
@@ -1105,6 +1106,7 @@ class TelethonProvider:
             route="account",
             identity=None,
             checkpoint=checkpoint,
+            generation=None,
             result_id=result_id,
         )
 
@@ -1116,11 +1118,11 @@ class TelethonProvider:
         result_id: str,
     ) -> None:
         """Release one channel page outcome after its durable handoff."""
-        del registry_generation
         self._acknowledge_difference(
             route="channel",
             identity=identity,
             checkpoint=checkpoint,
+            generation=registry_generation,
             result_id=result_id,
         )
 
@@ -1348,24 +1350,37 @@ class TelethonProvider:
 
     @staticmethod
     def _identity_from_peer(peer: object) -> TelegramPeerIdentity | None:
-        channel_id = getattr(peer, "channel_id", None)
-        if type(channel_id) is int and channel_id > 0:
-            return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, channel_id)
-        chat_id = getattr(peer, "chat_id", None)
-        if type(chat_id) is int and chat_id > 0:
-            return TelegramPeerIdentity(TelegramPeerKind.CHAT, chat_id)
+        try:
+            from telethon import types
+        except Exception:
+            return None
+        if isinstance(peer, (types.PeerChannel, types.InputPeerChannel)):
+            peer_id = getattr(peer, "channel_id", None)
+            if type(peer_id) is int and peer_id > 0:
+                return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, peer_id)
+        if isinstance(peer, (types.PeerChat, types.InputPeerChat)):
+            peer_id = getattr(peer, "chat_id", None)
+            if type(peer_id) is int and peer_id > 0:
+                return TelegramPeerIdentity(TelegramPeerKind.CHAT, peer_id)
         return None
 
     @staticmethod
-    def _response_messages(response: object) -> list[object]:
+    def _response_messages(
+        response: object,
+        *,
+        expected_identity: TelegramPeerIdentity | None,
+    ) -> list[object]:
         messages: list[object] = []
         for field_name in ("new_messages", "messages"):
             values = getattr(response, field_name, None)
-            if values:
-                try:
-                    messages.extend(values)
-                except TypeError:
-                    continue
+            if values is None:
+                continue
+            try:
+                messages.extend(values)
+            except TypeError:
+                raise TelethonProvider._malformed_difference_item_error(
+                    expected_identity
+                ) from None
         return messages
 
     def _pending_difference_result(
@@ -1374,8 +1389,9 @@ class TelethonProvider:
         route: str,
         identity: TelegramPeerIdentity | None,
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        generation: int | None,
     ) -> TelegramDifferenceResult | None:
-        key = (route, identity)
+        key = (route, identity, generation)
         pending = self._difference_pending.get(key)
         if not pending:
             self._difference_pending.pop(key, None)
@@ -1390,45 +1406,8 @@ class TelethonProvider:
             # A durable checkpoint changed without the provider acknowledgement.
             # The only safe interpretation is that this page was committed.
             self._difference_pending.pop(key, None)
-            self._difference_raw_pending.pop(key, None)
             return None
         return pending[0]
-
-    def _refresh_pending_account_difference(
-        self, checkpoint: TelegramAccountCheckpoint
-    ) -> TelegramDifferenceResult | None:
-        """Re-normalize a held account page after its peer becomes active."""
-        key = ("account", None)
-        raw = self._difference_raw_pending.get(key)
-        if raw is None:
-            return None
-        response, identity, generation, from_checkpoint, to_checkpoint = raw
-        if from_checkpoint != checkpoint:
-            self._difference_raw_pending.pop(key, None)
-            self._difference_pending.pop(key, None)
-            return None
-        pending = self._difference_pending.get(key)
-        if pending:
-            first = pending[0]
-            if isinstance(first, TelegramDifferencePending) and (
-                self._source_scope_generation(first.source_chat_identity) is None
-            ):
-                return first
-        results = self._normalize_difference_page(
-            response=response,
-            identity=identity,
-            generation=generation,
-            from_checkpoint=from_checkpoint,
-            to_checkpoint=to_checkpoint,
-        )
-        if not results:
-            self._difference_pending.pop(key, None)
-            self._difference_raw_pending.pop(key, None)
-            return None
-        self._difference_pending[key] = results
-        if not any(isinstance(result, TelegramDifferencePending) for result in results):
-            self._difference_raw_pending.pop(key, None)
-        return results[0]
 
     def _acknowledge_difference(
         self,
@@ -1436,9 +1415,10 @@ class TelethonProvider:
         route: str,
         identity: TelegramPeerIdentity | None,
         checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        generation: int | None,
         result_id: str,
     ) -> None:
-        key = (route, identity)
+        key = (route, identity, generation)
         pending = self._difference_pending.get(key)
         if not pending:
             return
@@ -1464,7 +1444,6 @@ class TelethonProvider:
         pending.pop(0)
         if not pending:
             self._difference_pending.pop(key, None)
-            self._difference_raw_pending.pop(key, None)
 
     @staticmethod
     def _difference_result_id(result: TelegramDifferenceResult) -> str:
@@ -1535,6 +1514,8 @@ class TelethonProvider:
             item_identity,
             message_id,
             transport_revision,
+            transport_event_id,
+            transport_order,
             event_time,
         ) in self._difference_items(response, expected_identity=identity):
             if message is not None:
@@ -1576,6 +1557,7 @@ class TelethonProvider:
                         telegram_message_id=current_message_id,
                         kind=kind,
                         transport_revision=transport_revision,
+                        transport_event_id=transport_event_id,
                     )
                 )
                 continue
@@ -1587,6 +1569,16 @@ class TelethonProvider:
             seen.add(key)
             result: _TelegramPageResult
             if message is None:
+                if transport_event_id is None or transport_order is None:
+                    raise TelethonTransportError(
+                        "Telegram delete transport identity is unavailable",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=(
+                            IngestionFailureScope.ACCOUNT_STREAM
+                            if isinstance(from_checkpoint, TelegramAccountCheckpoint)
+                            else IngestionFailureScope.SOURCE_STREAM
+                        ),
+                    )
                 result = self._delete_result(
                     identity=current_identity,
                     generation=current_generation,
@@ -1595,6 +1587,8 @@ class TelethonProvider:
                     telegram_message_id=current_message_id,
                     event_time=event_time,
                     transport_revision=transport_revision,
+                    transport_event_id=transport_event_id,
+                    transport_order=transport_order,
                 )
             else:
                 result = self._message_result(
@@ -1607,6 +1601,8 @@ class TelethonProvider:
                     from_history=False,
                     kind=kind,
                     transport_revision=transport_revision,
+                    transport_event_id=transport_event_id,
+                    transport_order=transport_order,
                     event_time_override=event_time,
                 )
             if not isinstance(
@@ -1707,6 +1703,7 @@ class TelethonProvider:
         telegram_message_id: int,
         kind: SourceEventKind,
         transport_revision: int | None,
+        transport_event_id: str | None,
     ) -> TelegramDifferencePending:
         """Build a body-free outcome whose raw page remains retryable."""
         return TelegramDifferencePending(
@@ -1716,7 +1713,8 @@ class TelethonProvider:
             source_event_id=(
                 f"telegram-pending:{identity.kind.value}:{identity.telegram_id}:"
                 f"message:{telegram_message_id}:kind:{kind.value}:"
-                f"transport:{transport_revision!r}:from:{from_checkpoint!r}"
+                f"transport:{transport_event_id or transport_revision!r}:"
+                f"from:{from_checkpoint!r}"
             ),
             telegram_message_id=telegram_message_id,
             registry_generation=generation,
@@ -1771,14 +1769,23 @@ class TelethonProvider:
             TelegramPeerIdentity | None,
             int | None,
             int | None,
+            str | None,
+            int | None,
             datetime | None,
         ]
     ]:
-        for message in self._response_messages(response):
+        for message in self._response_messages(
+            response,
+            expected_identity=expected_identity,
+        ):
             try:
                 if self._is_known_out_of_scope_message(message):
                     continue
                 edit_date = getattr(message, "edit_date", None)
+                if edit_date is not None and (
+                    not isinstance(edit_date, datetime) or edit_date.tzinfo is None
+                ):
+                    raise ValueError("unsupported Telegram edit time")
                 item_identity = self._difference_message_identity(message)
                 message_id = getattr(message, "id", None)
                 if (
@@ -1788,7 +1795,23 @@ class TelethonProvider:
                 ):
                     raise ValueError("unsupported Telegram difference message")
                 transport_revision = self._update_pts(message)
-                event_time = getattr(message, "date", None)
+                kind = (
+                    SourceEventKind.EDIT
+                    if edit_date is not None
+                    else SourceEventKind.CREATE
+                )
+                event_time = (
+                    edit_date
+                    if kind is SourceEventKind.EDIT
+                    else getattr(message, "date", None)
+                )
+                transport_event_id, transport_order = self._transport_details(
+                    kind=kind,
+                    message_id=message_id,
+                    transport_revision=transport_revision,
+                    event_time=event_time,
+                    edit_date=edit_date,
+                )
             except Exception:
                 if not self._is_known_out_of_scope_message(message):
                     raise self._malformed_difference_item_error(
@@ -1796,29 +1819,48 @@ class TelethonProvider:
                     ) from None
                 continue
             yield (
-                (
-                    SourceEventKind.EDIT
-                    if edit_date is not None
-                    else SourceEventKind.CREATE
-                ),
+                kind,
                 message,
                 item_identity,
                 None,
                 transport_revision,
+                transport_event_id,
+                transport_order,
                 event_time,
             )
-        updates = getattr(response, "other_updates", None) or ()
+        updates = getattr(response, "other_updates", None)
+        if updates is None:
+            updates = ()
         try:
             update_iterator = iter(updates)
         except TypeError:
-            return
+            raise self._malformed_difference_item_error(expected_identity) from None
         for update in update_iterator:
-            name = type(update).__name__
             try:
+                from telethon import types
+
+                source_update_types = (
+                    types.UpdateNewMessage,
+                    types.UpdateNewChannelMessage,
+                    types.UpdateEditMessage,
+                    types.UpdateEditChannelMessage,
+                )
+                delete_update_types = (
+                    types.UpdateDeleteMessages,
+                    types.UpdateDeleteChannelMessages,
+                )
+                scheduled_update_types = (
+                    types.UpdateNewScheduledMessage,
+                    types.UpdateDeleteScheduledMessages,
+                )
+                if isinstance(update, scheduled_update_types):
+                    continue
                 transport_revision = self._update_pts(update)
-                if "Delete" in name:
+                if isinstance(update, delete_update_types):
                     update_identity = self._identity_from_update(update)
-                    if "Channel" in name and update_identity is None:
+                    if isinstance(update, types.UpdateDeleteChannelMessages) and (
+                        update_identity is None
+                    ):
                         raise ValueError("unsupported Telegram channel deletion")
                     message_ids = getattr(update, "messages", None)
                     if message_ids is None:
@@ -1827,12 +1869,21 @@ class TelethonProvider:
                     for message_id in message_iterator:
                         if type(message_id) is not int or message_id < 1:
                             raise ValueError("unsupported Telegram deletion identity")
+                        transport_event_id, transport_order = self._transport_details(
+                            kind=SourceEventKind.DELETE,
+                            message_id=message_id,
+                            transport_revision=transport_revision,
+                            event_time=getattr(update, "date", None),
+                            edit_date=None,
+                        )
                         yield (
                             SourceEventKind.DELETE,
                             None,
                             update_identity,
                             message_id,
                             transport_revision,
+                            transport_event_id,
+                            transport_order,
                             getattr(update, "date", None),
                         )
                     continue
@@ -1840,13 +1891,14 @@ class TelethonProvider:
                 if message is None:
                     if self._difference_update_may_be_in_scope(
                         update,
-                        name=name,
                         expected_identity=expected_identity,
                     ):
                         raise ValueError("unsupported Telegram difference update")
                     continue
                 if self._is_known_out_of_scope_message(message):
                     continue
+                if not isinstance(update, source_update_types):
+                    raise ValueError("unsupported Telegram difference update")
                 item_identity = self._difference_message_identity(message)
                 message_id = getattr(message, "id", None)
                 if (
@@ -1855,19 +1907,40 @@ class TelethonProvider:
                     or message_id < 1
                 ):
                     raise ValueError("unsupported Telegram difference message")
-                edit = "Edit" in name or getattr(message, "edit_date", None) is not None
+                edit_date = getattr(message, "edit_date", None)
+                if edit_date is not None and (
+                    not isinstance(edit_date, datetime) or edit_date.tzinfo is None
+                ):
+                    raise ValueError("unsupported Telegram edit time")
+                edit = (
+                    isinstance(
+                        update,
+                        (types.UpdateEditMessage, types.UpdateEditChannelMessage),
+                    )
+                    or edit_date is not None
+                )
+                kind = SourceEventKind.EDIT if edit else SourceEventKind.CREATE
+                event_time = edit_date if edit else getattr(message, "date", None)
+                transport_event_id, transport_order = self._transport_details(
+                    kind=kind,
+                    message_id=message_id,
+                    transport_revision=transport_revision,
+                    event_time=event_time,
+                    edit_date=edit_date,
+                )
                 yield (
-                    SourceEventKind.EDIT if edit else SourceEventKind.CREATE,
+                    kind,
                     message,
                     self._identity_from_message(message),
                     None,
                     transport_revision,
-                    getattr(message, "date", None),
+                    transport_event_id,
+                    transport_order,
+                    event_time,
                 )
             except Exception:
                 if self._difference_update_may_be_in_scope(
                     update,
-                    name=name,
                     expected_identity=expected_identity,
                 ):
                     raise self._malformed_difference_item_error(
@@ -1882,7 +1955,11 @@ class TelethonProvider:
             peer = getattr(message, "peer_id", None) or getattr(message, "peer", None)
         except Exception:
             return False
-        return type(peer).__name__ in {"InputPeerUser", "PeerUser"}
+        try:
+            from telethon import types
+        except Exception:
+            return False
+        return isinstance(peer, (types.InputPeerUser, types.PeerUser))
 
     @classmethod
     def _difference_message_identity(
@@ -1893,15 +1970,21 @@ class TelethonProvider:
         peer = getattr(message, "peer_id", missing)
         if peer is missing or peer is None:
             peer = getattr(message, "peer", missing)
-        peer_name = type(peer).__name__
-        if peer_name in {"InputPeerUser", "PeerUser"}:
+        try:
+            from telethon import types
+        except Exception:
+            raise ValueError("unsupported Telegram message peer") from None
+        if isinstance(peer, (types.InputPeerUser, types.PeerUser)):
             return None
-        if peer_name not in {
-            "InputPeerChannel",
-            "InputPeerChat",
-            "PeerChannel",
-            "PeerChat",
-        }:
+        if not isinstance(
+            peer,
+            (
+                types.InputPeerChannel,
+                types.InputPeerChat,
+                types.PeerChannel,
+                types.PeerChat,
+            ),
+        ):
             raise ValueError("unsupported Telegram message peer")
         identity = cls._identity_from_peer(peer)
         if identity is None:
@@ -1913,27 +1996,139 @@ class TelethonProvider:
         cls,
         update: object,
         *,
-        name: str,
         expected_identity: TelegramPeerIdentity | None,
     ) -> bool:
         """Keep unrelated Telegram updates ignorable while failing closed on data."""
-        if expected_identity is not None:
-            try:
-                message = getattr(update, "message", None)
-            except Exception:
-                return True
-            if message is not None:
-                return not cls._is_known_out_of_scope_message(message)
-            return "Message" in name or "Delete" in name
-        if "Channel" in name and "Delete" in name:
+        try:
+            from telethon import types
+        except Exception:
             return True
+        if isinstance(
+            update,
+            (
+                types.UpdateNewScheduledMessage,
+                types.UpdateDeleteScheduledMessages,
+                types.UpdateDeleteQuickReply,
+                types.UpdateDeleteQuickReplyMessages,
+                types.UpdateChatParticipantDelete,
+                types.UpdateReadMessagesContents,
+                types.UpdateChannelReadMessagesContents,
+                types.UpdateReadHistoryInbox,
+                types.UpdateReadHistoryOutbox,
+                types.UpdateReadChannelInbox,
+                types.UpdateReadChannelOutbox,
+                types.UpdateReadChannelDiscussionInbox,
+                types.UpdateReadChannelDiscussionOutbox,
+                types.UpdateReadMonoForumInbox,
+                types.UpdateReadMonoForumOutbox,
+                types.UpdateReadStories,
+                types.UpdateRecentReactions,
+                types.UpdateNewStoryReaction,
+                types.UpdateSentStoryReaction,
+                types.UpdatePaidReactionPrivacy,
+                types.UpdateMessageReactions,
+                types.UpdateBotMessageReaction,
+                types.UpdateBotMessageReactions,
+                types.UpdateMessagePoll,
+                types.UpdateMessagePollVote,
+                types.UpdateChannelMessageViews,
+                types.UpdateChannelMessageForwards,
+                types.UpdatePinnedMessages,
+                types.UpdatePinnedChannelMessages,
+                types.UpdateDialogPinned,
+                types.UpdateDraftMessage,
+                types.UpdatePeerHistoryTTL,
+                types.UpdateMessageID,
+                types.UpdateNewEncryptedMessage,
+                types.UpdateEncryptedMessagesRead,
+                types.UpdateBotNewBusinessMessage,
+                types.UpdateBotEditBusinessMessage,
+                types.UpdateBotDeleteBusinessMessage,
+                types.UpdateShortMessage,
+                types.UpdateShortSentMessage,
+            ),
+        ):
+            return False
         try:
             message = getattr(update, "message", None)
         except Exception:
             return True
         if message is not None:
             return not cls._is_known_out_of_scope_message(message)
-        return "Message" in name or "Delete" in name
+        try:
+            from telethon import types
+
+            if isinstance(
+                update,
+                (
+                    types.UpdateDeleteMessages,
+                    types.UpdateDeleteChannelMessages,
+                    types.UpdateNewMessage,
+                    types.UpdateNewChannelMessage,
+                    types.UpdateEditMessage,
+                    types.UpdateEditChannelMessage,
+                ),
+            ):
+                return True
+        except Exception:
+            return True
+        return any(
+            getattr(update, field_name, None) is not None
+            for field_name in ("messages", "channel_id", "chat_id", "peer")
+        )
+
+    @staticmethod
+    def _transport_details(
+        *,
+        kind: SourceEventKind,
+        message_id: int,
+        transport_revision: int | None,
+        event_time: datetime | None,
+        edit_date: datetime | None,
+    ) -> tuple[str, int]:
+        """Return a body-independent Telegram occurrence identity and order."""
+        if kind is SourceEventKind.EDIT:
+            if not isinstance(edit_date, datetime) or edit_date.tzinfo is None:
+                raise ValueError("Telegram edit occurrence time is unavailable")
+            order = TelethonProvider._datetime_order(edit_date)
+            suffix = (
+                f":pts:{transport_revision}"
+                if type(transport_revision) is int and transport_revision > 0
+                else ""
+            )
+            return (
+                f"edit:message:{message_id}:at:{edit_date.isoformat()}{suffix}",
+                order,
+            )
+        if kind is SourceEventKind.CREATE:
+            order = (
+                transport_revision
+                if type(transport_revision) is int and transport_revision > 0
+                else 1
+            )
+            return f"create:message:{message_id}", order
+        if type(transport_revision) is int and transport_revision > 0:
+            return (
+                f"delete:message:{message_id}:pts:{transport_revision}",
+                transport_revision,
+            )
+        if isinstance(event_time, datetime) and event_time.tzinfo is not None:
+            return (
+                f"delete:message:{message_id}:at:{event_time.isoformat()}",
+                TelethonProvider._datetime_order(event_time),
+            )
+        return f"delete:message:{message_id}", 1
+
+    @staticmethod
+    def _datetime_order(value: datetime) -> int:
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        delta = value.astimezone(UTC) - epoch
+        return max(
+            1,
+            delta.days * 86_400 * 1_000_000
+            + delta.seconds * 1_000_000
+            + delta.microseconds,
+        )
 
     @staticmethod
     def _malformed_difference_item_error(
@@ -1992,6 +2187,8 @@ class TelethonProvider:
         telegram_message_id: int,
         event_time: datetime | None,
         transport_revision: int | None,
+        transport_event_id: str,
+        transport_order: int,
     ) -> TelegramDifferenceEvent:
         revision_history = self._revision_history(
             identity=identity,
@@ -2007,6 +2204,9 @@ class TelethonProvider:
             edit_date=None,
             body=None,
             revision_history=revision_history,
+            transport_event_id=transport_event_id,
+            transport_order=transport_order,
+            from_history=False,
         )
         stable_event_time = self._delete_event_time(
             identity=identity,
@@ -2026,6 +2226,7 @@ class TelethonProvider:
                 telegram_message_id,
                 revision,
                 SourceEventKind.DELETE,
+                registry_generation=generation,
             ),
             telegram_message_id=telegram_message_id,
             revision=revision,
@@ -2033,15 +2234,21 @@ class TelethonProvider:
             body=None,
             event_time=stable_event_time,
             registry_generation=generation,
+            transport_event_id=transport_event_id,
+            transport_order=transport_order,
         )
 
     @staticmethod
     def _is_difference_too_long(response: object) -> bool:
         """Recognize Telegram's typed unrecoverable-gap response."""
-        return type(response).__name__ in {
-            "DifferenceTooLong",
-            "ChannelDifferenceTooLong",
-        }
+        try:
+            from telethon import types
+        except Exception:
+            return False
+        return isinstance(
+            response,
+            (types.updates.DifferenceTooLong, types.updates.ChannelDifferenceTooLong),
+        )
 
     def _message_result(
         self,
@@ -2055,6 +2262,8 @@ class TelethonProvider:
         from_history: bool,
         kind: SourceEventKind | None = None,
         transport_revision: int | None = None,
+        transport_event_id: str | None = None,
+        transport_order: int | None = None,
         event_time_override: datetime | None = None,
     ) -> (
         TelegramDifferenceEvent
@@ -2062,7 +2271,11 @@ class TelethonProvider:
         | TelegramProtectionUnavailableEvent
     ):
         message_id = getattr(message, "id", None)
-        event_time = event_time_override or getattr(message, "date", None)
+        event_time = (
+            event_time_override
+            if event_time_override is not None
+            else getattr(message, "date", None)
+        )
         if type(message_id) is not int or message_id < 1:
             raise TelethonTransportError(
                 "Telegram message identity is unavailable",
@@ -2094,8 +2307,36 @@ class TelethonProvider:
                     scope=IngestionFailureScope.SOURCE_STREAM,
                 )
         edit_date = getattr(message, "edit_date", None)
+        if edit_date is not None and (
+            not isinstance(edit_date, datetime) or edit_date.tzinfo is None
+        ):
+            raise TelethonTransportError(
+                "Telegram edit occurrence time is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
         resolved_kind = kind or (
             SourceEventKind.EDIT if edit_date is not None else SourceEventKind.CREATE
+        )
+        derived_transport_event_id, derived_transport_order = self._transport_details(
+            kind=resolved_kind,
+            message_id=message_id,
+            transport_revision=transport_revision,
+            event_time=event_time,
+            edit_date=edit_date,
+        )
+        if (transport_event_id is None) != (transport_order is None):
+            raise TelethonTransportError(
+                "Telegram transport identity is incomplete",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        transport_event_id = transport_event_id or derived_transport_event_id
+        transport_order = transport_order or derived_transport_order
+        revision_history = self._revision_history(
+            identity=identity,
+            generation=generation,
+            message_id=message_id,
         )
         revision = self._revision_for_message(
             identity=identity,
@@ -2105,19 +2346,19 @@ class TelethonProvider:
             transport_revision=transport_revision,
             edit_date=edit_date,
             body=body,
-            revision_history=self._revision_history(
-                identity=identity,
-                generation=generation,
-                message_id=message_id,
-            ),
+            revision_history=revision_history,
+            transport_event_id=transport_event_id,
+            transport_order=transport_order,
+            from_history=from_history,
         )
         source_event_id = canonical_telethon_source_event_id(
             identity,
             message_id,
             revision,
             resolved_kind,
+            registry_generation=generation,
         )
-        self._message_event_times[(identity, message_id)] = event_time
+        self._message_event_times[(identity, generation, message_id)] = event_time
         if protected:
             return TelegramProtectedContentEvent(
                 source_chat_identity=identity,
@@ -2130,11 +2371,19 @@ class TelethonProvider:
                 event_time=event_time,
                 registry_generation=generation,
                 from_history=from_history,
+                transport_event_id=transport_event_id,
+                transport_order=transport_order,
             )
         reply_to = getattr(message, "reply_to", None)
         reply_to_message_id = getattr(reply_to, "reply_to_msg_id", None)
         if type(reply_to_message_id) is not int or reply_to_message_id < 1:
             reply_to_message_id = None
+        bounded_metadata = self._message_metadata(
+            identity=identity,
+            entity=authoritative_entity,
+            message=message,
+            message_id=message_id,
+        )
         return TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
@@ -2146,9 +2395,46 @@ class TelethonProvider:
             body=body,
             event_time=event_time,
             registry_generation=generation,
+            bounded_metadata=bounded_metadata,
             reply_to_telegram_message_id=reply_to_message_id,
             from_history=from_history,
+            transport_event_id=transport_event_id,
+            transport_order=transport_order,
         )
+
+    @staticmethod
+    def _message_metadata(
+        *,
+        identity: TelegramPeerIdentity,
+        entity: object,
+        message: object,
+        message_id: int,
+    ) -> dict[str, Any]:
+        """Carry only bounded, permitted Telegram publisher and route facts."""
+        metadata = empty_bounded_source_metadata()
+        publisher_digest = hashlib.sha256(
+            f"telegram:{identity.kind.value}:{identity.telegram_id}".encode()
+        ).hexdigest()[:32]
+        metadata["source_publisher_id"] = f"publisher:telegram-{publisher_digest}"
+        public_username = getattr(entity, "username", None)
+        if isinstance(public_username, str) and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{4,31}", public_username
+        ):
+            route = f"https://t.me/{public_username}/{message_id}"
+            metadata["source_message_url"] = route
+            metadata["reply_route_url"] = route
+            metadata["source_message_reply_capable"] = True
+        try:
+            from telethon import types
+        except Exception:
+            return metadata
+        if getattr(message, "post_author", None) is None:
+            author_peer = getattr(message, "from_id", None)
+            if isinstance(author_peer, (types.PeerUser, types.InputPeerUser)):
+                author_id = getattr(author_peer, "user_id", None)
+                if type(author_id) is int and author_id > 0:
+                    metadata["source_author_telegram_id"] = author_id
+        return metadata
 
     def _revision_for_message(
         self,
@@ -2160,9 +2446,12 @@ class TelethonProvider:
         transport_revision: int | None,
         edit_date: object,
         body: str | None,
-        revision_history: _RevisionHistory | None = None,
+        revision_history: _NormalizedRevisionHistory | None = None,
+        transport_event_id: str,
+        transport_order: int,
+        from_history: bool,
     ) -> int:
-        revision_key = (identity, message_id)
+        revision_key = (identity, generation, message_id)
         history = (
             revision_history
             if revision_history is not None
@@ -2172,15 +2461,33 @@ class TelethonProvider:
                 message_id=message_id,
             )
         )
-        matching_revisions = tuple(
-            revision
-            for revision, stored_kind, stored_body, _ in history
-            if stored_kind is kind and stored_body == body
+        matching_transport_revisions = tuple(
+            item[0]
+            for item in history
+            if (
+                len(item) == 6
+                and item[1] is kind
+                and item[4] == transport_event_id
+                and item[5] == transport_order
+            )
         )
-        if matching_revisions:
-            revision = max(matching_revisions)
+        if matching_transport_revisions:
+            revision = max(matching_transport_revisions)
+        elif (
+            from_history
+            and isinstance(edit_date, datetime)
+            and edit_date.tzinfo is not None
+        ):
+            matching_occurrence_revisions = tuple(
+                item[0] for item in history if item[1] is kind and item[3] == edit_date
+            )
+            revision = (
+                max(matching_occurrence_revisions)
+                if matching_occurrence_revisions
+                else self._canonical_edit_revision(edit_date)
+            )
         elif isinstance(edit_date, datetime) and edit_date.tzinfo is not None:
-            revision = self._canonical_edit_revision(edit_date, body)
+            revision = self._canonical_edit_revision(edit_date)
         elif type(transport_revision) is int and transport_revision > 0:
             revision = max(2, transport_revision + 1)
         else:
@@ -2189,7 +2496,7 @@ class TelethonProvider:
             self._revisions.get(revision_key, 0),
             (max((item[0] for item in history), default=0)),
         )
-        if revision <= previous and not matching_revisions:
+        if revision <= previous and not matching_transport_revisions:
             if previous >= (1 << 63) - 1:
                 raise TelethonTransportError(
                     "Telegram Source Message revision space is exhausted",
@@ -2201,7 +2508,7 @@ class TelethonProvider:
         return revision
 
     @staticmethod
-    def _canonical_edit_revision(edit_date: datetime, body: str | None) -> int:
+    def _canonical_edit_revision(edit_date: datetime) -> int:
         """Derive a stable edit ordering key without using route-specific pts."""
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         delta = edit_date.astimezone(UTC) - epoch
@@ -2210,7 +2517,6 @@ class TelethonProvider:
             + delta.seconds * 1_000_000
             + delta.microseconds
         )
-        del body
         return max(2, edit_microseconds)
 
     def _revision_history(
@@ -2219,7 +2525,7 @@ class TelethonProvider:
         identity: TelegramPeerIdentity,
         generation: int,
         message_id: int,
-    ) -> _RevisionHistory:
+    ) -> _NormalizedRevisionHistory:
         """Read and validate the durable revision history for one message."""
         lookup = self._revision_history_lookup
         if lookup is None:
@@ -2236,15 +2542,19 @@ class TelethonProvider:
                 scope=IngestionFailureScope.SOURCE_STREAM,
             ) from error
         previous_revision = 0
-        validated: list[tuple[int, SourceEventKind, str | None, datetime]] = []
+        validated: list[
+            tuple[int, SourceEventKind, str | None, datetime, str | None, int | None]
+        ] = []
         for item in history:
-            if not isinstance(item, tuple) or len(item) != 4:
+            if not isinstance(item, tuple) or len(item) not in {4, 6}:
                 raise TelethonTransportError(
                     "Telegram Source Message revision history is malformed",
                     reason=IngestionFailureReason.CHECKPOINT_INVALID,
                     scope=IngestionFailureScope.SOURCE_STREAM,
                 )
-            revision, kind, body, event_time = item
+            revision, kind, body, event_time = item[:4]
+            transport_event_id = item[4] if len(item) == 6 else None
+            transport_order = item[5] if len(item) == 6 else None
             if (
                 type(revision) is not int
                 or revision < 1
@@ -2253,6 +2563,20 @@ class TelethonProvider:
                 or (body is not None and not isinstance(body, str))
                 or not isinstance(event_time, datetime)
                 or event_time.tzinfo is None
+                or (
+                    transport_event_id is not None
+                    and (
+                        not isinstance(transport_event_id, str)
+                        or not transport_event_id
+                        or len(transport_event_id) > 256
+                        or any(character.isspace() for character in transport_event_id)
+                    )
+                )
+                or (
+                    transport_order is not None
+                    and (type(transport_order) is not int or transport_order < 1)
+                )
+                or (transport_event_id is None) != (transport_order is None)
             ):
                 raise TelethonTransportError(
                     "Telegram Source Message revision history is invalid",
@@ -2265,7 +2589,16 @@ class TelethonProvider:
                     reason=IngestionFailureReason.CHECKPOINT_INVALID,
                     scope=IngestionFailureScope.SOURCE_STREAM,
                 )
-            validated.append((revision, kind, body, event_time))
+            validated.append(
+                (
+                    revision,
+                    kind,
+                    body,
+                    event_time,
+                    transport_event_id,
+                    transport_order,
+                )
+            )
             previous_revision = revision
         return tuple(validated)
 
@@ -2278,10 +2611,17 @@ class TelethonProvider:
         event_time: datetime | None,
         transport_revision: int | None,
         revision: int,
-        revision_history: _RevisionHistory,
+        revision_history: _NormalizedRevisionHistory,
     ) -> datetime:
         """Choose a deterministic time for a body-free delete outcome."""
-        for stored_revision, stored_kind, stored_body, stored_time in revision_history:
+        for (
+            stored_revision,
+            stored_kind,
+            stored_body,
+            stored_time,
+            _stored_transport_event_id,
+            _stored_transport_order,
+        ) in revision_history:
             if (
                 stored_revision == revision
                 and stored_kind is SourceEventKind.DELETE
@@ -2290,19 +2630,10 @@ class TelethonProvider:
                 return stored_time
         if isinstance(event_time, datetime) and event_time.tzinfo is not None:
             return event_time
-        cached_time = self._message_event_times.get((identity, message_id))
-        if cached_time is not None:
-            return cached_time
-        for _, stored_kind, _, stored_time in reversed(revision_history):
-            if stored_kind is not SourceEventKind.DELETE:
-                return stored_time
         if isinstance(from_checkpoint, TelegramAccountCheckpoint):
             return from_checkpoint.date
-        stable_revision = transport_revision
-        if type(stable_revision) is not int or stable_revision < 1:
-            stable_revision = from_checkpoint.pts
-        epoch = datetime(1970, 1, 1, tzinfo=UTC)
-        return epoch + timedelta(microseconds=stable_revision)
+        del identity, message_id, transport_revision
+        return datetime.now(UTC)
 
     @staticmethod
     def _is_protected(entity: object, message: object) -> bool:
@@ -2381,13 +2712,20 @@ def canonical_telethon_source_event_id(
     telegram_message_id: int,
     revision: int,
     kind: SourceEventKind,
+    *,
+    registry_generation: int = 1,
 ) -> str:
     """Return one route-independent identity for a Telegram message revision."""
-    if telegram_message_id < 1 or revision < 1:
+    if telegram_message_id < 1 or revision < 1 or registry_generation < 1:
         raise ValueError("Telegram message identity must be positive")
-    return (
+    source_event_id = (
         f"telegram-event:{identity.kind.value}:{identity.telegram_id}:"
         f"message:{telegram_message_id}:revision:{revision}:kind:{kind.value}"
+    )
+    return (
+        source_event_id
+        if registry_generation == 1
+        else f"{source_event_id}:generation:{registry_generation}"
     )
 
 
@@ -2518,7 +2856,7 @@ class TelethonIngestionAdapter:
         self,
         lookup: Callable[
             [TelegramPeerIdentity, int, int],
-            tuple[tuple[int, SourceEventKind, str | None, datetime], ...],
+            _RevisionHistory,
         ],
     ) -> None:
         """Bind durable Source Message revision history for the provider."""
@@ -3029,6 +3367,7 @@ class TelethonIngestionAdapter:
                 result.telegram_message_id,
                 result.revision,
                 result.kind,
+                registry_generation=result.registry_generation,
             ),
         )
 

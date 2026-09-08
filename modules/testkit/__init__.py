@@ -400,7 +400,17 @@ class ControlledTelegramIngestionAdapter:
         self,
         lookup: Callable[
             [TelegramPeerIdentity, int, int],
-            tuple[tuple[int, SourceEventKind, str | None, datetime], ...],
+            tuple[
+                tuple[
+                    int,
+                    SourceEventKind,
+                    str | None,
+                    datetime,
+                    str | None,
+                    int | None,
+                ],
+                ...,
+            ],
         ],
     ) -> None:
         """Accept the production revision lookup without reading a live provider."""
