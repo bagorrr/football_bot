@@ -1839,16 +1839,20 @@ class TelethonProvider:
     def _resolve_message_identity(self, message_id: int) -> TelegramPeerIdentity | None:
         """Resolve a peer-less deletion through the durable application mapping."""
         cached = self._message_identities.get(message_id)
-        if cached is not None:
-            if cached.kind is not TelegramPeerKind.CHAT:
+        if cached is not None and cached.kind is not TelegramPeerKind.CHAT:
+            raise TelethonTransportError(
+                "Telegram peer-less deletion has an invalid cached peer",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+        lookup = self._message_identity_lookup
+        if lookup is None:
+            if cached is not None:
                 raise TelethonTransportError(
-                    "Telegram peer-less deletion has an invalid cached peer",
+                    "Telegram peer-less deletion cannot verify its cached peer",
                     reason=IngestionFailureReason.CHECKPOINT_INVALID,
                     scope=IngestionFailureScope.ACCOUNT_STREAM,
                 )
-            return cached
-        lookup = self._message_identity_lookup
-        if lookup is None:
             return None
         try:
             identity = lookup(message_id)
@@ -1865,6 +1869,12 @@ class TelethonProvider:
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
             ) from error
         if identity is None:
+            if cached is not None:
+                raise TelethonTransportError(
+                    "Telegram peer-less deletion has no durable peer mapping",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                )
             return None
         if not isinstance(identity, TelegramPeerIdentity):
             raise TelethonTransportError(
@@ -1875,6 +1885,12 @@ class TelethonProvider:
         if identity.kind is not TelegramPeerKind.CHAT:
             raise TelethonTransportError(
                 "Telegram peer-less deletion resolved to a non-chat peer",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+        if cached is not None and identity != cached:
+            raise TelethonTransportError(
+                "Telegram peer-less deletion disagrees with its cached peer",
                 reason=IngestionFailureReason.CHECKPOINT_INVALID,
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
             )
@@ -1991,6 +2007,12 @@ class TelethonProvider:
                     else self._update_pts(update)
                 )
                 if isinstance(update, delete_update_types):
+                    if expected_identity is not None and isinstance(
+                        update, types.UpdateDeleteMessages
+                    ):
+                        raise ValueError(
+                            "unsupported Telegram peer-less deletion for channel route"
+                        )
                     update_identity = self._identity_from_update(update)
                     if isinstance(update, types.UpdateDeleteChannelMessages) and (
                         update_identity is None

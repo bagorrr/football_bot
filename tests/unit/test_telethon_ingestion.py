@@ -770,6 +770,30 @@ def test_provider_normalizes_every_channel_page_update_and_acknowledges_in_order
     assert results[-1].to_checkpoint == advanced
 
 
+def test_provider_rejects_basic_chat_delete_constructor_on_channel_route() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    response = SimpleNamespace(
+        new_messages=[],
+        other_updates=[types.UpdateDeleteMessages([4], 11, 1)],
+        pts=11,
+    )
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(
+            identity,
+            TelegramChannelCheckpoint(pts=10),
+            1,
+        )
+
+    assert error.value.reason.value == "checkpoint_invalid"
+    assert error.value.scope is not None
+    assert error.value.scope.value == "source_stream"
+
+
 def test_provider_fails_closed_for_malformed_in_scope_channel_message() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     checkpoint = TelegramChannelCheckpoint(pts=10)
@@ -1295,6 +1319,97 @@ def test_provider_resolves_basic_delete_through_durable_message_lookup() -> None
     assert result.body is None
     assert result.event_time == advanced.date
     assert result.to_checkpoint == advanced
+
+
+@pytest.mark.parametrize(
+    ("durable_identity", "should_resolve"),
+    (
+        (TelegramPeerIdentity(TelegramPeerKind.CHAT, 42), True),
+        (TelegramPeerIdentity(TelegramPeerKind.CHAT, 99), False),
+        (None, False),
+    ),
+)
+def test_provider_reconciles_warm_peerless_delete_with_durable_identity(
+    durable_identity: TelegramPeerIdentity | None,
+    should_resolve: bool,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 42)
+    checkpoint = TelegramAccountCheckpoint(
+        pts=10,
+        qts=20,
+        seq=30,
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    warm_checkpoint = replace(
+        checkpoint,
+        pts=11,
+        seq=31,
+        date=datetime(2026, 9, 1, 10, 1, tzinfo=UTC),
+    )
+    delete_checkpoint = replace(
+        warm_checkpoint,
+        pts=12,
+        seq=32,
+        date=datetime(2026, 9, 1, 10, 2, tzinfo=UTC),
+    )
+    response = SimpleNamespace(
+        new_messages=[
+            _account_message(
+                message_id=8,
+                identity=identity,
+                event_time=warm_checkpoint.date,
+                body="warm cache source",
+            )
+        ],
+        other_updates=[],
+        state=SimpleNamespace(
+            pts=warm_checkpoint.pts,
+            qts=warm_checkpoint.qts,
+            seq=warm_checkpoint.seq,
+            date=warm_checkpoint.date,
+        ),
+    )
+    delete_response = SimpleNamespace(
+        new_messages=[],
+        other_updates=[types.UpdateDeleteMessages([8], 12, 1)],
+        state=SimpleNamespace(
+            pts=delete_checkpoint.pts,
+            qts=delete_checkpoint.qts,
+            seq=delete_checkpoint.seq,
+            date=delete_checkpoint.date,
+        ),
+    )
+    lookup_calls: list[int] = []
+
+    def lookup(message_id: int) -> TelegramPeerIdentity | None:
+        lookup_calls.append(message_id)
+        return durable_identity
+
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response, delete_response]),
+        approved_source_chats=(identity,),
+        message_identity_lookup=lookup,
+    )
+
+    warm_result = provider.get_account_difference_event(checkpoint)
+    assert isinstance(warm_result, TelegramDifferenceEvent)
+    provider.acknowledge_account_difference_event(
+        checkpoint,
+        warm_result.source_event_id,
+    )
+
+    if should_resolve:
+        result = provider.get_account_difference_event(warm_checkpoint)
+        assert isinstance(result, TelegramDifferenceEvent)
+        assert result.source_chat_identity == identity
+        assert result.kind is SourceEventKind.DELETE
+        assert result.to_checkpoint == delete_checkpoint
+    else:
+        with pytest.raises(TelethonTransportError) as error:
+            provider.get_account_difference_event(warm_checkpoint)
+        assert error.value.reason.value == "checkpoint_invalid"
+
+    assert lookup_calls == [8]
 
 
 def test_account_delete_rejects_without_a_current_live_boundary() -> None:

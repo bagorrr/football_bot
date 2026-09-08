@@ -132,6 +132,46 @@ class _RawDifferenceClient:
         return self.responses.pop(0)
 
 
+class _RawIdentityDifferenceClient:
+    """Raw Telethon probe that resolves multiple typed chat identities."""
+
+    def __init__(
+        self,
+        responses: list[object],
+        entities: dict[TelegramPeerIdentity, types.Chat],
+        addresses: dict[str, TelegramPeerIdentity],
+    ) -> None:
+        self.responses = responses
+        self.entities = entities
+        self.addresses = addresses
+
+    def connect(self) -> None:
+        return None
+
+    def is_user_authorized(self) -> bool:
+        return True
+
+    def get_me(self) -> SimpleNamespace:
+        return SimpleNamespace(id=46_103)
+
+    def get_entity(self, reference: object) -> types.Chat:
+        if isinstance(reference, str):
+            return self.entities[self.addresses[reference]]
+        if isinstance(reference, (types.PeerChat, types.InputPeerChat)):
+            identity = TelegramPeerIdentity(
+                TelegramPeerKind.CHAT,
+                reference.chat_id,
+            )
+            return self.entities[identity]
+        raise AssertionError(f"unexpected entity reference: {reference!r}")
+
+    def iter_messages(self, _entity: object, **_kwargs: object) -> object:
+        return iter(())
+
+    def __call__(self, _request: object) -> object:
+        return self.responses.pop(0)
+
+
 def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     fresh_database_url: str,
 ) -> None:
@@ -269,6 +309,7 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
         ("account", "invalid_state_pts"),
         ("channel", "missing_pts"),
         ("channel", "invalid_pts"),
+        ("channel", "wrong_delete_constructor"),
     ),
 )
 def test_raw_telethon_invalid_difference_checkpoint_stops_before_ack(
@@ -306,6 +347,9 @@ def test_raw_telethon_invalid_difference_checkpoint_stops_before_ack(
         response = SimpleNamespace(new_messages=[], other_updates=[])
         if failure_case == "invalid_pts":
             response.pts = None
+        elif failure_case == "wrong_delete_constructor":
+            response.other_updates = [types.UpdateDeleteMessages([901], 501, 1)]
+            response.pts = 501
     client = _RawDifferenceClient(
         [SimpleNamespace(pts=500), response],
         entity,
@@ -396,6 +440,209 @@ def test_raw_telethon_invalid_difference_checkpoint_stops_before_ack(
             registry_generation=1,
         )
     assert client.responses == []
+    system.reset()
+
+
+def test_raw_telethon_warm_peerless_delete_must_match_durable_chat_mapping(
+    fresh_database_url: str,
+) -> None:
+    warm_chat = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_610_205)
+    durable_chat = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_610_207)
+    registered_at = datetime(2026, 9, 12, 11, 0, tzinfo=UTC)
+
+    def entity(identity: TelegramPeerIdentity) -> types.Chat:
+        return types.Chat(
+            id=identity.telegram_id,
+            title=f"raw chat {identity.telegram_id}",
+            photo=types.ChatPhotoEmpty(),
+            participants_count=0,
+            date=None,
+            version=1,
+            noforwards=False,
+        )
+
+    def message(
+        *, identity: TelegramPeerIdentity, event_time: datetime, body: str
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=909,
+            peer_id=types.PeerChat(identity.telegram_id),
+            from_id=types.PeerUser(46_104),
+            post_author=None,
+            date=event_time,
+            message=body,
+            noforwards=False,
+        )
+
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=600,
+        qts=1,
+        seq=600,
+        date=registered_at,
+    )
+    durable_checkpoint = TelegramAccountCheckpoint(
+        pts=601,
+        qts=1,
+        seq=601,
+        date=registered_at + timedelta(minutes=1),
+    )
+    delete_checkpoint = TelegramAccountCheckpoint(
+        pts=602,
+        qts=1,
+        seq=602,
+        date=registered_at + timedelta(minutes=3),
+    )
+    warm_message_time = registered_at + timedelta(minutes=2)
+    client = _RawIdentityDifferenceClient(
+        [
+            SimpleNamespace(seq=600),
+            SimpleNamespace(seq=600),
+            SimpleNamespace(
+                new_messages=[
+                    message(
+                        identity=durable_chat,
+                        event_time=durable_checkpoint.date,
+                        body="durable chat body",
+                    )
+                ],
+                other_updates=[],
+                state=SimpleNamespace(
+                    pts=durable_checkpoint.pts,
+                    qts=durable_checkpoint.qts,
+                    seq=durable_checkpoint.seq,
+                    date=durable_checkpoint.date,
+                ),
+            ),
+            SimpleNamespace(
+                new_messages=[
+                    message(
+                        identity=warm_chat,
+                        event_time=warm_message_time,
+                        body="stale warm body",
+                    )
+                ],
+                other_updates=[],
+                state=SimpleNamespace(
+                    pts=durable_checkpoint.pts + 1,
+                    qts=durable_checkpoint.qts,
+                    seq=durable_checkpoint.seq + 1,
+                    date=warm_message_time,
+                ),
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateDeleteMessages([909], 602, 1)],
+                state=SimpleNamespace(
+                    pts=delete_checkpoint.pts,
+                    qts=delete_checkpoint.qts,
+                    seq=delete_checkpoint.seq,
+                    date=delete_checkpoint.date,
+                ),
+            ),
+        ],
+        entities={warm_chat: entity(warm_chat), durable_chat: entity(durable_chat)},
+        addresses={
+            "@raw_warm_chat": warm_chat,
+            "@raw_durable_chat": durable_chat,
+        },
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46103",
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(warm_chat, durable_chat),
+    )
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(warm_chat, durable_chat),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(warm_chat, durable_chat),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 11, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_103,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_103,
+        address="@raw_warm_chat",
+        update_suffix="raw-warm-chat",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at + timedelta(seconds=30),
+        administrator_id=46_103,
+        address="@raw_durable_chat",
+        update_suffix="raw-durable-chat",
+        already_in_source_chats=True,
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+
+    registered_sources = {entry.identity: entry for entry in system.source_chats()}
+    warm_generation = registered_sources[warm_chat].registry_generation
+    durable_generation = registered_sources[durable_chat].registry_generation
+    ingestion_store = system._roles[RuntimeRole.INGESTION].store
+    assert ingestion_store.source_chat_ingestion_generation(durable_chat) == (
+        durable_generation
+    )
+    assert (
+        ingestion_store.source_chat_ingestion_context(
+            identity=durable_chat,
+            registry_generation=durable_generation,
+        )
+        is not None
+    )
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == durable_checkpoint
+    assert system.source_events(), (system.source_chats(), system.ingestion_failures())
+    assert (
+        ingestion_store.source_chat_identity_for_telegram_message(909) == durable_chat
+    )
+
+    # Recreate a provider-only warm cache after the durable seed has been committed.
+    ingestion.refresh_source_scope(())
+    ingestion.refresh_source_scope(
+        (registered_sources[warm_chat], registered_sources[durable_chat])
+    )
+    warm_result = provider.get_account_difference_event(durable_checkpoint)
+    assert isinstance(warm_result, TelegramDifferenceEvent)
+    assert warm_result.source_chat_identity == warm_chat
+    assert warm_result.registry_generation == warm_generation
+    provider.acknowledge_account_difference_event(
+        durable_checkpoint,
+        warm_result.source_event_id,
+    )
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == durable_checkpoint
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].reason is IngestionFailureReason.CHECKPOINT_INVALID
+    assert {event.source_chat_identity for event in system.source_events()} == {
+        durable_chat
+    }
+    assert system.source_message_deletion_tombstones() == ()
     system.reset()
 
 
