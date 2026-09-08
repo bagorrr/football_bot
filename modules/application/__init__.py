@@ -22150,6 +22150,46 @@ class RuntimeApplication:
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
+        activation_outgoing: ContractEnvelope | None = None
+        if action is SourceChatLifecycleAction.RE_ENABLE:
+            source_chat_entry = next(
+                (
+                    entry
+                    for entry in self.store.source_chats()
+                    if entry.identity == identity
+                    and entry.registry_generation == registry_generation
+                ),
+                None,
+            )
+            if source_chat_entry is not None:
+                activation_outgoing = ContractEnvelope(
+                    contract_name=ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+                    contract_version=1,
+                    message_id=derive_contract_message_id(
+                        incoming.message_id,
+                        ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+                    ),
+                    producer=RuntimeRole.APPLICATION,
+                    consumer=RuntimeRole.INGESTION,
+                    subject_id=incoming.subject_id,
+                    subject_revision=registry_generation,
+                    idempotency_key=(
+                        f"source-chat-scope-activated:{incoming.message_id}"
+                    ),
+                    causation_id=incoming.message_id,
+                    correlation_id=incoming.correlation_id,
+                    recorded_at=recorded_at,
+                    payload={
+                        "source_chat_key": incoming.subject_id,
+                        "telegram_peer_kind": identity.kind.value,
+                        "telegram_chat_id": identity.telegram_id,
+                        "registry_generation": registry_generation,
+                        "address_kind": source_chat_entry.address_kind.value,
+                        "current_address": source_chat_entry.current_address,
+                        "processing_started_at": recorded_at.isoformat(),
+                        "transport_boundary": source_chat_entry.transport_boundary,
+                    },
+                )
         try:
             self.store.change_source_chat_lifecycle(
                 incoming=incoming,
@@ -22158,6 +22198,7 @@ class RuntimeApplication:
                 action=action,
                 telegram_user_id=telegram_user_id,
                 outgoing=outgoing,
+                activation_outgoing=activation_outgoing,
                 received_at=recorded_at,
             )
         except OutboxConflictError as error:

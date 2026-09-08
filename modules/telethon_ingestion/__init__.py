@@ -64,9 +64,10 @@ _RevisionHistoryItem = (
     | tuple[int, SourceEventKind, str | None, datetime, str | None, int | None]
 )
 _RevisionHistory = tuple[_RevisionHistoryItem, ...]
-_NormalizedRevisionHistory = tuple[
-    tuple[int, SourceEventKind, str | None, datetime, str | None, int | None], ...
+_NormalizedRevisionHistoryItem = tuple[
+    int, SourceEventKind, str | None, datetime, str | None, int | None
 ]
+_NormalizedRevisionHistory = tuple[_NormalizedRevisionHistoryItem, ...]
 
 
 class TelethonConfigurationError(ValueError):
@@ -720,6 +721,7 @@ class TelethonProvider:
             tuple[TelegramPeerIdentity, int, int], datetime
         ] = {}
         self._message_identities: dict[int, TelegramPeerIdentity] = {}
+        self._admission_in_progress: set[TelegramPeerIdentity] = set()
         self._message_identity_lookup = message_identity_lookup
         self._source_scope_generation_lookup = source_scope_generation_lookup
         self._revision_history_lookup = revision_history_lookup
@@ -760,8 +762,9 @@ class TelethonProvider:
         self._message_identities = {
             message_id: identity
             for message_id, identity in self._message_identities.items()
-            if identity in generations
+            if identity in generations and identity.kind is TelegramPeerKind.CHAT
         }
+        self._admission_in_progress.clear()
         self._difference_pending.clear()
         self._history_pending.clear()
         self._revisions = {
@@ -866,6 +869,7 @@ class TelethonProvider:
             if identity is None:
                 raise SourceChatAdmissionError
             self._entities[identity] = entity
+            self._admission_in_progress.add(identity)
             address_kind = (
                 SourceChatAddressKind.PRIVATE_INVITE
                 if address.startswith("https://t.me/+")
@@ -885,8 +889,8 @@ class TelethonProvider:
         self, identity: TelegramPeerIdentity
     ) -> str:
         """Capture a typed transport boundary after address resolution."""
-        entity = self._entity_for_identity(identity)
         try:
+            entity = self._entity_for_identity(identity)
             from telethon import functions, types  # type: ignore[import-untyped]
 
             if identity.kind.value == "channel":
@@ -928,8 +932,10 @@ class TelethonProvider:
                 )
             return f"chat-sequence:{sequence}"
         except TelethonTransportError:
+            self._admission_in_progress.discard(identity)
             raise
         except Exception as error:
+            self._admission_in_progress.discard(identity)
             raise TelethonTransportError(
                 "Telegram registration boundary failed",
                 reason=_telethon_failure_reason(error),
@@ -994,12 +1000,18 @@ class TelethonProvider:
                     reason=IngestionFailureReason.DIFFERENCE_TOO_LONG,
                 )
             to_checkpoint = self._account_response_checkpoint(response, checkpoint)
+            account_delete_observation_time = self._account_delete_observation_time(
+                response=response,
+                from_checkpoint=checkpoint,
+                to_checkpoint=to_checkpoint,
+            )
             results = self._normalize_difference_page(
                 response=response,
                 identity=None,
                 generation=1,
                 from_checkpoint=checkpoint,
                 to_checkpoint=to_checkpoint,
+                account_delete_observation_time=account_delete_observation_time,
             )
             if not results:
                 return None
@@ -1183,6 +1195,9 @@ class TelethonProvider:
                     message=message,
                     entity=entity,
                     from_history=True,
+                    event_time_override=(
+                        getattr(message, "edit_date", None) or event_time
+                    ),
                 )
                 self._history_pending[key] = result
                 return result
@@ -1375,12 +1390,11 @@ class TelethonProvider:
             values = getattr(response, field_name, None)
             if values is None:
                 continue
-            try:
-                messages.extend(values)
-            except TypeError:
+            if not isinstance(values, (list, tuple)):
                 raise TelethonProvider._malformed_difference_item_error(
                     expected_identity
                 ) from None
+            messages.extend(values)
         return messages
 
     def _pending_difference_result(
@@ -1494,6 +1508,32 @@ class TelethonProvider:
         )
 
     @staticmethod
+    def _account_delete_observation_time(
+        *,
+        response: object,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+    ) -> datetime | None:
+        """Return only a validated live boundary for peer-less account deletes."""
+        if to_checkpoint.pts <= from_checkpoint.pts:
+            return None
+        state = getattr(response, "state", None) or getattr(
+            response, "intermediate_state", None
+        )
+        value = (
+            getattr(state, "date", None)
+            if state is not None
+            else getattr(response, "date", None)
+        )
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value <= from_checkpoint.date
+        ):
+            return None
+        return value
+
+    @staticmethod
     def _checkpoint_date(value: object, fallback: datetime) -> datetime:
         return value if isinstance(value, datetime) and value.tzinfo else fallback
 
@@ -1505,6 +1545,7 @@ class TelethonProvider:
         generation: int,
         from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        account_delete_observation_time: datetime | None = None,
     ) -> list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance]:
         normalized: list[_TelegramPageResult] = []
         seen: set[tuple[TelegramPeerIdentity, int, SourceEventKind, int | None]] = set()
@@ -1537,7 +1578,7 @@ class TelethonProvider:
                 else self._source_scope_generation(current_identity)
             )
             if current_generation is None:
-                if self._source_scope_generation_lookup is None:
+                if current_identity not in self._admission_in_progress:
                     continue
                 if not (
                     isinstance(from_checkpoint, TelegramAccountCheckpoint)
@@ -1579,13 +1620,30 @@ class TelethonProvider:
                             else IngestionFailureScope.SOURCE_STREAM
                         ),
                     )
+                delete_event_time = event_time
+                if isinstance(from_checkpoint, TelegramAccountCheckpoint) and (
+                    not isinstance(delete_event_time, datetime)
+                    or delete_event_time.tzinfo is None
+                    or delete_event_time <= from_checkpoint.date
+                ):
+                    if (
+                        transport_revision is None
+                        or transport_revision <= from_checkpoint.pts
+                        or account_delete_observation_time is None
+                    ):
+                        raise TelethonTransportError(
+                            "Telegram account deletion observation time is unavailable",
+                            reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                            scope=IngestionFailureScope.ACCOUNT_STREAM,
+                        )
+                    delete_event_time = account_delete_observation_time
                 result = self._delete_result(
                     identity=current_identity,
                     generation=current_generation,
                     from_checkpoint=from_checkpoint,
                     to_checkpoint=from_checkpoint,
                     telegram_message_id=current_message_id,
-                    event_time=event_time,
+                    event_time=delete_event_time,
                     transport_revision=transport_revision,
                     transport_event_id=transport_event_id,
                     transport_order=transport_order,
@@ -1724,6 +1782,8 @@ class TelethonProvider:
         self, message_id: int, identity: TelegramPeerIdentity
     ) -> None:
         """Keep a process-local mapping while durable event state is committed."""
+        if identity.kind is not TelegramPeerKind.CHAT:
+            return
         previous = self._message_identities.get(message_id)
         if previous is not None and previous != identity:
             self._message_identities.pop(message_id, None)
@@ -1734,12 +1794,24 @@ class TelethonProvider:
         """Resolve a peer-less deletion through the durable application mapping."""
         cached = self._message_identities.get(message_id)
         if cached is not None:
+            if cached.kind is not TelegramPeerKind.CHAT:
+                raise TelethonTransportError(
+                    "Telegram peer-less deletion has an invalid cached peer",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                )
             return cached
         lookup = self._message_identity_lookup
         if lookup is None:
             return None
         try:
             identity = lookup(message_id)
+        except ValueError as error:
+            raise TelethonTransportError(
+                "Telegram message identity lookup is ambiguous",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from error
         except Exception as error:
             raise TelethonTransportError(
                 "Telegram message identity lookup failed",
@@ -1751,6 +1823,12 @@ class TelethonProvider:
         if not isinstance(identity, TelegramPeerIdentity):
             raise TelethonTransportError(
                 "Telegram message identity lookup returned an invalid peer",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+        if identity.kind is not TelegramPeerKind.CHAT:
+            raise TelethonTransportError(
+                "Telegram peer-less deletion resolved to a non-chat peer",
                 reason=IngestionFailureReason.CHECKPOINT_INVALID,
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
             )
@@ -1831,11 +1909,12 @@ class TelethonProvider:
         updates = getattr(response, "other_updates", None)
         if updates is None:
             updates = ()
-        try:
-            update_iterator = iter(updates)
-        except TypeError:
+        if not isinstance(updates, (list, tuple)):
             raise self._malformed_difference_item_error(expected_identity) from None
+        update_iterator = iter(updates)
         for update in update_iterator:
+            if isinstance(update, (Mapping, str, bytes, bytearray)):
+                raise self._malformed_difference_item_error(expected_identity)
             try:
                 from telethon import types
 
@@ -1863,7 +1942,7 @@ class TelethonProvider:
                     ):
                         raise ValueError("unsupported Telegram channel deletion")
                     message_ids = getattr(update, "messages", None)
-                    if message_ids is None:
+                    if not isinstance(message_ids, (list, tuple)):
                         raise ValueError("unsupported Telegram deletion")
                     message_iterator = iter(message_ids)
                     for message_id in message_iterator:
@@ -2195,7 +2274,7 @@ class TelethonProvider:
             generation=generation,
             message_id=telegram_message_id,
         )
-        revision = self._revision_for_message(
+        revision, matching_item = self._revision_for_message(
             identity=identity,
             generation=generation,
             message_id=telegram_message_id,
@@ -2208,6 +2287,13 @@ class TelethonProvider:
             transport_order=transport_order,
             from_history=False,
         )
+        if (
+            matching_item is not None
+            and matching_item[4] is not None
+            and matching_item[5] is not None
+        ):
+            transport_event_id = matching_item[4]
+            transport_order = matching_item[5]
         stable_event_time = self._delete_event_time(
             identity=identity,
             message_id=telegram_message_id,
@@ -2338,7 +2424,7 @@ class TelethonProvider:
             generation=generation,
             message_id=message_id,
         )
-        revision = self._revision_for_message(
+        revision, matching_item = self._revision_for_message(
             identity=identity,
             generation=generation,
             message_id=message_id,
@@ -2351,6 +2437,11 @@ class TelethonProvider:
             transport_order=transport_order,
             from_history=from_history,
         )
+        if matching_item is not None:
+            event_time = matching_item[3]
+            if matching_item[4] is not None and matching_item[5] is not None:
+                transport_event_id = matching_item[4]
+                transport_order = matching_item[5]
         source_event_id = canonical_telethon_source_event_id(
             identity,
             message_id,
@@ -2412,8 +2503,23 @@ class TelethonProvider:
     ) -> dict[str, Any]:
         """Carry only bounded, permitted Telegram publisher and route facts."""
         metadata = empty_bounded_source_metadata()
+        try:
+            from telethon import types
+        except Exception:
+            types = None
+        author_id: int | None = None
+        if types is not None and getattr(message, "post_author", None) is None:
+            author_peer = getattr(message, "from_id", None)
+            if isinstance(author_peer, (types.PeerUser, types.InputPeerUser)):
+                candidate = getattr(author_peer, "user_id", None)
+                if type(candidate) is int and candidate > 0:
+                    author_id = candidate
         publisher_digest = hashlib.sha256(
-            f"telegram:{identity.kind.value}:{identity.telegram_id}".encode()
+            (
+                f"telegram:user:{author_id}"
+                if author_id is not None
+                else f"telegram:{identity.kind.value}:{identity.telegram_id}"
+            ).encode()
         ).hexdigest()[:32]
         metadata["source_publisher_id"] = f"publisher:telegram-{publisher_digest}"
         public_username = getattr(entity, "username", None)
@@ -2422,18 +2528,12 @@ class TelethonProvider:
         ):
             route = f"https://t.me/{public_username}/{message_id}"
             metadata["source_message_url"] = route
-            metadata["reply_route_url"] = route
-            metadata["source_message_reply_capable"] = True
-        try:
-            from telethon import types
-        except Exception:
-            return metadata
-        if getattr(message, "post_author", None) is None:
-            author_peer = getattr(message, "from_id", None)
-            if isinstance(author_peer, (types.PeerUser, types.InputPeerUser)):
-                author_id = getattr(author_peer, "user_id", None)
-                if type(author_id) is int and author_id > 0:
-                    metadata["source_author_telegram_id"] = author_id
+            replies = getattr(message, "replies", None)
+            if getattr(replies, "comments", None) is True:
+                metadata["reply_route_url"] = route
+                metadata["source_message_reply_capable"] = True
+        if author_id is not None:
+            metadata["source_author_telegram_id"] = author_id
         return metadata
 
     def _revision_for_message(
@@ -2450,7 +2550,7 @@ class TelethonProvider:
         transport_event_id: str,
         transport_order: int,
         from_history: bool,
-    ) -> int:
+    ) -> tuple[int, _NormalizedRevisionHistoryItem | None]:
         revision_key = (identity, generation, message_id)
         history = (
             revision_history
@@ -2461,31 +2561,37 @@ class TelethonProvider:
                 message_id=message_id,
             )
         )
-        matching_transport_revisions = tuple(
-            item[0]
-            for item in history
-            if (
-                len(item) == 6
-                and item[1] is kind
-                and item[4] == transport_event_id
-                and item[5] == transport_order
-            )
+        matching_item = self._matching_revision_history_item(
+            history=history,
+            kind=kind,
+            transport_event_id=transport_event_id,
+            transport_order=transport_order,
+            from_history=from_history,
         )
-        if matching_transport_revisions:
-            revision = max(matching_transport_revisions)
-        elif (
-            from_history
-            and isinstance(edit_date, datetime)
-            and edit_date.tzinfo is not None
-        ):
-            matching_occurrence_revisions = tuple(
-                item[0] for item in history if item[1] is kind and item[3] == edit_date
+        if matching_item is not None:
+            revision = matching_item[0]
+        elif from_history and isinstance(edit_date, datetime) and edit_date.tzinfo:
+            same_time = tuple(
+                item
+                for item in history
+                if item[1] is SourceEventKind.EDIT and item[3] == edit_date
             )
-            revision = (
-                max(matching_occurrence_revisions)
-                if matching_occurrence_revisions
-                else self._canonical_edit_revision(edit_date)
-            )
+            if same_time:
+                raise TelethonTransportError(
+                    "Telegram history edit occurrence cannot be reconciled",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            if any(
+                item[1] is SourceEventKind.EDIT and item[3] > edit_date
+                for item in history
+            ):
+                raise TelethonTransportError(
+                    "Telegram history edit is older than retained transport state",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            revision = self._canonical_edit_revision(edit_date)
         elif isinstance(edit_date, datetime) and edit_date.tzinfo is not None:
             revision = self._canonical_edit_revision(edit_date)
         elif type(transport_revision) is int and transport_revision > 0:
@@ -2496,7 +2602,13 @@ class TelethonProvider:
             self._revisions.get(revision_key, 0),
             (max((item[0] for item in history), default=0)),
         )
-        if revision <= previous and not matching_transport_revisions:
+        if revision <= previous and matching_item is None:
+            if from_history:
+                raise TelethonTransportError(
+                    "Telegram history revision cannot be safely ordered",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
             if previous >= (1 << 63) - 1:
                 raise TelethonTransportError(
                     "Telegram Source Message revision space is exhausted",
@@ -2505,19 +2617,70 @@ class TelethonProvider:
                 )
             revision = previous + 1
         self._revisions[revision_key] = max(previous, revision)
-        return revision
+        return revision, matching_item
+
+    @staticmethod
+    def _transport_occurrence_key(transport_event_id: str) -> str:
+        """Remove route-specific pts while retaining the Telegram occurrence."""
+        return transport_event_id.split(":pts:", 1)[0]
+
+    def _matching_revision_history_item(
+        self,
+        *,
+        history: _NormalizedRevisionHistory,
+        kind: SourceEventKind,
+        transport_event_id: str,
+        transport_order: int,
+        from_history: bool,
+    ) -> _NormalizedRevisionHistoryItem | None:
+        exact = tuple(
+            item
+            for item in history
+            if item[1] is kind
+            and item[4] == transport_event_id
+            and item[5] == transport_order
+        )
+        if len(exact) > 1:
+            raise TelethonTransportError(
+                "Telegram revision history contains duplicate transport identity",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        if exact:
+            return exact[0]
+        if kind is SourceEventKind.EDIT:
+            occurrence_key = self._transport_occurrence_key(transport_event_id)
+            candidates = tuple(
+                item
+                for item in history
+                if item[1] is kind
+                and item[4] is not None
+                and self._transport_occurrence_key(item[4]) == occurrence_key
+            )
+        elif not from_history:
+            return None
+        elif kind in {SourceEventKind.CREATE, SourceEventKind.DELETE}:
+            candidates = tuple(item for item in history if item[1] is kind)
+        else:
+            candidates = ()
+        if len(candidates) > 1:
+            raise TelethonTransportError(
+                "Telegram history transport occurrence is ambiguous",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _canonical_edit_revision(edit_date: datetime) -> int:
-        """Derive a stable edit ordering key without using route-specific pts."""
-        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        """Derive a compact stable edit key that fits contract revisions."""
+        # ContractEnvelope.subject_revision is a PostgreSQL integer.  Telegram
+        # pts still separates same-second live occurrences; the timestamp key
+        # only needs to provide a restart-stable ordering across edit times.
+        epoch = datetime(2000, 1, 1, tzinfo=UTC)
         delta = edit_date.astimezone(UTC) - epoch
-        edit_microseconds = (
-            delta.days * 86_400 * 1_000_000
-            + delta.seconds * 1_000_000
-            + delta.microseconds
-        )
-        return max(2, edit_microseconds)
+        edit_seconds = delta.days * 86_400 + delta.seconds
+        return max(2, edit_seconds)
 
     def _revision_history(
         self,
@@ -2631,7 +2794,11 @@ class TelethonProvider:
         if isinstance(event_time, datetime) and event_time.tzinfo is not None:
             return event_time
         if isinstance(from_checkpoint, TelegramAccountCheckpoint):
-            return from_checkpoint.date
+            raise TelethonTransportError(
+                "Telegram account deletion observation time is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
         del identity, message_id, transport_revision
         return datetime.now(UTC)
 

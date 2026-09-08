@@ -3385,6 +3385,7 @@ class PostgresRoleStore:
         telegram_user_id: int,
         outgoing: ContractEnvelope,
         received_at: datetime,
+        activation_outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Apply one administrator transition and its publication barrier."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -3617,6 +3618,12 @@ class PostgresRoleStore:
                 )
                 try:
                     _insert_outbox(connection, outgoing)
+                    if (
+                        activation_outgoing is not None
+                        and transitioned
+                        and action is SourceChatLifecycleAction.RE_ENABLE
+                    ):
+                        _insert_outbox(connection, activation_outgoing)
                 except psycopg.errors.UniqueViolation as error:
                     raise OutboxConflictError from error
                 _release_claim(connection, incoming.message_id)
@@ -4242,17 +4249,23 @@ class PostgresRoleStore:
                 FROM (
                     SELECT peer_kind, telegram_chat_id
                     FROM football_runtime.source_event_records
-                    WHERE telegram_message_id = %s
+                    WHERE peer_kind = 'chat'
+                      AND telegram_message_id = %s
                     UNION
                     SELECT peer_kind, telegram_chat_id
                     FROM football_runtime.protected_content_skips
-                    WHERE telegram_message_id = %s
+                    WHERE peer_kind = 'chat'
+                      AND telegram_message_id = %s
                 ) AS retained_mapping
                 ORDER BY peer_kind, telegram_chat_id
                 """,
                 (telegram_message_id, telegram_message_id),
             ).fetchall()
-        if len(rows) != 1:
+        if len(rows) > 1:
+            raise ValueError(
+                "Telegram message identity is ambiguous across basic chats"
+            )
+        if not rows:
             return None
         row = rows[0]
         try:
@@ -5213,6 +5226,26 @@ class PostgresRoleStore:
                         existing_event = dict(existing)
                         existing_event.pop("event_time", None)
                         expected.pop("event_time", None)
+                        existing = existing_event
+                    if (
+                        existing is not None
+                        and event.kind is SourceEventKind.EDIT
+                        and existing["event_kind"] == event.kind.value
+                        and existing["event_time"] == event.event_time
+                        and isinstance(existing["transport_event_id"], str)
+                        and isinstance(event.transport_event_id, str)
+                        and existing["transport_event_id"].split(":pts:", 1)[0]
+                        == event.transport_event_id.split(":pts:", 1)[0]
+                    ):
+                        # Reconcile route-specific transport suffixes only when
+                        # the canonical edit occurrence, event time, and every
+                        # stored payload field already agree.  A same-time
+                        # snapshot whose body differs remains a conflict.
+                        existing_event = dict(existing)
+                        existing_event.pop("transport_event_id", None)
+                        existing_event.pop("transport_order", None)
+                        expected.pop("transport_event_id", None)
+                        expected.pop("transport_order", None)
                         existing = existing_event
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError

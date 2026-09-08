@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -99,9 +100,17 @@ class _InterruptAfterModelAdapter(ControlledModelAdapter):
 class _RawDifferenceClient:
     """Small raw Telethon client probe for the PostgreSQL seam test."""
 
-    def __init__(self, responses: list[object], entity: types.Channel) -> None:
+    def __init__(
+        self,
+        responses: list[object],
+        entity: types.Channel,
+        *,
+        history_messages: list[object] | None = None,
+    ) -> None:
         self.responses = responses
         self.entity = entity
+        self.history_messages = history_messages or []
+        self.history_kwargs: dict[str, object] | None = None
 
     def connect(self) -> None:
         return None
@@ -114,6 +123,10 @@ class _RawDifferenceClient:
 
     def get_entity(self, _reference: object) -> types.Channel:
         return self.entity
+
+    def iter_messages(self, _entity: object, **kwargs: object) -> object:
+        self.history_kwargs = kwargs
+        return iter(self.history_messages)
 
     def __call__(self, _request: object) -> object:
         return self.responses.pop(0)
@@ -133,6 +146,7 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
         noforwards=False,
         access_hash=9,
     )
+    entity.username = "raw_source"
     message = SimpleNamespace(
         id=901,
         peer_id=types.PeerChannel(identity.telegram_id),
@@ -206,13 +220,338 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     assert event.body == "Raw provider body."
     assert event.transport_event_id == "create:message:901"
     assert event.transport_order == 1
-    assert event.source_publisher_id is not None
+    assert event.source_publisher_id == (
+        "publisher:telegram-" + sha256(b"telegram:user:46102").hexdigest()[:32]
+    )
     assert event.source_author_telegram_id == 46_102
+    assert event.bounded_metadata["source_message_url"] == (
+        "https://t.me/raw_source/901"
+    )
+    assert event.bounded_metadata["reply_route_url"] is None
+    assert event.bounded_metadata["source_message_reply_capable"] is False
     assert system.source_messages()[0].body == "Raw provider body."
     assert system.channel_ingestion_checkpoint(
         identity=identity,
         registry_generation=1,
     ) == TelegramChannelCheckpoint(pts=501)
+    system.reset()
+
+
+def test_raw_telethon_overlap_reuses_revisions_and_does_not_promote_stale_history(
+    fresh_database_url: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_102)
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    first_edit = registered_at + timedelta(minutes=1)
+    second_edit = registered_at + timedelta(minutes=2)
+    entity = types.Channel(
+        id=identity.telegram_id,
+        title="raw overlap channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=False,
+        access_hash=9,
+    )
+    entity.username = "raw_overlap_source"
+
+    def message(
+        *,
+        message_id: int = 901,
+        edit_date: datetime | None,
+        body: str,
+    ) -> SimpleNamespace:
+        values: dict[str, object] = {
+            "id": message_id,
+            "peer_id": types.PeerChannel(identity.telegram_id),
+            "from_id": types.PeerUser(46_102),
+            "post_author": None,
+            "date": registered_at,
+            "message": body,
+            "noforwards": False,
+            "replies": SimpleNamespace(comments=False),
+        }
+        if edit_date is not None:
+            values["edit_date"] = edit_date
+        return SimpleNamespace(**values)
+
+    create_message = message(edit_date=None, body="Raw original.")
+    first_message = message(edit_date=first_edit, body="Raw A.")
+    second_message = message(edit_date=second_edit, body="Raw B.")
+    client = _RawDifferenceClient(
+        [
+            SimpleNamespace(pts=500),
+            SimpleNamespace(
+                new_messages=[create_message],
+                other_updates=[],
+                pts=501,
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateEditChannelMessage(first_message, 502, 1)],
+                pts=502,
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateEditChannelMessage(second_message, 503, 1)],
+                pts=503,
+            ),
+        ],
+        entity,
+        history_messages=[first_message],
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46101",
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(identity,),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_101,
+        address="@raw_overlap_source",
+        update_suffix="raw-overlap",
+    )
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert len(system.source_events()) == 3
+    assert len(system.source_message_revisions()) == 3
+    assert system.source_messages()[0].body == "Raw B."
+    assert system.source_messages()[0].current_revision == (
+        system.source_message_revisions()[-1].revision
+    )
+    assert client.history_kwargs is not None
+
+    third_edit_time = registered_at
+    history_first_message = message(
+        message_id=902,
+        edit_date=third_edit_time,
+        body="Raw C.",
+    )
+    client.history_messages = [history_first_message]
+    assert system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    history_event = next(
+        event for event in system.source_events() if event.telegram_message_id == 902
+    )
+
+    client.responses.append(
+        SimpleNamespace(
+            new_messages=[],
+            other_updates=[
+                types.UpdateEditChannelMessage(history_first_message, 504, 1)
+            ],
+            pts=504,
+        )
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    live_events = tuple(
+        event for event in system.source_events() if event.telegram_message_id == 902
+    )
+    assert len(live_events) == 1
+    assert live_events[0].source_event_id == history_event.source_event_id
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=504)
+    system.reset()
+
+
+def test_peerless_message_lookup_is_chat_only_and_rejects_ambiguous_chats(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    administrator_id = 46_103
+    clock = FrozenClock(datetime(2026, 8, 12, 10, 0, tzinfo=UTC))
+    first_chat = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_610_201)
+    second_chat = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_610_203)
+    channel = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_202)
+    for address, identity, boundary in (
+        ("@lookup_chat_one", first_chat, "chat-sequence:600"),
+        ("@lookup_chat_two", second_chat, "chat-sequence:601"),
+        ("@lookup_channel", channel, "channel-pts:601"),
+    ):
+        telethon.allow_public_username(
+            address=address,
+            identity=identity,
+            transport_boundary=boundary,
+        )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 10, 0, tzinfo=UTC),
+        administrator_id=administrator_id,
+        address="@lookup_chat_one",
+        update_suffix="lookup-chat-one",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 10, 0, 30, tzinfo=UTC),
+        administrator_id=administrator_id,
+        address="@lookup_channel",
+        update_suffix="lookup-channel",
+        already_in_source_chats=True,
+    )
+    registered_sources = {entry.identity: entry for entry in system.source_chats()}
+    assert set(registered_sources) == {channel, first_chat}
+    first_chat_generation = registered_sources[first_chat].registry_generation
+    channel_generation = registered_sources[channel].registry_generation
+    system.initialize_account_ingestion_checkpoint(
+        TelegramAccountCheckpoint(
+            pts=600,
+            qts=1,
+            seq=600,
+            date=datetime(2026, 9, 12, 10, 0, tzinfo=UTC),
+        )
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=TelegramAccountCheckpoint(
+            pts=600,
+            qts=1,
+            seq=600,
+            date=datetime(2026, 9, 12, 10, 0, tzinfo=UTC),
+        ),
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=601,
+            qts=1,
+            seq=601,
+            date=datetime(2026, 9, 12, 10, 1, tzinfo=UTC),
+        ),
+        identity=first_chat,
+        registry_generation=first_chat_generation,
+        source_event_id="source-event:lookup-chat-one",
+        telegram_message_id=909,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Basic chat mapping.",
+        event_time=datetime(2026, 9, 12, 10, 0, tzinfo=UTC),
+    )
+    assert system.process_next_account_telegram_difference()
+
+    telethon.add_channel_difference_event(
+        identity=channel,
+        from_checkpoint=TelegramChannelCheckpoint(pts=601),
+        to_checkpoint=TelegramChannelCheckpoint(pts=602),
+        source_event_id="source-event:lookup-channel",
+        telegram_message_id=909,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Channel mapping must not win.",
+        event_time=datetime(2026, 9, 12, 10, 0, 30, tzinfo=UTC),
+        registry_generation=channel_generation,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=channel,
+        registry_generation=channel_generation,
+    )
+
+    ingestion_store = system._roles[RuntimeRole.INGESTION].store
+    assert ingestion_store.source_chat_identity_for_telegram_message(909) == first_chat
+
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=datetime(2026, 9, 12, 10, 2, tzinfo=UTC),
+        administrator_id=administrator_id,
+        address="@lookup_chat_two",
+        update_suffix="lookup-chat-two",
+        already_in_source_chats=True,
+    )
+    second_chat_generation = next(
+        entry.registry_generation
+        for entry in system.source_chats()
+        if entry.identity == second_chat
+    )
+    second_account_checkpoint = TelegramAccountCheckpoint(
+        pts=601,
+        qts=1,
+        seq=601,
+        date=datetime(2026, 9, 12, 10, 1, tzinfo=UTC),
+    )
+    telethon.add_account_difference_event(
+        from_checkpoint=second_account_checkpoint,
+        to_checkpoint=TelegramAccountCheckpoint(
+            pts=602,
+            qts=1,
+            seq=602,
+            date=datetime(2026, 9, 12, 10, 2, tzinfo=UTC),
+        ),
+        identity=second_chat,
+        registry_generation=second_chat_generation,
+        source_event_id="source-event:lookup-chat-two",
+        telegram_message_id=909,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Second basic chat mapping.",
+        event_time=datetime(2026, 9, 12, 10, 2, tzinfo=UTC),
+    )
+    assert system.process_next_account_telegram_difference()
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        ingestion_store.source_chat_identity_for_telegram_message(909)
     system.reset()
 
 

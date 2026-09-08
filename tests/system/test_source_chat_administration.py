@@ -3713,6 +3713,8 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert re_enabled.lifecycle_state is SourceChatLifecycleState.ENABLED
     assert re_enabled.processing_started_at == re_enabled_at
     assert re_enabled.attested_at == initial.attested_at
+    assert system.process_next_source_chat_admission()
+    assert len(telethon.admitted_source_chats) == 2
     assert system.process_next_source_chat_bot_result()
     assert "Source Chat re-enable complete: enabled." in telegram.messages[-1].text
     assert not system.process_next_source_chat_history(

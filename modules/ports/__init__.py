@@ -1176,6 +1176,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         telegram_user_id: int,
         outgoing: ContractEnvelope,
         received_at: datetime,
+        activation_outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Apply one Application-owned Source Chat lifecycle transition."""
         ...

@@ -1724,10 +1724,10 @@ def _validate_bounded_source_metadata(value: JsonValue) -> None:
     reply_capable = value["source_message_reply_capable"]
     if not isinstance(reply_capable, bool):
         raise TypeError("source_message_reply_capable must be boolean")
-    if (value["source_message_url"] is not None) != reply_capable:
-        raise ValueError(
-            "source_message_url must identify exactly one reply-capable post"
-        )
+    if reply_capable and value["source_message_url"] is None:
+        raise ValueError("reply-capable source metadata requires source_message_url")
+    if not reply_capable and value["reply_route_url"] is not None:
+        raise ValueError("reply_route_url requires positive reply-capability evidence")
     if "source_publisher_id" in value:
         publisher_id = value["source_publisher_id"]
         if publisher_id is not None and not is_valid_opaque_source_publisher_id(
