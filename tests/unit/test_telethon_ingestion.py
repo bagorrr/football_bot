@@ -901,11 +901,41 @@ def test_provider_accepts_valid_empty_difference_vectors(
     assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
 
 
+@pytest.mark.parametrize(
+    "update",
+    (
+        pytest.param(
+            types.UpdateUserStatus(42, types.UserStatusRecently()),
+            id="UpdateUserStatus",
+        ),
+        pytest.param(types.UpdateChannel(42), id="UpdateChannel"),
+        pytest.param(types.UpdateChat(42), id="UpdateChat"),
+        pytest.param(types.UpdateUser(42), id="UpdateUser"),
+        pytest.param(
+            types.UpdateChannelParticipant(
+                42,
+                datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+                7,
+                8,
+                9,
+            ),
+            id="UpdateChannelParticipant",
+        ),
+        pytest.param(
+            types.UpdateWebPage(types.WebPageEmpty(1), 11, 1),
+            id="UpdateWebPage",
+        ),
+        pytest.param(
+            types.UpdateChannelAvailableMessages(42, 1),
+            id="UpdateChannelAvailableMessages",
+        ),
+    ),
+)
 @pytest.mark.parametrize("route", ("account", "channel"))
-def test_provider_ignores_typed_user_status_updates_on_both_routes(
+def test_provider_ignores_typed_unrelated_updates_on_both_routes(
+    update: object,
     route: str,
 ) -> None:
-    update = types.UpdateUserStatus(42, types.UserStatusRecently())
     if route == "account":
         account_checkpoint = TelegramAccountCheckpoint(
             pts=10,

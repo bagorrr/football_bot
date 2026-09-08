@@ -156,6 +156,20 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
         message="Raw provider body.",
         noforwards=False,
     )
+    unrelated_updates = (
+        types.UpdateChannel(42),
+        types.UpdateChat(42),
+        types.UpdateUser(42),
+        types.UpdateChannelParticipant(
+            42,
+            datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+            7,
+            8,
+            9,
+        ),
+        types.UpdateWebPage(types.WebPageEmpty(1), 11, 1),
+        types.UpdateChannelAvailableMessages(42, 1),
+    )
     client = _RawDifferenceClient(
         [
             SimpleNamespace(pts=500),
@@ -163,6 +177,11 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
                 new_messages=[message],
                 other_updates=[],
                 pts=501,
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=list(unrelated_updates),
+                pts=502,
             ),
         ],
         entity,
@@ -215,6 +234,10 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
         registry_generation=1,
     )
     assert system.process_next_source_event()
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
 
     event = system.source_events()[0]
     assert event.body == "Raw provider body."
@@ -230,10 +253,12 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     assert event.bounded_metadata["reply_route_url"] is None
     assert event.bounded_metadata["source_message_reply_capable"] is False
     assert system.source_messages()[0].body == "Raw provider body."
+    assert system.ingestion_failures() == ()
+    assert system.source_message_deletion_tombstones() == ()
     assert system.channel_ingestion_checkpoint(
         identity=identity,
         registry_generation=1,
-    ) == TelegramChannelCheckpoint(pts=501)
+    ) == TelegramChannelCheckpoint(pts=502)
     system.reset()
 
 

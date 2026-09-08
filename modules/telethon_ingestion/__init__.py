@@ -2181,6 +2181,12 @@ class TelethonProvider:
                 types.UpdateShortMessage,
                 types.UpdateShortSentMessage,
                 types.UpdateUserStatus,
+                types.UpdateChannel,
+                types.UpdateChat,
+                types.UpdateUser,
+                types.UpdateChannelParticipant,
+                types.UpdateWebPage,
+                types.UpdateChannelAvailableMessages,
             ),
         ):
             return False
