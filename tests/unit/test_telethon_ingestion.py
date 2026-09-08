@@ -769,6 +769,29 @@ def test_provider_normalizes_every_channel_page_update_and_acknowledges_in_order
     assert results[-1].to_checkpoint == advanced
 
 
+def test_provider_fails_closed_for_malformed_in_scope_channel_message() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    malformed_message = SimpleNamespace(
+        id=1,
+        peer_id=SimpleNamespace(channel_id=42),
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        message="controlled in-scope body",
+        noforwards=False,
+    )
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(new_messages=[malformed_message], other_updates=[], pts=11)]
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(identity, checkpoint, 1)
+
+    assert error.value.reason.value == "checkpoint_invalid"
+    assert error.value.scope is not None
+    assert error.value.scope.value == "source_stream"
+
+
 def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 42)
     checkpoint = TelegramAccountCheckpoint(

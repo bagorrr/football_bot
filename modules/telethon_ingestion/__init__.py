@@ -1536,7 +1536,7 @@ class TelethonProvider:
             message_id,
             transport_revision,
             event_time,
-        ) in self._difference_items(response):
+        ) in self._difference_items(response, expected_identity=identity):
             if message is not None:
                 current_message_id = getattr(message, "id", None)
             else:
@@ -1760,7 +1760,10 @@ class TelethonProvider:
         return identity
 
     def _difference_items(
-        self, response: object
+        self,
+        response: object,
+        *,
+        expected_identity: TelegramPeerIdentity | None,
     ) -> Iterator[
         tuple[
             SourceEventKind,
@@ -1773,11 +1776,24 @@ class TelethonProvider:
     ]:
         for message in self._response_messages(response):
             try:
+                if self._is_known_out_of_scope_message(message):
+                    continue
                 edit_date = getattr(message, "edit_date", None)
-                item_identity = self._identity_from_message(message)
+                item_identity = self._difference_message_identity(message)
+                message_id = getattr(message, "id", None)
+                if (
+                    item_identity is None
+                    or type(message_id) is not int
+                    or message_id < 1
+                ):
+                    raise ValueError("unsupported Telegram difference message")
                 transport_revision = self._update_pts(message)
                 event_time = getattr(message, "date", None)
             except Exception:
+                if not self._is_known_out_of_scope_message(message):
+                    raise self._malformed_difference_item_error(
+                        expected_identity
+                    ) from None
                 continue
             yield (
                 (
@@ -1797,14 +1813,20 @@ class TelethonProvider:
         except TypeError:
             return
         for update in update_iterator:
+            name = type(update).__name__
             try:
-                name = type(update).__name__
                 transport_revision = self._update_pts(update)
                 if "Delete" in name:
                     update_identity = self._identity_from_update(update)
-                    message_ids = getattr(update, "messages", None) or ()
+                    if "Channel" in name and update_identity is None:
+                        raise ValueError("unsupported Telegram channel deletion")
+                    message_ids = getattr(update, "messages", None)
+                    if message_ids is None:
+                        raise ValueError("unsupported Telegram deletion")
                     message_iterator = iter(message_ids)
                     for message_id in message_iterator:
+                        if type(message_id) is not int or message_id < 1:
+                            raise ValueError("unsupported Telegram deletion identity")
                         yield (
                             SourceEventKind.DELETE,
                             None,
@@ -1816,7 +1838,23 @@ class TelethonProvider:
                     continue
                 message = getattr(update, "message", None)
                 if message is None:
+                    if self._difference_update_may_be_in_scope(
+                        update,
+                        name=name,
+                        expected_identity=expected_identity,
+                    ):
+                        raise ValueError("unsupported Telegram difference update")
                     continue
+                if self._is_known_out_of_scope_message(message):
+                    continue
+                item_identity = self._difference_message_identity(message)
+                message_id = getattr(message, "id", None)
+                if (
+                    item_identity is None
+                    or type(message_id) is not int
+                    or message_id < 1
+                ):
+                    raise ValueError("unsupported Telegram difference message")
                 edit = "Edit" in name or getattr(message, "edit_date", None) is not None
                 yield (
                     SourceEventKind.EDIT if edit else SourceEventKind.CREATE,
@@ -1827,7 +1865,90 @@ class TelethonProvider:
                     getattr(message, "date", None),
                 )
             except Exception:
+                if self._difference_update_may_be_in_scope(
+                    update,
+                    name=name,
+                    expected_identity=expected_identity,
+                ):
+                    raise self._malformed_difference_item_error(
+                        expected_identity
+                    ) from None
                 continue
+
+    @staticmethod
+    def _is_known_out_of_scope_message(message: object) -> bool:
+        """Recognize Telegram user-peer messages that are not Source Chats."""
+        try:
+            peer = getattr(message, "peer_id", None) or getattr(message, "peer", None)
+        except Exception:
+            return False
+        return type(peer).__name__ in {"InputPeerUser", "PeerUser"}
+
+    @classmethod
+    def _difference_message_identity(
+        cls, message: object
+    ) -> TelegramPeerIdentity | None:
+        """Read only the supported Telegram chat peer from one message item."""
+        missing = object()
+        peer = getattr(message, "peer_id", missing)
+        if peer is missing or peer is None:
+            peer = getattr(message, "peer", missing)
+        peer_name = type(peer).__name__
+        if peer_name in {"InputPeerUser", "PeerUser"}:
+            return None
+        if peer_name not in {
+            "InputPeerChannel",
+            "InputPeerChat",
+            "PeerChannel",
+            "PeerChat",
+        }:
+            raise ValueError("unsupported Telegram message peer")
+        identity = cls._identity_from_peer(peer)
+        if identity is None:
+            raise ValueError("unsupported Telegram message peer")
+        return identity
+
+    @classmethod
+    def _difference_update_may_be_in_scope(
+        cls,
+        update: object,
+        *,
+        name: str,
+        expected_identity: TelegramPeerIdentity | None,
+    ) -> bool:
+        """Keep unrelated Telegram updates ignorable while failing closed on data."""
+        if expected_identity is not None:
+            try:
+                message = getattr(update, "message", None)
+            except Exception:
+                return True
+            if message is not None:
+                return not cls._is_known_out_of_scope_message(message)
+            return "Message" in name or "Delete" in name
+        if "Channel" in name and "Delete" in name:
+            return True
+        try:
+            message = getattr(update, "message", None)
+        except Exception:
+            return True
+        if message is not None:
+            return not cls._is_known_out_of_scope_message(message)
+        return "Message" in name or "Delete" in name
+
+    @staticmethod
+    def _malformed_difference_item_error(
+        expected_identity: TelegramPeerIdentity | None,
+    ) -> TelethonTransportError:
+        """Return the body-free failure that prevents lossless checkpointing."""
+        return TelethonTransportError(
+            "Telegram difference item is malformed or unsupported",
+            reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            scope=(
+                IngestionFailureScope.SOURCE_STREAM
+                if expected_identity is not None
+                else IngestionFailureScope.ACCOUNT_STREAM
+            ),
+        )
 
     @classmethod
     def _identity_from_update(cls, update: object) -> TelegramPeerIdentity | None:
