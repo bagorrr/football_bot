@@ -49,6 +49,7 @@ T2_CONFIGURATION_KEYS = frozenset(
     }
 )
 SEVEN_DAY_HISTORY = timedelta(days=7)
+_MISSING = object()
 
 _TelegramPageResult = (
     TelegramDifferenceEvent
@@ -1086,8 +1087,10 @@ class TelethonProvider:
                     reason=IngestionFailureReason.DIFFERENCE_TOO_LONG,
                 )
             to_checkpoint = TelegramChannelCheckpoint(
-                pts=self._nonnegative_int(
-                    getattr(response, "pts", None), checkpoint.pts
+                pts=self._required_checkpoint_int(
+                    getattr(response, "pts", _MISSING),
+                    field_name="pts",
+                    scope=IngestionFailureScope.SOURCE_STREAM,
                 )
             )
             results = self._normalize_difference_page(
@@ -1484,27 +1487,58 @@ class TelethonProvider:
         response: object,
         checkpoint: TelegramAccountCheckpoint,
     ) -> TelegramAccountCheckpoint:
-        state = getattr(response, "state", None) or getattr(
-            response, "intermediate_state", None
-        )
+        missing = _MISSING
+        state = getattr(response, "state", missing)
+        if state is missing:
+            state = getattr(response, "intermediate_state", missing)
+        account_scope = IngestionFailureScope.ACCOUNT_STREAM
+        if state is missing:
+            try:
+                from telethon import types
+            except Exception:
+                types = None
+            if types is not None and isinstance(
+                response, types.updates.DifferenceEmpty
+            ):
+                return TelegramAccountCheckpoint(
+                    pts=checkpoint.pts,
+                    qts=checkpoint.qts,
+                    seq=TelethonProvider._required_checkpoint_int(
+                        getattr(response, "seq", missing),
+                        field_name="seq",
+                        scope=account_scope,
+                    ),
+                    date=TelethonProvider._required_checkpoint_date(
+                        getattr(response, "date", missing),
+                        field_name="date",
+                        scope=account_scope,
+                    ),
+                )
+            raise TelethonTransportError(
+                "Telegram account difference checkpoint state is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=account_scope,
+            )
         return TelegramAccountCheckpoint(
-            pts=TelethonProvider._nonnegative_int(
-                getattr(state, "pts", None), checkpoint.pts
+            pts=TelethonProvider._required_checkpoint_int(
+                getattr(state, "pts", missing),
+                field_name="pts",
+                scope=account_scope,
             ),
-            qts=TelethonProvider._nonnegative_int(
-                getattr(state, "qts", None), checkpoint.qts
+            qts=TelethonProvider._required_checkpoint_int(
+                getattr(state, "qts", missing),
+                field_name="qts",
+                scope=account_scope,
             ),
-            seq=TelethonProvider._nonnegative_int(
-                getattr(state, "seq", None)
-                if state is not None
-                else getattr(response, "seq", None),
-                checkpoint.seq,
+            seq=TelethonProvider._required_checkpoint_int(
+                getattr(state, "seq", missing),
+                field_name="seq",
+                scope=account_scope,
             ),
-            date=TelethonProvider._checkpoint_date(
-                getattr(state, "date", None)
-                if state is not None
-                else getattr(response, "date", None),
-                checkpoint.date,
+            date=TelethonProvider._required_checkpoint_date(
+                getattr(state, "date", missing),
+                field_name="date",
+                scope=account_scope,
             ),
         )
 
@@ -1535,8 +1569,19 @@ class TelethonProvider:
         return value
 
     @staticmethod
-    def _checkpoint_date(value: object, fallback: datetime) -> datetime:
-        return value if isinstance(value, datetime) and value.tzinfo else fallback
+    def _required_checkpoint_date(
+        value: object,
+        *,
+        field_name: str,
+        scope: IngestionFailureScope,
+    ) -> datetime:
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise TelethonTransportError(
+                f"Telegram difference checkpoint field {field_name} is invalid",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=scope,
+            )
+        return value
 
     def _normalize_difference_page(
         self,
@@ -1930,13 +1975,21 @@ class TelethonProvider:
                     types.UpdateDeleteMessages,
                     types.UpdateDeleteChannelMessages,
                 )
+                progress_update_types = source_update_types + delete_update_types
                 scheduled_update_types = (
                     types.UpdateNewScheduledMessage,
                     types.UpdateDeleteScheduledMessages,
                 )
                 if isinstance(update, scheduled_update_types):
                     continue
-                transport_revision = self._update_pts(update)
+                transport_revision = (
+                    self._required_update_progress(
+                        update,
+                        expected_identity=expected_identity,
+                    )
+                    if isinstance(update, progress_update_types)
+                    else self._update_pts(update)
+                )
                 if isinstance(update, delete_update_types):
                     update_identity = self._identity_from_update(update)
                     if isinstance(update, types.UpdateDeleteChannelMessages) and (
@@ -2127,6 +2180,7 @@ class TelethonProvider:
                 types.UpdateBotDeleteBusinessMessage,
                 types.UpdateShortMessage,
                 types.UpdateShortSentMessage,
+                types.UpdateUserStatus,
             ),
         ):
             return False
@@ -2240,6 +2294,24 @@ class TelethonProvider:
     def _update_pts(value: object) -> int | None:
         pts = getattr(value, "pts", None)
         return pts if type(pts) is int and pts > 0 else None
+
+    @classmethod
+    def _required_update_progress(
+        cls,
+        update: object,
+        *,
+        expected_identity: TelegramPeerIdentity | None,
+    ) -> int:
+        pts = getattr(update, "pts", _MISSING)
+        pts_count = getattr(update, "pts_count", _MISSING)
+        if (
+            type(pts) is not int
+            or pts < 1
+            or type(pts_count) is not int
+            or pts_count < 1
+        ):
+            raise cls._malformed_difference_item_error(expected_identity)
+        return pts
 
     @staticmethod
     def _checkpoint_outcome_id(
@@ -2820,8 +2892,19 @@ class TelethonProvider:
         return entity_protected is True or message_protected is True
 
     @staticmethod
-    def _nonnegative_int(value: object, fallback: int) -> int:
-        return value if type(value) is int and value >= 0 else fallback
+    def _required_checkpoint_int(
+        value: object,
+        *,
+        field_name: str,
+        scope: IngestionFailureScope,
+    ) -> int:
+        if type(value) is not int or value < 0:
+            raise TelethonTransportError(
+                f"Telegram difference checkpoint field {field_name} is invalid",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=scope,
+            )
+        return value
 
     def _request(self, request: object, *, scope: IngestionFailureScope) -> object:
         return self._call(

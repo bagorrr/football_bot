@@ -901,6 +901,227 @@ def test_provider_accepts_valid_empty_difference_vectors(
     assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
 
 
+@pytest.mark.parametrize("route", ("account", "channel"))
+def test_provider_ignores_typed_user_status_updates_on_both_routes(
+    route: str,
+) -> None:
+    update = types.UpdateUserStatus(42, types.UserStatusRecently())
+    if route == "account":
+        account_checkpoint = TelegramAccountCheckpoint(
+            pts=10,
+            qts=20,
+            seq=30,
+            date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        )
+        account_advanced = replace(account_checkpoint, pts=11, seq=31)
+        response = SimpleNamespace(
+            new_messages=[],
+            other_updates=[update],
+            state=SimpleNamespace(
+                pts=account_advanced.pts,
+                qts=account_advanced.qts,
+                seq=account_advanced.seq,
+                date=account_advanced.date,
+            ),
+        )
+        result = TelethonProvider(
+            client=_DifferenceClientProbe([response]),
+        ).get_account_difference_event(account_checkpoint)
+        assert isinstance(result, TelegramDifferenceCheckpointAdvance)
+        assert result.from_checkpoint == account_checkpoint
+        assert result.to_checkpoint == account_advanced
+    else:
+        identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+        channel_checkpoint = TelegramChannelCheckpoint(pts=10)
+        channel_advanced = TelegramChannelCheckpoint(pts=11)
+        response = SimpleNamespace(
+            new_messages=[],
+            other_updates=[update],
+            pts=channel_advanced.pts,
+        )
+        result = TelethonProvider(
+            client=_DifferenceClientProbe([response]),
+            approved_source_chats=(identity,),
+        ).get_channel_difference_event(identity, channel_checkpoint, 1)
+        assert isinstance(result, TelegramDifferenceCheckpointAdvance)
+        assert result.from_checkpoint == channel_checkpoint
+        assert result.to_checkpoint == channel_advanced
+
+
+def test_provider_accepts_typed_empty_account_difference_boundary() -> None:
+    checkpoint = TelegramAccountCheckpoint(
+        pts=10,
+        qts=20,
+        seq=30,
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    advanced_date = datetime(2026, 9, 1, 10, 1, tzinfo=UTC)
+    result = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [types.updates.DifferenceEmpty(date=advanced_date, seq=31)]
+        )
+    ).get_account_difference_event(checkpoint)
+
+    assert isinstance(result, TelegramDifferenceCheckpointAdvance)
+    assert result.to_checkpoint == TelegramAccountCheckpoint(
+        pts=checkpoint.pts,
+        qts=checkpoint.qts,
+        seq=31,
+        date=advanced_date,
+    )
+
+
+_MISSING_CHECKPOINT_FIELD = object()
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        _MISSING_CHECKPOINT_FIELD,
+        None,
+        SimpleNamespace(qts=21, seq=31, date=datetime(2026, 9, 1, 10, 1, tzinfo=UTC)),
+        SimpleNamespace(
+            pts=None,
+            qts=21,
+            seq=31,
+            date=datetime(2026, 9, 1, 10, 1, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            pts=11,
+            qts=-1,
+            seq=31,
+            date=datetime(2026, 9, 1, 10, 1, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            pts=11,
+            qts=21,
+            seq="malformed",
+            date=datetime(2026, 9, 1, 10, 1, tzinfo=UTC),
+        ),
+        SimpleNamespace(pts=11, qts=21, seq=31, date=None),
+        SimpleNamespace(pts=11, qts=21, seq=31, date=datetime(2026, 9, 1, 10, 1)),
+    ),
+)
+def test_provider_fails_closed_for_missing_or_invalid_account_checkpoint_state(
+    state: object,
+) -> None:
+    checkpoint = TelegramAccountCheckpoint(
+        pts=10,
+        qts=20,
+        seq=30,
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    response = SimpleNamespace(new_messages=[], other_updates=[])
+    if state is not _MISSING_CHECKPOINT_FIELD:
+        response.state = state
+    provider = TelethonProvider(client=_DifferenceClientProbe([response]))
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_account_difference_event(checkpoint)
+
+    assert error.value.reason.value == "checkpoint_invalid"
+    assert error.value.scope is not None
+    assert error.value.scope.value == "account_stream"
+
+
+@pytest.mark.parametrize("pts", (_MISSING_CHECKPOINT_FIELD, None, -1, "malformed"))
+def test_provider_fails_closed_for_missing_or_invalid_channel_checkpoint(
+    pts: object,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    response = SimpleNamespace(new_messages=[], other_updates=[])
+    if pts is not _MISSING_CHECKPOINT_FIELD:
+        response.pts = pts
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(identity, checkpoint, 1)
+
+    assert error.value.reason.value == "checkpoint_invalid"
+    assert error.value.scope is not None
+    assert error.value.scope.value == "source_stream"
+
+
+@pytest.mark.parametrize("route", ("account", "channel"))
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("pts", _MISSING_CHECKPOINT_FIELD),
+        ("pts", None),
+        ("pts_count", _MISSING_CHECKPOINT_FIELD),
+        ("pts_count", None),
+        ("pts_count", 0),
+    ),
+)
+def test_provider_fails_closed_for_invalid_typed_update_progress(
+    route: str,
+    field_name: str,
+    value: object,
+) -> None:
+    event_time = datetime(2026, 9, 1, 10, 1, tzinfo=UTC)
+    if route == "account":
+        identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 42)
+        account_checkpoint = TelegramAccountCheckpoint(
+            pts=10,
+            qts=20,
+            seq=30,
+            date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        )
+        update = types.UpdateNewMessage(
+            _account_message(
+                message_id=1,
+                identity=identity,
+                event_time=event_time,
+                body="account body",
+            ),
+            pts=11,
+            pts_count=1,
+        )
+        response = SimpleNamespace(
+            new_messages=[],
+            other_updates=[update],
+            state=SimpleNamespace(pts=11, qts=20, seq=31, date=event_time),
+        )
+    else:
+        identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+        channel_checkpoint = TelegramChannelCheckpoint(pts=10)
+        update = types.UpdateNewChannelMessage(
+            _account_message(
+                message_id=1,
+                identity=identity,
+                event_time=event_time,
+                body="channel body",
+            ),
+            pts=11,
+            pts_count=1,
+        )
+        response = SimpleNamespace(
+            new_messages=[],
+            other_updates=[update],
+            pts=11,
+        )
+    if value is _MISSING_CHECKPOINT_FIELD:
+        delattr(update, field_name)
+    else:
+        setattr(update, field_name, value)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,) if route == "channel" else (),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        if route == "account":
+            provider.get_account_difference_event(account_checkpoint)
+        else:
+            provider.get_channel_difference_event(identity, channel_checkpoint, 1)
+
+    assert error.value.reason.value == "checkpoint_invalid"
+
+
 @pytest.mark.parametrize("message_ids", ({}, "malformed", b"malformed", 17))
 def test_provider_fails_closed_for_malformed_deletion_id_collections(
     message_ids: object,

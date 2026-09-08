@@ -237,6 +237,143 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     system.reset()
 
 
+@pytest.mark.parametrize(
+    ("route", "failure_case"),
+    (
+        ("account", "missing_state"),
+        ("account", "invalid_state_pts"),
+        ("channel", "missing_pts"),
+        ("channel", "invalid_pts"),
+    ),
+)
+def test_raw_telethon_invalid_difference_checkpoint_stops_before_ack(
+    fresh_database_url: str,
+    route: str,
+    failure_case: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_104)
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    initial_account_checkpoint = TelegramAccountCheckpoint(
+        pts=500,
+        qts=50,
+        seq=500,
+        date=registered_at - timedelta(minutes=1),
+    )
+    entity = types.Channel(
+        id=identity.telegram_id,
+        title="raw invalid checkpoint channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=False,
+        access_hash=9,
+    )
+    if route == "account":
+        response = SimpleNamespace(new_messages=[], other_updates=[])
+        if failure_case == "invalid_state_pts":
+            response.state = SimpleNamespace(
+                pts=None,
+                qts=initial_account_checkpoint.qts,
+                seq=initial_account_checkpoint.seq + 1,
+                date=registered_at,
+            )
+    else:
+        response = SimpleNamespace(new_messages=[], other_updates=[])
+        if failure_case == "invalid_pts":
+            response.pts = None
+    client = _RawDifferenceClient(
+        [SimpleNamespace(pts=500), response],
+        entity,
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46101",
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(identity,),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_101,
+        address="@raw_invalid_checkpoint",
+        update_suffix=f"raw-invalid-{route}-{failure_case}",
+    )
+
+    if route == "account":
+        system.initialize_account_ingestion_checkpoint(initial_account_checkpoint)
+        assert system.process_next_account_telegram_difference()
+        assert system.account_ingestion_checkpoint() == initial_account_checkpoint
+        expected_scope = "account_stream"
+    else:
+        initial_channel_checkpoint = TelegramChannelCheckpoint(pts=500)
+        assert (
+            system.channel_ingestion_checkpoint(
+                identity=identity,
+                registry_generation=1,
+            )
+            == initial_channel_checkpoint
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=identity,
+            registry_generation=1,
+        )
+        assert (
+            system.channel_ingestion_checkpoint(
+                identity=identity,
+                registry_generation=1,
+            )
+            == initial_channel_checkpoint
+        )
+        expected_scope = "source_stream"
+
+    assert client.responses == []
+    assert system.source_events() == ()
+    failures = system.ingestion_failures()
+    assert len(failures) == 1
+    assert failures[0].scope.value == expected_scope
+    assert failures[0].reason is IngestionFailureReason.CHECKPOINT_INVALID
+    assert system.process_next_source_event()
+    contract = system.source_stream_stop_contracts()[0]
+    alert = system.operator_alert(contract.message_id)
+    assert alert.failure_scope == expected_scope
+    assert alert.failure_reason == "checkpoint_invalid"
+    if route == "account":
+        assert not system.process_next_account_telegram_difference()
+    else:
+        assert not system.process_next_channel_telegram_difference(
+            identity=identity,
+            registry_generation=1,
+        )
+    assert client.responses == []
+    system.reset()
+
+
 def test_raw_telethon_same_time_edits_remain_distinct_and_stale_history_stops_stream(
     fresh_database_url: str,
 ) -> None:
