@@ -2555,10 +2555,7 @@ class TelethonProvider:
         )
         if matching_item is not None:
             event_time = matching_item[3]
-            if (
-                matching_item[4] is not None
-                and matching_item[5] is not None
-            ):
+            if matching_item[4] is not None and matching_item[5] is not None:
                 transport_event_id = matching_item[4]
                 transport_order = matching_item[5]
         source_event_id = canonical_telethon_source_event_id(
