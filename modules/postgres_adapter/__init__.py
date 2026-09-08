@@ -4175,6 +4175,43 @@ class PostgresRoleStore:
             date=row["checkpoint_date"],
         )
 
+    def source_chat_identity_for_telegram_message(
+        self, telegram_message_id: int
+    ) -> TelegramPeerIdentity | None:
+        """Resolve a peer-less deletion through retained body-free mappings."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if type(telegram_message_id) is not int or telegram_message_id < 1:
+            raise ValueError("Telegram message identity must be positive")
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id
+                FROM (
+                    SELECT peer_kind, telegram_chat_id
+                    FROM football_runtime.source_event_records
+                    WHERE telegram_message_id = %s
+                    UNION
+                    SELECT peer_kind, telegram_chat_id
+                    FROM football_runtime.protected_content_skips
+                    WHERE telegram_message_id = %s
+                ) AS retained_mapping
+                ORDER BY peer_kind, telegram_chat_id
+                """,
+                (telegram_message_id, telegram_message_id),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        try:
+            kind = TelegramPeerKind(row["peer_kind"])
+            chat_id = row["telegram_chat_id"]
+        except (KeyError, ValueError, TypeError):
+            return None
+        if type(chat_id) is not int or chat_id < 1:
+            return None
+        return TelegramPeerIdentity(kind=kind, telegram_id=chat_id)
+
     def advance_account_difference_checkpoint(
         self,
         *,

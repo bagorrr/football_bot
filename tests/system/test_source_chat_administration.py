@@ -295,6 +295,15 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
     )
     assert telethon.resolution_requests == ["@synthetic_public_source"]
     assert telethon.boundary_requests == [identity]
+    assert telethon.message_identity_lookup is not None
+    assert len(telethon.admitted_source_chats) == 1
+    admitted_resolution, admitted_generation, admitted_at, admitted_boundary = (
+        telethon.admitted_source_chats[0]
+    )
+    assert admitted_resolution.identity == identity
+    assert admitted_generation == 1
+    assert admitted_at == datetime(2026, 9, 9, 13, 0, tzinfo=UTC)
+    assert admitted_boundary == "channel-pts:7301"
     assert telethon.join_requests == []
     assert telethon.history_requests == []
     assert telegram.messages[-1].text == (

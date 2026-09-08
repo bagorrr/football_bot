@@ -365,6 +365,15 @@ class ControlledTelegramIngestionAdapter:
         tuple[TelegramPeerIdentity, TelegramChannelCheckpoint]
     ] = field(default_factory=list)
     live_callback_completions: list[TelegramPeerIdentity] = field(default_factory=list)
+    admitted_source_chats: list[
+        tuple[SourceChatAdmissionResolution, int, datetime, str]
+    ] = field(default_factory=list)
+    message_identity_lookup: Callable[[int], TelegramPeerIdentity | None] | None = (
+        field(
+            default=None,
+            repr=False,
+        )
+    )
 
     def source_event_id(self, probe_id: str) -> str:
         """Return a stable synthetic Source Event identity."""
@@ -373,6 +382,30 @@ class ControlledTelegramIngestionAdapter:
     def notify_live_update(self, identity: TelegramPeerIdentity) -> None:
         """Record callback completion without changing any durable cursor."""
         self.live_callback_completions.append(identity)
+
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Retain the controlled durable deletion-lookup seam."""
+        self.message_identity_lookup = lookup
+
+    def admit_source_chat(
+        self,
+        resolution: SourceChatAdmissionResolution,
+        *,
+        registry_generation: int,
+        processing_started_at: datetime,
+        transport_boundary: str,
+    ) -> None:
+        """Record immediate activation of one controlled Source Chat generation."""
+        self.admitted_source_chats.append(
+            (
+                resolution,
+                registry_generation,
+                processing_started_at,
+                transport_boundary,
+            )
+        )
 
     def allow_public_username(
         self,

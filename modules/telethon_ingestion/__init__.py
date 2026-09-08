@@ -265,6 +265,19 @@ class TelethonTransport(Protocol):
 class TelethonSource(Protocol):
     """Provider seam used by the application-facing ingestion adapter."""
 
+    def refresh_source_scope(
+        self,
+        approved_source_chats: Iterable[TelegramPeerIdentity | SourceChatRegistryEntry],
+    ) -> None:
+        """Atomically replace the provider's enabled Source Chat scope."""
+        ...
+
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Bind the durable lookup for deletion updates without a peer."""
+        ...
+
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         """Resolve one already-accessible Source Chat without joining it."""
         ...
@@ -534,11 +547,14 @@ class TelethonRuntime:
         approved_source_chats: Iterable[
             TelegramPeerIdentity | SourceChatRegistryEntry
         ] = (),
+        message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
+        | None = None,
     ) -> TelethonProvider:
         """Create the lazy production provider for the explicit T2 client."""
         return TelethonProvider(
             client=self.client,
             approved_source_chats=approved_source_chats,
+            message_identity_lookup=message_identity_lookup,
         )
 
     @property
@@ -550,6 +566,20 @@ class TelethonRuntime:
     def conformance_scope(self) -> frozenset[TelegramPeerIdentity]:
         """Return the exact peer scope covered by the last successful probe."""
         return self._conformance_scope
+
+    def extend_conformance_scope(
+        self, identities: Iterable[TelegramPeerIdentity]
+    ) -> None:
+        """Extend verified scope only after a successful admission probe."""
+        self.require_ready()
+        additions = tuple(identities)
+        if any(
+            not isinstance(identity, TelegramPeerIdentity) for identity in additions
+        ):
+            raise TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+            )
+        self._conformance_scope = self._conformance_scope.union(additions)
 
     def require_ready(self) -> None:
         """Fail closed before any live or historical work is accepted."""
@@ -571,6 +601,7 @@ def build_telethon_client(configuration: TelethonConfiguration) -> object:
             StringSession(configuration.session_string),
             configuration.api_id,
             configuration.api_hash,
+            catch_up=False,
         )
     except Exception:
         raise TelethonConfigurationError(
@@ -629,6 +660,8 @@ class TelethonProvider:
         approved_source_chats: Iterable[
             TelegramPeerIdentity | SourceChatRegistryEntry
         ] = (),
+        message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
+        | None = None,
     ) -> None:
         self._client = client
         self._entities: dict[TelegramPeerIdentity, object] = {}
@@ -644,23 +677,64 @@ class TelethonProvider:
             list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance],
         ] = {}
         self._revisions: dict[tuple[TelegramPeerIdentity, int], int] = {}
+        self._message_identities: dict[int, TelegramPeerIdentity] = {}
+        self._message_identity_lookup = message_identity_lookup
         self._live_callback: Callable[[TelegramPeerIdentity], None] | None = None
-        self.configure_source_scope(approved_source_chats)
+        self.refresh_source_scope(approved_source_chats)
 
     def configure_source_scope(
         self,
         approved_source_chats: Iterable[TelegramPeerIdentity | SourceChatRegistryEntry],
     ) -> None:
-        """Bind the exact approved identities used by account differences."""
-        for entry in approved_source_chats:
+        """Compatibility alias for refreshing the exact approved scope."""
+        self.refresh_source_scope(approved_source_chats)
+
+    def refresh_source_scope(
+        self,
+        approved_source_chats: Iterable[TelegramPeerIdentity | SourceChatRegistryEntry],
+    ) -> None:
+        """Atomically replace the approved identities and their generations."""
+        scope = tuple(approved_source_chats)
+        identities = _approved_identities(scope)
+        generations: dict[TelegramPeerIdentity, int] = {}
+        for entry, identity in zip(scope, identities, strict=True):
             if isinstance(entry, SourceChatRegistryEntry):
-                self._generations[entry.identity] = entry.registry_generation
+                generations[identity] = entry.registry_generation
             elif isinstance(entry, TelegramPeerIdentity):
-                self._generations.setdefault(entry, 1)
+                generations[identity] = 1
             else:
                 raise TelethonConformanceError(
                     key="APPROVED_SOURCE_CHATS", status="scope_invalid"
                 )
+        previous_generations = self._generations
+        self._generations = generations
+        self._entities = {
+            identity: entity
+            for identity, entity in self._entities.items()
+            if identity in generations
+        }
+        self._message_identities = {
+            message_id: identity
+            for message_id, identity in self._message_identities.items()
+            if identity in generations
+        }
+        self._difference_pending.clear()
+        self._history_pending.clear()
+        self._revisions = {
+            key: revision
+            for key, revision in self._revisions.items()
+            if generations.get(key[0]) == previous_generations.get(key[0])
+        }
+
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Set the durable lookup used by peer-less deletion updates."""
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="MESSAGE_IDENTITY_LOOKUP", status="scope_invalid"
+            )
+        self._message_identity_lookup = lookup
 
     def authenticate(self) -> int:
         """Connect the configured session and prove it is authorized."""
@@ -1085,7 +1159,17 @@ class TelethonProvider:
             ) from None
 
     def run_live_ingestion(self) -> None:
-        """Run Telethon's disconnect loop; handlers only wake the difference pump."""
+        """Catch up through installed handlers, then run the durable wake loop."""
+        if self._live_callback is None:
+            raise TelethonTransportError(
+                "Telegram live handlers are not installed",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            )
+        self._call(
+            "catch_up",
+            scope=IngestionFailureScope.INGESTION_ROLE,
+        )
         self._call(
             "run_until_disconnected",
             scope=IngestionFailureScope.INGESTION_ROLE,
@@ -1137,25 +1221,18 @@ class TelethonProvider:
     def _identity_from_entity(entity: object) -> TelegramPeerIdentity | None:
         try:
             from telethon import types
-
-            if isinstance(entity, types.User):
-                return None
-            if isinstance(entity, types.Channel):
-                return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, entity.id)
-            if isinstance(entity, types.Chat):
-                return TelegramPeerIdentity(TelegramPeerKind.CHAT, entity.id)
         except Exception:
-            pass
-        entity_id = getattr(entity, "id", None)
-        if type(entity_id) is not int or entity_id < 1:
             return None
-        if (
-            getattr(entity, "broadcast", None) is not None
-            or getattr(entity, "megagroup", None) is not None
-        ):
-            return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, entity_id)
-        if hasattr(entity, "noforwards") and hasattr(entity, "title"):
-            return TelegramPeerIdentity(TelegramPeerKind.CHAT, entity_id)
+        if isinstance(entity, types.User):
+            return None
+        if isinstance(entity, types.Channel):
+            entity_id = getattr(entity, "id", None)
+            if type(entity_id) is int and entity_id > 0:
+                return TelegramPeerIdentity(TelegramPeerKind.CHANNEL, entity_id)
+        if isinstance(entity, types.Chat):
+            entity_id = getattr(entity, "id", None)
+            if type(entity_id) is int and entity_id > 0:
+                return TelegramPeerIdentity(TelegramPeerKind.CHAT, entity_id)
         return None
 
     @classmethod
@@ -1334,17 +1411,21 @@ class TelethonProvider:
             transport_revision,
             event_time,
         ) in self._difference_items(response):
-            current_identity = item_identity or identity
-            if current_identity is None or current_identity not in self._generations:
-                continue
-            if identity is not None and current_identity != identity:
-                continue
             if message is not None:
                 current_message_id = getattr(message, "id", None)
             else:
                 current_message_id = message_id
             if type(current_message_id) is not int or current_message_id < 1:
                 continue
+            current_identity = item_identity or identity
+            if current_identity is None and kind is SourceEventKind.DELETE:
+                current_identity = self._resolve_message_identity(current_message_id)
+            if current_identity is None or current_identity not in self._generations:
+                continue
+            if identity is not None and current_identity != identity:
+                continue
+            if message is not None:
+                self._remember_message_identity(current_message_id, current_identity)
             key = (current_identity, current_message_id, kind, transport_revision)
             if key in seen:
                 continue
@@ -1428,6 +1509,43 @@ class TelethonProvider:
                 registry_generation=generation,
             )
         ]
+
+    def _remember_message_identity(
+        self, message_id: int, identity: TelegramPeerIdentity
+    ) -> None:
+        """Keep a process-local mapping while durable event state is committed."""
+        previous = self._message_identities.get(message_id)
+        if previous is not None and previous != identity:
+            self._message_identities.pop(message_id, None)
+            return
+        self._message_identities[message_id] = identity
+
+    def _resolve_message_identity(self, message_id: int) -> TelegramPeerIdentity | None:
+        """Resolve a peer-less deletion through the durable application mapping."""
+        cached = self._message_identities.get(message_id)
+        if cached is not None:
+            return cached
+        lookup = self._message_identity_lookup
+        if lookup is None:
+            return None
+        try:
+            identity = lookup(message_id)
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram message identity lookup failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from error
+        if identity is None:
+            return None
+        if not isinstance(identity, TelegramPeerIdentity):
+            raise TelethonTransportError(
+                "Telegram message identity lookup returned an invalid peer",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+        self._remember_message_identity(message_id, identity)
+        return identity
 
     def _difference_items(
         self, response: object
@@ -1616,6 +1734,15 @@ class TelethonProvider:
                 scope=IngestionFailureScope.SOURCE_STREAM,
             )
         protected = self._is_protected(authoritative_entity, message)
+        body: str | None = None
+        if not protected:
+            body = getattr(message, "message", None)
+            if body is not None and not isinstance(body, str):
+                raise TelethonTransportError(
+                    "Telegram message body is malformed",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
         edit_date = getattr(message, "edit_date", None)
         resolved_kind = kind or (
             SourceEventKind.EDIT if edit_date is not None else SourceEventKind.CREATE
@@ -1645,13 +1772,6 @@ class TelethonProvider:
                 event_time=event_time,
                 registry_generation=generation,
                 from_history=from_history,
-            )
-        body = getattr(message, "message", None)
-        if body is not None and not isinstance(body, str):
-            raise TelethonTransportError(
-                "Telegram message body is malformed",
-                reason=IngestionFailureReason.CHECKPOINT_INVALID,
-                scope=IngestionFailureScope.SOURCE_STREAM,
             )
         reply_to = getattr(message, "reply_to", None)
         reply_to_message_id = getattr(reply_to, "reply_to_msg_id", None)
@@ -1685,10 +1805,10 @@ class TelethonProvider:
         previous = self._revisions.get(revision_key, 0)
         if kind is SourceEventKind.CREATE:
             revision = 1
+        elif isinstance(edit_date, datetime) and edit_date.tzinfo is not None:
+            revision = self._canonical_edit_revision(edit_date)
         elif type(transport_revision) is int and transport_revision > 0:
             revision = max(2, transport_revision + 1)
-        elif isinstance(edit_date, datetime) and edit_date.tzinfo is not None:
-            revision = max(2, int(edit_date.timestamp() * 1_000_000))
         else:
             revision = max(2, previous + 1)
         if kind is SourceEventKind.CREATE:
@@ -1699,16 +1819,35 @@ class TelethonProvider:
         return revision
 
     @staticmethod
+    def _canonical_edit_revision(edit_date: datetime) -> int:
+        """Derive a stable edit identity without using route-specific update pts."""
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        delta = edit_date.astimezone(UTC) - epoch
+        edit_microseconds = (
+            delta.days * 86_400 * 1_000_000
+            + delta.seconds * 1_000_000
+            + delta.microseconds
+        )
+        return max(2, edit_microseconds)
+
+    @staticmethod
     def _is_protected(entity: object, message: object) -> bool:
+        missing = object()
         try:
-            entity_protected = getattr(entity, "noforwards", False)
-            message_protected = getattr(message, "noforwards", False)
+            entity_protected = getattr(entity, "noforwards", missing)
+            message_protected = getattr(message, "noforwards", missing)
         except Exception:
             raise TelethonTransportError(
                 "Telegram copy-protection state is unavailable",
                 reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
                 scope=IngestionFailureScope.SOURCE_STREAM,
             ) from None
+        if type(entity_protected) is not bool or type(message_protected) is not bool:
+            raise TelethonTransportError(
+                "Telegram copy-protection state is unavailable",
+                reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
         return entity_protected is True or message_protected is True
 
     @staticmethod
@@ -1778,11 +1917,14 @@ class TelethonIngestionAdapter:
             TelegramPeerIdentity | SourceChatRegistryEntry
         ] = (),
         live_update_callback: Callable[[TelegramPeerIdentity], None] | None = None,
+        message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
+        | None = None,
     ) -> TelethonIngestionAdapter:
         """Compose and verify the concrete provider at the T2 boundary."""
         scope = tuple(approved_source_chats)
         source = runtime.create_production_provider(
             approved_source_chats=scope,
+            message_identity_lookup=message_identity_lookup,
         )
         runtime.verify_conformance(
             transport=source,
@@ -1830,6 +1972,114 @@ class TelethonIngestionAdapter:
         self._require_approved(identity)
         if self._live_update_callback is not None:
             self._live_update_callback(identity)
+
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Bind the Ingestion-owned durable lookup for peer-less deletions."""
+        self._runtime.require_ready()
+        configure = getattr(self._source, "configure_message_identity_lookup", None)
+        if not callable(configure):
+            raise TelethonConformanceError(
+                key="MESSAGE_IDENTITY_LOOKUP", status="provider_boundary_unavailable"
+            )
+        try:
+            configure(lookup)
+        except TelethonConformanceError:
+            raise
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram message identity lookup setup failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+
+    def refresh_source_scope(
+        self,
+        approved_source_chats: Iterable[TelegramPeerIdentity | SourceChatRegistryEntry],
+        *,
+        _allow_new: bool = False,
+    ) -> None:
+        """Atomically apply the current enabled Source Chat scope."""
+        self._runtime.require_ready()
+        scope = tuple(approved_source_chats)
+        identities = frozenset(_approved_identities(scope))
+        new_identities = identities.difference(self._runtime.conformance_scope)
+        if new_identities and not _allow_new:
+            raise TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS", status="scope_not_verified"
+            )
+        refresh = getattr(self._source, "refresh_source_scope", None)
+        if not callable(refresh):
+            raise TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS", status="provider_scope_unavailable"
+            )
+        try:
+            refresh(scope)
+        except TelethonConformanceError:
+            raise
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram Source Chat scope refresh failed",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            ) from None
+        if new_identities:
+            self._runtime.extend_conformance_scope(new_identities)
+        self._approved_source_chats = scope
+        self._approved_identities = identities
+
+    def admit_source_chat(
+        self,
+        resolution: SourceChatAdmissionResolution,
+        *,
+        registry_generation: int,
+        processing_started_at: datetime,
+        transport_boundary: str,
+    ) -> None:
+        """Activate one newly admitted or re-added Source Chat immediately."""
+        self._runtime.require_ready()
+        if type(registry_generation) is not int or registry_generation < 1:
+            raise TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+            )
+        if (
+            not isinstance(processing_started_at, datetime)
+            or processing_started_at.tzinfo is None
+        ):
+            raise TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+            )
+        if not isinstance(transport_boundary, str) or not transport_boundary:
+            raise TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+            )
+        entry = SourceChatRegistryEntry(
+            identity=resolution.identity,
+            registry_generation=registry_generation,
+            address_kind=resolution.address_kind,
+            current_address=resolution.current_address,
+            processing_started_at=processing_started_at,
+            transport_boundary=transport_boundary,
+            enabled=True,
+            initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+            attested_at=processing_started_at,
+        )
+        candidate = list(self._approved_source_chats)
+        for index, existing in enumerate(candidate):
+            existing_identity = (
+                existing.identity
+                if isinstance(existing, SourceChatRegistryEntry)
+                else existing
+            )
+            if existing_identity == resolution.identity:
+                candidate[index] = entry
+                break
+        else:
+            candidate.append(entry)
+        self.refresh_source_scope(tuple(candidate), _allow_new=True)
 
     def start_live_ingestion(self) -> None:
         """Register the provider's live wake boundary after conformance."""

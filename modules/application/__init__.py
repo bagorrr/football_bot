@@ -88,6 +88,7 @@ from modules.domain import (
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
+    SourceChatAdmissionResolution,
     SourceChatLifecycleAction,
     SourceChatLifecycleContext,
     SourceChatLifecycleState,
@@ -17122,6 +17123,15 @@ class RuntimeApplication:
     search_failures_remaining: int = 0
 
     def __post_init__(self) -> None:
+        if self.role is RuntimeRole.INGESTION and self.telegram_ingestion is not None:
+            configure_lookup = getattr(
+                self.telegram_ingestion, "configure_message_identity_lookup", None
+            )
+            lookup = getattr(
+                self.store, "source_chat_identity_for_telegram_message", None
+            )
+            if callable(configure_lookup) and callable(lookup):
+                configure_lookup(lookup)
         if self.supported_versions:
             return
         for definition in SUPPORTED_CONTRACTS:
@@ -22319,6 +22329,8 @@ class RuntimeApplication:
         ):
             raise TypeError("RequestSourceChatAdmission requires registry_generation")
         recorded_at = self.clock.now()
+        resolution: SourceChatAdmissionResolution | None = None
+        transport_boundary: str | None = None
         try:
             resolution = self.telegram_ingestion.resolve_source_chat(address)
             transport_boundary = (
@@ -22383,7 +22395,7 @@ class RuntimeApplication:
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
         try:
-            self.store.consume(
+            result = self.store.consume(
                 incoming=incoming,
                 supported_versions=self.versions_for(incoming.contract_name),
                 received_at=recorded_at,
@@ -22391,6 +22403,18 @@ class RuntimeApplication:
             )
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
+        if (
+            outgoing.contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
+            and resolution is not None
+            and transport_boundary is not None
+            and result in {ConsumeResult.APPLIED, ConsumeResult.REPLAYED}
+        ):
+            self.telegram_ingestion.admit_source_chat(
+                resolution,
+                registry_generation=registry_generation,
+                processing_started_at=recorded_at,
+                transport_boundary=transport_boundary,
+            )
 
     def _reject_source_chat_registration(
         self,

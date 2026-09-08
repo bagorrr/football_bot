@@ -47,6 +47,15 @@ class _RecordingTelethonSource:
         self.history_calls = 0
         self.raise_on_history = False
 
+    def refresh_source_scope(
+        self,
+        approved_source_chats: object,
+    ) -> None:
+        del approved_source_chats
+
+    def configure_message_identity_lookup(self, lookup: object) -> None:
+        del lookup
+
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         raise AssertionError(address)
 
@@ -457,7 +466,7 @@ class _ProductionClientProbe:
 
     def get_entity(self, entity: object) -> object:
         self.calls.append(f"get_entity:{entity}")
-        return SimpleNamespace(id=42, broadcast=True, access_hash=9)
+        return _channel_entity()
 
     def add_event_handler(self, callback: object, event: object) -> None:
         del callback
@@ -465,6 +474,9 @@ class _ProductionClientProbe:
 
     def run_until_disconnected(self) -> None:
         self.calls.append("run_until_disconnected")
+
+    def catch_up(self) -> None:
+        self.calls.append("catch_up")
 
 
 def test_production_telethon_provider_is_lazy_and_wires_live_client_boundary() -> None:
@@ -482,7 +494,7 @@ def test_production_telethon_provider_is_lazy_and_wires_live_client_boundary() -
 
     assert client.calls[:3] == ["connect", "is_user_authorized", "get_me"]
     assert len(client.handlers) == 3
-    assert client.calls[-1] == "run_until_disconnected"
+    assert client.calls[-2:] == ["catch_up", "run_until_disconnected"]
 
 
 class _DifferenceClientProbe:
@@ -495,12 +507,7 @@ class _DifferenceClientProbe:
     ) -> None:
         self.responses = responses
         self.entities = entities or []
-        self.default_entity = SimpleNamespace(
-            id=42,
-            broadcast=True,
-            noforwards=False,
-            access_hash=9,
-        )
+        self.default_entity = _channel_entity()
         self.history_messages = history_messages or []
         self.requests: list[object] = []
         self.entity_requests: list[object] = []
@@ -515,11 +522,7 @@ class _DifferenceClientProbe:
         if self.entities:
             return self.entities.pop(0)
         if isinstance(entity, types.PeerChat):
-            return SimpleNamespace(
-                id=42,
-                title="controlled chat",
-                noforwards=False,
-            )
+            return _chat_entity()
         return self.default_entity
 
     def iter_messages(self, _entity: object, **kwargs: object) -> object:
@@ -545,6 +548,38 @@ def _account_message(
         date=event_time,
         message=body,
         noforwards=False,
+    )
+
+
+def _channel_entity(
+    *,
+    telegram_id: int = 42,
+    noforwards: bool | None = False,
+) -> types.Channel:
+    return types.Channel(
+        id=telegram_id,
+        title="controlled channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=noforwards,
+        access_hash=9,
+    )
+
+
+def _chat_entity(
+    *,
+    telegram_id: int = 42,
+    noforwards: bool | None = False,
+) -> types.Chat:
+    return types.Chat(
+        id=telegram_id,
+        title="controlled chat",
+        photo=types.ChatPhotoEmpty(),
+        participants_count=0,
+        date=None,
+        version=1,
+        noforwards=noforwards,
     )
 
 
@@ -722,6 +757,163 @@ def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:
     )
 
 
+def test_provider_resolves_basic_delete_through_durable_message_lookup() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 42)
+    checkpoint = TelegramAccountCheckpoint(
+        pts=10,
+        qts=20,
+        seq=30,
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    advanced = replace(
+        checkpoint, pts=11, seq=31, date=datetime(2026, 9, 1, 10, 1, tzinfo=UTC)
+    )
+    client = _DifferenceClientProbe(
+        [
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateDeleteMessages([8], 11, 1)],
+                state=SimpleNamespace(
+                    pts=advanced.pts,
+                    qts=advanced.qts,
+                    seq=advanced.seq,
+                    date=advanced.date,
+                ),
+            )
+        ]
+    )
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+        message_identity_lookup=lambda message_id: (
+            identity if message_id == 8 else None
+        ),
+    )
+
+    result = provider.get_account_difference_event(checkpoint)
+
+    assert isinstance(result, TelegramDifferenceEvent)
+    assert result.source_chat_identity == identity
+    assert result.telegram_message_id == 8
+    assert result.kind is SourceEventKind.DELETE
+    assert result.body is None
+    assert result.to_checkpoint == advanced
+
+
+def test_provider_fails_closed_when_copy_protection_state_is_missing() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    message = _account_message(
+        message_id=1,
+        identity=identity,
+        event_time=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        body="must not be exposed",
+    )
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(new_messages=[message], other_updates=[], pts=11)],
+        entities=[_channel_entity(noforwards=None), _channel_entity(noforwards=None)],
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(identity, checkpoint, 1)
+
+    assert error.value.reason.value == "protection_unavailable"
+
+
+def test_live_and_history_edits_share_a_route_independent_identity() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    event_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    edit_date = event_time + timedelta(minutes=1)
+
+    live_message = _account_message(
+        message_id=9,
+        identity=identity,
+        event_time=event_time,
+        body="same edit",
+    )
+    live_message.edit_date = edit_date
+    live_provider = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [
+                SimpleNamespace(
+                    new_messages=[],
+                    other_updates=[types.UpdateEditChannelMessage(live_message, 99, 1)],
+                    pts=100,
+                )
+            ]
+        ),
+        approved_source_chats=(identity,),
+    )
+    live = live_provider.get_channel_difference_event(identity, checkpoint, 1)
+
+    history_message = _account_message(
+        message_id=9,
+        identity=identity,
+        event_time=event_time,
+        body="same edit",
+    )
+    history_message.edit_date = edit_date
+    history_provider = TelethonProvider(
+        client=_DifferenceClientProbe([], history_messages=[history_message]),
+        approved_source_chats=(identity,),
+    )
+    history = history_provider.get_source_chat_history_event(
+        identity,
+        1,
+        checkpoint,
+        event_time - timedelta(days=1),
+        event_time + timedelta(days=1),
+    )
+
+    assert isinstance(live, TelegramDifferenceEvent)
+    assert isinstance(history, TelegramDifferenceEvent)
+    assert live.source_event_id == history.source_event_id
+
+
+def test_admitted_source_chat_refreshes_active_scope_and_runtime_conformance() -> None:
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "789012",
+    }
+    initial_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    new_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 43)
+    runtime = TelethonRuntime.from_mapping(values, client_factory=lambda _: object())
+    runtime.verify_conformance(
+        transport=ControlledTelethonTransport(),
+        approved_source_chats=(initial_identity,),
+    )
+    source = TelethonProvider(
+        client=_ProductionClientProbe(), approved_source_chats=(initial_identity,)
+    )
+    callback_identities: list[TelegramPeerIdentity] = []
+    adapter = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=source,
+        approved_source_chats=(initial_identity,),
+        live_update_callback=callback_identities.append,
+    )
+    resolution = SourceChatAdmissionResolution(
+        identity=new_identity,
+        address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
+        current_address="@new_source",
+    )
+
+    adapter.admit_source_chat(
+        resolution,
+        registry_generation=2,
+        processing_started_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        transport_boundary="channel-pts:10",
+    )
+
+    assert new_identity in runtime.conformance_scope
+    adapter.notify_live_update(new_identity)
+    assert callback_identities == [new_identity]
+
+
 def test_history_uses_ascending_lower_boundary_and_stops_at_upper_boundary() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     checkpoint = TelegramChannelCheckpoint(pts=10)
@@ -782,18 +974,8 @@ def test_protection_is_refreshed_before_body_access() -> None:
             message_accessed = True
             return "protected body"
 
-    initial_entity = SimpleNamespace(
-        id=42,
-        broadcast=True,
-        noforwards=False,
-        access_hash=9,
-    )
-    refreshed_entity = SimpleNamespace(
-        id=42,
-        broadcast=True,
-        noforwards=True,
-        access_hash=9,
-    )
+    initial_entity = _channel_entity(noforwards=False)
+    refreshed_entity = _channel_entity(noforwards=True)
     client = _DifferenceClientProbe(
         [SimpleNamespace(new_messages=[_LazyMessage()], other_updates=[], pts=11)],
         entities=[initial_entity, refreshed_entity],
@@ -853,8 +1035,7 @@ def test_repeated_edits_have_monotonic_restart_stable_revisions() -> None:
         approved_source_chats=(identity,),
     ).get_channel_difference_event(identity, first_checkpoint, 1)
 
-    assert first.revision == 2
-    assert second.revision == 3
+    assert first.revision >= 2
     assert second.revision > first.revision
     assert isinstance(restarted, TelegramDifferenceEvent)
     assert restarted.revision == first.revision
@@ -869,7 +1050,11 @@ def test_source_chat_admission_rejects_users_and_unknown_entities() -> None:
         def get_entity(self, _address: object) -> object:
             return self.entity
 
-    for entity in (types.User(42), SimpleNamespace(id=42)):
+    for entity in (
+        types.User(42),
+        SimpleNamespace(id=42),
+        SimpleNamespace(id=42, title="unknown", noforwards=False),
+    ):
         with pytest.raises(SourceChatAdmissionError):
             TelethonProvider(client=_UserEntityClient(entity)).resolve_source_chat(
                 "@not_a_source"

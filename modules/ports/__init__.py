@@ -124,6 +124,23 @@ class TelegramIngestionAdapter(Protocol):
         """Wake the difference pump without acknowledging Telegram state."""
         ...
 
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Bind the durable lookup for peer-less Telegram deletions."""
+        ...
+
+    def admit_source_chat(
+        self,
+        resolution: SourceChatAdmissionResolution,
+        *,
+        registry_generation: int,
+        processing_started_at: datetime,
+        transport_boundary: str,
+    ) -> None:
+        """Activate one successfully admitted Source Chat generation."""
+        ...
+
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         """Resolve one already-accessible chat without joining or reading history."""
         ...
@@ -1182,6 +1199,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
 
     def account_ingestion_checkpoint(self) -> TelegramAccountCheckpoint:
         """Read the durable Ingestion-owned account difference state."""
+        ...
+
+    def source_chat_identity_for_telegram_message(
+        self, telegram_message_id: int
+    ) -> TelegramPeerIdentity | None:
+        """Look up the durable peer mapping for a peer-less Telegram deletion."""
         ...
 
     def advance_account_difference_checkpoint(
