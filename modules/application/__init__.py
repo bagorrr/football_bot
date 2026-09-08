@@ -4394,7 +4394,23 @@ class ConversationOnboarding:
             or not _source_chat_terminal_matches_origin(incoming, origin)
             or origin.telegram_user_id != telegram_user_id
             or registration_request_id != str(origin.request_message_id)
-            or registry_generation != origin.registry_generation
+        ):
+            self.reject_invalid_source_chat_result(incoming=incoming)
+            return
+        peer_kind = incoming.payload.get("telegram_peer_kind")
+        telegram_chat_id = incoming.payload.get("telegram_chat_id")
+        if not isinstance(peer_kind, str) or not isinstance(telegram_chat_id, int):
+            self.reject_invalid_source_chat_result(incoming=incoming)
+            return
+        identity = TelegramPeerIdentity(
+            kind=TelegramPeerKind(peer_kind),
+            telegram_id=telegram_chat_id,
+        )
+        if not any(
+            entry.identity == identity
+            and entry.registry_generation == registry_generation
+            and entry.enabled
+            for entry in self._store.source_chat_administration_views()
         ):
             self.reject_invalid_source_chat_result(incoming=incoming)
             return
@@ -18883,6 +18899,12 @@ class RuntimeApplication:
             )
             return True
         if (
+            incoming.contract_name is ContractName.SOURCE_CHAT_SCOPE_ACTIVATED
+            and supported_incoming is not None
+        ):
+            self._activate_source_chat_scope(supported_incoming)
+            return True
+        if (
             incoming.contract_name is ContractName.SOURCE_CHAT_ADMISSION_FAILED
             and supported_incoming is not None
         ):
@@ -22395,7 +22417,7 @@ class RuntimeApplication:
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
         try:
-            result = self.store.consume(
+            self.store.consume(
                 incoming=incoming,
                 supported_versions=self.versions_for(incoming.contract_name),
                 received_at=recorded_at,
@@ -22403,18 +22425,64 @@ class RuntimeApplication:
             )
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
-        if (
-            outgoing.contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
-            and resolution is not None
-            and transport_boundary is not None
-            and result in {ConsumeResult.APPLIED, ConsumeResult.REPLAYED}
+
+    def _activate_source_chat_scope(self, incoming: ContractEnvelope) -> None:
+        """Activate a Source Chat only after Application committed its registry row."""
+        if self.role is not RuntimeRole.INGESTION:
+            raise RuntimeError("only Ingestion activates Telegram Source Chat scope")
+        if self.telegram_ingestion is None:
+            raise RuntimeError("Ingestion runtime has no Telegram admission adapter")
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SourceChatScopeActivated payload must be an object")
+        peer_kind = payload.get("telegram_peer_kind")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        registry_generation = payload.get("registry_generation")
+        address_kind = payload.get("address_kind")
+        current_address = payload.get("current_address")
+        processing_started_at = payload.get("processing_started_at")
+        transport_boundary = payload.get("transport_boundary")
+        source_chat_key = payload.get("source_chat_key")
+        if not isinstance(peer_kind, str) or not isinstance(telegram_chat_id, int):
+            raise TypeError("SourceChatScopeActivated identity is invalid")
+        if not isinstance(registry_generation, int) or isinstance(
+            registry_generation, bool
         ):
-            self.telegram_ingestion.admit_source_chat(
-                resolution,
-                registry_generation=registry_generation,
-                processing_started_at=recorded_at,
-                transport_boundary=transport_boundary,
+            raise TypeError("SourceChatScopeActivated generation is invalid")
+        if not isinstance(address_kind, str) or not isinstance(current_address, str):
+            raise TypeError("SourceChatScopeActivated address is invalid")
+        if not isinstance(processing_started_at, str) or not isinstance(
+            transport_boundary, str
+        ):
+            raise TypeError("SourceChatScopeActivated timing is invalid")
+        if not isinstance(source_chat_key, str):
+            raise TypeError("SourceChatScopeActivated key is invalid")
+        resolution = SourceChatAdmissionResolution(
+            identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind(peer_kind),
+                telegram_id=telegram_chat_id,
+            ),
+            address_kind=SourceChatAddressKind(address_kind),
+            current_address=current_address,
+        )
+        started_at = datetime.fromisoformat(processing_started_at)
+        if started_at.tzinfo is None:
+            raise ValueError("SourceChatScopeActivated time must be timezone-aware")
+        self.telegram_ingestion.admit_source_chat(
+            resolution,
+            registry_generation=registry_generation,
+            processing_started_at=started_at,
+            transport_boundary=transport_boundary,
+        )
+        try:
+            self.store.consume(
+                incoming=incoming,
+                supported_versions=self.versions_for(incoming.contract_name),
+                received_at=self.clock.now(),
+                outgoing=None,
             )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
 
     def _reject_source_chat_registration(
         self,
@@ -22597,6 +22665,32 @@ class RuntimeApplication:
                 inject_outbox_conflict=inject_outbox_conflict,
             )
             return
+        activation_outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            contract_version=1,
+            message_id=derive_contract_message_id(
+                incoming.message_id,
+                ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.INGESTION,
+            subject_id=source_chat_key,
+            subject_revision=registry_generation,
+            idempotency_key=(f"source-chat-scope-activated:{incoming.message_id}"),
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=registered_at,
+            payload={
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": telegram_peer_kind,
+                "telegram_chat_id": telegram_chat_id,
+                "registry_generation": registry_generation,
+                "address_kind": address_kind,
+                "current_address": current_address,
+                "processing_started_at": entry.processing_started_at.isoformat(),
+                "transport_boundary": transport_boundary,
+            },
+        )
         stale_outgoing = self._invalid_source_chat_registration_failure(incoming)
         if stale_outgoing is None:
             raise RuntimeError("Source Chat admission has no registration context")
@@ -22612,6 +22706,7 @@ class RuntimeApplication:
                 entry=entry,
                 outgoing=outgoing,
                 stale_outgoing=stale_outgoing,
+                activation_outgoing=activation_outgoing,
                 received_at=registered_at,
             )
         except OutboxConflictError as error:

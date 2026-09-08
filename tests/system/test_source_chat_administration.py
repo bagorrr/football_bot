@@ -3365,6 +3365,17 @@ def test_new_address_for_the_same_identity_changes_only_the_protected_address() 
             initial_time,
         ),
     )
+    changed = system.source_chat_contracts(
+        update_id="register-new-address",
+        contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+    )
+    assert len(changed) == 1
+    assert changed[0].subject_revision == 1
+    changed_payload = changed[0].payload
+    assert isinstance(changed_payload, dict)
+    assert changed_payload["registry_generation"] == 1
+    assert len(telethon.admitted_source_chats) == 1
+    assert telethon.admitted_source_chats[0][1] == 1
     assert telethon.join_requests == []
     assert telethon.history_requests == []
     system.reset()

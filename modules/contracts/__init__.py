@@ -59,6 +59,7 @@ class ContractName(StrEnum):
     CHANGE_SOURCE_CHAT_REGISTRY = "ChangeSourceChatRegistry"
     REQUEST_SOURCE_CHAT_ADMISSION = "RequestSourceChatAdmission"
     SOURCE_CHAT_ADMISSION_RESOLVED = "SourceChatAdmissionResolved"
+    SOURCE_CHAT_SCOPE_ACTIVATED = "SourceChatScopeActivated"
     SOURCE_CHAT_ADMISSION_FAILED = "SourceChatAdmissionFailed"
     SOURCE_CHAT_REGISTRATION_FAILED = "SourceChatRegistrationFailed"
     SOURCE_CHAT_GENERATION_CHANGED = "SourceChatGenerationChanged"
@@ -387,6 +388,14 @@ SUPPORTED_CONTRACTS = (
         ("telegram_user_id", "telegram_chat_id", "registry_generation"),
     ),
     ContractDefinition(
+        ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.INGESTION,
+        "source_chat_key",
+        ("telegram_chat_id", "registry_generation"),
+    ),
+    ContractDefinition(
         ContractName.SOURCE_CHAT_ADMISSION_FAILED,
         1,
         RuntimeRole.INGESTION,
@@ -688,6 +697,7 @@ class ContractEnvelope(RawContractEnvelope):
             ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
             ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
             ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+            ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
             ContractName.SOURCE_CHAT_ADMISSION_FAILED,
             ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
             ContractName.SOURCE_CHAT_GENERATION_CHANGED,
@@ -4351,6 +4361,63 @@ def _validate_source_chat_contract(
             subject_id=subject_id,
             subject_revision=subject_revision,
         )
+        return
+    if contract_name is ContractName.SOURCE_CHAT_SCOPE_ACTIVATED:
+        expected_fields = {
+            "source_chat_key",
+            "telegram_peer_kind",
+            "telegram_chat_id",
+            "registry_generation",
+            "address_kind",
+            "current_address",
+            "processing_started_at",
+            "transport_boundary",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("SourceChatScopeActivated has incomplete semantics")
+        if message_id != derive_contract_message_id(
+            causation_id,
+            ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+        ):
+            raise ValueError("Source Chat activation message identity is not canonical")
+        if idempotency_key != f"source-chat-scope-activated:{causation_id}":
+            raise ValueError("Source Chat activation idempotency is invalid")
+        peer_kind = _required_text(payload, "telegram_peer_kind")
+        if peer_kind not in {"chat", "channel"}:
+            raise ValueError("Source Chat activation peer kind is invalid")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        if (
+            not isinstance(telegram_chat_id, int)
+            or isinstance(telegram_chat_id, bool)
+            or telegram_chat_id < 1
+        ):
+            raise ValueError("Source Chat activation chat identity is invalid")
+        source_chat_key = _required_text(payload, "source_chat_key")
+        expected_key = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{peer_kind}:{telegram_chat_id}:source-chat",
+            )
+        )
+        if source_chat_key != subject_id or source_chat_key != expected_key:
+            raise ValueError("Source Chat activation key is inconsistent")
+        _validate_source_chat_generation(payload, subject_revision=subject_revision)
+        address_kind = _required_text(payload, "address_kind")
+        current_address = _required_text(payload, "current_address")
+        if address_kind == "public_username":
+            expected_address_kind = SourceChatAddressKind.PUBLIC_USERNAME
+        elif address_kind == "private_invite":
+            expected_address_kind = SourceChatAddressKind.PRIVATE_INVITE
+        else:
+            raise ValueError("Source Chat activation address kind is invalid")
+        if not is_valid_source_chat_address(
+            current_address,
+            kind=expected_address_kind,
+        ):
+            raise ValueError("Source Chat activation address is invalid")
+        _required_iso_datetime(payload, "processing_started_at")
+        if not _required_text(payload, "transport_boundary").strip():
+            raise ValueError("Source Chat activation requires a transport boundary")
         return
     if contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY:
         if set(payload) - {

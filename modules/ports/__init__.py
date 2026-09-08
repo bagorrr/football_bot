@@ -1122,9 +1122,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         entry: SourceChatRegistryEntry,
         outgoing: ContractEnvelope,
         stale_outgoing: ContractEnvelope,
+        activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically accept admission and publish the applicable terminal result."""
+        """Atomically accept admission, activate new scope, and publish the result."""
         ...
 
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:

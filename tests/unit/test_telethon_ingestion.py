@@ -800,7 +800,7 @@ def test_provider_resolves_basic_delete_through_durable_message_lookup() -> None
     assert result.to_checkpoint == advanced
 
 
-def test_provider_fails_closed_when_copy_protection_state_is_missing() -> None:
+def test_provider_treats_absent_optional_copy_protection_as_unprotected() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     checkpoint = TelegramChannelCheckpoint(pts=10)
     message = _account_message(
@@ -812,6 +812,27 @@ def test_provider_fails_closed_when_copy_protection_state_is_missing() -> None:
     client = _DifferenceClientProbe(
         [SimpleNamespace(new_messages=[message], other_updates=[], pts=11)],
         entities=[_channel_entity(noforwards=None), _channel_entity(noforwards=None)],
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    result = provider.get_channel_difference_event(identity, checkpoint, 1)
+
+    assert isinstance(result, TelegramDifferenceEvent)
+    assert result.body == "must not be exposed"
+
+
+def test_provider_fails_closed_when_copy_protection_attribute_is_missing() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    message = SimpleNamespace(
+        id=1,
+        peer_id=types.PeerChannel(42),
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        message="must not be exposed",
+    )
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(new_messages=[message], other_updates=[], pts=11)],
+        entities=[_channel_entity(noforwards=False), _channel_entity(noforwards=False)],
     )
     provider = TelethonProvider(client=client, approved_source_chats=(identity,))
 
@@ -1040,6 +1061,53 @@ def test_repeated_edits_have_monotonic_restart_stable_revisions() -> None:
     assert isinstance(restarted, TelegramDifferenceEvent)
     assert restarted.revision == first.revision
     assert restarted.source_event_id == first.source_event_id
+
+
+def test_same_timestamp_edits_and_a_later_delete_have_strict_revisions() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    first_checkpoint = TelegramChannelCheckpoint(pts=10)
+    second_checkpoint = TelegramChannelCheckpoint(pts=11)
+    third_checkpoint = TelegramChannelCheckpoint(pts=12)
+    event_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+
+    def edit_response(*, body: str, response_pts: int) -> object:
+        message = _account_message(
+            message_id=9,
+            identity=identity,
+            event_time=event_time,
+            body=body,
+        )
+        message.edit_date = event_time + timedelta(minutes=1)
+        return SimpleNamespace(
+            new_messages=[],
+            other_updates=[types.UpdateEditChannelMessage(message, response_pts, 1)],
+            pts=response_pts,
+        )
+
+    client = _DifferenceClientProbe(
+        [
+            edit_response(body="first", response_pts=11),
+            edit_response(body="second", response_pts=12),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateDeleteChannelMessages(42, [9], 13, 1)],
+                pts=13,
+            ),
+        ]
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    first = provider.get_channel_difference_event(identity, first_checkpoint, 1)
+    second = provider.get_channel_difference_event(identity, second_checkpoint, 1)
+    deleted = provider.get_channel_difference_event(identity, third_checkpoint, 1)
+
+    assert isinstance(first, TelegramDifferenceEvent)
+    assert isinstance(second, TelegramDifferenceEvent)
+    assert isinstance(deleted, TelegramDifferenceEvent)
+    assert second.revision > first.revision
+    assert deleted.revision > second.revision
+    assert deleted.kind is SourceEventKind.DELETE
+    assert deleted.body is None
 
 
 def test_source_chat_admission_rejects_users_and_unknown_entities() -> None:

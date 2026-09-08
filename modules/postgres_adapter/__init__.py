@@ -3059,9 +3059,10 @@ class PostgresRoleStore:
         entry: SourceChatRegistryEntry,
         outgoing: ContractEnvelope,
         stale_outgoing: ContractEnvelope,
+        activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically accept admission, persist the registry, and publish it."""
+        """Atomically persist admission, activate new scope, and publish it."""
         if self._role is not RuntimeRole.APPLICATION:
             raise RuntimeError("only Application owns the Source Chat registry")
         with psycopg.connect(self._database_url) as connection:
@@ -3217,6 +3218,18 @@ class PostgresRoleStore:
                         received_at,
                     ),
                 )
+            effective_outgoing = outgoing
+            if address_change:
+                assert latest_generation is not None
+                if not isinstance(outgoing.payload, dict):
+                    raise TypeError("Source Chat result payload must be an object")
+                effective_payload = dict(outgoing.payload)
+                effective_payload["registry_generation"] = latest_generation[0]
+                effective_outgoing = replace(
+                    outgoing,
+                    subject_revision=latest_generation[0],
+                    payload=effective_payload,
+                )
             _accept_contract_inbox(
                 connection,
                 consumer=self._role,
@@ -3226,8 +3239,14 @@ class PostgresRoleStore:
             try:
                 _insert_outbox(
                     connection,
-                    stale_outgoing if is_stale else outgoing,
+                    stale_outgoing if is_stale else effective_outgoing,
                 )
+                if (
+                    activation_outgoing is not None
+                    and not is_stale
+                    and not address_change
+                ):
+                    _insert_outbox(connection, activation_outgoing)
             except psycopg.errors.UniqueViolation as error:
                 raise OutboxConflictError from error
             _release_claim(connection, incoming.message_id)
@@ -5090,6 +5109,11 @@ class PostgresRoleStore:
                         "bounded_metadata": stored_metadata,
                         "reply_to_telegram_message_id": (stored_reply_to_message_id),
                     }
+                    if existing is not None and event.kind is SourceEventKind.DELETE:
+                        existing_event = dict(existing)
+                        existing_event.pop("event_time", None)
+                        expected.pop("event_time", None)
+                        existing = existing_event
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError
             advance_history_progress(

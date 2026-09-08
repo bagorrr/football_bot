@@ -14,6 +14,7 @@ import re
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Protocol, cast
 
 from modules.domain import (
@@ -55,6 +56,9 @@ _TelegramPageResult = (
 
 _API_ID_PATTERN = re.compile(r"[1-9][0-9]{0,9}")
 _ADMINISTRATOR_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}")
+_EDIT_REVISION_TIE_BITS = 12
+_EDIT_REVISION_TIE_MASK = (1 << _EDIT_REVISION_TIE_BITS) - 1
+_DELETE_REVISION = (1 << 63) - 1
 
 
 class TelethonConfigurationError(ValueError):
@@ -677,6 +681,7 @@ class TelethonProvider:
             list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance],
         ] = {}
         self._revisions: dict[tuple[TelegramPeerIdentity, int], int] = {}
+        self._revision_bodies: dict[tuple[TelegramPeerIdentity, int], str | None] = {}
         self._message_identities: dict[int, TelegramPeerIdentity] = {}
         self._message_identity_lookup = message_identity_lookup
         self._live_callback: Callable[[TelegramPeerIdentity], None] | None = None
@@ -723,6 +728,11 @@ class TelethonProvider:
         self._revisions = {
             key: revision
             for key, revision in self._revisions.items()
+            if generations.get(key[0]) == previous_generations.get(key[0])
+        }
+        self._revision_bodies = {
+            key: body
+            for key, body in self._revision_bodies.items()
             if generations.get(key[0]) == previous_generations.get(key[0])
         }
 
@@ -1666,6 +1676,7 @@ class TelethonProvider:
             kind=SourceEventKind.DELETE,
             transport_revision=transport_revision,
             edit_date=None,
+            body=None,
         )
         return TelegramDifferenceEvent(
             source_chat_identity=identity,
@@ -1753,6 +1764,7 @@ class TelethonProvider:
             kind=resolved_kind,
             transport_revision=transport_revision,
             edit_date=edit_date,
+            body=body,
         )
         source_event_id = canonical_telethon_source_event_id(
             identity,
@@ -1800,13 +1812,16 @@ class TelethonProvider:
         kind: SourceEventKind,
         transport_revision: int | None,
         edit_date: object,
+        body: str | None,
     ) -> int:
         revision_key = (identity, message_id)
         previous = self._revisions.get(revision_key, 0)
-        if kind is SourceEventKind.CREATE:
+        if kind is SourceEventKind.DELETE:
+            revision = _DELETE_REVISION
+        elif kind is SourceEventKind.CREATE:
             revision = 1
         elif isinstance(edit_date, datetime) and edit_date.tzinfo is not None:
-            revision = self._canonical_edit_revision(edit_date)
+            revision = self._canonical_edit_revision(edit_date, body)
         elif type(transport_revision) is int and transport_revision > 0:
             revision = max(2, transport_revision + 1)
         else:
@@ -1814,12 +1829,16 @@ class TelethonProvider:
         if kind is SourceEventKind.CREATE:
             self._revisions[revision_key] = max(previous, 1)
             return revision
+        if revision <= previous and self._revision_bodies.get(revision_key) != body:
+            revision = min(_DELETE_REVISION, previous + 1)
         revision = max(previous, revision)
         self._revisions[revision_key] = revision
+        if kind is SourceEventKind.EDIT:
+            self._revision_bodies[revision_key] = body
         return revision
 
     @staticmethod
-    def _canonical_edit_revision(edit_date: datetime) -> int:
+    def _canonical_edit_revision(edit_date: datetime, body: str | None) -> int:
         """Derive a stable edit identity without using route-specific update pts."""
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         delta = edit_date.astimezone(UTC) - epoch
@@ -1828,7 +1847,11 @@ class TelethonProvider:
             + delta.seconds * 1_000_000
             + delta.microseconds
         )
-        return max(2, edit_microseconds)
+        tie = (
+            int.from_bytes(sha256((body or "").encode("utf-8")).digest()[:2], "big")
+            & _EDIT_REVISION_TIE_MASK
+        )
+        return max(2, (edit_microseconds << _EDIT_REVISION_TIE_BITS) | tie)
 
     @staticmethod
     def _is_protected(entity: object, message: object) -> bool:
@@ -1842,7 +1865,19 @@ class TelethonProvider:
                 reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
                 scope=IngestionFailureScope.SOURCE_STREAM,
             ) from None
-        if type(entity_protected) is not bool or type(message_protected) is not bool:
+        if entity_protected is missing or message_protected is missing:
+            raise TelethonTransportError(
+                "Telegram copy-protection state is unavailable",
+                reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        if entity_protected is not None and type(entity_protected) is not bool:
+            raise TelethonTransportError(
+                "Telegram copy-protection state is unavailable",
+                reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        if message_protected is not None and type(message_protected) is not bool:
             raise TelethonTransportError(
                 "Telegram copy-protection state is unavailable",
                 reason=IngestionFailureReason.PROTECTION_UNAVAILABLE,

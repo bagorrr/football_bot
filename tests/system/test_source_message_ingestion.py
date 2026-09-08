@@ -4404,12 +4404,30 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
     )
     assert system.process_next_source_event()
 
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=4752),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4753),
+        source_event_id="source-event:delete-replay:delete",
+        telegram_message_id=405,
+        revision=2,
+        kind=SourceEventKind.DELETE,
+        body=None,
+        source_publisher_id="publisher:delete-replay",
+        event_time=clock.now() + timedelta(minutes=2),
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert not system.process_next_source_event()
+
     system.process_opportunities_until_idle()
 
     telethon.add_protected_channel_difference_event(
         identity=identity,
-        from_checkpoint=TelegramChannelCheckpoint(pts=4752),
-        to_checkpoint=TelegramChannelCheckpoint(pts=4753),
+        from_checkpoint=TelegramChannelCheckpoint(pts=4753),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4754),
         source_event_id="source-event:delete-replay:protected-edit",
         telegram_message_id=405,
         revision=3,
@@ -4473,8 +4491,8 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
 
     telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint=TelegramChannelCheckpoint(pts=4753),
-        to_checkpoint=TelegramChannelCheckpoint(pts=4754),
+        from_checkpoint=TelegramChannelCheckpoint(pts=4754),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4755),
         source_event_id="source-event:delete-replay:late-create",
         telegram_message_id=405,
         revision=3,
