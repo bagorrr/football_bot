@@ -981,6 +981,30 @@ def test_provider_accepts_valid_empty_difference_vectors(
             ),
             id="UpdateChatParticipantAdd",
         ),
+        pytest.param(
+            types.UpdateUserPhone(42, "controlled-phone"),
+            id="UpdateUserPhone",
+        ),
+        pytest.param(
+            types.UpdateChannelUserTyping(
+                42,
+                types.PeerUser(7),
+                types.SendMessageTypingAction(),
+            ),
+            id="UpdateChannelUserTyping",
+        ),
+        pytest.param(
+            types.UpdateChannelWebPage(42, types.WebPageEmpty(1), 11, 1),
+            id="UpdateChannelWebPage",
+        ),
+        pytest.param(
+            types.UpdateFolderPeers([], 11, 1),
+            id="UpdateFolderPeers",
+        ),
+        pytest.param(
+            types.UpdateMessageExtendedMedia(types.PeerChannel(42), 1, []),
+            id="UpdateMessageExtendedMedia",
+        ),
     ),
 )
 @pytest.mark.parametrize("route", ("account", "channel"))

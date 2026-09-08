@@ -4992,6 +4992,17 @@ class PostgresRoleStore:
                 if channel_route
                 else account_create_is_after_boundary
             )
+            transport_proven_post_boundary = (
+                channel_route
+                and isinstance(event, TelegramDifferenceEvent)
+                and not event.from_history
+                and event.kind is SourceEventKind.EDIT
+                and channel_event_is_after_boundary
+            )
+            if transport_proven_post_boundary:
+                stored_payload = dict(cast(dict[str, JsonValue], envelope.payload))
+                stored_payload["transport_proven_post_boundary"] = True
+                stored_envelope = replace(envelope, payload=stored_payload)
             if event.from_history:
                 processing_started_at = context["processing_started_at"]
                 history_generation_active = connection.execute(
@@ -5013,6 +5024,29 @@ class PostgresRoleStore:
                     and processing_started_at - timedelta(days=7)
                     <= event.event_time
                     <= processing_started_at
+                )
+            elif (
+                channel_route
+                and event.kind is SourceEventKind.EDIT
+                and channel_event_is_after_boundary
+            ):
+                # A strictly post-boundary channel edit has transport proof even
+                # when Telegram reports an older edit time.
+                active_row = connection.execute(
+                    """
+                    SELECT football_runtime.source_chat_event_is_processable(
+                        %s, %s, %s, %s
+                    ) AS event_is_processable
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        context["processing_started_at"] + timedelta(microseconds=1),
+                    ),
+                ).fetchone()
+                event_is_processable = active_row is not None and bool(
+                    active_row["event_is_processable"]
                 )
             else:
                 processable_row = connection.execute(
@@ -5366,20 +5400,44 @@ class PostgresRoleStore:
                         and registry[0] - timedelta(days=7) <= event_time <= registry[0]
                     )
             else:
-                processable_chat = connection.execute(
-                    """
-                    SELECT football_runtime.source_chat_event_is_processable(
-                        %s, %s, %s, %s
+                processable = (
+                    payload.get("transport_proven_post_boundary") is True
+                    and payload.get("telegram_peer_kind") == "channel"
+                    and payload.get("event_kind") == SourceEventKind.EDIT.value
+                    and not from_history
+                )
+                if processable:
+                    active_row = connection.execute(
+                        """
+                        SELECT football_runtime.source_chat_event_is_processable(
+                            %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            payload["telegram_peer_kind"],
+                            payload["telegram_chat_id"],
+                            payload["registry_generation"],
+                            received_at + timedelta(microseconds=1),
+                        ),
+                    ).fetchone()
+                    processable = active_row is not None and bool(active_row[0])
+                if not processable:
+                    processable_chat = connection.execute(
+                        """
+                        SELECT football_runtime.source_chat_event_is_processable(
+                            %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            payload["telegram_peer_kind"],
+                            payload["telegram_chat_id"],
+                            payload["registry_generation"],
+                            event_time,
+                        ),
+                    ).fetchone()
+                    processable = processable_chat is not None and bool(
+                        processable_chat[0]
                     )
-                    """,
-                    (
-                        payload["telegram_peer_kind"],
-                        payload["telegram_chat_id"],
-                        payload["registry_generation"],
-                        event_time,
-                    ),
-                ).fetchone()
-                processable = processable_chat is not None and bool(processable_chat[0])
             if not processable:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED

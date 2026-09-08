@@ -209,6 +209,17 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
         ),
         types.UpdateWebPage(types.WebPageEmpty(1), 11, 1),
         types.UpdateChannelAvailableMessages(42, 1),
+        types.UpdateUserPhone(42, "controlled-phone"),
+        types.UpdateChannelUserTyping(
+            42,
+            types.PeerUser(7),
+            types.SendMessageTypingAction(),
+        ),
+        types.UpdateChannelWebPage(42, types.WebPageEmpty(1), 501, 1),
+        types.UpdateFolderPeers([], 501, 1),
+        types.UpdateMessageExtendedMedia(
+            types.PeerChannel(identity.telegram_id), 901, []
+        ),
     )
     client = _RawDifferenceClient(
         [
@@ -354,13 +365,18 @@ def test_raw_telethon_first_page_post_boundary_edit_or_delete_is_recorded(
         access_hash=9,
     )
     entity.username = "raw_boundary_source"
+    message_event_time = (
+        registered_at - timedelta(days=1)
+        if event_kind is SourceEventKind.EDIT
+        else registered_at
+    )
     message = SimpleNamespace(
         id=902,
         peer_id=types.PeerChannel(identity.telegram_id),
         from_id=types.PeerUser(46_106),
         post_author=None,
-        date=registered_at,
-        edit_date=observed_at,
+        date=message_event_time,
+        edit_date=(message_event_time if event_kind is SourceEventKind.EDIT else None),
         message="First-page boundary edit.",
         noforwards=False,
     )
@@ -439,7 +455,10 @@ def test_raw_telethon_first_page_post_boundary_edit_or_delete_is_recorded(
     assert event.transport_order == (
         9001
         if event_kind is SourceEventKind.DELETE
-        else TelethonProvider._datetime_order(observed_at)
+        else TelethonProvider._datetime_order(message_event_time)
+    )
+    assert event.event_time == (
+        message_event_time if event_kind is SourceEventKind.EDIT else observed_at
     )
     assert event.transport_event_id is not None
     assert ":pts:9001" in event.transport_event_id

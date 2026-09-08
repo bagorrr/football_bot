@@ -1508,6 +1508,18 @@ def _validate_source_event_recorded(
         }
         allowed_variants.add(frozenset(allowed_with_transport))
         allowed_variants.add(frozenset(allowed_with_transport | {"from_history"}))
+        allowed_with_transport_proof = allowed | {"transport_proven_post_boundary"}
+        allowed_variants.add(frozenset(allowed_with_transport_proof))
+        allowed_variants.add(frozenset(allowed_with_transport_proof | {"from_history"}))
+        allowed_variants.add(
+            frozenset(allowed_with_transport | {"transport_proven_post_boundary"})
+        )
+        allowed_variants.add(
+            frozenset(
+                allowed_with_transport
+                | {"from_history", "transport_proven_post_boundary"}
+            )
+        )
     if frozenset(payload) not in allowed_variants:
         raise ValueError("SourceEventRecorded contains unsupported or missing facts")
     from_history = payload.get("from_history", False)
@@ -1551,6 +1563,15 @@ def _validate_source_event_recorded(
     event_kind = _required_text(payload, "event_kind")
     if event_kind not in {"create", "edit", "delete"}:
         raise ValueError("SourceEventRecorded event kind is invalid")
+    transport_proven_post_boundary = payload.get("transport_proven_post_boundary")
+    if transport_proven_post_boundary is not None and not isinstance(
+        transport_proven_post_boundary, bool
+    ):
+        raise TypeError("SourceEventRecorded transport boundary proof is invalid")
+    if transport_proven_post_boundary and (
+        from_history or peer_kind != "channel" or event_kind != "edit"
+    ):
+        raise ValueError("SourceEventRecorded transport boundary proof is invalid")
     event_time = datetime.fromisoformat(_required_text(payload, "event_time"))
     if event_time.tzinfo is None:
         raise ValueError("SourceEventRecorded event time must be timezone-aware")
