@@ -223,6 +223,18 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
                 other_updates=list(unrelated_updates),
                 pts=502,
             ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[
+                    types.UpdateDeleteChannelMessages(
+                        identity.telegram_id,
+                        [901],
+                        503,
+                        1,
+                    )
+                ],
+                pts=503,
+            ),
         ],
         entity,
     )
@@ -274,31 +286,47 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
         registry_generation=1,
     )
     assert system.process_next_source_event()
+    create_event = system.source_events()[0]
     assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
     )
+    delete_observed_at = registered_at + timedelta(minutes=1)
+    clock.advance_to(delete_observed_at)
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
 
-    event = system.source_events()[0]
-    assert event.body == "Raw provider body."
-    assert event.transport_event_id == "create:message:901"
-    assert event.transport_order == 1
-    assert event.source_publisher_id == (
+    delete_event = next(
+        event
+        for event in system.source_events()
+        if event.event_kind is SourceEventKind.DELETE
+    )
+    assert create_event.body == "Raw provider body."
+    assert create_event.transport_event_id == "create:message:901"
+    assert create_event.transport_order == 1
+    assert create_event.source_publisher_id == (
         "publisher:telegram-" + sha256(b"telegram:user:46102").hexdigest()[:32]
     )
-    assert event.source_author_telegram_id == 46_102
-    assert event.bounded_metadata["source_message_url"] == (
+    assert create_event.source_author_telegram_id == 46_102
+    assert create_event.bounded_metadata["source_message_url"] == (
         "https://t.me/raw_source/901"
     )
-    assert event.bounded_metadata["reply_route_url"] is None
-    assert event.bounded_metadata["source_message_reply_capable"] is False
-    assert system.source_messages()[0].body == "Raw provider body."
+    assert create_event.bounded_metadata["reply_route_url"] is None
+    assert create_event.bounded_metadata["source_message_reply_capable"] is False
+    assert delete_event.event_kind is SourceEventKind.DELETE
+    assert delete_event.body is None
+    assert delete_event.event_time == delete_observed_at
+    assert system.source_messages()[0].body is None
+    assert system.source_messages()[0].tombstoned
     assert system.ingestion_failures() == ()
-    assert system.source_message_deletion_tombstones() == ()
+    assert len(system.source_message_deletion_tombstones()) == 1
     assert system.channel_ingestion_checkpoint(
         identity=identity,
         registry_generation=1,
-    ) == TelegramChannelCheckpoint(pts=502)
+    ) == TelegramChannelCheckpoint(pts=503)
     system.reset()
 
 
@@ -646,7 +674,7 @@ def test_raw_telethon_warm_peerless_delete_must_match_durable_chat_mapping(
     system.reset()
 
 
-def test_raw_telethon_same_time_edits_remain_distinct_and_stale_history_stops_stream(
+def test_raw_telethon_same_time_edits_remain_distinct_and_history_replays(
     fresh_database_url: str,
 ) -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_102)
@@ -800,9 +828,7 @@ def test_raw_telethon_same_time_edits_remain_distinct_and_stale_history_stops_st
         identity=identity,
         registry_generation=1,
     ) == TelegramChannelCheckpoint(pts=504)
-    assert system.ingestion_failures()[-1].reason is (
-        IngestionFailureReason.CHECKPOINT_INVALID
-    )
+    assert system.ingestion_failures() == ()
     system.reset()
 
 

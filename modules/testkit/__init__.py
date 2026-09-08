@@ -384,6 +384,10 @@ class ControlledTelegramIngestionAdapter:
         """Record callback completion without changing any durable cursor."""
         self.live_callback_completions.append(identity)
 
+    def configure_clock(self, clock: Clock) -> None:
+        """Accept the Application clock without making controlled data live."""
+        del clock
+
     def configure_message_identity_lookup(
         self, lookup: Callable[[int], TelegramPeerIdentity | None]
     ) -> None:

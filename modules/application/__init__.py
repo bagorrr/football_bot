@@ -17141,6 +17141,13 @@ class RuntimeApplication:
 
     def __post_init__(self) -> None:
         if self.role is RuntimeRole.INGESTION and self.telegram_ingestion is not None:
+            configure_clock = getattr(
+                self.telegram_ingestion,
+                "configure_clock",
+                None,
+            )
+            if callable(configure_clock):
+                configure_clock(self.clock)
             configure_lookup = getattr(
                 self.telegram_ingestion, "configure_message_identity_lookup", None
             )

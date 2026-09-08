@@ -56,6 +56,9 @@ class _RecordingTelethonSource:
     ) -> None:
         del approved_source_chats
 
+    def configure_clock(self, clock: object) -> None:
+        del clock
+
     def configure_message_identity_lookup(self, lookup: object) -> None:
         del lookup
 
@@ -733,7 +736,11 @@ def test_provider_normalizes_every_channel_page_update_and_acknowledges_in_order
         pts=advanced.pts,
     )
     client = _DifferenceClientProbe([response])
-    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+        clock=SimpleNamespace(now=lambda: event_time + timedelta(minutes=2)),
+    )
 
     first = provider.get_channel_difference_event(identity, checkpoint, 1)
     assert isinstance(first, TelegramDifferenceEvent)
@@ -768,6 +775,7 @@ def test_provider_normalizes_every_channel_page_update_and_acknowledges_in_order
     assert all(result.from_checkpoint == checkpoint for result in results)
     assert all(result.to_checkpoint == checkpoint for result in results[:-1])
     assert results[-1].to_checkpoint == advanced
+    assert results[-1].event_time == event_time + timedelta(minutes=2)
 
 
 def test_provider_rejects_basic_chat_delete_constructor_on_channel_route() -> None:
@@ -1308,6 +1316,7 @@ def test_provider_resolves_basic_delete_through_durable_message_lookup() -> None
         message_identity_lookup=lambda message_id: (
             identity if message_id == 8 else None
         ),
+        clock=SimpleNamespace(now=lambda: advanced.date),
     )
 
     result = provider.get_account_difference_event(checkpoint)
@@ -1389,6 +1398,7 @@ def test_provider_reconciles_warm_peerless_delete_with_durable_identity(
         client=_DifferenceClientProbe([response, delete_response]),
         approved_source_chats=(identity,),
         message_identity_lookup=lookup,
+        clock=SimpleNamespace(now=lambda: delete_checkpoint.date),
     )
 
     warm_result = provider.get_account_difference_event(checkpoint)
@@ -1433,6 +1443,86 @@ def test_account_delete_rejects_without_a_current_live_boundary() -> None:
 
     with pytest.raises(TelethonTransportError) as error:
         provider.get_account_difference_event(checkpoint)
+
+    assert error.value.reason.value == "checkpoint_invalid"
+
+
+def test_provider_uses_a_distinct_application_clock_time_for_each_account_delete() -> (
+    None
+):
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 42)
+    checkpoint = TelegramAccountCheckpoint(
+        pts=10,
+        qts=20,
+        seq=30,
+        date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    advanced = replace(
+        checkpoint,
+        pts=12,
+        seq=32,
+        date=datetime(2026, 9, 1, 10, 10, tzinfo=UTC),
+    )
+    first_observation = checkpoint.date + timedelta(minutes=1)
+    observations = [first_observation]
+
+    def now() -> datetime:
+        value = observations[0]
+        observations[0] += timedelta(seconds=1)
+        return value
+
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [
+                SimpleNamespace(
+                    new_messages=[],
+                    other_updates=[
+                        types.UpdateDeleteMessages([8, 9], 11, 1),
+                    ],
+                    state=SimpleNamespace(
+                        pts=advanced.pts,
+                        qts=advanced.qts,
+                        seq=advanced.seq,
+                        date=advanced.date,
+                    ),
+                )
+            ]
+        ),
+        approved_source_chats=(identity,),
+        message_identity_lookup=lambda _message_id: identity,
+        clock=SimpleNamespace(now=now),
+    )
+
+    first = provider.get_account_difference_event(checkpoint)
+    assert isinstance(first, TelegramDifferenceEvent)
+    provider.acknowledge_account_difference_event(checkpoint, first.source_event_id)
+    second = provider.get_account_difference_event(checkpoint)
+
+    assert isinstance(second, TelegramDifferenceEvent)
+    assert first.event_time == first_observation
+    assert second.event_time == first_observation + timedelta(seconds=1)
+    assert first.event_time != advanced.date
+    assert second.event_time != advanced.date
+
+
+def test_channel_delete_fails_closed_without_an_application_clock() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    response = SimpleNamespace(
+        new_messages=[],
+        other_updates=[types.UpdateDeleteChannelMessages(42, [9], 11, 1)],
+        pts=11,
+    )
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(
+            identity,
+            TelegramChannelCheckpoint(pts=10),
+            1,
+        )
 
     assert error.value.reason.value == "checkpoint_invalid"
 
@@ -1776,9 +1866,7 @@ def test_restarted_provider_distinguishes_same_time_edit_pts_occurrences() -> No
     assert replayed.source_event_id == first.source_event_id
 
 
-def test_durable_transport_history_rejects_ambiguous_overlap_and_stale_promotion() -> (
-    None
-):
+def test_durable_transport_history_reconciles_overlap_and_stale_snapshots() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     checkpoint = TelegramChannelCheckpoint(pts=10)
     publication_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
@@ -1839,22 +1927,25 @@ def test_durable_transport_history_rejects_ambiguous_overlap_and_stale_promotion
         )
     )
 
-    with pytest.raises(TelethonTransportError) as replay_error:
-        TelethonProvider(
-            client=_DifferenceClientProbe(
-                [],
-                history_messages=[edit_message(first_edit_time, "A")],
-            ),
-            approved_source_chats=(identity,),
-            revision_history_lookup=revision_history,
-        ).get_source_chat_history_event(
-            identity,
-            1,
-            checkpoint,
-            publication_time - timedelta(days=1),
-            publication_time + timedelta(days=1),
-        )
-    assert replay_error.value.reason.value == "checkpoint_invalid"
+    replayed = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [],
+            history_messages=[edit_message(first_edit_time, "A")],
+        ),
+        approved_source_chats=(identity,),
+        revision_history_lookup=revision_history,
+    ).get_source_chat_history_event(
+        identity,
+        1,
+        checkpoint,
+        publication_time - timedelta(days=1),
+        publication_time + timedelta(days=1),
+    )
+    assert isinstance(replayed, TelegramDifferenceEvent)
+    assert replayed.source_event_id == first.source_event_id
+    assert replayed.revision == first.revision
+    assert replayed.transport_event_id == first.transport_event_id
+    assert replayed.transport_order == first.transport_order
 
     second = TelethonProvider(
         client=_DifferenceClientProbe(
@@ -1889,22 +1980,25 @@ def test_durable_transport_history_rejects_ambiguous_overlap_and_stale_promotion
         )
     )
 
-    with pytest.raises(TelethonTransportError) as late_error:
-        TelethonProvider(
-            client=_DifferenceClientProbe(
-                [],
-                history_messages=[edit_message(first_edit_time, "A")],
-            ),
-            approved_source_chats=(identity,),
-            revision_history_lookup=revision_history,
-        ).get_source_chat_history_event(
-            identity,
-            1,
-            checkpoint,
-            publication_time - timedelta(days=1),
-            publication_time + timedelta(days=1),
-        )
-    assert late_error.value.reason.value == "checkpoint_invalid"
+    late_replay = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [],
+            history_messages=[edit_message(first_edit_time, "A")],
+        ),
+        approved_source_chats=(identity,),
+        revision_history_lookup=revision_history,
+    ).get_source_chat_history_event(
+        identity,
+        1,
+        checkpoint,
+        publication_time - timedelta(days=1),
+        publication_time + timedelta(days=1),
+    )
+    assert isinstance(late_replay, TelegramDifferenceEvent)
+    assert late_replay.source_event_id == first.source_event_id
+    assert late_replay.revision == first.revision
+    assert late_replay.transport_event_id == first.transport_event_id
+    assert late_replay.transport_order == first.transport_order
 
     third_edit_time = publication_time + timedelta(minutes=3)
     history_first = TelethonProvider(
@@ -1956,8 +2050,10 @@ def test_durable_transport_history_rejects_ambiguous_overlap_and_stale_promotion
     )
 
     assert isinstance(live_after_history, TelegramDifferenceEvent)
-    assert live_after_history.source_event_id != history_first.source_event_id
-    assert live_after_history.revision > history_first.revision
+    assert live_after_history.source_event_id == history_first.source_event_id
+    assert live_after_history.revision == history_first.revision
+    assert live_after_history.transport_event_id == history_first.transport_event_id
+    assert live_after_history.transport_order == history_first.transport_order
 
 
 def test_public_source_url_is_provenance_only_without_positive_reply_evidence() -> None:
@@ -2320,7 +2416,11 @@ def test_same_timestamp_edits_and_a_later_delete_have_strict_revisions() -> None
             ),
         ]
     )
-    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+        clock=SimpleNamespace(now=lambda: event_time + timedelta(minutes=2)),
+    )
 
     first = provider.get_channel_difference_event(identity, first_checkpoint, 1)
     second = provider.get_channel_difference_event(identity, second_checkpoint, 1)
@@ -2400,6 +2500,7 @@ def test_restarted_provider_replays_delete_time_and_allows_later_edit() -> None:
     delete_checkpoint = TelegramChannelCheckpoint(pts=10)
     edit_checkpoint = TelegramChannelCheckpoint(pts=11)
     message_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    delete_observed_at = message_time + timedelta(minutes=1)
     delete_response = SimpleNamespace(
         new_messages=[],
         other_updates=[types.UpdateDeleteChannelMessages(42, [9], 11, 1)],
@@ -2425,13 +2526,14 @@ def test_restarted_provider_replays_delete_time_and_allows_later_edit() -> None:
         client=_DifferenceClientProbe([delete_response]),
         approved_source_chats=(identity,),
         revision_history_lookup=revision_history,
+        clock=SimpleNamespace(now=lambda: delete_observed_at),
     )
     first_delete = first_provider.get_channel_difference_event(
         identity, delete_checkpoint, 1
     )
     assert isinstance(first_delete, TelegramDifferenceEvent)
     assert first_delete.kind is SourceEventKind.DELETE
-    assert first_delete.event_time > message_time
+    assert first_delete.event_time == delete_observed_at
     durable_history.append(
         (
             first_delete.revision,
@@ -2463,6 +2565,7 @@ def test_restarted_provider_replays_delete_time_and_allows_later_edit() -> None:
         ),
         approved_source_chats=(identity,),
         revision_history_lookup=revision_history,
+        clock=SimpleNamespace(now=lambda: delete_observed_at),
     )
     replayed_delete = restarted_provider.get_channel_difference_event(
         identity, delete_checkpoint, 1

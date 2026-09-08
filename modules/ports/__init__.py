@@ -118,6 +118,10 @@ class TimezoneDataError(RuntimeError):
 class TelegramIngestionAdapter(Protocol):
     """Controlled Source Chat input boundary."""
 
+    def configure_clock(self, clock: Clock) -> None:
+        """Bind the Application clock used for provider event fallbacks."""
+        ...
+
     def source_event_id(self, probe_id: str) -> str:
         """Return a synthetic Source Event identity."""
         ...

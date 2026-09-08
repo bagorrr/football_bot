@@ -38,7 +38,7 @@ from modules.domain import (
     TelegramProtectionUnavailableEvent,
     empty_bounded_source_metadata,
 )
-from modules.ports import SourceChatAdmissionError
+from modules.ports import Clock, SourceChatAdmissionError
 
 T2_CONFIGURATION_KEYS = frozenset(
     {
@@ -69,6 +69,23 @@ _NormalizedRevisionHistoryItem = tuple[
     int, SourceEventKind, str | None, datetime, str | None, int | None
 ]
 _NormalizedRevisionHistory = tuple[_NormalizedRevisionHistoryItem, ...]
+
+
+def _same_edit_occurrence(
+    stored_transport_event_id: str | None,
+    observed_transport_event_id: str,
+) -> bool:
+    """Match a history edit to one live occurrence without merging live pts."""
+    if not isinstance(stored_transport_event_id, str):
+        return False
+    stored_has_pts = ":pts:" in stored_transport_event_id
+    observed_has_pts = ":pts:" in observed_transport_event_id
+    if stored_has_pts and observed_has_pts:
+        return stored_transport_event_id == observed_transport_event_id
+    return (
+        stored_transport_event_id.split(":pts:", 1)[0]
+        == (observed_transport_event_id.split(":pts:", 1)[0])
+    )
 
 
 class TelethonConfigurationError(ValueError):
@@ -278,6 +295,10 @@ class TelethonTransport(Protocol):
 
 class TelethonSource(Protocol):
     """Provider seam used by the application-facing ingestion adapter."""
+
+    def configure_clock(self, clock: Clock) -> None:
+        """Bind the application-owned clock for provider event fallbacks."""
+        ...
 
     def refresh_source_scope(
         self,
@@ -582,6 +603,7 @@ class TelethonRuntime:
             [TelegramPeerIdentity, int, int], _RevisionHistory
         ]
         | None = None,
+        clock: Clock | None = None,
     ) -> TelethonProvider:
         """Create the lazy production provider for the explicit T2 client."""
         return TelethonProvider(
@@ -590,6 +612,7 @@ class TelethonRuntime:
             message_identity_lookup=message_identity_lookup,
             source_scope_generation_lookup=source_scope_generation_lookup,
             revision_history_lookup=revision_history_lookup,
+            clock=clock,
         )
 
     @property
@@ -703,6 +726,7 @@ class TelethonProvider:
             [TelegramPeerIdentity, int, int], _RevisionHistory
         ]
         | None = None,
+        clock: Clock | None = None,
     ) -> None:
         self._client = client
         self._entities: dict[TelegramPeerIdentity, object] = {}
@@ -726,8 +750,15 @@ class TelethonProvider:
         self._message_identity_lookup = message_identity_lookup
         self._source_scope_generation_lookup = source_scope_generation_lookup
         self._revision_history_lookup = revision_history_lookup
+        self._clock = clock
         self._live_callback: Callable[[TelegramPeerIdentity], None] | None = None
         self.refresh_source_scope(approved_source_chats)
+
+    def configure_clock(self, clock: Clock) -> None:
+        """Set the Application clock used for provider-observed event times."""
+        if not callable(getattr(clock, "now", None)):
+            raise TelethonConformanceError(key="CLOCK", status="scope_invalid")
+        self._clock = clock
 
     def configure_source_scope(
         self,
@@ -1001,18 +1032,12 @@ class TelethonProvider:
                     reason=IngestionFailureReason.DIFFERENCE_TOO_LONG,
                 )
             to_checkpoint = self._account_response_checkpoint(response, checkpoint)
-            account_delete_observation_time = self._account_delete_observation_time(
-                response=response,
-                from_checkpoint=checkpoint,
-                to_checkpoint=to_checkpoint,
-            )
             results = self._normalize_difference_page(
                 response=response,
                 identity=None,
                 generation=1,
                 from_checkpoint=checkpoint,
                 to_checkpoint=to_checkpoint,
-                account_delete_observation_time=account_delete_observation_time,
             )
             if not results:
                 return None
@@ -1543,32 +1568,6 @@ class TelethonProvider:
         )
 
     @staticmethod
-    def _account_delete_observation_time(
-        *,
-        response: object,
-        from_checkpoint: TelegramAccountCheckpoint,
-        to_checkpoint: TelegramAccountCheckpoint,
-    ) -> datetime | None:
-        """Return only a validated live boundary for peer-less account deletes."""
-        if to_checkpoint.pts <= from_checkpoint.pts:
-            return None
-        state = getattr(response, "state", None) or getattr(
-            response, "intermediate_state", None
-        )
-        value = (
-            getattr(state, "date", None)
-            if state is not None
-            else getattr(response, "date", None)
-        )
-        if (
-            not isinstance(value, datetime)
-            or value.tzinfo is None
-            or value <= from_checkpoint.date
-        ):
-            return None
-        return value
-
-    @staticmethod
     def _required_checkpoint_date(
         value: object,
         *,
@@ -1591,7 +1590,6 @@ class TelethonProvider:
         generation: int,
         from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
-        account_delete_observation_time: datetime | None = None,
     ) -> list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance]:
         normalized: list[_TelegramPageResult] = []
         seen: set[tuple[TelegramPeerIdentity, int, SourceEventKind, int | None]] = set()
@@ -1675,14 +1673,31 @@ class TelethonProvider:
                     if (
                         transport_revision is None
                         or transport_revision <= from_checkpoint.pts
-                        or account_delete_observation_time is None
                     ):
                         raise TelethonTransportError(
                             "Telegram account deletion observation time is unavailable",
                             reason=IngestionFailureReason.CHECKPOINT_INVALID,
                             scope=IngestionFailureScope.ACCOUNT_STREAM,
                         )
-                    delete_event_time = account_delete_observation_time
+                    delete_event_time = self._application_deletion_time(
+                        scope=IngestionFailureScope.ACCOUNT_STREAM,
+                    )
+                    if delete_event_time <= from_checkpoint.date:
+                        raise TelethonTransportError(
+                            "Telegram account deletion observation time is unavailable",
+                            reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                            scope=IngestionFailureScope.ACCOUNT_STREAM,
+                        )
+                elif not isinstance(delete_event_time, datetime) or (
+                    delete_event_time.tzinfo is None
+                ):
+                    delete_event_time = self._application_deletion_time(
+                        scope=(
+                            IngestionFailureScope.ACCOUNT_STREAM
+                            if isinstance(from_checkpoint, TelegramAccountCheckpoint)
+                            else IngestionFailureScope.SOURCE_STREAM
+                        ),
+                    )
                 result = self._delete_result(
                     identity=current_identity,
                     generation=current_generation,
@@ -2384,6 +2399,7 @@ class TelethonProvider:
             revision_history=revision_history,
             transport_event_id=transport_event_id,
             transport_order=transport_order,
+            event_time=event_time,
             from_history=False,
         )
         if (
@@ -2534,11 +2550,15 @@ class TelethonProvider:
             revision_history=revision_history,
             transport_event_id=transport_event_id,
             transport_order=transport_order,
+            event_time=event_time,
             from_history=from_history,
         )
         if matching_item is not None:
             event_time = matching_item[3]
-            if matching_item[4] is not None and matching_item[5] is not None:
+            if (
+                matching_item[4] is not None
+                and matching_item[5] is not None
+            ):
                 transport_event_id = matching_item[4]
                 transport_order = matching_item[5]
         source_event_id = canonical_telethon_source_event_id(
@@ -2648,6 +2668,7 @@ class TelethonProvider:
         revision_history: _NormalizedRevisionHistory | None = None,
         transport_event_id: str,
         transport_order: int,
+        event_time: datetime | None,
         from_history: bool,
     ) -> tuple[int, _NormalizedRevisionHistoryItem | None]:
         revision_key = (identity, generation, message_id)
@@ -2663,6 +2684,8 @@ class TelethonProvider:
         matching_item = self._matching_revision_history_item(
             history=history,
             kind=kind,
+            body=body,
+            event_time=event_time,
             transport_event_id=transport_event_id,
             transport_order=transport_order,
             from_history=from_history,
@@ -2723,6 +2746,8 @@ class TelethonProvider:
         *,
         history: _NormalizedRevisionHistory,
         kind: SourceEventKind,
+        body: str | None,
+        event_time: datetime | None,
         transport_event_id: str,
         transport_order: int,
         from_history: bool,
@@ -2742,7 +2767,23 @@ class TelethonProvider:
             )
         if exact:
             return exact[0]
-        if kind is SourceEventKind.EDIT or not from_history:
+        if kind is SourceEventKind.EDIT:
+            overlapping = tuple(
+                item
+                for item in history
+                if item[1] is SourceEventKind.EDIT
+                and item[2] == body
+                and item[3] == event_time
+                and _same_edit_occurrence(item[4], transport_event_id)
+            )
+            if len(overlapping) > 1:
+                raise TelethonTransportError(
+                    "Telegram edit snapshot overlap is ambiguous",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            return overlapping[0] if overlapping else None
+        if not from_history:
             return None
         elif kind in {SourceEventKind.CREATE, SourceEventKind.DELETE}:
             candidates = tuple(item for item in history if item[1] is kind)
@@ -2885,7 +2926,38 @@ class TelethonProvider:
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
             )
         del identity, message_id, transport_revision
-        return datetime.now(UTC)
+        return self._application_deletion_time(
+            scope=IngestionFailureScope.SOURCE_STREAM,
+        )
+
+    def _application_deletion_time(
+        self,
+        *,
+        scope: IngestionFailureScope,
+    ) -> datetime:
+        """Read one validated current instant from the Application clock."""
+        clock = self._clock
+        if clock is None or not callable(getattr(clock, "now", None)):
+            raise TelethonTransportError(
+                "Telegram deletion observation time is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=scope,
+            )
+        try:
+            value = clock.now()
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram deletion observation clock failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=scope,
+            ) from error
+        if not isinstance(value, datetime) or value.tzinfo is None:
+            raise TelethonTransportError(
+                "Telegram deletion observation time is invalid",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=scope,
+            )
+        return value
 
     @staticmethod
     def _is_protected(entity: object, message: object) -> bool:
@@ -3083,6 +3155,26 @@ class TelethonIngestionAdapter:
                 "Telegram message identity lookup setup failed",
                 reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+
+    def configure_clock(self, clock: Clock) -> None:
+        """Bind the Application clock used for provider event fallbacks."""
+        self._runtime.require_ready()
+        configure = getattr(self._source, "configure_clock", None)
+        if not callable(configure):
+            raise TelethonConformanceError(
+                key="CLOCK", status="provider_boundary_unavailable"
+            )
+        try:
+            configure(clock)
+        except TelethonConformanceError:
+            raise
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram deletion observation clock setup failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
             ) from None
 
     def configure_source_scope_generation_lookup(
