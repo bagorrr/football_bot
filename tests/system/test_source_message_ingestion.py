@@ -4561,8 +4561,8 @@ def test_source_deletion_blocks_model_work_and_records_tombstone() -> None:
     clock.advance_to(reenabled_at)
     telethon.add_channel_difference_event(
         identity=identity,
-        from_checkpoint=TelegramChannelCheckpoint(pts=4754),
-        to_checkpoint=TelegramChannelCheckpoint(pts=4755),
+        from_checkpoint=TelegramChannelCheckpoint(pts=4755),
+        to_checkpoint=TelegramChannelCheckpoint(pts=4756),
         source_event_id="source-event:delete-replay:re-enabled-replay",
         telegram_message_id=405,
         revision=4,
