@@ -4930,6 +4930,34 @@ class PostgresRoleStore:
                             and event.transport_revision > boundary_pts
                         )
                     )
+                    if (
+                        isinstance(event, TelegramDifferenceEvent)
+                        and event.kind is SourceEventKind.EDIT
+                        and event.event_time <= context["processing_started_at"]
+                    ):
+                        lifecycle_boundary = connection.execute(
+                            """
+                            SELECT football_runtime.source_chat_event_is_processable(
+                                %s, %s, %s, %s
+                            ) AS lifecycle_boundary_is_processable
+                            """,
+                            (
+                                identity.kind.value,
+                                identity.telegram_id,
+                                registry_generation,
+                                context["processing_started_at"],
+                            ),
+                        ).fetchone()
+                        if (
+                            lifecycle_boundary is not None
+                            and not lifecycle_boundary[
+                                "lifecycle_boundary_is_processable"
+                            ]
+                        ):
+                            # The original transport boundary can prove an edit
+                            # recovered after registration, but not one recovered
+                            # from a pause gap after a re-enable boundary.
+                            channel_event_is_after_boundary = False
             else:
                 raise TypeError("Telegram difference checkpoint scope is unsupported")
             source_message_id = canonical_source_message_id(

@@ -341,6 +341,202 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     system.reset()
 
 
+def test_raw_telethon_reenable_rejects_pause_gap_edit_and_accepts_current_edit(
+    fresh_database_url: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_108)
+    registered_at = datetime(2026, 9, 12, 10, 0, tzinfo=UTC)
+    paused_at = datetime(2026, 9, 12, 10, 5, tzinfo=UTC)
+    re_enabled_at = datetime(2026, 9, 12, 10, 10, tzinfo=UTC)
+    current_at = datetime(2026, 9, 12, 10, 11, tzinfo=UTC)
+    administrator_id = 46_101
+    address = "@raw_reenable_boundary_source"
+    entity = types.Channel(
+        id=identity.telegram_id,
+        title="raw re-enable boundary channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=False,
+        access_hash=9,
+    )
+    entity.username = "raw_reenable_boundary_source"
+
+    def edit_message(*, event_time: datetime, body: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=901,
+            peer_id=types.PeerChannel(identity.telegram_id),
+            from_id=types.PeerUser(46_102),
+            post_author=None,
+            date=registered_at,
+            edit_date=event_time,
+            message=body,
+            noforwards=False,
+        )
+
+    client = _RawDifferenceClient(
+        [
+            SimpleNamespace(pts=6500, final=True),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[
+                    types.UpdateEditChannelMessage(
+                        edit_message(
+                            event_time=paused_at,
+                            body="Pause-gap edit body.",
+                        ),
+                        6501,
+                        1,
+                    )
+                ],
+                pts=6501,
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[
+                    types.UpdateEditChannelMessage(
+                        edit_message(
+                            event_time=current_at,
+                            body="Current post-re-enable edit body.",
+                        ),
+                        6502,
+                        1,
+                    )
+                ],
+                pts=6502,
+            ),
+        ],
+        entity,
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": str(administrator_id),
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+    )
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(identity,),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 10, 0, tzinfo=UTC))
+    telegram = ControlledTelegramDeliveryAdapter()
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=administrator_id,
+        address=address,
+        update_suffix="raw-reenable-boundary",
+    )
+
+    clock.advance_to(paused_at)
+    pause_callback = next(
+        callback
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+        if callback.startswith("source-chats:pause:")
+    )
+    system.select_source_chats_action(
+        update_id="pause-request:raw-reenable-boundary",
+        telegram_user_id=administrator_id,
+        action=pause_callback,
+        screen_revision=telegram.messages[-1].screen_revision,
+    )
+    pause_confirmation = next(
+        callback
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+        if callback.startswith("source-chats:confirm:pause:")
+    )
+    system.select_source_chats_action(
+        update_id="pause-confirm:raw-reenable-boundary",
+        telegram_user_id=administrator_id,
+        action=pause_confirmation,
+        screen_revision=telegram.messages[-1].screen_revision,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.process_next_source_chat_bot_result()
+
+    clock.advance_to(re_enabled_at)
+    re_enable_callback = next(
+        callback
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+        if callback.startswith("source-chats:re_enable:")
+    )
+    system.select_source_chats_action(
+        update_id="re-enable-request:raw-reenable-boundary",
+        telegram_user_id=administrator_id,
+        action=re_enable_callback,
+        screen_revision=telegram.messages[-1].screen_revision,
+    )
+    re_enable_confirmation = next(
+        callback
+        for row in telegram.messages[-1].button_rows
+        for _label, callback in row
+        if callback.startswith("source-chats:confirm:re_enable:")
+    )
+    system.select_source_chats_action(
+        update_id="re-enable-confirm:raw-reenable-boundary",
+        telegram_user_id=administrator_id,
+        action=re_enable_confirmation,
+        screen_revision=telegram.messages[-1].screen_revision,
+    )
+    assert system.process_next_source_chat_change_request()
+    assert system.process_next_source_chat_admission()
+    assert system.process_next_source_chat_bot_result()
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=6501)
+    assert system.source_events() == ()
+    assert system.source_messages() == ()
+    assert not system.process_next_source_event()
+
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=6502)
+    assert len(system.source_events()) == 1
+    assert system.source_events()[0].body == "Current post-re-enable edit body."
+    assert system.process_next_source_event()
+    assert system.source_messages()[0].body == "Current post-re-enable edit body."
+    assert system.ingestion_failures() == ()
+    system.reset()
+
+
 @pytest.mark.parametrize(
     "event_kind",
     (SourceEventKind.EDIT, SourceEventKind.DELETE),
