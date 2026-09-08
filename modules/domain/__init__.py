@@ -808,6 +808,7 @@ class _TelegramDifferenceProgress:
     from_history: bool = False
     transport_event_id: str | None = None
     transport_order: int | None = None
+    transport_revision: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
@@ -849,6 +850,10 @@ class _TelegramDifferenceProgress:
             type(self.transport_order) is not int or self.transport_order < 1
         ):
             raise ValueError("Telegram transport order must be positive")
+        if self.transport_revision is not None and (
+            type(self.transport_revision) is not int or self.transport_revision < 1
+        ):
+            raise ValueError("Telegram transport revision must be positive")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

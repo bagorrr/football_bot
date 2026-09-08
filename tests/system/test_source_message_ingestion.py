@@ -212,7 +212,7 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     )
     client = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=500),
+            SimpleNamespace(pts=500, final=True),
             SimpleNamespace(
                 new_messages=[message],
                 other_updates=[],
@@ -331,6 +331,133 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
 
 
 @pytest.mark.parametrize(
+    "event_kind",
+    (SourceEventKind.EDIT, SourceEventKind.DELETE),
+)
+def test_raw_telethon_first_page_post_boundary_edit_or_delete_is_recorded(
+    fresh_database_url: str,
+    event_kind: SourceEventKind,
+) -> None:
+    identity = TelegramPeerIdentity(
+        TelegramPeerKind.CHANNEL,
+        4_610_106 if event_kind is SourceEventKind.EDIT else 4_610_107,
+    )
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    observed_at = registered_at + timedelta(minutes=1)
+    entity = types.Channel(
+        id=identity.telegram_id,
+        title="raw boundary channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=False,
+        access_hash=9,
+    )
+    entity.username = "raw_boundary_source"
+    message = SimpleNamespace(
+        id=902,
+        peer_id=types.PeerChannel(identity.telegram_id),
+        from_id=types.PeerUser(46_106),
+        post_author=None,
+        date=registered_at,
+        edit_date=observed_at,
+        message="First-page boundary edit.",
+        noforwards=False,
+    )
+    update = (
+        types.UpdateEditChannelMessage(message, 9001, 1)
+        if event_kind is SourceEventKind.EDIT
+        else types.UpdateDeleteChannelMessages(identity.telegram_id, [902], 9001, 1)
+    )
+    client = _RawDifferenceClient(
+        [
+            SimpleNamespace(pts=9000, final=True),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[update],
+                pts=9001,
+            ),
+        ],
+        entity,
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46101",
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+    )
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(identity,),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_101,
+        address="@raw_boundary_source",
+        update_suffix=f"raw-boundary-{event_kind.value}",
+    )
+    clock.advance_to(observed_at)
+
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=9000)
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+
+    assert len(system.source_events()) == 1
+    event = system.source_events()[0]
+    assert event.event_kind is event_kind
+    assert event.transport_order == (
+        9001
+        if event_kind is SourceEventKind.DELETE
+        else TelethonProvider._datetime_order(observed_at)
+    )
+    assert event.transport_event_id is not None
+    assert ":pts:9001" in event.transport_event_id
+    assert system.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=9001)
+    assert system.process_next_source_event()
+    if event_kind is SourceEventKind.DELETE:
+        assert system.source_messages()[0].tombstoned
+        assert system.source_message_deletion_tombstones()
+    else:
+        assert system.source_messages()[0].body == "First-page boundary edit."
+    assert system.ingestion_failures() == ()
+    system.reset()
+
+
+@pytest.mark.parametrize(
     ("route", "failure_case"),
     (
         ("account", "missing_state"),
@@ -379,7 +506,7 @@ def test_raw_telethon_invalid_difference_checkpoint_stops_before_ack(
             response.other_updates = [types.UpdateDeleteMessages([901], 501, 1)]
             response.pts = 501
     client = _RawDifferenceClient(
-        [SimpleNamespace(pts=500), response],
+        [SimpleNamespace(pts=500, final=True), response],
         entity,
     )
     values = {
@@ -713,7 +840,7 @@ def test_raw_telethon_same_time_edits_remain_distinct_and_history_replays(
     second_message = message(edit_date=second_edit, body="Raw B.")
     client = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=500),
+            SimpleNamespace(pts=500, final=True),
             SimpleNamespace(
                 new_messages=[create_message],
                 other_updates=[],
@@ -864,7 +991,7 @@ def test_raw_telethon_same_snapshot_normalized_before_commit_is_idempotent(
     edit_message = message(body="Raw overlapping edit.", edit_date=edit_date)
     client_one = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=600),
+            SimpleNamespace(pts=600, final=True),
             SimpleNamespace(
                 new_messages=[create_message],
                 other_updates=[],

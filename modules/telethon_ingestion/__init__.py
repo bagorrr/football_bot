@@ -950,6 +950,12 @@ class TelethonProvider:
                         reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
                         scope=IngestionFailureScope.SOURCE_STREAM,
                     )
+                if getattr(response, "final", None) is not True:
+                    raise TelethonTransportError(
+                        "Telegram channel boundary is incomplete",
+                        reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    )
                 return f"channel-pts:{pts}"
             response = self._request(
                 functions.updates.GetStateRequest(),
@@ -2224,6 +2230,10 @@ class TelethonProvider:
                 types.UpdateChannelParticipant,
                 types.UpdateWebPage,
                 types.UpdateChannelAvailableMessages,
+                types.UpdateUserName,
+                types.UpdatePtsChanged,
+                types.UpdateChannelTooLong,
+                types.UpdateChatParticipantAdd,
             ),
         ):
             return False
@@ -2437,6 +2447,7 @@ class TelethonProvider:
             registry_generation=generation,
             transport_event_id=transport_event_id,
             transport_order=transport_order,
+            transport_revision=transport_revision,
         )
 
     @staticmethod
@@ -2580,6 +2591,7 @@ class TelethonProvider:
                 from_history=from_history,
                 transport_event_id=transport_event_id,
                 transport_order=transport_order,
+                transport_revision=transport_revision,
             )
         reply_to = getattr(message, "reply_to", None)
         reply_to_message_id = getattr(reply_to, "reply_to_msg_id", None)
@@ -2607,6 +2619,7 @@ class TelethonProvider:
             from_history=from_history,
             transport_event_id=transport_event_id,
             transport_order=transport_order,
+            transport_revision=transport_revision,
         )
 
     @staticmethod

@@ -11,6 +11,7 @@ import pytest
 from telethon import types  # type: ignore[import-untyped]
 
 from modules.domain import (
+    IngestionFailureReason,
     InitialConsentAttestation,
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
@@ -961,6 +962,25 @@ def test_provider_accepts_valid_empty_difference_vectors(
             types.UpdateChannelAvailableMessages(42, 1),
             id="UpdateChannelAvailableMessages",
         ),
+        pytest.param(
+            types.UpdateUserName(42, "Controlled", "", []),
+            id="UpdateUserName",
+        ),
+        pytest.param(types.UpdatePtsChanged(), id="UpdatePtsChanged"),
+        pytest.param(
+            types.UpdateChannelTooLong(42, pts=11),
+            id="UpdateChannelTooLong",
+        ),
+        pytest.param(
+            types.UpdateChatParticipantAdd(
+                42,
+                43,
+                44,
+                datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+                1,
+            ),
+            id="UpdateChatParticipantAdd",
+        ),
     ),
 )
 @pytest.mark.parametrize("route", ("account", "channel"))
@@ -1231,6 +1251,21 @@ def test_provider_ignores_scheduled_updates() -> None:
 
         assert isinstance(result, TelegramDifferenceCheckpointAdvance)
         assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
+
+
+def test_provider_rejects_non_final_channel_registration_boundary() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    client = _DifferenceClientProbe([SimpleNamespace(pts=11, final=False)])
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.capture_source_chat_registration_boundary(identity)
+
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_UNAVAILABLE
+    assert client.responses == []
 
 
 def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:

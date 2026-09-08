@@ -4922,8 +4922,13 @@ class PostgresRoleStore:
                     # beginning at that pts is the pre-boundary replay, while a
                     # strictly later starting pts is the first post-boundary
                     # transport identity we can safely admit.
-                    channel_event_is_after_boundary = event.from_checkpoint.pts > int(
-                        boundary[len(prefix) :]
+                    boundary_pts = int(boundary[len(prefix) :])
+                    channel_event_is_after_boundary = (
+                        event.from_checkpoint.pts > boundary_pts
+                        or (
+                            event.transport_revision is not None
+                            and event.transport_revision > boundary_pts
+                        )
                     )
             else:
                 raise TypeError("Telegram difference checkpoint scope is unsupported")
