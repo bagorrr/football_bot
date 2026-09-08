@@ -104,6 +104,7 @@ from modules.domain import (
     TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferencePending,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -17148,6 +17149,30 @@ class RuntimeApplication:
             )
             if callable(configure_lookup) and callable(lookup):
                 configure_lookup(lookup)
+            configure_scope_generation = getattr(
+                self.telegram_ingestion,
+                "configure_source_scope_generation_lookup",
+                None,
+            )
+            scope_generation_lookup = getattr(
+                self.store, "source_chat_ingestion_generation", None
+            )
+            if callable(configure_scope_generation) and callable(
+                scope_generation_lookup
+            ):
+                configure_scope_generation(scope_generation_lookup)
+            configure_revision_history = getattr(
+                self.telegram_ingestion,
+                "configure_source_message_revision_lookup",
+                None,
+            )
+            revision_history_lookup = getattr(
+                self.store, "source_message_revision_history_for_ingestion", None
+            )
+            if callable(configure_revision_history) and callable(
+                revision_history_lookup
+            ):
+                configure_revision_history(revision_history_lookup)
         if self.supported_versions:
             return
         for definition in SUPPORTED_CONTRACTS:
@@ -17373,6 +17398,26 @@ class RuntimeApplication:
                 checkpoint=checkpoint,
                 result_id=event.outcome_id,
             )
+        if isinstance(event, TelegramDifferencePending):
+            if event.from_checkpoint != checkpoint:
+                return self._stop_account_stream_for_transport_failure(
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID
+                )
+            try:
+                discarded = self.store.discard_account_difference_event(
+                    event=event,
+                    recorded_at=self.clock.now(),
+                )
+            except (LookupError, TypeError, ValueError):
+                return self._stop_account_stream_for_transport_failure(
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID
+                )
+            if not discarded:
+                return False
+            return self._acknowledge_account_difference_event(
+                checkpoint=checkpoint,
+                result_id=event.source_event_id,
+            )
         identity = event.source_chat_identity
         registry_generation = event.registry_generation
         if self.store.source_stream_is_stopped(
@@ -17585,6 +17630,12 @@ class RuntimeApplication:
                 registry_generation=registry_generation,
                 checkpoint=context.checkpoint,
                 result_id=event.outcome_id,
+            )
+        if isinstance(event, TelegramDifferencePending):
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
             )
         if event.source_chat_identity != identity:
             return self._stop_source_stream_for_transport_failure(
@@ -17859,6 +17910,12 @@ class RuntimeApplication:
                 reason=event.reason,
             )
         if isinstance(event, TelegramDifferenceCheckpointAdvance):
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
+        if isinstance(event, TelegramDifferencePending):
             return self._stop_source_stream_for_transport_failure(
                 identity=identity,
                 registry_generation=registry_generation,

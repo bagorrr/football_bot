@@ -94,6 +94,7 @@ from modules.domain import (
     TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferencePending,
     TelegramDifferenceResult,
     TelegramHistoryProgress,
     TelegramMessage,
@@ -388,6 +389,22 @@ class ControlledTelegramIngestionAdapter:
     ) -> None:
         """Retain the controlled durable deletion-lookup seam."""
         self.message_identity_lookup = lookup
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Accept the production scope lookup without making controlled data live."""
+        del lookup
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[
+            [TelegramPeerIdentity, int, int],
+            tuple[tuple[int, SourceEventKind, str | None, datetime], ...],
+        ],
+    ) -> None:
+        """Accept the production revision lookup without reading a live provider."""
+        del lookup
 
     def admit_source_chat(
         self,
@@ -1096,6 +1113,8 @@ class ControlledTelegramIngestionAdapter:
         if isinstance(event, TelegramDifferenceFailure):
             self._history_result_gate.enter()
             return replace(event, checkpoint=checkpoint)
+        if isinstance(event, TelegramDifferencePending):
+            raise RuntimeError("controlled history cursor contains pending progress")
         self._history_result_gate.enter()
         return replace(event, from_checkpoint=checkpoint, to_checkpoint=checkpoint)
 

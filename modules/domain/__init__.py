@@ -867,6 +867,38 @@ class TelegramProtectionUnavailableEvent(_TelegramDifferenceProgress):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramDifferencePending:
+    """Body-free account progress held until a newly registered peer is active."""
+
+    source_chat_identity: TelegramPeerIdentity
+    from_checkpoint: TelegramAccountCheckpoint
+    to_checkpoint: TelegramAccountCheckpoint
+    source_event_id: str
+    telegram_message_id: int
+    registry_generation: int = 1
+
+    def __post_init__(self) -> None:
+        if not (
+            isinstance(self.from_checkpoint, TelegramAccountCheckpoint)
+            and isinstance(self.to_checkpoint, TelegramAccountCheckpoint)
+        ):
+            raise ValueError("Pending Telegram differences require account checkpoints")
+        if (
+            self.to_checkpoint.pts < self.from_checkpoint.pts
+            or self.to_checkpoint.qts < self.from_checkpoint.qts
+            or self.to_checkpoint.seq < self.from_checkpoint.seq
+            or self.to_checkpoint.date < self.from_checkpoint.date
+        ):
+            raise ValueError("Telegram account checkpoint cannot regress")
+        if self.registry_generation < 1:
+            raise ValueError("Source Chat registry generation must be positive")
+        if not self.source_event_id:
+            raise ValueError("Source Event identity is required")
+        if self.telegram_message_id < 1:
+            raise ValueError("Telegram message identity must be positive")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TelegramDifferenceCheckpointAdvance:
     """Body-free page outcome that advances a durable Telegram checkpoint."""
 
@@ -917,6 +949,7 @@ TelegramDifferenceResult = (
     TelegramDifferenceEvent
     | TelegramProtectedContentEvent
     | TelegramProtectionUnavailableEvent
+    | TelegramDifferencePending
     | TelegramDifferenceCheckpointAdvance
     | TelegramDifferenceFailure
 )

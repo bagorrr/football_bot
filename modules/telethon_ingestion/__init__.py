@@ -14,7 +14,6 @@ import re
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from typing import Any, Protocol, cast
 
 from modules.domain import (
@@ -30,6 +29,7 @@ from modules.domain import (
     TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferencePending,
     TelegramDifferenceResult,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -52,13 +52,12 @@ _TelegramPageResult = (
     TelegramDifferenceEvent
     | TelegramProtectedContentEvent
     | TelegramProtectionUnavailableEvent
+    | TelegramDifferencePending
 )
 
 _API_ID_PATTERN = re.compile(r"[1-9][0-9]{0,9}")
 _ADMINISTRATOR_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}")
-_EDIT_REVISION_TIE_BITS = 12
-_EDIT_REVISION_TIE_MASK = (1 << _EDIT_REVISION_TIE_BITS) - 1
-_DELETE_REVISION = (1 << 63) - 1
+_RevisionHistory = tuple[tuple[int, SourceEventKind, str | None, datetime], ...]
 
 
 class TelethonConfigurationError(ValueError):
@@ -280,6 +279,19 @@ class TelethonSource(Protocol):
         self, lookup: Callable[[int], TelegramPeerIdentity | None]
     ) -> None:
         """Bind the durable lookup for deletion updates without a peer."""
+        ...
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Bind the durable current-generation lookup for account pages."""
+        ...
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int, int], _RevisionHistory],
+    ) -> None:
+        """Bind the durable revision history used for restart-safe ordering."""
         ...
 
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
@@ -553,12 +565,20 @@ class TelethonRuntime:
         ] = (),
         message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
         | None = None,
+        source_scope_generation_lookup: Callable[[TelegramPeerIdentity], int | None]
+        | None = None,
+        revision_history_lookup: Callable[
+            [TelegramPeerIdentity, int, int], _RevisionHistory
+        ]
+        | None = None,
     ) -> TelethonProvider:
         """Create the lazy production provider for the explicit T2 client."""
         return TelethonProvider(
             client=self.client,
             approved_source_chats=approved_source_chats,
             message_identity_lookup=message_identity_lookup,
+            source_scope_generation_lookup=source_scope_generation_lookup,
+            revision_history_lookup=revision_history_lookup,
         )
 
     @property
@@ -666,6 +686,12 @@ class TelethonProvider:
         ] = (),
         message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
         | None = None,
+        source_scope_generation_lookup: Callable[[TelegramPeerIdentity], int | None]
+        | None = None,
+        revision_history_lookup: Callable[
+            [TelegramPeerIdentity, int, int], _RevisionHistory
+        ]
+        | None = None,
     ) -> None:
         self._client = client
         self._entities: dict[TelegramPeerIdentity, object] = {}
@@ -681,9 +707,21 @@ class TelethonProvider:
             list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance],
         ] = {}
         self._revisions: dict[tuple[TelegramPeerIdentity, int], int] = {}
-        self._revision_bodies: dict[tuple[TelegramPeerIdentity, int], str | None] = {}
+        self._message_event_times: dict[tuple[TelegramPeerIdentity, int], datetime] = {}
         self._message_identities: dict[int, TelegramPeerIdentity] = {}
         self._message_identity_lookup = message_identity_lookup
+        self._source_scope_generation_lookup = source_scope_generation_lookup
+        self._revision_history_lookup = revision_history_lookup
+        self._difference_raw_pending: dict[
+            tuple[str, TelegramPeerIdentity | None],
+            tuple[
+                object,
+                TelegramPeerIdentity | None,
+                int,
+                TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+                TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+            ],
+        ] = {}
         self._live_callback: Callable[[TelegramPeerIdentity], None] | None = None
         self.refresh_source_scope(approved_source_chats)
 
@@ -730,9 +768,9 @@ class TelethonProvider:
             for key, revision in self._revisions.items()
             if generations.get(key[0]) == previous_generations.get(key[0])
         }
-        self._revision_bodies = {
-            key: body
-            for key, body in self._revision_bodies.items()
+        self._message_event_times = {
+            key: event_time
+            for key, event_time in self._message_event_times.items()
             if generations.get(key[0]) == previous_generations.get(key[0])
         }
 
@@ -745,6 +783,27 @@ class TelethonProvider:
                 key="MESSAGE_IDENTITY_LOOKUP", status="scope_invalid"
             )
         self._message_identity_lookup = lookup
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Set the durable current-generation lookup for account pages."""
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_GENERATION_LOOKUP", status="scope_invalid"
+            )
+        self._source_scope_generation_lookup = lookup
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int, int], _RevisionHistory],
+    ) -> None:
+        """Set the durable Source Message revision-history lookup."""
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="SOURCE_MESSAGE_REVISION_LOOKUP", status="scope_invalid"
+            )
+        self._revision_history_lookup = lookup
 
     def authenticate(self) -> int:
         """Connect the configured session and prove it is authorized."""
@@ -882,13 +941,23 @@ class TelethonProvider:
         self, checkpoint: TelegramAccountCheckpoint
     ) -> TelegramDifferenceResult | None:
         """Read one account difference page outcome at the durable checkpoint."""
+        key = ("account", None)
         pending = self._pending_difference_result(
             route="account",
             identity=None,
             checkpoint=checkpoint,
         )
         if pending is not None:
+            if isinstance(pending, TelegramDifferencePending):
+                refreshed = self._refresh_pending_account_difference(checkpoint)
+                if refreshed is not None:
+                    return refreshed
             return pending
+        raw_pending = self._difference_raw_pending.get(key)
+        if raw_pending is not None:
+            refreshed = self._refresh_pending_account_difference(checkpoint)
+            if refreshed is not None:
+                return refreshed
         custom = getattr(self._client, "get_account_difference_event", None)
         if callable(custom):
             return cast(
@@ -931,7 +1000,15 @@ class TelethonProvider:
             )
             if not results:
                 return None
-            self._difference_pending[("account", None)] = results
+            self._difference_pending[key] = results
+            if any(isinstance(result, TelegramDifferencePending) for result in results):
+                self._difference_raw_pending[key] = (
+                    response,
+                    None,
+                    1,
+                    checkpoint,
+                    to_checkpoint,
+                )
             return results[0]
         except TelethonTransportError:
             raise
@@ -1313,8 +1390,45 @@ class TelethonProvider:
             # A durable checkpoint changed without the provider acknowledgement.
             # The only safe interpretation is that this page was committed.
             self._difference_pending.pop(key, None)
+            self._difference_raw_pending.pop(key, None)
             return None
         return pending[0]
+
+    def _refresh_pending_account_difference(
+        self, checkpoint: TelegramAccountCheckpoint
+    ) -> TelegramDifferenceResult | None:
+        """Re-normalize a held account page after its peer becomes active."""
+        key = ("account", None)
+        raw = self._difference_raw_pending.get(key)
+        if raw is None:
+            return None
+        response, identity, generation, from_checkpoint, to_checkpoint = raw
+        if from_checkpoint != checkpoint:
+            self._difference_raw_pending.pop(key, None)
+            self._difference_pending.pop(key, None)
+            return None
+        pending = self._difference_pending.get(key)
+        if pending:
+            first = pending[0]
+            if isinstance(first, TelegramDifferencePending) and (
+                self._source_scope_generation(first.source_chat_identity) is None
+            ):
+                return first
+        results = self._normalize_difference_page(
+            response=response,
+            identity=identity,
+            generation=generation,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+        )
+        if not results:
+            self._difference_pending.pop(key, None)
+            self._difference_raw_pending.pop(key, None)
+            return None
+        self._difference_pending[key] = results
+        if not any(isinstance(result, TelegramDifferencePending) for result in results):
+            self._difference_raw_pending.pop(key, None)
+        return results[0]
 
     def _acknowledge_difference(
         self,
@@ -1350,6 +1464,7 @@ class TelethonProvider:
         pending.pop(0)
         if not pending:
             self._difference_pending.pop(key, None)
+            self._difference_raw_pending.pop(key, None)
 
     @staticmethod
     def _difference_result_id(result: TelegramDifferenceResult) -> str:
@@ -1361,6 +1476,7 @@ class TelethonProvider:
                 TelegramDifferenceEvent,
                 TelegramProtectedContentEvent,
                 TelegramProtectionUnavailableEvent,
+                TelegramDifferencePending,
             ),
         ):
             return result.source_event_id
@@ -1430,9 +1546,38 @@ class TelethonProvider:
             current_identity = item_identity or identity
             if current_identity is None and kind is SourceEventKind.DELETE:
                 current_identity = self._resolve_message_identity(current_message_id)
-            if current_identity is None or current_identity not in self._generations:
+            if current_identity is None:
                 continue
             if identity is not None and current_identity != identity:
+                continue
+            current_generation = (
+                generation
+                if identity is not None
+                else self._source_scope_generation(current_identity)
+            )
+            if current_generation is None:
+                if self._source_scope_generation_lookup is None:
+                    continue
+                if not (
+                    isinstance(from_checkpoint, TelegramAccountCheckpoint)
+                    and isinstance(to_checkpoint, TelegramAccountCheckpoint)
+                ):
+                    raise TelethonTransportError(
+                        "Telegram pending difference has an invalid route",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=IngestionFailureScope.ACCOUNT_STREAM,
+                    )
+                normalized.append(
+                    self._pending_scope_result(
+                        identity=current_identity,
+                        generation=self._generations.get(current_identity, 1) + 1,
+                        from_checkpoint=from_checkpoint,
+                        to_checkpoint=to_checkpoint,
+                        telegram_message_id=current_message_id,
+                        kind=kind,
+                        transport_revision=transport_revision,
+                    )
+                )
                 continue
             if message is not None:
                 self._remember_message_identity(current_message_id, current_identity)
@@ -1444,21 +1589,17 @@ class TelethonProvider:
             if message is None:
                 result = self._delete_result(
                     identity=current_identity,
-                    generation=generation
-                    if identity is not None
-                    else self._generations.get(current_identity, 1),
+                    generation=current_generation,
                     from_checkpoint=from_checkpoint,
                     to_checkpoint=from_checkpoint,
                     telegram_message_id=current_message_id,
-                    event_time=event_time or datetime.now(UTC),
+                    event_time=event_time,
                     transport_revision=transport_revision,
                 )
             else:
                 result = self._message_result(
                     identity=current_identity,
-                    generation=generation
-                    if identity is not None
-                    else self._generations.get(current_identity, 1),
+                    generation=current_generation,
                     from_checkpoint=from_checkpoint,
                     to_checkpoint=from_checkpoint,
                     message=message,
@@ -1474,6 +1615,7 @@ class TelethonProvider:
                     TelegramDifferenceEvent,
                     TelegramProtectedContentEvent,
                     TelegramProtectionUnavailableEvent,
+                    TelegramDifferencePending,
                 ),
             ):
                 raise TelethonTransportError(
@@ -1493,17 +1635,31 @@ class TelethonProvider:
                 ),
             )
         if normalized:
-            return [
-                replace(
-                    result,
-                    to_checkpoint=(
-                        to_checkpoint
-                        if index == len(normalized) - 1
-                        else from_checkpoint
-                    ),
+            results: list[
+                _TelegramPageResult | TelegramDifferenceCheckpointAdvance
+            ] = []
+            for index, result in enumerate(normalized):
+                result_to_checkpoint = (
+                    to_checkpoint if index == len(normalized) - 1 else from_checkpoint
                 )
-                for index, result in enumerate(normalized)
-            ]
+                if isinstance(result, TelegramDifferencePending) and not isinstance(
+                    result_to_checkpoint, TelegramAccountCheckpoint
+                ):
+                    raise TelethonTransportError(
+                        "Telegram pending difference has an invalid route",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=IngestionFailureScope.ACCOUNT_STREAM,
+                    )
+                results.append(
+                    cast(
+                        _TelegramPageResult,
+                        replace(
+                            cast(Any, result),
+                            to_checkpoint=result_to_checkpoint,
+                        ),
+                    )
+                )
+            return results
         if to_checkpoint == from_checkpoint:
             return []
         return [
@@ -1519,6 +1675,52 @@ class TelethonProvider:
                 registry_generation=generation,
             )
         ]
+
+    def _source_scope_generation(self, identity: TelegramPeerIdentity) -> int | None:
+        """Read the durable active generation when account scope is stale."""
+        lookup = self._source_scope_generation_lookup
+        if lookup is None:
+            return self._generations.get(identity)
+        try:
+            generation = lookup(identity)
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram Source Chat scope lookup failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from error
+        if generation is not None and (type(generation) is not int or generation < 1):
+            raise TelethonTransportError(
+                "Telegram Source Chat scope lookup returned an invalid generation",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+        return generation
+
+    @staticmethod
+    def _pending_scope_result(
+        *,
+        identity: TelegramPeerIdentity,
+        generation: int,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+        telegram_message_id: int,
+        kind: SourceEventKind,
+        transport_revision: int | None,
+    ) -> TelegramDifferencePending:
+        """Build a body-free outcome whose raw page remains retryable."""
+        return TelegramDifferencePending(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=(
+                f"telegram-pending:{identity.kind.value}:{identity.telegram_id}:"
+                f"message:{telegram_message_id}:kind:{kind.value}:"
+                f"transport:{transport_revision!r}:from:{from_checkpoint!r}"
+            ),
+            telegram_message_id=telegram_message_id,
+            registry_generation=generation,
+        )
 
     def _remember_message_identity(
         self, message_id: int, identity: TelegramPeerIdentity
@@ -1667,16 +1869,32 @@ class TelethonProvider:
         from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         telegram_message_id: int,
-        event_time: datetime,
+        event_time: datetime | None,
         transport_revision: int | None,
     ) -> TelegramDifferenceEvent:
+        revision_history = self._revision_history(
+            identity=identity,
+            generation=generation,
+            message_id=telegram_message_id,
+        )
         revision = self._revision_for_message(
             identity=identity,
+            generation=generation,
             message_id=telegram_message_id,
             kind=SourceEventKind.DELETE,
             transport_revision=transport_revision,
             edit_date=None,
             body=None,
+            revision_history=revision_history,
+        )
+        stable_event_time = self._delete_event_time(
+            identity=identity,
+            message_id=telegram_message_id,
+            from_checkpoint=from_checkpoint,
+            event_time=event_time,
+            transport_revision=transport_revision,
+            revision=revision,
+            revision_history=revision_history,
         )
         return TelegramDifferenceEvent(
             source_chat_identity=identity,
@@ -1692,7 +1910,7 @@ class TelethonProvider:
             revision=revision,
             kind=SourceEventKind.DELETE,
             body=None,
-            event_time=event_time if event_time.tzinfo else datetime.now(UTC),
+            event_time=stable_event_time,
             registry_generation=generation,
         )
 
@@ -1760,11 +1978,17 @@ class TelethonProvider:
         )
         revision = self._revision_for_message(
             identity=identity,
+            generation=generation,
             message_id=message_id,
             kind=resolved_kind,
             transport_revision=transport_revision,
             edit_date=edit_date,
             body=body,
+            revision_history=self._revision_history(
+                identity=identity,
+                generation=generation,
+                message_id=message_id,
+            ),
         )
         source_event_id = canonical_telethon_source_event_id(
             identity,
@@ -1772,6 +1996,7 @@ class TelethonProvider:
             revision,
             resolved_kind,
         )
+        self._message_event_times[(identity, message_id)] = event_time
         if protected:
             return TelegramProtectedContentEvent(
                 source_chat_identity=identity,
@@ -1808,38 +2033,55 @@ class TelethonProvider:
         self,
         *,
         identity: TelegramPeerIdentity,
+        generation: int,
         message_id: int,
         kind: SourceEventKind,
         transport_revision: int | None,
         edit_date: object,
         body: str | None,
+        revision_history: _RevisionHistory | None = None,
     ) -> int:
         revision_key = (identity, message_id)
-        previous = self._revisions.get(revision_key, 0)
-        if kind is SourceEventKind.DELETE:
-            revision = _DELETE_REVISION
-        elif kind is SourceEventKind.CREATE:
-            revision = 1
+        history = (
+            revision_history
+            if revision_history is not None
+            else self._revision_history(
+                identity=identity,
+                generation=generation,
+                message_id=message_id,
+            )
+        )
+        matching_revisions = tuple(
+            revision
+            for revision, stored_kind, stored_body, _ in history
+            if stored_kind is kind and stored_body == body
+        )
+        if matching_revisions:
+            revision = max(matching_revisions)
         elif isinstance(edit_date, datetime) and edit_date.tzinfo is not None:
             revision = self._canonical_edit_revision(edit_date, body)
         elif type(transport_revision) is int and transport_revision > 0:
             revision = max(2, transport_revision + 1)
         else:
-            revision = max(2, previous + 1)
-        if kind is SourceEventKind.CREATE:
-            self._revisions[revision_key] = max(previous, 1)
-            return revision
-        if revision <= previous and self._revision_bodies.get(revision_key) != body:
-            revision = min(_DELETE_REVISION, previous + 1)
-        revision = max(previous, revision)
-        self._revisions[revision_key] = revision
-        if kind is SourceEventKind.EDIT:
-            self._revision_bodies[revision_key] = body
+            revision = 1
+        previous = max(
+            self._revisions.get(revision_key, 0),
+            (max((item[0] for item in history), default=0)),
+        )
+        if revision <= previous and not matching_revisions:
+            if previous >= (1 << 63) - 1:
+                raise TelethonTransportError(
+                    "Telegram Source Message revision space is exhausted",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            revision = previous + 1
+        self._revisions[revision_key] = max(previous, revision)
         return revision
 
     @staticmethod
     def _canonical_edit_revision(edit_date: datetime, body: str | None) -> int:
-        """Derive a stable edit identity without using route-specific update pts."""
+        """Derive a stable edit ordering key without using route-specific pts."""
         epoch = datetime(1970, 1, 1, tzinfo=UTC)
         delta = edit_date.astimezone(UTC) - epoch
         edit_microseconds = (
@@ -1847,11 +2089,99 @@ class TelethonProvider:
             + delta.seconds * 1_000_000
             + delta.microseconds
         )
-        tie = (
-            int.from_bytes(sha256((body or "").encode("utf-8")).digest()[:2], "big")
-            & _EDIT_REVISION_TIE_MASK
-        )
-        return max(2, (edit_microseconds << _EDIT_REVISION_TIE_BITS) | tie)
+        del body
+        return max(2, edit_microseconds)
+
+    def _revision_history(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        generation: int,
+        message_id: int,
+    ) -> _RevisionHistory:
+        """Read and validate the durable revision history for one message."""
+        lookup = self._revision_history_lookup
+        if lookup is None:
+            return ()
+        try:
+            raw_history = lookup(identity, generation, message_id)
+            history = tuple(raw_history)
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram Source Message revision history is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from error
+        previous_revision = 0
+        validated: list[tuple[int, SourceEventKind, str | None, datetime]] = []
+        for item in history:
+            if not isinstance(item, tuple) or len(item) != 4:
+                raise TelethonTransportError(
+                    "Telegram Source Message revision history is malformed",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            revision, kind, body, event_time = item
+            if (
+                type(revision) is not int
+                or revision < 1
+                or revision <= previous_revision
+                or not isinstance(kind, SourceEventKind)
+                or (body is not None and not isinstance(body, str))
+                or not isinstance(event_time, datetime)
+                or event_time.tzinfo is None
+            ):
+                raise TelethonTransportError(
+                    "Telegram Source Message revision history is invalid",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            if kind is SourceEventKind.DELETE and body is not None:
+                raise TelethonTransportError(
+                    "Telegram DELETE revision retained a body",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            validated.append((revision, kind, body, event_time))
+            previous_revision = revision
+        return tuple(validated)
+
+    def _delete_event_time(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        message_id: int,
+        from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        event_time: datetime | None,
+        transport_revision: int | None,
+        revision: int,
+        revision_history: _RevisionHistory,
+    ) -> datetime:
+        """Choose a deterministic time for a body-free delete outcome."""
+        for stored_revision, stored_kind, stored_body, stored_time in revision_history:
+            if (
+                stored_revision == revision
+                and stored_kind is SourceEventKind.DELETE
+                and stored_body is None
+            ):
+                return stored_time
+        if isinstance(event_time, datetime) and event_time.tzinfo is not None:
+            return event_time
+        cached_time = self._message_event_times.get((identity, message_id))
+        if cached_time is not None:
+            return cached_time
+        for _, stored_kind, _, stored_time in reversed(revision_history):
+            if stored_kind is not SourceEventKind.DELETE:
+                return stored_time
+        if isinstance(from_checkpoint, TelegramAccountCheckpoint):
+            return from_checkpoint.date
+        stable_revision = transport_revision
+        if type(stable_revision) is not int or stable_revision < 1:
+            stable_revision = from_checkpoint.pts
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        return epoch + timedelta(microseconds=stable_revision)
 
     @staticmethod
     def _is_protected(entity: object, message: object) -> bool:
@@ -1994,6 +2324,9 @@ class TelethonIngestionAdapter:
             )
         self._approved_identities = approved_identities
         self._live_update_callback = live_update_callback
+        self._source_scope_generation_lookup: (
+            Callable[[TelegramPeerIdentity], int | None] | None
+        ) = None
 
     def source_event_id(self, probe_id: str) -> str:
         """Return a synthetic identity for the application probe seam."""
@@ -2028,6 +2361,69 @@ class TelethonIngestionAdapter:
                 "Telegram message identity lookup setup failed",
                 reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Bind the durable active-generation lookup for account pages."""
+        self._runtime.require_ready()
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_GENERATION_LOOKUP", status="scope_invalid"
+            )
+        configure = getattr(
+            self._source, "configure_source_scope_generation_lookup", None
+        )
+        if not callable(configure):
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_GENERATION_LOOKUP",
+                status="provider_boundary_unavailable",
+            )
+        try:
+            configure(lookup)
+        except TelethonConformanceError:
+            raise
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram Source Chat scope lookup setup failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+        self._source_scope_generation_lookup = lookup
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[
+            [TelegramPeerIdentity, int, int],
+            tuple[tuple[int, SourceEventKind, str | None, datetime], ...],
+        ],
+    ) -> None:
+        """Bind durable Source Message revision history for the provider."""
+        self._runtime.require_ready()
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="SOURCE_MESSAGE_REVISION_LOOKUP", status="scope_invalid"
+            )
+        configure = getattr(
+            self._source, "configure_source_message_revision_lookup", None
+        )
+        if not callable(configure):
+            raise TelethonConformanceError(
+                key="SOURCE_MESSAGE_REVISION_LOOKUP",
+                status="provider_boundary_unavailable",
+            )
+        try:
+            configure(lookup)
+        except TelethonConformanceError:
+            raise
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram Source Message revision lookup setup failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
             ) from None
 
     def refresh_source_scope(
@@ -2372,6 +2768,33 @@ class TelethonIngestionAdapter:
                     reason=IngestionFailureReason.CHECKPOINT_INVALID,
                 )
             return result
+        if isinstance(result, TelegramDifferencePending):
+            if expected_identity is not None:
+                raise TelethonConformanceError(
+                    key="APPROVED_SOURCE_CHATS", status="scope_mismatch"
+                )
+            if (
+                expected_checkpoint is not None
+                and result.from_checkpoint != expected_checkpoint
+            ):
+                raise TelethonTransportError(
+                    "Telegram pending difference returned an invalid checkpoint",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                )
+            if not isinstance(result.from_checkpoint, TelegramAccountCheckpoint):
+                raise TelethonTransportError(
+                    "Telegram pending difference has an invalid route",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                )
+            if expected_from_history is True:
+                raise TelethonTransportError(
+                    "Telegram pending difference has an invalid origin",
+                    reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                    scope=IngestionFailureScope.ACCOUNT_STREAM,
+                )
+            return result
         if isinstance(result, TelegramDifferenceCheckpointAdvance):
             if (
                 expected_checkpoint is not None
@@ -2422,9 +2845,31 @@ class TelethonIngestionAdapter:
                 key="APPROVED_SOURCE_CHATS", status="scope_mismatch"
             )
         if identity not in self._approved_identities:
-            raise TelethonConformanceError(
-                key="APPROVED_SOURCE_CHATS", status="scope_broadened"
-            )
+            if expected_identity is None and isinstance(
+                result.from_checkpoint, TelegramAccountCheckpoint
+            ):
+                lookup = self._source_scope_generation_lookup
+                if lookup is None:
+                    raise TelethonConformanceError(
+                        key="APPROVED_SOURCE_CHATS", status="scope_broadened"
+                    )
+                try:
+                    current_generation = lookup(identity)
+                except Exception as error:
+                    raise _transport_error(
+                        error,
+                        "Telegram Source Chat scope lookup failed",
+                        reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                        scope=IngestionFailureScope.ACCOUNT_STREAM,
+                    ) from None
+                if current_generation != result.registry_generation:
+                    raise TelethonConformanceError(
+                        key="APPROVED_SOURCE_CHATS", status="scope_mismatch"
+                    )
+            else:
+                raise TelethonConformanceError(
+                    key="APPROVED_SOURCE_CHATS", status="scope_broadened"
+                )
         if (
             expected_generation is not None
             and result.registry_generation != expected_generation

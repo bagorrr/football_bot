@@ -109,6 +109,7 @@ from modules.domain import (
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramDifferenceEvent,
+    TelegramDifferencePending,
     TelegramHistoryProgress,
     TelegramMessage,
     TelegramPeerIdentity,
@@ -210,6 +211,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0057_bot_api_continuity.sql",
     "0058_bot_api_delivery_reconciliation.sql",
     "0059_telethon_history_progress.sql",
+    "0060_telethon_ingestion_scope_lookup.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -273,6 +275,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "34645c5a8b188e677f153de19c82c34349a821343cc3e68f7c99911b8b7d3d80",
     "abb90f07e2e47dca9880b07ecf514af1b38407496fbe85c51739bb76387dbd6f",
     "f4f7e4fef466817d37c5c271c7f978b06d51f9a0bcda16a2812a7d9b5969149d",
+    "96788c3cf2a25f912e068517a1b2f15736d1b2ab9ee64132c96c6eda05da7247",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -3769,6 +3772,28 @@ class PostgresRoleStore:
             history_eligible=history_eligible,
         )
 
+    def source_chat_ingestion_generation(
+        self, identity: TelegramPeerIdentity
+    ) -> int | None:
+        """Read the current active generation through the Ingestion-only function."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.read_current_source_chat_ingestion_generation(
+                    %s, %s
+                )
+                """,
+                (identity.kind.value, identity.telegram_id),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        generation = row[0]
+        if type(generation) is not int or generation < 1:
+            raise ValueError("Source Chat ingestion generation is invalid")
+        return generation
+
     def ensure_source_chat_history_progress(
         self,
         *,
@@ -4231,6 +4256,43 @@ class PostgresRoleStore:
             return None
         return TelegramPeerIdentity(kind=kind, telegram_id=chat_id)
 
+    def source_message_revision_history_for_ingestion(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+    ) -> tuple[tuple[int, SourceEventKind, str | None, datetime], ...]:
+        """Read durable Source Event history without exposing Application tables."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_message_revision, event_kind, body, event_time
+                FROM football_runtime.source_event_records
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                  AND telegram_message_id = %s
+                ORDER BY source_message_revision
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    telegram_message_id,
+                ),
+            ).fetchall()
+        return tuple(
+            (
+                row["source_message_revision"],
+                SourceEventKind(row["event_kind"]),
+                row["body"],
+                row["event_time"],
+            )
+            for row in rows
+        )
+
     def advance_account_difference_checkpoint(
         self,
         *,
@@ -4424,6 +4486,7 @@ class PostgresRoleStore:
             TelegramDifferenceEvent
             | TelegramProtectedContentEvent
             | TelegramProtectionUnavailableEvent
+            | TelegramDifferencePending
         ),
         recorded_at: datetime,
     ) -> bool:
@@ -4436,6 +4499,7 @@ class PostgresRoleStore:
             raise TypeError("discard requires an account checkpoint")
         identity = event.source_chat_identity
         peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        pending_scope = isinstance(event, TelegramDifferencePending)
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             connection.execute(
                 "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
@@ -4451,19 +4515,29 @@ class PostgresRoleStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (peer_key,),
             )
-            context = connection.execute(
-                """
-                SELECT 1
-                FROM football_runtime.read_active_source_chat_ingestion_context(
-                    %s, %s, %s
-                )
-                """,
-                (
-                    identity.kind.value,
-                    identity.telegram_id,
-                    event.registry_generation,
-                ),
-            ).fetchone()
+            if pending_scope:
+                context = connection.execute(
+                    """
+                    SELECT football_runtime
+                        .read_current_source_chat_ingestion_generation(%s, %s)
+                        AS active_generation
+                    """,
+                    (identity.kind.value, identity.telegram_id),
+                ).fetchone()
+            else:
+                context = connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.read_active_source_chat_ingestion_context(
+                        %s, %s, %s
+                    )
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        event.registry_generation,
+                    ),
+                ).fetchone()
             if (
                 connection.execute(
                     """
@@ -4472,19 +4546,25 @@ class PostgresRoleStore:
                     WHERE scope = 'source_stream'
                       AND peer_kind = %s
                       AND telegram_chat_id = %s
-                      AND registry_generation = %s
+                      AND (%s OR registry_generation = %s)
                       AND active
                     """,
                     (
                         identity.kind.value,
                         identity.telegram_id,
+                        pending_scope,
                         event.registry_generation,
                     ),
                 ).fetchone()
                 is not None
             ):
                 return False
-            if context is not None:
+            has_active_scope = (
+                context is not None
+                if not pending_scope
+                else context is not None and context["active_generation"] is not None
+            )
+            if has_active_scope:
                 return False
             if (
                 connection.execute(

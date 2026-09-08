@@ -65,6 +65,7 @@ from modules.domain import (
     SourceDataDeletionOwnerAck,
     SourceDataDeletionReplayBarrier,
     SourceDataDeletionRequest,
+    SourceEventKind,
     SourceEventRecord,
     SourceMessage,
     SourceMessageDeletionTombstone,
@@ -74,6 +75,7 @@ from modules.domain import (
     TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDifferenceEvent,
+    TelegramDifferencePending,
     TelegramDifferenceResult,
     TelegramHistoryProgress,
     TelegramMessage,
@@ -128,6 +130,22 @@ class TelegramIngestionAdapter(Protocol):
         self, lookup: Callable[[int], TelegramPeerIdentity | None]
     ) -> None:
         """Bind the durable lookup for peer-less Telegram deletions."""
+        ...
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Bind the durable active-generation lookup for account pages."""
+        ...
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[
+            [TelegramPeerIdentity, int, int],
+            tuple[tuple[int, SourceEventKind, str | None, datetime], ...],
+        ],
+    ) -> None:
+        """Bind durable Source Message revision history for restart safety."""
         ...
 
     def admit_source_chat(
@@ -1189,6 +1207,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the current eligible generation and durable difference cursor."""
         ...
 
+    def source_chat_ingestion_generation(
+        self, identity: TelegramPeerIdentity
+    ) -> int | None:
+        """Read the current active generation for account-page scope gating."""
+        ...
+
     def initialize_account_ingestion_checkpoint(
         self,
         checkpoint: TelegramAccountCheckpoint,
@@ -1206,6 +1230,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         self, telegram_message_id: int
     ) -> TelegramPeerIdentity | None:
         """Look up the durable peer mapping for a peer-less Telegram deletion."""
+        ...
+
+    def source_message_revision_history_for_ingestion(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+    ) -> tuple[tuple[int, SourceEventKind, str | None, datetime], ...]:
+        """Read retained Source Event revisions for provider identity recovery."""
         ...
 
     def advance_account_difference_checkpoint(
@@ -1246,6 +1279,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
             TelegramDifferenceEvent
             | TelegramProtectedContentEvent
             | TelegramProtectionUnavailableEvent
+            | TelegramDifferencePending
         ),
         recorded_at: datetime,
     ) -> bool:

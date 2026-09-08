@@ -31,6 +31,7 @@ from modules.domain import (
     TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferencePending,
     TelegramDifferenceResult,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -888,6 +889,107 @@ def test_ineligible_account_event_advances_body_free_and_does_not_wedge_restart(
     assert len(system.source_message_revisions()) == 1
     assert not system.process_next_account_telegram_difference()
     assert telethon.account_difference_requests[-1] == eligible_checkpoint
+    system.reset()
+
+
+def test_pending_account_difference_waits_for_durable_scope_admission(
+    fresh_database_url: str,
+) -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 30, tzinfo=UTC))
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHAT,
+        telegram_id=4_606_301,
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=4_610,
+        qts=70,
+        seq=500,
+        date=datetime(2026, 9, 12, 9, 29, tzinfo=UTC),
+    )
+    discarded_checkpoint = TelegramAccountCheckpoint(
+        pts=4_611,
+        qts=71,
+        seq=501,
+        date=datetime(2026, 9, 12, 9, 30, tzinfo=UTC),
+    )
+    admitted_checkpoint = TelegramAccountCheckpoint(
+        pts=4_612,
+        qts=72,
+        seq=502,
+        date=datetime(2026, 9, 12, 9, 31, tzinfo=UTC),
+    )
+    telethon.queue_account_difference_result(
+        checkpoint=initial_checkpoint,
+        result=TelegramDifferencePending(
+            source_chat_identity=identity,
+            from_checkpoint=initial_checkpoint,
+            to_checkpoint=discarded_checkpoint,
+            source_event_id="telegram-pending:before-admission",
+            telegram_message_id=170,
+        ),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_063,
+    )
+    system.reset()
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == discarded_checkpoint
+    assert system.source_events() == ()
+
+    telethon.allow_public_username(
+        address="@synthetic_account_pending_race",
+        identity=identity,
+        transport_boundary="chat-sequence:501",
+    )
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=discarded_checkpoint.date,
+        administrator_id=46_063,
+        address="@synthetic_account_pending_race",
+        update_suffix="account-pending-race",
+    )
+    telethon.queue_account_difference_result(
+        checkpoint=discarded_checkpoint,
+        result=TelegramDifferencePending(
+            source_chat_identity=identity,
+            from_checkpoint=discarded_checkpoint,
+            to_checkpoint=admitted_checkpoint,
+            source_event_id="telegram-pending:during-admission",
+            telegram_message_id=171,
+        ),
+    )
+    telethon.queue_account_difference_result(
+        checkpoint=discarded_checkpoint,
+        result=TelegramDifferenceEvent(
+            source_chat_identity=identity,
+            from_checkpoint=discarded_checkpoint,
+            to_checkpoint=admitted_checkpoint,
+            source_event_id="source-event:account-pending-race:actual",
+            telegram_message_id=171,
+            revision=1,
+            kind=SourceEventKind.CREATE,
+            body="The admitted event must be retried.",
+            event_time=admitted_checkpoint.date,
+            registry_generation=1,
+        ),
+    )
+
+    assert not system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == discarded_checkpoint
+    assert system.source_events() == ()
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == admitted_checkpoint
+    assert len(system.source_events()) == 1
     system.reset()
 
 
