@@ -237,13 +237,13 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     system.reset()
 
 
-def test_raw_telethon_overlap_reuses_revisions_and_does_not_promote_stale_history(
+def test_raw_telethon_same_time_edits_remain_distinct_and_stale_history_stops_stream(
     fresh_database_url: str,
 ) -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_102)
     registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
     first_edit = registered_at + timedelta(minutes=1)
-    second_edit = registered_at + timedelta(minutes=2)
+    second_edit = first_edit
     entity = types.Channel(
         id=identity.telegram_id,
         title="raw overlap channel",
@@ -260,20 +260,16 @@ def test_raw_telethon_overlap_reuses_revisions_and_does_not_promote_stale_histor
         message_id: int = 901,
         edit_date: datetime | None,
         body: str,
-    ) -> SimpleNamespace:
-        values: dict[str, object] = {
-            "id": message_id,
-            "peer_id": types.PeerChannel(identity.telegram_id),
-            "from_id": types.PeerUser(46_102),
-            "post_author": None,
-            "date": registered_at,
-            "message": body,
-            "noforwards": False,
-            "replies": SimpleNamespace(comments=False),
-        }
-        if edit_date is not None:
-            values["edit_date"] = edit_date
-        return SimpleNamespace(**values)
+    ) -> types.Message:
+        return types.Message(
+            id=message_id,
+            peer_id=types.PeerChannel(identity.telegram_id),
+            from_id=types.PeerUser(46_102),
+            date=registered_at,
+            message=body,
+            noforwards=False,
+            edit_date=edit_date,
+        )
 
     create_message = message(edit_date=None, body="Raw original.")
     first_message = message(edit_date=first_edit, body="Raw A.")
@@ -295,6 +291,11 @@ def test_raw_telethon_overlap_reuses_revisions_and_does_not_promote_stale_histor
                 new_messages=[],
                 other_updates=[types.UpdateEditChannelMessage(second_message, 503, 1)],
                 pts=503,
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateEditChannelMessage(first_message, 502, 1)],
+                pts=504,
             ),
         ],
         entity,
@@ -355,10 +356,17 @@ def test_raw_telethon_overlap_reuses_revisions_and_does_not_promote_stale_histor
         registry_generation=1,
     )
     assert system.process_next_source_event()
-
-    assert system.process_next_source_chat_history(
+    assert system.process_next_channel_telegram_difference(
         identity=identity,
         registry_generation=1,
+    )
+
+    assert not system.process_next_source_event()
+
+    live_events = tuple(
+        event
+        for event in system.source_events()
+        if event.telegram_message_id == 901 and event.event_kind is SourceEventKind.EDIT
     )
     assert len(system.source_events()) == 3
     assert len(system.source_message_revisions()) == 3
@@ -366,47 +374,205 @@ def test_raw_telethon_overlap_reuses_revisions_and_does_not_promote_stale_histor
     assert system.source_messages()[0].current_revision == (
         system.source_message_revisions()[-1].revision
     )
-    assert client.history_kwargs is not None
+    assert len(live_events) == 2
+    assert live_events[1].body == "Raw B."
+    assert live_events[1].revision > live_events[0].revision
+    assert live_events[1].source_event_id != live_events[0].source_event_id
+    assert live_events[0].transport_event_id != live_events[1].transport_event_id
 
-    third_edit_time = registered_at
-    history_first_message = message(
-        message_id=902,
-        edit_date=third_edit_time,
-        body="Raw C.",
-    )
-    client.history_messages = [history_first_message]
     assert system.process_next_source_chat_history(
         identity=identity,
         registry_generation=1,
     )
-    history_event = next(
-        event for event in system.source_events() if event.telegram_message_id == 902
-    )
-
-    client.responses.append(
-        SimpleNamespace(
-            new_messages=[],
-            other_updates=[
-                types.UpdateEditChannelMessage(history_first_message, 504, 1)
-            ],
-            pts=504,
-        )
-    )
-    assert system.process_next_channel_telegram_difference(
-        identity=identity,
-        registry_generation=1,
-    )
-    assert system.process_next_source_event()
-    live_events = tuple(
-        event for event in system.source_events() if event.telegram_message_id == 902
-    )
-    assert len(live_events) == 1
-    assert live_events[0].source_event_id == history_event.source_event_id
+    assert client.history_kwargs is not None
+    assert len(system.source_events()) == 3
+    assert system.source_messages()[0].body == "Raw B."
     assert system.channel_ingestion_checkpoint(
         identity=identity,
         registry_generation=1,
     ) == TelegramChannelCheckpoint(pts=504)
+    assert system.ingestion_failures()[-1].reason is (
+        IngestionFailureReason.CHECKPOINT_INVALID
+    )
     system.reset()
+
+
+def test_raw_telethon_same_snapshot_normalized_before_commit_is_idempotent(
+    fresh_database_url: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_610_103)
+    registered_at = datetime(2026, 9, 12, 10, 0, tzinfo=UTC)
+    edit_date = registered_at + timedelta(minutes=1)
+    entity = types.Channel(
+        id=identity.telegram_id,
+        title="raw concurrent channel",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        noforwards=False,
+        access_hash=9,
+    )
+    entity.username = "raw_concurrent_source"
+
+    def message(*, body: str, edit_date: datetime | None) -> types.Message:
+        return types.Message(
+            id=901,
+            peer_id=types.PeerChannel(identity.telegram_id),
+            from_id=types.PeerUser(46_103),
+            date=registered_at,
+            message=body,
+            noforwards=False,
+            edit_date=edit_date,
+        )
+
+    create_message = message(body="Raw original.", edit_date=None)
+    edit_message = message(body="Raw overlapping edit.", edit_date=edit_date)
+    client_one = _RawDifferenceClient(
+        [
+            SimpleNamespace(pts=600),
+            SimpleNamespace(
+                new_messages=[create_message],
+                other_updates=[],
+                pts=601,
+            ),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateEditChannelMessage(edit_message, 602, 1)],
+                pts=602,
+            ),
+        ],
+        entity,
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46101",
+    }
+    runtime_one = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client_one,
+    )
+    provider_one = TelethonProvider(
+        client=client_one,
+        approved_source_chats=(identity,),
+    )
+    runtime_one.verify_conformance(
+        transport=provider_one,
+        approved_source_chats=(identity,),
+    )
+    ingestion_one = TelethonIngestionAdapter(
+        runtime=runtime_one,
+        source=provider_one,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 10, 0, tzinfo=UTC))
+    system_one = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion_one,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+    system_one.reset()
+    _register_source_chat(
+        system_one,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_101,
+        address="@raw_concurrent_source",
+        update_suffix="raw-concurrent",
+    )
+    assert system_one.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system_one.process_next_source_event()
+
+    client_two = _RawDifferenceClient(
+        [
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[types.UpdateEditChannelMessage(edit_message, 602, 1)],
+                pts=602,
+            )
+        ],
+        entity,
+    )
+    runtime_two = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client_two,
+    )
+    provider_two = TelethonProvider(
+        client=client_two,
+        approved_source_chats=(identity,),
+    )
+    runtime_two.verify_conformance(
+        transport=provider_two,
+        approved_source_chats=(identity,),
+    )
+    ingestion_two = TelethonIngestionAdapter(
+        runtime=runtime_two,
+        source=provider_two,
+        approved_source_chats=(identity,),
+    )
+    system_two = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion_two,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_101,
+    )
+
+    checkpoint = TelegramChannelCheckpoint(pts=601)
+    first = provider_one.get_channel_difference_event(identity, checkpoint, 1)
+    second = provider_two.get_channel_difference_event(identity, checkpoint, 1)
+    assert isinstance(first, TelegramDifferenceEvent)
+    assert isinstance(second, TelegramDifferenceEvent)
+    assert first.source_event_id == second.source_event_id
+    assert first.transport_event_id == second.transport_event_id
+
+    lock_key = f"source-ingestion:channel:{identity.telegram_id}:1"
+    with psycopg.connect(fresh_database_url, autocommit=True) as lock_gate:
+        lock_gate.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+            (lock_key,),
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            attempts = (
+                executor.submit(
+                    system_one.process_next_channel_telegram_difference,
+                    identity=identity,
+                    registry_generation=1,
+                ),
+                executor.submit(
+                    system_two.process_next_channel_telegram_difference,
+                    identity=identity,
+                    registry_generation=1,
+                ),
+            )
+            _wait_for_blocked_database_sessions(fresh_database_url, minimum=2)
+            lock_gate.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            outcomes = tuple(attempt.result(timeout=5) for attempt in attempts)
+
+    assert sorted(outcomes) == [False, True]
+    assert len(system_one.source_events()) == 2
+    assert system_one.channel_ingestion_checkpoint(
+        identity=identity,
+        registry_generation=1,
+    ) == TelegramChannelCheckpoint(pts=602)
+    assert system_one.process_next_source_event()
+    assert len(system_one.source_message_revisions()) == 2
+    assert system_one.source_messages()[0].body == "Raw overlapping edit."
+    assert len(system_one.source_messages()) == 1
+    system_one.reset()
 
 
 def test_peerless_message_lookup_is_chat_only_and_rejects_ambiguous_chats(

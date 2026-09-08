@@ -805,6 +805,12 @@ def test_provider_fails_closed_for_malformed_in_scope_channel_message() -> None:
         ("new_messages", "malformed"),
         ("messages", "malformed"),
         ("other_updates", "malformed"),
+        ("new_messages", None),
+        ("messages", None),
+        ("other_updates", None),
+        ("new_messages", b"malformed"),
+        ("messages", b"malformed"),
+        ("other_updates", b"malformed"),
     ),
 )
 def test_provider_fails_closed_for_non_iterable_difference_container(
@@ -814,6 +820,28 @@ def test_provider_fails_closed_for_non_iterable_difference_container(
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     response = SimpleNamespace(pts=11)
     setattr(response, field_name, value)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(
+            identity,
+            TelegramChannelCheckpoint(pts=10),
+            1,
+        )
+
+    assert error.value.reason.value == "checkpoint_invalid"
+
+
+def test_provider_fails_closed_for_unknown_difference_update() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    response = SimpleNamespace(
+        new_messages=[],
+        other_updates=[object()],
+        pts=11,
+    )
     provider = TelethonProvider(
         client=_DifferenceClientProbe([response]),
         approved_source_chats=(identity,),
@@ -847,6 +875,30 @@ def test_provider_fails_closed_for_malformed_difference_items(field_name: str) -
         )
 
     assert error.value.reason.value == "checkpoint_invalid"
+
+
+@pytest.mark.parametrize("vector", ([], ()))
+def test_provider_accepts_valid_empty_difference_vectors(
+    vector: list[object] | tuple[object, ...],
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    response = SimpleNamespace(
+        new_messages=vector,
+        messages=vector,
+        other_updates=vector,
+        pts=11,
+    )
+    result = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    ).get_channel_difference_event(
+        identity,
+        TelegramChannelCheckpoint(pts=10),
+        1,
+    )
+
+    assert isinstance(result, TelegramDifferenceCheckpointAdvance)
+    assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
 
 
 @pytest.mark.parametrize("message_ids", ({}, "malformed", b"malformed", 17))
@@ -924,7 +976,7 @@ def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:
             SimpleNamespace(
                 new_messages=[private_message],
                 other_updates=[
-                    SimpleNamespace(),
+                    types.UpdateRecentReactions(),
                     types.UpdateDeleteMessages([8], 11, 1),
                 ],
                 state=SimpleNamespace(
@@ -1279,7 +1331,86 @@ def test_live_and_history_edits_share_a_route_independent_identity() -> None:
     assert live.source_event_id == history.source_event_id
 
 
-def test_durable_transport_history_reconciles_overlap_and_rejects_stale_promotion() -> (
+def test_restarted_provider_distinguishes_same_time_edit_pts_occurrences() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    checkpoint = TelegramChannelCheckpoint(pts=10)
+    event_time = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    edit_date = event_time + timedelta(minutes=1)
+    durable_history: list[
+        tuple[int, SourceEventKind, str | None, datetime, str | None, int | None]
+    ] = []
+
+    def revision_history(
+        requested_identity: TelegramPeerIdentity,
+        requested_generation: int,
+        requested_message_id: int,
+    ) -> tuple[
+        tuple[int, SourceEventKind, str | None, datetime, str | None, int | None], ...
+    ]:
+        assert requested_identity == identity
+        assert requested_generation == 1
+        assert requested_message_id == 9
+        return tuple(durable_history)
+
+    def edit_message(body: str) -> types.Message:
+        return types.Message(
+            id=9,
+            peer_id=types.PeerChannel(identity.telegram_id),
+            date=event_time,
+            message=body,
+            noforwards=False,
+            edit_date=edit_date,
+        )
+
+    def edit_response(body: str, pts: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            new_messages=[],
+            other_updates=[types.UpdateEditChannelMessage(edit_message(body), pts, 1)],
+            pts=pts,
+        )
+
+    first = TelethonProvider(
+        client=_DifferenceClientProbe([edit_response("A", 11)]),
+        approved_source_chats=(identity,),
+        revision_history_lookup=revision_history,
+    ).get_channel_difference_event(identity, checkpoint, 1)
+    assert isinstance(first, TelegramDifferenceEvent)
+    durable_history.append(
+        (
+            first.revision,
+            first.kind,
+            first.body,
+            first.event_time,
+            first.transport_event_id,
+            first.transport_order,
+        )
+    )
+
+    second = TelethonProvider(
+        client=_DifferenceClientProbe([edit_response("B", 12)]),
+        approved_source_chats=(identity,),
+        revision_history_lookup=revision_history,
+    ).get_channel_difference_event(identity, checkpoint, 1)
+
+    assert isinstance(second, TelegramDifferenceEvent)
+    assert second.body == "B"
+    assert second.revision > first.revision
+    assert second.source_event_id != first.source_event_id
+    assert second.transport_event_id != first.transport_event_id
+
+    replayed = TelethonProvider(
+        client=_DifferenceClientProbe([edit_response("A", 11)]),
+        approved_source_chats=(identity,),
+        revision_history_lookup=revision_history,
+    ).get_channel_difference_event(identity, checkpoint, 1)
+
+    assert isinstance(replayed, TelegramDifferenceEvent)
+    assert replayed.body == "A"
+    assert replayed.revision == first.revision
+    assert replayed.source_event_id == first.source_event_id
+
+
+def test_durable_transport_history_rejects_ambiguous_overlap_and_stale_promotion() -> (
     None
 ):
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
@@ -1342,23 +1473,22 @@ def test_durable_transport_history_reconciles_overlap_and_rejects_stale_promotio
         )
     )
 
-    replayed_history = TelethonProvider(
-        client=_DifferenceClientProbe(
-            [],
-            history_messages=[edit_message(first_edit_time, "A")],
-        ),
-        approved_source_chats=(identity,),
-        revision_history_lookup=revision_history,
-    ).get_source_chat_history_event(
-        identity,
-        1,
-        checkpoint,
-        publication_time - timedelta(days=1),
-        publication_time + timedelta(days=1),
-    )
-    assert isinstance(replayed_history, TelegramDifferenceEvent)
-    assert replayed_history.source_event_id == first.source_event_id
-    assert replayed_history.transport_event_id == first.transport_event_id
+    with pytest.raises(TelethonTransportError) as replay_error:
+        TelethonProvider(
+            client=_DifferenceClientProbe(
+                [],
+                history_messages=[edit_message(first_edit_time, "A")],
+            ),
+            approved_source_chats=(identity,),
+            revision_history_lookup=revision_history,
+        ).get_source_chat_history_event(
+            identity,
+            1,
+            checkpoint,
+            publication_time - timedelta(days=1),
+            publication_time + timedelta(days=1),
+        )
+    assert replay_error.value.reason.value == "checkpoint_invalid"
 
     second = TelethonProvider(
         client=_DifferenceClientProbe(
@@ -1393,24 +1523,22 @@ def test_durable_transport_history_reconciles_overlap_and_rejects_stale_promotio
         )
     )
 
-    late_history = TelethonProvider(
-        client=_DifferenceClientProbe(
-            [],
-            history_messages=[edit_message(first_edit_time, "A")],
-        ),
-        approved_source_chats=(identity,),
-        revision_history_lookup=revision_history,
-    ).get_source_chat_history_event(
-        identity,
-        1,
-        checkpoint,
-        publication_time - timedelta(days=1),
-        publication_time + timedelta(days=1),
-    )
-
-    assert isinstance(late_history, TelegramDifferenceEvent)
-    assert late_history.source_event_id == first.source_event_id
-    assert late_history.revision < second.revision
+    with pytest.raises(TelethonTransportError) as late_error:
+        TelethonProvider(
+            client=_DifferenceClientProbe(
+                [],
+                history_messages=[edit_message(first_edit_time, "A")],
+            ),
+            approved_source_chats=(identity,),
+            revision_history_lookup=revision_history,
+        ).get_source_chat_history_event(
+            identity,
+            1,
+            checkpoint,
+            publication_time - timedelta(days=1),
+            publication_time + timedelta(days=1),
+        )
+    assert late_error.value.reason.value == "checkpoint_invalid"
 
     third_edit_time = publication_time + timedelta(minutes=3)
     history_first = TelethonProvider(
@@ -1462,8 +1590,8 @@ def test_durable_transport_history_reconciles_overlap_and_rejects_stale_promotio
     )
 
     assert isinstance(live_after_history, TelegramDifferenceEvent)
-    assert live_after_history.source_event_id == history_first.source_event_id
-    assert live_after_history.transport_event_id == history_first.transport_event_id
+    assert live_after_history.source_event_id != history_first.source_event_id
+    assert live_after_history.revision > history_first.revision
 
 
 def test_public_source_url_is_provenance_only_without_positive_reply_evidence() -> None:

@@ -1386,9 +1386,10 @@ class TelethonProvider:
         expected_identity: TelegramPeerIdentity | None,
     ) -> list[object]:
         messages: list[object] = []
+        missing = object()
         for field_name in ("new_messages", "messages"):
-            values = getattr(response, field_name, None)
-            if values is None:
+            values = getattr(response, field_name, missing)
+            if values is missing:
                 continue
             if not isinstance(values, (list, tuple)):
                 raise TelethonProvider._malformed_difference_item_error(
@@ -1906,8 +1907,9 @@ class TelethonProvider:
                 transport_order,
                 event_time,
             )
-        updates = getattr(response, "other_updates", None)
-        if updates is None:
+        missing = object()
+        updates = getattr(response, "other_updates", missing)
+        if updates is missing:
             updates = ()
         if not isinstance(updates, (list, tuple)):
             raise self._malformed_difference_item_error(expected_identity) from None
@@ -2151,10 +2153,7 @@ class TelethonProvider:
                 return True
         except Exception:
             return True
-        return any(
-            getattr(update, field_name, None) is not None
-            for field_name in ("messages", "channel_id", "chat_id", "peer")
-        )
+        return True
 
     @staticmethod
     def _transport_details(
@@ -2619,11 +2618,6 @@ class TelethonProvider:
         self._revisions[revision_key] = max(previous, revision)
         return revision, matching_item
 
-    @staticmethod
-    def _transport_occurrence_key(transport_event_id: str) -> str:
-        """Remove route-specific pts while retaining the Telegram occurrence."""
-        return transport_event_id.split(":pts:", 1)[0]
-
     def _matching_revision_history_item(
         self,
         *,
@@ -2648,16 +2642,7 @@ class TelethonProvider:
             )
         if exact:
             return exact[0]
-        if kind is SourceEventKind.EDIT:
-            occurrence_key = self._transport_occurrence_key(transport_event_id)
-            candidates = tuple(
-                item
-                for item in history
-                if item[1] is kind
-                and item[4] is not None
-                and self._transport_occurrence_key(item[4]) == occurrence_key
-            )
-        elif not from_history:
+        if kind is SourceEventKind.EDIT or not from_history:
             return None
         elif kind in {SourceEventKind.CREATE, SourceEventKind.DELETE}:
             candidates = tuple(item for item in history if item[1] is kind)
