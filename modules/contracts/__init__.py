@@ -59,6 +59,7 @@ class ContractName(StrEnum):
     CHANGE_SOURCE_CHAT_REGISTRY = "ChangeSourceChatRegistry"
     REQUEST_SOURCE_CHAT_ADMISSION = "RequestSourceChatAdmission"
     SOURCE_CHAT_ADMISSION_RESOLVED = "SourceChatAdmissionResolved"
+    SOURCE_CHAT_SCOPE_ACTIVATED = "SourceChatScopeActivated"
     SOURCE_CHAT_ADMISSION_FAILED = "SourceChatAdmissionFailed"
     SOURCE_CHAT_REGISTRATION_FAILED = "SourceChatRegistrationFailed"
     SOURCE_CHAT_GENERATION_CHANGED = "SourceChatGenerationChanged"
@@ -387,6 +388,14 @@ SUPPORTED_CONTRACTS = (
         ("telegram_user_id", "telegram_chat_id", "registry_generation"),
     ),
     ContractDefinition(
+        ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+        1,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.INGESTION,
+        "source_chat_key",
+        ("telegram_chat_id", "registry_generation"),
+    ),
+    ContractDefinition(
         ContractName.SOURCE_CHAT_ADMISSION_FAILED,
         1,
         RuntimeRole.INGESTION,
@@ -688,6 +697,7 @@ class ContractEnvelope(RawContractEnvelope):
             ContractName.CHANGE_SOURCE_CHAT_REGISTRY,
             ContractName.REQUEST_SOURCE_CHAT_ADMISSION,
             ContractName.SOURCE_CHAT_ADMISSION_RESOLVED,
+            ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
             ContractName.SOURCE_CHAT_ADMISSION_FAILED,
             ContractName.SOURCE_CHAT_REGISTRATION_FAILED,
             ContractName.SOURCE_CHAT_GENERATION_CHANGED,
@@ -1482,10 +1492,39 @@ def _validate_source_event_recorded(
         "event_time",
         "body",
     }
+    allowed_variants = {frozenset(allowed)}
     if envelope.contract_version == 4:
-        allowed |= {"bounded_metadata", "reply_to_telegram_message_id"}
-    if set(payload) != allowed:
+        allowed_variants.clear()
+        allowed |= {
+            "bounded_metadata",
+            "reply_to_telegram_message_id",
+        }
+        allowed_variants.add(frozenset(allowed))
+        allowed_with_history = allowed | {"from_history"}
+        allowed_variants.add(frozenset(allowed_with_history))
+        allowed_with_transport = allowed | {
+            "transport_event_id",
+            "transport_order",
+        }
+        allowed_variants.add(frozenset(allowed_with_transport))
+        allowed_variants.add(frozenset(allowed_with_transport | {"from_history"}))
+        allowed_with_transport_proof = allowed | {"transport_proven_post_boundary"}
+        allowed_variants.add(frozenset(allowed_with_transport_proof))
+        allowed_variants.add(frozenset(allowed_with_transport_proof | {"from_history"}))
+        allowed_variants.add(
+            frozenset(allowed_with_transport | {"transport_proven_post_boundary"})
+        )
+        allowed_variants.add(
+            frozenset(
+                allowed_with_transport
+                | {"from_history", "transport_proven_post_boundary"}
+            )
+        )
+    if frozenset(payload) not in allowed_variants:
         raise ValueError("SourceEventRecorded contains unsupported or missing facts")
+    from_history = payload.get("from_history", False)
+    if not isinstance(from_history, bool):
+        raise TypeError("SourceEventRecorded history marker must be boolean")
     source_event_id = _required_text(payload, "source_event_id")
     if envelope.message_id != derive_source_event_message_id(source_event_id):
         raise ValueError("SourceEventRecorded message identity is not canonical")
@@ -1524,6 +1563,15 @@ def _validate_source_event_recorded(
     event_kind = _required_text(payload, "event_kind")
     if event_kind not in {"create", "edit", "delete"}:
         raise ValueError("SourceEventRecorded event kind is invalid")
+    transport_proven_post_boundary = payload.get("transport_proven_post_boundary")
+    if transport_proven_post_boundary is not None and not isinstance(
+        transport_proven_post_boundary, bool
+    ):
+        raise TypeError("SourceEventRecorded transport boundary proof is invalid")
+    if transport_proven_post_boundary and (
+        from_history or peer_kind != "channel" or event_kind != "edit"
+    ):
+        raise ValueError("SourceEventRecorded transport boundary proof is invalid")
     event_time = datetime.fromisoformat(_required_text(payload, "event_time"))
     if event_time.tzinfo is None:
         raise ValueError("SourceEventRecorded event time must be timezone-aware")
@@ -1532,6 +1580,23 @@ def _validate_source_event_recorded(
         raise TypeError("SourceEventRecorded body must be text or null")
     if event_kind == "delete" and body is not None:
         raise ValueError("SourceEventRecorded deletion must be body-free")
+    transport_event_id = payload.get("transport_event_id")
+    transport_order = payload.get("transport_order")
+    if (transport_event_id is None) != (transport_order is None):
+        raise ValueError("SourceEventRecorded transport identity is incomplete")
+    if transport_event_id is not None and (
+        not isinstance(transport_event_id, str)
+        or not transport_event_id
+        or len(transport_event_id) > 256
+        or any(character.isspace() for character in transport_event_id)
+    ):
+        raise ValueError("SourceEventRecorded transport identity is invalid")
+    if transport_order is not None and (
+        not isinstance(transport_order, int)
+        or isinstance(transport_order, bool)
+        or transport_order < 1
+    ):
+        raise ValueError("SourceEventRecorded transport order is invalid")
     if envelope.contract_version == 4:
         metadata = payload["bounded_metadata"]
         _validate_bounded_source_metadata(metadata)
@@ -1680,10 +1745,10 @@ def _validate_bounded_source_metadata(value: JsonValue) -> None:
     reply_capable = value["source_message_reply_capable"]
     if not isinstance(reply_capable, bool):
         raise TypeError("source_message_reply_capable must be boolean")
-    if (value["source_message_url"] is not None) != reply_capable:
-        raise ValueError(
-            "source_message_url must identify exactly one reply-capable post"
-        )
+    if reply_capable and value["source_message_url"] is None:
+        raise ValueError("reply-capable source metadata requires source_message_url")
+    if not reply_capable and value["reply_route_url"] is not None:
+        raise ValueError("reply_route_url requires positive reply-capability evidence")
     if "source_publisher_id" in value:
         publisher_id = value["source_publisher_id"]
         if publisher_id is not None and not is_valid_opaque_source_publisher_id(
@@ -4345,6 +4410,63 @@ def _validate_source_chat_contract(
             subject_id=subject_id,
             subject_revision=subject_revision,
         )
+        return
+    if contract_name is ContractName.SOURCE_CHAT_SCOPE_ACTIVATED:
+        expected_fields = {
+            "source_chat_key",
+            "telegram_peer_kind",
+            "telegram_chat_id",
+            "registry_generation",
+            "address_kind",
+            "current_address",
+            "processing_started_at",
+            "transport_boundary",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("SourceChatScopeActivated has incomplete semantics")
+        if message_id != derive_contract_message_id(
+            causation_id,
+            ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+        ):
+            raise ValueError("Source Chat activation message identity is not canonical")
+        if idempotency_key != f"source-chat-scope-activated:{causation_id}":
+            raise ValueError("Source Chat activation idempotency is invalid")
+        peer_kind = _required_text(payload, "telegram_peer_kind")
+        if peer_kind not in {"chat", "channel"}:
+            raise ValueError("Source Chat activation peer kind is invalid")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        if (
+            not isinstance(telegram_chat_id, int)
+            or isinstance(telegram_chat_id, bool)
+            or telegram_chat_id < 1
+        ):
+            raise ValueError("Source Chat activation chat identity is invalid")
+        source_chat_key = _required_text(payload, "source_chat_key")
+        expected_key = str(
+            uuid5(
+                NAMESPACE_URL,
+                f"football-bot:{peer_kind}:{telegram_chat_id}:source-chat",
+            )
+        )
+        if source_chat_key != subject_id or source_chat_key != expected_key:
+            raise ValueError("Source Chat activation key is inconsistent")
+        _validate_source_chat_generation(payload, subject_revision=subject_revision)
+        address_kind = _required_text(payload, "address_kind")
+        current_address = _required_text(payload, "current_address")
+        if address_kind == "public_username":
+            expected_address_kind = SourceChatAddressKind.PUBLIC_USERNAME
+        elif address_kind == "private_invite":
+            expected_address_kind = SourceChatAddressKind.PRIVATE_INVITE
+        else:
+            raise ValueError("Source Chat activation address kind is invalid")
+        if not is_valid_source_chat_address(
+            current_address,
+            kind=expected_address_kind,
+        ):
+            raise ValueError("Source Chat activation address is invalid")
+        _required_iso_datetime(payload, "processing_started_at")
+        if not _required_text(payload, "transport_boundary").strip():
+            raise ValueError("Source Chat activation requires a transport boundary")
         return
     if contract_name is ContractName.CHANGE_SOURCE_CHAT_REGISTRY:
         if set(payload) - {

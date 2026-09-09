@@ -295,6 +295,15 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
     )
     assert telethon.resolution_requests == ["@synthetic_public_source"]
     assert telethon.boundary_requests == [identity]
+    assert telethon.message_identity_lookup is not None
+    assert len(telethon.admitted_source_chats) == 1
+    admitted_resolution, admitted_generation, admitted_at, admitted_boundary = (
+        telethon.admitted_source_chats[0]
+    )
+    assert admitted_resolution.identity == identity
+    assert admitted_generation == 1
+    assert admitted_at == datetime(2026, 9, 9, 13, 0, tzinfo=UTC)
+    assert admitted_boundary == "channel-pts:7301"
     assert telethon.join_requests == []
     assert telethon.history_requests == []
     assert telegram.messages[-1].text == (
@@ -3356,6 +3365,17 @@ def test_new_address_for_the_same_identity_changes_only_the_protected_address() 
             initial_time,
         ),
     )
+    changed = system.source_chat_contracts(
+        update_id="register-new-address",
+        contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+    )
+    assert len(changed) == 1
+    assert changed[0].subject_revision == 1
+    changed_payload = changed[0].payload
+    assert isinstance(changed_payload, dict)
+    assert changed_payload["registry_generation"] == 1
+    assert len(telethon.admitted_source_chats) == 1
+    assert telethon.admitted_source_chats[0][1] == 1
     assert telethon.join_requests == []
     assert telethon.history_requests == []
     system.reset()
@@ -3591,6 +3611,33 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert initial.lifecycle_state is SourceChatLifecycleState.ENABLED
     assert initial.initial_consent_attestation is InitialConsentAttestation.CONFIRMED
 
+    telethon.add_channel_difference_event(
+        identity=identity,
+        from_checkpoint=TelegramChannelCheckpoint(pts=6500),
+        to_checkpoint=TelegramChannelCheckpoint(pts=6501),
+        source_event_id="source-event:lifecycle:before-pause",
+        telegram_message_id=6501,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Live event before pause.",
+        event_time=registered_at,
+    )
+    assert system.process_next_channel_telegram_difference(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert system.process_next_source_event()
+    telethon.add_channel_history_event(
+        identity=identity,
+        checkpoint=TelegramChannelCheckpoint(pts=6501),
+        source_event_id="source-event:lifecycle:during-pause",
+        telegram_message_id=6502,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="History event during pause.",
+        event_time=paused_at,
+    )
+
     _click_source_chat_lifecycle_control(
         system,
         telegram,
@@ -3666,8 +3713,15 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert re_enabled.lifecycle_state is SourceChatLifecycleState.ENABLED
     assert re_enabled.processing_started_at == re_enabled_at
     assert re_enabled.attested_at == initial.attested_at
+    assert system.process_next_source_chat_admission()
+    assert len(telethon.admitted_source_chats) == 2
     assert system.process_next_source_chat_bot_result()
     assert "Source Chat re-enable complete: enabled." in telegram.messages[-1].text
+    assert not system.process_next_source_chat_history(
+        identity=identity,
+        registry_generation=1,
+    )
+    assert telethon.history_requests == []
 
     clock.advance_to(removed_at)
     _click_source_chat_lifecycle_control(

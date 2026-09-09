@@ -9,6 +9,7 @@ pathspec==1.1.1
 pluggy==1.6.0
 psycopg==3.3.4
 psycopg-binary==3.3.4
+telethon==1.42.0
 Pygments==2.20.0
 pytest==9.1.1
 ruff==0.16.1

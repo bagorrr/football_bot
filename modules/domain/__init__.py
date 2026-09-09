@@ -704,6 +704,36 @@ class TelegramChannelCheckpoint:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramHistoryProgress:
+    """Durable per-generation cursor and outcome for bounded history paging."""
+
+    last_telegram_message_id: int | None
+    window_start: datetime
+    window_end: datetime
+    completed: bool
+    last_outcome: str
+    last_source_event_id: str | None
+    advanced_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            self.last_telegram_message_id is not None
+            and self.last_telegram_message_id < 1
+        ):
+            raise ValueError("Telegram history cursor must be positive")
+        if self.window_start.tzinfo is None or self.window_end.tzinfo is None:
+            raise ValueError("Telegram history window must be timezone-aware")
+        if self.window_end < self.window_start:
+            raise ValueError("Telegram history window cannot be reversed")
+        if not self.last_outcome:
+            raise ValueError("Telegram history outcome is required")
+        if self.last_source_event_id == "":
+            raise ValueError("Telegram history Source Event identity cannot be empty")
+        if self.advanced_at.tzinfo is None:
+            raise ValueError("Telegram history progress time must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
 class SourceChatAdmissionResolution:
     """Accessible stable identity returned without joining or history access."""
 
@@ -775,10 +805,18 @@ class _TelegramDifferenceProgress:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+    from_history: bool = False
+    transport_event_id: str | None = None
+    transport_order: int | None = None
+    transport_revision: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.from_checkpoint) is not type(self.to_checkpoint):
             raise ValueError("Telegram difference checkpoint scopes must match")
+        if type(self.from_history) is not bool:
+            raise TypeError("Telegram difference history marker must be boolean")
+        if self.from_history and self.from_checkpoint != self.to_checkpoint:
+            raise ValueError("Historical Telegram events cannot advance checkpoints")
         if isinstance(self.from_checkpoint, TelegramAccountCheckpoint):
             assert isinstance(self.to_checkpoint, TelegramAccountCheckpoint)
             if (
@@ -800,6 +838,22 @@ class _TelegramDifferenceProgress:
             raise ValueError("Source Message identity and revision must be positive")
         if self.event_time.tzinfo is None:
             raise ValueError("Source Event time must be timezone-aware")
+        if (self.transport_event_id is None) != (self.transport_order is None):
+            raise ValueError("Telegram transport identity and order must be paired")
+        if self.transport_event_id is not None and (
+            not self.transport_event_id
+            or len(self.transport_event_id) > 256
+            or any(character.isspace() for character in self.transport_event_id)
+        ):
+            raise ValueError("Telegram transport identity is invalid")
+        if self.transport_order is not None and (
+            type(self.transport_order) is not int or self.transport_order < 1
+        ):
+            raise ValueError("Telegram transport order must be positive")
+        if self.transport_revision is not None and (
+            type(self.transport_revision) is not int or self.transport_revision < 1
+        ):
+            raise ValueError("Telegram transport revision must be positive")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -831,6 +885,76 @@ class TelegramProtectionUnavailableEvent(_TelegramDifferenceProgress):
     persistent: bool
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramDifferencePending:
+    """Body-free account progress held until a newly registered peer is active."""
+
+    source_chat_identity: TelegramPeerIdentity
+    from_checkpoint: TelegramAccountCheckpoint
+    to_checkpoint: TelegramAccountCheckpoint
+    source_event_id: str
+    telegram_message_id: int
+    registry_generation: int = 1
+
+    def __post_init__(self) -> None:
+        if not (
+            isinstance(self.from_checkpoint, TelegramAccountCheckpoint)
+            and isinstance(self.to_checkpoint, TelegramAccountCheckpoint)
+        ):
+            raise ValueError("Pending Telegram differences require account checkpoints")
+        if (
+            self.to_checkpoint.pts < self.from_checkpoint.pts
+            or self.to_checkpoint.qts < self.from_checkpoint.qts
+            or self.to_checkpoint.seq < self.from_checkpoint.seq
+            or self.to_checkpoint.date < self.from_checkpoint.date
+        ):
+            raise ValueError("Telegram account checkpoint cannot regress")
+        if self.registry_generation < 1:
+            raise ValueError("Source Chat registry generation must be positive")
+        if not self.source_event_id:
+            raise ValueError("Source Event identity is required")
+        if self.telegram_message_id < 1:
+            raise ValueError("Telegram message identity must be positive")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TelegramDifferenceCheckpointAdvance:
+    """Body-free page outcome that advances a durable Telegram checkpoint."""
+
+    from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
+    to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint
+    outcome_id: str
+    source_chat_identity: TelegramPeerIdentity | None = None
+    registry_generation: int = 1
+    from_history: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.from_checkpoint) is not type(self.to_checkpoint):
+            raise ValueError("Telegram difference checkpoint scopes must match")
+        if self.from_history:
+            raise ValueError("Checkpoint-only Telegram outcomes cannot be historical")
+        if isinstance(self.from_checkpoint, TelegramAccountCheckpoint):
+            assert isinstance(self.to_checkpoint, TelegramAccountCheckpoint)
+            if (
+                self.to_checkpoint.pts < self.from_checkpoint.pts
+                or self.to_checkpoint.qts < self.from_checkpoint.qts
+                or self.to_checkpoint.seq < self.from_checkpoint.seq
+                or self.to_checkpoint.date < self.from_checkpoint.date
+            ):
+                raise ValueError("Telegram account checkpoint cannot regress")
+        else:
+            assert isinstance(self.from_checkpoint, TelegramChannelCheckpoint)
+            assert isinstance(self.to_checkpoint, TelegramChannelCheckpoint)
+            if self.to_checkpoint.pts < self.from_checkpoint.pts:
+                raise ValueError("Telegram channel checkpoint cannot regress")
+            if self.source_chat_identity is None:
+                raise ValueError("Channel checkpoint outcome requires a Source Chat")
+        if self.registry_generation < 1:
+            raise ValueError("Source Chat registry generation must be positive")
+        if not self.outcome_id:
+            raise ValueError("Telegram checkpoint outcome identity is required")
+
+
 @dataclass(frozen=True, slots=True)
 class TelegramDifferenceFailure:
     """Body-free controlled failure returned at one durable checkpoint."""
@@ -844,6 +968,8 @@ TelegramDifferenceResult = (
     TelegramDifferenceEvent
     | TelegramProtectedContentEvent
     | TelegramProtectionUnavailableEvent
+    | TelegramDifferencePending
+    | TelegramDifferenceCheckpointAdvance
     | TelegramDifferenceFailure
 )
 
@@ -856,6 +982,7 @@ class SourceChatIngestionContext:
     registry_generation: int
     processing_started_at: datetime
     checkpoint: TelegramChannelCheckpoint | None
+    history_eligible: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -906,6 +1033,8 @@ class SourceEventRecord:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+    transport_event_id: str | None = None
+    transport_order: int | None = None
 
     @property
     def source_publisher_id(self) -> str | None:
@@ -958,6 +1087,8 @@ class SourceMessageRevision:
         default_factory=empty_bounded_source_metadata
     )
     reply_to_telegram_message_id: int | None = None
+    transport_event_id: str | None = None
+    transport_order: int | None = None
 
     @property
     def source_publisher_id(self) -> str | None:

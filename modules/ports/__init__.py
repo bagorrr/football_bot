@@ -65,6 +65,7 @@ from modules.domain import (
     SourceDataDeletionOwnerAck,
     SourceDataDeletionReplayBarrier,
     SourceDataDeletionRequest,
+    SourceEventKind,
     SourceEventRecord,
     SourceMessage,
     SourceMessageDeletionTombstone,
@@ -74,7 +75,9 @@ from modules.domain import (
     TelegramChannelCheckpoint,
     TelegramDeliveryClaim,
     TelegramDifferenceEvent,
+    TelegramDifferencePending,
     TelegramDifferenceResult,
+    TelegramHistoryProgress,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramProtectedContentEvent,
@@ -115,12 +118,59 @@ class TimezoneDataError(RuntimeError):
 class TelegramIngestionAdapter(Protocol):
     """Controlled Source Chat input boundary."""
 
+    def configure_clock(self, clock: Clock) -> None:
+        """Bind the Application clock used for provider event fallbacks."""
+        ...
+
     def source_event_id(self, probe_id: str) -> str:
         """Return a synthetic Source Event identity."""
         ...
 
     def notify_live_update(self, identity: TelegramPeerIdentity) -> None:
         """Wake the difference pump without acknowledging Telegram state."""
+        ...
+
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Bind the durable lookup for peer-less Telegram deletions."""
+        ...
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Bind the durable active-generation lookup for account pages."""
+        ...
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[
+            [TelegramPeerIdentity, int, int],
+            tuple[
+                tuple[
+                    int,
+                    SourceEventKind,
+                    str | None,
+                    datetime,
+                    str | None,
+                    int | None,
+                ],
+                ...,
+            ],
+        ],
+    ) -> None:
+        """Bind durable Source Message revision history for restart safety."""
+        ...
+
+    def admit_source_chat(
+        self,
+        resolution: SourceChatAdmissionResolution,
+        *,
+        registry_generation: int,
+        processing_started_at: datetime,
+        transport_boundary: str,
+    ) -> None:
+        """Activate one successfully admitted Source Chat generation."""
         ...
 
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
@@ -140,12 +190,53 @@ class TelegramIngestionAdapter(Protocol):
         """Return the next account-wide event from durable application state."""
         ...
 
+    def acknowledge_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge one account page outcome after its durable handoff."""
+        ...
+
     def get_channel_difference_event(
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the next channel event from its typed durable pts."""
+        ...
+
+    def acknowledge_channel_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge one channel page outcome after its durable handoff."""
+        ...
+
+    def get_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        window_start: datetime,
+        window_end: datetime,
+        history_cursor: int | None = None,
+    ) -> TelegramDifferenceResult | None:
+        """Return the next bounded historical event without moving the cursor."""
+        ...
+
+    def acknowledge_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        source_event_id: str,
+    ) -> None:
+        """Acknowledge one atomically committed history event for provider paging."""
         ...
 
 
@@ -1063,9 +1154,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         entry: SourceChatRegistryEntry,
         outgoing: ContractEnvelope,
         stale_outgoing: ContractEnvelope,
+        activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically accept admission and publish the applicable terminal result."""
+        """Atomically accept admission, activate new scope, and publish the result."""
         ...
 
     def source_chats(self) -> tuple[SourceChatRegistryEntry, ...]:
@@ -1088,6 +1180,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         telegram_user_id: int,
         outgoing: ContractEnvelope,
         received_at: datetime,
+        activation_outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Apply one Application-owned Source Chat lifecycle transition."""
         ...
@@ -1129,6 +1222,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the current eligible generation and durable difference cursor."""
         ...
 
+    def source_chat_ingestion_generation(
+        self, identity: TelegramPeerIdentity
+    ) -> int | None:
+        """Read the current active generation for account-page scope gating."""
+        ...
+
     def initialize_account_ingestion_checkpoint(
         self,
         checkpoint: TelegramAccountCheckpoint,
@@ -1142,6 +1241,41 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the durable Ingestion-owned account difference state."""
         ...
 
+    def source_chat_identity_for_telegram_message(
+        self, telegram_message_id: int
+    ) -> TelegramPeerIdentity | None:
+        """Look up the durable peer mapping for a peer-less Telegram deletion."""
+        ...
+
+    def source_message_revision_history_for_ingestion(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+    ) -> tuple[
+        tuple[
+            int,
+            SourceEventKind,
+            str | None,
+            datetime,
+            str | None,
+            int | None,
+        ],
+        ...,
+    ]:
+        """Read retained Source Event revisions for provider identity recovery."""
+        ...
+
+    def advance_account_difference_checkpoint(
+        self,
+        *,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance an account checkpoint for a body-free page outcome."""
+        ...
+
     def channel_ingestion_checkpoint(
         self,
         *,
@@ -1151,6 +1285,18 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read one Source Chat generation's durable channel pts."""
         ...
 
+    def advance_channel_difference_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance a channel checkpoint for a body-free page outcome."""
+        ...
+
     def discard_account_difference_event(
         self,
         *,
@@ -1158,6 +1304,7 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
             TelegramDifferenceEvent
             | TelegramProtectedContentEvent
             | TelegramProtectionUnavailableEvent
+            | TelegramDifferencePending
         ),
         recorded_at: datetime,
     ) -> bool:
@@ -1174,6 +1321,56 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         inject_database_failure: bool = False,
     ) -> bool:
         """Atomically record one event, its outbox, and checkpoint advance."""
+        ...
+
+    def ensure_source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        initialized_at: datetime,
+    ) -> TelegramHistoryProgress:
+        """Create or read one generation's exact bounded-history progress row."""
+        ...
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress | None:
+        """Read durable bounded-history progress without changing it."""
+        ...
+
+    def record_source_chat_history_outcome(
+        self,
+        *,
+        event: (
+            TelegramDifferenceEvent
+            | TelegramProtectedContentEvent
+            | TelegramProtectionUnavailableEvent
+        ),
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        outcome: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Persist a body-free history outcome before provider acknowledgement."""
+        ...
+
+    def complete_source_chat_history(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        completed_at: datetime,
+    ) -> bool:
+        """Persist that one bounded generation history window is exhausted."""
         ...
 
     def source_stream_is_stopped(
@@ -1745,6 +1942,15 @@ class AcceptanceObserver(Protocol):
 
     def source_events(self) -> tuple[SourceEventRecord, ...]:
         """Observe Ingestion-owned Source Events through the testkit."""
+        ...
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress | None:
+        """Observe one generation's durable bounded-history progress."""
         ...
 
     def source_message_revisions(self) -> tuple[SourceMessageRevision, ...]:

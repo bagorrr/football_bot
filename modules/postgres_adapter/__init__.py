@@ -109,6 +109,8 @@ from modules.domain import (
     TelegramDeliveryClaim,
     TelegramDeliveryMode,
     TelegramDifferenceEvent,
+    TelegramDifferencePending,
+    TelegramHistoryProgress,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -208,6 +210,9 @@ _LEGACY_MIGRATION_NAMES = (
     "0056_source_data_deletion_bot_fail_closed.sql",
     "0057_bot_api_continuity.sql",
     "0058_bot_api_delivery_reconciliation.sql",
+    "0059_telethon_history_progress.sql",
+    "0060_telethon_ingestion_scope_lookup.sql",
+    "0061_telethon_event_identity_and_progress_retention.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -270,6 +275,9 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "441dea8bc764ec932169281f6ad02ac87beeb76593ff746bf968e67d478478ed",
     "34645c5a8b188e677f153de19c82c34349a821343cc3e68f7c99911b8b7d3d80",
     "abb90f07e2e47dca9880b07ecf514af1b38407496fbe85c51739bb76387dbd6f",
+    "f4f7e4fef466817d37c5c271c7f978b06d51f9a0bcda16a2812a7d9b5969149d",
+    "96788c3cf2a25f912e068517a1b2f15736d1b2ab9ee64132c96c6eda05da7247",
+    "ae782f526807bf08c2daee9fe523ef72f0d17c8b6f335061597147af659db559",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -773,6 +781,7 @@ class PostgresAcceptanceObserver:
                      football_runtime.bot_api_updates,
                      football_runtime.bot_api_checkpoints,
                      football_runtime.ingestion_failures,
+                     football_runtime.telegram_source_chat_history_progress,
                      football_runtime.protected_content_skips,
                      football_runtime.classifier_adapter_circuits,
                      football_runtime.classification_attempts,
@@ -861,6 +870,44 @@ class PostgresAcceptanceObserver:
                     registry_generation,
                 ),
             )
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress | None:
+        """Observe one durable bounded-history cursor through the testkit."""
+        with psycopg.connect(
+            self._admin_database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT last_telegram_message_id, window_start, window_end,
+                       completed, last_outcome, last_source_event_id, advanced_at
+                FROM football_runtime.telegram_source_chat_history_progress
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return TelegramHistoryProgress(
+            last_telegram_message_id=row["last_telegram_message_id"],
+            window_start=row["window_start"],
+            window_end=row["window_end"],
+            completed=row["completed"],
+            last_outcome=row["last_outcome"],
+            last_source_event_id=row["last_source_event_id"],
+            advanced_at=row["advanced_at"],
+        )
 
     def envelope(self, message_id: UUID) -> RawContractEnvelope:
         """Recover an immutable envelope through the administrative testkit."""
@@ -969,7 +1016,8 @@ class PostgresAcceptanceObserver:
                        registry_generation, telegram_message_id,
                        source_message_revision, event_kind, body, event_time,
                        recorded_at, bounded_metadata,
-                       reply_to_telegram_message_id
+                       reply_to_telegram_message_id, transport_event_id,
+                       transport_order
                 FROM football_runtime.source_event_records
                 ORDER BY recorded_at, source_event_id
                 """
@@ -995,6 +1043,8 @@ class PostgresAcceptanceObserver:
                 recorded_at=row["recorded_at"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -1011,7 +1061,8 @@ class PostgresAcceptanceObserver:
                        source_event_id, revision, event_kind, body,
                        event_time, recorded_at, registry_generation,
                        bounded_metadata,
-                       reply_to_telegram_message_id
+                       reply_to_telegram_message_id, transport_event_id,
+                       transport_order
                 FROM football_runtime.source_message_revisions
                 ORDER BY source_message_id, revision
                 """
@@ -1029,6 +1080,8 @@ class PostgresAcceptanceObserver:
                 registry_generation=row["registry_generation"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -3017,9 +3070,10 @@ class PostgresRoleStore:
         entry: SourceChatRegistryEntry,
         outgoing: ContractEnvelope,
         stale_outgoing: ContractEnvelope,
+        activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
-        """Atomically accept admission, persist the registry, and publish it."""
+        """Atomically persist admission, activate new scope, and publish it."""
         if self._role is not RuntimeRole.APPLICATION:
             raise RuntimeError("only Application owns the Source Chat registry")
         with psycopg.connect(self._database_url) as connection:
@@ -3175,6 +3229,18 @@ class PostgresRoleStore:
                         received_at,
                     ),
                 )
+            effective_outgoing = outgoing
+            if address_change:
+                assert latest_generation is not None
+                if not isinstance(outgoing.payload, dict):
+                    raise TypeError("Source Chat result payload must be an object")
+                effective_payload = dict(outgoing.payload)
+                effective_payload["registry_generation"] = latest_generation[0]
+                effective_outgoing = replace(
+                    outgoing,
+                    subject_revision=latest_generation[0],
+                    payload=effective_payload,
+                )
             _accept_contract_inbox(
                 connection,
                 consumer=self._role,
@@ -3184,8 +3250,14 @@ class PostgresRoleStore:
             try:
                 _insert_outbox(
                     connection,
-                    stale_outgoing if is_stale else outgoing,
+                    stale_outgoing if is_stale else effective_outgoing,
                 )
+                if (
+                    activation_outgoing is not None
+                    and not is_stale
+                    and not address_change
+                ):
+                    _insert_outbox(connection, activation_outgoing)
             except psycopg.errors.UniqueViolation as error:
                 raise OutboxConflictError from error
             _release_claim(connection, incoming.message_id)
@@ -3313,6 +3385,7 @@ class PostgresRoleStore:
         telegram_user_id: int,
         outgoing: ContractEnvelope,
         received_at: datetime,
+        activation_outgoing: ContractEnvelope | None = None,
     ) -> ConsumeResult:
         """Apply one administrator transition and its publication barrier."""
         if self._role is not RuntimeRole.APPLICATION:
@@ -3545,6 +3618,12 @@ class PostgresRoleStore:
                 )
                 try:
                     _insert_outbox(connection, outgoing)
+                    if (
+                        activation_outgoing is not None
+                        and transitioned
+                        and action is SourceChatLifecycleAction.RE_ENABLE
+                    ):
+                        _insert_outbox(connection, activation_outgoing)
                 except psycopg.errors.UniqueViolation as error:
                     raise OutboxConflictError from error
                 _release_claim(connection, incoming.message_id)
@@ -3680,6 +3759,23 @@ class PostgresRoleStore:
                     raise ValueError("Source Chat channel boundary is invalid")
             else:
                 channel_checkpoint = TelegramChannelCheckpoint(pts=channel_pts)
+        with psycopg.connect(self._database_url) as connection:
+            history_eligible_row = connection.execute(
+                """
+                SELECT football_runtime.source_chat_event_is_processable(
+                    %s, %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    row["processing_started_at"],
+                ),
+            ).fetchone()
+        history_eligible = history_eligible_row is not None and bool(
+            history_eligible_row[0]
+        )
         return SourceChatIngestionContext(
             identity=TelegramPeerIdentity(
                 kind=TelegramPeerKind(row["peer_kind"]),
@@ -3688,7 +3784,392 @@ class PostgresRoleStore:
             registry_generation=row["registry_generation"],
             processing_started_at=row["processing_started_at"],
             checkpoint=channel_checkpoint,
+            history_eligible=history_eligible,
         )
+
+    def source_chat_ingestion_generation(
+        self, identity: TelegramPeerIdentity
+    ) -> int | None:
+        """Read the current active generation through the Ingestion-only function."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.read_current_source_chat_ingestion_generation(
+                    %s, %s
+                )
+                """,
+                (identity.kind.value, identity.telegram_id),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        generation = row[0]
+        if type(generation) is not int or generation < 1:
+            raise ValueError("Source Chat ingestion generation is invalid")
+        return generation
+
+    def ensure_source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        initialized_at: datetime,
+    ) -> TelegramHistoryProgress:
+        """Create or read one exact bounded-history progress row."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_source_chat_history_progress (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    window_start, window_end, last_outcome, advanced_at
+                ) VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                DO NOTHING
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    window_start,
+                    window_end,
+                    initialized_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT last_telegram_message_id, window_start, window_end,
+                       completed, last_outcome, last_source_event_id, advanced_at
+                FROM football_runtime.telegram_source_chat_history_progress
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            raise LookupError(identity)
+        if row["window_start"] != window_start or row["window_end"] != window_end:
+            raise ValueError("Source Chat history window changed for a generation")
+        return TelegramHistoryProgress(
+            last_telegram_message_id=row["last_telegram_message_id"],
+            window_start=row["window_start"],
+            window_end=row["window_end"],
+            completed=row["completed"],
+            last_outcome=row["last_outcome"],
+            last_source_event_id=row["last_source_event_id"],
+            advanced_at=row["advanced_at"],
+        )
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress | None:
+        """Read one generation's bounded-history progress."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT last_telegram_message_id, window_start, window_end,
+                       completed, last_outcome, last_source_event_id, advanced_at
+                FROM football_runtime.telegram_source_chat_history_progress
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return TelegramHistoryProgress(
+            last_telegram_message_id=row["last_telegram_message_id"],
+            window_start=row["window_start"],
+            window_end=row["window_end"],
+            completed=row["completed"],
+            last_outcome=row["last_outcome"],
+            last_source_event_id=row["last_source_event_id"],
+            advanced_at=row["advanced_at"],
+        )
+
+    @staticmethod
+    def _record_history_progress_in(
+        connection: psycopg.Connection[Any],
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        event: TelegramDifferenceEvent
+        | TelegramProtectedContentEvent
+        | TelegramProtectionUnavailableEvent,
+        outcome: str,
+        recorded_at: datetime,
+    ) -> None:
+        """Advance the body-free history cursor in the current transaction."""
+        updated = connection.execute(
+            """
+            UPDATE football_runtime.telegram_source_chat_history_progress
+            SET last_telegram_message_id = CASE
+                    WHEN last_telegram_message_id IS NULL
+                      OR last_telegram_message_id < %s
+                    THEN %s
+                    ELSE last_telegram_message_id
+                END,
+                last_source_event_id = CASE
+                    WHEN last_telegram_message_id IS NULL
+                      OR last_telegram_message_id <= %s
+                    THEN %s
+                    ELSE last_source_event_id
+                END,
+                completed = FALSE,
+                last_outcome = %s,
+                advanced_at = %s
+            WHERE peer_kind = %s
+              AND telegram_chat_id = %s
+              AND registry_generation = %s
+            """,
+            (
+                event.telegram_message_id,
+                event.telegram_message_id,
+                event.telegram_message_id,
+                event.source_event_id,
+                outcome,
+                recorded_at,
+                identity.kind.value,
+                identity.telegram_id,
+                registry_generation,
+            ),
+        ).rowcount
+        if updated != 1:
+            raise LookupError("Source Chat history progress is not initialized")
+
+    def record_source_chat_history_outcome(
+        self,
+        *,
+        event: TelegramDifferenceEvent
+        | TelegramProtectedContentEvent
+        | TelegramProtectionUnavailableEvent,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        outcome: str,
+        recorded_at: datetime,
+    ) -> bool:
+        """Persist one body-free history outcome before provider acknowledgement."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if not event.from_history:
+            raise ValueError("history progress requires a historical event")
+        identity = event.source_chat_identity
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            ):
+                return False
+            active_context = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if active_context is not None and (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'source_stream'
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                      AND active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            progress_outcome = (
+                "source_chat_inactive" if active_context is None else outcome
+            )
+            connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_source_chat_history_progress (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    window_start, window_end, last_outcome, advanced_at
+                ) VALUES (%s, %s, %s, %s, %s, 'pending', %s)
+                ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                DO NOTHING
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    window_start,
+                    window_end,
+                    recorded_at,
+                ),
+            )
+            progress = connection.execute(
+                """
+                SELECT window_start, window_end
+                FROM football_runtime.telegram_source_chat_history_progress
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                FOR UPDATE
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if progress is None:
+                raise LookupError("Source Chat history progress is not initialized")
+            if (
+                progress["window_start"] != window_start
+                or progress["window_end"] != window_end
+            ):
+                raise ValueError("Source Chat history window changed for a generation")
+            self._record_history_progress_in(
+                connection,
+                identity=identity,
+                registry_generation=registry_generation,
+                event=event,
+                outcome=progress_outcome,
+                recorded_at=recorded_at,
+            )
+        return True
+
+    def complete_source_chat_history(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        completed_at: datetime,
+    ) -> bool:
+        """Persist exhaustion of one exact bounded history window."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            ):
+                return False
+            progress = connection.execute(
+                """
+                SELECT window_start, window_end
+                FROM football_runtime.telegram_source_chat_history_progress
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                FOR UPDATE
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if progress is None:
+                raise LookupError("Source Chat history progress is not initialized")
+            if (
+                progress["window_start"] != window_start
+                or progress["window_end"] != window_end
+            ):
+                raise ValueError("Source Chat history window changed for a generation")
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_source_chat_history_progress
+                SET completed = TRUE, last_outcome = 'completed', advanced_at = %s
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    completed_at,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            )
+        return True
 
     def initialize_account_ingestion_checkpoint(
         self,
@@ -3753,6 +4234,159 @@ class PostgresRoleStore:
             date=row["checkpoint_date"],
         )
 
+    def source_chat_identity_for_telegram_message(
+        self, telegram_message_id: int
+    ) -> TelegramPeerIdentity | None:
+        """Resolve a peer-less deletion through retained body-free mappings."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if type(telegram_message_id) is not int or telegram_message_id < 1:
+            raise ValueError("Telegram message identity must be positive")
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id
+                FROM (
+                    SELECT peer_kind, telegram_chat_id
+                    FROM football_runtime.source_event_records
+                    WHERE peer_kind = 'chat'
+                      AND telegram_message_id = %s
+                    UNION
+                    SELECT peer_kind, telegram_chat_id
+                    FROM football_runtime.protected_content_skips
+                    WHERE peer_kind = 'chat'
+                      AND telegram_message_id = %s
+                ) AS retained_mapping
+                ORDER BY peer_kind, telegram_chat_id
+                """,
+                (telegram_message_id, telegram_message_id),
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError(
+                "Telegram message identity is ambiguous across basic chats"
+            )
+        if not rows:
+            return None
+        row = rows[0]
+        try:
+            kind = TelegramPeerKind(row["peer_kind"])
+            chat_id = row["telegram_chat_id"]
+        except (KeyError, ValueError, TypeError):
+            return None
+        if type(chat_id) is not int or chat_id < 1:
+            return None
+        return TelegramPeerIdentity(kind=kind, telegram_id=chat_id)
+
+    def source_message_revision_history_for_ingestion(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        telegram_message_id: int,
+    ) -> tuple[
+        tuple[int, SourceEventKind, str | None, datetime, str | None, int | None],
+        ...,
+    ]:
+        """Read durable Source Event history without exposing Application tables."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT source_message_revision, event_kind, body, event_time,
+                       transport_event_id, transport_order
+                FROM football_runtime.source_event_records
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                  AND telegram_message_id = %s
+                ORDER BY source_message_revision
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    telegram_message_id,
+                ),
+            ).fetchall()
+        return tuple(
+            (
+                row["source_message_revision"],
+                SourceEventKind(row["event_kind"]),
+                row["body"],
+                row["event_time"],
+                row["transport_event_id"],
+                row["transport_order"],
+            )
+            for row in rows
+        )
+
+    def advance_account_difference_checkpoint(
+        self,
+        *,
+        from_checkpoint: TelegramAccountCheckpoint,
+        to_checkpoint: TelegramAccountCheckpoint,
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance an account checkpoint for a body-free page outcome."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                ).fetchone()
+                is not None
+            ):
+                return False
+            row = connection.execute(
+                """
+                SELECT pts, qts, seq, checkpoint_date
+                FROM football_runtime.telegram_account_difference_checkpoints
+                WHERE singleton
+                FOR UPDATE
+                """
+            ).fetchone()
+            if row is None:
+                raise LookupError("Telegram account checkpoint is not initialized")
+            current = TelegramAccountCheckpoint(
+                pts=row["pts"],
+                qts=row["qts"],
+                seq=row["seq"],
+                date=row["checkpoint_date"],
+            )
+            if current != from_checkpoint:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_account_difference_checkpoints
+                SET pts = %s, qts = %s, seq = %s,
+                    checkpoint_date = %s, advanced_at = %s
+                WHERE singleton
+                """,
+                (
+                    to_checkpoint.pts,
+                    to_checkpoint.qts,
+                    to_checkpoint.seq,
+                    to_checkpoint.date,
+                    recorded_at,
+                ),
+            )
+        return True
+
     def channel_ingestion_checkpoint(
         self,
         *,
@@ -3768,25 +4402,23 @@ class PostgresRoleStore:
             raise LookupError(identity)
         return context.checkpoint
 
-    def discard_account_difference_event(
+    def advance_channel_difference_checkpoint(
         self,
         *,
-        event: (
-            TelegramDifferenceEvent
-            | TelegramProtectedContentEvent
-            | TelegramProtectionUnavailableEvent
-        ),
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        from_checkpoint: TelegramChannelCheckpoint,
+        to_checkpoint: TelegramChannelCheckpoint,
         recorded_at: datetime,
     ) -> bool:
-        """Advance one ineligible account event without retaining content."""
+        """Advance a channel checkpoint for a body-free page outcome."""
         if self._role is not RuntimeRole.INGESTION:
             raise ConversationAccessDeniedError
-        if not isinstance(event.from_checkpoint, TelegramAccountCheckpoint):
-            raise TypeError("discard requires an account checkpoint")
-        if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
-            raise TypeError("discard requires an account checkpoint")
-        identity = event.source_chat_identity
         peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        lock_key = (
+            f"source-ingestion:{identity.kind.value}:{identity.telegram_id}:"
+            f"{registry_generation}"
+        )
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             connection.execute(
                 "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
@@ -3798,19 +4430,10 @@ class PostgresRoleStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (peer_key,),
             )
-            context = connection.execute(
-                """
-                SELECT 1
-                FROM football_runtime.read_active_source_chat_ingestion_context(
-                    %s, %s, %s
-                )
-                """,
-                (
-                    identity.kind.value,
-                    identity.telegram_id,
-                    event.registry_generation,
-                ),
-            ).fetchone()
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
             if (
                 connection.execute(
                     """
@@ -3825,18 +4448,151 @@ class PostgresRoleStore:
                     (
                         identity.kind.value,
                         identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            context = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if context is None:
+                return False
+            current = connection.execute(
+                """
+                SELECT channel_pts
+                FROM football_runtime.telegram_channel_difference_checkpoints
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                FOR UPDATE
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if current is None:
+                raise LookupError("Telegram channel checkpoint is not initialized")
+            if current["channel_pts"] != from_checkpoint.pts:
+                return False
+            connection.execute(
+                """
+                UPDATE football_runtime.telegram_channel_difference_checkpoints
+                SET channel_pts = %s, advanced_at = %s
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    to_checkpoint.pts,
+                    recorded_at,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            )
+        return True
+
+    def discard_account_difference_event(
+        self,
+        *,
+        event: (
+            TelegramDifferenceEvent
+            | TelegramProtectedContentEvent
+            | TelegramProtectionUnavailableEvent
+            | TelegramDifferencePending
+        ),
+        recorded_at: datetime,
+    ) -> bool:
+        """Advance one ineligible account event without retaining content."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if not isinstance(event.from_checkpoint, TelegramAccountCheckpoint):
+            raise TypeError("discard requires an account checkpoint")
+        if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
+            raise TypeError("discard requires an account checkpoint")
+        identity = event.source_chat_identity
+        peer_key = f"source-chat:{identity.kind.value}:{identity.telegram_id}"
+        pending_scope = isinstance(event, TelegramDifferencePending)
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                ("source-ingestion:role",),
+            )
+            if self._ingestion_role_stopped_in(connection):
+                return False
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                ("source-ingestion:account",),
+            )
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer_key,),
+            )
+            if pending_scope:
+                context = connection.execute(
+                    """
+                    SELECT football_runtime
+                        .read_current_source_chat_ingestion_generation(%s, %s)
+                        AS active_generation
+                    """,
+                    (identity.kind.value, identity.telegram_id),
+                ).fetchone()
+            else:
+                context = connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.read_active_source_chat_ingestion_context(
+                        %s, %s, %s
+                    )
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        event.registry_generation,
+                    ),
+                ).fetchone()
+            if (
+                connection.execute(
+                    """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'source_stream'
+                      AND peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND (%s OR registry_generation = %s)
+                      AND active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        pending_scope,
                         event.registry_generation,
                     ),
                 ).fetchone()
                 is not None
             ):
                 return False
-            if context is not None:
-                return False
-            connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                ("source-ingestion:account",),
+            has_active_scope = (
+                context is not None
+                if not pending_scope
+                else context is not None and context["active_generation"] is not None
             )
+            if has_active_scope:
+                return False
             if (
                 connection.execute(
                     """
@@ -3910,6 +4666,8 @@ class PostgresRoleStore:
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
 
             def advance_checkpoint() -> None:
+                if event.from_history:
+                    return
                 if account_route:
                     if not isinstance(event.to_checkpoint, TelegramAccountCheckpoint):
                         raise TypeError("account event requires an account checkpoint")
@@ -3955,20 +4713,43 @@ class PostgresRoleStore:
                         "Telegram difference checkpoint scope is unsupported"
                     )
 
+            def advance_history_progress(outcome: str) -> None:
+                if not event.from_history:
+                    return
+                self._record_history_progress_in(
+                    connection,
+                    identity=identity,
+                    registry_generation=registry_generation,
+                    event=event,
+                    outcome=outcome,
+                    recorded_at=recorded_at,
+                )
+
             connection.execute(
                 "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
                 ("source-ingestion:role",),
             )
             if self._ingestion_role_stopped_in(connection):
                 return False
+            if account_route:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    ("source-ingestion:account",),
+                )
+            elif event.from_history and channel_route:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock_shared(hashtextextended(%s, 0))",
+                    ("source-ingestion:account",),
+                )
             connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (peer_key,),
             )
-            connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (lock_key,),
-            )
+            if not account_route:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (lock_key,),
+                )
             if account_route and (
                 connection.execute(
                     """
@@ -3978,6 +4759,21 @@ class PostgresRoleStore:
                     """
                 ).fetchone()
                 is not None
+            ):
+                return False
+            if (
+                event.from_history
+                and not account_route
+                and (
+                    connection.execute(
+                        """
+                    SELECT 1
+                    FROM football_runtime.ingestion_failures
+                    WHERE scope = 'account_stream' AND active
+                    """
+                    ).fetchone()
+                    is not None
+                )
             ):
                 return False
             if (
@@ -4063,11 +4859,14 @@ class PostgresRoleStore:
                     raise TypeError(
                         "Telegram difference checkpoint scope is unsupported"
                     )
+                advance_history_progress("source_chat_inactive")
                 advance_checkpoint()
                 return True
             account_create_is_after_boundary = False
             channel_event_is_after_boundary = False
             if account_route:
+                if not isinstance(event.from_checkpoint, TelegramAccountCheckpoint):
+                    raise TypeError("account event requires an account checkpoint")
                 account_checkpoint = connection.execute(
                     """
                     SELECT pts, qts, seq, checkpoint_date
@@ -4084,9 +4883,13 @@ class PostgresRoleStore:
                     seq=account_checkpoint["seq"],
                     date=account_checkpoint["checkpoint_date"],
                 )
-                if current_account_checkpoint != event.from_checkpoint:
+                if not event.from_history and (
+                    current_account_checkpoint != event.from_checkpoint
+                ):
                     return False
-                if identity.kind is TelegramPeerKind.CHAT:
+                if event.from_history:
+                    account_create_is_after_boundary = True
+                elif identity.kind is TelegramPeerKind.CHAT:
                     prefix = "chat-sequence:"
                     boundary = context["transport_boundary"]
                     if (
@@ -4094,29 +4897,74 @@ class PostgresRoleStore:
                         or not boundary[len(prefix) :].isdigit()
                     ):
                         raise ValueError("Source Chat account boundary is invalid")
-                    account_create_is_after_boundary = event.from_checkpoint.seq >= int(
-                        boundary[len(prefix) :]
+                    boundary_sequence = int(boundary[len(prefix) :])
+                    account_create_is_after_boundary = (
+                        event.from_checkpoint.seq >= boundary_sequence
+                        or (
+                            event.kind is SourceEventKind.CREATE
+                            and event.transport_event_id is not None
+                            and event.transport_order is not None
+                            and event.event_time > context["processing_started_at"]
+                        )
                     )
             elif channel_route:
                 channel_pts = context["channel_pts"]
                 if channel_pts is None:
                     raise LookupError("Telegram channel checkpoint is unavailable")
-                if TelegramChannelCheckpoint(pts=channel_pts) != event.from_checkpoint:
-                    return False
-                prefix = "channel-pts:"
-                boundary = context["transport_boundary"]
-                if (
-                    not boundary.startswith(prefix)
-                    or not boundary[len(prefix) :].isdigit()
+                if not event.from_history and (
+                    TelegramChannelCheckpoint(pts=channel_pts) != event.from_checkpoint
                 ):
-                    raise ValueError("Source Chat channel boundary is invalid")
-                # A channel boundary is the last observed pts.  The event
-                # beginning at that pts is the pre-boundary replay, while a
-                # strictly later starting pts is the first post-boundary
-                # transport identity we can safely admit.
-                channel_event_is_after_boundary = event.from_checkpoint.pts > int(
-                    boundary[len(prefix) :]
-                )
+                    return False
+                if event.from_history:
+                    channel_event_is_after_boundary = True
+                else:
+                    prefix = "channel-pts:"
+                    boundary = context["transport_boundary"]
+                    if (
+                        not boundary.startswith(prefix)
+                        or not boundary[len(prefix) :].isdigit()
+                    ):
+                        raise ValueError("Source Chat channel boundary is invalid")
+                    # A channel boundary is the last observed pts.  The event
+                    # beginning at that pts is the pre-boundary replay, while a
+                    # strictly later starting pts is the first post-boundary
+                    # transport identity we can safely admit.
+                    boundary_pts = int(boundary[len(prefix) :])
+                    channel_event_is_after_boundary = (
+                        event.from_checkpoint.pts > boundary_pts
+                        or (
+                            event.transport_revision is not None
+                            and event.transport_revision > boundary_pts
+                        )
+                    )
+                    if (
+                        isinstance(event, TelegramDifferenceEvent)
+                        and event.kind is SourceEventKind.EDIT
+                        and event.event_time <= context["processing_started_at"]
+                    ):
+                        lifecycle_boundary = connection.execute(
+                            """
+                            SELECT football_runtime.source_chat_event_is_processable(
+                                %s, %s, %s, %s
+                            ) AS lifecycle_boundary_is_processable
+                            """,
+                            (
+                                identity.kind.value,
+                                identity.telegram_id,
+                                registry_generation,
+                                context["processing_started_at"],
+                            ),
+                        ).fetchone()
+                        if (
+                            lifecycle_boundary is not None
+                            and not lifecycle_boundary[
+                                "lifecycle_boundary_is_processable"
+                            ]
+                        ):
+                            # The original transport boundary can prove an edit
+                            # recovered after registration, but not one recovered
+                            # from a pause gap after a re-enable boundary.
+                            channel_event_is_after_boundary = False
             else:
                 raise TypeError("Telegram difference checkpoint scope is unsupported")
             source_message_id = canonical_source_message_id(
@@ -4179,21 +5027,82 @@ class PostgresRoleStore:
                 if channel_route
                 else account_create_is_after_boundary
             )
-            event_is_processable = connection.execute(
-                """
-                SELECT football_runtime.source_chat_event_is_processable(
-                    %s, %s, %s, %s
-                ) AS event_is_processable
-                """,
-                (
-                    identity.kind.value,
-                    identity.telegram_id,
-                    registry_generation,
-                    event.event_time,
-                ),
-            ).fetchone()
-            assert event_is_processable is not None
-            if not bool(event_is_processable["event_is_processable"]):
+            transport_proven_post_boundary = (
+                channel_route
+                and isinstance(event, TelegramDifferenceEvent)
+                and not event.from_history
+                and event.kind is SourceEventKind.EDIT
+                and channel_event_is_after_boundary
+            )
+            if transport_proven_post_boundary:
+                stored_payload = dict(cast(dict[str, JsonValue], envelope.payload))
+                stored_payload["transport_proven_post_boundary"] = True
+                stored_envelope = replace(envelope, payload=stored_payload)
+            if event.from_history:
+                processing_started_at = context["processing_started_at"]
+                history_generation_active = connection.execute(
+                    """
+                    SELECT football_runtime.source_chat_event_is_processable(
+                        %s, %s, %s, %s
+                    ) AS history_generation_active
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        processing_started_at,
+                    ),
+                ).fetchone()
+                event_is_processable = (
+                    history_generation_active is not None
+                    and bool(history_generation_active["history_generation_active"])
+                    and processing_started_at - timedelta(days=7)
+                    <= event.event_time
+                    <= processing_started_at
+                )
+            elif (
+                channel_route
+                and event.kind is SourceEventKind.EDIT
+                and channel_event_is_after_boundary
+            ):
+                # A strictly post-boundary channel edit has transport proof even
+                # when Telegram reports an older edit time.
+                active_row = connection.execute(
+                    """
+                    SELECT football_runtime.source_chat_event_is_processable(
+                        %s, %s, %s, %s
+                    ) AS event_is_processable
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        context["processing_started_at"] + timedelta(microseconds=1),
+                    ),
+                ).fetchone()
+                event_is_processable = active_row is not None and bool(
+                    active_row["event_is_processable"]
+                )
+            else:
+                processable_row = connection.execute(
+                    """
+                    SELECT football_runtime.source_chat_event_is_processable(
+                        %s, %s, %s, %s
+                    ) AS event_is_processable
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        event.event_time,
+                    ),
+                ).fetchone()
+                assert processable_row is not None
+                event_is_processable = bool(processable_row["event_is_processable"])
+            if not event_is_processable:
+                advance_history_progress(
+                    "replay_barrier" if replay_barrier_active else "not_processable"
+                )
                 advance_checkpoint()
                 return True
             if (
@@ -4221,6 +5130,7 @@ class PostgresRoleStore:
                     if author_barrier is not None and bool(
                         author_barrier["source_author_deletion_barrier"]
                     ):
+                        advance_history_progress("author_deleted")
                         advance_checkpoint()
                         return True
             known_transport_identity = (
@@ -4318,10 +5228,11 @@ class PostgresRoleStore:
                         registry_generation, telegram_message_id,
                         source_message_revision, event_kind, body, event_time,
                         recorded_at, bounded_metadata,
-                        reply_to_telegram_message_id
+                        reply_to_telegram_message_id,
+                        transport_event_id, transport_order
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s
+                        %s::jsonb, %s, %s, %s
                     )
                     ON CONFLICT (source_event_id) DO NOTHING
                     RETURNING source_event_id
@@ -4340,6 +5251,8 @@ class PostgresRoleStore:
                         recorded_at,
                         json.dumps(stored_metadata),
                         stored_reply_to_message_id,
+                        event.transport_event_id,
+                        event.transport_order,
                     ),
                 ).fetchone()
                 if inserted is not None:
@@ -4361,7 +5274,8 @@ class PostgresRoleStore:
                         SELECT message_id, peer_kind, telegram_chat_id,
                                registry_generation, telegram_message_id,
                                source_message_revision, event_kind, body, event_time,
-                               bounded_metadata, reply_to_telegram_message_id
+                               bounded_metadata, reply_to_telegram_message_id,
+                               transport_event_id, transport_order
                         FROM football_runtime.source_event_records
                         WHERE source_event_id = %s
                         """,
@@ -4379,9 +5293,45 @@ class PostgresRoleStore:
                         "event_time": event.event_time,
                         "bounded_metadata": stored_metadata,
                         "reply_to_telegram_message_id": (stored_reply_to_message_id),
+                        "transport_event_id": event.transport_event_id,
+                        "transport_order": event.transport_order,
                     }
+                    if existing is not None and event.kind is SourceEventKind.DELETE:
+                        existing_event = dict(existing)
+                        existing_event.pop("event_time", None)
+                        expected.pop("event_time", None)
+                        existing = existing_event
+                    if (
+                        existing is not None
+                        and event.kind is SourceEventKind.EDIT
+                        and existing["event_kind"] == event.kind.value
+                        and existing["event_time"] == event.event_time
+                        and isinstance(existing["transport_event_id"], str)
+                        and isinstance(event.transport_event_id, str)
+                        and existing["transport_event_id"].split(":pts:", 1)[0]
+                        == event.transport_event_id.split(":pts:", 1)[0]
+                    ):
+                        # Reconcile route-specific transport suffixes only when
+                        # the canonical edit occurrence, event time, and every
+                        # stored payload field already agree.  A same-time
+                        # snapshot whose body differs remains a conflict.
+                        existing_event = dict(existing)
+                        existing_event.pop("transport_event_id", None)
+                        existing_event.pop("transport_order", None)
+                        expected.pop("transport_event_id", None)
+                        expected.pop("transport_order", None)
+                        existing = existing_event
                     if existing is None or dict(existing) != expected:
                         raise OutboxConflictError
+            advance_history_progress(
+                "replay_barrier"
+                if replay_barrier_active
+                else (
+                    "protected_content_skipped"
+                    if isinstance(event, TelegramProtectedContentEvent)
+                    else "accepted"
+                )
+            )
             advance_checkpoint()
         return True
 
@@ -4442,20 +5392,88 @@ class PostgresRoleStore:
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                 (peer_key,),
             )
-            processable_chat = connection.execute(
-                """
-                SELECT football_runtime.source_chat_event_is_processable(
-                    %s, %s, %s, %s
+            from_history = payload.get("from_history", False)
+            if from_history:
+                registry = connection.execute(
+                    """
+                    SELECT processing_started_at, enabled,
+                           permanently_removed_at,
+                           initial_consent_attestation
+                    FROM football_runtime.source_chat_registry
+                    WHERE peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                    """,
+                    (
+                        payload["telegram_peer_kind"],
+                        payload["telegram_chat_id"],
+                        payload["registry_generation"],
+                    ),
+                ).fetchone()
+                if registry is None:
+                    processable = False
+                else:
+                    history_generation_active = connection.execute(
+                        """
+                        SELECT football_runtime.source_chat_event_is_processable(
+                            %s, %s, %s, %s
+                        ) AS history_generation_active
+                        """,
+                        (
+                            payload["telegram_peer_kind"],
+                            payload["telegram_chat_id"],
+                            payload["registry_generation"],
+                            registry[0],
+                        ),
+                    ).fetchone()
+                    processable = (
+                        registry[1]
+                        and registry[2] is None
+                        and registry[3] == "confirmed"
+                        and history_generation_active is not None
+                        and bool(history_generation_active[0])
+                        and registry[0] - timedelta(days=7) <= event_time <= registry[0]
+                    )
+            else:
+                processable = (
+                    payload.get("transport_proven_post_boundary") is True
+                    and payload.get("telegram_peer_kind") == "channel"
+                    and payload.get("event_kind") == SourceEventKind.EDIT.value
+                    and not from_history
                 )
-                """,
-                (
-                    payload["telegram_peer_kind"],
-                    payload["telegram_chat_id"],
-                    payload["registry_generation"],
-                    event_time,
-                ),
-            ).fetchone()
-            if processable_chat is None or not processable_chat[0]:
+                if processable:
+                    active_row = connection.execute(
+                        """
+                        SELECT football_runtime.source_chat_event_is_processable(
+                            %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            payload["telegram_peer_kind"],
+                            payload["telegram_chat_id"],
+                            payload["registry_generation"],
+                            received_at + timedelta(microseconds=1),
+                        ),
+                    ).fetchone()
+                    processable = active_row is not None and bool(active_row[0])
+                if not processable:
+                    processable_chat = connection.execute(
+                        """
+                        SELECT football_runtime.source_chat_event_is_processable(
+                            %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            payload["telegram_peer_kind"],
+                            payload["telegram_chat_id"],
+                            payload["registry_generation"],
+                            event_time,
+                        ),
+                    ).fetchone()
+                    processable = processable_chat is not None and bool(
+                        processable_chat[0]
+                    )
+            if not processable:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             event_kind = payload.get("event_kind")
@@ -4745,9 +5763,10 @@ class PostgresRoleStore:
                     source_event_id, revision, event_kind, body,
                     event_time, recorded_at, registry_generation,
                     bounded_metadata,
-                    reply_to_telegram_message_id
+                    reply_to_telegram_message_id,
+                    transport_event_id, transport_order
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s
                 )
                 """,
                 (
@@ -4762,6 +5781,8 @@ class PostgresRoleStore:
                     payload["registry_generation"],
                     json.dumps(bounded_metadata),
                     reply_to_message_id,
+                    payload.get("transport_event_id"),
+                    payload.get("transport_order"),
                 ),
             )
             if event_kind == SourceEventKind.DELETE.value:
@@ -4938,6 +5959,12 @@ class PostgresRoleStore:
                 """,
                 (as_of,),
             ).fetchone()
+            progress_row = connection.execute(
+                """
+                SELECT football_runtime.cleanup_expired_telethon_history_progress(%s)
+                """,
+                (as_of,),
+            ).fetchone()
             if cluster_ids:
                 connection.execute(
                     """
@@ -5001,7 +6028,9 @@ class PostgresRoleStore:
                                 if direct_expiry is not None and direct_expiry[0]:
                                     continue
                         _insert_outbox(connection, outgoing)
-        return int(row[0]) if row is not None else 0
+        return (int(row[0]) if row is not None else 0) + (
+            int(progress_row[0]) if progress_row is not None else 0
+        )
 
     def source_data_audit(self) -> tuple[SourceDataAuditEvent, ...]:
         """Read only the body-free audit projection allowed to this role."""
@@ -6476,7 +7505,8 @@ class PostgresRoleStore:
                            registry_generation, telegram_message_id,
                            source_message_revision, event_kind, body,
                            event_time, recorded_at, bounded_metadata,
-                           reply_to_telegram_message_id
+                           reply_to_telegram_message_id,
+                           transport_event_id, transport_order
                     FROM football_runtime.source_event_records
                     ORDER BY recorded_at, source_event_id
                     """
@@ -6504,6 +7534,8 @@ class PostgresRoleStore:
                 recorded_at=row["recorded_at"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -6571,7 +7603,9 @@ class PostgresRoleStore:
                        revision.recorded_at,
                        revision.registry_generation,
                        revision.bounded_metadata,
-                       revision.reply_to_telegram_message_id
+                       revision.reply_to_telegram_message_id,
+                       revision.transport_event_id,
+                       revision.transport_order
                 FROM football_runtime.source_message_revisions AS revision
                 JOIN football_runtime.source_messages AS message
                   ON message.source_message_id = revision.source_message_id
@@ -6596,6 +7630,8 @@ class PostgresRoleStore:
             registry_generation=row["registry_generation"],
             bounded_metadata=row["bounded_metadata"],
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            transport_event_id=row["transport_event_id"],
+            transport_order=row["transport_order"],
         )
 
     def source_message_revision_history(
@@ -6613,7 +7649,8 @@ class PostgresRoleStore:
                 SELECT source_message_revision_id, source_message_id,
                        source_event_id, revision, event_kind, body,
                        event_time, recorded_at, registry_generation,
-                       bounded_metadata, reply_to_telegram_message_id
+                       bounded_metadata, reply_to_telegram_message_id,
+                       transport_event_id, transport_order
                 FROM football_runtime.source_message_revisions
                 WHERE source_message_id = %s
                 ORDER BY revision
@@ -6633,6 +7670,8 @@ class PostgresRoleStore:
                 registry_generation=row["registry_generation"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )
@@ -6682,7 +7721,9 @@ class PostgresRoleStore:
                        revision.recorded_at,
                        revision.registry_generation,
                        revision.bounded_metadata,
-                       revision.reply_to_telegram_message_id
+                       revision.reply_to_telegram_message_id,
+                       revision.transport_event_id,
+                       revision.transport_order
                 FROM football_runtime.source_messages AS message
                 JOIN football_runtime.source_message_revisions AS revision
                   ON revision.source_message_id = message.source_message_id
@@ -6723,6 +7764,8 @@ class PostgresRoleStore:
             registry_generation=row["registry_generation"],
             bounded_metadata=row["bounded_metadata"],
             reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+            transport_event_id=row["transport_event_id"],
+            transport_order=row["transport_order"],
         )
 
     def adjacent_source_message_revisions(
@@ -6752,7 +7795,9 @@ class PostgresRoleStore:
                        revision.recorded_at,
                        revision.registry_generation,
                        revision.bounded_metadata,
-                       revision.reply_to_telegram_message_id
+                       revision.reply_to_telegram_message_id,
+                       revision.transport_event_id,
+                       revision.transport_order
                 FROM football_runtime.source_messages AS message
                 JOIN football_runtime.source_message_revisions AS revision
                   ON revision.source_message_id = message.source_message_id
@@ -6800,6 +7845,8 @@ class PostgresRoleStore:
                 registry_generation=row["registry_generation"],
                 bounded_metadata=row["bounded_metadata"],
                 reply_to_telegram_message_id=row["reply_to_telegram_message_id"],
+                transport_event_id=row["transport_event_id"],
+                transport_order=row["transport_order"],
             )
             for row in rows
         )

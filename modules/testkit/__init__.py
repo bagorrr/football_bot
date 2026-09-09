@@ -91,9 +91,12 @@ from modules.domain import (
     SourceMessageRevision,
     TelegramAccountCheckpoint,
     TelegramChannelCheckpoint,
+    TelegramDifferenceCheckpointAdvance,
     TelegramDifferenceEvent,
     TelegramDifferenceFailure,
+    TelegramDifferencePending,
     TelegramDifferenceResult,
+    TelegramHistoryProgress,
     TelegramMessage,
     TelegramPeerIdentity,
     TelegramPeerKind,
@@ -125,6 +128,9 @@ from modules.ports import (
     TimezoneDataError,
 )
 from modules.ports import BotAssistantResponse as BotAssistantResponse
+from modules.telethon_ingestion import (
+    ControlledTelethonTransport as ControlledTelethonTransport,
+)
 from modules.timezone_data_adapter import (
     InstalledTimezoneDataAdapter,
     SourceBoundTimezoneDataAdapter,
@@ -324,10 +330,21 @@ class ControlledTelegramIngestionAdapter:
         tuple[TelegramPeerIdentity, TelegramChannelCheckpoint],
         TelegramDifferenceResult,
     ] = field(default_factory=dict)
+    _account_history_events: dict[
+        tuple[TelegramPeerIdentity, int, TelegramAccountCheckpoint],
+        list[TelegramDifferenceResult],
+    ] = field(default_factory=dict)
+    _channel_history_events: dict[
+        tuple[TelegramPeerIdentity, int, TelegramChannelCheckpoint],
+        list[TelegramDifferenceResult],
+    ] = field(default_factory=dict)
     _account_result_gate: _ControlledResultGate = field(
         default_factory=_ControlledResultGate
     )
     _channel_result_gate: _ControlledResultGate = field(
+        default_factory=_ControlledResultGate
+    )
+    _history_result_gate: _ControlledResultGate = field(
         default_factory=_ControlledResultGate
     )
     _protected_bodies: list[_ControlledProtectedBody] = field(
@@ -338,6 +355,10 @@ class ControlledTelegramIngestionAdapter:
     boundary_requests: list[TelegramPeerIdentity] = field(default_factory=list)
     join_requests: list[str] = field(default_factory=list)
     history_requests: list[str] = field(default_factory=list)
+    history_window_requests: list[tuple[datetime, datetime]] = field(
+        default_factory=list
+    )
+    history_cursor_requests: list[int | None] = field(default_factory=list)
     account_difference_requests: list[TelegramAccountCheckpoint] = field(
         default_factory=list
     )
@@ -345,6 +366,15 @@ class ControlledTelegramIngestionAdapter:
         tuple[TelegramPeerIdentity, TelegramChannelCheckpoint]
     ] = field(default_factory=list)
     live_callback_completions: list[TelegramPeerIdentity] = field(default_factory=list)
+    admitted_source_chats: list[
+        tuple[SourceChatAdmissionResolution, int, datetime, str]
+    ] = field(default_factory=list)
+    message_identity_lookup: Callable[[int], TelegramPeerIdentity | None] | None = (
+        field(
+            default=None,
+            repr=False,
+        )
+    )
 
     def source_event_id(self, probe_id: str) -> str:
         """Return a stable synthetic Source Event identity."""
@@ -353,6 +383,60 @@ class ControlledTelegramIngestionAdapter:
     def notify_live_update(self, identity: TelegramPeerIdentity) -> None:
         """Record callback completion without changing any durable cursor."""
         self.live_callback_completions.append(identity)
+
+    def configure_clock(self, clock: Clock) -> None:
+        """Accept the Application clock without making controlled data live."""
+        del clock
+
+    def configure_message_identity_lookup(
+        self, lookup: Callable[[int], TelegramPeerIdentity | None]
+    ) -> None:
+        """Retain the controlled durable deletion-lookup seam."""
+        self.message_identity_lookup = lookup
+
+    def configure_source_scope_generation_lookup(
+        self, lookup: Callable[[TelegramPeerIdentity], int | None]
+    ) -> None:
+        """Accept the production scope lookup without making controlled data live."""
+        del lookup
+
+    def configure_source_message_revision_lookup(
+        self,
+        lookup: Callable[
+            [TelegramPeerIdentity, int, int],
+            tuple[
+                tuple[
+                    int,
+                    SourceEventKind,
+                    str | None,
+                    datetime,
+                    str | None,
+                    int | None,
+                ],
+                ...,
+            ],
+        ],
+    ) -> None:
+        """Accept the production revision lookup without reading a live provider."""
+        del lookup
+
+    def admit_source_chat(
+        self,
+        resolution: SourceChatAdmissionResolution,
+        *,
+        registry_generation: int,
+        processing_started_at: datetime,
+        transport_boundary: str,
+    ) -> None:
+        """Record immediate activation of one controlled Source Chat generation."""
+        self.admitted_source_chats.append(
+            (
+                resolution,
+                registry_generation,
+                processing_started_at,
+                transport_boundary,
+            )
+        )
 
     def allow_public_username(
         self,
@@ -441,6 +525,7 @@ class ControlledTelegramIngestionAdapter:
         telegram_author_fake: bool = False,
         telegram_author_restricted: bool = False,
         reply_to_telegram_message_id: int | None = None,
+        from_history: bool = False,
     ) -> None:
         """Configure one account-wide event at its typed durable checkpoint."""
         bounded_metadata: dict[str, JsonValue] = {
@@ -481,7 +566,7 @@ class ControlledTelegramIngestionAdapter:
             )
         if author_flags:
             bounded_metadata["telegram_author_flags"] = cast(JsonValue, author_flags)
-        self._account_difference_events[from_checkpoint] = TelegramDifferenceEvent(
+        event = TelegramDifferenceEvent(
             source_chat_identity=identity,
             from_checkpoint=from_checkpoint,
             to_checkpoint=to_checkpoint,
@@ -494,7 +579,14 @@ class ControlledTelegramIngestionAdapter:
             registry_generation=registry_generation,
             bounded_metadata=bounded_metadata,
             reply_to_telegram_message_id=reply_to_telegram_message_id,
+            from_history=from_history,
         )
+        if from_history:
+            self._account_history_events.setdefault(
+                (identity, registry_generation, from_checkpoint), []
+            ).append(event)
+        else:
+            self._account_difference_events[from_checkpoint] = event
 
     def add_unavailable_protection_account_difference_event(
         self,
@@ -613,6 +705,42 @@ class ControlledTelegramIngestionAdapter:
         self._account_result_gate.enter()
         return result
 
+    def acknowledge_account_difference_event(
+        self,
+        checkpoint: TelegramAccountCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge a controlled account outcome after durable commit."""
+        del checkpoint, result_id
+
+    def add_account_history_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint,
+        source_event_id: str,
+        telegram_message_id: int,
+        revision: int,
+        kind: SourceEventKind,
+        body: str | None,
+        event_time: datetime,
+    ) -> None:
+        """Configure one body-bearing event in the prior bounded window."""
+        self.add_account_difference_event(
+            from_checkpoint=checkpoint,
+            to_checkpoint=checkpoint,
+            identity=identity,
+            registry_generation=registry_generation,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=event_time,
+            from_history=True,
+        )
+
     def add_channel_difference_event(
         self,
         *,
@@ -642,6 +770,8 @@ class ControlledTelegramIngestionAdapter:
         telegram_author_fake: bool = False,
         telegram_author_restricted: bool = False,
         reply_to_telegram_message_id: int | None = None,
+        registry_generation: int = 1,
+        from_history: bool = False,
     ) -> None:
         """Configure one channel event at its typed durable pts."""
         bounded_metadata: dict[str, JsonValue] = {
@@ -682,20 +812,54 @@ class ControlledTelegramIngestionAdapter:
             )
         if author_flags:
             bounded_metadata["telegram_author_flags"] = cast(JsonValue, author_flags)
-        self._channel_difference_events[(identity, from_checkpoint)] = (
-            TelegramDifferenceEvent(
-                source_chat_identity=identity,
-                from_checkpoint=from_checkpoint,
-                to_checkpoint=to_checkpoint,
-                source_event_id=source_event_id,
-                telegram_message_id=telegram_message_id,
-                revision=revision,
-                kind=kind,
-                body=body,
-                event_time=event_time,
-                bounded_metadata=bounded_metadata,
-                reply_to_telegram_message_id=reply_to_telegram_message_id,
-            )
+        event = TelegramDifferenceEvent(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=event_time,
+            registry_generation=registry_generation,
+            bounded_metadata=bounded_metadata,
+            reply_to_telegram_message_id=reply_to_telegram_message_id,
+            from_history=from_history,
+        )
+        if from_history:
+            self._channel_history_events.setdefault(
+                (identity, registry_generation, from_checkpoint), []
+            ).append(event)
+        else:
+            self._channel_difference_events[(identity, from_checkpoint)] = event
+
+    def add_channel_history_event(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        checkpoint: TelegramChannelCheckpoint,
+        source_event_id: str,
+        telegram_message_id: int,
+        revision: int,
+        kind: SourceEventKind,
+        body: str | None,
+        event_time: datetime,
+        registry_generation: int = 1,
+    ) -> None:
+        """Configure one body-bearing event in the prior bounded window."""
+        self.add_channel_difference_event(
+            identity=identity,
+            from_checkpoint=checkpoint,
+            to_checkpoint=checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=revision,
+            kind=kind,
+            body=body,
+            event_time=event_time,
+            registry_generation=registry_generation,
+            from_history=True,
         )
 
     def add_access_loss_channel_difference(
@@ -781,6 +945,8 @@ class ControlledTelegramIngestionAdapter:
         contact: str | None,
         other_body: str | None,
         event_time: datetime,
+        registry_generation: int = 1,
+        from_history: bool = False,
     ) -> None:
         """Configure one protected event without exposing its body to Ingestion."""
         self._protected_bodies.append(
@@ -792,18 +958,24 @@ class ControlledTelegramIngestionAdapter:
                 other_body=other_body,
             )
         )
-        self._channel_difference_events[(identity, from_checkpoint)] = (
-            TelegramProtectedContentEvent(
-                source_chat_identity=identity,
-                from_checkpoint=from_checkpoint,
-                to_checkpoint=to_checkpoint,
-                source_event_id=source_event_id,
-                telegram_message_id=telegram_message_id,
-                revision=revision,
-                kind=kind,
-                event_time=event_time,
-            )
+        event = TelegramProtectedContentEvent(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=revision,
+            kind=kind,
+            event_time=event_time,
+            registry_generation=registry_generation,
+            from_history=from_history,
         )
+        if from_history:
+            self._channel_history_events.setdefault(
+                (identity, registry_generation, from_checkpoint), []
+            ).append(event)
+        else:
+            self._channel_difference_events[(identity, from_checkpoint)] = event
 
     def add_unavailable_protection_channel_difference_event(
         self,
@@ -821,6 +993,8 @@ class ControlledTelegramIngestionAdapter:
         contact: str | None,
         event_time: datetime,
         persistent: bool,
+        registry_generation: int = 1,
+        from_history: bool = False,
     ) -> None:
         """Configure a current protection-state lookup that cannot be established."""
         self._protected_bodies.append(
@@ -832,19 +1006,25 @@ class ControlledTelegramIngestionAdapter:
                 other_body=None,
             )
         )
-        self._channel_difference_events[(identity, from_checkpoint)] = (
-            TelegramProtectionUnavailableEvent(
-                source_chat_identity=identity,
-                from_checkpoint=from_checkpoint,
-                to_checkpoint=to_checkpoint,
-                source_event_id=source_event_id,
-                telegram_message_id=telegram_message_id,
-                revision=revision,
-                kind=kind,
-                event_time=event_time,
-                persistent=persistent,
-            )
+        event = TelegramProtectionUnavailableEvent(
+            source_chat_identity=identity,
+            from_checkpoint=from_checkpoint,
+            to_checkpoint=to_checkpoint,
+            source_event_id=source_event_id,
+            telegram_message_id=telegram_message_id,
+            revision=revision,
+            kind=kind,
+            event_time=event_time,
+            persistent=persistent,
+            registry_generation=registry_generation,
+            from_history=from_history,
         )
+        if from_history:
+            self._channel_history_events.setdefault(
+                (identity, registry_generation, from_checkpoint), []
+            ).append(event)
+        else:
+            self._channel_difference_events[(identity, from_checkpoint)] = event
 
     def pause_channel_difference_results(self) -> None:
         """Pause channel results after callers cross the controlled adapter port."""
@@ -862,12 +1042,159 @@ class ControlledTelegramIngestionAdapter:
         self,
         identity: TelegramPeerIdentity,
         checkpoint: TelegramChannelCheckpoint,
+        registry_generation: int | None = None,
     ) -> TelegramDifferenceResult | None:
         """Return the configured channel difference from typed pts."""
+        del registry_generation
         self.channel_difference_requests.append((identity, checkpoint))
         result = self._channel_difference_events.get((identity, checkpoint))
         self._channel_result_gate.enter()
         return result
+
+    def acknowledge_channel_difference_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        result_id: str,
+    ) -> None:
+        """Acknowledge a controlled channel outcome after durable commit."""
+        del identity, registry_generation, checkpoint, result_id
+
+    def get_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        window_start: datetime,
+        window_end: datetime,
+        history_cursor: int | None = None,
+    ) -> TelegramDifferenceResult | None:
+        """Return the next configured historical event without moving a cursor."""
+        source_key = (
+            f"source-chat:{identity.kind.value}:{identity.telegram_id}:"
+            f"generation:{registry_generation}"
+        )
+        self.history_requests.append(source_key)
+        self.history_window_requests.append((window_start, window_end))
+        self.history_cursor_requests.append(history_cursor)
+        events: list[TelegramDifferenceResult]
+        if isinstance(checkpoint, TelegramAccountCheckpoint):
+            events = self._account_history_events.get(
+                (identity, registry_generation, checkpoint), []
+            )
+        else:
+            events = self._channel_history_events.get(
+                (identity, registry_generation, checkpoint), []
+            )
+        if not events:
+            history_events = (
+                self._account_history_events
+                if isinstance(checkpoint, TelegramAccountCheckpoint)
+                else self._channel_history_events
+            )
+            events = next(
+                (
+                    candidate
+                    for (candidate_identity, candidate_generation, _), candidate in (
+                        history_events.items()
+                    )
+                    if candidate_identity == identity
+                    and candidate_generation == registry_generation
+                    and candidate
+                ),
+                [],
+            )
+        if not events:
+            return None
+        event = next(
+            (
+                candidate
+                for candidate in events
+                if isinstance(candidate, TelegramDifferenceFailure)
+                or (
+                    not isinstance(candidate, TelegramDifferenceCheckpointAdvance)
+                    and (
+                        history_cursor is None
+                        or candidate.telegram_message_id > history_cursor
+                    )
+                )
+            ),
+            None,
+        )
+        if event is None:
+            return None
+        if isinstance(event, TelegramDifferenceFailure):
+            self._history_result_gate.enter()
+            return replace(event, checkpoint=checkpoint)
+        if isinstance(event, TelegramDifferencePending):
+            raise RuntimeError("controlled history cursor contains pending progress")
+        self._history_result_gate.enter()
+        return replace(event, from_checkpoint=checkpoint, to_checkpoint=checkpoint)
+
+    def pause_source_chat_history_results(self) -> None:
+        """Pause one history result after the controlled adapter boundary."""
+        self._history_result_gate.pause()
+
+    def wait_for_source_chat_history_requests(self, count: int) -> None:
+        """Wait until history requests reach the controlled adapter boundary."""
+        self._history_result_gate.wait_for(count)
+
+    def release_source_chat_history_results(self, count: int) -> None:
+        """Release paused history results in request order."""
+        self._history_result_gate.release(count)
+
+    def acknowledge_source_chat_history_event(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
+        source_event_id: str,
+    ) -> None:
+        """Move the controlled history cursor after a durable commit."""
+        events: list[TelegramDifferenceResult]
+        if isinstance(checkpoint, TelegramAccountCheckpoint):
+            events = self._account_history_events.get(
+                (identity, registry_generation, checkpoint), []
+            )
+        else:
+            events = self._channel_history_events.get(
+                (identity, registry_generation, checkpoint), []
+            )
+        if not events:
+            history_events = (
+                self._account_history_events
+                if isinstance(checkpoint, TelegramAccountCheckpoint)
+                else self._channel_history_events
+            )
+            events = next(
+                (
+                    candidate
+                    for (candidate_identity, candidate_generation, _), candidate in (
+                        history_events.items()
+                    )
+                    if candidate_identity == identity
+                    and candidate_generation == registry_generation
+                    and candidate
+                ),
+                [],
+            )
+        first_event = events[0] if events else None
+        if isinstance(first_event, TelegramDifferenceFailure):
+            raise RuntimeError("controlled history cursor contains a failure")
+        if isinstance(first_event, TelegramDifferenceCheckpointAdvance):
+            raise RuntimeError("controlled history cursor contains checkpoint progress")
+        if first_event is not None and first_event.source_event_id == source_event_id:
+            events.pop(0)
+        elif any(
+            not isinstance(
+                event,
+                (TelegramDifferenceFailure, TelegramDifferenceCheckpointAdvance),
+            )
+            and event.source_event_id == source_event_id
+            for event in events
+        ):
+            raise RuntimeError("controlled history cursor is out of order")
 
 
 @dataclass(slots=True)
@@ -2334,6 +2661,35 @@ class AcceptanceSpine:
         return self._roles[RuntimeRole.INGESTION].store.channel_ingestion_checkpoint(
             identity=identity,
             registry_generation=registry_generation,
+        )
+
+    def source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> TelegramHistoryProgress:
+        """Observe one generation's durable bounded-history progress."""
+        progress = self._observer.source_chat_history_progress(
+            identity=identity,
+            registry_generation=registry_generation,
+        )
+        if progress is None:
+            raise LookupError(identity)
+        return progress
+
+    def process_next_source_chat_history(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        inject_database_failure: bool = False,
+    ) -> bool:
+        """Drive one bounded historical event through Ingestion."""
+        return self._roles[RuntimeRole.INGESTION].process_source_chat_history(
+            identity=identity,
+            registry_generation=registry_generation,
+            inject_database_failure=inject_database_failure,
         )
 
     def notify_telegram_live_update(self, identity: TelegramPeerIdentity) -> None:
