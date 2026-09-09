@@ -4897,8 +4897,15 @@ class PostgresRoleStore:
                         or not boundary[len(prefix) :].isdigit()
                     ):
                         raise ValueError("Source Chat account boundary is invalid")
-                    account_create_is_after_boundary = event.from_checkpoint.seq >= int(
-                        boundary[len(prefix) :]
+                    boundary_sequence = int(boundary[len(prefix) :])
+                    account_create_is_after_boundary = (
+                        event.from_checkpoint.seq >= boundary_sequence
+                        or (
+                            event.kind is SourceEventKind.CREATE
+                            and event.transport_event_id is not None
+                            and event.transport_order is not None
+                            and event.event_time > context["processing_started_at"]
+                        )
                     )
             elif channel_route:
                 channel_pts = context["channel_pts"]

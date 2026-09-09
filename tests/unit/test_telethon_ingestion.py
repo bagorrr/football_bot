@@ -12,6 +12,7 @@ from telethon import types  # type: ignore[import-untyped]
 
 from modules.domain import (
     IngestionFailureReason,
+    IngestionFailureScope,
     InitialConsentAttestation,
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
@@ -803,6 +804,63 @@ def test_provider_rejects_basic_chat_delete_constructor_on_channel_route() -> No
     assert error.value.scope.value == "source_stream"
 
 
+@pytest.mark.parametrize(
+    "update",
+    (
+        pytest.param(
+            types.UpdateDeleteChannelMessages(99, [4], 11, 1),
+            id="wrong-channel-delete",
+        ),
+        pytest.param(
+            types.UpdateNewChannelMessage(
+                _account_message(
+                    message_id=4,
+                    identity=TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 99),
+                    event_time=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+                    body="wrong channel body",
+                ),
+                11,
+                1,
+            ),
+            id="wrong-channel-message",
+        ),
+        pytest.param(
+            types.UpdateNewMessage(
+                _account_message(
+                    message_id=4,
+                    identity=TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42),
+                    event_time=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+                    body="generic channel body",
+                ),
+                11,
+                1,
+            ),
+            id="generic-channel-message",
+        ),
+    ),
+)
+def test_provider_fails_closed_for_channel_identity_and_constructor_mismatches(
+    update: object,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [SimpleNamespace(new_messages=[], other_updates=[update], pts=11)]
+        ),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(
+            identity,
+            TelegramChannelCheckpoint(pts=10),
+            1,
+        )
+
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_INVALID
+    assert error.value.scope is IngestionFailureScope.SOURCE_STREAM
+
+
 def test_provider_fails_closed_for_malformed_in_scope_channel_message() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     checkpoint = TelegramChannelCheckpoint(pts=10)
@@ -923,6 +981,49 @@ def test_provider_accepts_valid_empty_difference_vectors(
     )
     result = TelethonProvider(
         client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    ).get_channel_difference_event(
+        identity,
+        TelegramChannelCheckpoint(pts=10),
+        1,
+    )
+
+    assert isinstance(result, TelegramDifferenceCheckpointAdvance)
+    assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
+
+
+@pytest.mark.parametrize(
+    "response",
+    (
+        SimpleNamespace(pts=11),
+        SimpleNamespace(new_messages=[], pts=11),
+        SimpleNamespace(other_updates=[], pts=11),
+    ),
+)
+def test_provider_rejects_missing_difference_collections(response: object) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([response]),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_channel_difference_event(
+            identity,
+            TelegramChannelCheckpoint(pts=10),
+            1,
+        )
+
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_INVALID
+    assert error.value.scope is IngestionFailureScope.SOURCE_STREAM
+
+
+def test_provider_accepts_typed_empty_channel_difference() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    result = TelethonProvider(
+        client=_DifferenceClientProbe(
+            [types.updates.ChannelDifferenceEmpty(pts=11, final=True)]
+        ),
         approved_source_chats=(identity,),
     ).get_channel_difference_event(
         identity,
@@ -2251,6 +2352,48 @@ def test_history_uses_ascending_lower_boundary_and_stops_at_upper_boundary() -> 
     offset_date = client.history_kwargs["offset_date"]
     assert isinstance(offset_date, datetime)
     assert offset_date < window.start_at
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        SimpleNamespace(
+            id=0,
+            peer_id=types.PeerChannel(42),
+            date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+            message="invalid id",
+        ),
+        SimpleNamespace(
+            id=1,
+            date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+            message="missing peer",
+        ),
+        SimpleNamespace(
+            id=1,
+            peer_id=types.PeerChannel(99),
+            date=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+            message="wrong peer",
+        ),
+    ),
+)
+def test_provider_fails_closed_for_malformed_history_messages(
+    message: object,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    client = _DifferenceClientProbe([], history_messages=[message])
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.get_source_chat_history_event(
+            identity,
+            1,
+            TelegramChannelCheckpoint(pts=10),
+            datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+            datetime(2026, 9, 8, 10, 0, tzinfo=UTC),
+        )
+
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_INVALID
+    assert error.value.scope is IngestionFailureScope.SOURCE_STREAM
 
 
 def test_protection_is_refreshed_before_body_access() -> None:

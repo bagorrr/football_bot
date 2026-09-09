@@ -1207,7 +1207,25 @@ class TelethonProvider:
             for message in cast(Iterator[Any], iterator):
                 message_id = getattr(message, "id", None)
                 if type(message_id) is not int or message_id < 1:
-                    continue
+                    raise TelethonTransportError(
+                        "Telegram history message identity is invalid",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    )
+                try:
+                    message_identity = self._difference_message_identity(message)
+                except Exception:
+                    raise TelethonTransportError(
+                        "Telegram history message peer is unavailable",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    ) from None
+                if message_identity != identity:
+                    raise TelethonTransportError(
+                        "Telegram history message peer does not match its Source Chat",
+                        reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                        scope=IngestionFailureScope.SOURCE_STREAM,
+                    )
                 if history_cursor is not None and message_id <= history_cursor:
                     continue
                 event_time = getattr(message, "date", None)
@@ -1432,6 +1450,54 @@ class TelethonProvider:
             messages.extend(values)
         return messages
 
+    @staticmethod
+    def _is_typed_empty_difference(
+        response: object,
+        *,
+        expected_identity: TelegramPeerIdentity | None,
+    ) -> bool:
+        """Recognize only the provider's typed empty Difference controls."""
+        try:
+            from telethon import types
+        except Exception:
+            return False
+        if expected_identity is None:
+            return isinstance(response, types.updates.DifferenceEmpty)
+        return isinstance(response, types.updates.ChannelDifferenceEmpty)
+
+    @classmethod
+    def _validate_difference_response_shape(
+        cls,
+        response: object,
+        *,
+        expected_identity: TelegramPeerIdentity | None,
+    ) -> None:
+        """Require every non-empty Difference collection before normalization."""
+        if cls._is_typed_empty_difference(
+            response,
+            expected_identity=expected_identity,
+        ):
+            return
+        missing = _MISSING
+        message_collection_found = False
+        for field_name in ("new_messages", "messages"):
+            values = getattr(response, field_name, missing)
+            if values is missing:
+                continue
+            message_collection_found = True
+            if not isinstance(values, (list, tuple)):
+                raise cls._malformed_difference_item_error(expected_identity) from None
+        encrypted_messages = getattr(response, "new_encrypted_messages", missing)
+        if encrypted_messages is not missing and not isinstance(
+            encrypted_messages, (list, tuple)
+        ):
+            raise cls._malformed_difference_item_error(expected_identity) from None
+        if not message_collection_found:
+            raise cls._malformed_difference_item_error(expected_identity) from None
+        updates = getattr(response, "other_updates", missing)
+        if updates is missing or not isinstance(updates, (list, tuple)):
+            raise cls._malformed_difference_item_error(expected_identity) from None
+
     def _pending_difference_result(
         self,
         *,
@@ -1597,6 +1663,10 @@ class TelethonProvider:
         from_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
         to_checkpoint: TelegramAccountCheckpoint | TelegramChannelCheckpoint,
     ) -> list[_TelegramPageResult | TelegramDifferenceCheckpointAdvance]:
+        self._validate_difference_response_shape(
+            response,
+            expected_identity=identity,
+        )
         normalized: list[_TelegramPageResult] = []
         seen: set[tuple[TelegramPeerIdentity, int, SourceEventKind, int | None]] = set()
         for (
@@ -1621,7 +1691,7 @@ class TelethonProvider:
             if current_identity is None:
                 continue
             if identity is not None and current_identity != identity:
-                continue
+                raise self._malformed_difference_item_error(identity) from None
             current_generation = (
                 generation
                 if identity is not None
@@ -2034,6 +2104,12 @@ class TelethonProvider:
                         raise ValueError(
                             "unsupported Telegram peer-less deletion for channel route"
                         )
+                    if not self._difference_update_constructor_matches_route(
+                        update,
+                        expected_identity=expected_identity,
+                        types=types,
+                    ):
+                        raise ValueError("unsupported Telegram deletion constructor")
                     update_identity = self._identity_from_update(update)
                     if isinstance(update, types.UpdateDeleteChannelMessages) and (
                         update_identity is None
@@ -2077,6 +2153,13 @@ class TelethonProvider:
                 if not isinstance(update, source_update_types):
                     raise ValueError("unsupported Telegram difference update")
                 item_identity = self._difference_message_identity(message)
+                if not self._difference_update_constructor_matches_route(
+                    update,
+                    expected_identity=expected_identity,
+                    types=types,
+                    message_identity=item_identity,
+                ):
+                    raise ValueError("unsupported Telegram message constructor")
                 message_id = getattr(message, "id", None)
                 if (
                     item_identity is None
@@ -2124,6 +2207,48 @@ class TelethonProvider:
                         expected_identity
                     ) from None
                 continue
+
+    @classmethod
+    def _difference_update_constructor_matches_route(
+        cls,
+        update: object,
+        *,
+        expected_identity: TelegramPeerIdentity | None,
+        types: Any,
+        message_identity: TelegramPeerIdentity | None = None,
+    ) -> bool:
+        """Require typed channel/basic-chat constructors to match their peer."""
+        channel_source_types = (
+            types.UpdateNewChannelMessage,
+            types.UpdateEditChannelMessage,
+        )
+        basic_source_types = (
+            types.UpdateNewMessage,
+            types.UpdateEditMessage,
+        )
+        if isinstance(update, channel_source_types):
+            if expected_identity is not None and (
+                expected_identity.kind is not TelegramPeerKind.CHANNEL
+            ):
+                return False
+            if message_identity is None:
+                return False
+            return message_identity.kind is TelegramPeerKind.CHANNEL
+        if isinstance(update, basic_source_types):
+            if expected_identity is not None:
+                return False
+            if message_identity is None:
+                return False
+            return message_identity.kind is TelegramPeerKind.CHAT
+        if isinstance(update, types.UpdateDeleteChannelMessages):
+            if expected_identity is not None and (
+                expected_identity.kind is not TelegramPeerKind.CHANNEL
+            ):
+                return False
+            return cls._identity_from_update(update) is not None
+        if isinstance(update, types.UpdateDeleteMessages):
+            return expected_identity is None
+        return False
 
     @staticmethod
     def _is_known_out_of_scope_message(message: object) -> bool:

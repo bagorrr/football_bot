@@ -341,6 +341,141 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     system.reset()
 
 
+def test_raw_telethon_mixed_account_page_keeps_post_boundary_chat_event(
+    fresh_database_url: str,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHAT, 4_610_109)
+    registered_at = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+    pre_boundary_at = registered_at - timedelta(seconds=1)
+    post_boundary_at = registered_at + timedelta(seconds=1)
+    entity = types.Chat(
+        id=identity.telegram_id,
+        title="raw mixed account chat",
+        photo=types.ChatPhotoEmpty(),
+        participants_count=0,
+        date=None,
+        version=1,
+        noforwards=False,
+    )
+    entity.username = "raw_mixed_account_chat"
+
+    def message(*, message_id: int, event_time: datetime, body: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=message_id,
+            peer_id=types.PeerChat(identity.telegram_id),
+            date=event_time,
+            message=body,
+            noforwards=False,
+        )
+
+    client = _RawIdentityDifferenceClient(
+        [
+            SimpleNamespace(seq=11),
+            SimpleNamespace(
+                new_messages=[],
+                other_updates=[
+                    types.UpdateNewMessage(
+                        message(
+                            message_id=910,
+                            event_time=pre_boundary_at,
+                            body="Pre-boundary body.",
+                        ),
+                        101,
+                        1,
+                    ),
+                    types.UpdateNewMessage(
+                        message(
+                            message_id=911,
+                            event_time=post_boundary_at,
+                            body="Post-boundary body.",
+                        ),
+                        102,
+                        1,
+                    ),
+                ],
+                state=SimpleNamespace(
+                    pts=102,
+                    qts=1,
+                    seq=12,
+                    date=post_boundary_at,
+                ),
+            ),
+        ],
+        {identity: entity},
+        {"@raw_mixed_account_chat": identity},
+    )
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "46103",
+    }
+    runtime = TelethonRuntime.from_mapping(
+        values,
+        client_factory=lambda _configuration: client,
+    )
+    provider = TelethonProvider(
+        client=client,
+        approved_source_chats=(identity,),
+    )
+    runtime.verify_conformance(
+        transport=provider,
+        approved_source_chats=(identity,),
+    )
+    ingestion = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=provider,
+        approved_source_chats=(identity,),
+    )
+    clock = FrozenClock(datetime(2026, 8, 12, 9, 0, tzinfo=UTC))
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=ingestion,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=46_103,
+    )
+    system.reset()
+    _register_source_chat(
+        system,
+        clock=clock,
+        registered_at=registered_at,
+        administrator_id=46_103,
+        address="@raw_mixed_account_chat",
+        update_suffix="raw-mixed-account",
+    )
+    initial_checkpoint = TelegramAccountCheckpoint(
+        pts=100,
+        qts=1,
+        seq=10,
+        date=registered_at - timedelta(minutes=1),
+    )
+    final_checkpoint = TelegramAccountCheckpoint(
+        pts=102,
+        qts=1,
+        seq=12,
+        date=post_boundary_at,
+    )
+    system.initialize_account_ingestion_checkpoint(initial_checkpoint)
+
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == initial_checkpoint
+    assert system.source_events() == ()
+    assert system.process_next_account_telegram_difference()
+    assert system.account_ingestion_checkpoint() == final_checkpoint
+    assert [event.telegram_message_id for event in system.source_events()] == [911]
+    assert system.source_events()[0].body == "Post-boundary body."
+    assert system.process_next_source_event()
+    assert [message.telegram_message_id for message in system.source_messages()] == [
+        911
+    ]
+    assert system.source_messages()[0].body == "Post-boundary body."
+    assert system.ingestion_failures() == ()
+    system.reset()
+
+
 def test_raw_telethon_reenable_rejects_pause_gap_edit_and_accepts_current_edit(
     fresh_database_url: str,
 ) -> None:
