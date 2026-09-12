@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from modules.classifier_configuration import T4ClassifierProjection
 from modules.codex_classification_adapter import (
     CodexCliClassifierAdapter,
     SubprocessCodexRunner,
@@ -21,6 +22,43 @@ from modules.ports import (
     ClassifierTransientError,
 )
 from modules.responses_classification_adapter import ResponsesClassifierAdapter
+
+
+def test_t4_role_projection_exposes_only_validated_classifier_policy() -> None:
+    projection = T4ClassifierProjection.from_t4_projection(
+        {
+            "CLASSIFIER_MODEL": "gpt-5.6-sol",
+            "CLASSIFIER_REASONING_EFFORT": "high",
+        }
+    )
+
+    assert projection.to_role_projection() == {
+        "CLASSIFIER_MODEL": "gpt-5.6-sol",
+        "CLASSIFIER_REASONING_EFFORT": "high",
+    }
+
+
+@pytest.mark.parametrize(
+    "projection",
+    (
+        {},
+        {"CLASSIFIER_MODEL": "gpt-5.6-sol"},
+        {"TELEGRAM_BOT_TOKEN": "fake-classifier-credential"},
+        {"CLASSIFIER_MODEL": "gpt-5.6-luna"},
+        {"CLASSIFIER_REASONING_EFFORT": "low"},
+        {"CLASSIFIER_MODEL": ""},
+        {"CLASSIFIER_REASONING_EFFORT": None},
+    ),
+)
+def test_t4_role_projection_fails_closed_without_exposing_values(
+    projection: dict[str, object],
+) -> None:
+    from modules.classifier_configuration import ClassifierConfigurationError
+
+    with pytest.raises(ClassifierConfigurationError) as raised:
+        T4ClassifierProjection.from_t4_projection(projection)
+
+    assert "fake-classifier-credential" not in str(raised.value)
 
 
 @dataclass(slots=True)
@@ -243,6 +281,12 @@ def test_codex_adapter_enforces_isolation_and_180_second_timeout(
         codex_executable=Path("/opt/classifier/bin/codex"),
         codex_home=codex_home,
         workspace=workspace,
+        classifier_configuration=T4ClassifierProjection.from_t4_projection(
+            {
+                "CLASSIFIER_MODEL": "gpt-5.6-sol",
+                "CLASSIFIER_REASONING_EFFORT": "high",
+            }
+        ),
         schema_paths={"source-message-classification-v2": schema},
         prompt_paths={"open-match-primary-v2": prompt},
         runner=runner,
@@ -630,6 +674,12 @@ def test_responses_adapter_is_stateless_tool_free_and_schema_strict(
     prompt.write_text("primary prompt", encoding="utf-8")
     adapter = ResponsesClassifierAdapter(
         transport=transport,
+        classifier_configuration=T4ClassifierProjection.from_t4_projection(
+            {
+                "CLASSIFIER_MODEL": "gpt-5.6-sol",
+                "CLASSIFIER_REASONING_EFFORT": "high",
+            }
+        ),
         schemas={
             "source-message-classification-v2": {
                 "type": "object",

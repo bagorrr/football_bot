@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from modules.classifier_adapter import classifier_provider_error_from_metadata
+from modules.classifier_configuration import T4ClassifierProjection
 from modules.classifier_contract import (
     ClassifierArtifactDescriptor,
     classifier_artifact_descriptor_for_primary,
@@ -41,6 +42,7 @@ class ResponsesClassifierAdapter:
         schemas: Mapping[str, dict[str, object]],
         prompt_paths: Mapping[str, Path],
         adapter_version: str,
+        classifier_configuration: T4ClassifierProjection | None = None,
         smoke_test: Callable[[], bool] | None = None,
         primary_schema_version: str | None = None,
     ) -> None:
@@ -48,6 +50,9 @@ class ResponsesClassifierAdapter:
         self._schemas = dict(schemas)
         self._prompt_paths = dict(prompt_paths)
         self._adapter_version = adapter_version
+        self._classifier_configuration = (
+            classifier_configuration or T4ClassifierProjection()
+        )
         v2_primary_available = (
             "source-message-classification-v2" in self._schemas
             and "open-match-primary-v2" in self._prompt_paths
@@ -202,14 +207,15 @@ class ResponsesClassifierAdapter:
         return f"proposal:{revision_id}"
 
     def _execute(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        configuration = self._classifier_configuration
         if (
-            request.requested_model != "gpt-5.6-sol"
-            or request.requested_reasoning_effort != "high"
+            request.requested_model != configuration.model
+            or request.requested_reasoning_effort != configuration.reasoning_effort
         ):
-            raise ValueError("classifier request does not match pinned model policy")
+            raise ValueError("classifier request does not match T4 model policy")
         payload: dict[str, object] = {
-            "model": "gpt-5.6-sol",
-            "reasoning": {"effort": "high"},
+            "model": configuration.model,
+            "reasoning": {"effort": configuration.reasoning_effort},
             "store": False,
             "tools": [],
             "input": [

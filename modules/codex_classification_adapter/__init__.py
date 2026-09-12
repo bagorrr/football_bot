@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Protocol, cast
 
 from modules.classifier_adapter import classifier_provider_error_from_metadata
+from modules.classifier_configuration import T4ClassifierProjection
 from modules.classifier_contract import (
     ClassifierArtifactDescriptor,
     classifier_artifact_descriptor_for_primary,
@@ -100,6 +101,7 @@ class CodexCliClassifierAdapter:
         runner: CodexProcessRunner,
         codex_version: str,
         adapter_version: str,
+        classifier_configuration: T4ClassifierProjection | None = None,
         smoke_test: Callable[[], bool] | None = None,
         primary_schema_version: str | None = None,
     ) -> None:
@@ -109,6 +111,9 @@ class CodexCliClassifierAdapter:
         self._schema_paths = dict(schema_paths)
         self._prompt_paths = dict(prompt_paths)
         self._runner = runner
+        self._classifier_configuration = (
+            classifier_configuration or T4ClassifierProjection()
+        )
         self._codex_version = codex_version
         self._adapter_version = adapter_version
         v2_primary_available = (
@@ -265,11 +270,12 @@ class CodexCliClassifierAdapter:
         return f"proposal:{revision_id}"
 
     def _execute(self, request: ClassifierRequest) -> ClassifierAdapterResult:
+        configuration = self._classifier_configuration
         if (
-            request.requested_model != "gpt-5.6-sol"
-            or request.requested_reasoning_effort != "high"
+            request.requested_model != configuration.model
+            or request.requested_reasoning_effort != configuration.reasoning_effort
         ):
-            raise ValueError("classifier request does not match pinned model policy")
+            raise ValueError("classifier request does not match T4 model policy")
         schema_path = self._schema_paths[request.schema_version]
         argv = (
             str(self._codex_executable),
@@ -279,9 +285,9 @@ class CodexCliClassifierAdapter:
             "--output-schema",
             str(schema_path),
             "--model",
-            "gpt-5.6-sol",
+            configuration.model,
             "-c",
-            'model_reasoning_effort="high"',
+            f'model_reasoning_effort="{configuration.reasoning_effort}"',
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",

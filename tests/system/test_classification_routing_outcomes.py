@@ -18,6 +18,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
+from modules.classifier_configuration import T4ClassifierProjection
 from modules.classifier_contract import ClassifierArtifactDescriptor
 from modules.codex_classification_adapter import CodexCliClassifierAdapter
 from modules.contracts import ContractName, JsonValue, RuntimeRole
@@ -266,6 +267,10 @@ def test_concrete_classifier_adapters_route_application_through_v2(
     adapter_kind: str, tmp_path: Path
 ) -> None:
     body = f"Concrete {adapter_kind} adapter must use the durable v2 path."
+    classifier_projection = {
+        "CLASSIFIER_MODEL": "gpt-5.6-sol",
+        "CLASSIFIER_REASONING_EFFORT": "high",
+    }
     if adapter_kind == "codex_cli":
         runner = _ApplicationCodexRunner()
         schema_path = tmp_path / "source-message-classification-v2.json"
@@ -291,6 +296,9 @@ def test_concrete_classifier_adapters_route_application_through_v2(
             runner=runner,
             codex_version="codex-test-version",
             adapter_version="codex-classifier-v1",
+            classifier_configuration=T4ClassifierProjection.from_t4_projection(
+                classifier_projection
+            ),
         )
     else:
         transport = _ApplicationResponsesTransport()
@@ -309,6 +317,9 @@ def test_concrete_classifier_adapters_route_application_through_v2(
                 "open-match-primary-v3": v3_prompt_path,
             },
             adapter_version="responses-classifier-v1",
+            classifier_configuration=T4ClassifierProjection.from_t4_projection(
+                classifier_projection
+            ),
         )
 
     # v3 is an additive tournament/open-match artifact; opponent_request must
@@ -321,6 +332,7 @@ def test_concrete_classifier_adapters_route_application_through_v2(
         telegram_id=4_900_199,
         checkpoint=4_999,
         administrator_id=49_199,
+        classifier_projection=classifier_projection,
     )
 
     assert system.process_next_contract_handoff(RuntimeRole.CLASSIFICATION)
@@ -331,6 +343,15 @@ def test_concrete_classifier_adapters_route_application_through_v2(
     assert outcomes[0].source_message_revision_id == revision_id
     assert outcomes[0].disposition == "irrelevant"
     assert outcomes[0].route == "irrelevant"
+    assert [
+        (
+            attempt.requested_model,
+            attempt.requested_reasoning_effort,
+            attempt.effective_model,
+            attempt.effective_reasoning_effort,
+        )
+        for attempt in system.classification_attempts()
+    ] == [("gpt-5.6-sol", "high", "gpt-5.6-sol", "high")]
 
     if adapter_kind == "codex_cli":
         assert runner.calls
@@ -5254,6 +5275,7 @@ def _stage_v2_source_delivery(
     telegram_id: int,
     checkpoint: int,
     administrator_id: int,
+    classifier_projection: dict[str, str] | None = None,
     adjacent_bodies: tuple[str, ...] = (),
     location_resolver: ControlledLocationResolverAdapter | None = None,
     clock: FrozenClock | None = None,
@@ -5277,6 +5299,7 @@ def _stage_v2_source_delivery(
         model=classifier,
         location_resolver=location_resolver,
         telegram_admin_user_id=administrator_id,
+        classifier_projection=classifier_projection,
     )
     system.reset()
     _register_source_chat(

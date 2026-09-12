@@ -5109,6 +5109,7 @@ def boot_acceptance_spine(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    classifier_projection: Mapping[str, object] | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately.
 
@@ -5199,6 +5200,9 @@ def boot_acceptance_spine(
                 if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
                 else None
             ),
+            classifier_projection=(
+                classifier_projection if role is RuntimeRole.CLASSIFICATION else None
+            ),
         )
 
     return AcceptanceSpine(
@@ -5223,6 +5227,7 @@ def boot_legacy_acceptance_spine(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    classifier_projection: Mapping[str, object] | None = None,
 ) -> AcceptanceSpine:
     """Boot a named legacy fixture with its compatibility opt-out enabled."""
     return boot_acceptance_spine(
@@ -5238,6 +5243,7 @@ def boot_legacy_acceptance_spine(
         date_interpretation=date_interpretation,
         timezone_data=timezone_data,
         telegram_admin_user_id=telegram_admin_user_id,
+        classifier_projection=classifier_projection,
     )
 
 
