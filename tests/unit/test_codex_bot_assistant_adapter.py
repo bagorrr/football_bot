@@ -43,6 +43,71 @@ def _controlled_codex_sdk_version(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(codex_worker, "_codex_sdk_version", lambda: "0.154.0")
 
 
+_RESULT_CONVERSATION_V2_FIXTURES = (
+    pytest.param(
+        "ru",
+        "Какое покрытие?",
+        (
+            "Матч проходит в зале, но покрытие "
+            "не указано. "
+            "Уточните у @organizer."
+        ),
+        id="ru-unknown-fact-contact",
+    ),
+    pytest.param(
+        "en",
+        "What surface does it have?",
+        (
+            "The match is indoors, but its surface isn't listed. "
+            "Ask @organizer."
+        ),
+        id="en-unknown-fact-contact",
+    ),
+    pytest.param(
+        "es",
+        "¿Qué superficie tiene?",
+        (
+            "El partido se juega en pista cubierta, pero no se indica la superficie. "
+            "Pregunta a @organizer."
+        ),
+        id="es-unknown-fact-contact",
+    ),
+    pytest.param(
+        "fr",
+        "Quelle est sa surface ?",
+        (
+            "Le match se joue en salle, mais la surface n'est pas indiquée. "
+            "Demandez à @organizer."
+        ),
+        id="fr-unknown-fact-contact",
+    ),
+    pytest.param(
+        "ru",
+        "Найди прогноз погоды в интернете.",
+        "Откройте поиск в боте, чтобы найти футбольные варианты.",
+        id="ru-general-web-redirection",
+    ),
+    pytest.param(
+        "en",
+        "Find tomorrow's weather on the web.",
+        "Use Search in the bot to find football opportunities.",
+        id="en-general-web-redirection",
+    ),
+    pytest.param(
+        "es",
+        "Busca el pronóstico del tiempo en internet.",
+        "Usa Buscar en el bot para encontrar oportunidades de fútbol.",
+        id="es-general-web-redirection",
+    ),
+    pytest.param(
+        "fr",
+        "Trouve la météo de demain sur le web.",
+        "Lancez une recherche dans le bot pour trouver des opportunités de football.",
+        id="fr-general-web-redirection",
+    ),
+)
+
+
 def test_t3_settings_are_explicit_and_fail_closed() -> None:
     settings = BotAssistantSdkSettings.from_t3_projection({})
 
@@ -267,7 +332,7 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     assert len(fake_sdk.clients) == 2
     artifact_root = Path(__file__).resolve().parents[2] / "assistant"
     prompt_artifact = json.loads(
-        (artifact_root / "prompts" / "result-conversation-v1.json").read_text()
+        (artifact_root / "prompts" / "result-conversation-v2.json").read_text()
     )
     response_contract = json.loads(
         (
@@ -321,6 +386,83 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     )
     assert rejected["failure_code"] == "invalid_configuration"
     assert untrusted_sdk.clients == []
+
+
+@pytest.mark.parametrize(
+    ("locale", "message", "reply"), _RESULT_CONVERSATION_V2_FIXTURES
+)
+def test_sdk_worker_runs_versioned_result_conversation_fixtures(
+    locale: str, message: str, reply: str
+) -> None:
+    request = _request(locale=locale, message=message)
+    payload = _input_envelope(request)
+    context = payload["context"]
+    assert isinstance(context, dict)
+    current_result = {
+        "result_id": "active:1",
+        "absolute_position": 1,
+        "result_class": "best_match",
+        "card_facts": {"format": "indoor", "contact": "@organizer"},
+    }
+    context["current_result_id"] = "active:1"
+    context["current_result"] = current_result
+    response: dict[str, object] = {
+        "reply": reply,
+        "referenced_result_id": None,
+        "candidate_result_ids": [],
+        "proposed_action": None,
+        "relaxed_criterion": None,
+    }
+    fake_sdk = _FakeSdkBindings(response=response)
+    settings = BotAssistantSdkSettings()
+
+    result = run_codex_worker_turn(
+        payload,
+        environment={
+            "PATH": os.defpath,
+            "HOME": "/tmp/isolated-home",
+            "TMPDIR": "/tmp/isolated-tmp",
+            "CODEX_HOME": "/protected/codex-subscription-store",
+            **settings.to_worker_projection(),
+        },
+        sdk_bindings=fake_sdk.bindings,
+        cwd=Path("/tmp/empty-worker"),
+    )
+
+    assert result["outcome"] == "success"
+    assert result["response"] == response
+    provenance = result["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["prompt_version"] == "result-conversation-v2"
+    client = fake_sdk.clients[0]
+    sdk_input = json.loads(client.threads[0].prompt)
+    assert sdk_input["context"]["locale"] == locale
+    assert sdk_input["context"]["current_result"] == current_result
+    assert sdk_input["policy"]["prompt_version"] == "result-conversation-v2"
+    prompt_artifact = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "assistant"
+            / "prompts"
+            / "result-conversation-v2.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert prompt_artifact["version"] == "result-conversation-v2"
+    prompt_instructions = client.thread_start_args["developer_instructions"]
+    assert isinstance(prompt_instructions, str)
+    assert prompt_instructions == prompt_artifact["developer_instructions"]
+    assert all(
+        instruction in prompt_instructions
+        for instruction in (
+            "context.locale as the confirmed Conversation Language",
+            "application-accepted Opportunity Attributes",
+            "If a requested fact is absent",
+            "point to the Contact shown",
+            "outside supported marketplace behavior",
+            "one short redirection",
+            "confirmed conversation style",
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -478,13 +620,14 @@ def _request(
     update_id: str = "turn-1",
     remaining_deadline_ms: int = 30_000,
     message: str = "What options are available?",
+    locale: str = "en",
 ) -> BotAssistantTurnRequest:
     now = datetime.now(UTC)
     return BotAssistantTurnRequest(
         turn_id=f"result-turn:{update_id}",
         update_id=update_id,
         message=message,
-        locale="en",
+        locale=locale,
         stage=ConversationStage.RESULTS,
         screen_revision=4,
         completed_search_id="completed-search:1",
@@ -498,7 +641,7 @@ def _request(
         timezone_data_version=None,
         requested_model="gpt-5.6-luna",
         requested_reasoning_effort="high",
-        prompt_version="result-conversation-v1",
+        prompt_version="result-conversation-v2",
         response_contract_version="bot-assistant-response-v1",
         context_policy_version="active-result-context-v1",
         deadline=now + timedelta(seconds=60),

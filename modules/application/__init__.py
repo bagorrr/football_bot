@@ -12314,7 +12314,7 @@ def _result_turn_request(
         ),
         requested_model=requested_model,
         requested_reasoning_effort=requested_reasoning_effort,
-        prompt_version="result-conversation-v1",
+        prompt_version="result-conversation-v2",
         response_contract_version="bot-assistant-response-v1",
         context_policy_version="active-result-context-v1",
         external_knowledge_allowed=False,
