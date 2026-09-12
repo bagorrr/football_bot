@@ -51,7 +51,6 @@ BOT_ASSISTANT_RESPONSE_SCHEMA: dict[str, object] = {
         "candidate_result_ids": {
             "type": "array",
             "items": {"type": "string"},
-            "maxItems": 1,
             "uniqueItems": True,
         },
         "proposed_action": {
@@ -308,8 +307,8 @@ def _valid_response(response: object) -> bool:
         and len(reply) <= 4_000
         and (reference is None or isinstance(reference, str))
         and isinstance(candidates, list)
-        and len(candidates) <= 1
         and all(isinstance(item, str) for item in candidates)
+        and len(candidates) == len(set(candidates))
         and (proposal is None or isinstance(proposal, dict))
         and (relaxed is None or isinstance(relaxed, str))
     )

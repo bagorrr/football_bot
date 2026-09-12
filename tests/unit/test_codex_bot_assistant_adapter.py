@@ -247,6 +247,59 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     assert untrusted_sdk.clients == []
 
 
+@pytest.mark.parametrize(
+    ("candidate_result_ids", "expected_outcome"),
+    (
+        (["active:1", "active:2", "active:3"], "success"),
+        (["active:1", "active:1"], "failure"),
+    ),
+)
+def test_sdk_worker_accepts_multiple_unique_candidate_ids_and_rejects_duplicates(
+    candidate_result_ids: list[str], expected_outcome: str
+) -> None:
+    payload = _input_envelope(_request())
+    settings = BotAssistantSdkSettings()
+    environment = {
+        "PATH": os.defpath,
+        "HOME": "/tmp/isolated-home",
+        "TMPDIR": "/tmp/isolated-tmp",
+        "CODEX_HOME": "/protected/codex-subscription-store",
+        **settings.to_worker_projection(),
+    }
+    fake_sdk = _FakeSdkBindings(
+        response={
+            "reply": "Which result do you mean?",
+            "referenced_result_id": None,
+            "candidate_result_ids": candidate_result_ids,
+            "proposed_action": None,
+            "relaxed_criterion": None,
+        }
+    )
+
+    result = run_codex_worker_turn(
+        payload,
+        environment=environment,
+        sdk_bindings=fake_sdk.bindings,
+        cwd=Path("/tmp/empty-worker"),
+    )
+
+    response_schema = fake_sdk.clients[0].threads[0].run_args["output_schema"]
+    assert isinstance(response_schema, dict)
+    properties = response_schema["properties"]
+    assert isinstance(properties, dict)
+    candidate_schema = properties["candidate_result_ids"]
+    assert isinstance(candidate_schema, dict)
+    assert "maxItems" not in candidate_schema
+    assert candidate_schema["uniqueItems"] is True
+    assert result["outcome"] == expected_outcome
+    if expected_outcome == "success":
+        response = result["response"]
+        assert isinstance(response, dict)
+        assert response["candidate_result_ids"] == candidate_result_ids
+    else:
+        assert result["failure_code"] == "malformed_output"
+
+
 class AuthenticationError(RuntimeError):
     """Synthetic subscription authentication failure."""
 
@@ -439,12 +492,17 @@ class _RecordingRunner:
 
 
 class _FakeSdkBindings:
-    def __init__(self, *, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        response: dict[str, object] | None = None,
+    ) -> None:
         self.clients: list[_FakeCodex] = []
         self.sandbox = SimpleNamespace(read_only=object())
 
         def codex_factory(config: _FakeCodexConfig) -> _FakeCodex:
-            client = _FakeCodex(config, error=error)
+            client = _FakeCodex(config, error=error, response=response)
             self.clients.append(client)
             return client
 
@@ -459,10 +517,15 @@ class _FakeCodexConfig:
 
 class _FakeCodex:
     def __init__(
-        self, config: _FakeCodexConfig, *, error: BaseException | None = None
+        self,
+        config: _FakeCodexConfig,
+        *,
+        error: BaseException | None = None,
+        response: dict[str, object] | None = None,
     ) -> None:
         self.config = config
         self.error = error
+        self.response = response
         self.thread_start_args: dict[str, object] = {}
         self.threads: list[_FakeThread] = []
 
@@ -474,16 +537,22 @@ class _FakeCodex:
 
     def thread_start(self, **kwargs: object) -> _FakeThread:
         self.thread_start_args = kwargs
-        thread = _FakeThread(error=self.error)
+        thread = _FakeThread(error=self.error, response=self.response)
         self.threads.append(thread)
         return thread
 
 
 class _FakeThread:
-    def __init__(self, *, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: BaseException | None = None,
+        response: dict[str, object] | None = None,
+    ) -> None:
         self.prompt = ""
         self.run_args: dict[str, object] = {}
         self.error = error
+        self.response = response
 
     def run(self, prompt: str, **kwargs: object) -> SimpleNamespace:
         self.prompt = prompt
@@ -492,7 +561,9 @@ class _FakeThread:
             raise self.error
         return SimpleNamespace(
             final_response=json.dumps(
-                {
+                self.response
+                if self.response is not None
+                else {
                     "reply": "A controlled answer.",
                     "referenced_result_id": None,
                     "candidate_result_ids": [],
