@@ -19,6 +19,12 @@ from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from modules.classifier_configuration import (
+    DEFAULT_CLASSIFIER_MODEL,
+    DEFAULT_CLASSIFIER_REASONING_EFFORT,
+    ClassifierConfigurationError,
+    T4ClassifierProjection,
+)
 from modules.classifier_contract import (
     OPEN_MATCH_V1_DESCRIPTOR,
     ClassifierArtifactDescriptor,
@@ -17185,6 +17191,7 @@ class RuntimeApplication:
     telegram_ingestion: TelegramIngestionAdapter | None = None
     telegram_delivery: TelegramDeliveryAdapter | None = None
     model: ModelAdapter | None = None
+    classifier_configuration: T4ClassifierProjection | None = None
     assistant_model: BotAssistantModelAdapter | None = None
     location_resolver: LocationResolverAdapter | None = None
     conversation_language: ConversationLanguageAdapter | None = None
@@ -17195,6 +17202,11 @@ class RuntimeApplication:
     search_failures_remaining: int = 0
 
     def __post_init__(self) -> None:
+        if self.role is RuntimeRole.CLASSIFICATION:
+            if self.classifier_configuration is None:
+                self.classifier_configuration = T4ClassifierProjection()
+        elif self.classifier_configuration is not None:
+            raise ClassifierConfigurationError(key="T4", status="role_unauthorized")
         if self.role is RuntimeRole.INGESTION and self.telegram_ingestion is not None:
             configure_clock = getattr(
                 self.telegram_ingestion,
@@ -19215,6 +19227,9 @@ class RuntimeApplication:
     def _classify_source_message_impl(self, incoming: ContractEnvelope) -> None:
         if self.role is not RuntimeRole.CLASSIFICATION or self.model is None:
             raise RuntimeError("only Classification executes the primary classifier")
+        configuration = self.classifier_configuration
+        if configuration is None:
+            raise RuntimeError("classification runtime has no T4 configuration")
         if self._source_message_deletion_barrier(incoming):
             self.store.consume(
                 incoming=incoming,
@@ -19296,8 +19311,8 @@ class RuntimeApplication:
             eligible_reply_context=_classifier_reply_context(
                 cast(dict[str, JsonValue] | None, payload["eligible_reply_context"])
             ),
-            requested_model="gpt-5.6-sol",
-            requested_reasoning_effort="high",
+            requested_model=configuration.model,
+            requested_reasoning_effort=configuration.reasoning_effort,
             prompt_version=artifact_descriptor.primary_prompt_version,
             schema_version=artifact_descriptor.primary_schema_version,
             glossary_version="football-opportunity-glossary-v1",
@@ -19439,8 +19454,8 @@ class RuntimeApplication:
         )
         provenance_complete = (
             _classifier_adapter_result_has_complete_provenance(result)
-            and result.effective_model == "gpt-5.6-sol"
-            and result.effective_reasoning_effort == "high"
+            and result.effective_model == configuration.model
+            and result.effective_reasoning_effort == configuration.reasoning_effort
         )
         primary_output_is_valid = classifier_output_is_schema_valid(
             result.output,
@@ -19906,6 +19921,9 @@ class RuntimeApplication:
             raise RuntimeError(
                 "only Classification executes the multi-candidate classifier"
             )
+        configuration = self.classifier_configuration
+        if configuration is None:
+            raise RuntimeError("classification runtime has no T4 configuration")
         descriptor = artifact_descriptor or self.model.artifact_descriptor
         if (
             not classifier_artifact_descriptor_is_trusted(descriptor)
@@ -19966,8 +19984,8 @@ class RuntimeApplication:
             eligible_reply_context=_classifier_reply_context(
                 cast(dict[str, JsonValue] | None, payload["eligible_reply_context"])
             ),
-            requested_model="gpt-5.6-sol",
-            requested_reasoning_effort="high",
+            requested_model=configuration.model,
+            requested_reasoning_effort=configuration.reasoning_effort,
             prompt_version=primary_prompt_version,
             schema_version=classification_schema_version,
             glossary_version="football-opportunity-glossary-v1",
@@ -20026,8 +20044,8 @@ class RuntimeApplication:
         def primary_result_is_valid(result: ClassifierAdapterResult) -> bool:
             return (
                 _classifier_adapter_result_has_complete_provenance(result)
-                and result.effective_model == "gpt-5.6-sol"
-                and result.effective_reasoning_effort == "high"
+                and result.effective_model == configuration.model
+                and result.effective_reasoning_effort == configuration.reasoning_effort
                 and classifier_output_is_schema_valid(
                     result.output,
                     body=body,
@@ -20416,8 +20434,9 @@ class RuntimeApplication:
                 raise
             second_valid = (
                 _classifier_adapter_result_has_complete_provenance(second_result)
-                and second_result.effective_model == "gpt-5.6-sol"
-                and second_result.effective_reasoning_effort == "high"
+                and second_result.effective_model == configuration.model
+                and second_result.effective_reasoning_effort
+                == configuration.reasoning_effort
                 and classifier_output_is_schema_valid(
                     second_result.output,
                     body=body,
@@ -24451,8 +24470,8 @@ def _semantic_proof_result_has_pinned_provenance(
     """Require the bounded proof pass to use the same pinned product model."""
     return (
         _classifier_adapter_result_has_complete_provenance(result)
-        and result.effective_model == "gpt-5.6-sol"
-        and result.effective_reasoning_effort == "high"
+        and result.effective_model == DEFAULT_CLASSIFIER_MODEL
+        and result.effective_reasoning_effort == DEFAULT_CLASSIFIER_REASONING_EFFORT
     )
 
 
@@ -24611,10 +24630,10 @@ def _classifier_proposal_has_pinned_provenance(
     ):
         return False
     pinned = {
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "high",
-        "effective_reasoning_effort": "high",
+        "requested_model": DEFAULT_CLASSIFIER_MODEL,
+        "effective_model": DEFAULT_CLASSIFIER_MODEL,
+        "requested_reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
+        "effective_reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
         "prompt_version": "open-match-primary-v1",
         "schema_version": "source-message-classification-v1",
         "glossary_version": "football-opportunity-glossary-v1",
@@ -24787,10 +24806,10 @@ def _v2_classifier_proposal_has_pinned_provenance(
     if adjacent_context is None:
         return False
     pinned = {
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "high",
-        "effective_reasoning_effort": "high",
+        "requested_model": DEFAULT_CLASSIFIER_MODEL,
+        "effective_model": DEFAULT_CLASSIFIER_MODEL,
+        "requested_reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
+        "effective_reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
         "prompt_version": prompt_version,
         "schema_version": descriptor.primary_schema_version,
         "glossary_version": "football-opportunity-glossary-v1",
@@ -24896,8 +24915,8 @@ def _classifier_input_manifest_hash(
             "bounded_metadata": _classifier_bounded_metadata(metadata),
             "eligible_reply_context": _classifier_reply_context(reply_context),
             "adjacent_context": list(adjacent_context),
-            "model": "gpt-5.6-sol",
-            "reasoning_effort": "high",
+            "model": DEFAULT_CLASSIFIER_MODEL,
+            "reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
             "prompt_version": prompt_version,
             "schema_version": schema_version,
             "glossary_version": "football-opportunity-glossary-v1",
@@ -24974,10 +24993,10 @@ def _classifier_execution_metadata_is_current(
     if set(metadata) != required_fields:
         return False
     expected_text = {
-        "requested_model": "gpt-5.6-sol",
-        "effective_model": "gpt-5.6-sol",
-        "requested_reasoning_effort": "high",
-        "effective_reasoning_effort": "high",
+        "requested_model": DEFAULT_CLASSIFIER_MODEL,
+        "effective_model": DEFAULT_CLASSIFIER_MODEL,
+        "requested_reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
+        "effective_reasoning_effort": DEFAULT_CLASSIFIER_REASONING_EFFORT,
         "prompt_version": prompt_version,
         "schema_version": schema_version,
         "glossary_version": "football-opportunity-glossary-v1",

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from modules.application import RuntimeApplication
+from modules.classifier_configuration import (
+    ClassifierConfigurationError,
+    T4ClassifierProjection,
+)
 from modules.contracts import RuntimeRole
 from modules.ports import (
     BotAssistantModelAdapter,
@@ -36,8 +42,19 @@ def boot_acceptance_role(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    classifier_projection: Mapping[str, object] | None = None,
 ) -> RuntimeApplication:
     """Boot exactly one role with its own least-privilege database credential."""
+    if role is RuntimeRole.CLASSIFICATION:
+        classifier_configuration = (
+            T4ClassifierProjection()
+            if classifier_projection is None
+            else T4ClassifierProjection.from_t4_projection(classifier_projection)
+        )
+    elif classifier_projection is not None:
+        raise ClassifierConfigurationError(key="T4", status="role_unauthorized")
+    else:
+        classifier_configuration = None
     return RuntimeApplication(
         role=role,
         store=PostgresRoleStore(
@@ -50,6 +67,7 @@ def boot_acceptance_role(
         telegram_ingestion=telegram_ingestion,
         telegram_delivery=telegram_delivery,
         model=model,
+        classifier_configuration=classifier_configuration,
         assistant_model=assistant_model,
         location_resolver=location_resolver,
         conversation_language=conversation_language,
