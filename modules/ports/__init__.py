@@ -343,6 +343,7 @@ class ModelAdapter(Protocol):
 
 DEFAULT_BOT_ASSISTANT_MODEL = "gpt-5.6-luna"
 DEFAULT_BOT_ASSISTANT_REASONING_EFFORT = "high"
+BOT_ASSISTANT_MODEL_POLICY_VERSION = "bot-assistant-model-policy-v1"
 
 
 @dataclass(frozen=True, slots=True)

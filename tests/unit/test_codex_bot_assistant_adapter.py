@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+import apps.codex_bot_assistant_worker as codex_worker
+import modules.codex_bot_assistant_adapter as codex_adapter
 from apps.codex_bot_assistant_worker import (
     CODEX_CONFIG_OVERRIDES,
     run_codex_worker_turn,
@@ -33,6 +35,12 @@ from modules.ports import (
     BotAssistantTransientError,
     BotAssistantTurnRequest,
 )
+
+
+@pytest.fixture(autouse=True)
+def _controlled_codex_sdk_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(codex_adapter, "_codex_sdk_version", lambda: "0.154.0")
+    monkeypatch.setattr(codex_worker, "_codex_sdk_version", lambda: "0.154.0")
 
 
 def test_t3_settings_are_explicit_and_fail_closed() -> None:
@@ -101,6 +109,43 @@ def test_adapter_sends_versioned_bounded_input_and_sanitized_environment() -> No
     assert "OPENAI_API_KEY" not in runner.environment
     assert request.remaining_deadline_ms is not None
     assert runner.timeout_seconds <= request.remaining_deadline_ms / 1_000
+
+
+def test_adapter_carries_and_verifies_exact_turn_provenance() -> None:
+    request = _request()
+    runner = _RecordingRunner(_success_output(request))
+    adapter = _adapter(runner)
+
+    assert adapter.respond(request).reply == "A controlled answer."
+
+    envelope = json.loads(runner.input_text)
+    policy = envelope["policy"]
+    assert isinstance(policy, dict)
+    assert set(policy) == {
+        "prompt_version",
+        "response_contract_version",
+        "context_policy_version",
+        "external_knowledge_allowed",
+        "resolver_version",
+        "glossary_version",
+        "sdk_version",
+        "model_policy_version",
+        "adapter_version",
+    }
+    assert policy["prompt_version"] == request.prompt_version
+    assert policy["response_contract_version"] == request.response_contract_version
+    assert policy["context_policy_version"] == request.context_policy_version
+    assert policy["resolver_version"] == request.resolver_version
+    assert policy["glossary_version"].startswith("sha256:")
+    assert policy["sdk_version"] == "0.154.0"
+    assert policy["model_policy_version"] == "bot-assistant-model-policy-v1"
+    assert policy["adapter_version"] == adapter.adapter_version
+    assert json.loads(runner.output)["provenance"] == policy
+
+    forged_output = json.loads(_success_output(request))
+    forged_output["provenance"]["prompt_version"] = "another-prompt-v1"
+    with pytest.raises(BotAssistantSdkAdapterError, match="provenance"):
+        _adapter(_RecordingRunner(json.dumps(forged_output))).respond(request)
 
 
 def test_adapter_returns_multiple_candidate_result_ids_to_application() -> None:
@@ -220,6 +265,24 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     assert first["outcome"] == second["outcome"] == "success"
     assert first["turn_id"] != second["turn_id"]
     assert len(fake_sdk.clients) == 2
+    artifact_root = Path(__file__).resolve().parents[2] / "assistant"
+    prompt_artifact = json.loads(
+        (artifact_root / "prompts" / "result-conversation-v1.json").read_text()
+    )
+    response_contract = json.loads(
+        (
+            artifact_root / "response-contracts" / "bot-assistant-response-v1.json"
+        ).read_text()
+    )
+    assert (
+        fake_sdk.clients[0].thread_start_args["developer_instructions"]
+        == prompt_artifact["developer_instructions"]
+    )
+    assert (
+        fake_sdk.clients[0].threads[0].run_args["output_schema"]
+        == response_contract["schema"]
+    )
+    assert first["provenance"] == _input_envelope(_request())["policy"]
     for client in fake_sdk.clients:
         assert client.thread_start_args["ephemeral"] is True
         assert client.thread_start_args["model"] == "gpt-5.6-luna"
@@ -258,6 +321,46 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     )
     assert rejected["failure_code"] == "invalid_configuration"
     assert untrusted_sdk.clients == []
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_version"),
+    (
+        ("prompt_version", "unregistered-prompt-v99"),
+        ("response_contract_version", "unregistered-contract-v99"),
+        ("context_policy_version", "unregistered-context-v99"),
+        ("glossary_version", f"sha256:{'0' * 64}"),
+        ("sdk_version", "0.154.1"),
+        ("model_policy_version", "bot-assistant-model-policy-v99"),
+        ("adapter_version", "codex-sdk-worker-v99"),
+    ),
+)
+def test_sdk_worker_rejects_unbound_per_turn_provenance(
+    field: str, invalid_version: str
+) -> None:
+    payload = _input_envelope(_request())
+    policy = payload["policy"]
+    assert isinstance(policy, dict)
+    policy[field] = invalid_version
+    settings = BotAssistantSdkSettings()
+    fake_sdk = _FakeSdkBindings()
+
+    result = run_codex_worker_turn(
+        payload,
+        environment={
+            "PATH": os.defpath,
+            "HOME": "/tmp/isolated-home",
+            "TMPDIR": "/tmp/isolated-tmp",
+            "CODEX_HOME": "/protected/codex-subscription-store",
+            **settings.to_worker_projection(),
+        },
+        sdk_bindings=fake_sdk.bindings,
+        cwd=Path("/tmp/empty-worker"),
+    )
+
+    assert result["outcome"] == "failure"
+    assert result["failure_code"] == "invalid_configuration"
+    assert fake_sdk.clients == []
 
 
 @pytest.mark.parametrize(
@@ -405,36 +508,11 @@ def _request(
 
 
 def _input_envelope(request: BotAssistantTurnRequest) -> dict[str, object]:
-    return {
-        "version": 1,
-        "turn_id": request.turn_id,
-        "remaining_deadline_ms": request.remaining_deadline_ms,
-        "idempotency_identity": request.update_id,
-        "requested_model": request.requested_model,
-        "requested_reasoning_effort": request.requested_reasoning_effort,
-        "context": {
-            "message": request.message,
-            "locale": request.locale,
-            "stage": request.stage.value,
-            "screen_revision": request.screen_revision,
-            "completed_search_id": request.completed_search_id,
-            "current_result_id": None,
-            "current_result": None,
-            "alternative_results": [],
-            "transcript": [],
-            "current_time": request.current_time.isoformat(),
-            "iana_timezone": None,
-            "local_date": None,
-            "timezone_data_version": None,
-        },
-        "policy": {
-            "prompt_version": request.prompt_version,
-            "response_contract_version": request.response_contract_version,
-            "context_policy_version": request.context_policy_version,
-            "external_knowledge_allowed": False,
-            "resolver_version": request.resolver_version,
-        },
-    }
+    assert request.remaining_deadline_ms is not None
+    return codex_adapter._worker_input_envelope(
+        request,
+        remaining_deadline_ms=request.remaining_deadline_ms,
+    )
 
 
 def _success_output(
@@ -452,6 +530,7 @@ def _success_output(
             "effective_reasoning_effort": "high",
             "outcome": "success",
             "failure_code": None,
+            "provenance": _input_envelope(request)["policy"],
             "response": {
                 "reply": "A controlled answer.",
                 "referenced_result_id": None,
@@ -474,6 +553,7 @@ def _failure_output(request: BotAssistantTurnRequest, failure_code: str) -> str:
             "effective_reasoning_effort": "high",
             "outcome": "failure",
             "failure_code": failure_code,
+            "provenance": _input_envelope(request)["policy"],
             "response": None,
         }
     )

@@ -1,0 +1,21 @@
+{
+  "version": "active-result-context-v1",
+  "context_fields": [
+    "message",
+    "locale",
+    "stage",
+    "screen_revision",
+    "completed_search_id",
+    "current_result_id",
+    "current_result",
+    "alternative_results",
+    "transcript",
+    "current_time",
+    "iana_timezone",
+    "local_date",
+    "timezone_data_version"
+  ],
+  "allowed_locales": ["ru", "en", "es", "fr"],
+  "allowed_stages": ["results"],
+  "external_knowledge_allowed": false
+}

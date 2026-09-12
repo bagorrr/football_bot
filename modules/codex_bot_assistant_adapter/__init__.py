@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -12,6 +13,8 @@ import tempfile
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from pathlib import Path
 from threading import BoundedSemaphore
 from time import monotonic
@@ -19,6 +22,7 @@ from typing import Protocol, cast
 
 from modules.contracts import JsonValue
 from modules.ports import (
+    BOT_ASSISTANT_MODEL_POLICY_VERSION,
     DEFAULT_BOT_ASSISTANT_MODEL,
     DEFAULT_BOT_ASSISTANT_REASONING_EFFORT,
     BotAssistantExecutionTimeoutError,
@@ -41,6 +45,7 @@ T3_BOT_ASSISTANT_CONFIG_KEYS = frozenset(
 MAX_BOT_ASSISTANT_SDK_SLOTS = 4
 BOT_ASSISTANT_WORKER_INPUT_VERSION = 1
 BOT_ASSISTANT_WORKER_OUTPUT_VERSION = 1
+BOT_ASSISTANT_ADAPTER_VERSION = "codex-sdk-worker-v1"
 MAX_BOT_ASSISTANT_WORKER_INPUT_BYTES = 64 * 1024
 MAX_BOT_ASSISTANT_WORKER_OUTPUT_BYTES = 16 * 1024
 QUICK_TECHNICAL_RETRY_SECONDS = 2.0
@@ -55,6 +60,7 @@ _OUTPUT_FIELDS = {
     "outcome",
     "failure_code",
     "response",
+    "provenance",
 }
 _RESPONSE_FIELDS = {
     "reply",
@@ -75,6 +81,21 @@ _TERMINAL_FAILURE_CODES = {
 
 class BotAssistantSdkAdapterError(RuntimeError):
     """A terminal worker, provider, configuration, or envelope failure."""
+
+
+def _codex_sdk_version() -> str:
+    try:
+        return package_version("openai-codex")
+    except PackageNotFoundError:
+        raise BotAssistantSdkAdapterError(
+            "Codex SDK package version is unavailable"
+        ) from None
+
+
+def _glossary_version() -> str:
+    glossary_path = Path(__file__).resolve().parents[2] / "CONTEXT.md"
+    digest = hashlib.sha256(glossary_path.read_bytes()).hexdigest()
+    return f"sha256:{digest}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +255,7 @@ class CodexSdkBotAssistantAdapter(BotAssistantModelAdapter):
 
     @property
     def adapter_version(self) -> str:
-        return "codex-sdk-worker-v1"
+        return BOT_ASSISTANT_ADAPTER_VERSION
 
     def respond(self, request: BotAssistantTurnRequest) -> BotAssistantResponse:
         """Run one bounded SDK turn and return only its strict response envelope."""
@@ -271,6 +292,7 @@ class CodexSdkBotAssistantAdapter(BotAssistantModelAdapter):
                 request,
                 remaining_deadline_ms=max(1, int(remaining_seconds * 1_000)),
             )
+            provenance = envelope["policy"]
             input_text = json.dumps(
                 envelope,
                 ensure_ascii=False,
@@ -335,6 +357,7 @@ class CodexSdkBotAssistantAdapter(BotAssistantModelAdapter):
                 request=request,
                 elapsed_seconds=monotonic() - started,
                 deadline=deadline,
+                expected_provenance=provenance,
             )
         finally:
             self._slots.release()
@@ -385,8 +408,12 @@ def _worker_input_envelope(
             "prompt_version": request.prompt_version,
             "response_contract_version": request.response_contract_version,
             "context_policy_version": request.context_policy_version,
-            "external_knowledge_allowed": False,
+            "external_knowledge_allowed": request.external_knowledge_allowed,
             "resolver_version": request.resolver_version,
+            "glossary_version": _glossary_version(),
+            "sdk_version": _codex_sdk_version(),
+            "model_policy_version": BOT_ASSISTANT_MODEL_POLICY_VERSION,
+            "adapter_version": BOT_ASSISTANT_ADAPTER_VERSION,
         },
     }
 
@@ -414,6 +441,7 @@ def _parse_worker_output(
     request: BotAssistantTurnRequest,
     elapsed_seconds: float,
     deadline: float,
+    expected_provenance: object,
 ) -> BotAssistantResponse:
     if not isinstance(raw_output, str) or len(raw_output.encode("utf-8")) > (
         MAX_BOT_ASSISTANT_WORKER_OUTPUT_BYTES
@@ -436,6 +464,18 @@ def _parse_worker_output(
         or output["requested_reasoning_effort"] != request.requested_reasoning_effort
         or output["effective_reasoning_effort"] != request.requested_reasoning_effort
     ):
+        raise BotAssistantSdkAdapterError(
+            "Bot Assistant worker policy provenance failed"
+        )
+    if (
+        output["outcome"] == "failure"
+        and output["failure_code"] == "invalid_configuration"
+        and output["provenance"] is None
+    ):
+        raise BotAssistantSdkAdapterError(
+            "Bot Assistant worker rejected its configuration or artifact versions"
+        )
+    if output["provenance"] != expected_provenance:
         raise BotAssistantSdkAdapterError(
             "Bot Assistant worker policy provenance failed"
         )
