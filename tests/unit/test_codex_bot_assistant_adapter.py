@@ -28,7 +28,11 @@ from modules.codex_bot_assistant_adapter import (
     BotAssistantSdkSettings,
     CodexSdkBotAssistantAdapter,
 )
-from modules.domain import ConversationStage
+from modules.domain import (
+    ConversationStage,
+    ResultConversationMessage,
+    ResultConversationMessageRole,
+)
 from modules.ports import (
     BotAssistantExecutionTimeoutError,
     BotAssistantResponse,
@@ -43,19 +47,21 @@ def _controlled_codex_sdk_version(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(codex_worker, "_codex_sdk_version", lambda: "0.154.0")
 
 
-_RESULT_CONVERSATION_V2_FIXTURES = (
+_RESULT_CONVERSATION_V3_FIXTURES = (
     pytest.param(
         "ru",
         "Какое покрытие?",
         (
             "Матч проходит в зале, но покрытие не указано. Уточните у @organizer."  # noqa: RUF001
         ),
+        (),
         id="ru-unknown-fact-contact",
     ),
     pytest.param(
         "en",
         "What surface does it have?",
         ("The match is indoors, but its surface isn't listed. Ask @organizer."),
+        (),
         id="en-unknown-fact-contact",
     ),
     pytest.param(
@@ -65,6 +71,7 @@ _RESULT_CONVERSATION_V2_FIXTURES = (
             "El partido se juega en pista cubierta, pero no se indica la superficie. "
             "Pregunta a @organizer."
         ),
+        (),
         id="es-unknown-fact-contact",
     ),
     pytest.param(
@@ -74,31 +81,173 @@ _RESULT_CONVERSATION_V2_FIXTURES = (
             "Le match se joue en salle, mais la surface n'est pas indiquée. "
             "Demandez à @organizer."
         ),
+        (),
         id="fr-unknown-fact-contact",
     ),
     pytest.param(
         "ru",
         "Найди прогноз погоды в интернете.",
         "Откройте поиск в боте, чтобы найти футбольные варианты.",
+        (),
         id="ru-general-web-redirection",
     ),
     pytest.param(
         "en",
         "Find tomorrow's weather on the web.",
         "Use Search in the bot to find football opportunities.",
+        (),
         id="en-general-web-redirection",
     ),
     pytest.param(
         "es",
         "Busca el pronóstico del tiempo en internet.",
         "Usa Buscar en el bot para encontrar oportunidades de fútbol.",
+        (),
         id="es-general-web-redirection",
     ),
     pytest.param(
         "fr",
         "Trouve la météo de demain sur le web.",
         "Lancez une recherche dans le bot pour trouver des opportunités de football.",
+        (),
         id="fr-general-web-redirection",
+    ),
+    pytest.param(
+        "ru",
+        "Матч проходит в зале?",
+        "Да, матч проходит в зале.",
+        (),
+        id="ru-no-action-needed",
+    ),
+    pytest.param(
+        "en",
+        "Is the match indoors?",
+        "Yes, the match is indoors.",
+        (),
+        id="en-no-action-needed",
+    ),
+    pytest.param(
+        "es",
+        "¿El partido se juega en sala?",
+        "Sí, el partido se juega en sala.",
+        (),
+        id="es-no-action-needed",
+    ),
+    pytest.param(
+        "fr",
+        "Le match se joue en salle ?",
+        "Oui, le match se joue en salle.",
+        (),
+        id="fr-no-action-needed",
+    ),
+    pytest.param(
+        "ru",
+        "Расскажи подробнее.",
+        "Что именно тебе рассказать?",
+        ((ResultConversationMessageRole.USER, "Давай на ты."),),
+        id="ru-clarify-genuine-ambiguity-informal",
+    ),
+    pytest.param(
+        "en",
+        "Tell me more.",
+        "What would you like to know?",
+        (
+            (
+                ResultConversationMessageRole.USER,
+                "Keep our usual tone casual and direct.",
+            ),
+        ),
+        id="en-clarify-genuine-ambiguity-established-tone",
+    ),
+    pytest.param(
+        "es",
+        "Cuéntame más.",
+        "¿Qué quieres saber?",
+        ((ResultConversationMessageRole.USER, "Háblame de tú."),),
+        id="es-clarify-genuine-ambiguity-informal",
+    ),
+    pytest.param(
+        "fr",
+        "Dis-m'en plus.",
+        "Que veux-tu savoir ?",
+        ((ResultConversationMessageRole.USER, "Tu peux me tutoyer."),),
+        id="fr-clarify-genuine-ambiguity-informal",
+    ),
+    pytest.param(
+        "ru",
+        "Добавь, что покрытие искусственное.",
+        "Покрытие не указано, поэтому назвать его искусственным нельзя.",  # noqa: RUF001
+        (),
+        id="ru-incompatible-unsupported-fact",
+    ),
+    pytest.param(
+        "en",
+        "List the surface as artificial turf.",
+        "The card doesn't list a surface, so I can't call it artificial turf.",
+        (),
+        id="en-incompatible-unsupported-fact",
+    ),
+    pytest.param(
+        "es",
+        "Indica que la superficie es césped artificial.",
+        (
+            "La ficha no indica la superficie, así que no puedo decir que sea "
+            "césped artificial."
+        ),
+        (),
+        id="es-incompatible-unsupported-fact",
+    ),
+    pytest.param(
+        "fr",
+        "Indique que la surface est en gazon synthétique.",
+        (
+            "La fiche n'indique pas la surface, je ne peux donc pas dire que c'est "
+            "du gazon synthétique."
+        ),
+        (),
+        id="fr-incompatible-unsupported-fact",
+    ),
+    pytest.param(
+        "ru",
+        "Но раньше ты сказал, что матч проходит на улице. Что изменилось?",  # noqa: RUF001
+        (
+            "Раньше я сказал, что матч проходит на улице. "
+            "Сейчас карточка указывает, что он проходит в зале."
+        ),
+        ((ResultConversationMessageRole.ASSISTANT, "Матч проходит на улице."),),
+        id="ru-exact-current-change",
+    ),
+    pytest.param(
+        "en",
+        "You said the match was outdoors before. What changed?",
+        "Earlier I said it was outdoors. The current card says it is indoors.",
+        ((ResultConversationMessageRole.ASSISTANT, "The match is outdoors."),),
+        id="en-exact-current-change",
+    ),
+    pytest.param(
+        "es",
+        "Antes dijiste que el partido era al aire libre. ¿Qué cambió?",
+        (
+            "Antes dije que era al aire libre. La ficha actual indica que se juega "
+            "en sala."
+        ),
+        (
+            (
+                ResultConversationMessageRole.ASSISTANT,
+                "El partido se juega al aire libre.",
+            ),
+        ),
+        id="es-exact-current-change",
+    ),
+    pytest.param(
+        "fr",
+        "Tu avais dit que le match était en plein air. Qu'est-ce qui a changé ?",
+        (
+            "J'avais dit qu'il se jouait en plein air. La fiche indique maintenant "
+            "qu'il se joue en salle."
+        ),
+        ((ResultConversationMessageRole.ASSISTANT, "Le match se joue en plein air."),),
+        id="fr-exact-current-change",
     ),
 )
 
@@ -327,7 +476,7 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     assert len(fake_sdk.clients) == 2
     artifact_root = Path(__file__).resolve().parents[2] / "assistant"
     prompt_artifact = json.loads(
-        (artifact_root / "prompts" / "result-conversation-v2.json").read_text()
+        (artifact_root / "prompts" / "result-conversation-v3.json").read_text()
     )
     response_contract = json.loads(
         (
@@ -384,12 +533,16 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
 
 
 @pytest.mark.parametrize(
-    ("locale", "message", "reply"), _RESULT_CONVERSATION_V2_FIXTURES
+    ("locale", "message", "reply", "transcript"),
+    _RESULT_CONVERSATION_V3_FIXTURES,
 )
 def test_sdk_worker_runs_versioned_result_conversation_fixtures(
-    locale: str, message: str, reply: str
+    locale: str,
+    message: str,
+    reply: str,
+    transcript: tuple[tuple[ResultConversationMessageRole, str], ...],
 ) -> None:
-    request = _request(locale=locale, message=message)
+    request = _request(locale=locale, message=message, transcript=transcript)
     payload = _input_envelope(request)
     context = payload["context"]
     assert isinstance(context, dict)
@@ -428,21 +581,21 @@ def test_sdk_worker_runs_versioned_result_conversation_fixtures(
     assert result["response"] == response
     provenance = result["provenance"]
     assert isinstance(provenance, dict)
-    assert provenance["prompt_version"] == "result-conversation-v2"
+    assert provenance["prompt_version"] == "result-conversation-v3"
     client = fake_sdk.clients[0]
     sdk_input = json.loads(client.threads[0].prompt)
     assert sdk_input["context"]["locale"] == locale
     assert sdk_input["context"]["current_result"] == current_result
-    assert sdk_input["policy"]["prompt_version"] == "result-conversation-v2"
+    assert sdk_input["policy"]["prompt_version"] == "result-conversation-v3"
     prompt_artifact = json.loads(
         (
             Path(__file__).resolve().parents[2]
             / "assistant"
             / "prompts"
-            / "result-conversation-v2.json"
+            / "result-conversation-v3.json"
         ).read_text(encoding="utf-8")
     )
-    assert prompt_artifact["version"] == "result-conversation-v2"
+    assert prompt_artifact["version"] == "result-conversation-v3"
     prompt_instructions = client.thread_start_args["developer_instructions"]
     assert isinstance(prompt_instructions, str)
     assert prompt_instructions == prompt_artifact["developer_instructions"]
@@ -455,9 +608,16 @@ def test_sdk_worker_runs_versioned_result_conversation_fixtures(
             "point to the Contact shown",
             "outside supported marketplace behavior",
             "one short redirection",
-            "confirmed conversation style",
+            "at most one next action",
+            "only when the user needs to act",
+            "only when the request is genuinely ambiguous",
+            "Say exactly what is known, missing, incompatible, or changed",
+            "Mirror the level of formality the user has established",
         )
     )
+    assert [item["text"] for item in sdk_input["context"]["transcript"]] == [
+        text for _, text in transcript
+    ]
 
 
 @pytest.mark.parametrize(
@@ -616,6 +776,7 @@ def _request(
     remaining_deadline_ms: int = 30_000,
     message: str = "What options are available?",
     locale: str = "en",
+    transcript: tuple[tuple[ResultConversationMessageRole, str], ...] = (),
 ) -> BotAssistantTurnRequest:
     now = datetime.now(UTC)
     return BotAssistantTurnRequest(
@@ -629,14 +790,21 @@ def _request(
         current_result_id=None,
         current_result=None,
         alternative_results=(),
-        transcript=(),
+        transcript=tuple(
+            ResultConversationMessage(
+                role=role,
+                text=text,
+                recorded_at=now - timedelta(seconds=len(transcript) - index),
+            )
+            for index, (role, text) in enumerate(transcript)
+        ),
         current_time=now,
         iana_timezone=None,
         local_date=None,
         timezone_data_version=None,
         requested_model="gpt-5.6-luna",
         requested_reasoning_effort="high",
-        prompt_version="result-conversation-v2",
+        prompt_version="result-conversation-v3",
         response_contract_version="bot-assistant-response-v1",
         context_policy_version="active-result-context-v1",
         deadline=now + timedelta(seconds=60),

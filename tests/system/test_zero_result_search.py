@@ -218,7 +218,7 @@ def test_result_turn_preserves_four_language_model_policy(
     assert len(assistant.requests) == 1
     request = assistant.requests[0]
     assert request.locale == locale
-    assert request.prompt_version == "result-conversation-v2"
+    assert request.prompt_version == "result-conversation-v3"
     assert request.requested_model == "gpt-5.6-luna"
     assert request.requested_reasoning_effort == "high"
     assert request.remaining_deadline_ms is not None
