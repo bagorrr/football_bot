@@ -478,7 +478,6 @@ def _parse_worker_output(
             and not isinstance(referenced_result_id, str)
         )
         or not isinstance(candidate_result_ids, list)
-        or len(candidate_result_ids) > 1
         or not all(isinstance(result_id, str) for result_id in candidate_result_ids)
         or (proposed_action is not None and not isinstance(proposed_action, dict))
         or (relaxed_criterion is not None and not isinstance(relaxed_criterion, str))

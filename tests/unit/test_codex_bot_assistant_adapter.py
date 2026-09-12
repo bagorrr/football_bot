@@ -103,6 +103,19 @@ def test_adapter_sends_versioned_bounded_input_and_sanitized_environment() -> No
     assert runner.timeout_seconds <= request.remaining_deadline_ms / 1_000
 
 
+def test_adapter_returns_multiple_candidate_result_ids_to_application() -> None:
+    request = _request()
+    candidate_ids = ("active:1", "active:2")
+    adapter = _adapter(
+        _RecordingRunner(_success_output(request, candidate_result_ids=candidate_ids))
+    )
+
+    assert adapter.respond(request) == BotAssistantResponse(
+        reply="A controlled answer.",
+        candidate_result_ids=candidate_ids,
+    )
+
+
 @pytest.mark.parametrize("failure_code", ("authentication", "quota", "renewal"))
 def test_subscription_failures_are_terminal_and_never_retry(
     failure_code: str,
@@ -424,7 +437,11 @@ def _input_envelope(request: BotAssistantTurnRequest) -> dict[str, object]:
     }
 
 
-def _success_output(request: BotAssistantTurnRequest) -> str:
+def _success_output(
+    request: BotAssistantTurnRequest,
+    *,
+    candidate_result_ids: tuple[str, ...] = (),
+) -> str:
     return json.dumps(
         {
             "version": 1,
@@ -438,7 +455,7 @@ def _success_output(request: BotAssistantTurnRequest) -> str:
             "response": {
                 "reply": "A controlled answer.",
                 "referenced_result_id": None,
-                "candidate_result_ids": [],
+                "candidate_result_ids": list(candidate_result_ids),
                 "proposed_action": None,
                 "relaxed_criterion": None,
             },
