@@ -1,0 +1,35 @@
+{
+  "version": "bot-assistant-response-v1",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "reply": {"type": "string", "minLength": 1, "maxLength": 4000},
+      "referenced_result_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+      "candidate_result_ids": {
+        "type": "array",
+        "items": {"type": "string"},
+        "uniqueItems": true
+      },
+      "proposed_action": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {"type": "string"},
+              "criterion": {"type": "string"},
+              "operation": {"type": "string"},
+              "value": {},
+              "relaxed_criterion": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            },
+            "required": ["kind", "criterion", "operation", "value", "relaxed_criterion"],
+            "additionalProperties": false
+          },
+          {"type": "null"}
+        ]
+      },
+      "relaxed_criterion": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    },
+    "required": ["reply", "referenced_result_id", "candidate_result_ids", "proposed_action", "relaxed_criterion"],
+    "additionalProperties": false
+  }
+}

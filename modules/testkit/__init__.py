@@ -104,6 +104,8 @@ from modules.domain import (
     TelegramProtectionUnavailableEvent,
 )
 from modules.ports import (
+    DEFAULT_BOT_ASSISTANT_MODEL,
+    DEFAULT_BOT_ASSISTANT_REASONING_EFFORT,
     AcceptanceObserver,
     BotAssistantModelAdapter,
     BotAssistantTransientError,
@@ -1544,10 +1546,10 @@ class ControlledBotAssistantModelAdapter:
     _responses: dict[str, BotAssistantResponse] = field(default_factory=dict)
     _failures: list[BaseException] = field(default_factory=list)
     requests: list[BotAssistantTurnRequest] = field(default_factory=list)
-    requested_model: str = "gpt-5.6-sol"
-    requested_reasoning_effort: str = "high"
-    effective_model: str = "gpt-5.6-sol"
-    effective_reasoning_effort: str = "high"
+    requested_model: str = DEFAULT_BOT_ASSISTANT_MODEL
+    requested_reasoning_effort: str = DEFAULT_BOT_ASSISTANT_REASONING_EFFORT
+    effective_model: str = DEFAULT_BOT_ASSISTANT_MODEL
+    effective_reasoning_effort: str = DEFAULT_BOT_ASSISTANT_REASONING_EFFORT
     adapter_version: str = "result-conversation-recording-v1"
     response_delay_seconds: float = 0.0
 
