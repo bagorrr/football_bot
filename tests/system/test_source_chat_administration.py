@@ -37,6 +37,7 @@ from modules.domain import (
 from modules.ports import ClassifierAdapterResult
 from modules.testkit import (
     AcceptanceSpine,
+    ControlledBotAssistantModelAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -52,6 +53,7 @@ from modules.testkit import (
 
 def test_administration_requires_the_exact_configured_telegram_user_id() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
+    assistant = ControlledBotAssistantModelAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 12, 0, tzinfo=UTC))
     administrator_id = 46_001
     ordinary_user_id = 46_002
@@ -60,6 +62,7 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
         clock=clock,
         telegram_delivery=telegram,
         model=ControlledModelAdapter(),
+        assistant_model=assistant,
         location_resolver=ControlledLocationResolverAdapter(),
         telegram_admin_user_id=administrator_id,
     )
@@ -181,6 +184,13 @@ def test_administration_requires_the_exact_configured_telegram_user_id() -> None
     assert audit_message.button_rows == (
         (("Back", f"administration:back:{audit_message.screen_revision}"),),
     )
+    system.select_administration_action(
+        update_id="source-data-deletion:administrator",
+        telegram_user_id=administrator_id,
+        action="source-data-deletion",
+    )
+    assert "Source Data Deletion Requests" in telegram.messages[-1].text
+    assert assistant.requests == []
 
     rotated_system = boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],

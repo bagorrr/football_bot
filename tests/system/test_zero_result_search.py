@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, date, datetime, timedelta
@@ -178,6 +179,59 @@ def test_result_turn_is_bounded_to_active_context_and_replays_once() -> None:
     assert len(telegram.messages) == before_messages + 1
     assert len(assistant.requests) == 1
     assert len(system.result_conversation(user_id).messages) == 2
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("locale", "reply"),
+    (
+        ("ru", "Подходящие варианты есть."),
+        ("en", "There are suitable options."),
+        ("es", "Hay opciones adecuadas."),
+        ("fr", "Il existe des options adaptées."),
+    ),
+)
+def test_result_turn_preserves_four_language_model_policy(
+    locale: str, reply: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="modules.application")
+    system, telegram, assistant, _clock = _boot_search_system_with_assistant_model()
+    user_id = 44_098
+    _advance_to_complete_draft(system, user_id=user_id, locale=locale)
+    system.submit_search(
+        update_id=f"language-search-{locale}",
+        telegram_user_id=user_id,
+    )
+    system.process_searches_until_idle()
+    assistant.return_for(
+        text="What options are available?",
+        response=BotAssistantResponse(reply=reply),
+    )
+
+    system.answer_result_message(
+        update_id=f"language-turn-{locale}",
+        telegram_user_id=user_id,
+        text="What options are available?",
+    )
+
+    assert telegram.messages[-1].text == reply
+    assert len(assistant.requests) == 1
+    request = assistant.requests[0]
+    assert request.locale == locale
+    assert request.requested_model == "gpt-5.6-luna"
+    assert request.requested_reasoning_effort == "high"
+    assert request.remaining_deadline_ms is not None
+    assert 0 < request.remaining_deadline_ms <= 60_000
+    turn_record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "bot_assistant_turn_outcome", None) == "succeeded"
+    )
+    fields = turn_record.__dict__
+    assert fields["bot_assistant_requested_model"] == "gpt-5.6-luna"
+    assert fields["bot_assistant_effective_model"] == "gpt-5.6-luna"
+    assert fields["bot_assistant_requested_reasoning_effort"] == "high"
+    assert fields["bot_assistant_effective_reasoning_effort"] == "high"
     system.reset()
 
 

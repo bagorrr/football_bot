@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
@@ -118,6 +119,8 @@ from modules.domain import (
     telegram_moderation_triggers,
 )
 from modules.ports import (
+    DEFAULT_BOT_ASSISTANT_MODEL,
+    DEFAULT_BOT_ASSISTANT_REASONING_EFFORT,
     AcceptanceRoleStore,
     BotAssistantExecutionTimeoutError,
     BotAssistantFailure,
@@ -5795,6 +5798,16 @@ class ConversationOnboarding:
                 conversation=conversation,
                 now=turn_started_at,
                 deadline=turn_deadline,
+                requested_model=(
+                    self._assistant_model.requested_model
+                    if self._assistant_model is not None
+                    else DEFAULT_BOT_ASSISTANT_MODEL
+                ),
+                requested_reasoning_effort=(
+                    self._assistant_model.requested_reasoning_effort
+                    if self._assistant_model is not None
+                    else DEFAULT_BOT_ASSISTANT_REASONING_EFFORT
+                ),
             )
             response: BotAssistantResponse | None = None
             failure_type: str | None = None
@@ -5929,6 +5942,35 @@ class ConversationOnboarding:
                 text=reply,
                 selection=self._language_rendering(current.locale or "en"),
             )
+            assistant_model = self._assistant_model
+            logging.getLogger(__name__).info(
+                "bot_assistant_turn_completed",
+                extra={
+                    "bot_assistant_turn_outcome": (
+                        "failed" if failure_type is not None else "succeeded"
+                    ),
+                    "bot_assistant_requested_model": request.requested_model,
+                    "bot_assistant_effective_model": (
+                        str(getattr(assistant_model, "effective_model", "unavailable"))
+                        if assistant_model is not None
+                        else "unavailable"
+                    ),
+                    "bot_assistant_requested_reasoning_effort": (
+                        request.requested_reasoning_effort
+                    ),
+                    "bot_assistant_effective_reasoning_effort": (
+                        str(
+                            getattr(
+                                assistant_model,
+                                "effective_reasoning_effort",
+                                "unavailable",
+                            )
+                        )
+                        if assistant_model is not None
+                        else "unavailable"
+                    ),
+                },
+            )
             committed = self._store.commit_result_conversation_turn(
                 update_id=update_id,
                 telegram_user_id=telegram_user_id,
@@ -5963,7 +6005,18 @@ class ConversationOnboarding:
 
         def run_model() -> None:
             try:
-                responses.append(assistant_model.respond(request))
+                responses.append(
+                    assistant_model.respond(
+                        replace(
+                            request,
+                            remaining_deadline_ms=max(
+                                0,
+                                int((deadline_monotonic - monotonic()) * 1_000),
+                            ),
+                            deadline_monotonic=deadline_monotonic,
+                        )
+                    )
+                )
             except BaseException as error:
                 failures.append(error)
             finally:
@@ -12214,6 +12267,8 @@ def _result_turn_request(
     conversation: ResultConversation,
     now: datetime,
     deadline: datetime | None = None,
+    requested_model: str = DEFAULT_BOT_ASSISTANT_MODEL,
+    requested_reasoning_effort: str = DEFAULT_BOT_ASSISTANT_REASONING_EFFORT,
     attempt_number: int = 1,
     resolver_version: str = "not-used",
 ) -> BotAssistantTurnRequest:
@@ -12257,8 +12312,8 @@ def _result_turn_request(
         timezone_data_version=(
             required_date.timezone_data_version if required_date is not None else None
         ),
-        requested_model="gpt-5.6-sol",
-        requested_reasoning_effort="high",
+        requested_model=requested_model,
+        requested_reasoning_effort=requested_reasoning_effort,
         prompt_version="result-conversation-v1",
         response_contract_version="bot-assistant-response-v1",
         context_policy_version="active-result-context-v1",

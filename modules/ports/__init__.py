@@ -341,6 +341,10 @@ class ModelAdapter(Protocol):
         ...
 
 
+DEFAULT_BOT_ASSISTANT_MODEL = "gpt-5.6-luna"
+DEFAULT_BOT_ASSISTANT_REASONING_EFFORT = "high"
+
+
 @dataclass(frozen=True, slots=True)
 class BotAssistantTurnRequest:
     """Application-selected context for one direct Result Conversation turn."""
@@ -369,6 +373,8 @@ class BotAssistantTurnRequest:
     deadline: datetime | None = None
     attempt_number: int = 1
     resolver_version: str = "not-used"
+    remaining_deadline_ms: int | None = None
+    deadline_monotonic: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,6 +410,26 @@ class BotAssistantFailureAlarmCleanup:
 
 class BotAssistantModelAdapter(Protocol):
     """Direct proposal-only model boundary for Result Conversation turns."""
+
+    @property
+    def requested_model(self) -> str:
+        """Return the application-selected model for each requested turn."""
+        ...
+
+    @property
+    def requested_reasoning_effort(self) -> str:
+        """Return the application-selected reasoning effort for each turn."""
+        ...
+
+    @property
+    def effective_model(self) -> str:
+        """Return the model explicitly selected by the worker SDK request."""
+        ...
+
+    @property
+    def effective_reasoning_effort(self) -> str:
+        """Return the reasoning effort explicitly selected by the worker SDK."""
+        ...
 
     def respond(self, request: BotAssistantTurnRequest) -> BotAssistantResponse:
         """Return one bounded reply and at most one application proposal."""
