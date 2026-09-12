@@ -48,19 +48,14 @@ _RESULT_CONVERSATION_V2_FIXTURES = (
         "ru",
         "Какое покрытие?",
         (
-            "Матч проходит в зале, но покрытие "
-            "не указано. "
-            "Уточните у @organizer."
+            "Матч проходит в зале, но покрытие не указано. Уточните у @organizer."  # noqa: RUF001
         ),
         id="ru-unknown-fact-contact",
     ),
     pytest.param(
         "en",
         "What surface does it have?",
-        (
-            "The match is indoors, but its surface isn't listed. "
-            "Ask @organizer."
-        ),
+        ("The match is indoors, but its surface isn't listed. Ask @organizer."),
         id="en-unknown-fact-contact",
     ),
     pytest.param(
