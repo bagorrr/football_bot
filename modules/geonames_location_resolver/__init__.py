@@ -299,6 +299,7 @@ class GeoNamesLocationResolverAdapter:
             normalized,
             country_code,
             candidate_type=LocationCandidate,
+            include_street_candidates=True,
             allow_whole_city=False,
         )
 

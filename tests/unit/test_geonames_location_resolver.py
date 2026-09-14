@@ -303,7 +303,7 @@ def test_search_area_uses_its_own_candidate_model_and_verified_parents() -> None
     )
 
 
-def test_bare_street_resolves_as_street_without_widening_numbered_address() -> None:
+def test_bare_street_resolution_includes_source_message_path() -> None:
     def search(
         params: Mapping[str, str | tuple[str, ...]],
     ) -> Mapping[str, object]:
@@ -420,6 +420,26 @@ def test_bare_street_resolves_as_street_without_widening_numbered_address() -> N
         )
     )
     assert legacy_numbered.interpretations == ()
+
+    message_interpretations = adapter.resolve_location_mention(
+        LocationResolutionQuery(
+            text="Baker Street",
+            locale="en",
+            stage=ConversationStage.SEARCH_AREA,
+            country_id="geonames:100",
+            city_id="geonames:200",
+        )
+    ).interpretations
+
+    assert len(message_interpretations) == 1
+    message_candidate = message_interpretations[0].places[0]
+    assert type(message_candidate) is LocationCandidate
+    assert message_candidate.place_id == "geonames:300"
+    assert message_candidate.geographic_type is GeographicType.STREET
+    assert message_candidate.verified_parent_ids == (
+        "geonames:200",
+        "geonames:100",
+    )
 
 
 def test_whole_city_phrase_uses_confirmed_city_without_searching_its_name() -> None:
