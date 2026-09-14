@@ -1,11 +1,16 @@
 # Six-Role MVP Runtime Operations
 
 This runbook prepares the release candidate; it does not authorize production
-configuration migration, deployment, or release. The implementation has five
-long-running systemd owners. T1 Bot API ingress is served by Bot Assistant;
-T3 remains an isolated one-shot SDK subprocess per turn, as required by
-[ADR 0009](../adr/0009-keep-bot-assistant-execution-direct-and-application-authoritative.md).
-Do not create a T3 daemon or durable conversation queue.
+configuration migration, deployment, or release. Six functional roles are
+implemented by five independently restartable long-running systemd services
+plus per-turn execution through the one-shot T3 Python Codex SDK worker managed
+by Bot Assistant. A permitted retry uses a fresh one-shot process. T1 Bot API
+ingress is served by Bot Assistant. The current T3 implementation is specified
+by [Ticket #102](https://github.com/bagorrr/football_bot/issues/102)
+and the [2026-09-14 owner topology amendment](https://github.com/bagorrr/football_bot/issues/99#issuecomment-5664415306).
+ADR 0009 retains the direct-execution and application-authority boundary; it
+does not prescribe this SDK implementation. Do not create a standalone T3
+service or durable conversation queue.
 
 ## Runtime map
 
@@ -21,7 +26,9 @@ Every database URL must authenticate as its matching `football_<role>` role.
 The runtime catalog is [`.env.example`](../../.env.example); it contains names
 only and every assignment is empty. T1 and T2 are the only projections with
 Telegram keys. T3 and T4 receive separate protected Codex authentication stores;
-neither store is part of the master `.env`.
+T3 uses its ChatGPT-subscription store, not an OpenAI Platform API key. Neither
+store is part of the master `.env`. The validated T3 model policy is explicitly
+`gpt-5.6-luna` with reasoning effort `high`.
 
 ## Host layout and service installation
 
@@ -123,6 +130,26 @@ identifiers. Queue, ingestion-lag, classification, delivery, and retention
 signals remain the existing bounded application/database health signals in
 the product operational policy; do not duplicate message-level data in host
 metrics.
+
+These systemd and host-health records cover only the five long-running
+services. T3 has no separate unit, readiness state, or independent restart;
+Bot Assistant service health does not report the outcome of any one T3 call.
+For each permitted semantic or free-form turn, Bot Assistant waits for a
+bounded SDK slot within the shared 60-second turn deadline, then starts a fresh
+Python worker process in an empty temporary workspace with one versioned
+request and a sanitized environment. The process runs one ephemeral SDK thread,
+returns one bounded success or failure envelope, and exits; the temporary
+workspace is removed after the attempt. A permitted quick technical retry
+starts a fresh one-shot worker process and consumes the same deadline. Slot
+waiting creates no durable queue. Inspect individual invocation outcomes and
+failures through the existing application-level turn handling in
+[`bot-assistant-model-execution.md`](../product/bot-assistant-model-execution.md).
+
+Timeout termination kills the current T3 process group. Stopping or restarting
+the Bot Assistant systemd unit stops its child processes through the unit's
+`KillMode=control-group`; T3 cannot be stopped or restarted independently.
+Cancellation, crash, or restart produces no accepted partial or late model
+action and follows the existing #102/#67 failure and idempotency contract.
 
 For a dependency outage, do not edit or widen role projections. GeoNames,
 PostgreSQL, Telegram, and Codex failures are visible as redacted dependency or
