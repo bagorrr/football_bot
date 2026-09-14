@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request
 
+from modules.application import _resolve_source_location_across_supported_locales
 from modules.domain import (
     ConversationStage,
     GeographicType,
@@ -348,3 +349,62 @@ def test_whole_city_phrase_uses_confirmed_city_without_searching_its_name() -> N
         "getJSON",
         "hierarchyJSON",
     ]
+
+
+def test_nonempty_geonames_result_passes_application_location_contract() -> None:
+    country_id = "geonames:100"
+    city_id = "geonames:200"
+    place_id = "geonames:300"
+    transport = ScriptedGeoNamesTransport(
+        {
+            "getJSON": lambda _params: {
+                "geonameId": 100,
+                "name": "Russia",
+                "toponymName": "Russia",
+                "countryCode": "RU",
+                "fcl": "A",
+                "fcode": "PCLI",
+            },
+            "searchJSON": {
+                "geonames": [
+                    {
+                        "geonameId": 300,
+                        "name": "Komendantsky Prospekt",
+                        "toponymName": "Komendantsky Prospekt",
+                        "countryCode": "RU",
+                        "fcl": "S",
+                        "fcode": "STTN",
+                    }
+                ]
+            },
+            "hierarchyJSON": {
+                "geonames": [
+                    {"geonameId": 100, "name": "Russia", "fcode": "PCLI"},
+                    {
+                        "geonameId": 200,
+                        "name": "Saint Petersburg",
+                        "fcode": "PPLA",
+                    },
+                ]
+            },
+        }
+    )
+    adapter = GeoNamesLocationResolverAdapter(
+        username="controlled-user",
+        transport=transport,
+    )
+
+    accepted = _resolve_source_location_across_supported_locales(
+        adapter,
+        mention="Komendantsky Prospekt",
+        country_id=country_id,
+        city_id=city_id,
+    )
+
+    assert accepted is not None
+    candidate, city_labels = accepted
+    assert candidate.place_id == place_id
+    assert candidate.geographic_type is GeographicType.STATION
+    assert candidate.glossary_version == "location-glossary-v1"
+    assert candidate.verified_parent_ids == (city_id, country_id)
+    assert city_labels == dict.fromkeys(("en", "es", "fr", "ru"), "Saint Petersburg")

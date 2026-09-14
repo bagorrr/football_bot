@@ -26,7 +26,7 @@ from modules.domain import (
 from modules.ports import LocationResolverError
 
 GEONAMES_RESOLVER_VERSION = "geonames-ws-v1"
-GEONAMES_GLOSSARY_VERSION = "geonames-feature-map-v1"
+GEONAMES_GLOSSARY_VERSION = "location-glossary-v1"
 GEONAMES_BASE_URL = "https://api.geonames.org/"
 GEONAMES_MAX_ROWS = 5
 GEONAMES_MAX_REQUESTS_PER_HOUR = 100
