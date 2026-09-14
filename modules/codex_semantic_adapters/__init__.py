@@ -150,6 +150,7 @@ class CodexDateInterpretationAdapter(DateInterpretationAdapter):
         try:
             response = self._runner.respond(
                 stage=ConversationStage.REQUIRED_DATE,
+                update_id=query.update_id,
                 message=query.text,
                 locale=query.locale,
                 current_time=query.authoritative_utc,
@@ -208,7 +209,7 @@ class CodexConversationLanguageAdapter(ConversationLanguageAdapter):
         self._cache: OrderedDict[str, LanguageSelection] = OrderedDict()
         self._lock = RLock()
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
         """Return no selection on ambiguity or any semantic execution failure."""
         if not isinstance(text, str) or not text.strip() or len(text) > 200:
             return None
@@ -226,6 +227,7 @@ class CodexConversationLanguageAdapter(ConversationLanguageAdapter):
             )
             response = self._runner.respond(
                 stage=ConversationStage.LANGUAGE_INPUT,
+                update_id=update_id,
                 message=message,
                 locale="en",
                 current_time=self._clock.now(),
@@ -237,7 +239,7 @@ class CodexConversationLanguageAdapter(ConversationLanguageAdapter):
             self._remember(selection)
         return selection
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(self, locale: str, *, update_id: str | None) -> LanguageSelection | None:
         """Render one dynamic language from the same reviewed English source."""
         if locale in _STATIC_LOCALES or not self._supports_locale(locale):
             return None
@@ -246,6 +248,8 @@ class CodexConversationLanguageAdapter(ConversationLanguageAdapter):
             if cached is not None:
                 self._cache.move_to_end(locale)
                 return cached
+        if update_id is None:
+            return None
         try:
             message = json.dumps(
                 {
@@ -260,6 +264,7 @@ class CodexConversationLanguageAdapter(ConversationLanguageAdapter):
             )
             response = self._runner.respond(
                 stage=ConversationStage.LANGUAGE_INPUT,
+                update_id=update_id,
                 message=message,
                 locale="en",
                 current_time=self._clock.now(),
@@ -349,6 +354,7 @@ class _SemanticTurnRunner:
         self,
         *,
         stage: ConversationStage,
+        update_id: str,
         message: str,
         locale: str,
         current_time: datetime,
@@ -360,6 +366,8 @@ class _SemanticTurnRunner:
             raise DateInterpretationError("semantic turn clock is not timezone-aware")
         if not isinstance(message, str) or not message.strip() or len(message) > 8_000:
             raise DateInterpretationError("semantic turn input is invalid")
+        if not isinstance(update_id, str) or not update_id:
+            raise DateInterpretationError("semantic update identity is invalid")
         requested_model = self._model.requested_model
         requested_effort = self._model.requested_reasoning_effort
         if not requested_model or not requested_effort:
@@ -376,7 +384,7 @@ class _SemanticTurnRunner:
                 raise DateInterpretationError("semantic turn reached its deadline")
             request = BotAssistantTurnRequest(
                 turn_id=turn_id,
-                update_id=turn_id,
+                update_id=update_id,
                 message=message,
                 locale=locale,
                 stage=stage,
@@ -429,6 +437,8 @@ class _SemanticTurnRunner:
 def _validate_date_query(query: DateInterpretationQuery) -> None:
     if (
         not isinstance(query, DateInterpretationQuery)
+        or not isinstance(query.update_id, str)
+        or not query.update_id
         or not isinstance(query.text, str)
         or not query.text.strip()
         or len(query.text) > 2_000

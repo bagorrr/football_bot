@@ -2415,13 +2415,17 @@ def _as_search_area_candidate(
 class ControlledConversationLanguageAdapter:
     """Deterministic free-text interpretation with no live model call."""
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(
+        self, text: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         """Recognize one acceptance fixture and reject every ambiguous input."""
         if text.strip().casefold() != "deutsch":
             return None
-        return self.render("de")
+        return self.render("de", update_id=update_id)
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         """Render the one validated non-static acceptance locale."""
         if locale != "de":
             return None
@@ -4769,7 +4773,7 @@ class AcceptanceSpine:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
         current = self.conversation_state(telegram_user_id)
         draft = role.store.discovery_draft(telegram_user_id)
-        selection = _conversation_language(role).render(locale)
+        selection = _conversation_language(role).render(locale, update_id=update_id)
         if selection is not None and selection.locale != locale:
             raise RuntimeError("controlled language change rendered another locale")
         result_context = (

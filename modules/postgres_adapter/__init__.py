@@ -214,6 +214,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0060_telethon_ingestion_scope_lookup.sql",
     "0061_telethon_event_identity_and_progress_retention.sql",
     "0062_telethon_active_ingestion_scope.sql",
+    "0063_semantic_origin_update_id.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -280,6 +281,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "96788c3cf2a25f912e068517a1b2f15736d1b2ab9ee64132c96c6eda05da7247",
     "ae782f526807bf08c2daee9fe523ef72f0d17c8b6f335061597147af659db559",
     "bf3dbc633756c1d7264d7a447eea530c4daefb0f81b57ab08880ae44fd46699b",
+    "b543c9190bafe36a006c0ce01eb2224c19f9a0e760132bf0d967b58d487c921b",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -11438,7 +11440,7 @@ class PostgresRoleStore:
                 """
                 SELECT command_message_id, request_message_id, telegram_user_id,
                        origin_subject_id, origin_subject_revision,
-                       registry_generation
+                       registry_generation, originating_update_id
                 FROM football_runtime.source_chat_registration_origins
                 WHERE correlation_id = %s
                 """,
@@ -11453,6 +11455,7 @@ class PostgresRoleStore:
             subject_id,
             subject_revision,
             registry_generation,
+            originating_update_id,
         ) = row
         if (
             not isinstance(command_message_id, UUID)
@@ -11466,6 +11469,13 @@ class PostgresRoleStore:
             or isinstance(telegram_user_id, bool)
             or not isinstance(registry_generation, int)
             or isinstance(registry_generation, bool)
+            or (
+                originating_update_id is not None
+                and (
+                    not isinstance(originating_update_id, str)
+                    or not originating_update_id
+                )
+            )
         ):
             raise RuntimeError("Bot registration context is invalid")
         return SourceChatRegistrationContext(
@@ -11475,6 +11485,7 @@ class PostgresRoleStore:
             origin_subject_id=subject_id,
             origin_subject_revision=subject_revision,
             registry_generation=registry_generation,
+            originating_update_id=originating_update_id,
         )
 
     def source_chat_registration_origin_for_terminal(
@@ -11489,7 +11500,8 @@ class PostgresRoleStore:
                 """
                 SELECT correlation_id, command_message_id, request_message_id,
                        telegram_user_id, origin_subject_id,
-                       origin_subject_revision, registry_generation
+                       origin_subject_revision, registry_generation,
+                       originating_update_id
                 FROM football_runtime.source_chat_registration_origins
                 """
             ).fetchall()
@@ -11504,6 +11516,7 @@ class PostgresRoleStore:
                 subject_id,
                 subject_revision,
                 registry_generation,
+                originating_update_id,
             ) = row
             if (
                 not isinstance(correlation_id, UUID)
@@ -11518,6 +11531,13 @@ class PostgresRoleStore:
                 or isinstance(telegram_user_id, bool)
                 or not isinstance(registry_generation, int)
                 or isinstance(registry_generation, bool)
+                or (
+                    originating_update_id is not None
+                    and (
+                        not isinstance(originating_update_id, str)
+                        or not originating_update_id
+                    )
+                )
             ):
                 raise RuntimeError("Bot registration context is invalid")
             resolved_message_id = derive_contract_message_id(
@@ -11546,6 +11566,7 @@ class PostgresRoleStore:
                 origin_subject_id=subject_id,
                 origin_subject_revision=subject_revision,
                 registry_generation=registry_generation,
+                originating_update_id=originating_update_id,
             )
             expected_messages = tuple(
                 derive_contract_message_id(cause, incoming.contract_name)
@@ -11572,7 +11593,7 @@ class PostgresRoleStore:
                 """
                 SELECT command_message_id, correlation_id, telegram_user_id,
                        source_chat_key, telegram_peer_kind, telegram_chat_id,
-                       registry_generation, action
+                       registry_generation, action, originating_update_id
                 FROM football_runtime.source_chat_lifecycle_origins
                 WHERE correlation_id = %s
                 """,
@@ -11589,6 +11610,7 @@ class PostgresRoleStore:
             telegram_chat_id,
             registry_generation,
             action,
+            originating_update_id,
         ) = row
         if (
             not isinstance(command_message_id, UUID)
@@ -11604,6 +11626,13 @@ class PostgresRoleStore:
             or not isinstance(registry_generation, int)
             or isinstance(registry_generation, bool)
             or action not in {item.value for item in SourceChatLifecycleAction}
+            or (
+                originating_update_id is not None
+                and (
+                    not isinstance(originating_update_id, str)
+                    or not originating_update_id
+                )
+            )
         ):
             raise RuntimeError("Bot Source Chat lifecycle context is invalid")
         return SourceChatLifecycleContext(
@@ -11617,6 +11646,7 @@ class PostgresRoleStore:
             ),
             registry_generation=registry_generation,
             action=SourceChatLifecycleAction(action),
+            originating_update_id=originating_update_id,
         )
 
     def source_chat_lifecycle_origin_for_terminal(
@@ -11633,7 +11663,7 @@ class PostgresRoleStore:
                 """
                 SELECT command_message_id, correlation_id, telegram_user_id,
                        source_chat_key, telegram_peer_kind, telegram_chat_id,
-                       registry_generation, action
+                       registry_generation, action, originating_update_id
                 FROM football_runtime.source_chat_lifecycle_origins
                 """
             ).fetchall()
@@ -11649,7 +11679,12 @@ class PostgresRoleStore:
                 telegram_chat_id,
                 registry_generation,
                 action,
+                originating_update_id,
             ) = row
+            if originating_update_id is not None and (
+                not isinstance(originating_update_id, str) or not originating_update_id
+            ):
+                raise RuntimeError("Bot Source Chat lifecycle context is invalid")
             context = SourceChatLifecycleContext(
                 correlation_id=correlation_id,
                 command_message_id=command_message_id,
@@ -11661,6 +11696,7 @@ class PostgresRoleStore:
                 ),
                 registry_generation=registry_generation,
                 action=SourceChatLifecycleAction(action),
+                originating_update_id=originating_update_id,
             )
             expected_message_id = derive_contract_message_id(
                 command_message_id,
@@ -12239,8 +12275,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -12251,6 +12287,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -12317,8 +12354,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -12329,6 +12366,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -12520,8 +12558,9 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, telegram_message_id, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, telegram_message_id,
+                    originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -12533,6 +12572,7 @@ class PostgresRoleStore:
                     message.reply_button,
                     message.reply_keyboard_action.value,
                     telegram_message_id,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -12573,7 +12613,8 @@ class PostgresRoleStore:
                        presentation.completed_search_id,
                        presentation.current_result_id,
                        presentation.absolute_position,
-                       outbox.superseded_at
+                       outbox.superseded_at,
+                       outbox.originating_update_id
                 FROM football_runtime.bot_message_outbox AS outbox
                 JOIN football_runtime.bot_search_presentations AS presentation
                   ON presentation.delivery_id = outbox.delivery_id
@@ -12618,8 +12659,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -12631,6 +12672,7 @@ class PostgresRoleStore:
                     row[4],
                     row[5],
                     row[6],
+                    row[11],
                     recorded_at,
                 ),
             )
@@ -12982,8 +13024,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     assistant_message.delivery_id,
@@ -12994,6 +13036,7 @@ class PostgresRoleStore:
                     json.dumps(assistant_message.button_rows, ensure_ascii=False),
                     assistant_message.reply_button,
                     assistant_message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13128,8 +13171,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13140,6 +13183,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13157,8 +13201,9 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.source_chat_registration_origins (
                     command_message_id, correlation_id, request_message_id,
                     telegram_user_id, origin_subject_id,
-                    origin_subject_revision, registry_generation, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    origin_subject_revision, registry_generation,
+                    originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     command.message_id,
@@ -13168,6 +13213,7 @@ class PostgresRoleStore:
                     command.subject_id,
                     command.subject_revision,
                     registry_generation,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13255,8 +13301,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13267,6 +13313,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13275,8 +13322,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.source_chat_lifecycle_origins (
                     command_message_id, correlation_id, telegram_user_id,
                     source_chat_key, telegram_peer_kind, telegram_chat_id,
-                    registry_generation, action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    registry_generation, action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     command.message_id,
@@ -13287,6 +13334,7 @@ class PostgresRoleStore:
                     telegram_chat_id,
                     registry_generation,
                     action,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13368,8 +13416,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13380,6 +13428,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13510,8 +13559,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13522,6 +13571,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -13638,8 +13688,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13650,6 +13700,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -13841,8 +13892,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13853,6 +13904,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -13999,8 +14051,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -14011,6 +14063,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -14892,6 +14945,7 @@ class PostgresRoleStore:
                           bot_message_outbox.button_rows,
                           bot_message_outbox.reply_button,
                           bot_message_outbox.reply_keyboard_action,
+                          bot_message_outbox.originating_update_id,
                           bot_message_outbox.telegram_message_id,
                           candidate.delivery_status AS prior_delivery_status
                 """,
@@ -14999,8 +15053,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -15011,6 +15065,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     recorded_at,
                 ),
             )
@@ -15470,6 +15525,7 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
         ),
         reply_button=row.get("reply_button"),
         reply_keyboard_action=ReplyKeyboardAction(row["reply_keyboard_action"]),
+        originating_update_id=row.get("originating_update_id"),
     )
 
 

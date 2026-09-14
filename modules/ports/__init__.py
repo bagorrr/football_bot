@@ -574,11 +574,11 @@ class DateInterpretationError(RuntimeError):
 class ConversationLanguageAdapter(Protocol):
     """Bounded semantic adapter for free-text language names."""
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
         """Propose one unambiguous language or request clarification."""
         ...
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(self, locale: str, *, update_id: str | None) -> LanguageSelection | None:
         """Render one previously validated non-static Conversation Language."""
         ...
 

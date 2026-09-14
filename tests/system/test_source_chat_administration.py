@@ -320,6 +320,7 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
         "✅ Source Chat registered.\n\nInitial consent confirmed.\n\n"
         "@synthetic_public_source [enabled]"
     )
+    assert telegram.messages[-1].originating_update_id == "address:public-registration"
     system.reset()
 
 
@@ -3667,6 +3668,7 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
         confirm=True,
     )
     assert telegram.messages[-1].text.startswith("Applying Source Chat pause")
+    assert telegram.messages[-1].originating_update_id == "pause-confirm:lifecycle"
     assert system.source_chats() == (initial,)
 
     clock.advance_to(paused_at)
@@ -3678,6 +3680,7 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert paused.permanently_removed_at is None
     assert system.process_next_source_chat_bot_result()
     assert "Source Chat pause complete: paused." in telegram.messages[-1].text
+    assert telegram.messages[-1].originating_update_id == "pause-confirm:lifecycle"
     assert not system.process_next_source_chat_change_request()
 
     terminal_pause_count = sum(

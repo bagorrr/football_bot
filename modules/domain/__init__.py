@@ -1163,6 +1163,7 @@ class SourceChatRegistrationContext:
     origin_subject_id: str
     origin_subject_revision: int
     registry_generation: int
+    originating_update_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1176,6 +1177,7 @@ class SourceChatLifecycleContext:
     identity: TelegramPeerIdentity
     registry_generation: int
     action: SourceChatLifecycleAction
+    originating_update_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1288,6 +1290,7 @@ class DateInterpretationResolution:
 class DateInterpretationQuery:
     """Application-owned temporal context supplied to the interpretation boundary."""
 
+    update_id: str
     text: str
     locale: str
     authoritative_utc: datetime
@@ -1466,6 +1469,7 @@ class TelegramMessage:
     button_rows: tuple[ButtonRow, ...]
     reply_button: str | None = None
     reply_keyboard_action: ReplyKeyboardAction = ReplyKeyboardAction.REMOVE
+    originating_update_id: str | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         """Require a button label exactly when reply-keyboard markup is requested."""

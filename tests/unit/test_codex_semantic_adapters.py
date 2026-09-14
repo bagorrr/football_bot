@@ -77,6 +77,7 @@ def test_date_adapter_returns_only_model_proposals_with_application_timezone() -
         clock=FrozenClock(now),
     )
     query = DateInterpretationQuery(
+        update_id="telegram-update:date-41",
         text="next weekend",
         locale="en",
         authoritative_utc=now,
@@ -96,6 +97,8 @@ def test_date_adapter_returns_only_model_proposals_with_application_timezone() -
     )
     request = model.requests[0]
     assert request.stage is ConversationStage.REQUIRED_DATE
+    assert request.update_id == "telegram-update:date-41"
+    assert request.turn_id != request.update_id
     assert request.message == "next weekend"
     assert request.locale == "en"
     assert request.current_time == now
@@ -130,16 +133,22 @@ def test_language_selection_caches_a_complete_model_catalog_for_the_locale() -> 
         supported_locales=frozenset({"en", "es", "fr", "ru", "de"}),
     )
 
-    selection = adapter.interpret("Deutsch")
+    selection = adapter.interpret(
+        "Deutsch",
+        update_id="telegram-update:language-42",
+    )
 
     assert selection is not None
     assert selection.locale == "de"
     assert selection.confirmation == fields["confirmation"]
     assert selection.direction_labels[0] == "direction_labels 0"
-    assert adapter.render("de") == selection
+    assert adapter.render("de", update_id="telegram-update:cache-hit") == selection
+    assert adapter.render("de", update_id=None) == selection
     assert len(model.requests) == 1
     request = model.requests[0]
     assert request.stage is ConversationStage.LANGUAGE_INPUT
+    assert request.update_id == "telegram-update:language-42"
+    assert request.turn_id != request.update_id
     assert request.locale == "en"
     semantic_input = json.loads(request.message)
     assert semantic_input["operation"] == "select_language"
@@ -149,6 +158,51 @@ def test_language_selection_caches_a_complete_model_catalog_for_the_locale() -> 
         for field in dataclasses.fields(LanguageSelection)
         if field.name != "locale"
     }
+
+
+def test_language_render_turn_keeps_the_triggering_telegram_update_id() -> None:
+    fields = _translated_language_fields()
+    model = RecordingSemanticModel(
+        BotAssistantResponse(
+            reply="language rendered",
+            proposed_action=cast(
+                dict[str, JsonValue],
+                {
+                    "kind": "language_selection",
+                    "criterion": "conversation_language",
+                    "operation": "select",
+                    "value": {"locale": "de", "fields": fields},
+                    "relaxed_criterion": None,
+                },
+            ),
+        )
+    )
+    adapter = CodexConversationLanguageAdapter(
+        model=model,
+        clock=FrozenClock(datetime(2026, 9, 13, 8, 15, tzinfo=UTC)),
+        supported_locales=frozenset({"de"}),
+    )
+
+    selection = adapter.render("de", update_id="telegram-update:render-43")
+
+    assert selection is not None
+    request = model.requests[0]
+    assert request.stage is ConversationStage.LANGUAGE_INPUT
+    assert request.update_id == "telegram-update:render-43"
+    assert request.turn_id != request.update_id
+    assert json.loads(request.message)["operation"] == "render_language"
+
+
+def test_language_render_without_originating_update_does_not_call_the_model() -> None:
+    model = RecordingSemanticModel(BotAssistantResponse(reply="unused"))
+    adapter = CodexConversationLanguageAdapter(
+        model=model,
+        clock=FrozenClock(datetime(2026, 9, 13, 8, 15, tzinfo=UTC)),
+        supported_locales=frozenset({"de"}),
+    )
+
+    assert adapter.render("de", update_id=None) is None
+    assert model.requests == []
 
 
 def test_language_selection_accepts_any_valid_dynamic_bcp47_locale() -> None:
@@ -174,12 +228,12 @@ def test_language_selection_accepts_any_valid_dynamic_bcp47_locale() -> None:
         supported_locales=None,
     )
 
-    selection = adapter.interpret("العربية")
+    selection = adapter.interpret("العربية", update_id="telegram-update:language-44")
 
     assert selection is not None
     assert selection.locale == "ar-EG"
-    assert adapter.render("ar-EG") == selection
-    assert adapter.render("bad_locale") is None
+    assert adapter.render("ar-EG", update_id="telegram-update:render-45") == selection
+    assert adapter.render("bad_locale", update_id="telegram-update:render-46") is None
 
 
 def _translated_language_fields() -> dict[str, JsonValue]:
